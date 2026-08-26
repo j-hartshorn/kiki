@@ -25,7 +25,9 @@ One user turn may contain repeated code executions and execution results before 
 
 After an execution, the model receives explicit output, errors, and a compact summary of changed variable names and types. Values do not enter the model context merely because they changed. Large values stay in the arena until the agent deliberately inspects, filters, or summarises them.
 
-The arena lives for the running session initially. The architecture must leave a route to saving and resuming sessions and restoring earlier agent state. Restoring agent state does not need to roll back filesystem changes or other external effects.
+The arena lives for the running session initially. When persistence is added, session history should be an append-only tree from its first durable format. Each entry has a parent, and a durable active leaf selects the branch projected into model context and arena state. Rewinding to an earlier restorable point and continuing creates a new branch without deleting the previous future.
+
+Rewind restores agent and arena state only. It does not roll back filesystem changes or other external effects performed along either branch.
 
 ## Runtime boundary
 
@@ -171,8 +173,8 @@ Keep built-in concepts few. Features such as memory, web access, TODO presentati
 
 ## Later directions
 
-- persisted and resumable sessions;
-- restoring earlier agent state without pretending external effects were undone;
+- persisted and resumable tree-shaped sessions;
+- branch navigation and arena restoration without pretending external effects were undone;
 - parallel subagent workflows and richer result inspection;
 - a debugger-like arena variable inspector;
 - TUI projections for TODOs and other recognised Python objects;
