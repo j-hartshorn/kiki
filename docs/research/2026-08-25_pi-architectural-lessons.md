@@ -69,7 +69,26 @@ The distinction matters because persistence and policy hooks are correctness bar
 
 Kiki's initial runtime event vocabulary can stay small, but event types should distinguish commands, ordered state transitions, and observational notifications. The TUI should consume committed state transitions and live progress without becoming an awaited dependency of the agent loop.
 
-Pi also distinguishes low-level `agent_end` from coding-session `agent_settled`, because retries or recovery may continue after one loop run. Kiki does not need the second state until it adds automatic recovery, but should avoid overloading one completion event later. `.research/pi/source/packages/coding-agent/src/core/agent-session.ts:1085-1097`
+Pi also distinguishes low-level `agent_end` from coding-session `agent_settled`, because retries or recovery may continue after one loop run. Kiki does not need the second state until it adds automatic recovery, but context-affecting plugin post-processing creates the same distinction between a final answer and full settlement. `.research/pi/source/packages/coding-agent/src/core/agent-session.ts:1085-1097`
+
+#### Event vocabulary worth carrying into Kiki
+
+Pi's small core event set is the useful starting point. It groups events by agent, turn, message, and tool-execution lifecycle, with start, streaming update where applicable, and end events. `.research/pi/source/packages/agent/src/types.ts:421-448`
+
+| Pi event group | Kiki equivalent | Initial use |
+|---|---|---|
+| `agent_start`, `agent_end` | run started, final answer/failed/cancelled | Bound one user-request run while preserving its terminal outcome. |
+| `agent_settled` | run settled | Mark that retry, recovery, and every durable post-turn producer have finished before another run begins. |
+| `turn_start`, `turn_end` | model-step started/completed | Bound one model response and its resulting code execution; Kiki may need several within one run. |
+| `message_start`, `message_update`, `message_end` | model-output started/delta/completed | Stream presentation data while treating only the completed `code` or `message` action as committable. |
+| `tool_execution_start`, `tool_execution_update`, `tool_execution_end` | tool invocation started/progressed/completed | Project async host calls made from arena Python and correlate them by invocation ID. |
+| `entry_appended` | session entry appended | Notify front ends and plugin observers after canonical session state changes. |
+
+Kiki additionally needs arena-specific events which Pi's direct-tool loop does not: Python execution started, output produced, execution completed or failed, changed arena values, and arena checkpoint/restoration. Active-leaf changes also need a first-class state transition because they select both model history and restorable arena state.
+
+Pi's coding-session layer adds queue, compaction, retry, thinking-level, and shell-specific events. Kiki can add queue, compaction, and retry events when those mechanisms exist rather than reserving them now. A shell-specific progress event should remain ordinary tool progress instead of entering the core vocabulary. `.research/pi/source/packages/coding-agent/src/core/agent-session.ts:143-186`
+
+Pi exposes observations, transforms, and decisions through the same `on(event, handler)` registration shape even though its runner gives them different ordering and failure semantics. Kiki should retain the semantic seams but not disguise all of them as one event bus: immutable runtime events are observed, transforms return replacement values which Rust validates, and decisions return explicit allow, block, or cancellation outcomes. `.research/pi/source/packages/coding-agent/src/core/extensions/types.ts:1232-1308` `.research/pi/source/packages/coding-agent/src/core/extensions/runner.ts:801-1038`
 
 ### Cancellation has both semantic and mechanical parts
 

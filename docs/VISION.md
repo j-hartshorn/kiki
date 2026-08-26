@@ -27,6 +27,8 @@ After an execution, the model receives explicit output, errors, and a compact su
 
 The arena lives for the running session initially. When persistence is added, session history should be an append-only tree from its first durable format. Each entry has a parent, and a durable active leaf selects the branch projected into model context and arena state. Rewinding to an earlier restorable point and continuing creates a new branch without deleting the previous future.
 
+Each arena checkpoint records the exact Monty runtime identity required to restore it. When an older session is opened after an upgrade, Kiki must select a compatible worker or explicitly migrate the checkpoint through one. If neither is available, Kiki preserves the session records but marks that arena state non-restorable rather than attempting an incompatible load.
+
 Rewind restores agent and arena state only. It does not roll back filesystem changes or other external effects performed along either branch.
 
 ## Runtime boundary
@@ -53,15 +55,27 @@ Each agent owns an arena. Variables survive across code executions and user turn
 
 ### Python is the extension language
 
-Tools appear inside the arena as typed async Python functions. The model uses normal Python control flow, filtering, loops, and `asyncio.gather()` rather than harness-specific batching syntax.
+A **tool** and a **plugin** are different concepts. A tool is a typed async function exposed to model-authored code in an arena. A plugin is trusted host code loaded by Kiki which can extend selected harness behaviour. A plugin may provide tools, but a tool may instead be built into Rust or backed by MCP or another adapter.
 
-Rust-backed tools perform core external effects. Trusted user-authored Python modules can also expose functions as tools. These modules run outside the model-authored arena and may use normal Python packages. Loading one grants it the user's host permissions; it is trusted plugin code, not sandboxed model code. Rust controls whether the model may invoke it, but cannot contain arbitrary effects performed inside it.
+The model uses tools through normal Python control flow, filtering, loops, and `asyncio.gather()` rather than harness-specific batching syntax. Tool arguments and results cross the runtime boundary as transferable values. Arbitrary Python functions and closures are not transferable results initially. Strings remain available when an agent needs to represent source code.
 
-Tool arguments and results cross the runtime boundary as transferable values. Arbitrary Python functions and closures are not transferable results initially. Strings remain available when an agent needs to represent source code.
+Trusted user-authored Python plugins run outside the model-authored arena and may use normal Python packages. Loading one grants it the user's host permissions; it is not sandboxed model code. Rust controls the interfaces through which Kiki and model-authored code invoke the plugin, but cannot contain arbitrary effects performed by the plugin itself.
+
+The initial plugin interface should stay narrower than Pi's extension surface. Plugins may register tools and user commands, contribute resources, observe typed lifecycle events, participate in explicit transform or policy seams, append typed session records, and produce structured display data. They should not receive mutable session or arena objects, replace the session runtime, or construct Ratatui components directly.
+
+Plugins may also contribute deterministic sandbox bootstrap source and initial bindings to an arena. This supports domain objects whose source of truth belongs in persistent arena state while still projecting outside it. A TODO plugin, for example, can define a `TodoList`, initialise a `todos` binding, and export a transferable task-list projection which Rust renders. The object follows arena checkpoints and session branches without requiring a second plugin-owned copy of its state. Ordinary importable plugin-defined modules require a future Monty module-registration facility and are not part of the initial interface.
+
+Plugin records are durable session entries with two independent optional projections: one into future model context and one into human-facing display. A record with neither projection is durable plugin state; a display-only record is still durable but omitted from model context.
+
+Every durable post-turn record producer receives the committed final message and runs in deterministic registration order. Rust serially appends its returned records to the originating branch. The final answer may be displayed immediately, but no later run begins or takes a model-context snapshot until every producer has finished and the run has settled. A failed producer appends an inspectable plugin error record without changing or removing the message the model actually produced. Display anchoring can place a summary beneath that message independently of the record's parent link in the session tree.
+
+If a plugin needs another model call, it should request auxiliary model work through a narrow Rust-owned interface so provider credentials, cancellation, usage, and recording remain host concerns.
 
 ## Tools
 
-Core tools are described in the model's initial context. A discovery API lets the agent progressively search the wider registry and inspect tool signatures and docstrings only when needed.
+Model-facing capabilities have an explicit exposure policy. **Pinned** capabilities receive concise descriptions in the initial context, **discoverable** capabilities expose only enough metadata to find and load them on demand, and **hidden** capabilities are not advertised to the model. Plugins can suggest an exposure level, but user configuration has final control.
+
+Core tools are pinned. A discovery API lets the agent progressively search the wider registry and inspect tool signatures and docstrings only when needed.
 
 The initial coding toolset is:
 
@@ -109,13 +123,32 @@ Kiki discovers skills from:
 
 Only each skill's name and description enter the initial context. Full `SKILL.md` instructions load on demand. Skills may contain scripts, references, and assets which the agent can access through its normal tools. Installation, registries, compatibility paths for other harnesses, and the experimental `allowed-tools` field are not initial requirements.
 
+## Prompt resources
+
+All substantial static instructions sent to models should be Markdown resources rather than prose embedded in Rust source. This includes the base system prompt, the `code`/`message` protocol, arena guidance, future compaction instructions, subagent instructions, and prompts for auxiliary model work. Rust still assembles dynamic facts such as tool schemas, applicable project instructions, session context, and current resource metadata.
+
+Each prompt has a stable logical identity and a shipped default. Users can replace a prompt with their own Markdown file without rebuilding Kiki. The resource loader resolves overrides in one place, and sessions record the identity and provenance of the prompts they used so behaviour remains inspectable. Plugins contribute model instructions through the same prompt-resource mechanism rather than appending opaque strings from arbitrary hooks.
+
 ## Interface
 
-The Ratatui interface is a projection of agent state and events, not the owner of agent behaviour. The agent loop must remain usable independently of the TUI.
+Kiki follows an MVC-like split. The session model is canonical and independent of any front end: it owns the session tree, active leaf, committed records, model-context projection, and references to restorable arena state. The runtime acts as controller, accepting commands and coordinating providers, arenas, tools, plugins, and persistence. The Ratatui interface is a view over session snapshots and typed runtime events; it does not own agent behaviour.
 
-One thread owns terminal access, mutable UI state, and rendering. Providers, agents, code execution, and tools run separately and communicate through typed events. The initial event vocabulary should cover message and code output, execution lifecycle, tool lifecycle, arena changes, errors, cancellation, and completion without exposing provider-specific wire formats.
+One thread owns terminal access, ephemeral UI state, and rendering. Focus, scrolling, expansion, and other presentation choices stay in the TUI. Opening a view produces a session snapshot and an ordered event subscription from the same revision, so no state transition can be lost between rebuilding the view and receiving later events.
 
-Model history and display history are different products. The model receives the compact representation needed for its next decision. The interface may retain richer code, tool output, status, timing, and inspection data without feeding those details back into context.
+Events describe ordered facts and live progress; they are not the canonical state or a generic mutation mechanism. Commands request work, the runtime updates or appends to the session model, and events report the resulting transition. Plugin observations receive immutable events. Hooks which transform data or make policy decisions use separate typed interfaces with explicit ordering, validation, and failure semantics.
+
+The initial event vocabulary should cover:
+
+- session entries and active-leaf changes;
+- run start, final answer, failure, cancellation, and settlement;
+- streamed model output;
+- arena execution, output, errors, and changed values;
+- tool invocation, progress, and completion;
+- plugin records and other committed display projections.
+
+Each event carries the stable identifiers needed to associate it with its session, branch, run, model step, execution, or tool invocation. Generation checks prevent late events from obsolete runs changing current state.
+
+Model history and display history are different products. The model receives the compact representation needed for its next decision. The session and interface may retain richer code, tool output, status, timing, plugin records, and inspection data without feeding those details back into context.
 
 The final conversation remains prominent. Code executions and tool calls appear as a collapsed timeline that the user can expand. Cancellation must make the interface responsive immediately and prevent late events from an obsolete run changing current state.
 
@@ -123,7 +156,7 @@ Rendering should be driven by visible changes rather than a permanent frame loop
 
 A later arena inspector should work like a debugger: variable names and types listed in a keyboard- and mouse-navigable panel, with values available for deeper inspection. It is a projection of arena state, not a requirement for the first working agent.
 
-Other structured state can follow the same pattern. A TODO list can begin as a Python object with methods that mutate it; Kiki can later recognise and render that object in the TUI without making TODO management part of the core agent protocol.
+Other structured state follows the same projection pattern. A plugin-provided TODO object remains in the arena, while its registered transferable projection becomes a generic task-list view in the TUI. The projection is regenerated from the selected arena state after committed execution and after restoration, branch selection, or arena replacement; a host-side cache never becomes a second source of truth. Concise pinned guidance can make an existing TODO binding the obvious interface for the model without making TODO management part of the core agent protocol or allowing the plugin to construct UI components. Names such as `TodoList` and `todos` remain illustrative.
 
 ## First complete loop
 
@@ -177,7 +210,7 @@ Keep built-in concepts few. Features such as memory, web access, TODO presentati
 - branch navigation and arena restoration without pretending external effects were undone;
 - parallel subagent workflows and richer result inspection;
 - a debugger-like arena variable inspector;
-- TUI projections for TODOs and other recognised Python objects;
+- richer structured projections and interaction with recognised arena objects;
 - tool search and richer progressive discovery;
 - MCP-to-Python tool translation;
 - memory and web capabilities;
