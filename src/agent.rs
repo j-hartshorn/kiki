@@ -1,7 +1,10 @@
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::arena::{Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError};
+use crate::arena::{
+    Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, Observation, PythonError,
+    ReadOutcome,
+};
 use crate::model::{
     ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
 };
@@ -16,6 +19,26 @@ pub struct CompletedStep {
 pub struct AgentRun {
     pub final_message: String,
     pub completed_steps: Vec<CompletedStep>,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentProgress {
+    ModelStepStarted,
+    ExecutionStarted {
+        source: String,
+    },
+    ToolStarted {
+        path: String,
+    },
+    ToolFinished {
+        path: String,
+        outcome: ReadOutcome,
+    },
+    ExecutionCompleted {
+        source: String,
+        execution: Execution,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +73,17 @@ impl Agent {
         request: impl Into<String>,
         cancellation: &CancellationToken,
     ) -> Result<AgentRun, AgentError> {
+        let mut progress = |_| {};
+        self.run_with_progress(request, cancellation, &mut progress)
+            .await
+    }
+
+    pub(crate) async fn run_with_progress(
+        &mut self,
+        request: impl Into<String>,
+        cancellation: &CancellationToken,
+        progress: &mut impl FnMut(AgentProgress),
+    ) -> Result<AgentRun, AgentError> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
@@ -63,13 +97,34 @@ impl Agent {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+            progress(AgentProgress::ModelStepStarted);
             match self.model.next_action(&self.model_context)? {
                 ModelAction::Code { source } => {
-                    let execution = match self.arena.execute(&source, cancellation).await {
+                    progress(AgentProgress::ExecutionStarted {
+                        source: source.clone(),
+                    });
+                    let execution = {
+                        let mut arena_progress = |arena_progress| match arena_progress {
+                            ArenaProgress::ReadStarted { path } => {
+                                progress(AgentProgress::ToolStarted { path });
+                            }
+                            ArenaProgress::ReadFinished { path, outcome } => {
+                                progress(AgentProgress::ToolFinished { path, outcome });
+                            }
+                        };
+                        self.arena
+                            .execute_with_progress(&source, cancellation, &mut arena_progress)
+                            .await
+                    };
+                    let execution = match execution {
                         Ok(execution) => execution,
                         Err(ArenaError::Cancelled) => return Err(AgentError::Cancelled),
                         Err(error) => return Err(AgentError::Arena(error)),
                     };
+                    progress(AgentProgress::ExecutionCompleted {
+                        source: source.clone(),
+                        execution: execution.clone(),
+                    });
                     let feedback = execution_feedback(&execution);
                     self.model_context.push(ModelContextEntry::Execution {
                         source: source.clone(),

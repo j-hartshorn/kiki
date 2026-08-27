@@ -9,7 +9,7 @@ ratatui = "0.30.2"
 monty-pool = "=0.0.21"
 monty-types = "=0.0.21"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]

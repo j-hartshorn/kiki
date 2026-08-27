@@ -82,6 +82,18 @@ pub enum ExecutionOutcome {
     PythonError(PythonError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArenaProgress {
+    ReadStarted { path: String },
+    ReadFinished { path: String, outcome: ReadOutcome },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadOutcome {
+    Success { line_count: usize },
+    Failure { message: String },
+}
+
 #[derive(Debug, Error)]
 pub enum ArenaError {
     #[error("Monty worker path must be absolute")]
@@ -198,6 +210,17 @@ impl Arena {
         code: &str,
         cancellation: &CancellationToken,
     ) -> Result<Execution, ArenaError> {
+        let mut progress = |_| {};
+        self.execute_with_progress(code, cancellation, &mut progress)
+            .await
+    }
+
+    pub(crate) async fn execute_with_progress(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) -> Result<Execution, ArenaError> {
         self.restore_current_checkpoint_if_needed().await?;
         let mut checkout = self
             .checkout
@@ -208,7 +231,7 @@ impl Arena {
             biased;
             _ = cancellation.cancelled() => Err(ArenaError::Cancelled),
             _ = sleep(self.execution_timeout) => Err(ArenaError::TimedOut),
-            result = execute_checkout(&mut checkout, &self.read_tool, code, self.max_memory) => result,
+            result = execute_checkout(&mut checkout, &self.read_tool, code, self.max_memory, progress) => result,
         };
 
         match attempt {
@@ -345,8 +368,9 @@ async fn execute_checkout(
     read_tool: &ReadTool,
     code: &str,
     max_memory: Option<usize>,
+    progress: &mut impl FnMut(ArenaProgress),
 ) -> Result<(Execution, Vec<u8>), ArenaError> {
-    let (result, streams) = drive(checkout, read_tool, code).await;
+    let (result, streams) = drive(checkout, read_tool, code, progress).await;
     let stdout = streams.stdout.finish();
     let stderr = streams.stderr.finish();
     let (outcome, unsafe_memory, error_text) = match result {
@@ -434,6 +458,7 @@ async fn drive(
     checkout: &mut Checkout,
     read_tool: &ReadTool,
     code: &str,
+    progress: &mut impl FnMut(ArenaProgress),
 ) -> (Result<MontyObject, DriverError>, StreamAccumulators) {
     let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
     let result = 'drive: {
@@ -508,7 +533,19 @@ async fn drive(
                                     break 'drive Err(DriverError::Fatal(pool_failure(error)));
                                 }
                             };
-                        let value = match read_tool.read(path).await {
+                        let path = path.clone();
+                        progress(ArenaProgress::ReadStarted { path: path.clone() });
+                        let read = read_tool.read(&path).await;
+                        let outcome = match &read {
+                            Ok(lines) => ReadOutcome::Success {
+                                line_count: lines.len(),
+                            },
+                            Err(error) => ReadOutcome::Failure {
+                                message: error.to_string(),
+                            },
+                        };
+                        progress(ArenaProgress::ReadFinished { path, outcome });
+                        let value = match read {
                             Ok(lines) => ResumeValue::Return(MontyObject::List(
                                 lines.into_iter().map(MontyObject::String).collect(),
                             )),
@@ -1769,7 +1806,14 @@ mod tests {
             .as_mut()
             .expect("new arena should have a checkout");
 
-        let (result, _) = drive(checkout, &arena.read_tool, "x = ' ' * (1 << 60)").await;
+        let mut progress = |_| {};
+        let (result, _) = drive(
+            checkout,
+            &arena.read_tool,
+            "x = ' ' * (1 << 60)",
+            &mut progress,
+        )
+        .await;
         let Err(DriverError::Runtime(error)) = result else {
             panic!("expected a runtime worker allocator failure");
         };
