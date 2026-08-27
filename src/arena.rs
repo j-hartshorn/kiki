@@ -134,7 +134,6 @@ pub struct Arena {
     checkpoint: Checkpoint,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
-    max_memory: Option<usize>,
     execution_timeout: Duration,
 }
 
@@ -200,7 +199,6 @@ impl Arena {
             checkpoint,
             runtime,
             repl_config,
-            max_memory,
             execution_timeout,
         })
     }
@@ -226,12 +224,16 @@ impl Arena {
             .checkout
             .take()
             .expect("restoring a missing checkout should install one");
-        let checkpoint = self.checkpoint.clone();
+        let max_memory = self
+            .repl_config
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.max_memory);
         let attempt = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(ArenaError::Cancelled),
             _ = sleep(self.execution_timeout) => Err(ArenaError::TimedOut),
-            result = execute_checkout(&mut checkout, &self.read_tool, code, self.max_memory, progress) => result,
+            result = execute_checkout(&mut checkout, &self.read_tool, code, max_memory, progress) => result,
         };
 
         match attempt {
@@ -245,7 +247,7 @@ impl Arena {
             }
             Err(original) => {
                 drop(checkout);
-                self.recover(checkpoint, original).await
+                Err(self.recover(original).await)
             }
         }
     }
@@ -275,26 +277,21 @@ impl Arena {
 
     async fn restore_current_checkpoint_if_needed(&mut self) -> Result<(), ArenaError> {
         if self.checkout.is_none() {
-            let checkpoint = self.checkpoint.clone();
-            self.checkout = Some(self.checkout_from_checkpoint(&checkpoint).await?);
+            self.checkout = Some(self.checkout_from_checkpoint(&self.checkpoint).await?);
         }
         Ok(())
     }
 
-    async fn recover(
-        &mut self,
-        checkpoint: Checkpoint,
-        original: ArenaError,
-    ) -> Result<Execution, ArenaError> {
-        match self.checkout_from_checkpoint(&checkpoint).await {
+    async fn recover(&mut self, original: ArenaError) -> ArenaError {
+        match self.checkout_from_checkpoint(&self.checkpoint).await {
             Ok(checkout) => {
                 self.checkout = Some(checkout);
-                Err(original)
+                original
             }
-            Err(recovery) => Err(ArenaError::RecoveryFailed {
+            Err(recovery) => ArenaError::RecoveryFailed {
                 original: Box::new(original),
                 recovery: Box::new(recovery),
-            }),
+            },
         }
     }
 

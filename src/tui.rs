@@ -174,9 +174,9 @@ impl App {
             {
                 self.set_status(format!("model step {}", step_id.0))
             }
-            RuntimeEvent::ExecutionStarted {
-                run_id, step_id, ..
-            } if self.run_state == RunState::Active(run_id) => {
+            RuntimeEvent::ExecutionStarted { run_id, step_id }
+                if self.run_state == RunState::Active(run_id) =>
+            {
                 self.set_status(format!("running code for step {}", step_id.0))
             }
             RuntimeEvent::ToolStarted { run_id, path, .. }
@@ -597,7 +597,6 @@ mod tests {
         app.handle_event(RuntimeEvent::ExecutionStarted {
             run_id: RunId(2),
             step_id: ModelStepId(4),
-            source: "current()".to_owned(),
         });
         let current_status = app.status.clone();
 
@@ -639,7 +638,6 @@ mod tests {
         app.handle_event(RuntimeEvent::ExecutionStarted {
             run_id: RunId(3),
             step_id: ModelStepId(8),
-            source: "code".to_owned(),
         });
         assert_eq!(app.status, "running code for step 8");
         app.handle_event(RuntimeEvent::ToolStarted {

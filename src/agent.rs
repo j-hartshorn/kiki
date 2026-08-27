@@ -9,25 +9,11 @@ use crate::model::{
     ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedStep {
-    pub source: String,
-    pub execution: Execution,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRun {
-    pub final_message: String,
-    pub completed_steps: Vec<CompletedStep>,
-}
-
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AgentProgress {
     ModelStepStarted,
-    ExecutionStarted {
-        source: String,
-    },
+    ExecutionStarted,
     ToolStarted {
         path: String,
     },
@@ -72,7 +58,7 @@ impl Agent {
         &mut self,
         request: impl Into<String>,
         cancellation: &CancellationToken,
-    ) -> Result<AgentRun, AgentError> {
+    ) -> Result<String, AgentError> {
         let mut progress = |_| {};
         self.run_with_progress(request, cancellation, &mut progress)
             .await
@@ -83,7 +69,7 @@ impl Agent {
         request: impl Into<String>,
         cancellation: &CancellationToken,
         progress: &mut impl FnMut(AgentProgress),
-    ) -> Result<AgentRun, AgentError> {
+    ) -> Result<String, AgentError> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
@@ -91,7 +77,6 @@ impl Agent {
         self.model_context.push(ModelContextEntry::UserRequest {
             text: request.into(),
         });
-        let mut completed_steps = Vec::new();
 
         loop {
             if cancellation.is_cancelled() {
@@ -100,9 +85,7 @@ impl Agent {
             progress(AgentProgress::ModelStepStarted);
             match self.model.next_action(&self.model_context)? {
                 ModelAction::Code { source } => {
-                    progress(AgentProgress::ExecutionStarted {
-                        source: source.clone(),
-                    });
+                    progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ReadStarted { path } => {
@@ -121,24 +104,17 @@ impl Agent {
                         Err(ArenaError::Cancelled) => return Err(AgentError::Cancelled),
                         Err(error) => return Err(AgentError::Arena(error)),
                     };
-                    progress(AgentProgress::ExecutionCompleted {
-                        source: source.clone(),
-                        execution: execution.clone(),
-                    });
                     let feedback = execution_feedback(&execution);
                     self.model_context.push(ModelContextEntry::Execution {
                         source: source.clone(),
                         feedback,
                     });
-                    completed_steps.push(CompletedStep { source, execution });
+                    progress(AgentProgress::ExecutionCompleted { source, execution });
                 }
                 ModelAction::Message { text } => {
                     self.model_context
                         .push(ModelContextEntry::FinalMessage { text: text.clone() });
-                    return Ok(AgentRun {
-                        final_message: text,
-                        completed_steps,
-                    });
+                    return Ok(text);
                 }
             }
         }
@@ -244,7 +220,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{Agent, AgentError};
+    use super::{Agent, AgentError, AgentProgress};
     use crate::arena::{Arena, Execution, ExecutionOutcome, Observation, PythonError};
     use crate::model::{
         ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
@@ -267,6 +243,33 @@ mod tests {
         .await
         .expect("create arena");
         Agent::new(arena, ScriptedModel::new(actions))
+    }
+
+    async fn run_capturing_progress(
+        agent: &mut Agent,
+        request: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(String, Vec<AgentProgress>), AgentError> {
+        let mut captured = Vec::new();
+        let message = {
+            let mut progress = |event| captured.push(event);
+            agent
+                .run_with_progress(request, cancellation, &mut progress)
+                .await?
+        };
+        Ok((message, captured))
+    }
+
+    fn completed_executions(progress: &[AgentProgress]) -> Vec<(&str, &Execution)> {
+        progress
+            .iter()
+            .filter_map(|event| match event {
+                AgentProgress::ExecutionCompleted { source, execution } => {
+                    Some((source.as_str(), execution))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     struct ObservationMetadata {
@@ -316,11 +319,9 @@ mod tests {
         .await;
         let cancellation = CancellationToken::new();
 
-        let run = agent.run("inspect", &cancellation).await.unwrap();
+        let message = agent.run("inspect", &cancellation).await.unwrap();
 
-        assert_eq!(run.final_message, "done");
-        assert_eq!(run.completed_steps.len(), 1);
-        assert_eq!(run.completed_steps[0].source, "print('hello')");
+        assert_eq!(message, "done");
         assert_eq!(
             agent.model.contexts(),
             [
@@ -379,15 +380,16 @@ mod tests {
         assert_eq!(agent.model.contexts(), observed_contexts.as_slice());
         assert_eq!(agent.model.position(), action_position);
 
-        let fresh = agent.run("fresh", &CancellationToken::new()).await.unwrap();
+        let (message, progress) =
+            run_capturing_progress(&mut agent, "fresh", &CancellationToken::new())
+                .await
+                .unwrap();
+        let executions = completed_executions(&progress);
 
-        assert_eq!(fresh.final_message, "done");
-        assert_eq!(fresh.completed_steps.len(), 1);
-        assert_eq!(
-            fresh.completed_steps[0].source,
-            "first_action = 1\nfirst_action"
-        );
-        assert_eq!(result_head(&fresh.completed_steps[0].execution), "1");
+        assert_eq!(message, "done");
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].0, "first_action = 1\nfirst_action");
+        assert_eq!(result_head(executions[0].1), "1");
     }
 
     #[tokio::test]
@@ -472,14 +474,17 @@ mod tests {
         .await;
         let cancellation = CancellationToken::new();
 
-        let run = agent.run("continue", &cancellation).await.unwrap();
+        let (_, progress) = run_capturing_progress(&mut agent, "continue", &cancellation)
+            .await
+            .unwrap();
+        let executions = completed_executions(&progress);
 
-        assert_eq!(run.completed_steps.len(), 2);
+        assert_eq!(executions.len(), 2);
         assert!(matches!(
-            run.completed_steps[0].execution.outcome,
+            executions[0].1.outcome,
             ExecutionOutcome::PythonError(_)
         ));
-        assert_eq!(result_head(&run.completed_steps[1].execution), "2");
+        assert_eq!(result_head(executions[1].1), "2");
         let ModelContextEntry::Execution { feedback, .. } = agent.model.contexts()[1]
             .last()
             .expect("following action should receive the Python error")
@@ -596,20 +601,23 @@ mod tests {
         let mut agent = Agent::new(arena, ScriptedModel::default());
         let cancellation = CancellationToken::new();
 
-        let run = agent.run("inspect", &cancellation).await.unwrap();
+        let (message, progress) = run_capturing_progress(&mut agent, "inspect", &cancellation)
+            .await
+            .unwrap();
+        let executions = completed_executions(&progress);
 
-        assert_eq!(run.final_message, "I inspected Cargo.toml.");
-        assert_eq!(run.completed_steps.len(), 2);
+        assert_eq!(message, "I inspected Cargo.toml.");
+        assert_eq!(executions.len(), 2);
         assert_eq!(
-            run.completed_steps[0].source,
+            executions[0].0,
             "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\nlines = await read(\"Cargo.toml\")"
         );
         assert_eq!(
-            run.completed_steps[1].source,
+            executions[1].0,
             "print(\"\".join(lines[0:20]), end=\"\")\nrequest_count"
         );
-        assert_eq!(run.completed_steps[1].execution.stdout.head, cargo_toml);
-        assert_eq!(result_head(&run.completed_steps[1].execution), "1");
+        assert_eq!(executions[1].1.stdout.head, cargo_toml);
+        assert_eq!(result_head(executions[1].1), "1");
         assert_eq!(
             agent.model.contexts()[0][0],
             ModelContextEntry::ReadCapability {
@@ -633,11 +641,17 @@ mod tests {
         let mut agent = Agent::new(arena, ScriptedModel::default());
         let cancellation = CancellationToken::new();
 
-        let first = agent.run("first", &cancellation).await.unwrap();
-        let second = agent.run("second", &cancellation).await.unwrap();
+        let (_, first_progress) = run_capturing_progress(&mut agent, "first", &cancellation)
+            .await
+            .unwrap();
+        let (_, second_progress) = run_capturing_progress(&mut agent, "second", &cancellation)
+            .await
+            .unwrap();
+        let first_executions = completed_executions(&first_progress);
+        let second_executions = completed_executions(&second_progress);
 
-        assert_eq!(result_head(&first.completed_steps[1].execution), "1");
-        assert_eq!(result_head(&second.completed_steps[1].execution), "2");
+        assert_eq!(result_head(first_executions[1].1), "1");
+        assert_eq!(result_head(second_executions[1].1), "2");
         let second_request_context = &agent.model.contexts()[3];
         assert!(second_request_context.iter().any(|entry| {
             matches!(

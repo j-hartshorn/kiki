@@ -144,20 +144,13 @@ fn read_file(workspace: &Dir, path: &Path, limits: ReadLimits) -> Result<Vec<Str
 
 fn read_limited(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, ReadError> {
     let mut contents = Vec::new();
-    let mut buffer = [0; 8192];
-
-    loop {
-        let remaining = max_bytes - contents.len();
-        let read_len = remaining.saturating_add(1).min(buffer.len());
-        let read = file.read(&mut buffer[..read_len]).map_err(ReadError::Io)?;
-        if read == 0 {
-            return Ok(contents);
-        }
-        if read > remaining {
-            return Err(ReadError::ByteLimitExceeded { limit: max_bytes });
-        }
-        contents.extend_from_slice(&buffer[..read]);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(ReadError::Io)?;
+    if contents.len() > max_bytes {
+        return Err(ReadError::ByteLimitExceeded { limit: max_bytes });
     }
+    Ok(contents)
 }
 
 #[cfg(test)]

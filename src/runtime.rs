@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentError, AgentProgress, AgentRun};
+use crate::agent::{Agent, AgentError, AgentProgress};
 use crate::arena::{Execution, ReadOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,7 +57,6 @@ pub(crate) enum RuntimeEvent {
     ExecutionStarted {
         run_id: RunId,
         step_id: ModelStepId,
-        source: String,
     },
     ToolStarted {
         run_id: RunId,
@@ -101,7 +100,7 @@ enum WorkerMessage {
     Progress(AgentProgress),
     Finished {
         agent: Agent,
-        result: Result<AgentRun, AgentError>,
+        result: Result<String, AgentError>,
     },
 }
 
@@ -243,7 +242,7 @@ impl RuntimeController {
                 self.agent = Some(agent);
                 let run_id = self.active_run_id();
                 let record = match result {
-                    Ok(AgentRun { final_message, .. }) => Record::FinalMessage {
+                    Ok(final_message) => Record::FinalMessage {
                         step_id: self.current_step_id(),
                         text: final_message,
                     },
@@ -287,16 +286,9 @@ impl RuntimeController {
                     .current_step_id = Some(step_id);
                 self.emit(events, RuntimeEvent::ModelStepStarted { run_id, step_id });
             }
-            AgentProgress::ExecutionStarted { source } => {
+            AgentProgress::ExecutionStarted => {
                 let (run_id, step_id) = self.active_step();
-                self.emit(
-                    events,
-                    RuntimeEvent::ExecutionStarted {
-                        run_id,
-                        step_id,
-                        source,
-                    },
-                );
+                self.emit(events, RuntimeEvent::ExecutionStarted { run_id, step_id });
             }
             AgentProgress::ToolStarted { path } => {
                 let (run_id, step_id) = self.active_step();
