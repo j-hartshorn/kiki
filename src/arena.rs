@@ -40,6 +40,8 @@ pub struct Checkpoint {
 pub struct Observation {
     pub(crate) head: String,
     pub(crate) tail: Option<String>,
+    pub(crate) head_lines: usize,
+    pub(crate) tail_lines: usize,
     pub(crate) total_lines: usize,
     pub(crate) total_bytes: usize,
     pub(crate) omitted_lines: usize,
@@ -712,6 +714,8 @@ impl ObservationAccumulator {
             return Observation {
                 head,
                 tail: Some(tail),
+                head_lines,
+                tail_lines,
                 total_lines,
                 total_bytes: self.total_bytes,
                 omitted_lines,
@@ -724,6 +728,8 @@ impl ObservationAccumulator {
         Observation {
             head: self.whole.expect("untruncated observation has text"),
             tail: None,
+            head_lines: total_lines,
+            tail_lines: 0,
             total_lines,
             total_bytes: self.total_bytes,
             omitted_lines: 0,
@@ -1327,6 +1333,8 @@ mod tests {
 
         assert_eq!(observation.head, "a\nb\n");
         assert_eq!(observation.tail.as_deref(), Some("d\n"));
+        assert_eq!(observation.head_lines, 2);
+        assert_eq!(observation.tail_lines, 1);
         assert_eq!(observation.total_lines, 4);
         assert_eq!(observation.total_bytes, 8);
         assert_eq!(observation.omitted_lines, 1);
@@ -1349,6 +1357,8 @@ mod tests {
 
         assert_eq!(observation.head, "abc");
         assert_eq!(observation.tail.as_deref(), Some("ef"));
+        assert_eq!(observation.head_lines, 1);
+        assert_eq!(observation.tail_lines, 1);
         assert_eq!(observation.total_lines, 1);
         assert_eq!(observation.omitted_lines, 0);
         assert_eq!(observation.omitted_bytes, 1);
@@ -1392,6 +1402,8 @@ mod tests {
 
         assert_eq!(observation.head, "éé");
         assert_eq!(observation.tail.as_deref(), Some("éé"));
+        assert_eq!(observation.head_lines, 1);
+        assert_eq!(observation.tail_lines, 1);
         assert_eq!(observation.omitted_bytes, 4);
         assert_eq!(observation.omitted_lines, 0);
         assert!(observation.partial_lines);
