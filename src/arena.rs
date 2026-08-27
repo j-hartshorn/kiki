@@ -5,15 +5,18 @@ use std::time::Duration;
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
-use monty_types::{ExcType, MontyException, MontyObject, PrintStream};
+use monty_types::{ExcType, MontyException, MontyObject, PrintStream, ResourceLimits};
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 use crate::tools::{ReadError, ReadTool};
 
 const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_MEMORY: usize = 64 * 1024 * 1024;
 const ERROR_BYTES: usize = 32 * 1024;
 const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
     max_total_bytes: 256 * 1024,
@@ -91,16 +94,23 @@ pub enum ArenaError {
     WorkerVersionInvalidOutput,
     #[error("Monty worker version mismatch: expected {expected}, got {actual}")]
     WorkerVersionMismatch { expected: String, actual: String },
-    #[error("Monty pool failure: {message}")]
-    PoolFailure { message: String },
+    #[error("arena execution was cancelled")]
+    Cancelled,
+    #[error("arena execution timed out")]
+    TimedOut,
+    #[error("arena infrastructure failed: {message}")]
+    Infrastructure { message: String },
+    #[error("arena recovery failed after {original}: {recovery}")]
+    RecoveryFailed {
+        original: Box<ArenaError>,
+        recovery: Box<ArenaError>,
+    },
     #[error("checkpoint runtime identity is incompatible: expected {expected}, got {actual}")]
     IncompatibleCheckpoint { expected: String, actual: String },
     #[error("Monty checkpoint was suspended")]
     SuspendedCheckpoint,
     #[error("unsupported Monty suspension: {message}")]
     UnsupportedSuspension { message: String },
-    #[error("arena checkout is unavailable")]
-    CheckoutUnavailable,
 }
 
 pub struct Arena {
@@ -109,6 +119,9 @@ pub struct Arena {
     read_tool: ReadTool,
     checkpoint: Checkpoint,
     runtime: RuntimeIdentity,
+    repl_config: ReplConfig,
+    max_memory: Option<usize>,
+    execution_timeout: Duration,
 }
 
 impl Arena {
@@ -116,16 +129,50 @@ impl Arena {
         worker_path: impl AsRef<Path>,
         read_tool: ReadTool,
     ) -> Result<Self, ArenaError> {
-        let worker_path = worker_path.as_ref().to_path_buf();
+        Self::open(
+            worker_path.as_ref().to_path_buf(),
+            read_tool,
+            EXECUTION_TIMEOUT,
+            Some(MAX_MEMORY),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn with_limits(
+        worker_path: impl AsRef<Path>,
+        read_tool: ReadTool,
+        execution_timeout: Duration,
+        max_memory: Option<usize>,
+    ) -> Result<Self, ArenaError> {
+        Self::open(
+            worker_path.as_ref().to_path_buf(),
+            read_tool,
+            execution_timeout,
+            max_memory,
+        )
+        .await
+    }
+
+    async fn open(
+        worker_path: std::path::PathBuf,
+        read_tool: ReadTool,
+        execution_timeout: Duration,
+        max_memory: Option<usize>,
+    ) -> Result<Self, ArenaError> {
         let runtime = validate_worker(&worker_path).await?;
         let mut config = PoolConfig::subprocess(worker_path);
         config.min_processes = 1;
         config.max_processes = 1;
         let pool = Pool::new(config).await.map_err(pool_failure)?;
-        let mut checkout = pool
-            .checkout(&ReplConfig::default())
-            .await
-            .map_err(pool_failure)?;
+        let repl_config = ReplConfig {
+            limits: Some(ResourceLimits {
+                max_memory,
+                ..ResourceLimits::default()
+            }),
+            ..ReplConfig::default()
+        };
+        let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
         let state = checkout.dump().await.map_err(pool_failure)?;
         let checkpoint = Checkpoint {
             identity: runtime.clone(),
@@ -138,36 +185,44 @@ impl Arena {
             read_tool,
             checkpoint,
             runtime,
+            repl_config,
+            max_memory,
+            execution_timeout,
         })
     }
 
-    pub async fn execute(&mut self, code: &str) -> Result<Execution, ArenaError> {
-        let (result, streams) = {
-            let checkout = self
-                .checkout
-                .as_mut()
-                .ok_or(ArenaError::CheckoutUnavailable)?;
-            drive(checkout, &self.read_tool, code).await
-        };
-        let stdout = streams.stdout.finish();
-        let stderr = streams.stderr.finish();
-        let outcome = match result {
-            Ok(value) => ExecutionOutcome::Complete {
-                result: (!matches!(value, MontyObject::None))
-                    .then(|| observation_from_text(value.py_repr())),
-            },
-            Err(DriverError::Runtime(error)) => {
-                ExecutionOutcome::PythonError(PythonError::from_text(error.to_string()))
-            }
-            Err(DriverError::Fatal(error)) => return Err(error),
+    pub async fn execute(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Execution, ArenaError> {
+        self.restore_current_checkpoint_if_needed().await?;
+        let mut checkout = self
+            .checkout
+            .take()
+            .expect("restoring a missing checkout should install one");
+        let checkpoint = self.checkpoint.clone();
+        let attempt = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ArenaError::Cancelled),
+            _ = sleep(self.execution_timeout) => Err(ArenaError::TimedOut),
+            result = execute_checkout(&mut checkout, &self.read_tool, code, self.max_memory) => result,
         };
 
-        self.advance_checkpoint().await?;
-        Ok(Execution {
-            stdout,
-            stderr,
-            outcome,
-        })
+        match attempt {
+            Ok((execution, state)) => {
+                self.checkout = Some(checkout);
+                self.checkpoint = Checkpoint {
+                    identity: self.runtime.clone(),
+                    state,
+                };
+                Ok(execution)
+            }
+            Err(original) => {
+                drop(checkout);
+                self.recover(checkpoint, original).await
+            }
+        }
     }
 
     pub fn checkpoint(&self) -> Checkpoint {
@@ -177,19 +232,7 @@ impl Arena {
     pub async fn restore(&mut self, checkpoint: Checkpoint) -> Result<(), ArenaError> {
         self.validate_checkpoint(&checkpoint)?;
         self.checkout.take();
-        let mut checkout = self
-            .pool
-            .checkout(&ReplConfig::default())
-            .await
-            .map_err(pool_failure)?;
-        let mut on_print = on_print_sync(|_, _| {});
-        let (event, _) = checkout
-            .restore(checkpoint.state.clone(), vec![], &mut on_print)
-            .await
-            .map_err(pool_failure)?;
-        if event.is_some() {
-            return Err(ArenaError::SuspendedCheckpoint);
-        }
+        let checkout = self.checkout_from_checkpoint(&checkpoint).await?;
         self.checkout = Some(checkout);
         self.checkpoint = checkpoint;
         Ok(())
@@ -205,19 +248,50 @@ impl Arena {
         Ok(())
     }
 
-    async fn advance_checkpoint(&mut self) -> Result<(), ArenaError> {
-        let state = self
-            .checkout
-            .as_mut()
-            .ok_or(ArenaError::CheckoutUnavailable)?
-            .dump()
+    async fn restore_current_checkpoint_if_needed(&mut self) -> Result<(), ArenaError> {
+        if self.checkout.is_none() {
+            let checkpoint = self.checkpoint.clone();
+            self.checkout = Some(self.checkout_from_checkpoint(&checkpoint).await?);
+        }
+        Ok(())
+    }
+
+    async fn recover(
+        &mut self,
+        checkpoint: Checkpoint,
+        original: ArenaError,
+    ) -> Result<Execution, ArenaError> {
+        match self.checkout_from_checkpoint(&checkpoint).await {
+            Ok(checkout) => {
+                self.checkout = Some(checkout);
+                Err(original)
+            }
+            Err(recovery) => Err(ArenaError::RecoveryFailed {
+                original: Box::new(original),
+                recovery: Box::new(recovery),
+            }),
+        }
+    }
+
+    async fn checkout_from_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<Checkout, ArenaError> {
+        self.validate_checkpoint(checkpoint)?;
+        let mut checkout = self
+            .pool
+            .checkout(&self.repl_config)
             .await
             .map_err(pool_failure)?;
-        self.checkpoint = Checkpoint {
-            identity: self.runtime.clone(),
-            state,
-        };
-        Ok(())
+        let mut on_print = on_print_sync(|_, _| {});
+        let (event, _) = checkout
+            .restore(checkpoint.state.clone(), vec![], &mut on_print)
+            .await
+            .map_err(pool_failure)?;
+        if event.is_some() {
+            return Err(ArenaError::SuspendedCheckpoint);
+        }
+        Ok(checkout)
     }
 }
 
@@ -259,9 +333,94 @@ async fn validate_worker_with_timeout(
 }
 
 fn pool_failure(error: PoolError) -> ArenaError {
-    ArenaError::PoolFailure {
+    ArenaError::Infrastructure {
         message: error.to_string(),
     }
+}
+
+async fn execute_checkout(
+    checkout: &mut Checkout,
+    read_tool: &ReadTool,
+    code: &str,
+    max_memory: Option<usize>,
+) -> Result<(Execution, Vec<u8>), ArenaError> {
+    let (result, streams) = drive(checkout, read_tool, code).await;
+    let stdout = streams.stdout.finish();
+    let stderr = streams.stderr.finish();
+    let (outcome, unsafe_memory, error_text) = match result {
+        Ok(value) => (
+            ExecutionOutcome::Complete {
+                result: (!matches!(value, MontyObject::None))
+                    .then(|| observation_from_text(value.py_repr())),
+            },
+            false,
+            None,
+        ),
+        Err(DriverError::Runtime(error)) => {
+            let unsafe_memory = is_unsafe_memory_error(&error, max_memory);
+            let error_text = error.to_string();
+            (
+                ExecutionOutcome::PythonError(PythonError::from_text(error_text.clone())),
+                unsafe_memory,
+                Some(error_text),
+            )
+        }
+        Err(DriverError::Fatal(error)) => return Err(error),
+    };
+    let state = checkout.dump().await.map_err(|error| {
+        let context = error_text.as_deref().unwrap_or("completed execution");
+        ArenaError::Infrastructure {
+            message: format!("post-execution checkpoint failed after {context}: {error}"),
+        }
+    })?;
+    if unsafe_memory {
+        return Err(ArenaError::Infrastructure {
+            message: format!(
+                "unsafe resource memory failure: {}",
+                error_text.expect("memory errors have diagnostics")
+            ),
+        });
+    }
+    Ok((
+        Execution {
+            stdout,
+            stderr,
+            outcome,
+        },
+        state,
+    ))
+}
+
+fn is_unsafe_memory_error(error: &MontyException, max_memory: Option<usize>) -> bool {
+    if error.exc_type() != ExcType::MemoryError {
+        return false;
+    }
+    match error.message() {
+        Some("the worker exceeded its memory limit and was terminated") => {
+            error.traceback().is_empty()
+        }
+        Some(message) => is_unsafe_soft_memory_error(message, max_memory),
+        None => false,
+    }
+}
+
+fn is_unsafe_soft_memory_error(message: &str, max_memory: Option<usize>) -> bool {
+    let Some((used, limit)) = parse_soft_memory_limit(message) else {
+        return false;
+    };
+    used > limit && max_memory == Some(limit)
+}
+
+fn parse_soft_memory_limit(message: &str) -> Option<(usize, usize)> {
+    let message = message.strip_prefix("memory limit exceeded: ")?;
+    let (used, limit) = message.split_once(" bytes > ")?;
+    let limit = limit.strip_suffix(" bytes")?;
+    Some((parse_canonical_usize(used)?, parse_canonical_usize(limit)?))
+}
+
+fn parse_canonical_usize(value: &str) -> Option<usize> {
+    let parsed = value.parse::<usize>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
 }
 
 enum DriverError {
@@ -830,16 +989,17 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[cfg(unix)]
     use std::time::Duration;
 
     use monty_types::PrintStream;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, ObservationAccumulator,
-        ObservationLimits, PythonError, RUNTIME_IDENTITY, RuntimeIdentity, StreamAccumulators,
-        validate_worker, validate_worker_with_timeout,
+        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome, Observation,
+        ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY, RuntimeIdentity,
+        StreamAccumulators, drive, is_unsafe_memory_error, is_unsafe_soft_memory_error,
+        parse_soft_memory_limit, validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::ReadTool;
 
@@ -867,6 +1027,31 @@ mod tests {
         )
         .await
         .expect("create arena")
+    }
+
+    async fn arena_with_limits(
+        workspace: &TempDir,
+        execution_timeout: Duration,
+        max_memory: Option<usize>,
+    ) -> Arena {
+        Arena::with_limits(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool"),
+            execution_timeout,
+            max_memory,
+        )
+        .await
+        .expect("create arena")
+    }
+
+    async fn execute_without_cancellation(
+        arena: &mut Arena,
+        code: &str,
+    ) -> Result<Execution, ArenaError> {
+        let cancellation = CancellationToken::new();
+        arena.execute(code, &cancellation).await
     }
 
     fn complete(execution: &Execution) -> Option<&Observation> {
@@ -985,16 +1170,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_arena_sets_a_whole_execution_deadline_and_memory_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = arena(&workspace).await;
+        let limits = arena
+            .repl_config
+            .limits
+            .as_ref()
+            .expect("arena should configure Monty resource limits");
+
+        assert_eq!(arena.execution_timeout, Duration::from_secs(10));
+        assert_eq!(limits.max_duration, None);
+        assert_eq!(limits.max_memory, Some(64 * 1024 * 1024));
+    }
+
+    #[tokio::test]
     async fn preserves_values_across_several_executions() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
 
-        assert_eq!(complete(&arena.execute("value = 40").await.unwrap()), None);
-        assert_eq!(complete(&arena.execute("value += 1").await.unwrap()), None);
         assert_eq!(
-            complete(&arena.execute("value * 2").await.unwrap())
-                .unwrap()
-                .head,
+            complete(
+                &execute_without_cancellation(&mut arena, "value = 40")
+                    .await
+                    .unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value += 1")
+                    .await
+                    .unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value * 2")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
             "82"
         );
     }
@@ -1005,10 +1223,12 @@ mod tests {
         fs::write(workspace.path().join("lines.txt"), "first\r\nsecond\nlast").unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = arena
-            .execute("lines = await read('lines.txt')\n''.join(lines)")
-            .await
-            .unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "lines = await read('lines.txt')\n''.join(lines)",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             complete(&execution).unwrap().head,
@@ -1026,7 +1246,9 @@ mod tests {
             "await read()",
             "await read(path='lines.txt')",
         ] {
-            let execution = arena.execute(code).await.unwrap();
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
 
             assert!(python_error(&execution).text.contains("TypeError"));
         }
@@ -1037,7 +1259,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = arena.execute("await read('/outside')").await.unwrap();
+        let execution = execute_without_cancellation(&mut arena, "await read('/outside')")
+            .await
+            .unwrap();
 
         assert!(python_error(&execution).text.contains("ValueError"));
     }
@@ -1047,7 +1271,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = arena.execute("await missing_host_call()").await.unwrap();
+        let execution = execute_without_cancellation(&mut arena, "await missing_host_call()")
+            .await
+            .unwrap();
 
         assert!(python_error(&execution).text.contains("NameError"));
     }
@@ -1057,10 +1283,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = arena
-            .execute("from pathlib import Path\nPath('/etc/passwd').read_text()")
-            .await
-            .unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "from pathlib import Path\nPath('/etc/passwd').read_text()",
+        )
+        .await
+        .unwrap();
 
         assert!(python_error(&execution).text.contains("PermissionError"));
     }
@@ -1071,10 +1299,12 @@ mod tests {
         fs::write(workspace.path().join("lines.txt"), "one\ntwo\n").unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = arena
-            .execute("print('before')\nlines = await read('lines.txt')\nprint('after')\nlen(lines)")
-            .await
-            .unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "print('before')\nlines = await read('lines.txt')\nprint('after')\nlen(lines)",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(execution.stdout.head, "before\nafter\n");
         assert_eq!(complete(&execution).unwrap().head, "2");
@@ -1270,19 +1500,320 @@ mod tests {
     async fn ordinary_python_errors_commit_preceding_mutation() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
+        #[cfg(unix)]
+        let worker_pid = arena_worker_pid(&arena);
 
-        let error = arena
-            .execute("value = 41\nraise ValueError('expected')")
-            .await
-            .unwrap();
+        let error =
+            execute_without_cancellation(&mut arena, "value = 41\nraise ValueError('expected')")
+                .await
+                .unwrap();
         assert!(python_error(&error).text.contains("ValueError"));
 
         assert_eq!(
-            complete(&arena.execute("value + 1").await.unwrap())
-                .unwrap()
-                .head,
+            complete(
+                &execute_without_cancellation(&mut arena, "value + 1")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
             "42"
         );
+        #[cfg(unix)]
+        assert_eq!(arena_worker_pid(&arena), worker_pid);
+    }
+
+    #[test]
+    fn recognises_only_the_configured_canonical_soft_memory_diagnostic() {
+        const LIMIT: usize = 16;
+        let canonical = "memory limit exceeded: 17 bytes > 16 bytes";
+
+        assert_eq!(parse_soft_memory_limit(canonical), Some((17, LIMIT)));
+        assert!(is_unsafe_soft_memory_error(canonical, Some(LIMIT)));
+        assert!(!is_unsafe_soft_memory_error(canonical, Some(32)));
+        for diagnostic in [
+            "memory limit exceeded: 017 bytes > 16 bytes",
+            "memory limit exceeded: +17 bytes > 16 bytes",
+            "memory limit exceeded: 17 bytes > 016 bytes",
+            "memory limit exceeded: 17 bytes > +16 bytes",
+        ] {
+            assert_eq!(parse_soft_memory_limit(diagnostic), None);
+            assert!(!is_unsafe_soft_memory_error(diagnostic, Some(LIMIT)));
+        }
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: sixteen bytes > 16 bytes",
+            Some(LIMIT)
+        ));
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: 17 bytes > sixteen bytes",
+            Some(LIMIT)
+        ));
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: 18446744073709551616 bytes > 16 bytes",
+            Some(LIMIT)
+        ));
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: 16 bytes > 16 bytes",
+            Some(LIMIT)
+        ));
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: 15 bytes > 16 bytes",
+            Some(LIMIT)
+        ));
+        assert!(!is_unsafe_soft_memory_error(
+            "memory limit exceeded: 17 bytes > 16 bytes more",
+            Some(LIMIT)
+        ));
+    }
+
+    #[tokio::test]
+    async fn user_raised_fatal_message_memory_error_commits_mutation_and_keeps_the_worker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        #[cfg(unix)]
+        let worker_pid = arena_worker_pid(&arena);
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "value = 99\nraise MemoryError('the worker exceeded its memory limit and was terminated')",
+        )
+        .await
+        .unwrap();
+
+        assert!(python_error(&execution).text.contains("Traceback"));
+        assert!(python_error(&execution).text.contains("MemoryError"));
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "99"
+        );
+        #[cfg(unix)]
+        assert_eq!(arena_worker_pid(&arena), worker_pid);
+    }
+
+    #[test]
+    fn rejects_a_near_match_empty_traceback_fatal_memory_error() {
+        let error = monty_types::MontyException::new(
+            monty_types::ExcType::MemoryError,
+            Some("the worker exceeded its memory limit and was terminated.".to_owned()),
+        );
+
+        assert!(error.traceback().is_empty());
+        assert!(!is_unsafe_memory_error(&error, None));
+    }
+
+    async fn set_trusted_value(arena: &mut Arena) {
+        execute_without_cancellation(arena, "value = 7")
+            .await
+            .expect("set trusted value");
+    }
+
+    async fn assert_trusted_value(arena: &mut Arena) {
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(arena, "value")
+                    .await
+                    .expect("execute after recovery")
+            )
+            .expect("value result")
+            .head,
+            "7"
+        );
+    }
+
+    #[cfg(unix)]
+    fn arena_worker_pid(arena: &Arena) -> u32 {
+        arena
+            .checkout
+            .as_ref()
+            .and_then(Checkout::pid)
+            .expect("local arena worker should have a process ID")
+    }
+
+    #[tokio::test]
+    async fn cancellation_recovers_the_trusted_checkpoint_before_returning() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        let previous_pid = arena_worker_pid(&arena);
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let cancel = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+
+        let error = arena
+            .execute("value = 99\nwhile True:\n    pass", &cancellation)
+            .await
+            .unwrap_err();
+        cancel.await.unwrap();
+
+        assert!(matches!(error, ArenaError::Cancelled));
+        assert_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        assert_ne!(arena_worker_pid(&arena), previous_pid);
+    }
+
+    #[tokio::test]
+    async fn execution_deadline_recovers_the_trusted_checkpoint_before_returning() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_limits(
+            &workspace,
+            Duration::from_millis(100),
+            Some(64 * 1024 * 1024),
+        )
+        .await;
+        set_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        let previous_pid = arena_worker_pid(&arena);
+
+        let error = execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ArenaError::TimedOut));
+        assert_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        assert_ne!(arena_worker_pid(&arena), previous_pid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_crashes_recover_the_trusted_checkpoint_before_returning() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        let previous_pid = arena_worker_pid(&arena);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                unsafe { libc::kill(previous_pid as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+        });
+
+        let result =
+            execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass").await;
+        killer.join().unwrap();
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, ArenaError::Infrastructure { .. }));
+        assert_trusted_value(&mut arena).await;
+        assert_ne!(arena_worker_pid(&arena), previous_pid);
+    }
+
+    #[tokio::test]
+    async fn soft_memory_limit_recovers_the_trusted_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena =
+            arena_with_limits(&workspace, Duration::from_secs(10), Some(8 * 1024 * 1024)).await;
+        set_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        let previous_pid = arena_worker_pid(&arena);
+
+        let error = execute_without_cancellation(
+            &mut arena,
+            "value = 99\n[str(i) for i in range(131_072)]",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ArenaError::Infrastructure { .. }));
+        assert!(error.to_string().contains("MemoryError"));
+        #[cfg(unix)]
+        {
+            assert_ne!(arena_worker_pid(&arena), previous_pid);
+            assert!(
+                process_exited(previous_pid as libc::pid_t).await,
+                "soft-memory worker {previous_pid} is still running"
+            );
+        }
+        assert_trusted_value(&mut arena).await;
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value + 1")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "8"
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_worker_memory_error_has_an_empty_traceback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_limits(&workspace, Duration::from_secs(1), None).await;
+        let checkout = arena
+            .checkout
+            .as_mut()
+            .expect("new arena should have a checkout");
+
+        let (result, _) = drive(checkout, &arena.read_tool, "x = ' ' * (1 << 60)").await;
+        let Err(DriverError::Runtime(error)) = result else {
+            panic!("expected a runtime worker allocator failure");
+        };
+
+        assert_eq!(error.exc_type(), monty_types::ExcType::MemoryError);
+        assert_eq!(
+            error.message(),
+            Some("the worker exceeded its memory limit and was terminated")
+        );
+        assert!(error.traceback().is_empty());
+        assert!(is_unsafe_memory_error(&error, None));
+    }
+
+    #[tokio::test]
+    async fn fatal_allocator_failure_recovers_the_trusted_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_limits(&workspace, Duration::from_secs(1), None).await;
+        set_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        let previous_pid = arena_worker_pid(&arena);
+
+        let error = execute_without_cancellation(&mut arena, "value = 99\nx = ' ' * (1 << 60)")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ArenaError::Infrastructure { .. }));
+        assert!(error.to_string().contains("MemoryError"));
+        assert_trusted_value(&mut arena).await;
+        #[cfg(unix)]
+        assert_ne!(arena_worker_pid(&arena), previous_pid);
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_preserves_original_error_and_a_missing_checkout_self_recovers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        let valid_checkpoint = arena.checkpoint();
+        arena.checkpoint.state = vec![0];
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = arena
+            .execute("value = 99", &cancellation)
+            .await
+            .unwrap_err();
+
+        let ArenaError::RecoveryFailed { original, recovery } = error else {
+            panic!("expected recovery failure, got {error:?}");
+        };
+        assert!(matches!(*original, ArenaError::Cancelled));
+        assert!(matches!(*recovery, ArenaError::Infrastructure { .. }));
+        assert!(arena.checkout.is_none());
+
+        arena.checkpoint = valid_checkpoint;
+        assert_trusted_value(&mut arena).await;
     }
 
     #[tokio::test]
@@ -1291,36 +1822,54 @@ mod tests {
         let mut arena = arena(&workspace).await;
         let initial = arena.checkpoint();
 
-        arena.execute("value = 1").await.unwrap();
+        execute_without_cancellation(&mut arena, "value = 1")
+            .await
+            .unwrap();
         let successful_mutation = arena.checkpoint();
-        arena.execute("value = 99").await.unwrap();
+        execute_without_cancellation(&mut arena, "value = 99")
+            .await
+            .unwrap();
         arena.restore(initial).await.unwrap();
         assert!(
-            python_error(&arena.execute("value").await.unwrap())
-                .text
-                .contains("NameError")
+            python_error(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("NameError")
         );
 
         arena.restore(successful_mutation).await.unwrap();
         assert_eq!(
-            complete(&arena.execute("value").await.unwrap())
-                .unwrap()
-                .head,
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
             "1"
         );
 
-        let error = arena
-            .execute("value = 2\nraise ValueError('expected')")
-            .await
-            .unwrap();
+        let error =
+            execute_without_cancellation(&mut arena, "value = 2\nraise ValueError('expected')")
+                .await
+                .unwrap();
         assert!(python_error(&error).text.contains("ValueError"));
         let python_error_mutation = arena.checkpoint();
-        arena.execute("value = 99").await.unwrap();
+        execute_without_cancellation(&mut arena, "value = 99")
+            .await
+            .unwrap();
         arena.restore(python_error_mutation).await.unwrap();
         assert_eq!(
-            complete(&arena.execute("value").await.unwrap())
-                .unwrap()
-                .head,
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
             "2"
         );
     }
@@ -1336,9 +1885,13 @@ mod tests {
 
         assert!(matches!(error, ArenaError::IncompatibleCheckpoint { .. }));
         assert_eq!(
-            complete(&arena.execute("1 + 1").await.unwrap())
-                .unwrap()
-                .head,
+            complete(
+                &execute_without_cancellation(&mut arena, "1 + 1")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
             "2"
         );
     }
