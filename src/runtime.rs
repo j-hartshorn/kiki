@@ -3,6 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress};
 use crate::arena::{Execution, ReadOutcome};
+use crate::model::Model;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RunId(pub(crate) u64);
@@ -80,32 +81,32 @@ pub(crate) enum RuntimeEvent {
     },
 }
 
-pub(crate) struct RuntimeController {
-    agent: Option<Agent>,
+pub(crate) struct RuntimeController<M: Model> {
+    agent: Option<Agent<M>>,
     records: Vec<StoredRecord>,
     next_run_id: u64,
     next_model_step_id: u64,
-    active: Option<ActiveRun>,
+    active: Option<ActiveRun<M>>,
 }
 
-struct ActiveRun {
+struct ActiveRun<M: Model> {
     run_id: RunId,
     cancellation: CancellationToken,
-    worker: mpsc::UnboundedReceiver<WorkerMessage>,
+    worker: mpsc::UnboundedReceiver<WorkerMessage<M>>,
     current_step_id: Option<ModelStepId>,
 }
 
 #[allow(clippy::large_enum_variant)]
-enum WorkerMessage {
+enum WorkerMessage<M: Model> {
     Progress(AgentProgress),
     Finished {
-        agent: Agent,
+        agent: Agent<M>,
         result: Result<String, AgentError>,
     },
 }
 
-impl RuntimeController {
-    pub(crate) fn new(agent: Agent) -> Self {
+impl<M: Model> RuntimeController<M> {
+    pub(crate) fn new(agent: Agent<M>) -> Self {
         Self {
             agent: Some(agent),
             records: Vec::new(),
@@ -233,7 +234,7 @@ impl RuntimeController {
 
     fn handle_worker_message(
         &mut self,
-        message: WorkerMessage,
+        message: WorkerMessage<M>,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         match message {
@@ -405,7 +406,7 @@ mod tests {
     };
     use crate::agent::Agent;
     use crate::arena::{Arena, Execution, ExecutionOutcome, ReadOutcome};
-    use crate::model::{ModelAction, ScriptedModel};
+    use crate::model::{ScriptedAction as ModelAction, ScriptedModel};
     use crate::tools::ReadTool;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -419,7 +420,7 @@ mod tests {
     async fn controller(
         workspace: &tempfile::TempDir,
         actions: Vec<ModelAction>,
-    ) -> RuntimeController {
+    ) -> RuntimeController<ScriptedModel> {
         let arena = Arena::new(
             worker_path(),
             ReadTool::new(workspace.path())
@@ -431,7 +432,7 @@ mod tests {
         RuntimeController::new(Agent::new(arena, ScriptedModel::new(actions)))
     }
 
-    async fn default_controller(workspace: &tempfile::TempDir) -> RuntimeController {
+    async fn default_controller(workspace: &tempfile::TempDir) -> RuntimeController<ScriptedModel> {
         let arena = Arena::new(
             worker_path(),
             ReadTool::new(workspace.path())
@@ -444,7 +445,7 @@ mod tests {
     }
 
     fn start_controller(
-        controller: RuntimeController,
+        controller: RuntimeController<ScriptedModel>,
     ) -> (
         mpsc::Sender<RuntimeCommand>,
         mpsc::UnboundedReceiver<RuntimeEvent>,

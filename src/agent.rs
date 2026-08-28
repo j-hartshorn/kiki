@@ -6,7 +6,8 @@ use crate::arena::{
     ReadOutcome,
 };
 use crate::model::{
-    ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
+    CodeResult, Model, ModelAction, ModelError, ModelHistory, ModelHistoryError, ModelProgress,
+    ModelStep, READ_CAPABILITY_DESCRIPTION,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -34,23 +35,23 @@ pub enum AgentError {
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
+    ModelHistory(#[from] ModelHistoryError),
+    #[error(transparent)]
     Arena(#[from] ArenaError),
 }
 
-pub struct Agent {
+pub struct Agent<M: Model> {
     arena: Arena,
-    model: ScriptedModel,
-    model_context: Vec<ModelContextEntry>,
+    model: M,
+    model_context: ModelHistory,
 }
 
-impl Agent {
-    pub fn new(arena: Arena, model: ScriptedModel) -> Self {
+impl<M: Model> Agent<M> {
+    pub fn new(arena: Arena, model: M) -> Self {
         Self {
             arena,
             model,
-            model_context: vec![ModelContextEntry::ReadCapability {
-                description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-            }],
+            model_context: ModelHistory::new(READ_CAPABILITY_DESCRIPTION),
         }
     }
 
@@ -68,23 +69,36 @@ impl Agent {
         &mut self,
         request: impl Into<String>,
         cancellation: &CancellationToken,
-        progress: &mut impl FnMut(AgentProgress),
+        progress: &mut (impl FnMut(AgentProgress) + Send),
     ) -> Result<String, AgentError> {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.model.reset();
-        self.model_context.push(ModelContextEntry::UserRequest {
-            text: request.into(),
-        });
+        self.model_context.append_user_request(request);
 
         loop {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
             progress(AgentProgress::ModelStepStarted);
-            match self.model.next_action(&self.model_context)? {
-                ModelAction::Code { source } => {
+            let mut model_progress = |model_progress: ModelProgress| match model_progress {};
+            let model_step = match self
+                .model
+                .step(&self.model_context, cancellation, &mut model_progress)
+                .await
+            {
+                Err(ModelError::Cancelled) => return Err(AgentError::Cancelled),
+                result => result?,
+            };
+            if cancellation.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            let ModelStep { action, replay } = model_step;
+            match action {
+                ModelAction::Code { source, call_id } => {
+                    if self.model_context.contains_call_id(&call_id) {
+                        return Err(ModelHistoryError::DuplicateCallId(call_id).into());
+                    }
                     progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
@@ -105,15 +119,17 @@ impl Agent {
                         Err(error) => return Err(AgentError::Arena(error)),
                     };
                     let feedback = execution_feedback(&execution);
-                    self.model_context.push(ModelContextEntry::Execution {
-                        source: source.clone(),
-                        feedback,
-                    });
+                    self.model_context.append_completed_code(
+                        source.clone(),
+                        call_id,
+                        replay,
+                        CodeResult::Execution { feedback },
+                    )?;
                     progress(AgentProgress::ExecutionCompleted { source, execution });
                 }
                 ModelAction::Message { text } => {
                     self.model_context
-                        .push(ModelContextEntry::FinalMessage { text: text.clone() });
+                        .append_final_message(text.clone(), replay);
                     return Ok(text);
                 }
             }
@@ -216,14 +232,18 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use tempfile::TempDir;
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
     use super::{Agent, AgentError, AgentProgress};
     use crate::arena::{Arena, Execution, ExecutionOutcome, Observation, PythonError};
     use crate::model::{
-        ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
+        CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelHistory, ModelProgress, ModelStep, ProviderReplay,
+        READ_CAPABILITY_DESCRIPTION, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::tools::ReadTool;
 
@@ -233,7 +253,11 @@ mod tests {
             .expect("MONTY_BIN must point to the monty-runtime 0.0.21 worker")
     }
 
-    async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent {
+    async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent<ScriptedModel> {
+        agent_with_model(workspace, ScriptedModel::new(actions)).await
+    }
+
+    async fn agent_with_model<M: Model>(workspace: &TempDir, model: M) -> Agent<M> {
         let arena = Arena::new(
             worker_path(),
             ReadTool::new(workspace.path())
@@ -242,11 +266,11 @@ mod tests {
         )
         .await
         .expect("create arena");
-        Agent::new(arena, ScriptedModel::new(actions))
+        Agent::new(arena, model)
     }
 
     async fn run_capturing_progress(
-        agent: &mut Agent,
+        agent: &mut Agent<ScriptedModel>,
         request: &str,
         cancellation: &CancellationToken,
     ) -> Result<(String, Vec<AgentProgress>), AgentError> {
@@ -322,31 +346,125 @@ mod tests {
         let message = agent.run("inspect", &cancellation).await.unwrap();
 
         assert_eq!(message, "done");
+        assert_eq!(agent.model.contexts().len(), 2);
         assert_eq!(
-            agent.model.contexts(),
+            agent.model.contexts()[0],
             [
-                vec![
-                    ModelContextEntry::ReadCapability {
-                        description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                    },
-                    ModelContextEntry::UserRequest {
-                        text: "inspect".to_owned(),
-                    },
-                ],
-                vec![
-                    ModelContextEntry::ReadCapability {
-                        description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                    },
-                    ModelContextEntry::UserRequest {
-                        text: "inspect".to_owned(),
-                    },
-                    ModelContextEntry::Execution {
-                        source: "print('hello')".to_owned(),
-                        feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
-                    },
-                ],
+                ModelContextEntry::ReadCapability {
+                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
+                },
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned(),
+                },
             ]
         );
+        let completed = agent.model.contexts()[1]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("second model step should receive completed code");
+        assert_eq!(completed.source(), "print('hello')");
+        assert_eq!(completed.call_id().as_str(), "scripted-1-1");
+        assert_eq!(completed.replay().provider(), "scripted");
+        assert_eq!(completed.replay().items().len(), 1);
+        assert_eq!(
+            completed.result(),
+            &CodeResult::Execution {
+                feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_awaits_an_asynchronously_delayed_complete_model_action() {
+        let workspace = tempfile::tempdir().unwrap();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "delayed_action = 1".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ])
+        .with_delay(Duration::from_millis(50));
+        let mut agent = agent_with_model(&workspace, model).await;
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(agent.run("inspect", &cancellation));
+
+        assert!(timeout(Duration::from_millis(5), &mut run).await.is_err());
+        assert_eq!(run.await.unwrap(), "done");
+        assert!(matches!(
+            agent.model_context.entries(),
+            [
+                ModelContextEntry::ReadCapability { .. },
+                ModelContextEntry::UserRequest { .. },
+                ModelContextEntry::CompletedCode(_),
+                ModelContextEntry::FinalMessage { .. },
+            ]
+        ));
+    }
+
+    struct BoundaryCancellationModel {
+        action: CompletedModelAction,
+    }
+
+    impl Model for BoundaryCancellationModel {
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
+            async move {
+                cancellation.cancel();
+                Ok(ModelStep {
+                    action: self.action.clone(),
+                    replay: ProviderReplay::new("boundary", Vec::new()),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_actions_returned_after_model_boundary_cancellation() {
+        for action in [
+            CompletedModelAction::Code {
+                source: "boundary_action_ran = True".to_owned(),
+                call_id: ModelCallId::new("boundary-code"),
+            },
+            CompletedModelAction::Message {
+                text: "must not be admitted".to_owned(),
+            },
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent =
+                agent_with_model(&workspace, BoundaryCancellationModel { action }).await;
+            let cancellation = CancellationToken::new();
+            let mut progress = Vec::new();
+
+            let error = {
+                let mut capture = |event| progress.push(event);
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap_err()
+            };
+
+            assert!(matches!(error, AgentError::Cancelled));
+            assert!(!progress.iter().any(|event| matches!(
+                event,
+                AgentProgress::ExecutionStarted | AgentProgress::ExecutionCompleted { .. }
+            )));
+            assert!(!agent.model_context.entries().iter().any(|entry| matches!(
+                entry,
+                ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
+            )));
+            let probe = agent
+                .arena
+                .execute("boundary_action_ran", &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(matches!(probe.outcome, ExecutionOutcome::PythonError(_)));
+        }
     }
 
     #[tokio::test]
@@ -404,8 +522,8 @@ mod tests {
         assert_eq!(agent.model.contexts().len(), 1);
         assert_eq!(agent.model.position(), 0);
         assert_eq!(
-            agent.model_context,
-            vec![
+            agent.model_context.entries(),
+            [
                 ModelContextEntry::ReadCapability {
                     description: READ_CAPABILITY_DESCRIPTION.to_owned(),
                 },
@@ -446,6 +564,13 @@ mod tests {
 
         assert!(matches!(error, AgentError::Cancelled));
         assert_eq!(agent.model.contexts().len(), 1);
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::CompletedCode(_)))
+        );
         let recovered = agent
             .arena
             .execute("1 + 1", &CancellationToken::new())
@@ -485,12 +610,11 @@ mod tests {
             ExecutionOutcome::PythonError(_)
         ));
         assert_eq!(result_head(executions[1].1), "2");
-        let ModelContextEntry::Execution { feedback, .. } = agent.model.contexts()[1]
+        let completed = agent.model.contexts()[1]
             .last()
-            .expect("following action should receive the Python error")
-        else {
-            panic!("expected completed execution context");
-        };
+            .and_then(ModelContextEntry::completed_code)
+            .expect("following action should receive the Python error");
+        let CodeResult::Execution { feedback } = completed.result();
         assert!(feedback.contains("<kiki_error omitted_bytes=\"0\">"));
         assert!(feedback.contains("ValueError"));
     }
@@ -656,7 +780,10 @@ mod tests {
         assert!(second_request_context.iter().any(|entry| {
             matches!(
                 entry,
-                ModelContextEntry::FinalMessage { text } if text == "I inspected Cargo.toml."
+                ModelContextEntry::FinalMessage { text, replay }
+                    if text == "I inspected Cargo.toml."
+                        && replay.provider() == "scripted"
+                        && replay.items().len() == 1
             )
         }));
         assert_eq!(
@@ -665,12 +792,12 @@ mod tests {
                 text: "second".to_owned(),
             })
         );
-        let ModelContextEntry::Execution { feedback, .. } = agent.model.contexts()[5]
+        let completed = agent.model.contexts()[5]
             .last()
-            .expect("second final message should receive execution feedback")
-        else {
-            panic!("expected completed execution context");
-        };
+            .and_then(ModelContextEntry::completed_code)
+            .expect("second final message should receive execution feedback");
+        assert_eq!(completed.call_id().as_str(), "scripted-2-2");
+        let CodeResult::Execution { feedback } = completed.result();
         assert!(feedback.contains("<kiki_result truncated=\"false\" total_lines=\"1\" total_bytes=\"1\">\n<kiki_output_head lines=\"1\" bytes=\"1\" ends_mid_line=\"false\">\n2</kiki_output_head>\n</kiki_result>"));
     }
 
