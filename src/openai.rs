@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use async_openai::Client;
 use async_openai::config::{OPENAI_API_BASE, OpenAIConfig};
@@ -13,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
-    ModelHistory, ModelStep, ModelUsage, OpaqueReplayItem, ProviderReplay,
+    ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem, ProviderReplay,
 };
 
 const OPENAI_PROVIDER: &str = "openai";
@@ -145,11 +146,13 @@ impl OpenAiModel {
         &self,
         history: &ModelHistory,
         cancellation: &CancellationToken,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
     ) -> Result<ModelStep, ModelError> {
         if cancellation.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
         let request = self.request(history)?;
+        progress(ModelProgress::AttemptStarted { attempt: 1 });
         let responses = self.client.responses();
         let open_stream = responses.create_stream_byot::<_, WireEvent>(request);
         let mut stream: WireStream = tokio::select! {
@@ -157,136 +160,202 @@ impl OpenAiModel {
             stream = open_stream => stream.map_err(provider_error)?,
         };
         let mut content = ApplicationContentGuard::default();
+        let mut presentation = PresentationBatcher::default();
+        let mut python_decoders = HashMap::<(usize, String), PythonPreviewDecoder>::new();
 
         loop {
             let event = tokio::select! {
-                _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                _ = cancellation.cancelled() => {
+                    presentation.flush_all(progress);
+                    return Err(ModelError::Cancelled);
+                }
                 event = stream.next() => event,
             };
             let Some(event) = event else {
+                presentation.flush_all(progress);
                 return Err(ModelError::InvalidResponse(
                     "stream ended without a terminal response",
                 ));
             };
-            let event = event.map_err(provider_error)?;
-
-            match event {
-                WireEvent::Completed { response, .. } => {
-                    return self.completed_step(history, response, &mut content);
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    presentation.flush_all(progress);
+                    return Err(provider_error(error));
                 }
-                WireEvent::Failed { response, .. } => {
-                    return Err(ModelError::Provider(response_failure(
-                        "response failed",
-                        &response,
-                    )));
-                }
-                WireEvent::Incomplete { response, .. } => {
-                    return Err(ModelError::Provider(response_failure(
-                        "response incomplete",
-                        &response,
-                    )));
-                }
-                WireEvent::Error { code, message, .. } => {
-                    let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
-                    return Err(ModelError::Provider(format!(
-                        "stream error{code}: {message}"
-                    )));
-                }
-                WireEvent::OutputTextDelta {
-                    output_index,
-                    content_index,
-                    delta,
-                    ..
-                } => content.append(
-                    ContentField::AssistantText(output_index, content_index),
-                    delta.len(),
-                )?,
-                WireEvent::OutputTextDone {
-                    output_index,
-                    content_index,
-                    text,
-                    ..
-                } => content.observe(
-                    ContentField::AssistantText(output_index, content_index),
-                    text.len(),
-                )?,
-                WireEvent::ReasoningSummaryDelta {
-                    output_index,
-                    summary_index,
-                    delta,
-                    ..
-                } => content.append(
-                    ContentField::ReasoningSummary(output_index, summary_index),
-                    delta.len(),
-                )?,
-                WireEvent::ReasoningSummaryDone {
-                    output_index,
-                    summary_index,
-                    text,
-                    ..
-                } => content.observe(
-                    ContentField::ReasoningSummary(output_index, summary_index),
-                    text.len(),
-                )?,
-                WireEvent::FunctionArgumentsDelta {
-                    output_index,
-                    delta,
-                    ..
-                } => content.append(ContentField::FunctionArguments(output_index), delta.len())?,
-                WireEvent::FunctionArgumentsDone {
-                    output_index,
-                    arguments,
-                    ..
-                } => content.observe(
-                    ContentField::FunctionArguments(output_index),
-                    arguments.len(),
-                )?,
-                WireEvent::OutputItemAdded {
-                    output_index, item, ..
-                } => {
-                    content.account_output_item(output_index, &item)?;
-                }
-                WireEvent::OutputItemDone {
-                    output_index, item, ..
-                } => {
-                    content.account_output_item(output_index, &item)?;
-                    validate_done_output_item(&item)?;
-                }
-                WireEvent::ContentPartAdded {
-                    output_index,
-                    content_index,
-                    part,
-                    ..
-                }
-                | WireEvent::ContentPartDone {
-                    output_index,
-                    content_index,
-                    part,
-                    ..
-                } => content.account_content_part(output_index, content_index, &part)?,
-                WireEvent::ReasoningSummaryPartAdded {
-                    output_index,
-                    summary_index,
-                    part,
-                    ..
-                }
-                | WireEvent::ReasoningSummaryPartDone {
-                    output_index,
-                    summary_index,
-                    part,
-                    ..
-                } => content.account_reasoning_part(output_index, summary_index, &part)?,
-                WireEvent::RefusalDelta | WireEvent::RefusalDone => {
-                    return Err(ModelError::InvalidResponse("model refused the request"));
-                }
-                WireEvent::Created
-                | WireEvent::Queued
-                | WireEvent::InProgress
-                | WireEvent::OutputTextAnnotationAdded => {}
-                WireEvent::Unexpected => {
-                    return Err(ModelError::InvalidResponse(
+            };
+            let now = Instant::now();
+            let event_result = (|| -> Result<Option<WireResponse>, ModelError> {
+                match event {
+                    WireEvent::Completed { response, .. } => Ok(Some(response)),
+                    WireEvent::Failed { response, .. } => Err(ModelError::Provider(
+                        response_failure("response failed", &response),
+                    )),
+                    WireEvent::Incomplete { response, .. } => Err(ModelError::Provider(
+                        response_failure("response incomplete", &response),
+                    )),
+                    WireEvent::Error { code, message, .. } => {
+                        let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
+                        Err(ModelError::Provider(format!(
+                            "stream error{code}: {message}"
+                        )))
+                    }
+                    WireEvent::OutputTextDelta {
+                        output_index,
+                        content_index,
+                        delta,
+                        ..
+                    } => {
+                        content.append(
+                            ContentField::AssistantText(output_index, content_index),
+                            delta.len(),
+                        )?;
+                        presentation.push(PresentationKind::AssistantText, delta, now, progress);
+                        Ok(None)
+                    }
+                    WireEvent::OutputTextDone {
+                        output_index,
+                        content_index,
+                        text,
+                        ..
+                    } => {
+                        content.observe(
+                            ContentField::AssistantText(output_index, content_index),
+                            text.len(),
+                        )?;
+                        Ok(None)
+                    }
+                    WireEvent::ReasoningSummaryDelta {
+                        output_index,
+                        summary_index,
+                        delta,
+                        ..
+                    } => {
+                        content.append(
+                            ContentField::ReasoningSummary(output_index, summary_index),
+                            delta.len(),
+                        )?;
+                        presentation.push(PresentationKind::ReasoningSummary, delta, now, progress);
+                        Ok(None)
+                    }
+                    WireEvent::ReasoningSummaryDone {
+                        output_index,
+                        summary_index,
+                        text,
+                        ..
+                    } => {
+                        content.observe(
+                            ContentField::ReasoningSummary(output_index, summary_index),
+                            text.len(),
+                        )?;
+                        Ok(None)
+                    }
+                    WireEvent::FunctionArgumentsDelta {
+                        output_index,
+                        item_id,
+                        delta,
+                        ..
+                    } => {
+                        content
+                            .append(ContentField::FunctionArguments(output_index), delta.len())?;
+                        if let Some(decoder) = python_decoders.get_mut(&(output_index, item_id)) {
+                            let code = decoder.push(&delta);
+                            presentation.push(PresentationKind::DecodedPython, code, now, progress);
+                        }
+                        Ok(None)
+                    }
+                    WireEvent::FunctionArgumentsDone {
+                        output_index,
+                        item_id,
+                        arguments,
+                        ..
+                    } => {
+                        content.observe(
+                            ContentField::FunctionArguments(output_index),
+                            arguments.len(),
+                        )?;
+                        python_decoders.remove(&(output_index, item_id));
+                        Ok(None)
+                    }
+                    WireEvent::OutputItemAdded {
+                        output_index, item, ..
+                    } => {
+                        content.account_output_item(output_index, &item)?;
+                        if let Some(item_id) = execute_python_item_id(&item) {
+                            python_decoders
+                                .entry((output_index, item_id.to_owned()))
+                                .or_default();
+                        }
+                        Ok(None)
+                    }
+                    WireEvent::OutputItemDone {
+                        output_index, item, ..
+                    } => {
+                        let item_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                        content.account_output_item(output_index, &item)?;
+                        if let Some(item_id) = item_id {
+                            python_decoders.remove(&(output_index, item_id));
+                        }
+                        validate_done_output_item(&item)?;
+                        Ok(None)
+                    }
+                    WireEvent::ContentPartAdded {
+                        output_index,
+                        content_index,
+                        part,
+                        ..
+                    }
+                    | WireEvent::ContentPartDone {
+                        output_index,
+                        content_index,
+                        part,
+                        ..
+                    } => {
+                        content.account_content_part(output_index, content_index, &part)?;
+                        Ok(None)
+                    }
+                    WireEvent::ReasoningSummaryPartAdded {
+                        output_index,
+                        summary_index,
+                        part,
+                        ..
+                    }
+                    | WireEvent::ReasoningSummaryPartDone {
+                        output_index,
+                        summary_index,
+                        part,
+                        ..
+                    } => {
+                        content.account_reasoning_part(output_index, summary_index, &part)?;
+                        Ok(None)
+                    }
+                    WireEvent::RefusalDelta | WireEvent::RefusalDone => {
+                        Err(ModelError::InvalidResponse("model refused the request"))
+                    }
+                    WireEvent::Created
+                    | WireEvent::Queued
+                    | WireEvent::InProgress
+                    | WireEvent::OutputTextAnnotationAdded => Ok(None),
+                    WireEvent::Unexpected => Err(ModelError::InvalidResponse(
                         "stream contained an unexpected event",
-                    ));
+                    )),
+                }
+            })();
+
+            match event_result {
+                Ok(Some(response)) => {
+                    presentation.flush_all(progress);
+                    let step = self.completed_step(history, response, &mut content)?;
+                    progress(ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: step.attempts[0].clone(),
+                    });
+                    return Ok(step);
+                }
+                Ok(None) => presentation.flush_due(now, progress),
+                Err(error) => {
+                    presentation.flush_all(progress);
+                    return Err(error);
                 }
             }
         }
@@ -362,9 +431,9 @@ impl Model for OpenAiModel {
         &'a mut self,
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
-        _progress: &'a mut (dyn FnMut(crate::model::ModelProgress) + Send),
+        progress: &'a mut (dyn FnMut(ModelProgress) + Send),
     ) -> impl Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
-        self.one_attempt(history, cancellation)
+        self.one_attempt(history, cancellation, progress)
     }
 }
 
@@ -788,6 +857,327 @@ impl ApplicationContentGuard {
     }
 }
 
+const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
+const PROGRESS_RATE_LIMIT: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentationKind {
+    ReasoningSummary,
+    AssistantText,
+    DecodedPython,
+}
+
+impl PresentationKind {
+    fn progress(self, text: String) -> ModelProgress {
+        match self {
+            Self::ReasoningSummary => ModelProgress::ReasoningSummaryChunk { text },
+            Self::AssistantText => ModelProgress::AssistantTextChunk { text },
+            Self::DecodedPython => ModelProgress::DecodedPythonChunk { code: text },
+        }
+    }
+}
+
+struct PendingPresentation {
+    kind: PresentationKind,
+    text: String,
+}
+
+#[derive(Default)]
+struct PresentationBatcher {
+    pending: VecDeque<PendingPresentation>,
+    pending_bytes: usize,
+    last_emission: Option<Instant>,
+}
+
+impl PresentationBatcher {
+    fn push(
+        &mut self,
+        kind: PresentationKind,
+        text: String,
+        now: Instant,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.pending_bytes += text.len();
+        if let Some(pending) = self
+            .pending
+            .back_mut()
+            .filter(|pending| pending.kind == kind)
+        {
+            pending.text.push_str(&text);
+        } else {
+            self.pending.push_back(PendingPresentation { kind, text });
+        }
+
+        if self.rate_window_open(now) {
+            self.flush_all_at(now, progress);
+        } else {
+            self.flush_full_chunks(now, progress);
+        }
+    }
+
+    fn flush_due(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
+        if !self.pending.is_empty() && self.rate_window_open(now) {
+            self.flush_all_at(now, progress);
+        }
+    }
+
+    fn flush_all(&mut self, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
+        self.flush_all_at(Instant::now(), progress);
+    }
+
+    fn flush_all_at(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
+        while !self.pending.is_empty() {
+            self.emit_front(now, progress);
+        }
+    }
+
+    fn flush_full_chunks(
+        &mut self,
+        now: Instant,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
+    ) {
+        while self.pending_bytes >= PROGRESS_PAYLOAD_LIMIT {
+            self.emit_front(now, progress);
+        }
+    }
+
+    fn emit_front(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
+        let mut pending = self.pending.pop_front().expect("pending presentation");
+        let split = utf8_prefix_end(&pending.text, PROGRESS_PAYLOAD_LIMIT);
+        let remainder = pending.text.split_off(split);
+        self.pending_bytes -= pending.text.len();
+        if !remainder.is_empty() {
+            self.pending.push_front(PendingPresentation {
+                kind: pending.kind,
+                text: remainder,
+            });
+        }
+        self.last_emission = Some(now);
+        progress(pending.kind.progress(pending.text));
+    }
+
+    fn rate_window_open(&self, now: Instant) -> bool {
+        self.last_emission
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_RATE_LIMIT)
+    }
+}
+
+fn utf8_prefix_end(text: &str, limit: usize) -> usize {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn execute_python_item_id(item: &Value) -> Option<&str> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call")
+        || item.get("name").and_then(Value::as_str) != Some("execute_python")
+    {
+        return None;
+    }
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|item_id| !item_id.is_empty())
+}
+
+#[derive(Default)]
+struct PythonPreviewDecoder {
+    state: PythonJsonState,
+}
+
+#[derive(Default)]
+enum PythonJsonState {
+    #[default]
+    LeadingWhitespace,
+    BeforeKey,
+    Key(usize),
+    AfterKey,
+    BeforeCode,
+    Code,
+    Escape,
+    Unicode {
+        value: u16,
+        digits: u8,
+    },
+    HighSurrogateBackslash {
+        high: u16,
+    },
+    HighSurrogateU {
+        high: u16,
+    },
+    LowSurrogate {
+        high: u16,
+        value: u16,
+        digits: u8,
+    },
+    AfterCode,
+    TrailingWhitespace,
+    Invalid,
+}
+
+impl PythonPreviewDecoder {
+    fn push(&mut self, fragment: &str) -> String {
+        let mut decoded = String::new();
+        for character in fragment.chars() {
+            let state = std::mem::replace(&mut self.state, PythonJsonState::Invalid);
+            self.state = match state {
+                PythonJsonState::LeadingWhitespace if json_whitespace(character) => {
+                    PythonJsonState::LeadingWhitespace
+                }
+                PythonJsonState::LeadingWhitespace if character == '{' => {
+                    PythonJsonState::BeforeKey
+                }
+                PythonJsonState::BeforeKey if json_whitespace(character) => {
+                    PythonJsonState::BeforeKey
+                }
+                PythonJsonState::BeforeKey if character == '"' => PythonJsonState::Key(0),
+                PythonJsonState::Key(index) => {
+                    let expected = ['c', 'o', 'd', 'e', '"'];
+                    if expected.get(index) == Some(&character) {
+                        if index + 1 == expected.len() {
+                            PythonJsonState::AfterKey
+                        } else {
+                            PythonJsonState::Key(index + 1)
+                        }
+                    } else {
+                        PythonJsonState::Invalid
+                    }
+                }
+                PythonJsonState::AfterKey if json_whitespace(character) => {
+                    PythonJsonState::AfterKey
+                }
+                PythonJsonState::AfterKey if character == ':' => PythonJsonState::BeforeCode,
+                PythonJsonState::BeforeCode if json_whitespace(character) => {
+                    PythonJsonState::BeforeCode
+                }
+                PythonJsonState::BeforeCode if character == '"' => PythonJsonState::Code,
+                PythonJsonState::Code if character == '"' => PythonJsonState::AfterCode,
+                PythonJsonState::Code if character == '\\' => PythonJsonState::Escape,
+                PythonJsonState::Code if character <= '\u{1f}' => PythonJsonState::Invalid,
+                PythonJsonState::Code => {
+                    decoded.push(character);
+                    PythonJsonState::Code
+                }
+                PythonJsonState::Escape => match character {
+                    '"' | '\\' | '/' => {
+                        decoded.push(character);
+                        PythonJsonState::Code
+                    }
+                    'b' => {
+                        decoded.push('\u{0008}');
+                        PythonJsonState::Code
+                    }
+                    'f' => {
+                        decoded.push('\u{000c}');
+                        PythonJsonState::Code
+                    }
+                    'n' => {
+                        decoded.push('\n');
+                        PythonJsonState::Code
+                    }
+                    'r' => {
+                        decoded.push('\r');
+                        PythonJsonState::Code
+                    }
+                    't' => {
+                        decoded.push('\t');
+                        PythonJsonState::Code
+                    }
+                    'u' => PythonJsonState::Unicode {
+                        value: 0,
+                        digits: 0,
+                    },
+                    _ => PythonJsonState::Invalid,
+                },
+                PythonJsonState::Unicode { value, digits } => match hexadecimal(character) {
+                    Some(digit) if digits < 3 => PythonJsonState::Unicode {
+                        value: value * 16 + digit,
+                        digits: digits + 1,
+                    },
+                    Some(digit) => {
+                        let value = value * 16 + digit;
+                        if (0xd800..=0xdbff).contains(&value) {
+                            PythonJsonState::HighSurrogateBackslash { high: value }
+                        } else if (0xdc00..=0xdfff).contains(&value) {
+                            PythonJsonState::Invalid
+                        } else if let Some(character) = char::from_u32(u32::from(value)) {
+                            decoded.push(character);
+                            PythonJsonState::Code
+                        } else {
+                            PythonJsonState::Invalid
+                        }
+                    }
+                    None => PythonJsonState::Invalid,
+                },
+                PythonJsonState::HighSurrogateBackslash { high } if character == '\\' => {
+                    PythonJsonState::HighSurrogateU { high }
+                }
+                PythonJsonState::HighSurrogateU { high } if character == 'u' => {
+                    PythonJsonState::LowSurrogate {
+                        high,
+                        value: 0,
+                        digits: 0,
+                    }
+                }
+                PythonJsonState::LowSurrogate {
+                    high,
+                    value,
+                    digits,
+                } => match hexadecimal(character) {
+                    Some(digit) if digits < 3 => PythonJsonState::LowSurrogate {
+                        high,
+                        value: value * 16 + digit,
+                        digits: digits + 1,
+                    },
+                    Some(digit) => {
+                        let low = value * 16 + digit;
+                        if (0xdc00..=0xdfff).contains(&low) {
+                            let scalar = 0x10000
+                                + ((u32::from(high) - 0xd800) << 10)
+                                + (u32::from(low) - 0xdc00);
+                            if let Some(character) = char::from_u32(scalar) {
+                                decoded.push(character);
+                                PythonJsonState::Code
+                            } else {
+                                PythonJsonState::Invalid
+                            }
+                        } else {
+                            PythonJsonState::Invalid
+                        }
+                    }
+                    None => PythonJsonState::Invalid,
+                },
+                PythonJsonState::AfterCode if json_whitespace(character) => {
+                    PythonJsonState::AfterCode
+                }
+                PythonJsonState::AfterCode if character == '}' => {
+                    PythonJsonState::TrailingWhitespace
+                }
+                PythonJsonState::TrailingWhitespace if json_whitespace(character) => {
+                    PythonJsonState::TrailingWhitespace
+                }
+                PythonJsonState::Invalid => PythonJsonState::Invalid,
+                _ => PythonJsonState::Invalid,
+            };
+        }
+        decoded
+    }
+}
+
+fn json_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\n' | '\r' | '\t')
+}
+
+fn hexadecimal(character: char) -> Option<u16> {
+    character
+        .to_digit(16)
+        .and_then(|value| u16::try_from(value).ok())
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -876,11 +1266,13 @@ enum WireEvent {
     FunctionArgumentsDelta {
         sequence_number: u64,
         output_index: usize,
+        item_id: String,
         delta: String,
     },
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionArgumentsDone {
         output_index: usize,
+        item_id: String,
         arguments: String,
     },
     #[serde(rename = "error")]
@@ -1475,6 +1867,908 @@ mod tests {
 
         fixture.wait_for_disconnect().await;
         assert_eq!(fixture.request_count(), 1);
+    }
+
+    mod streaming {
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{
+            APPLICATION_CONTENT_LIMIT, OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT,
+            PresentationBatcher, PresentationKind,
+        };
+        use super::*;
+        use crate::model::{
+            AttemptAccounting, Model, ModelAction, ModelCallId, ModelError, ModelHistory,
+            ModelProgress, ModelUsage,
+        };
+
+        const STREAMED_PREFIX: &str = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"code\\\":\\\"print('preview')\"}\n\n",
+        );
+
+        fn usage() -> Value {
+            json!({
+                "input_tokens": 23,
+                "input_tokens_details": {
+                    "cached_tokens": 5,
+                    "cache_write_tokens": 7
+                },
+                "output_tokens": 11,
+                "output_tokens_details": {"reasoning_tokens": 3},
+                "total_tokens": 34
+            })
+        }
+
+        fn expected_accounting() -> AttemptAccounting {
+            AttemptAccounting::KnownUsage(ModelUsage {
+                model: "gpt-5.6-sol".to_owned(),
+                service_tier: Some("default".to_owned()),
+                input_tokens: Some(23),
+                cached_input_tokens: Some(5),
+                cache_write_input_tokens: Some(7),
+                output_tokens: Some(11),
+                reasoning_output_tokens: Some(3),
+                total_tokens: Some(34),
+            })
+        }
+
+        fn reasoning(id: &str, text: &str) -> Value {
+            json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": [{"type": "summary_text", "text": text}],
+                "encrypted_content": "encrypted",
+                "status": "completed"
+            })
+        }
+
+        fn function_call(arguments: &str) -> Value {
+            json!({
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "execute_python",
+                "arguments": arguments,
+                "status": "completed"
+            })
+        }
+
+        fn message(text: &str) -> Value {
+            json!({
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }],
+                "status": "completed"
+            })
+        }
+
+        fn function_added(sequence_number: u64, output_index: usize, item_id: &str) -> Value {
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": sequence_number,
+                "output_index": output_index,
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            })
+        }
+
+        fn completed_event(sequence_number: u64, output: Vec<Value>) -> Value {
+            json!({
+                "type": "response.completed",
+                "sequence_number": sequence_number,
+                "response": {
+                    "id": "resp_streaming",
+                    "status": "completed",
+                    "service_tier": "default",
+                    "output": output,
+                    "usage": usage()
+                }
+            })
+        }
+
+        fn sse_event(event: Value) -> String {
+            format!("data: {event}\n\n")
+        }
+
+        fn event_stream(events: impl IntoIterator<Item = Value>) -> String {
+            let mut stream = String::new();
+            for event in events {
+                stream.push_str(&sse_event(event));
+            }
+            stream.push_str("data: [DONE]\n\n");
+            stream
+        }
+
+        fn history() -> ModelHistory {
+            let mut history = ModelHistory::new("read files exactly");
+            history.append_user_request("inspect");
+            history
+        }
+
+        async fn step(
+            fixture: &Fixture,
+            history: &ModelHistory,
+        ) -> (
+            Result<crate::model::ModelStep, ModelError>,
+            Vec<ModelProgress>,
+        ) {
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut events = Vec::new();
+            let result = {
+                let mut progress = |event| events.push(event);
+                model.step(history, &cancellation, &mut progress).await
+            };
+            (result, events)
+        }
+
+        #[tokio::test]
+        async fn emits_ordered_typed_chunks_before_settled_usage_and_result() {
+            let arguments = r#"{"code":"print(1)"}"#;
+            let stream = event_stream([
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "first"
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_candidate",
+                    "output_index": 2,
+                    "content_index": 0,
+                    "delta": "assistant"
+                }),
+                function_added(3, 1, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 4,
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": r#"{"code":"pri"#
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 5,
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "second"
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 6,
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": r#"nt(1)"}"#
+                }),
+                completed_event(
+                    7,
+                    vec![reasoning("rs_1", "firstsecond"), function_call(arguments)],
+                ),
+            ]);
+            let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert_eq!(
+                result.unwrap().action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                }
+            );
+            assert_eq!(
+                progress,
+                vec![
+                    ModelProgress::AttemptStarted { attempt: 1 },
+                    ModelProgress::ReasoningSummaryChunk {
+                        text: "first".to_owned(),
+                    },
+                    ModelProgress::AssistantTextChunk {
+                        text: "assistant".to_owned(),
+                    },
+                    ModelProgress::DecodedPythonChunk {
+                        code: "pri".to_owned(),
+                    },
+                    ModelProgress::ReasoningSummaryChunk {
+                        text: "second".to_owned(),
+                    },
+                    ModelProgress::DecodedPythonChunk {
+                        code: "nt(1)".to_owned(),
+                    },
+                    ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: expected_accounting(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn presentation_batcher_emits_pending_content_at_the_next_due_producer_event() {
+            let start = Instant::now();
+            let mut batcher = PresentationBatcher::default();
+            let mut progress = Vec::new();
+            {
+                let mut sink = |event| progress.push(event);
+                batcher.push(
+                    PresentationKind::AssistantText,
+                    "first".to_owned(),
+                    start,
+                    &mut sink,
+                );
+                batcher.push(
+                    PresentationKind::AssistantText,
+                    "later".to_owned(),
+                    start + PROGRESS_RATE_LIMIT / 2,
+                    &mut sink,
+                );
+                batcher.flush_due(
+                    start + PROGRESS_RATE_LIMIT - Duration::from_nanos(1),
+                    &mut sink,
+                );
+            }
+            assert_eq!(
+                progress,
+                vec![ModelProgress::AssistantTextChunk {
+                    text: "first".to_owned(),
+                }]
+            );
+
+            {
+                let mut sink = |event| progress.push(event);
+                batcher.flush_due(start + PROGRESS_RATE_LIMIT, &mut sink);
+            }
+            assert_eq!(
+                progress,
+                vec![
+                    ModelProgress::AssistantTextChunk {
+                        text: "first".to_owned(),
+                    },
+                    ModelProgress::AssistantTextChunk {
+                        text: "later".to_owned(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn presentation_batcher_emits_four_kib_before_an_explicit_flush() {
+            let start = Instant::now();
+            let full_chunk = "x".repeat(PROGRESS_PAYLOAD_LIMIT);
+            let mut batcher = PresentationBatcher::default();
+            let mut progress = Vec::new();
+            let mut sink = |event| progress.push(event);
+
+            batcher.push(
+                PresentationKind::AssistantText,
+                "first".to_owned(),
+                start,
+                &mut sink,
+            );
+            batcher.push(
+                PresentationKind::AssistantText,
+                full_chunk.clone(),
+                start + PROGRESS_RATE_LIMIT / 2,
+                &mut sink,
+            );
+
+            assert_eq!(
+                progress,
+                vec![
+                    ModelProgress::AssistantTextChunk {
+                        text: "first".to_owned(),
+                    },
+                    ModelProgress::AssistantTextChunk { text: full_chunk },
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn ignores_python_argument_deltas_before_the_output_item_is_added() {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 1,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"before"}"#
+                }),
+                function_added(2, 0, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"after"}"#
+                }),
+                completed_event(4, vec![function_call(r#"{"code":"final"}"#)]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert_eq!(
+                result.unwrap().action,
+                ModelAction::Code {
+                    source: "final".to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                }
+            );
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter_map(|event| match event {
+                        ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "after"
+            );
+        }
+
+        #[tokio::test]
+        async fn ignores_python_argument_deltas_with_a_mismatched_item_id() {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                function_added(1, 0, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 2,
+                    "item_id": "fc_other",
+                    "output_index": 0,
+                    "delta": r#"{"code":"wrong"}"#
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"right"}"#
+                }),
+                completed_event(4, vec![function_call(r#"{"code":"final"}"#)]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter_map(|event| match event {
+                        ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "right"
+            );
+        }
+
+        #[tokio::test]
+        async fn unrelated_output_item_added_at_same_index_preserves_active_python_decoder() {
+            let unrelated_items = [
+                ("different Python call", function_added(3, 0, "fc_other")),
+                (
+                    "non-Python output item",
+                    json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": 3,
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_other",
+                            "role": "assistant",
+                            "content": [],
+                            "status": "in_progress"
+                        }
+                    }),
+                ),
+            ];
+
+            for (case, unrelated_item) in unrelated_items {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                    function_added(1, 0, "fc_1"),
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": 2,
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": r#"{"code":"before "#
+                    }),
+                    unrelated_item,
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": 4,
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": r#"after"}"#
+                    }),
+                    completed_event(5, vec![function_call(r#"{"code":"before after"}"#)]),
+                ])))
+                .await;
+
+                let (result, progress) = step(&fixture, &history()).await;
+
+                assert!(result.is_ok(), "{case}");
+                assert_eq!(
+                    progress
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    "before after",
+                    "{case}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn duplicate_output_item_added_preserves_accumulated_python_decoder() {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                function_added(1, 0, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 2,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"before "#
+                }),
+                function_added(3, 0, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 4,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"after"}"#
+                }),
+                completed_event(5, vec![function_call(r#"{"code":"before after"}"#)]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter_map(|event| match event {
+                        ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "before after"
+            );
+        }
+
+        #[tokio::test]
+        async fn mismatched_done_events_do_not_terminate_the_active_python_decoder() {
+            let mut mismatched_item = function_call(r#"{"code":"wrong"}"#);
+            mismatched_item["id"] = json!("fc_other");
+            let done_cases = [
+                (
+                    "function arguments done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "sequence_number": 2,
+                        "item_id": "fc_other",
+                        "output_index": 0,
+                        "arguments": r#"{"code":"wrong"}"#
+                    }),
+                ),
+                (
+                    "output item done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "sequence_number": 2,
+                        "output_index": 0,
+                        "item": mismatched_item
+                    }),
+                ),
+            ];
+
+            for (case, done) in done_cases {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                    function_added(1, 0, "fc_1"),
+                    done,
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": 3,
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": r#"{"code":"right"}"#
+                    }),
+                    completed_event(4, vec![function_call(r#"{"code":"final"}"#)]),
+                ])))
+                .await;
+
+                let (result, progress) = step(&fixture, &history()).await;
+
+                assert!(result.is_ok(), "{case}");
+                assert_eq!(
+                    progress
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    "right",
+                    "{case}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn ignores_python_argument_deltas_after_arguments_or_output_item_done() {
+            let done_cases = [
+                (
+                    "function arguments done",
+                    vec![
+                        function_added(1, 0, "fc_1"),
+                        json!({
+                            "type": "response.function_call_arguments.done",
+                            "sequence_number": 2,
+                            "item_id": "fc_1",
+                            "output_index": 0,
+                            "arguments": r#"{"code":"final"}"#
+                        }),
+                    ],
+                ),
+                (
+                    "output item done after added",
+                    vec![
+                        function_added(1, 0, "fc_1"),
+                        json!({
+                            "type": "response.output_item.done",
+                            "sequence_number": 2,
+                            "output_index": 0,
+                            "item": function_call(r#"{"code":"final"}"#)
+                        }),
+                    ],
+                ),
+                (
+                    "output item done without added",
+                    vec![json!({
+                        "type": "response.output_item.done",
+                        "sequence_number": 1,
+                        "output_index": 0,
+                        "item": function_call(r#"{"code":"final"}"#)
+                    })],
+                ),
+            ];
+
+            for (case, mut events) in done_cases {
+                events.push(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"after"}"#
+                }));
+                events.push(completed_event(
+                    4,
+                    vec![function_call(r#"{"code":"final"}"#)],
+                ));
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream(events))).await;
+
+                let (result, progress) = step(&fixture, &history()).await;
+
+                assert!(result.is_ok(), "{case}");
+                assert!(
+                    progress
+                        .iter()
+                        .all(|event| !matches!(event, ModelProgress::DecodedPythonChunk { .. })),
+                    "{case}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn splits_chunks_at_four_kib_on_utf8_boundaries() {
+            let assistant = "€".repeat(3_000);
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "open"
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_1",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": assistant
+                }),
+                completed_event(3, vec![message("done")]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+            assert!(result.is_ok());
+            let chunks: Vec<&str> = progress
+                .iter()
+                .filter_map(|event| match event {
+                    ModelProgress::AssistantTextChunk { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+
+            assert!(chunks.len() >= 3);
+            assert!(chunks.iter().all(|chunk| chunk.len() <= 4 * 1024));
+            assert_eq!(chunks.concat(), assistant);
+        }
+
+        #[tokio::test]
+        async fn flushes_a_short_pending_chunk_before_terminal_settlement() {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "first"
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_1",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "short"
+                }),
+                completed_event(3, vec![message("done")]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                &progress[progress.len() - 2..],
+                &[
+                    ModelProgress::AssistantTextChunk {
+                        text: "short".to_owned(),
+                    },
+                    ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: expected_accounting(),
+                    },
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn decodes_split_json_escapes_unicode_surrogates_and_utf8_for_preview() {
+            let fragments = [
+                " \n { \"co",
+                "de\" \t: \"quote: \\",
+                "\" slash: \\",
+                "/ backslash: \\",
+                "\\ newline:\\",
+                "n lambda:\\u",
+                "03",
+                "BB emoji:\\uD8",
+                "3D\\",
+                "uDE",
+                "00 utf8:é",
+                "\" } \t",
+            ];
+            let arguments = fragments.concat();
+            let mut events = vec![function_added(1, 0, "fc_1")];
+            events.extend(fragments.iter().enumerate().map(|(index, fragment)| {
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": index + 2,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": fragment
+                })
+            }));
+            events.push(completed_event(
+                fragments.len() as u64 + 2,
+                vec![function_call(&arguments)],
+            ));
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream(events))).await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+            let expected = "quote: \" slash: / backslash: \\ newline:\n lambda:λ emoji:😀 utf8:é";
+
+            assert_eq!(
+                result.unwrap().action,
+                ModelAction::Code {
+                    source: expected.to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                }
+            );
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter_map(|event| match event {
+                        ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                expected
+            );
+        }
+
+        #[tokio::test]
+        async fn malformed_or_incomplete_argument_prefixes_cannot_replace_the_final_action() {
+            for (prefix, expected_preview) in [
+                (r#"{"other":"ignored"}"#, ""),
+                (r#"{"code":"bad\u12X"#, "bad"),
+                (r#"{"code":"half\uD83D"#, "half"),
+            ] {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                    function_added(1, 0, "fc_1"),
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": 2,
+                        "item_id": "fc_1",
+                        "output_index": 0,
+                        "delta": prefix
+                    }),
+                    completed_event(3, vec![function_call(r#"{"code":"final"}"#)]),
+                ])))
+                .await;
+
+                let (result, progress) = step(&fixture, &history()).await;
+
+                assert_eq!(
+                    result.unwrap().action,
+                    ModelAction::Code {
+                        source: "final".to_owned(),
+                        call_id: ModelCallId::new("call_1"),
+                    }
+                );
+                assert_eq!(
+                    progress
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    expected_preview
+                );
+            }
+
+            let original_history = history();
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                function_added(1, 0, "fc_1"),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 2,
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": r#"{"code":"preview"}"#
+                }),
+                completed_event(3, vec![function_call(r#"{"code":"unterminated}"#)]),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &original_history).await;
+
+            assert!(matches!(result, Err(ModelError::InvalidResponse(_))));
+            assert!(progress.iter().any(|event| {
+                matches!(
+                    event,
+                    ModelProgress::DecodedPythonChunk { code } if code == "preview"
+                )
+            }));
+            assert_eq!(original_history, history());
+        }
+
+        #[tokio::test]
+        async fn flushes_pending_progress_when_the_content_guard_is_exhausted() {
+            let oversized = "x".repeat(APPLICATION_CONTENT_LIMIT);
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "first"
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_1",
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": "pending"
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "fc_1",
+                    "output_index": 2,
+                    "delta": oversized
+                }),
+            ])))
+            .await;
+
+            let (result, progress) = step(&fixture, &history()).await;
+
+            assert_eq!(result, Err(ModelError::ContentTooLarge));
+            assert_eq!(
+                progress.last(),
+                Some(&ModelProgress::AssistantTextChunk {
+                    text: "pending".to_owned(),
+                })
+            );
+            assert!(
+                !progress
+                    .iter()
+                    .any(|event| matches!(event, ModelProgress::AttemptSettled { .. }))
+            );
+        }
+
+        #[tokio::test]
+        async fn streamed_python_prefix_neither_returns_an_action_nor_enters_history() {
+            let fixture = Fixture::start(FixtureReply::IdleSse(STREAMED_PREFIX)).await;
+            let original_history = history();
+            let step_history = original_history.clone();
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let collected = progress.clone();
+            let endpoint = fixture.endpoint.clone();
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let task = tokio::spawn(async move {
+                let mut model =
+                    OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+                let mut sink = |event| collected.lock().unwrap().push(event);
+                model.step(&step_history, &cancellation, &mut sink).await
+            });
+
+            timeout(Duration::from_secs(1), async {
+                while !progress.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        ModelProgress::DecodedPythonChunk { code } if code == "print('preview')"
+                    )
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
+            assert_eq!(original_history, history());
+
+            cancel.cancel();
+            assert_eq!(task.await.unwrap(), Err(ModelError::Cancelled));
+            fixture.wait_for_disconnect().await;
+        }
     }
 
     mod action_protocol {

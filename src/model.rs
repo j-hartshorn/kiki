@@ -242,7 +242,24 @@ pub enum ModelError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelProgress {}
+pub enum ModelProgress {
+    AttemptStarted {
+        attempt: u32,
+    },
+    ReasoningSummaryChunk {
+        text: String,
+    },
+    AssistantTextChunk {
+        text: String,
+    },
+    DecodedPythonChunk {
+        code: String,
+    },
+    AttemptSettled {
+        attempt: u32,
+        accounting: AttemptAccounting,
+    },
+}
 
 pub trait Model: Send + 'static {
     fn step<'a>(
@@ -294,6 +311,7 @@ impl ScriptedModel {
 }
 
 impl Model for ScriptedModel {
+    #[allow(clippy::manual_async_fn)]
     fn step<'a>(
         &'a mut self,
         history: &'a ModelHistory,

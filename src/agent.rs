@@ -81,7 +81,7 @@ impl<M: Model> Agent<M> {
                 return Err(AgentError::Cancelled);
             }
             progress(AgentProgress::ModelStepStarted);
-            let mut model_progress = |model_progress: ModelProgress| match model_progress {};
+            let mut model_progress = |_model_progress: ModelProgress| {};
             let model_step = match self
                 .model
                 .step(&self.model_context, cancellation, &mut model_progress)
@@ -408,6 +408,7 @@ mod tests {
     }
 
     impl Model for BoundaryCancellationModel {
+        #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
             _history: &'a ModelHistory,
