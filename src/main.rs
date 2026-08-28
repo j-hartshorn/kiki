@@ -2,6 +2,7 @@ pub mod agent;
 pub mod arena;
 pub mod model;
 mod openai;
+pub mod prompt;
 pub mod runtime;
 pub mod tools;
 pub mod tui;
