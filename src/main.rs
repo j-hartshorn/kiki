@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod arena;
+pub mod config;
 pub mod model;
 mod openai;
 pub mod prompt;
