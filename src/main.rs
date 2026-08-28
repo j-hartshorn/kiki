@@ -3,6 +3,7 @@ pub mod arena;
 pub mod config;
 pub mod model;
 mod openai;
+pub mod pricing;
 pub mod prompt;
 pub mod runtime;
 pub mod tools;

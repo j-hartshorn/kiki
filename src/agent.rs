@@ -93,7 +93,7 @@ impl<M: Model> Agent<M> {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let ModelStep { action, replay } = model_step;
+            let ModelStep { action, replay, .. } = model_step;
             match action {
                 ModelAction::Code { source, call_id } => {
                     if self.model_context.contains_call_id(&call_id) {
@@ -419,6 +419,7 @@ mod tests {
                 Ok(ModelStep {
                     action: self.action.clone(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
+                    attempts: Vec::new(),
                 })
             }
         }

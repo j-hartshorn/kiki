@@ -24,6 +24,25 @@ pub enum ModelAction {
 pub struct ModelStep {
     pub action: ModelAction,
     pub replay: ProviderReplay,
+    pub attempts: Vec<AttemptAccounting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub model: String,
+    pub service_tier: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptAccounting {
+    KnownUsage(ModelUsage),
+    UsageUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -316,7 +335,11 @@ impl Model for ScriptedModel {
                 },
                 ScriptedAction::Message { text } => ModelAction::Message { text },
             };
-            Ok(ModelStep { action, replay })
+            Ok(ModelStep {
+                action,
+                replay,
+                attempts: Vec::new(),
+            })
         }
     }
 }
@@ -385,6 +408,7 @@ mod tests {
         );
         assert_eq!(step.replay.provider(), "scripted");
         assert_eq!(step.replay.items()[0].as_bytes(), b"scripted-1-1");
+        assert!(step.attempts.is_empty());
     }
 
     #[tokio::test]
