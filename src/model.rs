@@ -231,6 +231,14 @@ pub enum ModelError {
     Cancelled,
     #[error("scripted model exhausted before returning a final message")]
     Exhausted,
+    #[error("model provider failed: {0}")]
+    Provider(String),
+    #[error("model request history is invalid: {0}")]
+    InvalidHistory(&'static str),
+    #[error("model response violated the action protocol: {0}")]
+    InvalidResponse(&'static str),
+    #[error("model response application content exceeded 16 MiB")]
+    ContentTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

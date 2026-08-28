@@ -1,6 +1,955 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+
+use async_openai::Client;
+use async_openai::config::{OPENAI_API_BASE, OpenAIConfig};
+use async_openai::error::OpenAIError;
+use async_openai::middleware::ReqwestService;
+use futures::{Stream, StreamExt};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::model::{
+    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
+    ModelHistory, ModelStep, ModelUsage, OpaqueReplayItem, ProviderReplay,
+};
+
+const OPENAI_PROVIDER: &str = "openai";
+const FIXED_MODEL: &str = "gpt-5.6-sol";
+const APPLICATION_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+
+type WireStream = Pin<Box<dyn Stream<Item = Result<WireEvent, OpenAIError>> + Send>>;
+
+fn openai_config(api_key: impl Into<String>, api_base: impl Into<String>) -> OpenAIConfig {
+    OpenAIConfig::new()
+        .with_api_base(api_base)
+        .with_api_key(api_key)
+        .with_org_id("")
+        .with_project_id("")
+}
+
+pub(crate) struct OpenAiModel {
+    prompt: String,
+    client: Client<OpenAIConfig>,
+    model: &'static str,
+}
+
+impl OpenAiModel {
+    #[allow(dead_code)]
+    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            client: Client::with_config(openai_config(api_key, OPENAI_API_BASE))
+                .with_http_service(ReqwestService::default()),
+            model: FIXED_MODEL,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        endpoint: &str,
+    ) -> Self {
+        Self {
+            prompt: prompt.into(),
+            client: Client::with_config(openai_config(api_key, endpoint))
+                .with_http_service(ReqwestService::default()),
+            model: FIXED_MODEL,
+        }
+    }
+
+    fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
+        let mut instructions = self.prompt.clone();
+        let mut input = Vec::new();
+
+        for entry in history.entries() {
+            match entry {
+                ModelContextEntry::ReadCapability { description } => {
+                    instructions.push_str("\n\n");
+                    instructions.push_str(description);
+                }
+                ModelContextEntry::UserRequest { text } => {
+                    input.push(json!({"role": "user", "content": text}));
+                }
+                ModelContextEntry::CompletedCode(completed) => {
+                    let replay = replay_values(completed.replay())?;
+                    match validate_replay_output(&replay)? {
+                        ValidatedAction::Code { source, call_id }
+                            if source == completed.source() && call_id == *completed.call_id() => {}
+                        _ => {
+                            return Err(ModelError::InvalidHistory(
+                                "completed code does not match its OpenAI replay",
+                            ));
+                        }
+                    }
+                    input.extend(replay);
+                    let output = match completed.result() {
+                        CodeResult::Execution { feedback } => feedback,
+                    };
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": completed.call_id().as_str(),
+                        "output": output
+                    }));
+                }
+                ModelContextEntry::FinalMessage { text, replay } => {
+                    let replay = replay_values(replay)?;
+                    match validate_replay_output(&replay)? {
+                        ValidatedAction::Message { text: replay_text } if replay_text == *text => {}
+                        _ => {
+                            return Err(ModelError::InvalidHistory(
+                                "final message does not match its OpenAI replay",
+                            ));
+                        }
+                    }
+                    input.extend(replay);
+                }
+            }
+        }
+
+        Ok(json!({
+            "model": self.model,
+            "instructions": instructions,
+            "input": input,
+            "stream": true,
+            "store": false,
+            "service_tier": "default",
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {
+                "effort": "medium",
+                "summary": "auto",
+                "context": "all_turns"
+            },
+            "include": ["reasoning.encrypted_content"],
+            "tools": [{
+                "type": "function",
+                "name": "execute_python",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"}
+                    },
+                    "required": ["code"],
+                    "additionalProperties": false
+                }
+            }]
+        }))
+    }
+
+    async fn one_attempt(
+        &self,
+        history: &ModelHistory,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelStep, ModelError> {
+        if cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let request = self.request(history)?;
+        let responses = self.client.responses();
+        let open_stream = responses.create_stream_byot::<_, WireEvent>(request);
+        let mut stream: WireStream = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
+            stream = open_stream => stream.map_err(provider_error)?,
+        };
+        let mut content = ApplicationContentGuard::default();
+
+        loop {
+            let event = tokio::select! {
+                _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                event = stream.next() => event,
+            };
+            let Some(event) = event else {
+                return Err(ModelError::InvalidResponse(
+                    "stream ended without a terminal response",
+                ));
+            };
+            let event = event.map_err(provider_error)?;
+
+            match event {
+                WireEvent::Completed { response, .. } => {
+                    return self.completed_step(history, response, &mut content);
+                }
+                WireEvent::Failed { response, .. } => {
+                    return Err(ModelError::Provider(response_failure(
+                        "response failed",
+                        &response,
+                    )));
+                }
+                WireEvent::Incomplete { response, .. } => {
+                    return Err(ModelError::Provider(response_failure(
+                        "response incomplete",
+                        &response,
+                    )));
+                }
+                WireEvent::Error { code, message, .. } => {
+                    let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
+                    return Err(ModelError::Provider(format!(
+                        "stream error{code}: {message}"
+                    )));
+                }
+                WireEvent::OutputTextDelta {
+                    output_index,
+                    content_index,
+                    delta,
+                    ..
+                } => content.append(
+                    ContentField::AssistantText(output_index, content_index),
+                    delta.len(),
+                )?,
+                WireEvent::OutputTextDone {
+                    output_index,
+                    content_index,
+                    text,
+                    ..
+                } => content.observe(
+                    ContentField::AssistantText(output_index, content_index),
+                    text.len(),
+                )?,
+                WireEvent::ReasoningSummaryDelta {
+                    output_index,
+                    summary_index,
+                    delta,
+                    ..
+                } => content.append(
+                    ContentField::ReasoningSummary(output_index, summary_index),
+                    delta.len(),
+                )?,
+                WireEvent::ReasoningSummaryDone {
+                    output_index,
+                    summary_index,
+                    text,
+                    ..
+                } => content.observe(
+                    ContentField::ReasoningSummary(output_index, summary_index),
+                    text.len(),
+                )?,
+                WireEvent::FunctionArgumentsDelta {
+                    output_index,
+                    delta,
+                    ..
+                } => content.append(ContentField::FunctionArguments(output_index), delta.len())?,
+                WireEvent::FunctionArgumentsDone {
+                    output_index,
+                    arguments,
+                    ..
+                } => content.observe(
+                    ContentField::FunctionArguments(output_index),
+                    arguments.len(),
+                )?,
+                WireEvent::OutputItemAdded {
+                    output_index, item, ..
+                } => {
+                    content.account_output_item(output_index, &item)?;
+                }
+                WireEvent::OutputItemDone {
+                    output_index, item, ..
+                } => {
+                    content.account_output_item(output_index, &item)?;
+                    validate_done_output_item(&item)?;
+                }
+                WireEvent::ContentPartAdded {
+                    output_index,
+                    content_index,
+                    part,
+                    ..
+                }
+                | WireEvent::ContentPartDone {
+                    output_index,
+                    content_index,
+                    part,
+                    ..
+                } => content.account_content_part(output_index, content_index, &part)?,
+                WireEvent::ReasoningSummaryPartAdded {
+                    output_index,
+                    summary_index,
+                    part,
+                    ..
+                }
+                | WireEvent::ReasoningSummaryPartDone {
+                    output_index,
+                    summary_index,
+                    part,
+                    ..
+                } => content.account_reasoning_part(output_index, summary_index, &part)?,
+                WireEvent::RefusalDelta | WireEvent::RefusalDone => {
+                    return Err(ModelError::InvalidResponse("model refused the request"));
+                }
+                WireEvent::Created
+                | WireEvent::Queued
+                | WireEvent::InProgress
+                | WireEvent::OutputTextAnnotationAdded => {}
+                WireEvent::Unexpected => {
+                    return Err(ModelError::InvalidResponse(
+                        "stream contained an unexpected event",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn completed_step(
+        &self,
+        history: &ModelHistory,
+        response: WireResponse,
+        content: &mut ApplicationContentGuard,
+    ) -> Result<ModelStep, ModelError> {
+        if response.status != WireStatus::Completed {
+            return Err(ModelError::InvalidResponse(
+                "response.completed did not contain completed status",
+            ));
+        }
+        if response.error.is_some() || response.incomplete_details.is_some() {
+            return Err(ModelError::InvalidResponse(
+                "completed response contained terminal failure details",
+            ));
+        }
+        content.account_output(&response.output)?;
+        let action = match validate_output(&response.output)? {
+            ValidatedAction::Code { source, call_id } => {
+                if history.contains_call_id(&call_id) {
+                    return Err(ModelError::InvalidResponse(
+                        "function call identifier duplicates model history",
+                    ));
+                }
+                ModelAction::Code { source, call_id }
+            }
+            ValidatedAction::Message { text } => ModelAction::Message { text },
+        };
+        let replay = ProviderReplay::new(
+            OPENAI_PROVIDER,
+            response
+                .output
+                .iter()
+                .map(|item| OpaqueReplayItem::new(serde_json::to_vec(item).expect("JSON value")))
+                .collect(),
+        );
+        let attempts = vec![match response.usage {
+            Some(usage) => AttemptAccounting::KnownUsage(ModelUsage {
+                model: self.model.to_owned(),
+                service_tier: response.service_tier,
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage
+                    .input_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: usage
+                    .input_tokens_details
+                    .and_then(|details| details.cache_write_tokens),
+                output_tokens: usage.output_tokens,
+                reasoning_output_tokens: usage
+                    .output_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                total_tokens: usage.total_tokens,
+            }),
+            None => AttemptAccounting::UsageUnavailable,
+        }];
+
+        Ok(ModelStep {
+            action,
+            replay,
+            attempts,
+        })
+    }
+}
+
+impl Model for OpenAiModel {
+    fn step<'a>(
+        &'a mut self,
+        history: &'a ModelHistory,
+        cancellation: &'a CancellationToken,
+        _progress: &'a mut (dyn FnMut(crate::model::ModelProgress) + Send),
+    ) -> impl Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
+        self.one_attempt(history, cancellation)
+    }
+}
+
+fn provider_error(error: OpenAIError) -> ModelError {
+    ModelError::Provider(error.to_string())
+}
+
+fn response_failure(prefix: &str, response: &WireResponse) -> String {
+    if let Some(error) = &response.error {
+        format!("{prefix}: {}: {}", error.code, error.message)
+    } else if let Some(details) = &response.incomplete_details {
+        format!("{prefix}: {}", details.reason)
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
+    if replay.provider() != OPENAI_PROVIDER {
+        return Err(ModelError::InvalidHistory(
+            "opaque replay belongs to another provider",
+        ));
+    }
+    replay
+        .items()
+        .iter()
+        .map(|item| {
+            serde_json::from_slice(item.as_bytes())
+                .map_err(|_| ModelError::InvalidHistory("opaque OpenAI replay is malformed"))
+        })
+        .collect()
+}
+
+fn validate_replay_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
+    validate_output(output).map_err(|error| match error {
+        ModelError::InvalidResponse(message) => ModelError::InvalidHistory(message),
+        error => error,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutePythonArguments {
+    code: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ValidatedAction {
+    Code {
+        source: String,
+        call_id: ModelCallId,
+    },
+    Message {
+        text: String,
+    },
+}
+
+fn validate_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
+    let mut code = None;
+    let mut message = None;
+    let mut item_ids = HashSet::new();
+
+    for item in output {
+        let object = item
+            .as_object()
+            .ok_or(ModelError::InvalidResponse("output item was not an object"))?;
+        if !item_ids.insert(required_nonempty_string(object, "id")?) {
+            return Err(ModelError::InvalidResponse(
+                "response contained duplicate output item identifiers",
+            ));
+        }
+        match required_string(object, "type")? {
+            "reasoning" => validate_reasoning(object)?,
+            "function_call" => {
+                if code.is_some() {
+                    return Err(ModelError::InvalidResponse(
+                        "response contained multiple function calls",
+                    ));
+                }
+                code = Some(validate_function_call(object)?);
+            }
+            "message" => {
+                if message.is_some() {
+                    return Err(ModelError::InvalidResponse(
+                        "response contained multiple assistant messages",
+                    ));
+                }
+                message = Some(validate_message(object)?);
+            }
+            _ => {
+                return Err(ModelError::InvalidResponse(
+                    "response contained an unexpected output item",
+                ));
+            }
+        }
+    }
+
+    match (code, message) {
+        (Some(action), None) => Ok(action),
+        (None, Some(action)) => Ok(action),
+        (Some(_), Some(_)) => Err(ModelError::InvalidResponse(
+            "response mixed a function call with assistant text",
+        )),
+        (None, None) => Err(ModelError::InvalidResponse(
+            "response did not contain an action",
+        )),
+    }
+}
+
+fn validate_reasoning(object: &serde_json::Map<String, Value>) -> Result<(), ModelError> {
+    match object.get("status") {
+        None => {}
+        Some(Value::String(status)) if status == "completed" => {}
+        _ => {
+            return Err(ModelError::InvalidResponse(
+                "completed response contained incomplete reasoning",
+            ));
+        }
+    }
+    required_nonempty_string(object, "id")?;
+    match object.get("content") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(content)) if content.is_empty() => {}
+        _ => {
+            return Err(ModelError::InvalidResponse(
+                "reasoning contained unexpected content",
+            ));
+        }
+    }
+    let summary =
+        object
+            .get("summary")
+            .and_then(Value::as_array)
+            .ok_or(ModelError::InvalidResponse(
+                "reasoning summary was missing or malformed",
+            ))?;
+    for part in summary {
+        let part = part.as_object().ok_or(ModelError::InvalidResponse(
+            "reasoning summary part was malformed",
+        ))?;
+        if required_string(part, "type")? != "summary_text" {
+            return Err(ModelError::InvalidResponse(
+                "reasoning contained unexpected summary content",
+            ));
+        }
+        required_string(part, "text")?;
+    }
+    if !matches!(object.get("encrypted_content"), None | Some(Value::Null))
+        && object
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(ModelError::InvalidResponse(
+            "encrypted reasoning content was malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_done_output_item(item: &Value) -> Result<(), ModelError> {
+    let object = item.as_object().ok_or(ModelError::InvalidResponse(
+        "completed stream output item was not an object",
+    ))?;
+    match required_string(object, "type")? {
+        "reasoning" => validate_reasoning(object),
+        "function_call" => validate_function_call(object).map(|_| ()),
+        "message" => validate_message(object).map(|_| ()),
+        _ => Err(ModelError::InvalidResponse(
+            "stream contained an unexpected output item",
+        )),
+    }
+}
+
+fn validate_function_call(
+    object: &serde_json::Map<String, Value>,
+) -> Result<ValidatedAction, ModelError> {
+    require_completed(object)?;
+    required_nonempty_string(object, "id")?;
+    let call_id = required_nonempty_string(object, "call_id")?;
+    if required_string(object, "name")? != "execute_python" {
+        return Err(ModelError::InvalidResponse(
+            "response called an unknown function",
+        ));
+    }
+    let arguments = required_string(object, "arguments")?;
+    let arguments: ExecutePythonArguments = serde_json::from_str(arguments).map_err(|_| {
+        ModelError::InvalidResponse("execute_python arguments were not a closed code object")
+    })?;
+    Ok(ValidatedAction::Code {
+        source: arguments.code,
+        call_id: ModelCallId::new(call_id),
+    })
+}
+
+fn validate_message(
+    object: &serde_json::Map<String, Value>,
+) -> Result<ValidatedAction, ModelError> {
+    require_completed(object)?;
+    required_nonempty_string(object, "id")?;
+    if required_string(object, "role")? != "assistant" {
+        return Err(ModelError::InvalidResponse(
+            "response message did not have assistant role",
+        ));
+    }
+    let content =
+        object
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or(ModelError::InvalidResponse(
+                "assistant message content was missing or malformed",
+            ))?;
+    let mut text = String::new();
+    for part in content {
+        let part = part.as_object().ok_or(ModelError::InvalidResponse(
+            "assistant message content part was malformed",
+        ))?;
+        if required_string(part, "type")? != "output_text" {
+            return Err(ModelError::InvalidResponse(
+                "assistant message contained unexpected content",
+            ));
+        }
+        text.push_str(required_string(part, "text")?);
+    }
+    if text.is_empty() {
+        return Err(ModelError::InvalidResponse("assistant message was empty"));
+    }
+    Ok(ValidatedAction::Message { text })
+}
+
+fn require_completed(object: &serde_json::Map<String, Value>) -> Result<(), ModelError> {
+    if required_string(object, "status")? != "completed" {
+        return Err(ModelError::InvalidResponse(
+            "completed response contained an incomplete output item",
+        ));
+    }
+    Ok(())
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a str, ModelError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(ModelError::InvalidResponse(match field {
+            "type" => "output type was missing or malformed",
+            "status" => "output status was missing or malformed",
+            "id" => "output identifier was missing or malformed",
+            "call_id" => "function call identifier was missing or malformed",
+            "name" => "function name was missing or malformed",
+            "arguments" => "function arguments were missing or malformed",
+            "role" => "message role was missing or malformed",
+            "text" => "text content was missing or malformed",
+            _ => "required output field was missing or malformed",
+        }))
+}
+
+fn required_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a str, ModelError> {
+    let value = required_string(object, field)?;
+    if value.is_empty() {
+        return Err(ModelError::InvalidResponse("output identifier was empty"));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ContentField {
+    AssistantText(usize, usize),
+    ReasoningSummary(usize, usize),
+    FunctionArguments(usize),
+    EncryptedReplay(usize),
+}
+
+#[derive(Default)]
+struct ApplicationContentGuard {
+    bytes: usize,
+    fields: HashMap<ContentField, usize>,
+}
+
+impl ApplicationContentGuard {
+    fn append(&mut self, field: ContentField, bytes: usize) -> Result<(), ModelError> {
+        let current = self.fields.get(&field).copied().unwrap_or_default();
+        let observed = current
+            .checked_add(bytes)
+            .ok_or(ModelError::ContentTooLarge)?;
+        self.set_observed(field, current, observed)
+    }
+
+    fn observe(&mut self, field: ContentField, observed: usize) -> Result<(), ModelError> {
+        let current = self.fields.get(&field).copied().unwrap_or_default();
+        if observed <= current {
+            return Ok(());
+        }
+        self.set_observed(field, current, observed)
+    }
+
+    fn set_observed(
+        &mut self,
+        field: ContentField,
+        current: usize,
+        observed: usize,
+    ) -> Result<(), ModelError> {
+        let additional = observed - current;
+        let bytes = self
+            .bytes
+            .checked_add(additional)
+            .ok_or(ModelError::ContentTooLarge)?;
+        if bytes > APPLICATION_CONTENT_LIMIT {
+            return Err(ModelError::ContentTooLarge);
+        }
+        self.bytes = bytes;
+        self.fields.insert(field, observed);
+        Ok(())
+    }
+
+    fn account_output(&mut self, output: &[Value]) -> Result<(), ModelError> {
+        for (output_index, item) in output.iter().enumerate() {
+            self.account_output_item(output_index, item)?;
+        }
+        Ok(())
+    }
+
+    fn account_output_item(&mut self, output_index: usize, item: &Value) -> Result<(), ModelError> {
+        let object = item.as_object().ok_or(ModelError::InvalidResponse(
+            "stream output item was not an object",
+        ))?;
+        let item_type = required_string(object, "type")?;
+        required_nonempty_string(object, "id")?;
+        match item_type {
+            "reasoning" => {
+                if let Some(summary) = object.get("summary").and_then(Value::as_array) {
+                    for (index, part) in summary.iter().enumerate() {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            self.observe(
+                                ContentField::ReasoningSummary(output_index, index),
+                                text.len(),
+                            )?;
+                        }
+                    }
+                }
+                if let Some(encrypted) = object.get("encrypted_content").and_then(Value::as_str) {
+                    self.observe(ContentField::EncryptedReplay(output_index), encrypted.len())?;
+                }
+            }
+            "function_call" => {
+                if let Some(arguments) = object.get("arguments").and_then(Value::as_str) {
+                    self.observe(
+                        ContentField::FunctionArguments(output_index),
+                        arguments.len(),
+                    )?;
+                }
+            }
+            "message" => {
+                if let Some(parts) = object.get("content").and_then(Value::as_array) {
+                    for (index, part) in parts.iter().enumerate() {
+                        self.account_content_part(output_index, index, part)?;
+                    }
+                }
+            }
+            _ => {
+                return Err(ModelError::InvalidResponse(
+                    "stream contained an unexpected output item",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn account_content_part(
+        &mut self,
+        output_index: usize,
+        content_index: usize,
+        part: &Value,
+    ) -> Result<(), ModelError> {
+        let object = part.as_object().ok_or(ModelError::InvalidResponse(
+            "stream content part was not an object",
+        ))?;
+        match required_string(object, "type")? {
+            "output_text" => {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    self.observe(
+                        ContentField::AssistantText(output_index, content_index),
+                        text.len(),
+                    )?;
+                }
+                Ok(())
+            }
+            "refusal" => Err(ModelError::InvalidResponse("model refused the request")),
+            _ => Err(ModelError::InvalidResponse(
+                "stream contained unexpected message content",
+            )),
+        }
+    }
+
+    fn account_reasoning_part(
+        &mut self,
+        output_index: usize,
+        summary_index: usize,
+        part: &Value,
+    ) -> Result<(), ModelError> {
+        let object = part.as_object().ok_or(ModelError::InvalidResponse(
+            "stream reasoning summary part was not an object",
+        ))?;
+        if required_string(object, "type")? != "summary_text" {
+            return Err(ModelError::InvalidResponse(
+                "stream contained unexpected reasoning content",
+            ));
+        }
+        if let Some(text) = object.get("text").and_then(Value::as_str) {
+            self.observe(
+                ContentField::ReasoningSummary(output_index, summary_index),
+                text.len(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum WireEvent {
+    #[serde(rename = "response.created")]
+    Created,
+    #[serde(rename = "response.queued")]
+    Queued,
+    #[serde(rename = "response.in_progress")]
+    InProgress,
+    #[serde(rename = "response.completed")]
+    Completed {
+        sequence_number: u64,
+        response: WireResponse,
+    },
+    #[serde(rename = "response.failed")]
+    Failed {
+        sequence_number: u64,
+        response: WireResponse,
+    },
+    #[serde(rename = "response.incomplete")]
+    Incomplete {
+        sequence_number: u64,
+        response: WireResponse,
+    },
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded { output_index: usize, item: Value },
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone { output_index: usize, item: Value },
+    #[serde(rename = "response.content_part.added")]
+    ContentPartAdded {
+        output_index: usize,
+        content_index: usize,
+        part: Value,
+    },
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {
+        output_index: usize,
+        content_index: usize,
+        part: Value,
+    },
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta {
+        output_index: usize,
+        content_index: usize,
+        delta: String,
+    },
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone {
+        output_index: usize,
+        content_index: usize,
+        text: String,
+    },
+    #[serde(rename = "response.output_text.annotation.added")]
+    OutputTextAnnotationAdded,
+    #[serde(rename = "response.refusal.delta")]
+    RefusalDelta,
+    #[serde(rename = "response.refusal.done")]
+    RefusalDone,
+    #[serde(rename = "response.reasoning_summary_part.added")]
+    ReasoningSummaryPartAdded {
+        output_index: usize,
+        summary_index: usize,
+        part: Value,
+    },
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        output_index: usize,
+        summary_index: usize,
+        part: Value,
+    },
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryDelta {
+        sequence_number: u64,
+        output_index: usize,
+        summary_index: usize,
+        delta: String,
+    },
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryDone {
+        output_index: usize,
+        summary_index: usize,
+        text: String,
+    },
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionArgumentsDelta {
+        sequence_number: u64,
+        output_index: usize,
+        delta: String,
+    },
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionArgumentsDone {
+        output_index: usize,
+        arguments: String,
+    },
+    #[serde(rename = "error")]
+    Error {
+        sequence_number: u64,
+        code: Option<String>,
+        message: String,
+    },
+    #[serde(other)]
+    Unexpected,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct WireResponse {
+    id: String,
+    status: WireStatus,
+    #[serde(default)]
+    output: Vec<Value>,
+    service_tier: Option<String>,
+    usage: Option<WireUsage>,
+    error: Option<WireResponseError>,
+    incomplete_details: Option<WireIncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WireStatus {
+    Queued,
+    InProgress,
+    Completed,
+    Failed,
+    Incomplete,
+    Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    input_tokens: Option<u64>,
+    input_tokens_details: Option<WireInputTokenDetails>,
+    output_tokens: Option<u64>,
+    output_tokens_details: Option<WireOutputTokenDetails>,
+    total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireInputTokenDetails {
+    cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireOutputTokenDetails {
+    reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireResponseError {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireIncompleteDetails {
+    reason: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -9,13 +958,14 @@ mod tests {
     use async_openai::config::OpenAIConfig;
     use async_openai::error::OpenAIError;
     use async_openai::middleware::ReqwestService;
-    use futures::{Stream, StreamExt};
-    use serde::{Deserialize, Serialize};
+    use futures::StreamExt;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
+
+    use super::{WireEvent, WireStatus, WireStream, openai_config};
 
     const COMPLETED_STREAM: &str = concat!(
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
@@ -37,110 +987,10 @@ mod tests {
     );
     const ONE_DELTA: &str = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"partial\"}\n\n";
 
-    type WireStream = Pin<Box<dyn Stream<Item = Result<WireEvent, OpenAIError>> + Send>>;
-
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "type")]
-    enum WireEvent {
-        #[serde(rename = "response.completed")]
-        Completed {
-            sequence_number: u64,
-            response: WireResponse,
-        },
-        #[serde(rename = "response.failed")]
-        Failed {
-            sequence_number: u64,
-            response: WireResponse,
-        },
-        #[serde(rename = "response.incomplete")]
-        Incomplete {
-            sequence_number: u64,
-            response: WireResponse,
-        },
-        #[serde(rename = "response.reasoning_summary_text.delta")]
-        ReasoningSummaryDelta { sequence_number: u64, delta: String },
-        #[serde(rename = "response.function_call_arguments.delta")]
-        FunctionArgumentsDelta { sequence_number: u64, delta: String },
-        #[serde(rename = "error")]
-        Error {
-            sequence_number: u64,
-            code: Option<String>,
-            message: String,
-        },
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireResponse {
-        id: String,
-        status: WireStatus,
-        #[serde(default)]
-        output: Vec<WireOutputItem>,
-        service_tier: Option<String>,
-        usage: Option<WireUsage>,
-        error: Option<WireResponseError>,
-        incomplete_details: Option<WireIncompleteDetails>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    #[serde(rename_all = "snake_case")]
-    enum WireStatus {
-        Completed,
-        Failed,
-        Incomplete,
-    }
-
-    #[derive(Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    enum WireOutputItem {
-        Reasoning {
-            id: String,
-            summary: Vec<Value>,
-            encrypted_content: Option<String>,
-            status: String,
-        },
-        FunctionCall {
-            id: String,
-            call_id: String,
-            name: String,
-            arguments: String,
-            status: String,
-        },
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireUsage {
-        input_tokens: u64,
-        input_tokens_details: WireInputTokenDetails,
-        output_tokens: u64,
-        output_tokens_details: WireOutputTokenDetails,
-        total_tokens: u64,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireInputTokenDetails {
-        cached_tokens: u64,
-        cache_write_tokens: u64,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireOutputTokenDetails {
-        reasoning_tokens: u64,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireResponseError {
-        code: String,
-        message: String,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct WireIncompleteDetails {
-        reason: String,
-    }
-
     #[derive(Clone)]
     enum FixtureReply {
         Sse(&'static str),
+        OwnedSse(String),
         Status { code: u16, body: &'static str },
         AbruptSse(&'static str),
         IdleSse(&'static str),
@@ -249,6 +1099,14 @@ mod tests {
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
+            FixtureReply::OwnedSse(body) => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
             FixtureReply::Status { code, body } => {
                 let response = format!(
                     "HTTP/1.1 {code} Fixture Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -289,12 +1147,8 @@ mod tests {
     }
 
     fn sdk_client(endpoint: &str) -> Client<OpenAIConfig> {
-        Client::with_config(
-            OpenAIConfig::new()
-                .with_api_key("fixture-key")
-                .with_api_base(endpoint),
-        )
-        .with_http_service(ReqwestService::default())
+        Client::with_config(openai_config("fixture-key", endpoint))
+            .with_http_service(ReqwestService::default())
     }
 
     fn execute_python_request() -> Value {
@@ -358,6 +1212,7 @@ mod tests {
             WireEvent::ReasoningSummaryDelta {
                 sequence_number,
                 delta,
+                ..
             } => {
                 assert_eq!(sequence_number, 1);
                 assert_eq!(delta, "Checking");
@@ -368,6 +1223,7 @@ mod tests {
             WireEvent::FunctionArgumentsDelta {
                 sequence_number,
                 delta,
+                ..
             } => {
                 assert_eq!(sequence_number, 2);
                 assert_eq!(delta, r#"{"code":"print(1)"}"#);
@@ -388,30 +1244,26 @@ mod tests {
         assert_eq!(response.id, "resp_1");
         assert_eq!(response.status, WireStatus::Completed);
         assert_eq!(response.service_tier.as_deref(), Some("default"));
-        match &response.output[0] {
-            WireOutputItem::Reasoning {
-                encrypted_content, ..
-            } => {
-                assert_eq!(encrypted_content.as_deref(), Some("encrypted-reasoning"));
-            }
-            output => panic!("unexpected first output: {output:?}"),
-        }
-        match &response.output[1] {
-            WireOutputItem::FunctionCall {
-                name, arguments, ..
-            } => {
-                assert_eq!(name, "execute_python");
-                assert_eq!(arguments, r#"{"code":"print(1)"}"#);
-            }
-            output => panic!("unexpected second output: {output:?}"),
-        }
+        assert_eq!(
+            response.output[0]["encrypted_content"],
+            json!("encrypted-reasoning")
+        );
+        assert_eq!(response.output[1]["name"], json!("execute_python"));
+        assert_eq!(
+            response.output[1]["arguments"],
+            json!(r#"{"code":"print(1)"}"#)
+        );
         let usage = response.usage.unwrap();
-        assert_eq!(usage.input_tokens, 23);
-        assert_eq!(usage.input_tokens_details.cached_tokens, 5);
-        assert_eq!(usage.input_tokens_details.cache_write_tokens, 7);
-        assert_eq!(usage.output_tokens, 11);
-        assert_eq!(usage.output_tokens_details.reasoning_tokens, 3);
-        assert_eq!(usage.total_tokens, 34);
+        assert_eq!(usage.input_tokens, Some(23));
+        let input_details = usage.input_tokens_details.unwrap();
+        assert_eq!(input_details.cached_tokens, Some(5));
+        assert_eq!(input_details.cache_write_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(
+            usage.output_tokens_details.unwrap().reasoning_tokens,
+            Some(3)
+        );
+        assert_eq!(usage.total_tokens, Some(34));
         assert!(stream.next().await.is_none());
 
         let captured = fixture.request();
@@ -454,23 +1306,20 @@ mod tests {
         let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
         let mut first_stream = open_stream(&fixture).await.unwrap();
         let first_response = loop {
-            match next_event(&mut first_stream).await.unwrap() {
-                WireEvent::Completed { response, .. } => break response,
-                _ => {}
+            if let WireEvent::Completed { response, .. } =
+                next_event(&mut first_stream).await.unwrap()
+            {
+                break response;
             }
         };
         assert_eq!(first_response.output.len(), 2);
         assert!(first_stream.next().await.is_none());
 
-        let call_id = match &first_response.output[1] {
-            WireOutputItem::FunctionCall { call_id, .. } => call_id.clone(),
-            output => panic!("unexpected function call output: {output:?}"),
-        };
-        let mut second_input = first_response
-            .output
-            .iter()
-            .map(|output| serde_json::to_value(output).unwrap())
-            .collect::<Vec<_>>();
+        let call_id = first_response.output[1]["call_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut second_input = first_response.output.clone();
         second_input.push(json!({
             "type": "function_call_output",
             "call_id": call_id,
@@ -626,5 +1475,771 @@ mod tests {
 
         fixture.wait_for_disconnect().await;
         assert_eq!(fixture.request_count(), 1);
+    }
+
+    mod action_protocol {
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{APPLICATION_CONTENT_LIMIT, ApplicationContentGuard, OpenAiModel};
+        use super::*;
+        use crate::model::{
+            AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
+            ModelError, ModelHistory, ModelUsage, OpaqueReplayItem, ProviderReplay,
+        };
+
+        const COMPLETED_ITEM_ONLY_STREAM: &str = "data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_candidate\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"not terminal\",\"annotations\":[]}],\"status\":\"completed\"}}\n\n";
+
+        fn usage() -> Value {
+            json!({
+                "input_tokens": 23,
+                "input_tokens_details": {
+                    "cached_tokens": 5,
+                    "cache_write_tokens": 7
+                },
+                "output_tokens": 11,
+                "output_tokens_details": {"reasoning_tokens": 3},
+                "total_tokens": 34
+            })
+        }
+
+        fn reasoning(id: &str, text: &str, encrypted_content: &str) -> Value {
+            json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": [{"type": "summary_text", "text": text}],
+                "encrypted_content": encrypted_content,
+                "status": "completed"
+            })
+        }
+
+        fn function_call(id: &str, call_id: &str, name: &str, arguments: &str) -> Value {
+            json!({
+                "type": "function_call",
+                "id": id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed"
+            })
+        }
+
+        fn message(id: &str, text: &str) -> Value {
+            json!({
+                "type": "message",
+                "id": id,
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }],
+                "status": "completed"
+            })
+        }
+
+        fn completed_event(
+            sequence_number: u64,
+            status: &str,
+            output: Vec<Value>,
+            usage: Option<Value>,
+        ) -> Value {
+            let mut response = json!({
+                "id": "resp_action",
+                "status": status,
+                "service_tier": "default",
+                "output": output
+            });
+            if let Some(usage) = usage {
+                response["usage"] = usage;
+            }
+            json!({
+                "type": "response.completed",
+                "sequence_number": sequence_number,
+                "response": response
+            })
+        }
+
+        fn terminal_stream(status: &str, output: Vec<Value>, usage: Option<Value>) -> String {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                completed_event(1, status, output, usage)
+            )
+        }
+
+        fn event_stream(events: impl IntoIterator<Item = Value>) -> String {
+            let mut stream = String::new();
+            for event in events {
+                stream.push_str("data: ");
+                stream.push_str(&event.to_string());
+                stream.push_str("\n\n");
+            }
+            stream.push_str("data: [DONE]\n\n");
+            stream
+        }
+
+        fn replay(items: &[Value]) -> ProviderReplay {
+            ProviderReplay::new(
+                "openai",
+                items
+                    .iter()
+                    .map(|item| OpaqueReplayItem::new(serde_json::to_vec(item).unwrap()))
+                    .collect(),
+            )
+        }
+
+        fn history(request: &str) -> ModelHistory {
+            let mut history = ModelHistory::new("read files exactly");
+            history.append_user_request(request);
+            history
+        }
+
+        fn expected_request(instructions: &str, input: Value) -> Value {
+            json!({
+                "model": "gpt-5.6-sol",
+                "instructions": instructions,
+                "input": input,
+                "stream": true,
+                "store": false,
+                "service_tier": "default",
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+                "reasoning": {
+                    "effort": "medium",
+                    "summary": "auto",
+                    "context": "all_turns"
+                },
+                "include": ["reasoning.encrypted_content"],
+                "tools": [{
+                    "type": "function",
+                    "name": "execute_python",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string"}
+                        },
+                        "required": ["code"],
+                        "additionalProperties": false
+                    }
+                }]
+            })
+        }
+
+        async fn step(
+            fixture: &Fixture,
+            history: &ModelHistory,
+        ) -> Result<crate::model::ModelStep, ModelError> {
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            model.step(history, &cancellation, &mut progress).await
+        }
+
+        async fn assert_rejected(output: Vec<Value>) {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output,
+                Some(usage()),
+            )))
+            .await;
+
+            let error = step(&fixture, &history("inspect")).await.unwrap_err();
+            assert!(
+                matches!(error, ModelError::InvalidResponse(_)),
+                "unexpected rejection: {error:?}"
+            );
+            assert_eq!(fixture.request_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn builds_the_exact_first_request_and_returns_one_completed_code_action() {
+            let output = vec![
+                reasoning("rs_1", "Checking", "encrypted-reasoning"),
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#),
+            ];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output.clone(),
+                Some(usage()),
+            )))
+            .await;
+            let history = history("inspect this project");
+
+            let completed = step(&fixture, &history).await.unwrap();
+
+            assert_eq!(
+                completed.action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("call_1")
+                }
+            );
+            assert_eq!(completed.replay.provider(), "openai");
+            assert_eq!(completed.replay.items().len(), 2);
+            for (opaque, expected) in completed.replay.items().iter().zip(&output) {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(opaque.as_bytes()).unwrap(),
+                    *expected
+                );
+            }
+            assert_eq!(
+                completed.attempts,
+                vec![AttemptAccounting::KnownUsage(ModelUsage {
+                    model: "gpt-5.6-sol".to_owned(),
+                    service_tier: Some("default".to_owned()),
+                    input_tokens: Some(23),
+                    cached_input_tokens: Some(5),
+                    cache_write_input_tokens: Some(7),
+                    output_tokens: Some(11),
+                    reasoning_output_tokens: Some(3),
+                    total_tokens: Some(34),
+                })]
+            );
+
+            let captured = fixture.request();
+            assert!(
+                captured
+                    .head
+                    .contains("authorization: Bearer fixture-key\r\n")
+            );
+            let routing_headers = captured.head.to_ascii_lowercase();
+            assert!(!routing_headers.contains("openai-organization:"));
+            assert!(!routing_headers.contains("openai-project:"));
+            assert_eq!(
+                captured.body,
+                expected_request(
+                    "system prompt\n\nread files exactly",
+                    json!([{"role": "user", "content": "inspect this project"}])
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn accepts_statusless_reasoning_in_completed_sol_output() {
+            let mut statusless_reasoning = reasoning("rs_1", "Checking", "encrypted-reasoning");
+            statusless_reasoning
+                .as_object_mut()
+                .unwrap()
+                .remove("status");
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                vec![
+                    statusless_reasoning,
+                    function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#),
+                ],
+                Some(usage()),
+            )))
+            .await;
+
+            assert_eq!(
+                step(&fixture, &history("inspect")).await.unwrap().action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn replays_exact_subsequent_history_and_returns_one_completed_message() {
+            let code_output = vec![
+                reasoning("rs_1", "First", "encrypted-first"),
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"1 + 1"}"#),
+            ];
+            let message_output = vec![
+                reasoning("rs_2", "Second", "encrypted-second"),
+                message("msg_1", "first answer"),
+            ];
+            let mut history = history("first request");
+            history
+                .append_completed_code(
+                    "1 + 1".to_owned(),
+                    ModelCallId::new("call_1"),
+                    replay(&code_output),
+                    CodeResult::Execution {
+                        feedback: "2".to_owned(),
+                    },
+                )
+                .unwrap();
+            history.append_final_message("first answer".to_owned(), replay(&message_output));
+            history.append_user_request("second request");
+            let returned_output = vec![
+                reasoning("rs_3", "Third", "encrypted-third"),
+                message("msg_2", "second answer"),
+            ];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_action", "status": "in_progress"}
+                }),
+                json!({
+                    "type": "response.queued",
+                    "sequence_number": 2,
+                    "response": {"id": "resp_action", "status": "queued"}
+                }),
+                json!({
+                    "type": "response.in_progress",
+                    "sequence_number": 3,
+                    "response": {"id": "resp_action", "status": "in_progress"}
+                }),
+                completed_event(4, "completed", returned_output, None),
+            ])))
+            .await;
+
+            let completed = step(&fixture, &history).await.unwrap();
+
+            assert_eq!(
+                completed.action,
+                ModelAction::Message {
+                    text: "second answer".to_owned()
+                }
+            );
+            assert_eq!(
+                completed.attempts,
+                vec![AttemptAccounting::UsageUnavailable]
+            );
+            assert_eq!(
+                fixture.request().body,
+                expected_request(
+                    "system prompt\n\nread files exactly",
+                    json!([
+                        {"role": "user", "content": "first request"},
+                        code_output[0].clone(),
+                        code_output[1].clone(),
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": "2"
+                        },
+                        message_output[0].clone(),
+                        message_output[1].clone(),
+                        {"role": "user", "content": "second request"}
+                    ])
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn rejects_mixed_multiple_unknown_malformed_refused_and_unexpected_output() {
+            let valid_call =
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#);
+            let cases = vec![
+                vec![message("msg_1", "answer"), valid_call.clone()],
+                vec![
+                    valid_call.clone(),
+                    function_call("fc_2", "call_2", "execute_python", r#"{"code":"print(2)"}"#),
+                ],
+                vec![message("msg_1", "one"), message("msg_2", "two")],
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "other_function",
+                    r#"{"code":"print(1)"}"#,
+                )],
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "execute_python",
+                    r#"{"code":"print(1)","extra":true}"#,
+                )],
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "execute_python",
+                    r#"{"missing":"code"}"#,
+                )],
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "execute_python",
+                    r#"{"code":1}"#,
+                )],
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "execute_python",
+                    r#"{"code":"unterminated}"#,
+                )],
+                vec![json!({
+                    "type": "function_call",
+                    "id": "fc_missing_arguments",
+                    "call_id": "call_missing_arguments",
+                    "name": "execute_python",
+                    "status": "completed"
+                })],
+                vec![json!({
+                    "type": "message",
+                    "id": "msg_refusal",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "no"}],
+                    "status": "completed"
+                })],
+                vec![json!({
+                    "type": "web_search_call",
+                    "id": "search_1",
+                    "status": "completed"
+                })],
+                vec![json!({
+                    "type": "message",
+                    "id": "msg_input",
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "wrong"}],
+                    "status": "completed"
+                })],
+                vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_raw",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": "hidden"}],
+                        "encrypted_content": "encrypted",
+                        "status": "completed"
+                    }),
+                    message("msg_1", "answer"),
+                ],
+                vec![],
+                vec![message("msg_empty", "")],
+            ];
+
+            for output in cases {
+                assert_rejected(output).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_duplicate_nonempty_terminal_output_item_ids() {
+            assert_rejected(vec![
+                reasoning("duplicate", "Checking", "encrypted"),
+                message("duplicate", "answer"),
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        async fn rejects_invalid_reasoning_status_and_noncompleted_action_statuses() {
+            let mut incomplete_reasoning = reasoning("rs_1", "Wait", "encrypted");
+            incomplete_reasoning["status"] = json!("incomplete");
+            let mut malformed_reasoning = reasoning("rs_1", "Wait", "encrypted");
+            malformed_reasoning["status"] = Value::Null;
+            let mut incomplete_call =
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#);
+            incomplete_call["status"] = json!("incomplete");
+            let mut statusless_call =
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#);
+            statusless_call.as_object_mut().unwrap().remove("status");
+            let mut incomplete_message = message("msg_1", "answer");
+            incomplete_message["status"] = json!("incomplete");
+            let mut statusless_message = message("msg_1", "answer");
+            statusless_message.as_object_mut().unwrap().remove("status");
+
+            for output in [
+                vec![incomplete_reasoning, message("msg_1", "answer")],
+                vec![malformed_reasoning, message("msg_1", "answer")],
+                vec![incomplete_call],
+                vec![statusless_call],
+                vec![incomplete_message],
+                vec![statusless_message],
+            ] {
+                assert_rejected(output).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_failed_incomplete_error_eof_and_noncompleted_terminal_statuses() {
+            for (stream, expected) in [
+                (
+                    FAILED_STREAM.to_owned(),
+                    ModelError::Provider("response failed: server_error: failed".to_owned()),
+                ),
+                (
+                    INCOMPLETE_STREAM.to_owned(),
+                    ModelError::Provider("response incomplete: max_output_tokens".to_owned()),
+                ),
+                (
+                    ERROR_STREAM.to_owned(),
+                    ModelError::Provider("stream error (stream_error): stream failed".to_owned()),
+                ),
+                (
+                    "data: [DONE]\n\n".to_owned(),
+                    ModelError::InvalidResponse("stream ended without a terminal response"),
+                ),
+                (
+                    terminal_stream(
+                        "incomplete",
+                        vec![message("msg_1", "answer")],
+                        Some(usage()),
+                    ),
+                    ModelError::InvalidResponse(
+                        "response.completed did not contain completed status",
+                    ),
+                ),
+            ] {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
+
+                assert_eq!(step(&fixture, &history("inspect")).await, Err(expected));
+                assert_eq!(fixture.request_count(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_a_call_identifier_already_present_in_history() {
+            let prior_output = vec![function_call(
+                "fc_prior",
+                "call_duplicate",
+                "execute_python",
+                r#"{"code":"1"}"#,
+            )];
+            let mut history = history("first request");
+            history
+                .append_completed_code(
+                    "1".to_owned(),
+                    ModelCallId::new("call_duplicate"),
+                    replay(&prior_output),
+                    CodeResult::Execution {
+                        feedback: "1".to_owned(),
+                    },
+                )
+                .unwrap();
+            history.append_user_request("continue");
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                vec![function_call(
+                    "fc_new",
+                    "call_duplicate",
+                    "execute_python",
+                    r#"{"code":"2"}"#,
+                )],
+                Some(usage()),
+            )))
+            .await;
+
+            assert_eq!(
+                step(&fixture, &history).await,
+                Err(ModelError::InvalidResponse(
+                    "function call identifier duplicates model history"
+                ))
+            );
+            assert_eq!(fixture.request_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn completed_output_item_without_response_completed_remains_pending() {
+            let fixture = Fixture::start(FixtureReply::IdleSse(COMPLETED_ITEM_ONLY_STREAM)).await;
+            let original_history = history("inspect");
+            let history = original_history.clone();
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            let mut pending = Box::pin(model.step(&history, &cancellation, &mut progress));
+
+            assert!(
+                timeout(Duration::from_millis(20), &mut pending)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(history, original_history);
+
+            cancellation.cancel();
+            assert_eq!(pending.await, Err(ModelError::Cancelled));
+            fixture.wait_for_disconnect().await;
+            assert_eq!(fixture.request_count(), 1);
+            assert!(history.entries().iter().all(|entry| matches!(
+                entry,
+                ModelContextEntry::ReadCapability { .. } | ModelContextEntry::UserRequest { .. }
+            )));
+        }
+
+        #[tokio::test]
+        async fn application_content_guard_counts_all_guarded_fields_as_events_arrive() {
+            let quarter = APPLICATION_CONTENT_LIMIT / 4;
+            let fragment = "x".repeat(quarter);
+            let stream = event_stream([
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": fragment
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "rs_1",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "delta": fragment
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 3,
+                    "item_id": "fc_1",
+                    "output_index": 2,
+                    "delta": fragment
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 4,
+                    "output_index": 1,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_encrypted",
+                        "summary": [],
+                        "encrypted_content": format!("{fragment}x"),
+                        "status": "completed"
+                    }
+                }),
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 5,
+                    "response": {
+                        "id": "must_not_become_an_action",
+                        "status": "completed",
+                        "service_tier": "default",
+                        "output": [message("msg_terminal", "must not return")],
+                        "usage": usage()
+                    }
+                }),
+            ]);
+            let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
+
+            assert_eq!(
+                step(&fixture, &history("inspect")).await,
+                Err(ModelError::ContentTooLarge)
+            );
+            assert_eq!(fixture.request_count(), 1);
+        }
+
+        #[test]
+        fn application_content_guard_combines_terminal_reasoning_by_output_index() {
+            for ids in [["rs_1", "rs_2"], ["duplicate", "duplicate"]] {
+                let mut first = reasoning(ids[0], "", "");
+                first["encrypted_content"] =
+                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                let mut second = reasoning(ids[1], "", "");
+                second["encrypted_content"] =
+                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                let mut content = ApplicationContentGuard::default();
+
+                assert_eq!(
+                    content.account_output(&[first, second]),
+                    Err(ModelError::ContentTooLarge)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_invalid_stored_replays_without_making_a_request() {
+            let mut provider_mismatch = history("first request");
+            provider_mismatch.append_final_message(
+                "answer".to_owned(),
+                ProviderReplay::new(
+                    "other-provider",
+                    vec![OpaqueReplayItem::new(b"{}".to_vec())],
+                ),
+            );
+            provider_mismatch.append_user_request("continue");
+
+            let mut malformed_json = history("first request");
+            malformed_json.append_final_message(
+                "answer".to_owned(),
+                ProviderReplay::new("openai", vec![OpaqueReplayItem::new(b"not json".to_vec())]),
+            );
+            malformed_json.append_user_request("continue");
+
+            let mut semantically_malformed = history("first request");
+            let mut non_assistant_message = message("msg_1", "answer");
+            non_assistant_message["role"] = json!("user");
+            semantically_malformed
+                .append_final_message("answer".to_owned(), replay(&[non_assistant_message]));
+            semantically_malformed.append_user_request("continue");
+
+            let code_replay = replay(&[function_call(
+                "fc_1",
+                "call_1",
+                "execute_python",
+                r#"{"code":"1 + 1"}"#,
+            )]);
+            let mut source_mismatch = history("first request");
+            source_mismatch
+                .append_completed_code(
+                    "2 + 2".to_owned(),
+                    ModelCallId::new("call_1"),
+                    code_replay.clone(),
+                    CodeResult::Execution {
+                        feedback: "2".to_owned(),
+                    },
+                )
+                .unwrap();
+            source_mismatch.append_user_request("continue");
+
+            let mut call_id_mismatch = history("first request");
+            call_id_mismatch
+                .append_completed_code(
+                    "1 + 1".to_owned(),
+                    ModelCallId::new("call_2"),
+                    code_replay,
+                    CodeResult::Execution {
+                        feedback: "2".to_owned(),
+                    },
+                )
+                .unwrap();
+            call_id_mismatch.append_user_request("continue");
+
+            let mut text_mismatch = history("first request");
+            text_mismatch.append_final_message(
+                "different answer".to_owned(),
+                replay(&[message("msg_1", "answer")]),
+            );
+            text_mismatch.append_user_request("continue");
+
+            for (case, history, expected) in [
+                (
+                    "provider mismatch",
+                    provider_mismatch,
+                    ModelError::InvalidHistory("opaque replay belongs to another provider"),
+                ),
+                (
+                    "malformed JSON",
+                    malformed_json,
+                    ModelError::InvalidHistory("opaque OpenAI replay is malformed"),
+                ),
+                (
+                    "semantically malformed replay",
+                    semantically_malformed,
+                    ModelError::InvalidHistory("response message did not have assistant role"),
+                ),
+                (
+                    "completed code source mismatch",
+                    source_mismatch,
+                    ModelError::InvalidHistory("completed code does not match its OpenAI replay"),
+                ),
+                (
+                    "completed code call ID mismatch",
+                    call_id_mismatch,
+                    ModelError::InvalidHistory("completed code does not match its OpenAI replay"),
+                ),
+                (
+                    "final message text mismatch",
+                    text_mismatch,
+                    ModelError::InvalidHistory("final message does not match its OpenAI replay"),
+                ),
+            ] {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                    "completed",
+                    vec![message("msg_1", "answer")],
+                    Some(usage()),
+                )))
+                .await;
+
+                let result = step(&fixture, &history).await;
+
+                assert_eq!(fixture.request_count(), 0, "{case}");
+                assert_eq!(result, Err(expected), "{case}");
+            }
+        }
     }
 }
