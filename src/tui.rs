@@ -10,10 +10,13 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
+use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
+use crate::arena::{Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome};
+use crate::model::{AttemptAccounting, ModelProgress};
+use crate::pricing::{CostEstimate, RunCostEstimate, estimate_run_cost, estimate_usage};
 use crate::runtime::{
     ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent,
-    RuntimeProgressReceiver, StoredRecord,
+    RuntimeProgressReceiver, StoredRecord, TerminalDetails,
 };
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -54,16 +57,72 @@ enum RunState {
     Active(RunId),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayedRecord {
+    record: StoredRecord,
+    progress_gap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePhase {
+    Generating,
+    Executing,
+}
+
+impl LivePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Generating => "generating",
+            Self::Executing => "executing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveStep {
+    run_id: RunId,
+    step_id: ModelStepId,
+    phase: LivePhase,
+    attempt: Option<u32>,
+    settled_attempts: Vec<AttemptAccounting>,
+    reasoning: String,
+    assistant_text: String,
+    decoded_python: String,
+    stdout: String,
+    stdout_truncated: bool,
+    progress_gap: bool,
+    activity: String,
+}
+
+impl LiveStep {
+    fn new(run_id: RunId, step_id: ModelStepId, progress_gap: bool) -> Self {
+        Self {
+            run_id,
+            step_id,
+            phase: LivePhase::Generating,
+            attempt: None,
+            settled_attempts: Vec::new(),
+            reasoning: String::new(),
+            assistant_text: String::new(),
+            decoded_python: String::new(),
+            stdout: String::new(),
+            stdout_truncated: false,
+            progress_gap,
+            activity: "waiting for model".to_owned(),
+        }
+    }
+}
+
 struct App {
     prompt: String,
     run_state: RunState,
     latest_run_id: Option<RunId>,
-    settled_run_id: Option<RunId>,
-    current_step_id: Option<ModelStepId>,
-    completed_step_id: Option<ModelStepId>,
-    progress_gap: bool,
+    settled_run_ids: Vec<RunId>,
+    completed_steps: Vec<(RunId, ModelStepId)>,
+    pending_run_gap: bool,
     status: String,
-    records: Vec<StoredRecord>,
+    records: Vec<DisplayedRecord>,
+    live_step: Option<LiveStep>,
     scroll_from_bottom: usize,
     history_height: usize,
 }
@@ -74,12 +133,12 @@ impl Default for App {
             prompt: String::new(),
             run_state: RunState::Idle,
             latest_run_id: None,
-            settled_run_id: None,
-            current_step_id: None,
-            completed_step_id: None,
-            progress_gap: false,
+            settled_run_ids: Vec::new(),
+            completed_steps: Vec::new(),
+            pending_run_gap: false,
             status: "idle".to_owned(),
             records: Vec::new(),
+            live_step: None,
             scroll_from_bottom: 0,
             history_height: 0,
         }
@@ -167,99 +226,121 @@ impl App {
     }
 
     fn handle_event(&mut self, event: RuntimeEvent) -> bool {
+        self.handle_event_with_gap(event, false)
+    }
+
+    fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
+        self.handle_event_with_gap(envelope.item, envelope.gap_before)
+    }
+
+    fn handle_event_with_gap(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
         match event {
-            RuntimeEvent::RunStarted { run_id } => self.start_run(run_id),
-            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
-                self.handle_step_progress(run_id, step_id, format!("model step {}", step_id.0))
-            }
+            RuntimeEvent::RunStarted { run_id } => self.start_run(run_id, gap_before),
+            RuntimeEvent::ModelStepStarted { run_id, step_id } => self.update_live_step(
+                run_id,
+                step_id,
+                gap_before,
+                Some(format!("model step {}", step_id.0)),
+                |_| {},
+            ),
             RuntimeEvent::ModelProgress {
                 run_id,
                 step_id,
                 progress,
-            } => self.handle_step_progress(
-                run_id,
-                step_id,
-                match progress {
-                    crate::model::ModelProgress::AttemptStarted { attempt } => {
-                        format!("model step {} attempt {attempt}", step_id.0)
+            } => {
+                let status = match &progress {
+                    ModelProgress::AttemptStarted { attempt } => {
+                        Some(format!("model step {} attempt {attempt}", step_id.0))
                     }
-                    _ => format!("model step {}", step_id.0),
-                },
-            ),
-            RuntimeEvent::ExecutionStarted { run_id, step_id } => self.handle_step_progress(
+                    _ => Some(format!("model step {}", step_id.0)),
+                };
+                self.update_live_step(run_id, step_id, gap_before, status, |live| match progress {
+                    ModelProgress::AttemptStarted { attempt } => {
+                        live.phase = LivePhase::Generating;
+                        live.attempt = Some(attempt);
+                        live.reasoning.clear();
+                        live.assistant_text.clear();
+                        live.decoded_python.clear();
+                        live.activity = format!("model attempt {attempt}");
+                    }
+                    ModelProgress::ReasoningSummaryChunk { text } => live.reasoning.push_str(&text),
+                    ModelProgress::AssistantTextChunk { text } => {
+                        live.assistant_text.push_str(&text)
+                    }
+                    ModelProgress::DecodedPythonChunk { code } => {
+                        live.decoded_python.push_str(&code)
+                    }
+                    ModelProgress::AttemptSettled { accounting, .. } => {
+                        live.settled_attempts.push(accounting)
+                    }
+                })
+            }
+            RuntimeEvent::ExecutionStarted { run_id, step_id } => self.update_live_step(
                 run_id,
                 step_id,
-                format!("running code for step {}", step_id.0),
+                gap_before,
+                Some(format!("running code for step {}", step_id.0)),
+                |live| {
+                    live.phase = LivePhase::Executing;
+                    live.activity = "running code".to_owned();
+                },
             ),
             RuntimeEvent::ToolStarted {
                 run_id,
                 step_id,
                 path,
-            } => self.handle_step_progress(run_id, step_id, format!("reading {path}")),
+            } => self.update_live_step(
+                run_id,
+                step_id,
+                gap_before,
+                Some(format!("reading {path}")),
+                |live| {
+                    live.phase = LivePhase::Executing;
+                    live.activity = format!("reading {path}");
+                },
+            ),
             RuntimeEvent::ToolFinished {
                 run_id,
                 step_id,
                 path,
                 outcome,
-            } => match outcome {
-                ReadOutcome::Success { line_count } => self.handle_step_progress(
+            } => {
+                let activity = match outcome {
+                    ReadOutcome::Success { line_count } => {
+                        format!("read {path} ({line_count} lines)")
+                    }
+                    ReadOutcome::Failure { message } => format!("read {path} failed: {message}"),
+                };
+                self.update_live_step(
                     run_id,
                     step_id,
-                    format!("read {path} ({line_count} lines)"),
-                ),
-                ReadOutcome::Failure { message } => self.handle_step_progress(
-                    run_id,
-                    step_id,
-                    format!("read {path} failed: {message}"),
-                ),
-            },
-            RuntimeEvent::StdoutDelta { .. } | RuntimeEvent::StdoutTruncated { .. } => false,
+                    gap_before,
+                    Some(activity.clone()),
+                    |live| {
+                        live.phase = LivePhase::Executing;
+                        live.activity = activity;
+                    },
+                )
+            }
+            RuntimeEvent::StdoutDelta {
+                run_id,
+                step_id,
+                text,
+            } => self.update_live_step(run_id, step_id, gap_before, None, |live| {
+                live.phase = LivePhase::Executing;
+                live.stdout.push_str(&text);
+            }),
+            RuntimeEvent::StdoutTruncated { run_id, step_id } => {
+                self.update_live_step(run_id, step_id, gap_before, None, |live| {
+                    live.phase = LivePhase::Executing;
+                    live.stdout_truncated = true;
+                })
+            }
             RuntimeEvent::RecordAppended {
                 record,
                 progress_gap,
-            } => {
-                self.progress_gap |= progress_gap;
-                self.latest_run_id = Some(
-                    self.latest_run_id
-                        .map_or(record.run_id, |latest| latest.max(record.run_id)),
-                );
-                if let Record::CompletedExecution { step_id, .. } = &record.record
-                    && self.latest_run_id == Some(record.run_id)
-                {
-                    self.completed_step_id = Some(
-                        self.completed_step_id
-                            .map_or(*step_id, |completed| completed.max(*step_id)),
-                    );
-                }
-                if matches!(
-                    &record.record,
-                    Record::FinalMessage { .. }
-                        | Record::CancelledRun { .. }
-                        | Record::FailedRun { .. }
-                ) {
-                    self.settled_run_id = Some(
-                        self.settled_run_id
-                            .map_or(record.run_id, |settled| settled.max(record.run_id)),
-                    );
-                }
-                self.records.push(record);
-                true
-            }
-            RuntimeEvent::RunSettled { run_id }
-                if self
-                    .latest_run_id
-                    .is_none_or(|latest_run_id| run_id >= latest_run_id) =>
-            {
-                self.latest_run_id = Some(run_id);
-                self.settled_run_id = Some(
-                    self.settled_run_id
-                        .map_or(run_id, |settled| settled.max(run_id)),
-                );
-                self.run_state = RunState::Idle;
-                self.current_step_id = None;
-                self.status = "idle".to_owned();
-                true
-            }
+            } => self.append_record(record, progress_gap),
+            RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.run_state == RunState::Submitting
                     || self.run_state == RunState::Active(active_run_id) =>
@@ -271,22 +352,15 @@ impl App {
                 self.run_state = RunState::Active(active_run_id);
                 self.set_status(format!("run {} is busy", active_run_id.0))
             }
-            RuntimeEvent::RunSettled { .. }
-            | RuntimeEvent::SubmissionRejectedBusy { .. }
+            RuntimeEvent::SubmissionRejectedBusy { .. }
             | RuntimeEvent::RuntimeDisabled { .. }
             | RuntimeEvent::SubmissionRejectedDisabled { .. } => false,
         }
     }
 
-    fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
-        self.progress_gap |= envelope.gap_before;
-        self.handle_event(envelope.item)
-    }
-
-    fn start_run(&mut self, run_id: RunId) -> bool {
-        if self
-            .settled_run_id
-            .is_some_and(|settled_run_id| run_id <= settled_run_id)
+    fn start_run(&mut self, run_id: RunId, gap_before: bool) -> bool {
+        if self.is_terminal_run(run_id)
+            || matches!(self.run_state, RunState::Active(_))
             || self
                 .latest_run_id
                 .is_some_and(|latest_run_id| run_id < latest_run_id)
@@ -295,60 +369,166 @@ impl App {
             return false;
         }
         self.latest_run_id = Some(run_id);
-        self.current_step_id = None;
-        self.completed_step_id = None;
+        self.pending_run_gap = gap_before;
+        self.live_step = None;
         self.run_state = RunState::Active(run_id);
-        self.status = format!("run {} started", run_id.0);
-        true
+        self.set_status(format!("run {} started", run_id.0))
     }
 
-    fn handle_step_progress(
+    fn update_live_step(
         &mut self,
         run_id: RunId,
         step_id: ModelStepId,
-        status: String,
+        gap_before: bool,
+        status: Option<String>,
+        update: impl FnOnce(&mut LiveStep),
     ) -> bool {
+        if !self.accepts_live_step(run_id, step_id) {
+            return false;
+        }
+
+        let mut changed = self.activate_progress_run(run_id);
         if self
-            .settled_run_id
-            .is_some_and(|settled_run_id| run_id <= settled_run_id)
+            .live_step
+            .as_ref()
+            .is_none_or(|live| live.run_id != run_id || live.step_id != step_id)
+        {
+            let progress_gap = std::mem::take(&mut self.pending_run_gap) || gap_before;
+            self.live_step = Some(LiveStep::new(run_id, step_id, progress_gap));
+            changed = true;
+        } else if gap_before
+            && !self
+                .live_step
+                .as_ref()
+                .expect("matching live step checked")
+                .progress_gap
+        {
+            self.live_step
+                .as_mut()
+                .expect("matching live step checked")
+                .progress_gap = true;
+            changed = true;
+        }
+
+        let live = self.live_step.as_mut().expect("live step was created");
+        let before = live.clone();
+        update(live);
+        changed |= *live != before;
+        if let Some(status) = status {
+            changed |= self.set_status(status);
+        }
+        changed
+    }
+
+    fn accepts_live_step(&self, run_id: RunId, step_id: ModelStepId) -> bool {
+        if self.is_terminal_run(run_id)
             || self
-                .completed_step_id
-                .is_some_and(|completed_step_id| step_id <= completed_step_id)
+                .latest_run_id
+                .is_some_and(|latest_run_id| run_id < latest_run_id)
+            || self.step_is_complete(run_id, step_id)
         {
             return false;
         }
+        let accepts_run = match self.run_state {
+            RunState::Active(active_run_id) => active_run_id == run_id,
+            RunState::Submitting => self
+                .latest_run_id
+                .is_none_or(|latest_run_id| run_id >= latest_run_id),
+            RunState::Idle => self
+                .latest_run_id
+                .is_none_or(|latest_run_id| run_id > latest_run_id),
+        };
+        if !accepts_run {
+            return false;
+        }
+        self.live_step
+            .as_ref()
+            .is_none_or(|live| live.run_id != run_id || step_id >= live.step_id)
+    }
+
+    fn activate_progress_run(&mut self, run_id: RunId) -> bool {
         match self.run_state {
-            RunState::Active(active_run_id) if active_run_id == run_id => {}
-            RunState::Submitting
-                if self
-                    .latest_run_id
-                    .is_none_or(|latest_run_id| run_id >= latest_run_id) =>
-            {
+            RunState::Active(_) => false,
+            RunState::Submitting | RunState::Idle => {
                 self.latest_run_id = Some(run_id);
+                self.pending_run_gap = false;
                 self.run_state = RunState::Active(run_id);
-                self.current_step_id = None;
-                self.completed_step_id = None;
+                self.live_step = None;
+                self.set_status(format!("run {} started", run_id.0))
             }
-            RunState::Idle
+        }
+    }
+
+    fn append_record(&mut self, record: StoredRecord, progress_gap: bool) -> bool {
+        self.latest_run_id = Some(
+            self.latest_run_id
+                .map_or(record.run_id, |latest| latest.max(record.run_id)),
+        );
+        match &record.record {
+            Record::CompletedExecution { step_id, .. } => {
+                self.completed_steps.push((record.run_id, *step_id));
                 if self
-                    .latest_run_id
-                    .is_none_or(|latest_run_id| run_id > latest_run_id) =>
-            {
-                self.latest_run_id = Some(run_id);
-                self.run_state = RunState::Active(run_id);
-                self.current_step_id = None;
-                self.completed_step_id = None;
+                    .live_step
+                    .as_ref()
+                    .is_some_and(|live| live.run_id == record.run_id && live.step_id == *step_id)
+                {
+                    self.live_step = None;
+                }
             }
-            _ => return false,
+            Record::FinalMessage { .. }
+            | Record::CancelledRun { .. }
+            | Record::FailedRun { .. } => {
+                self.mark_terminal_run(record.run_id);
+            }
+            Record::UserRequest { .. } => {}
+        }
+        self.records.push(DisplayedRecord {
+            record,
+            progress_gap,
+        });
+        true
+    }
+
+    fn settle_run(&mut self, run_id: RunId) -> bool {
+        if self
+            .latest_run_id
+            .is_some_and(|latest_run_id| run_id < latest_run_id)
+            || self.is_terminal_run(run_id) && self.run_state == RunState::Idle
+        {
+            return false;
+        }
+        self.latest_run_id = Some(run_id);
+        self.mark_terminal_run(run_id);
+        self.run_state = RunState::Idle;
+        self.set_status("idle".to_owned())
+    }
+
+    fn mark_terminal_run(&mut self, run_id: RunId) {
+        if !self.is_terminal_run(run_id) {
+            self.settled_run_ids.push(run_id);
         }
         if self
-            .current_step_id
-            .is_some_and(|current_step_id| step_id < current_step_id)
+            .live_step
+            .as_ref()
+            .is_some_and(|live| live.run_id == run_id)
         {
-            return false;
+            self.live_step = None;
         }
-        self.current_step_id = Some(step_id);
-        self.set_status(status)
+        if self.latest_run_id == Some(run_id) {
+            self.pending_run_gap = false;
+        }
+    }
+
+    fn is_terminal_run(&self, run_id: RunId) -> bool {
+        self.settled_run_ids.contains(&run_id)
+    }
+
+    fn step_is_complete(&self, run_id: RunId, step_id: ModelStepId) -> bool {
+        self.completed_steps
+            .iter()
+            .any(|(completed_run_id, completed_step_id)| {
+                *completed_run_id == run_id && *completed_step_id >= step_id
+            })
     }
 
     fn set_status(&mut self, status: String) -> bool {
@@ -514,7 +694,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(format!(
             "Status: {} | Enter submit | Esc cancel | Ctrl-C quit | Up/Down scroll",
-            app.status
+            normalise_terminal_text(&app.status)
         )),
         Rect::new(area.x, area.y, area.width, 1),
     );
@@ -525,7 +705,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     let prompt_y = area.y.saturating_add(area.height - 1);
     frame.render_widget(
-        Paragraph::new(format!("> {}", app.prompt)),
+        Paragraph::new(format!("> {}", normalise_terminal_text(&app.prompt))),
         Rect::new(area.x, prompt_y, area.width, 1),
     );
 
@@ -548,39 +728,155 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn format_history(app: &App) -> String {
-    app.records
-        .iter()
-        .map(format_record)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut entries = Vec::new();
+    for (index, displayed) in app.records.iter().enumerate() {
+        let prior_attempts = app.records[..index]
+            .iter()
+            .filter(|prior| prior.record.run_id == displayed.record.run_id)
+            .filter_map(|prior| match &prior.record.record {
+                Record::CompletedExecution { attempts, .. } => Some(attempts.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        entries.push(format_record(displayed, &prior_attempts));
+    }
+    if let Some(live) = &app.live_step {
+        let prior_attempts = app
+            .records
+            .iter()
+            .filter(|record| record.record.run_id == live.run_id)
+            .filter_map(|record| match &record.record.record {
+                Record::CompletedExecution { attempts, .. } => Some(attempts.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        entries.push(format_live_step(live, &prior_attempts));
+    }
+    entries.join("\n")
 }
 
-fn format_record(stored: &StoredRecord) -> String {
+fn format_record(displayed: &DisplayedRecord, prior_attempts: &[&AttemptAccounting]) -> String {
+    let stored = &displayed.record;
     let run_id = stored.run_id.0;
     match &stored.record {
-        Record::UserRequest { request } => format!("[run {run_id}] you: {request}"),
+        Record::UserRequest { request } => {
+            let mut lines = vec![format!("[run {run_id}] you: {request}")];
+            append_display_gap(&mut lines, displayed.progress_gap);
+            normalised_lines(lines)
+        }
         Record::CompletedExecution {
             step_id,
             source,
             execution,
-            ..
-        } => format_execution(run_id, step_id.0, source, execution),
-        Record::FinalMessage { step_id, text, .. } => {
-            format!("[run {run_id} step {}] kiki: {text}", step_id.0)
-        }
-        Record::CancelledRun { .. } => format!("[run {run_id}] cancelled"),
-        Record::FailedRun { message, .. } => format!("[run {run_id}] failed: {message}"),
+            attempts,
+        } => format_execution(
+            run_id,
+            step_id.0,
+            source,
+            execution,
+            attempts,
+            prior_attempts,
+            displayed.progress_gap,
+        ),
+        Record::FinalMessage {
+            step_id,
+            text,
+            terminal,
+        } => format_terminal(
+            format!("[run {run_id} step {}] kiki: {text}", step_id.0),
+            terminal,
+            prior_attempts,
+            displayed.progress_gap,
+        ),
+        Record::CancelledRun { terminal } => format_terminal(
+            format!("[run {run_id}] cancelled"),
+            terminal,
+            prior_attempts,
+            displayed.progress_gap,
+        ),
+        Record::FailedRun { message, terminal } => format_terminal(
+            format!("[run {run_id}] failed: {message}"),
+            terminal,
+            prior_attempts,
+            displayed.progress_gap,
+        ),
     }
 }
 
-fn format_execution(run_id: u64, step_id: u64, source: &str, execution: &Execution) -> String {
+fn format_live_step(live: &LiveStep, prior_attempts: &[&AttemptAccounting]) -> String {
+    let mut lines = vec![format!(
+        "[run {} step {}] live: {}",
+        live.run_id.0,
+        live.step_id.0,
+        live.phase.label()
+    )];
+    append_display_gap(&mut lines, live.progress_gap);
+    if let Some(attempt) = live.attempt {
+        lines.push(format!("attempt: {attempt}"));
+    }
+    if !live.reasoning.is_empty() {
+        lines.push(format!("reasoning: {}", live.reasoning));
+    }
+    if !live.assistant_text.is_empty() {
+        lines.push(format!("assistant: {}", live.assistant_text));
+    }
+    if !live.decoded_python.is_empty() {
+        lines.push(format!("code:\n{}", live.decoded_python));
+    }
+    if !live.stdout.is_empty() {
+        lines.push(format!("stdout: {}", live.stdout));
+    }
+    if live.stdout_truncated {
+        lines.push("stdout preview truncated".to_owned());
+    }
+    if !live.activity.is_empty() {
+        lines.push(format!("activity: {}", live.activity));
+    }
+    append_attempts(&mut lines, &live.settled_attempts);
+    lines.push(format_cost(
+        "Step estimated cost",
+        &live.settled_attempts.iter().collect::<Vec<_>>(),
+    ));
+    let run_attempts = prior_attempts
+        .iter()
+        .copied()
+        .chain(live.settled_attempts.iter())
+        .collect::<Vec<_>>();
+    lines.push(format_cost("Run estimated cost", &run_attempts));
+    normalised_lines(lines)
+}
+
+fn format_execution(
+    run_id: u64,
+    step_id: u64,
+    source: &str,
+    execution: &Execution,
+    attempts: &[AttemptAccounting],
+    prior_attempts: &[&AttemptAccounting],
+    progress_gap: bool,
+) -> String {
     let mut lines = vec![format!("[run {run_id} step {step_id}] code:\n{source}")];
-    if execution.stdout.total_bytes > 0 {
-        lines.push(format!("stdout: {}", format_observation(&execution.stdout)));
-    }
-    if execution.stderr.total_bytes > 0 {
-        lines.push(format!("stderr: {}", format_observation(&execution.stderr)));
-    }
+    append_display_gap(&mut lines, progress_gap);
+    append_execution_output(&mut lines, execution);
+    append_attempts(&mut lines, attempts);
+    lines.push(format_cost(
+        "Step estimated cost",
+        &attempts.iter().collect::<Vec<_>>(),
+    ));
+    let run_attempts = prior_attempts
+        .iter()
+        .copied()
+        .chain(attempts.iter())
+        .collect::<Vec<_>>();
+    lines.push(format_cost("Run estimated cost", &run_attempts));
+    normalised_lines(lines)
+}
+
+fn append_execution_output(lines: &mut Vec<String>, execution: &Execution) {
+    append_observation(lines, "stdout", &execution.stdout);
+    append_observation(lines, "stderr", &execution.stderr);
     match &execution.outcome {
         ExecutionOutcome::Complete {
             result: Some(result),
@@ -588,19 +884,218 @@ fn format_execution(run_id: u64, step_id: u64, source: &str, execution: &Executi
         ExecutionOutcome::Complete { result: None } => {}
         ExecutionOutcome::PythonError(error) => lines.push(format!("error: {}", error.text)),
     }
-    lines.join("\n")
+}
+
+fn format_terminal(
+    header: String,
+    terminal: &TerminalDetails,
+    prior_attempts: &[&AttemptAccounting],
+    progress_gap: bool,
+) -> String {
+    let mut lines = vec![header];
+    append_display_gap(&mut lines, progress_gap);
+    let terminal_step_attempts = terminal
+        .attempts
+        .get(prior_attempts.len()..)
+        .unwrap_or_default();
+    append_attempts(&mut lines, terminal_step_attempts);
+    lines.push(format_cost(
+        "Step estimated cost",
+        &terminal_step_attempts.iter().collect::<Vec<_>>(),
+    ));
+    lines.push(format_cost(
+        "Run estimated cost",
+        &terminal.attempts.iter().collect::<Vec<_>>(),
+    ));
+    if let Some(evidence) = &terminal.evidence {
+        append_terminal_evidence(&mut lines, evidence);
+    }
+    normalised_lines(lines)
+}
+
+fn append_terminal_evidence(lines: &mut Vec<String>, evidence: &TerminalEvidence) {
+    match evidence {
+        TerminalEvidence::Generation(GenerationEvidence {
+            reasoning,
+            assistant_text,
+            decoded_python,
+        }) => {
+            if !reasoning.is_empty() {
+                lines.push(format!("reasoning: {reasoning}"));
+            }
+            if !assistant_text.is_empty() {
+                lines.push(format!("assistant: {assistant_text}"));
+            }
+            if !decoded_python.is_empty() {
+                lines.push(format!("code:\n{decoded_python}"));
+            }
+        }
+        TerminalEvidence::Execution(evidence) => append_execution_evidence(lines, evidence),
+    }
+}
+
+fn append_execution_evidence(lines: &mut Vec<String>, evidence: &ExecutionEvidence) {
+    lines.push(format!("source: {}", evidence.source));
+    lines.push(if evidence.began {
+        "execution: started".to_owned()
+    } else {
+        "execution: not started".to_owned()
+    });
+    append_observation(lines, "stdout", &evidence.stdout);
+    append_observation(lines, "stderr", &evidence.stderr);
+    lines.push(format_interrupted_read(&evidence.read));
+    if let Some(failure) = &evidence.failure {
+        lines.push(format!("failure: {}", format_execution_failure(failure)));
+    }
+    if let Some(warning) = &evidence.cancellation_warning {
+        lines.push(format!("warning: {warning}"));
+    }
+}
+
+fn format_interrupted_read(read: &InterruptedRead) -> String {
+    match read {
+        InterruptedRead::NoRead => "read: none".to_owned(),
+        InterruptedRead::Pending { path } => format!("read: pending {path}"),
+        InterruptedRead::Completed { path, outcome } => match outcome {
+            ReadOutcome::Success { line_count } => {
+                format!("read: completed {path} ({line_count} lines)")
+            }
+            ReadOutcome::Failure { message } => format!("read: completed {path} failed: {message}"),
+        },
+    }
+}
+
+fn format_execution_failure(failure: &ExecutionFailure) -> String {
+    match failure {
+        ExecutionFailure::Arena { message } => message.clone(),
+        ExecutionFailure::RecoveryFailed { original, recovery } => {
+            format!("arena recovery failed after {original}: {recovery}")
+        }
+    }
+}
+
+fn append_observation(lines: &mut Vec<String>, label: &str, observation: &Observation) {
+    if observation.total_bytes > 0 {
+        lines.push(format!("{label}: {}", format_observation(observation)));
+    }
+}
+
+fn append_display_gap(lines: &mut Vec<String>, progress_gap: bool) {
+    if progress_gap {
+        lines.push("display gap: some live progress was dropped".to_owned());
+    }
+}
+
+fn append_attempts(lines: &mut Vec<String>, attempts: &[AttemptAccounting]) {
+    for (index, attempt) in attempts.iter().enumerate() {
+        match attempt {
+            AttemptAccounting::KnownUsage(usage)
+            | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
+                let priceability = if estimate_usage(usage).is_ok() {
+                    "priceable"
+                } else {
+                    "unpriceable"
+                };
+                lines.push(format!(
+                    "attempt {}: model={} tier={} input={} cached-input={} cache-write-input={} output={} reasoning-output={} total={} ({priceability})",
+                    index + 1,
+                    usage.model,
+                    usage.service_tier.as_deref().unwrap_or("unavailable"),
+                    format_usage_value(usage.input_tokens),
+                    format_usage_value(usage.cached_input_tokens),
+                    format_usage_value(usage.cache_write_input_tokens),
+                    format_usage_value(usage.output_tokens),
+                    format_usage_value(usage.reasoning_output_tokens),
+                    format_usage_value(usage.total_tokens),
+                ));
+            }
+            AttemptAccounting::UsageUnavailable => {
+                lines.push(format!(
+                    "attempt {}: model=unavailable tier=unavailable input=unavailable cached-input=unavailable cache-write-input=unavailable output=unavailable reasoning-output=unavailable total=unavailable (unpriceable)",
+                    index + 1
+                ));
+            }
+        }
+    }
+}
+
+fn format_usage_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
+fn format_cost(label: &str, attempts: &[&AttemptAccounting]) -> String {
+    if attempts.is_empty() {
+        return format!("{label}: Unavailable (no priceable usage)");
+    }
+    match estimate_run_cost(attempts.iter().copied()) {
+        RunCostEstimate::Complete(estimate) => format_estimated_cost(label, "Complete", estimate),
+        RunCostEstimate::LowerBound(estimate) => {
+            format_estimated_cost(label, "LowerBound", estimate)
+        }
+        RunCostEstimate::Unavailable => format!("{label}: Unavailable (no priceable usage)"),
+    }
+}
+
+fn format_estimated_cost(label: &str, completeness: &str, estimate: CostEstimate) -> String {
+    let pricing = estimate.pricing();
+    format!(
+        "{label}: {completeness} {} USD ({}/{} pricing {})",
+        format_usd(estimate.amount().as_nanos()),
+        pricing.model,
+        pricing.service_tier,
+        pricing.version,
+    )
+}
+
+fn format_usd(nanodollars: u128) -> String {
+    const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
+    let dollars = nanodollars / NANODOLLARS_PER_DOLLAR;
+    let fractional = nanodollars % NANODOLLARS_PER_DOLLAR;
+    if fractional == 0 {
+        return format!("${dollars}");
+    }
+    let fractional = format!("{fractional:09}");
+    format!("${dollars}.{}", fractional.trim_end_matches('0'))
 }
 
 fn format_observation(observation: &Observation) -> String {
-    let mut text = observation.head.clone();
+    let mut text = normalise_terminal_text(&observation.head);
     if let Some(tail) = &observation.tail {
         text.push_str(&format!(
             "\n[{} lines, {} bytes omitted]\n",
             observation.omitted_lines, observation.omitted_bytes
         ));
-        text.push_str(tail);
+        text.push_str(&normalise_terminal_text(tail));
     }
-    text.trim_end_matches('\n').to_owned()
+    text
+}
+
+fn normalised_lines(lines: Vec<String>) -> String {
+    lines
+        .iter()
+        .map(|line| normalise_terminal_text(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalise_terminal_text(text: &str) -> String {
+    let mut normalised = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' if characters.peek() == Some(&'\n') => {
+                characters.next();
+                normalised.push('\n');
+            }
+            '\n' => normalised.push('\n'),
+            '\t' => normalised.push_str("    "),
+            '\r' | '\0'..='\x1f' | '\x7f' | '\u{0080}'..='\u{009f}' => {
+                normalised.push_str(&format!("\\x{:02X}", character as u32));
+            }
+            _ => normalised.push(character),
+        }
+    }
+    normalised
 }
 
 #[cfg(test)]
@@ -616,7 +1111,11 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::App;
-    use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
+    use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
+    use crate::arena::{
+        Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadOutcome,
+    };
+    use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::runtime::{
         ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeDisabledReason,
         RuntimeEvent, StoredRecord, TerminalDetails,
@@ -782,11 +1281,11 @@ mod tests {
             record: stale_record.clone(),
             progress_gap: false,
         }));
-        assert_eq!(app.records, [stale_record]);
+        assert_eq!(app.records[0].record, stale_record);
     }
 
     #[test]
-    fn current_live_progress_updates_status_until_settlement() {
+    fn transcript_current_live_progress_updates_status_until_settlement() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(3) });
         assert_eq!(app.status, "run 3 started");
@@ -829,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn stdout_progress_is_a_tui_no_op_until_transcript_projection_exists() {
+    fn transcript_rejects_stale_stdout_progress() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         app.handle_event(RuntimeEvent::ModelStepStarted {
@@ -848,7 +1347,10 @@ mod tests {
             step_id: ModelStepId(2),
         }));
         assert_eq!(app.status, status);
-        assert_eq!(app.current_step_id, Some(ModelStepId(3)));
+        assert!(matches!(
+            app.live_step,
+            Some(ref live) if live.run_id == RunId(2) && live.step_id == ModelStepId(3)
+        ));
     }
 
     #[test]
@@ -867,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_history_renders_chronologically_through_final_settlement() {
+    fn transcript_committed_history_renders_chronologically_through_final_settlement() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
         app.handle_event(RuntimeEvent::RecordAppended {
@@ -902,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_and_terminal_records_render_inspectable_content() {
+    fn transcript_completed_and_terminal_records_render_inspectable_content() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -942,7 +1444,7 @@ mod tests {
             progress_gap: false,
         });
 
-        let screen = rendered(&mut app, 60, 16);
+        let screen = super::format_history(&app);
 
         assert!(screen.contains("[run 1 step 1] code:"));
         assert!(screen.contains("print('hello')"));
@@ -954,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_scrolling_moves_between_oldest_and_newest_history() {
+    fn transcript_keyboard_scrolling_moves_between_oldest_and_newest_history() {
         let mut app = App::default();
         for run_id in 1..=8 {
             app.handle_event(RuntimeEvent::RecordAppended {
@@ -987,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_without_hidden_history_does_not_request_a_redraw() {
+    fn transcript_scrolling_without_hidden_history_does_not_request_a_redraw() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -1004,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_channels_reject_stale_runs_and_steps_and_keep_terminal_authoritative() {
+    fn transcript_progress_channels_reject_stale_runs_and_steps_and_keep_terminal_authoritative() {
         let mut app = App {
             run_state: super::RunState::Submitting,
             ..App::default()
@@ -1023,7 +1525,6 @@ mod tests {
             item: RuntimeEvent::RunStarted { run_id: RunId(2) },
             gap_before: true,
         }));
-        assert!(app.progress_gap);
         assert!(app.handle_progress(ProgressEnvelope {
             item: RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
@@ -1031,6 +1532,7 @@ mod tests {
             },
             gap_before: false,
         }));
+        assert!(matches!(app.live_step, Some(ref live) if live.progress_gap));
         assert!(!app.handle_progress(ProgressEnvelope {
             item: RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
@@ -1093,7 +1595,7 @@ mod tests {
             },
             gap_before: false,
         }));
-        assert!(app.progress_gap);
+        assert!(super::format_history(&app).contains("display gap"));
     }
 
     #[test]
@@ -1127,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_redraws_only_for_visible_changes_and_drains_events_without_a_key() {
+    fn transcript_loop_redraws_only_for_visible_changes_and_drains_events_without_a_key() {
         let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::default();
@@ -1195,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn rendering_is_stable_at_tiny_dimensions() {
+    fn transcript_rendering_is_stable_at_tiny_dimensions() {
         let mut app = App {
             prompt: "🦀".to_owned(),
             ..App::default()
@@ -1220,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_is_restored_after_initialisation_and_loop_errors() {
+    fn transcript_terminal_is_restored_after_initialisation_and_loop_errors() {
         let restored_after_init = Cell::new(false);
         let init_result = super::with_terminal::<TestBackend>(
             || Err(super::TuiError::Terminal("init failed".to_owned())),
@@ -1259,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_is_restored_during_unwind() {
+    fn transcript_terminal_is_restored_during_unwind() {
         let restored = Cell::new(false);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1275,5 +1777,643 @@ mod tests {
 
         assert!(result.is_err());
         assert!(restored.get());
+    }
+
+    fn usage(input: u64, output: u64) -> AttemptAccounting {
+        AttemptAccounting::KnownUsage(ModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(input),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(output),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(input + output),
+        })
+    }
+
+    fn terminal(
+        evidence: Option<TerminalEvidence>,
+        attempts: Vec<AttemptAccounting>,
+    ) -> TerminalDetails {
+        TerminalDetails { evidence, attempts }
+    }
+
+    fn completed_record(
+        run_id: u64,
+        step_id: u64,
+        source: &str,
+        attempts: Vec<AttemptAccounting>,
+    ) -> RuntimeEvent {
+        RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(step_id),
+                    source: source.to_owned(),
+                    execution: Execution {
+                        stdout: observation("authoritative stdout\n"),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::Complete {
+                            result: Some(observation("42")),
+                        },
+                    },
+                    attempts,
+                },
+            },
+            progress_gap: false,
+        }
+    }
+
+    #[test]
+    fn transcript_projects_reasoning_code_and_stdout_then_replaces_the_preview() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelStepStarted {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::ReasoningSummaryChunk {
+                text: "reasoning".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::DecodedPythonChunk {
+                code: "print('preview')".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ExecutionStarted {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+        });
+        app.handle_event(RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            text: "preview stdout\n".to_owned(),
+        });
+        assert!(app.handle_event(RuntimeEvent::StdoutTruncated {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+        }));
+        assert!(!app.handle_event(RuntimeEvent::StdoutTruncated {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+        }));
+
+        let preview = super::format_history(&app);
+        let reasoning = preview.find("reasoning: reasoning").unwrap();
+        let code = preview.find("print('preview')").unwrap();
+        let stdout = preview.find("preview stdout").unwrap();
+        assert!(reasoning < code && code < stdout);
+        assert_eq!(preview.matches("stdout preview truncated").count(), 1);
+
+        assert!(app.handle_event(completed_record(1, 1, "print('authoritative')", vec![])));
+        let history = super::format_history(&app);
+        assert!(history.contains("print('authoritative')"));
+        assert_eq!(history.matches("authoritative stdout").count(), 1);
+        assert!(!history.contains("print('preview')"));
+        assert!(!history.contains("preview stdout"));
+    }
+
+    #[test]
+    fn transcript_retry_reset_keeps_settled_attempt_accounting_and_gap() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptStarted { attempt: 1 },
+            },
+            gap_before: true,
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::ReasoningSummaryChunk {
+                text: "discarded reasoning".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::DecodedPythonChunk {
+                code: "discarded_code()".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: usage(100, 0),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AttemptStarted { attempt: 2 },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "retained answer".to_owned(),
+            },
+        });
+
+        let history = super::format_history(&app);
+        assert!(!history.contains("discarded reasoning"));
+        assert!(!history.contains("discarded_code()"));
+        assert!(history.contains("retained answer"));
+        assert!(history.contains("attempt 1: model=gpt-5.6-sol"));
+        assert!(history.contains("display gap"));
+    }
+
+    #[test]
+    fn transcript_attaches_gaps_only_to_current_live_or_committed_content() {
+        let mut app = App::default();
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(1) },
+            gap_before: true,
+        });
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            gap_before: false,
+        });
+        assert!(super::format_history(&app).contains("display gap"));
+
+        app.handle_event(completed_record(1, 1, "done", vec![]));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "stale".to_owned(),
+                },
+            },
+            gap_before: true,
+        }));
+        assert!(!super::format_history(&app).contains("stale"));
+        assert!(!super::format_history(&app).contains("display gap"));
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(2),
+                    text: "settled".to_owned(),
+                    terminal: terminal(None, vec![]),
+                },
+            },
+            progress_gap: true,
+        });
+        let history = super::format_history(&app);
+        assert!(history.contains("settled"));
+        assert!(history.contains("display gap"));
+
+        let mut next_run = App::default();
+        next_run.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(1) },
+            gap_before: true,
+        });
+        next_run.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::CancelledRun {
+                    terminal: terminal(None, vec![]),
+                },
+            },
+            progress_gap: false,
+        });
+        next_run.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
+        next_run.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(2) },
+            gap_before: false,
+        });
+        next_run.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(2),
+            },
+            gap_before: false,
+        });
+        assert!(matches!(next_run.live_step, Some(ref live) if !live.progress_gap));
+    }
+
+    #[test]
+    fn transcript_rejects_stale_steps_and_post_settlement_progress_without_dirtying() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        app.handle_event(RuntimeEvent::ModelStepStarted {
+            run_id: RunId(2),
+            step_id: ModelStepId(2),
+        });
+        assert!(!app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(2),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "old step".to_owned(),
+            },
+        }));
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::CancelledRun {
+                    terminal: terminal(None, vec![]),
+                },
+            },
+            progress_gap: false,
+        });
+        assert!(!super::format_history(&app).contains("[run 2 step 2] live"));
+        assert!(!app.handle_event(RuntimeEvent::StdoutDelta {
+            run_id: RunId(2),
+            step_id: ModelStepId(3),
+            text: "late stdout".to_owned(),
+        }));
+        assert!(!super::format_history(&app).contains("old step"));
+        assert!(!super::format_history(&app).contains("late stdout"));
+    }
+
+    #[test]
+    fn transcript_renders_completed_and_interrupted_evidence_variants() {
+        let mut app = App::default();
+        app.handle_event(completed_record(1, 1, "result = 42", vec![]));
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(2),
+                    source: "raise RuntimeError()".to_owned(),
+                    execution: Execution {
+                        stdout: observation(""),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::PythonError(PythonError {
+                            text: "boom".to_owned(),
+                            omitted_bytes: 0,
+                        }),
+                    },
+                    attempts: vec![],
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(3),
+                record: Record::CancelledRun {
+                    terminal: terminal(
+                        Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            source: "await read(path)".to_owned(),
+                            began: true,
+                            stdout: observation("before\n"),
+                            stderr: observation("diagnostic\n"),
+                            read: InterruptedRead::Completed {
+                                path: "bad\tpath".to_owned(),
+                                outcome: ReadOutcome::Failure {
+                                    message: "read failed".to_owned(),
+                                },
+                            },
+                            failure: Some(ExecutionFailure::Arena {
+                                message: "interrupted".to_owned(),
+                            }),
+                            cancellation_warning: Some("cancelled warning".to_owned()),
+                        }))),
+                        vec![],
+                    ),
+                },
+            },
+            progress_gap: false,
+        });
+
+        let history = super::format_history(&app);
+        assert!(history.contains("result: 42"));
+        assert!(history.contains("error: boom"));
+        assert!(!history.contains("stderr: \n"));
+        assert!(history.contains("source: await read(path)"));
+        assert!(history.contains("stderr: diagnostic"));
+        assert!(history.contains("read: completed bad    path failed: read failed"));
+        assert!(history.contains("failure: interrupted"));
+        assert!(history.ends_with("warning: cancelled warning"));
+
+        let mut generation = App::default();
+        generation.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(4),
+                record: Record::CancelledRun {
+                    terminal: terminal(
+                        Some(TerminalEvidence::Generation(GenerationEvidence {
+                            reasoning: "interrupted reasoning".to_owned(),
+                            assistant_text: "interrupted assistant".to_owned(),
+                            decoded_python: "interrupted_code()".to_owned(),
+                        })),
+                        vec![],
+                    ),
+                },
+            },
+            progress_gap: false,
+        });
+        let generation_history = super::format_history(&generation);
+        assert!(generation_history.contains("reasoning: interrupted reasoning"));
+        assert!(generation_history.contains("assistant: interrupted assistant"));
+        assert!(generation_history.contains("code:\ninterrupted_code()"));
+    }
+
+    #[test]
+    fn transcript_keeps_final_messages_after_prior_executions() {
+        let mut app = App::default();
+        app.handle_event(completed_record(1, 1, "first()", vec![]));
+        app.handle_event(completed_record(1, 2, "second()", vec![]));
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(3),
+                    text: "final answer".to_owned(),
+                    terminal: terminal(None, vec![]),
+                },
+            },
+            progress_gap: false,
+        });
+
+        let history = super::format_history(&app);
+        assert!(history.find("first()").unwrap() < history.find("second()").unwrap());
+        assert!(history.find("second()").unwrap() < history.find("final answer").unwrap());
+    }
+
+    #[test]
+    fn transcript_renders_per_step_and_cumulative_costs_without_double_counting() {
+        let mut app = App::default();
+        app.handle_event(completed_record(1, 1, "first()", vec![usage(100, 0)]));
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(2),
+                    text: "done".to_owned(),
+                    terminal: terminal(
+                        None,
+                        vec![
+                            usage(100, 0),
+                            AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
+                                model: "gpt-5.6-sol".to_owned(),
+                                service_tier: Some("default".to_owned()),
+                                input_tokens: Some(0),
+                                cached_input_tokens: Some(0),
+                                cache_write_input_tokens: Some(0),
+                                output_tokens: Some(100),
+                                reasoning_output_tokens: Some(20),
+                                total_tokens: Some(100),
+                            }),
+                        ],
+                    ),
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::FailedRun {
+                    message: "unpriced".to_owned(),
+                    terminal: terminal(None, vec![AttemptAccounting::UsageUnavailable]),
+                },
+            },
+            progress_gap: false,
+        });
+
+        let history = super::format_history(&app);
+        assert_eq!(history.matches("attempt 1: model=gpt-5.6-sol").count(), 2);
+        assert!(history.contains("Step estimated cost: Complete $0.0004 USD"));
+        assert!(history.contains("Step estimated cost: LowerBound $0.002 USD"));
+        assert!(history.contains("Run estimated cost: LowerBound $0.0024 USD"));
+        assert!(history.contains("Step estimated cost: Unavailable"));
+        assert!(history.contains("Run estimated cost: Unavailable"));
+        assert!(!history.contains("Unavailable $0"));
+
+        let mut active = App::default();
+        active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(3) });
+        active.handle_event(completed_record(3, 3, "prior()", vec![usage(100, 0)]));
+        active.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(3),
+            step_id: ModelStepId(4),
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: usage(0, 100),
+            },
+        });
+        assert!(
+            super::format_history(&active).contains("Run estimated cost: Complete $0.0024 USD")
+        );
+    }
+
+    #[test]
+    fn transcript_following_bottom_and_manual_scroll_survive_live_replacement() {
+        let mut app = App::default();
+        for step in 1..=4 {
+            app.handle_event(completed_record(1, step, &format!("line_{step}"), vec![]));
+        }
+        rendered(&mut app, 50, 5);
+        assert_eq!(app.scroll_from_bottom, 0);
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(2),
+            step_id: ModelStepId(5),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "live".to_owned(),
+            },
+        });
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
+        let manual_scroll = app.scroll_from_bottom;
+        app.handle_event(completed_record(2, 5, "settled", vec![]));
+        assert_eq!(app.scroll_from_bottom, manual_scroll);
+    }
+
+    #[test]
+    fn transcript_live_changes_dirty_once_and_keeps_tiny_and_restore_behaviour() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        let event = RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "once".to_owned(),
+            },
+        };
+        assert!(app.handle_event(event.clone()));
+        assert!(!app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: String::new(),
+            },
+        }));
+
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (3, 3)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+        }
+        let restored = Cell::new(false);
+        let _ = super::with_terminal(
+            || {
+                Terminal::new(TestBackend::new(10, 3))
+                    .map_err(|error| super::TuiError::Terminal(error.to_string()))
+            },
+            || restored.set(true),
+            |_| Ok(()),
+        );
+        assert!(restored.get());
+    }
+
+    #[test]
+    fn normalise_exhaustively_escapes_terminal_controls() {
+        let c0 = (0_u8..=0x1f).map(char::from).collect::<String>();
+        let c1 = (0x80_u8..=0x9f).map(char::from).collect::<String>();
+        let input =
+            format!("lf\ncrlf\r\ntab\tlone\r{c0}{c1}\x7f\x1b]title\x07\u{009d}wide\u{009c}é🦀");
+        let expected_c0 = (0_u8..=0x1f)
+            .map(|value| match value {
+                b'\n' => "\n".to_owned(),
+                b'\t' => "    ".to_owned(),
+                _ => format!("\\x{value:02X}"),
+            })
+            .collect::<String>();
+        let expected_c1 = (0x80_u8..=0x9f)
+            .map(|value| format!("\\x{value:02X}"))
+            .collect::<String>();
+        let expected = format!(
+            "lf\ncrlf\ntab    lone\\x0D{expected_c0}{expected_c1}\\x7F\\x1B]title\\x07\\x9Dwide\\x9Cé🦀"
+        );
+
+        assert_eq!(super::normalise_terminal_text(&input), expected);
+    }
+
+    #[test]
+    fn normalise_fragmented_crlf_and_hostile_projection_have_no_executable_controls() {
+        let mut app = App {
+            prompt: "prompt\r\n\t\x1b]title\x07".to_owned(),
+            status: "status\u{009d}unsafe".to_owned(),
+            ..App::default()
+        };
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.status = "status\u{009d}unsafe".to_owned();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "user\trequest".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "provider\r".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "\ntext\x1b]payload\x07".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::DecodedPythonChunk {
+                code: "code\x7f".to_owned(),
+            },
+        });
+        app.handle_event(RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            text: "stdout\u{0085}".to_owned(),
+        });
+        app.handle_event(RuntimeEvent::ToolStarted {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            path: "path\r".to_owned(),
+        });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::FailedRun {
+                    message: "error\x1b".to_owned(),
+                    terminal: terminal(
+                        Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            source: "source\x1b".to_owned(),
+                            began: true,
+                            stdout: observation("terminal stdout\u{009f}"),
+                            stderr: observation(""),
+                            read: InterruptedRead::Pending {
+                                path: "terminal path\t".to_owned(),
+                            },
+                            failure: Some(ExecutionFailure::Arena {
+                                message: "failure\r".to_owned(),
+                            }),
+                            cancellation_warning: None,
+                        }))),
+                        vec![AttemptAccounting::KnownUsage(ModelUsage {
+                            model: "model\x1b".to_owned(),
+                            service_tier: Some("tier\u{0080}".to_owned()),
+                            input_tokens: Some(0),
+                            cached_input_tokens: Some(0),
+                            cache_write_input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            reasoning_output_tokens: Some(0),
+                            total_tokens: Some(0),
+                        })],
+                    ),
+                },
+            },
+            progress_gap: false,
+        });
+
+        let history = super::format_history(&app);
+        assert!(history.contains("user    request"));
+        assert!(matches!(
+            &app.records[0].record.record,
+            Record::UserRequest { request } if request == "user\trequest"
+        ));
+        assert_eq!(app.prompt, "prompt\r\n\t\x1b]title\x07");
+        assert!(matches!(
+            app.live_step,
+            Some(ref live) if live.assistant_text == "provider\r\ntext\x1b]payload\x07"
+        ));
+        assert!(history.contains("provider\ntext\\x1B]payload\\x07"));
+        assert!(history.contains("code\\x7F"));
+        assert!(history.contains("stdout\\x85"));
+        assert!(history.contains("path\\x0D"), "{history}");
+        assert!(history.contains("source\\x1B"));
+        assert!(history.contains("terminal stdout\\x9F"));
+        assert!(history.contains("failure\\x0D"));
+        assert!(history.contains("terminal path    "));
+        assert!(history.contains("error\\x1B"));
+        assert!(history.contains("model=model\\x1B"));
+        assert!(history.contains("tier=tier\\x80"));
+
+        app.status = "status\u{009d}unsafe".to_owned();
+        let screen = rendered(&mut app, 120, 30);
+        assert!(screen.contains("status\\x9Dunsafe"));
+        assert!(screen.contains("prompt"));
+        assert!(!screen.chars().any(|character| {
+            matches!(character, '\u{1b}' | '\u{7f}') || character.is_control() && character != '\n'
+        }));
     }
 }

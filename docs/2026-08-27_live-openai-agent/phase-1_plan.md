@@ -233,7 +233,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/tui.rs`, projection/rendering) — First fail on a reasoning/code/stdout sequence. Then cover chronological updates, retry reset, progress-gap display, same-run stale-step and post-settlement rejection, completed and interrupted terminal replacement, final message below executions, per-step and cumulative complete/lower-bound/unavailable cost rows, follow-at-bottom versus preserved manual scroll, dirty-only redraws, tiny terminals, and terminal restoration. Exhaustively test LF/CRLF, four-space tabs, lone CR, C0/C1, ESC/OSC, and DEL once, plus one hostile projection fixture covering user, provider, source, stdout, error, path, and usage strings. Configuration rendering is tested in Task 16.
 
-**Files** — Modify: `src/tui.rs`, `src/runtime.rs`
+**Files** — Modify: `src/tui.rs`
 
 **Commit** — `Project plain streaming transcript`
 
