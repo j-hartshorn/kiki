@@ -16,8 +16,8 @@ use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, Submissio
 use crate::model::{AttemptAccounting, ModelProgress};
 use crate::pricing::{CostEstimate, RunCostEstimate, estimate_run_cost, estimate_usage};
 use crate::runtime::{
-    ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent,
-    RuntimeProgressReceiver, StoredRecord, TerminalDetails,
+    ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeDisabledReason,
+    RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails,
 };
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -86,6 +86,15 @@ impl LivePhase {
     }
 }
 
+fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
+    match reason {
+        RuntimeDisabledReason::OpenAiAuthentication => "OpenAI authentication failed; restart Kiki",
+        RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
+            "Arena recovery failed; restart Kiki"
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveStep {
     run_id: RunId,
@@ -126,6 +135,7 @@ struct App {
     mode: AppMode,
     prompt: String,
     run_state: RunState,
+    disabled_reason: Option<RuntimeDisabledReason>,
     latest_run_id: Option<RunId>,
     settled_run_ids: Vec<RunId>,
     completed_steps: Vec<(RunId, ModelStepId)>,
@@ -144,6 +154,7 @@ impl Default for App {
             mode: AppMode::Configured,
             prompt: String::new(),
             run_state: RunState::Idle,
+            disabled_reason: None,
             latest_run_id: None,
             settled_run_ids: Vec::new(),
             completed_steps: Vec::new(),
@@ -184,6 +195,10 @@ impl App {
         self.mode == AppMode::ConfigurationOnly
     }
 
+    fn is_submission_disabled(&self) -> bool {
+        self.is_configuration_only() || self.disabled_reason.is_some()
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Update {
         if key.is_release() {
             return Update::default();
@@ -217,7 +232,7 @@ impl App {
                 };
                 self.update_scroll(scroll)
             }
-            _ if self.is_configuration_only() => Update::default(),
+            _ if self.is_submission_disabled() => Update::default(),
             KeyCode::Esc if self.run_state != RunState::Idle => Update {
                 command: Some(RuntimeCommand::Cancel),
                 visible_changed: false,
@@ -242,7 +257,11 @@ impl App {
                     quit: false,
                 }
             }
-            KeyCode::Enter if self.run_state == RunState::Idle && !self.prompt.is_empty() => {
+            KeyCode::Enter
+                if self.disabled_reason.is_none()
+                    && self.run_state == RunState::Idle
+                    && !self.prompt.is_empty() =>
+            {
                 self.run_state = RunState::Submitting;
                 self.status = "starting run".to_owned();
                 Update {
@@ -374,8 +393,9 @@ impl App {
             } => self.append_record(record, progress_gap),
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
-                if self.run_state == RunState::Submitting
-                    || self.run_state == RunState::Active(active_run_id) =>
+                if self.disabled_reason.is_none()
+                    && (self.run_state == RunState::Submitting
+                        || self.run_state == RunState::Active(active_run_id)) =>
             {
                 self.latest_run_id = Some(
                     self.latest_run_id
@@ -384,14 +404,25 @@ impl App {
                 self.run_state = RunState::Active(active_run_id);
                 self.set_status(format!("run {} is busy", active_run_id.0))
             }
-            RuntimeEvent::SubmissionRejectedBusy { .. }
-            | RuntimeEvent::RuntimeDisabled { .. }
-            | RuntimeEvent::SubmissionRejectedDisabled { .. } => false,
+            RuntimeEvent::RuntimeDisabled { reason } => self.disable(reason, false),
+            RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
+            RuntimeEvent::SubmissionRejectedBusy { .. } => false,
         }
     }
 
+    fn disable(&mut self, reason: RuntimeDisabledReason, clear_submitting: bool) -> bool {
+        let reason_changed = self.disabled_reason.as_ref() != Some(&reason);
+        self.disabled_reason = Some(reason.clone());
+        let submitting_cleared = clear_submitting && self.run_state == RunState::Submitting;
+        if submitting_cleared {
+            self.run_state = RunState::Idle;
+        }
+        reason_changed | submitting_cleared | self.set_status(disabled_status(&reason).to_owned())
+    }
+
     fn start_run(&mut self, run_id: RunId, gap_before: bool) -> bool {
-        if self.is_terminal_run(run_id)
+        if self.disabled_reason.is_some()
+            || self.is_terminal_run(run_id)
             || matches!(self.run_state, RunState::Active(_))
             || self
                 .latest_run_id
@@ -453,7 +484,8 @@ impl App {
     }
 
     fn accepts_live_step(&self, run_id: RunId, step_id: ModelStepId) -> bool {
-        if self.is_terminal_run(run_id)
+        if self.disabled_reason.is_some()
+            || self.is_terminal_run(run_id)
             || self
                 .latest_run_id
                 .is_some_and(|latest_run_id| run_id < latest_run_id)
@@ -479,6 +511,9 @@ impl App {
     }
 
     fn activate_progress_run(&mut self, run_id: RunId) -> bool {
+        if self.disabled_reason.is_some() {
+            return false;
+        }
         match self.run_state {
             RunState::Active(_) => false,
             RunState::Submitting | RunState::Idle => {
@@ -531,8 +566,9 @@ impl App {
         }
         self.latest_run_id = Some(run_id);
         self.mark_terminal_run(run_id);
+        let state_changed = self.run_state != RunState::Idle;
         self.run_state = RunState::Idle;
-        self.set_status("idle".to_owned())
+        state_changed | (self.disabled_reason.is_none() && self.set_status("idle".to_owned()))
     }
 
     fn mark_terminal_run(&mut self, run_id: RunId) {
@@ -772,6 +808,11 @@ fn render(frame: &mut Frame, app: &mut App) {
     let header = if configuration_only {
         "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
             .to_owned()
+    } else if app.disabled_reason.is_some() {
+        format!(
+            "Status: {} | Input disabled | Ctrl-C quit | Up/Down scroll",
+            normalise_terminal_text(&app.status)
+        )
     } else {
         format!(
             "Status: {} | Enter submit | Esc cancel | Ctrl-C quit | Up/Down scroll",
@@ -1614,18 +1655,91 @@ mod tests {
     }
 
     #[test]
-    fn disabled_runtime_events_do_not_change_tui_state_before_disabled_controls_exist() {
-        let mut app = App::default();
-        let previous_status = app.status.clone();
+    fn disabled_authentication_stays_sticky_and_rejects_late_progress() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FailedRun {
+                    message: "provider error".to_owned(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
 
-        assert!(!app.handle_event(RuntimeEvent::RuntimeDisabled {
+        assert!(app.handle_event(RuntimeEvent::RuntimeDisabled {
             reason: RuntimeDisabledReason::OpenAiAuthentication,
         }));
-        assert!(!app.handle_event(RuntimeEvent::SubmissionRejectedDisabled {
-            reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
-        }));
-        assert_eq!(app.status, previous_status);
+        assert_eq!(app.status, "OpenAI authentication failed; restart Kiki");
+        assert!(rendered(&mut app, 120, 15).contains("Input disabled"));
+        assert!(app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) }));
         assert_eq!(app.run_state, super::RunState::Idle);
+        assert_eq!(app.status, "OpenAI authentication failed; restart Kiki");
+
+        app.prompt = "saved prompt".to_owned();
+        assert!(!app.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert_eq!(app.prompt, "saved prompt");
+        assert!(app.handle_key(key(KeyCode::Enter)).command.is_none());
+        assert_eq!(app.prompt, "saved prompt");
+        let shutdown = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(shutdown.command, Some(RuntimeCommand::Shutdown));
+        assert!(shutdown.quit);
+
+        let records = app.records.clone();
+        let status = app.status.clone();
+        for event in [
+            RuntimeEvent::RunStarted { run_id: RunId(2) },
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: RunId(1),
+            },
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "late model".to_owned(),
+                },
+            },
+            RuntimeEvent::ToolStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                path: "late tool".to_owned(),
+            },
+            RuntimeEvent::StdoutDelta {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                text: "late stdout".to_owned(),
+            },
+        ] {
+            assert!(!app.handle_event(event));
+        }
+        assert_eq!(app.status, status);
+        assert!(app.live_step.is_none());
+        assert!(!app.pending_run_gap);
+        assert_eq!(app.records, records);
+        assert!(super::format_history(&app).contains("Submission: available"));
+
+        let mut rejected = App {
+            prompt: "submit".to_owned(),
+            ..App::default()
+        };
+        assert!(matches!(
+            rejected.handle_key(key(KeyCode::Enter)).command,
+            Some(RuntimeCommand::Submit { .. })
+        ));
+        assert_eq!(rejected.run_state, super::RunState::Submitting);
+        assert!(
+            rejected.handle_event(RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            })
+        );
+        assert_eq!(rejected.run_state, super::RunState::Idle);
+        assert_eq!(rejected.status, "Arena recovery failed; restart Kiki");
     }
 
     #[test]

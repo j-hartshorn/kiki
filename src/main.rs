@@ -16,20 +16,28 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::arena::Arena;
-use crate::model::ScriptedModel;
+use crate::openai::OpenAiModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
 use crate::tools::ReadTool;
 
+fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
+    OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let configuration = config::load();
-    let Some((worker_path, workspace_root)) = configuration.ready().map(|ready| {
-        (
-            ready.worker_path().to_path_buf(),
-            ready.workspace_root().to_path_buf(),
-        )
-    }) else {
+    let startup_inputs = {
+        configuration.ready().map(|ready| {
+            (
+                ready.worker_path().to_path_buf(),
+                ready.workspace_root().to_path_buf(),
+                production_model(&ready),
+            )
+        })
+    };
+    let Some((worker_path, workspace_root, model)) = startup_inputs else {
         return Ok(tui::run_configuration(configuration.snapshot().clone())?);
     };
 
@@ -49,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let startup = configuration.snapshot().clone();
-    let controller = RuntimeController::new(Agent::new(arena, ScriptedModel::default()));
+    let controller = RuntimeController::new(Agent::new(arena, model));
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =
@@ -68,4 +76,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     tui_result?;
     controller_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::production_model;
+    use crate::config::ReadyStartup;
+    use crate::openai::OpenAiModel;
+
+    #[test]
+    fn production_model_composition_is_openai() {
+        let _: for<'a> fn(&ReadyStartup<'a>) -> OpenAiModel = production_model;
+    }
 }

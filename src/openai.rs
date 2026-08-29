@@ -1557,7 +1557,7 @@ mod tests {
     use std::time::Duration;
 
     use async_openai::Client;
-    use async_openai::config::OpenAIConfig;
+    use async_openai::config::{Config, OPENAI_API_BASE, OpenAIConfig};
     use async_openai::error::OpenAIError;
     use async_openai::middleware::ReqwestService;
     use futures::StreamExt;
@@ -1593,6 +1593,19 @@ mod tests {
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"first\"}\n\n",
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"second\"}\n\n",
     );
+
+    #[test]
+    fn standard_constructor_uses_only_the_fixed_openai_configuration() {
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+
+        assert_eq!(model.prompt, "system prompt");
+        assert_eq!(model.model, super::FIXED_MODEL);
+        assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
+        assert_eq!(
+            model.client.config().url("/responses"),
+            format!("{OPENAI_API_BASE}/responses")
+        );
+    }
 
     #[derive(Clone)]
     enum FixtureReply {
