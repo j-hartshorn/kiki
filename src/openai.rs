@@ -1564,9 +1564,9 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{Instant, sleep, sleep_until, timeout};
 
     use super::{WireEvent, WireStatus, WireStream, openai_config};
 
@@ -4512,6 +4512,686 @@ mod tests {
                 assert_eq!(fixture.request_count(), 0, "{case}");
                 assert_eq!(failure.error(), &expected, "{case}");
             }
+        }
+    }
+
+    const LIVE_OUTER_TIMEOUT: Duration = Duration::from_secs(300);
+    const LIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+    const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
+    const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+    const LIVE_SETUP_CONFIGURATION: &str =
+        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.21";
+    const LIVE_SETUP_READ_TOOL: &str =
+        "live test could not initialise the workspace read capability";
+    const LIVE_SETUP_ARENA: &str = "live test could not initialise the Monty arena";
+    const LIVE_COMMAND: &str = "live test could not send a runtime command";
+    const LIVE_EVENT_CHANNEL_CLOSED: &str = "live runtime event channels closed before settlement";
+    const LIVE_PROVIDER_DEADLINE: &str = "live provider attempt exceeded its two-minute deadline";
+    const LIVE_OUTER_DEADLINE: &str = "live scenario exceeded its five-minute deadline";
+    const LIVE_STEP_LIMIT: &str = "live first run exceeded eight model steps";
+    const LIVE_FIRST_SETTLEMENT: &str = "live first run did not settle correctly";
+    const LIVE_SECOND_START: &str = "live cancellation run did not start an OpenAI attempt";
+    const LIVE_SECOND_SETTLEMENT: &str = "live cancellation run did not settle correctly";
+    const LIVE_THIRD_SETTLEMENT: &str = "live follow-up run did not settle correctly";
+    const LIVE_CLEANUP_SHUTDOWN: &str = "live test could not request runtime shutdown";
+    const LIVE_CLEANUP_CONTROLLER: &str = "live runtime controller stopped unexpectedly";
+    const LIVE_CLEANUP_TIMEOUT_MESSAGE: &str =
+        "live runtime controller did not stop within ten seconds";
+    const LIVE_RECORDS: &str = "live runtime records did not match the scenario";
+    const FIRST_REQUEST: &str = "Work through this exact sequence before replying. Use at least two separate execute_python steps. First successfully execute `lines = await read(\"README.md\")` and retain the returned lines in the persistent arena. In a later separate step, use `lines` and print only a focused, non-empty selection. Do not combine those Python steps. After both executions complete, provide a concise nonblank final answer.";
+    const CANCELLATION_REQUEST: &str = "Begin this request with execute_python and do not send a final message before starting that work.";
+    const FOLLOW_UP_REQUEST: &str = "Provide a concise nonblank final response confirming that you can continue after the cancelled request.";
+
+    struct LiveController {
+        commands: mpsc::Sender<crate::runtime::RuntimeCommand>,
+        events: mpsc::UnboundedReceiver<crate::runtime::RuntimeEvent>,
+        progress: mpsc::Receiver<crate::runtime::ProgressEnvelope<crate::runtime::RuntimeEvent>>,
+        controller: JoinHandle<Vec<crate::runtime::StoredRecord>>,
+        events_open: bool,
+        progress_open: bool,
+    }
+
+    struct LiveRun {
+        run_id: crate::runtime::RunId,
+        steps: Vec<crate::runtime::ModelStepId>,
+        completed_executions: usize,
+        successful_read: bool,
+        final_messages: usize,
+        nonblank_final_messages: usize,
+        cancelled_runs: usize,
+        failed_runs: usize,
+        streamed_content: bool,
+        settled: usize,
+        attempts_started: usize,
+        attempts_settled: usize,
+        attempt_open: bool,
+    }
+
+    impl LiveRun {
+        fn new(run_id: crate::runtime::RunId) -> Self {
+            Self {
+                run_id,
+                steps: Vec::new(),
+                completed_executions: 0,
+                successful_read: false,
+                final_messages: 0,
+                nonblank_final_messages: 0,
+                cancelled_runs: 0,
+                failed_runs: 0,
+                streamed_content: false,
+                settled: 0,
+                attempts_started: 0,
+                attempts_settled: 0,
+                attempt_open: false,
+            }
+        }
+
+        fn add_step(&mut self, step_id: crate::runtime::ModelStepId) {
+            if !self.steps.contains(&step_id) {
+                self.steps.push(step_id);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveCollector {
+        runs: Vec<LiveRun>,
+        provider_attempt: Option<(crate::runtime::RunId, Instant)>,
+        disabled_events: usize,
+    }
+
+    impl LiveCollector {
+        fn run_mut(&mut self, run_id: crate::runtime::RunId) -> &mut LiveRun {
+            if let Some(index) = self.runs.iter().position(|run| run.run_id == run_id) {
+                return &mut self.runs[index];
+            }
+            let index = self.runs.len();
+            self.runs.push(LiveRun::new(run_id));
+            &mut self.runs[index]
+        }
+
+        fn run(&self, run_id: crate::runtime::RunId) -> Option<&LiveRun> {
+            self.runs.iter().find(|run| run.run_id == run_id)
+        }
+
+        fn observe(&mut self, event: &crate::runtime::RuntimeEvent) {
+            use crate::model::ModelProgress;
+            use crate::runtime::{Record, RuntimeEvent};
+
+            match event {
+                RuntimeEvent::ModelProgress {
+                    run_id, step_id, ..
+                }
+                | RuntimeEvent::ExecutionStarted { run_id, step_id }
+                | RuntimeEvent::ToolStarted {
+                    run_id, step_id, ..
+                }
+                | RuntimeEvent::ToolFinished {
+                    run_id, step_id, ..
+                }
+                | RuntimeEvent::StdoutDelta {
+                    run_id, step_id, ..
+                }
+                | RuntimeEvent::StdoutTruncated { run_id, step_id } => {
+                    self.run_mut(*run_id).add_step(*step_id);
+                }
+                _ => {}
+            }
+
+            match event {
+                RuntimeEvent::RunStarted { run_id } => {
+                    self.run_mut(*run_id);
+                }
+                RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+                    self.run_mut(*run_id).add_step(*step_id);
+                }
+                RuntimeEvent::ModelProgress {
+                    run_id, progress, ..
+                } => match progress {
+                    ModelProgress::AttemptStarted { .. } => {
+                        let run = self.run_mut(*run_id);
+                        run.attempts_started += 1;
+                        run.attempt_open = true;
+                        self.provider_attempt =
+                            Some((*run_id, Instant::now() + LIVE_PROVIDER_TIMEOUT));
+                    }
+                    ModelProgress::AttemptSettled { .. } => {
+                        let run = self.run_mut(*run_id);
+                        run.attempts_settled += 1;
+                        run.attempt_open = false;
+                        if self
+                            .provider_attempt
+                            .is_some_and(|(current_run_id, _)| current_run_id == *run_id)
+                        {
+                            self.provider_attempt = None;
+                        }
+                    }
+                    ModelProgress::ReasoningSummaryChunk { text }
+                    | ModelProgress::AssistantTextChunk { text } => {
+                        self.run_mut(*run_id).streamed_content |= !text.is_empty();
+                    }
+                    ModelProgress::DecodedPythonChunk { code } => {
+                        self.run_mut(*run_id).streamed_content |= !code.is_empty();
+                    }
+                },
+                RuntimeEvent::ToolFinished {
+                    run_id,
+                    path,
+                    outcome,
+                    ..
+                } => {
+                    if path == "README.md"
+                        && matches!(outcome, crate::arena::ReadOutcome::Success { .. })
+                    {
+                        self.run_mut(*run_id).successful_read = true;
+                    }
+                }
+                RuntimeEvent::RecordAppended { record, .. } => {
+                    let run = self.run_mut(record.run_id);
+                    match &record.record {
+                        Record::UserRequest { .. } => {}
+                        Record::CompletedExecution { step_id, .. } => {
+                            run.add_step(*step_id);
+                            run.completed_executions += 1;
+                        }
+                        Record::FinalMessage { step_id, text, .. } => {
+                            run.add_step(*step_id);
+                            run.final_messages += 1;
+                            run.nonblank_final_messages += usize::from(!text.trim().is_empty());
+                        }
+                        Record::CancelledRun { .. } => run.cancelled_runs += 1,
+                        Record::FailedRun { .. } => run.failed_runs += 1,
+                    }
+                }
+                RuntimeEvent::RunSettled { run_id } => {
+                    self.run_mut(*run_id).settled += 1;
+                }
+                RuntimeEvent::RuntimeDisabled { .. }
+                | RuntimeEvent::SubmissionRejectedDisabled { .. } => {
+                    self.disabled_events += 1;
+                }
+                RuntimeEvent::ExecutionStarted { .. }
+                | RuntimeEvent::ToolStarted { .. }
+                | RuntimeEvent::StdoutDelta { .. }
+                | RuntimeEvent::StdoutTruncated { .. }
+                | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
+            }
+        }
+
+        fn drain_ready(&mut self, controller: &mut LiveController) {
+            while let Ok(event) = controller.events.try_recv() {
+                self.observe(&event);
+            }
+            while let Ok(envelope) = controller.progress.try_recv() {
+                self.observe(&envelope.item);
+            }
+        }
+
+        fn deadline(&self, outer_deadline: Instant) -> (Instant, &'static str) {
+            match self.provider_attempt {
+                Some((_, deadline)) if deadline <= outer_deadline => {
+                    (deadline, LIVE_PROVIDER_DEADLINE)
+                }
+                _ => (outer_deadline, LIVE_OUTER_DEADLINE),
+            }
+        }
+
+        async fn next(
+            &mut self,
+            controller: &mut LiveController,
+            outer_deadline: Instant,
+        ) -> Result<Option<crate::runtime::RuntimeEvent>, &'static str> {
+            loop {
+                if !controller.events_open && !controller.progress_open {
+                    return Err(LIVE_EVENT_CHANNEL_CLOSED);
+                }
+                let (deadline, timeout_message) = self.deadline(outer_deadline);
+                tokio::select! {
+                    event = controller.events.recv(), if controller.events_open => match event {
+                        Some(event) => {
+                            self.observe(&event);
+                            return Ok(Some(event));
+                        }
+                        None => controller.events_open = false,
+                    },
+                    envelope = controller.progress.recv(), if controller.progress_open => match envelope {
+                        Some(envelope) => {
+                            let event = envelope.item;
+                            self.observe(&event);
+                            return Ok(None);
+                        }
+                        None => controller.progress_open = false,
+                    },
+                    _ = sleep_until(deadline) => return Err(timeout_message),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_collector_counts_step_from_progress_once() {
+        let run_id = crate::runtime::RunId(1);
+        let progress = crate::runtime::RuntimeEvent::ModelProgress {
+            run_id,
+            step_id: crate::runtime::ModelStepId(1),
+            progress: crate::model::ModelProgress::AssistantTextChunk {
+                text: "progress".to_owned(),
+            },
+        };
+        let mut collector = LiveCollector::default();
+
+        collector.observe(&progress);
+        collector.observe(&progress);
+
+        assert_eq!(
+            collector.run(run_id).unwrap().steps,
+            [crate::runtime::ModelStepId(1)]
+        );
+    }
+
+    struct LiveScenario {
+        first_run_id: crate::runtime::RunId,
+        second_run_id: crate::runtime::RunId,
+        third_run_id: crate::runtime::RunId,
+    }
+
+    async fn start_live_controller() -> Result<LiveController, &'static str> {
+        let configuration = crate::config::load();
+        let (worker_path, workspace_root, model) = {
+            let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
+            (
+                ready.worker_path().to_path_buf(),
+                ready.workspace_root().to_path_buf(),
+                super::OpenAiModel::new(ready.system_prompt(), ready.api_key().expose()),
+            )
+        };
+        let read_tool = crate::tools::ReadTool::new(workspace_root)
+            .await
+            .map_err(|_| LIVE_SETUP_READ_TOOL)?;
+        let arena = crate::arena::Arena::new(worker_path, read_tool)
+            .await
+            .map_err(|_| LIVE_SETUP_ARENA)?;
+        let runtime =
+            crate::runtime::RuntimeController::new(crate::agent::Agent::new(arena, model));
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (event_sender, events) = mpsc::unbounded_channel();
+        let (progress_sender, progress) = mpsc::channel(256);
+        let controller = tokio::spawn(runtime.run(command_receiver, event_sender, progress_sender));
+        Ok(LiveController {
+            commands,
+            events,
+            progress,
+            controller,
+            events_open: true,
+            progress_open: true,
+        })
+    }
+
+    fn send_command(
+        commands: &mpsc::Sender<crate::runtime::RuntimeCommand>,
+        command: crate::runtime::RuntimeCommand,
+    ) -> Result<(), &'static str> {
+        commands.try_send(command).map_err(|_| LIVE_COMMAND)
+    }
+
+    fn requested_run(
+        input: &Option<crate::runtime::RuntimeEvent>,
+        request: &str,
+    ) -> Option<crate::runtime::RunId> {
+        let Some(crate::runtime::RuntimeEvent::RecordAppended { record, .. }) = input else {
+            return None;
+        };
+        let crate::runtime::Record::UserRequest {
+            request: actual_request,
+        } = &record.record
+        else {
+            return None;
+        };
+        (actual_request == request).then_some(record.run_id)
+    }
+
+    fn settled_run(
+        input: &Option<crate::runtime::RuntimeEvent>,
+        run_id: crate::runtime::RunId,
+    ) -> bool {
+        matches!(
+            input,
+            Some(crate::runtime::RuntimeEvent::RunSettled {
+                run_id: actual_run_id
+            }) if *actual_run_id == run_id
+        )
+    }
+
+    async fn wait_for_request(
+        controller: &mut LiveController,
+        collector: &mut LiveCollector,
+        request: &str,
+        deadline: Instant,
+    ) -> Result<crate::runtime::RunId, &'static str> {
+        loop {
+            let input = collector.next(controller, deadline).await?;
+            if let Some(run_id) = requested_run(&input, request) {
+                return Ok(run_id);
+            }
+        }
+    }
+
+    async fn wait_for_attempt_started(
+        controller: &mut LiveController,
+        collector: &mut LiveCollector,
+        run_id: crate::runtime::RunId,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        loop {
+            if collector
+                .run(run_id)
+                .is_some_and(|run| run.attempts_started > 0)
+            {
+                return Ok(());
+            }
+            collector.next(controller, deadline).await?;
+        }
+    }
+
+    async fn wait_for_attempt_settlement(
+        controller: &mut LiveController,
+        collector: &mut LiveCollector,
+        run_id: crate::runtime::RunId,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        collector.drain_ready(controller);
+        loop {
+            let Some(run) = collector.run(run_id) else {
+                return Err(LIVE_EVENT_CHANNEL_CLOSED);
+            };
+            if !run.attempt_open {
+                return Ok(());
+            }
+            collector.next(controller, deadline).await?;
+        }
+    }
+
+    async fn wait_for_first_settlement(
+        controller: &mut LiveController,
+        collector: &mut LiveCollector,
+        run_id: crate::runtime::RunId,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        loop {
+            let input = collector.next(controller, deadline).await?;
+            if collector.run(run_id).is_some_and(|run| run.steps.len() > 8) {
+                send_command(&controller.commands, crate::runtime::RuntimeCommand::Cancel)?;
+                return Err(LIVE_STEP_LIMIT);
+            }
+            if settled_run(&input, run_id) {
+                return wait_for_attempt_settlement(controller, collector, run_id, deadline).await;
+            }
+        }
+    }
+
+    async fn wait_for_settlement(
+        controller: &mut LiveController,
+        collector: &mut LiveCollector,
+        run_id: crate::runtime::RunId,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        loop {
+            let input = collector.next(controller, deadline).await?;
+            if settled_run(&input, run_id) {
+                return wait_for_attempt_settlement(controller, collector, run_id, deadline).await;
+            }
+        }
+    }
+
+    fn first_run_is_valid(collector: &LiveCollector, run_id: crate::runtime::RunId) -> bool {
+        collector.run(run_id).is_some_and(|run| {
+            run.completed_executions >= 2
+                && run.successful_read
+                && run.final_messages == 1
+                && run.nonblank_final_messages == 1
+                && run.cancelled_runs == 0
+                && run.failed_runs == 0
+                && run.steps.len() <= 8
+                && run.streamed_content
+                && run.attempts_started > 0
+                && run.attempts_started == run.attempts_settled
+                && run.settled == 1
+        })
+    }
+
+    fn cancellation_run_is_valid(
+        collector: &LiveCollector,
+        run_id: crate::runtime::RunId,
+        disabled_events: usize,
+    ) -> bool {
+        collector.run(run_id).is_some_and(|run| {
+            run.cancelled_runs == 1
+                && run.final_messages == 0
+                && run.failed_runs == 0
+                && run.attempts_started > 0
+                && run.attempts_started == run.attempts_settled
+                && run.settled == 1
+                && collector.disabled_events == disabled_events
+        })
+    }
+
+    fn follow_up_run_is_valid(collector: &LiveCollector, run_id: crate::runtime::RunId) -> bool {
+        collector.run(run_id).is_some_and(|run| {
+            run.final_messages == 1
+                && run.nonblank_final_messages == 1
+                && run.cancelled_runs == 0
+                && run.failed_runs == 0
+                && run.attempts_started > 0
+                && run.attempts_started == run.attempts_settled
+                && run.settled == 1
+        })
+    }
+
+    async fn run_live_scenario(
+        controller: &mut LiveController,
+    ) -> Result<LiveScenario, &'static str> {
+        let outer_deadline = Instant::now() + LIVE_OUTER_TIMEOUT;
+        send_command(
+            &controller.commands,
+            crate::runtime::RuntimeCommand::Submit {
+                request: FIRST_REQUEST.to_owned(),
+            },
+        )?;
+        let mut collector = LiveCollector::default();
+        let first_run_id = wait_for_request(
+            controller,
+            &mut collector,
+            FIRST_REQUEST,
+            outer_deadline.min(Instant::now() + LIVE_PROVIDER_TIMEOUT),
+        )
+        .await?;
+        wait_for_first_settlement(controller, &mut collector, first_run_id, outer_deadline).await?;
+        if !first_run_is_valid(&collector, first_run_id) {
+            return Err(LIVE_FIRST_SETTLEMENT);
+        }
+
+        let disabled_events = collector.disabled_events;
+        let cancellation_start = Instant::now();
+        let cancellation_start_deadline = cancellation_start + LIVE_CANCELLATION_TIMEOUT;
+        send_command(
+            &controller.commands,
+            crate::runtime::RuntimeCommand::Submit {
+                request: CANCELLATION_REQUEST.to_owned(),
+            },
+        )?;
+        let second_run_id = wait_for_request(
+            controller,
+            &mut collector,
+            CANCELLATION_REQUEST,
+            cancellation_start_deadline,
+        )
+        .await?;
+        wait_for_attempt_started(
+            controller,
+            &mut collector,
+            second_run_id,
+            cancellation_start_deadline,
+        )
+        .await
+        .map_err(|_| LIVE_SECOND_START)?;
+        send_command(&controller.commands, crate::runtime::RuntimeCommand::Cancel)?;
+        let cancellation_settlement_deadline = Instant::now() + LIVE_CANCELLATION_TIMEOUT;
+        wait_for_settlement(
+            controller,
+            &mut collector,
+            second_run_id,
+            cancellation_settlement_deadline,
+        )
+        .await?;
+        if !cancellation_run_is_valid(&collector, second_run_id, disabled_events) {
+            return Err(LIVE_SECOND_SETTLEMENT);
+        }
+
+        let follow_up_deadline = Instant::now() + LIVE_PROVIDER_TIMEOUT;
+        send_command(
+            &controller.commands,
+            crate::runtime::RuntimeCommand::Submit {
+                request: FOLLOW_UP_REQUEST.to_owned(),
+            },
+        )?;
+        let third_run_id = wait_for_request(
+            controller,
+            &mut collector,
+            FOLLOW_UP_REQUEST,
+            follow_up_deadline,
+        )
+        .await?;
+        wait_for_settlement(controller, &mut collector, third_run_id, follow_up_deadline).await?;
+        if !follow_up_run_is_valid(&collector, third_run_id) {
+            return Err(LIVE_THIRD_SETTLEMENT);
+        }
+
+        Ok(LiveScenario {
+            first_run_id,
+            second_run_id,
+            third_run_id,
+        })
+    }
+
+    fn record_summary(
+        records: &[crate::runtime::StoredRecord],
+        run_id: crate::runtime::RunId,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        Vec<crate::runtime::ModelStepId>,
+    ) {
+        use crate::runtime::Record;
+
+        let mut requests = 0;
+        let mut completed_executions = 0;
+        let mut final_messages = 0;
+        let mut nonblank_final_messages = 0;
+        let mut cancelled_runs = 0;
+        let mut failed_runs = 0;
+        let mut steps = Vec::new();
+        for stored in records.iter().filter(|stored| stored.run_id == run_id) {
+            match &stored.record {
+                Record::UserRequest { .. } => requests += 1,
+                Record::CompletedExecution { step_id, .. } => {
+                    completed_executions += 1;
+                    if !steps.contains(step_id) {
+                        steps.push(*step_id);
+                    }
+                }
+                Record::FinalMessage { step_id, text, .. } => {
+                    final_messages += 1;
+                    nonblank_final_messages += usize::from(!text.trim().is_empty());
+                    if !steps.contains(step_id) {
+                        steps.push(*step_id);
+                    }
+                }
+                Record::CancelledRun { .. } => cancelled_runs += 1,
+                Record::FailedRun { .. } => failed_runs += 1,
+            }
+        }
+        (
+            requests,
+            completed_executions,
+            final_messages,
+            nonblank_final_messages,
+            cancelled_runs,
+            failed_runs,
+            steps,
+        )
+    }
+
+    fn records_match_scenario(
+        records: &[crate::runtime::StoredRecord],
+        scenario: &LiveScenario,
+    ) -> bool {
+        let first = record_summary(records, scenario.first_run_id);
+        let second = record_summary(records, scenario.second_run_id);
+        let third = record_summary(records, scenario.third_run_id);
+        first.0 == 1
+            && first.1 >= 2
+            && first.2 == 1
+            && first.3 == 1
+            && first.4 == 0
+            && first.5 == 0
+            && first.6.len() <= 8
+            && second.0 == 1
+            && second.2 == 0
+            && second.4 == 1
+            && second.5 == 0
+            && third.0 == 1
+            && third.2 == 1
+            && third.3 == 1
+            && third.4 == 0
+            && third.5 == 0
+    }
+
+    async fn cleanup_live_controller(
+        mut controller: LiveController,
+    ) -> Result<Vec<crate::runtime::StoredRecord>, &'static str> {
+        let deadline = Instant::now() + LIVE_CLEANUP_TIMEOUT;
+        let shutdown = tokio::select! {
+            result = controller.commands.send(crate::runtime::RuntimeCommand::Shutdown) => result.is_ok(),
+            _ = sleep_until(deadline) => false,
+        };
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        match timeout(remaining, &mut controller.controller).await {
+            Ok(Ok(records)) if shutdown => Ok(records),
+            Ok(Ok(_)) => Err(LIVE_CLEANUP_SHUTDOWN),
+            Ok(Err(_)) => Err(LIVE_CLEANUP_CONTROLLER),
+            Err(_) => {
+                controller.controller.abort();
+                let _ = controller.controller.await;
+                Err(LIVE_CLEANUP_TIMEOUT_MESSAGE)
+            }
+        }
+    }
+
+    async fn run_live_sol_smoke_test() -> Result<(), &'static str> {
+        let mut controller = start_live_controller().await?;
+        let scenario = match timeout(LIVE_OUTER_TIMEOUT, run_live_scenario(&mut controller)).await {
+            Ok(result) => result,
+            Err(_) => Err(LIVE_OUTER_DEADLINE),
+        };
+        let records = cleanup_live_controller(controller).await?;
+        let scenario = scenario?;
+        if !records_match_scenario(&records, &scenario) {
+            return Err(LIVE_RECORDS);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit OPENAI_API_KEY and MONTY_BIN"]
+    async fn live_sol() {
+        if let Err(message) = run_live_sol_smoke_test().await {
+            panic!("{message}");
         }
     }
 }
