@@ -6,7 +6,7 @@ use crate::arena::{
     ReadOutcome,
 };
 use crate::model::{
-    CodeResult, Model, ModelAction, ModelError, ModelHistory, ModelHistoryError, ModelProgress,
+    CodeResult, Model, ModelAction, ModelFailure, ModelHistory, ModelHistoryError, ModelProgress,
     ModelStep, READ_CAPABILITY_DESCRIPTION,
 };
 
@@ -33,7 +33,7 @@ pub enum AgentError {
     #[error("agent run was cancelled")]
     Cancelled,
     #[error(transparent)]
-    Model(#[from] ModelError),
+    Model(#[from] ModelFailure),
     #[error(transparent)]
     ModelHistory(#[from] ModelHistoryError),
     #[error(transparent)]
@@ -87,7 +87,7 @@ impl<M: Model> Agent<M> {
                 .step(&self.model_context, cancellation, &mut model_progress)
                 .await
             {
-                Err(ModelError::Cancelled) => return Err(AgentError::Cancelled),
+                Err(error) if error.is_cancelled() => return Err(AgentError::Cancelled),
                 result => result?,
             };
             if cancellation.is_cancelled() {
@@ -242,7 +242,7 @@ mod tests {
     use crate::arena::{Arena, Execution, ExecutionOutcome, Observation, PythonError};
     use crate::model::{
         CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId, ModelContextEntry,
-        ModelError, ModelHistory, ModelProgress, ModelStep, ProviderReplay,
+        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ProviderReplay,
         READ_CAPABILITY_DESCRIPTION, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::tools::ReadTool;
@@ -414,7 +414,8 @@ mod tests {
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
             async move {
                 cancellation.cancel();
                 Ok(ModelStep {
@@ -520,7 +521,10 @@ mod tests {
 
         let error = agent.run("inspect", &cancellation).await.unwrap_err();
 
-        assert!(matches!(error, AgentError::Model(ModelError::Exhausted)));
+        assert!(matches!(
+            error,
+            AgentError::Model(failure) if failure.error() == &ModelError::Exhausted
+        ));
         assert_eq!(agent.model.contexts().len(), 1);
         assert_eq!(agent.model.position(), 0);
         assert_eq!(

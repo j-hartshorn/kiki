@@ -10,7 +10,7 @@
 - Every provider step produces exactly one completely validated Python action or final message. Partial, mixed, multiple, malformed, refused, incomplete, unknown, or oversized output never executes.
 - Explicit `store: false` history replays completed provider items, encrypted reasoning, and every function-call/result pair in exact order while preserving persistent Monty state across steps and requests.
 - Reasoning summaries, assistant text, decoded Python, retry state, and Python stdout use fixed-capacity, non-blocking progress channels into a plain structured transcript. Dropped previews are marked, while the separate reliable path always settles with complete authoritative records.
-- Retries occur only for the specified pre-event transient failures, stop after three total attempts, honour bounded `Retry-After`, and stop immediately on cancellation.
+- The SDK performs bounded HTTP retries for its standard transient classes; Kiki restarts interrupted streams at most twice, discards partial failed generation, and stops immediately on cancellation.
 - Cancellation settles once, preserves earlier completed work, records bounded interrupted-step evidence, never leaves a dangling function call, restores an interrupted arena checkpoint, and permits a later request after successful recovery.
 - Failed checkpoint recovery produces one failed terminal record, retains bounded original and recovery evidence, and disables the affected Agent.
 - Provider failures and every dynamic terminal string are bounded and sanitised; API keys and executable terminal controls never appear in records, events, configuration, or rendering.
@@ -143,17 +143,17 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Verification** — `cargo test openai::tests::streaming -- --test-threads=1` — progress is ordered and bounded while completed action validation remains authoritative.
 
-### Task 8: Add explicit retries and safe provider failures
+### Task 8: Add SDK retries and safe provider failures
 
-**Changes** — Disable implicit SDK retry behaviour and implement the specified three-attempt pre-event retry policy with cancellation-aware exponential jitter and `Retry-After` capped at 30 seconds. Classify authentication separately, retain compact attempt summaries and potentially-billed-unknown accounting, and convert terminal provider failures to Kiki diagnostics whose provider message is UTF-8-safely capped at 4 KiB without request bodies, headers, SDK debug output, or credentials. Emit attempt-start progress so retry presentation resets explicitly.
+**Changes** — Configure `async-openai`'s retry middleware for two retries after the initial HTTP request and let it own opening HTTP/connect retries and backoff. Kiki never restarts `create_stream` after the SDK exhausts that policy; it adds at most two whole-step restarts only after EOF or a retryable transport error yielded while consuming an already-open SSE stream. Use one small cancellable Kiki delay, reset presentation and the 16 MiB content budget on restart, and add no idle timeout. Record exactly one accounting value per Kiki stream attempt. Extract returned usage from every terminal response before semantic or action validation, retain it on failures, and mark known OpenAI usage as a lower bound because SDK-internal retries remain opaque. Replace recursive attempted errors with one flat model failure containing a model error and attempt accounting. Keep provider failures to bounded status, code, message, and authentication detection. Provider failure construction owns the 256-byte code and 4 KiB message bounds; the adapter only redacts credential occurrences. Emit attempt-start progress so restarted presentation replaces partial failed generation.
 
-**Tests** (`src/openai.rs`, adapter policy) — First fail on a transient fixture response. Then cover connection failure and HTTP `408`, `409`, `429`, and `5xx`; exactly three attempts; `Retry-After` seconds/date handling and cap; no retry for authentication, permission, validation, refusal, content filter, incomplete output, post-event failure, or cancellation; immediate cancellation during backoff; attempt-start reset signals and fresh presentation/content state; exact 4 KiB UTF-8-safe diagnostic truncation; and an adversarial response containing the configured key before and beyond the truncation boundary.
+**Tests** (`src/openai.rs`, adapter policy) — First fail on an SDK-retryable fixture response. Keep only adapter-level fixtures which prove `OpenAIRetryLayer::new(2)` is wired: one `429`/`5xx` success sequence and one three-request exhaustion case. Then cover whole-step restart after pre-event and post-event SSE interruption and EOF; no Kiki restart after opening failure; at most three stream attempts; deterministic cancellation after a retry response is fully written and during the Kiki delay; attempt-start reset signals and fresh presentation/content state; one accounting value per Kiki attempt; retained terminal usage for failed, incomplete, and locally invalid completed responses; no restart for semantic or local failures; exact UTF-8-safe diagnostic bounds; and adversarial credential redaction. Do not duplicate the SDK's request counting service, connection classifier, status classifier, backoff, redirect, or intermediate-attempt semantics.
 
-**Files** — Modify: `src/openai.rs`, `src/model.rs`, `src/pricing.rs`
+**Files** — Modify: `Cargo.toml`, `Cargo.lock`, `src/openai.rs`, `src/model.rs`, `src/pricing.rs`, `src/agent.rs`
 
 **Commit** — `Add safe OpenAI retry policy`
 
-**Verification** — `cargo test openai::tests::retry_policy -- --test-threads=1 && cargo test openai::tests::safe_failures -- --test-threads=1` — attempt counts, delays, classifications, accounting state, and redaction match the spec.
+**Verification** — `cargo test openai::tests::retry_policy -- --test-threads=1 && cargo test openai::tests::safe_failures -- --test-threads=1` — SDK retries, stream restarts, cancellation, bounded diagnostics, redaction, and lower-bound accounting match the spec.
 
 ### Task 9: Retain interrupted Arena evidence
 

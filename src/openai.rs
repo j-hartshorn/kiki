@@ -6,20 +6,24 @@ use std::time::{Duration, Instant};
 use async_openai::Client;
 use async_openai::config::{OPENAI_API_BASE, OpenAIConfig};
 use async_openai::error::OpenAIError;
-use async_openai::middleware::ReqwestService;
+use async_openai::middleware::{ReqwestService, retry::OpenAIRetryLayer};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
 
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
-    ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem, ProviderReplay,
+    ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
+    ProviderFailure, ProviderReplay,
 };
 
 const OPENAI_PROVIDER: &str = "openai";
 const FIXED_MODEL: &str = "gpt-5.6-sol";
 const APPLICATION_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+const MAX_STREAM_ATTEMPTS: u32 = 3;
+const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
 type WireStream = Pin<Box<dyn Stream<Item = Result<WireEvent, OpenAIError>> + Send>>;
 
@@ -35,16 +39,25 @@ pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
     model: &'static str,
+    api_key: String,
 }
 
 impl OpenAiModel {
     #[allow(dead_code)]
     pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
+    }
+
+    fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
+        let service = ServiceBuilder::new()
+            .layer(OpenAIRetryLayer::new(2))
+            .service(ReqwestService::default());
         Self {
-            prompt: prompt.into(),
-            client: Client::with_config(openai_config(api_key, OPENAI_API_BASE))
-                .with_http_service(ReqwestService::default()),
+            prompt,
+            client: Client::with_config(openai_config(api_key.clone(), endpoint))
+                .with_http_service(service),
             model: FIXED_MODEL,
+            api_key,
         }
     }
 
@@ -54,12 +67,7 @@ impl OpenAiModel {
         api_key: impl Into<String>,
         endpoint: &str,
     ) -> Self {
-        Self {
-            prompt: prompt.into(),
-            client: Client::with_config(openai_config(api_key, endpoint))
-                .with_http_service(ReqwestService::default()),
-            model: FIXED_MODEL,
-        }
+        Self::build(prompt.into(), api_key.into(), endpoint)
     }
 
     fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
@@ -142,64 +150,179 @@ impl OpenAiModel {
         }))
     }
 
-    async fn one_attempt(
+    async fn step_with_restarts(
         &self,
         history: &ModelHistory,
         cancellation: &CancellationToken,
         progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) -> Result<ModelStep, ModelError> {
+    ) -> Result<ModelStep, ModelFailure> {
         if cancellation.is_cancelled() {
-            return Err(ModelError::Cancelled);
+            return Err(ModelError::Cancelled.into());
         }
         let request = self.request(history)?;
-        progress(ModelProgress::AttemptStarted { attempt: 1 });
+        let mut attempts = Vec::new();
+
+        for attempt in 1..=MAX_STREAM_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                return Err(ModelFailure::new(ModelError::Cancelled, attempts));
+            }
+            progress(ModelProgress::AttemptStarted { attempt });
+
+            match self
+                .one_attempt(request.clone(), history, cancellation, progress)
+                .await
+            {
+                Ok(mut step) => {
+                    let accounting = step
+                        .attempts
+                        .pop()
+                        .expect("completed OpenAI stream has accounting");
+                    progress(ModelProgress::AttemptSettled {
+                        attempt,
+                        accounting: accounting.clone(),
+                    });
+                    attempts.push(accounting);
+                    step.attempts = attempts;
+                    return Ok(step);
+                }
+                Err(AttemptFailure::Cancelled) => {
+                    let accounting = AttemptAccounting::UsageUnavailable;
+                    progress(ModelProgress::AttemptSettled {
+                        attempt,
+                        accounting: accounting.clone(),
+                    });
+                    attempts.push(accounting);
+                    return Err(ModelFailure::new(ModelError::Cancelled, attempts));
+                }
+                Err(AttemptFailure::Restartable(failure)) => {
+                    let accounting = AttemptAccounting::UsageUnavailable;
+                    progress(ModelProgress::AttemptSettled {
+                        attempt,
+                        accounting: accounting.clone(),
+                    });
+                    attempts.push(accounting);
+                    if attempt == MAX_STREAM_ATTEMPTS {
+                        return Err(ModelFailure::new(
+                            ModelError::Provider(Box::new(failure)),
+                            attempts,
+                        ));
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            return Err(ModelFailure::new(ModelError::Cancelled, attempts));
+                        }
+                        _ = tokio::time::sleep(STREAM_RESTART_DELAY) => {}
+                    }
+                }
+                Err(AttemptFailure::Terminal { error, accounting }) => {
+                    let accounting = *accounting;
+                    progress(ModelProgress::AttemptSettled {
+                        attempt,
+                        accounting: accounting.clone(),
+                    });
+                    attempts.push(accounting);
+                    return Err(ModelFailure::new(error, attempts));
+                }
+            }
+        }
+
+        unreachable!("stream attempts are bounded")
+    }
+
+    async fn one_attempt(
+        &self,
+        request: Value,
+        history: &ModelHistory,
+        cancellation: &CancellationToken,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
+    ) -> Result<ModelStep, AttemptFailure> {
+        if cancellation.is_cancelled() {
+            return Err(AttemptFailure::Cancelled);
+        }
         let responses = self.client.responses();
         let open_stream = responses.create_stream_byot::<_, WireEvent>(request);
-        let mut stream: WireStream = tokio::select! {
-            _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
-            stream = open_stream => stream.map_err(provider_error)?,
+        let stream = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AttemptFailure::Cancelled),
+            stream = open_stream => stream,
         };
+        if cancellation.is_cancelled() {
+            return Err(AttemptFailure::Cancelled);
+        }
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(AttemptFailure::Terminal {
+                    error: ModelError::Provider(Box::new(self.provider_failure(error))),
+                    accounting: Box::new(AttemptAccounting::UsageUnavailable),
+                });
+            }
+        };
+        self.consume_stream(stream, history, cancellation, progress)
+            .await
+    }
+
+    async fn consume_stream(
+        &self,
+        mut stream: WireStream,
+        history: &ModelHistory,
+        cancellation: &CancellationToken,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
+    ) -> Result<ModelStep, AttemptFailure> {
         let mut content = ApplicationContentGuard::default();
         let mut presentation = PresentationBatcher::default();
         let mut python_decoders = HashMap::<(usize, String), PythonPreviewDecoder>::new();
 
         loop {
             let event = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => {
                     presentation.flush_all(progress);
-                    return Err(ModelError::Cancelled);
+                    return Err(AttemptFailure::Cancelled);
                 }
                 event = stream.next() => event,
             };
+            if cancellation.is_cancelled() {
+                presentation.flush_all(progress);
+                return Err(AttemptFailure::Cancelled);
+            }
             let Some(event) = event else {
                 presentation.flush_all(progress);
-                return Err(ModelError::InvalidResponse(
-                    "stream ended without a terminal response",
-                ));
+                return Err(AttemptFailure::Restartable(self.diagnostic(
+                    None,
+                    None,
+                    "provider stream ended without a terminal response",
+                )));
             };
             let event = match event {
                 Ok(event) => event,
                 Err(error) => {
                     presentation.flush_all(progress);
-                    return Err(provider_error(error));
+                    return Err(self.stream_failure(error));
                 }
             };
             let now = Instant::now();
+            let terminal_accounting = match &event {
+                WireEvent::Completed { response, .. }
+                | WireEvent::Failed { response, .. }
+                | WireEvent::Incomplete { response, .. } => {
+                    Some(self.response_accounting(response))
+                }
+                _ => None,
+            };
             let event_result = (|| -> Result<Option<WireResponse>, ModelError> {
                 match event {
                     WireEvent::Completed { response, .. } => Ok(Some(response)),
-                    WireEvent::Failed { response, .. } => Err(ModelError::Provider(
-                        response_failure("response failed", &response),
-                    )),
-                    WireEvent::Incomplete { response, .. } => Err(ModelError::Provider(
-                        response_failure("response incomplete", &response),
-                    )),
-                    WireEvent::Error { code, message, .. } => {
-                        let code = code.map(|code| format!(" ({code})")).unwrap_or_default();
-                        Err(ModelError::Provider(format!(
-                            "stream error{code}: {message}"
-                        )))
-                    }
+                    WireEvent::Failed { response, .. } => Err(ModelError::Provider(Box::new(
+                        self.response_failure("response failed", &response),
+                    ))),
+                    WireEvent::Incomplete { response, .. } => Err(ModelError::Provider(Box::new(
+                        self.response_failure("response incomplete", &response),
+                    ))),
+                    WireEvent::Error { code, message, .. } => Err(ModelError::Provider(Box::new(
+                        self.diagnostic(None, code, message),
+                    ))),
                     WireEvent::OutputTextDelta {
                         output_index,
                         content_index,
@@ -329,9 +452,9 @@ impl OpenAiModel {
                         content.account_reasoning_part(output_index, summary_index, &part)?;
                         Ok(None)
                     }
-                    WireEvent::RefusalDelta | WireEvent::RefusalDone => {
-                        Err(ModelError::InvalidResponse("model refused the request"))
-                    }
+                    WireEvent::RefusalDelta | WireEvent::RefusalDone => Err(ModelError::Provider(
+                        Box::new(self.diagnostic(None, None, "model refused the request")),
+                    )),
                     WireEvent::Created
                     | WireEvent::Queued
                     | WireEvent::InProgress
@@ -345,20 +468,123 @@ impl OpenAiModel {
             match event_result {
                 Ok(Some(response)) => {
                     presentation.flush_all(progress);
-                    let step = self.completed_step(history, response, &mut content)?;
-                    progress(ModelProgress::AttemptSettled {
-                        attempt: 1,
-                        accounting: step.attempts[0].clone(),
-                    });
-                    return Ok(step);
+                    let accounting = terminal_accounting.expect("terminal response accounting");
+                    return self
+                        .completed_step(history, response, &mut content)
+                        .map(|mut step| {
+                            step.attempts.push(accounting.clone());
+                            step
+                        })
+                        .map_err(|error| AttemptFailure::Terminal {
+                            error,
+                            accounting: Box::new(accounting),
+                        });
                 }
                 Ok(None) => presentation.flush_due(now, progress),
                 Err(error) => {
                     presentation.flush_all(progress);
-                    return Err(error);
+                    return Err(AttemptFailure::Terminal {
+                        error,
+                        accounting: Box::new(
+                            terminal_accounting.unwrap_or(AttemptAccounting::UsageUnavailable),
+                        ),
+                    });
                 }
             }
         }
+    }
+
+    fn stream_failure(&self, error: OpenAIError) -> AttemptFailure {
+        let restartable = matches!(error, OpenAIError::Reqwest(_) | OpenAIError::StreamError(_));
+        let failure = self.provider_failure(error);
+        if restartable {
+            AttemptFailure::Restartable(failure)
+        } else {
+            AttemptFailure::Terminal {
+                error: ModelError::Provider(Box::new(failure)),
+                accounting: Box::new(AttemptAccounting::UsageUnavailable),
+            }
+        }
+    }
+
+    fn provider_failure(&self, error: OpenAIError) -> ProviderFailure {
+        match error {
+            OpenAIError::ApiError(error) => self.diagnostic(
+                Some(error.status_code.as_u16()),
+                error.api_error.code,
+                error.api_error.message,
+            ),
+            OpenAIError::Reqwest(_) => self.diagnostic(None, None, "provider transport failed"),
+            OpenAIError::StreamError(_) => self.diagnostic(None, None, "provider stream failed"),
+            OpenAIError::JSONDeserialize(_, _) => {
+                self.diagnostic(None, None, "provider response was invalid")
+            }
+            OpenAIError::InvalidArgument(_)
+            | OpenAIError::FileSaveError(_)
+            | OpenAIError::FileReadError(_)
+            | OpenAIError::Boxed(_) => {
+                self.diagnostic(None, None, "provider request could not be processed")
+            }
+        }
+    }
+
+    fn response_failure(&self, prefix: &str, response: &WireResponse) -> ProviderFailure {
+        if let Some(error) = &response.error {
+            self.diagnostic(
+                None,
+                Some(error.code.clone()),
+                format!("{prefix}: {}", error.message),
+            )
+        } else if let Some(details) = &response.incomplete_details {
+            self.diagnostic(
+                None,
+                Some(details.reason.clone()),
+                format!("{prefix}: {}", details.reason),
+            )
+        } else {
+            self.diagnostic(None, None, prefix)
+        }
+    }
+
+    fn diagnostic(
+        &self,
+        status: Option<u16>,
+        code: Option<String>,
+        message: impl Into<String>,
+    ) -> ProviderFailure {
+        ProviderFailure::new(
+            status,
+            code.map(|value| redact(&value, &self.api_key)),
+            redact(&message.into(), &self.api_key),
+        )
+    }
+
+    fn response_accounting(&self, response: &WireResponse) -> AttemptAccounting {
+        let Some(usage) = &response.usage else {
+            return AttemptAccounting::UsageUnavailable;
+        };
+        AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
+            model: self.model.to_owned(),
+            service_tier: response
+                .service_tier
+                .as_deref()
+                .map(|tier| redact(tier, &self.api_key)),
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            cache_write_input_tokens: usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.cache_write_tokens),
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            total_tokens: usage.total_tokens,
+        })
     }
 
     fn completed_step(
@@ -397,31 +623,10 @@ impl OpenAiModel {
                 .map(|item| OpaqueReplayItem::new(serde_json::to_vec(item).expect("JSON value")))
                 .collect(),
         );
-        let attempts = vec![match response.usage {
-            Some(usage) => AttemptAccounting::KnownUsage(ModelUsage {
-                model: self.model.to_owned(),
-                service_tier: response.service_tier,
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage
-                    .input_tokens_details
-                    .as_ref()
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: usage
-                    .input_tokens_details
-                    .and_then(|details| details.cache_write_tokens),
-                output_tokens: usage.output_tokens,
-                reasoning_output_tokens: usage
-                    .output_tokens_details
-                    .and_then(|details| details.reasoning_tokens),
-                total_tokens: usage.total_tokens,
-            }),
-            None => AttemptAccounting::UsageUnavailable,
-        }];
-
         Ok(ModelStep {
             action,
             replay,
-            attempts,
+            attempts: Vec::new(),
         })
     }
 }
@@ -432,22 +637,25 @@ impl Model for OpenAiModel {
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-    ) -> impl Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
-        self.one_attempt(history, cancellation, progress)
+    ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a {
+        self.step_with_restarts(history, cancellation, progress)
     }
 }
 
-fn provider_error(error: OpenAIError) -> ModelError {
-    ModelError::Provider(error.to_string())
+enum AttemptFailure {
+    Cancelled,
+    Restartable(ProviderFailure),
+    Terminal {
+        error: ModelError,
+        accounting: Box<AttemptAccounting>,
+    },
 }
 
-fn response_failure(prefix: &str, response: &WireResponse) -> String {
-    if let Some(error) = &response.error {
-        format!("{prefix}: {}: {}", error.code, error.message)
-    } else if let Some(details) = &response.incomplete_details {
-        format!("{prefix}: {}", details.reason)
+fn redact(value: &str, api_key: &str) -> String {
+    if api_key.is_empty() {
+        value.to_owned()
     } else {
-        prefix.to_owned()
+        value.replace(api_key, "[REDACTED]")
     }
 }
 
@@ -1342,7 +1550,7 @@ struct WireIncompleteDetails {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1354,6 +1562,7 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
 
@@ -1378,12 +1587,24 @@ mod tests {
         "data: [DONE]\n\n",
     );
     const ONE_DELTA: &str = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"partial\"}\n\n";
+    const TWO_DELTAS: &str = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"first\"}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"second\"}\n\n",
+    );
 
     #[derive(Clone)]
     enum FixtureReply {
         Sse(&'static str),
         OwnedSse(String),
-        Status { code: u16, body: &'static str },
+        Status {
+            code: u16,
+            body: &'static str,
+        },
+        OwnedStatus {
+            code: u16,
+            headers: Vec<(String, String)>,
+            body: String,
+        },
         AbruptSse(&'static str),
         IdleSse(&'static str),
     }
@@ -1397,31 +1618,52 @@ mod tests {
     struct Fixture {
         endpoint: String,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        replies_written: Arc<AtomicUsize>,
+        reply_written: Arc<Notify>,
         disconnected: Arc<AtomicBool>,
         task: JoinHandle<()>,
     }
 
     impl Fixture {
         async fn start(reply: FixtureReply) -> Self {
+            Self::start_sequence(vec![reply]).await
+        }
+
+        async fn start_sequence(replies: Vec<FixtureReply>) -> Self {
+            assert!(!replies.is_empty());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let replies_written = Arc::new(AtomicUsize::new(0));
+            let reply_written = Arc::new(Notify::new());
             let disconnected = Arc::new(AtomicBool::new(false));
             let task = {
                 let requests = requests.clone();
+                let replies_written = replies_written.clone();
+                let reply_written = reply_written.clone();
                 let disconnected = disconnected.clone();
                 tokio::spawn(async move {
+                    let mut reply_index = 0;
                     loop {
                         let (mut stream, _) = listener.accept().await.unwrap();
                         let request = read_request(&mut stream).await;
                         requests.lock().unwrap().push(request);
-                        write_reply(&mut stream, &reply, &disconnected).await;
+                        let reply = replies
+                            .get(reply_index)
+                            .or_else(|| replies.last())
+                            .expect("fixture reply");
+                        reply_index += 1;
+                        write_reply(&mut stream, reply, &disconnected).await;
+                        replies_written.fetch_add(1, Ordering::SeqCst);
+                        reply_written.notify_waiters();
                     }
                 })
             };
             Self {
                 endpoint,
                 requests,
+                replies_written,
+                reply_written,
                 disconnected,
                 task,
             }
@@ -1433,6 +1675,20 @@ mod tests {
 
         fn request(&self) -> CapturedRequest {
             self.requests.lock().unwrap()[0].clone()
+        }
+
+        async fn wait_for_replies_written(&self, count: usize) {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let notified = self.reply_written.notified();
+                    if self.replies_written.load(Ordering::SeqCst) >= count {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("fixture should finish writing its reply");
         }
 
         async fn wait_for_disconnect(&self) {
@@ -1505,6 +1761,25 @@ mod tests {
                     body.len(),
                     body
                 );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            FixtureReply::OwnedStatus {
+                code,
+                headers,
+                body,
+            } => {
+                let mut response = format!(
+                    "HTTP/1.1 {code} Fixture Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                    body.len()
+                );
+                for (name, value) in headers {
+                    response.push_str(name);
+                    response.push_str(": ");
+                    response.push_str(value);
+                    response.push_str("\r\n");
+                }
+                response.push_str("\r\n");
+                response.push_str(body);
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
             FixtureReply::AbruptSse(body) => {
@@ -1842,6 +2117,601 @@ mod tests {
         assert_eq!(fixture.request_count(), 1);
     }
 
+    mod retry_policy {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{APPLICATION_CONTENT_LIMIT, OpenAiModel};
+        use super::*;
+        use crate::model::{
+            AttemptAccounting, Model, ModelError, ModelFailure, ModelHistory, ModelProgress,
+            ProviderReplay,
+        };
+        use crate::pricing::{RunCostEstimate, estimate_run_cost};
+
+        fn history() -> ModelHistory {
+            let mut history = ModelHistory::new("read files exactly");
+            history.append_user_request("inspect");
+            history
+        }
+
+        async fn step(
+            fixture: &Fixture,
+        ) -> (
+            Result<crate::model::ModelStep, ModelFailure>,
+            Vec<ModelProgress>,
+        ) {
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = Vec::new();
+            let result = {
+                let mut sink = |event| progress.push(event);
+                model.step(&history(), &cancellation, &mut sink).await
+            };
+            (result, progress)
+        }
+
+        fn starts(progress: &[ModelProgress]) -> Vec<u32> {
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    ModelProgress::AttemptStarted { attempt } => Some(*attempt),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn settles(progress: &[ModelProgress]) -> Vec<u32> {
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    ModelProgress::AttemptSettled { attempt, .. } => Some(*attempt),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn complete_message(text: &str) -> String {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": {
+                        "id": "resp_complete",
+                        "status": "completed",
+                        "service_tier": "default",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_complete",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                            "status": "completed"
+                        }],
+                        "usage": {
+                            "input_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                            "output_tokens": 1,
+                            "output_tokens_details": {"reasoning_tokens": 0},
+                            "total_tokens": 2
+                        }
+                    }
+                })
+            )
+        }
+
+        fn error_body(message: &str, code: &str) -> String {
+            json!({
+                "error": {
+                    "message": message,
+                    "type": "fixture_error",
+                    "param": null,
+                    "code": code
+                }
+            })
+            .to_string()
+        }
+
+        fn function_stream(arguments: &str, complete: bool) -> String {
+            let mut stream = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "execute_python",
+                        "arguments": "",
+                        "status": "in_progress"
+                    }
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "fc_1",
+                    "delta": arguments
+                })
+            );
+            if complete {
+                stream.push_str(&format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({
+                        "type": "response.completed",
+                        "sequence_number": 3,
+                        "response": {
+                            "id": "resp_complete",
+                            "status": "completed",
+                            "service_tier": "default",
+                            "output": [{
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "execute_python",
+                                "arguments": arguments,
+                                "status": "completed"
+                            }],
+                            "usage": {
+                                "input_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                                "output_tokens": 1,
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                                "total_tokens": 2
+                            }
+                        }
+                    })
+                ));
+            }
+            stream
+        }
+
+        #[tokio::test]
+        async fn configured_sdk_retry_layer_handles_429_and_5xx_within_two_retries() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::Status {
+                    code: 429,
+                    body: r#"{"error":{"message":"retry later","type":"rate_limit_error","param":null,"code":"rate_limit"}}"#,
+                },
+                FixtureReply::Status {
+                    code: 500,
+                    body: r#"{"error":{"message":"unavailable","type":"server_error","param":null,"code":"server_error"}}"#,
+                },
+                FixtureReply::Sse(COMPLETED_STREAM),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture).await;
+
+            assert!(result.is_ok());
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(starts(&progress), vec![1]);
+            assert_eq!(settles(&progress), vec![1]);
+        }
+
+        #[tokio::test]
+        async fn exhausted_sdk_retries_do_not_trigger_a_kiki_stream_restart() {
+            let fixture = Fixture::start(FixtureReply::Status {
+                code: 429,
+                body: r#"{"error":{"message":"retry later","type":"rate_limit_error","param":null,"code":"rate_limit"}}"#,
+            })
+            .await;
+
+            let (result, progress) = step(&fixture).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(starts(&progress), vec![1]);
+            assert_eq!(settles(&progress), vec![1]);
+            assert_eq!(failure.provider_failure().unwrap().status(), Some(429));
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        }
+
+        #[tokio::test]
+        async fn restartable_stream_failures_reset_presentation_before_the_next_attempt() {
+            for first_reply in [
+                FixtureReply::AbruptSse(ONE_DELTA),
+                FixtureReply::OwnedSse(ONE_DELTA.to_owned()),
+            ] {
+                let fixture =
+                    Fixture::start_sequence(vec![first_reply, FixtureReply::Sse(COMPLETED_STREAM)])
+                        .await;
+                let (result, progress) = step(&fixture).await;
+                let step = result.unwrap();
+
+                assert_eq!(fixture.request_count(), 2);
+                assert_eq!(starts(&progress), vec![1, 2]);
+                assert_eq!(settles(&progress), vec![1, 2]);
+                assert_eq!(
+                    progress.iter().position(|event| matches!(
+                        event,
+                        ModelProgress::AttemptSettled { attempt: 1, .. }
+                    )),
+                    Some(2)
+                );
+                assert_eq!(
+                    progress.iter().position(|event| matches!(
+                        event,
+                        ModelProgress::AttemptStarted { attempt: 2 }
+                    )),
+                    Some(3)
+                );
+                assert!(matches!(
+                    step.attempts.as_slice(),
+                    [
+                        AttemptAccounting::UsageUnavailable,
+                        AttemptAccounting::KnownUsageWithUntrackedRetries(_)
+                    ]
+                ));
+                assert!(matches!(
+                    estimate_run_cost(&step.attempts),
+                    RunCostEstimate::LowerBound(_)
+                ));
+                assert_eq!(step.replay.items().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn restarts_after_pre_event_eof() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::Sse(""),
+                FixtureReply::OwnedSse(complete_message("fresh")),
+            ])
+            .await;
+            let (result, progress) = step(&fixture).await;
+
+            assert!(result.is_ok());
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(starts(&progress), vec![1, 2]);
+            assert_eq!(settles(&progress), vec![1, 2]);
+        }
+
+        #[tokio::test]
+        async fn restart_uses_a_fresh_python_decoder() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::OwnedSse(function_stream(r#"{"code":"partial"#, false)),
+                FixtureReply::OwnedSse(function_stream(r#"{"code":"fresh"}"#, true)),
+            ])
+            .await;
+            let (result, progress) = step(&fixture).await;
+            let step = result.unwrap();
+
+            assert!(matches!(
+                step.action,
+                crate::model::ModelAction::Code { source, .. } if source == "fresh"
+            ));
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter_map(|event| match event {
+                        ModelProgress::DecodedPythonChunk { code } => Some(code.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                ["partial", "fresh"]
+            );
+            assert!(
+                step.replay
+                    .items()
+                    .iter()
+                    .all(|item| !String::from_utf8_lossy(item.as_bytes()).contains("partial"))
+            );
+        }
+
+        #[tokio::test]
+        async fn restart_after_post_event_eof_has_a_fresh_content_budget() {
+            let first = format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.output_text.done",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "x".repeat(APPLICATION_CONTENT_LIMIT)
+                })
+            );
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::OwnedSse(first),
+                FixtureReply::OwnedSse(complete_message("fresh")),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture).await;
+            let step = result.unwrap();
+
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(starts(&progress), vec![1, 2]);
+            assert_eq!(settles(&progress), vec![1, 2]);
+            assert!(
+                matches!(step.action, crate::model::ModelAction::Message { text } if text == "fresh")
+            );
+        }
+
+        #[tokio::test]
+        async fn failure_flushes_pending_presentation_before_settling_and_restarting() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::OwnedSse(TWO_DELTAS.to_owned()),
+                FixtureReply::Sse(COMPLETED_STREAM),
+            ])
+            .await;
+            let (_, progress) = step(&fixture).await;
+
+            assert_eq!(
+                &progress[..5],
+                &[
+                    ModelProgress::AttemptStarted { attempt: 1 },
+                    ModelProgress::ReasoningSummaryChunk {
+                        text: "first".to_owned(),
+                    },
+                    ModelProgress::ReasoningSummaryChunk {
+                        text: "second".to_owned(),
+                    },
+                    ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: AttemptAccounting::UsageUnavailable,
+                    },
+                    ModelProgress::AttemptStarted { attempt: 2 },
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn restart_attempts_stop_after_three_interrupted_streams() {
+            let fixture = Fixture::start(FixtureReply::Sse("")).await;
+            let (result, progress) = step(&fixture).await;
+            let error = result.unwrap_err();
+
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(starts(&progress), vec![1, 2, 3]);
+            assert_eq!(settles(&progress), vec![1, 2, 3]);
+            assert_eq!(
+                error.attempts(),
+                [
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                ]
+            );
+            let provider = error.provider_failure().unwrap();
+            assert_eq!(provider.status(), None);
+            assert_eq!(
+                provider.message(),
+                "provider stream ended without a terminal response"
+            );
+        }
+
+        #[tokio::test]
+        async fn cancellation_stops_sdk_backoff_without_starting_another_request() {
+            let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                code: 429,
+                headers: vec![("retry-after".to_owned(), "1".to_owned())],
+                body: error_body("retry later", "rate_limit"),
+            })
+            .await;
+            let endpoint = fixture.endpoint.clone();
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let task = tokio::spawn(async move {
+                let mut model =
+                    OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+                let mut progress = |_| {};
+                model.step(&history(), &cancellation, &mut progress).await
+            });
+
+            fixture.wait_for_replies_written(1).await;
+            assert_eq!(fixture.request_count(), 1);
+            cancel.cancel();
+
+            let error = timeout(Duration::from_millis(100), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.is_cancelled());
+            assert_eq!(fixture.request_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn cancellation_stops_the_kiki_restart_delay_before_the_next_attempt() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::Sse(""),
+                FixtureReply::Sse(COMPLETED_STREAM),
+            ])
+            .await;
+            let endpoint = fixture.endpoint.clone();
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let captured = progress.clone();
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let task = tokio::spawn(async move {
+                let mut model =
+                    OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+                let mut sink = |event| captured.lock().unwrap().push(event);
+                model.step(&history(), &cancellation, &mut sink).await
+            });
+
+            timeout(Duration::from_secs(1), async {
+                while !progress
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, ModelProgress::AttemptSettled { attempt: 1, .. }))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.cancel();
+
+            let error = timeout(Duration::from_millis(100), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.is_cancelled());
+            assert_eq!(fixture.request_count(), 1);
+            assert_eq!(starts(&progress.lock().unwrap()), vec![1]);
+        }
+
+        #[tokio::test]
+        async fn semantic_and_local_failures_never_restart_the_model_step() {
+            for status in [400, 401, 403] {
+                let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                    code: status,
+                    headers: Vec::new(),
+                    body: error_body("terminal", "terminal"),
+                })
+                .await;
+                let error = step(&fixture).await.0.unwrap_err();
+                let provider = error.provider_failure().unwrap();
+
+                assert_eq!(provider.status(), Some(status));
+                assert_eq!(provider.message(), "terminal");
+                assert_eq!(error.is_authentication(), status == 401);
+                assert_eq!(fixture.request_count(), 1, "HTTP {status}");
+            }
+
+            for (stream, code, message) in [
+                (
+                    "data: {\"type\":\"response.refusal.delta\"}\n\ndata: [DONE]\n\n".to_owned(),
+                    None,
+                    "model refused the request",
+                ),
+                (
+                    "data: {\"type\":\"response.incomplete\",\"sequence_number\":1,\"response\":{\"id\":\"resp\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\ndata: [DONE]\n\n".to_owned(),
+                    Some("content_filter"),
+                    "response incomplete: content_filter",
+                ),
+                (
+                    "data: {\"type\":\"response.incomplete\",\"sequence_number\":1,\"response\":{\"id\":\"resp\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\ndata: [DONE]\n\n".to_owned(),
+                    Some("max_output_tokens"),
+                    "response incomplete: max_output_tokens",
+                ),
+            ] {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
+                let error = step(&fixture).await.0.unwrap_err();
+                let provider = error.provider_failure().unwrap();
+
+                assert_eq!(provider.code(), code);
+                assert_eq!(provider.message(), message);
+                assert_eq!(fixture.request_count(), 1);
+            }
+
+            let invalid = Fixture::start(FixtureReply::OwnedSse(complete_message(""))).await;
+            let error = step(&invalid).await.0.unwrap_err();
+            assert_eq!(
+                error.error(),
+                &ModelError::InvalidResponse("assistant message was empty")
+            );
+            assert_eq!(invalid.request_count(), 1);
+
+            let mut invalid_history = ModelHistory::new("read files exactly");
+            invalid_history.append_final_message(
+                "answer".to_owned(),
+                ProviderReplay::new("other", Vec::new()),
+            );
+            let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            assert!(matches!(
+                model
+                    .step(&invalid_history, &cancellation, &mut progress)
+                    .await,
+                Err(failure) if matches!(failure.error(), ModelError::InvalidHistory(_))
+            ));
+            assert_eq!(fixture.request_count(), 0);
+        }
+    }
+
+    mod safe_failures {
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::OpenAiModel;
+        use super::*;
+        use crate::model::{Model, ModelFailure, ModelHistory};
+
+        fn history() -> ModelHistory {
+            let mut history = ModelHistory::new("read files exactly");
+            history.append_user_request("inspect");
+            history
+        }
+
+        fn error_body(message: &str, code: &str) -> String {
+            json!({
+                "error": {
+                    "message": message,
+                    "type": "fixture_error",
+                    "param": "ignored",
+                    "code": code
+                }
+            })
+            .to_string()
+        }
+
+        async fn failure(fixture: &Fixture, key: &str) -> ModelFailure {
+            let mut model = OpenAiModel::with_endpoint("system prompt", key, &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            model
+                .step(&history(), &cancellation, &mut progress)
+                .await
+                .unwrap_err()
+        }
+
+        #[tokio::test]
+        async fn provider_fields_are_capped_once_on_utf8_boundaries() {
+            let message = format!("{}tail", "é".repeat(2_049));
+            let code = format!("{}tail", "é".repeat(129));
+            let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                code: 400,
+                headers: Vec::new(),
+                body: error_body(&message, &code),
+            })
+            .await;
+
+            let error = failure(&fixture, "fixture-key").await;
+            let failure = error.provider_failure().unwrap();
+
+            assert_eq!(failure.message(), "é".repeat(2_048));
+            assert_eq!(failure.message().len(), 4 * 1024);
+            assert_eq!(failure.code(), Some("é".repeat(128).as_str()));
+            assert_eq!(failure.code().unwrap().len(), 256);
+        }
+
+        #[tokio::test]
+        async fn provider_failures_redact_secrets_without_retaining_response_metadata() {
+            let key = "sk-secret-credential";
+            let message = format!("before:{key}:{}:after:{key}", "x".repeat(5_000));
+            let fixture = Fixture::start(FixtureReply::OwnedStatus {
+                code: 401,
+                headers: vec![("x-request-id".to_owned(), "request-id-secret".to_owned())],
+                body: error_body(&message, &format!("code-{key}")),
+            })
+            .await;
+
+            let error = failure(&fixture, key).await;
+            let failure = error.provider_failure().unwrap();
+            let diagnostics = format!("{failure:?}\n{failure}\n{error:?}\n{error}");
+
+            assert!(failure.is_authentication());
+            assert!(error.is_authentication());
+            assert_eq!(failure.status(), Some(401));
+            assert!(!diagnostics.contains(key));
+            assert!(!diagnostics.contains("request-id-secret"));
+            assert!(failure.message().len() <= 4 * 1024);
+            assert!(failure.code().unwrap().len() <= 256);
+        }
+    }
+
     #[tokio::test]
     async fn sdk_compatibility_reports_an_abrupt_stream_close() {
         let fixture = Fixture::start(FixtureReply::AbruptSse(ONE_DELTA)).await;
@@ -1882,8 +2752,8 @@ mod tests {
         };
         use super::*;
         use crate::model::{
-            AttemptAccounting, Model, ModelAction, ModelCallId, ModelError, ModelHistory,
-            ModelProgress, ModelUsage,
+            AttemptAccounting, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
+            ModelHistory, ModelProgress, ModelUsage,
         };
 
         const STREAMED_PREFIX: &str = concat!(
@@ -1905,7 +2775,7 @@ mod tests {
         }
 
         fn expected_accounting() -> AttemptAccounting {
-            AttemptAccounting::KnownUsage(ModelUsage {
+            AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
                 model: "gpt-5.6-sol".to_owned(),
                 service_tier: Some("default".to_owned()),
                 input_tokens: Some(23),
@@ -2005,7 +2875,7 @@ mod tests {
             fixture: &Fixture,
             history: &ModelHistory,
         ) -> (
-            Result<crate::model::ModelStep, ModelError>,
+            Result<crate::model::ModelStep, ModelFailure>,
             Vec<ModelProgress>,
         ) {
             let mut model =
@@ -2677,7 +3547,14 @@ mod tests {
 
             let (result, progress) = step(&fixture, &original_history).await;
 
-            assert!(matches!(result, Err(ModelError::InvalidResponse(_))));
+            assert!(matches!(
+                result,
+                Err(failure)
+                    if failure.error()
+                        == &ModelError::InvalidResponse(
+                            "execute_python arguments were not a closed code object"
+                        )
+            ));
             assert!(progress.iter().any(|event| {
                 matches!(
                     event,
@@ -2719,17 +3596,21 @@ mod tests {
 
             let (result, progress) = step(&fixture, &history()).await;
 
-            assert_eq!(result, Err(ModelError::ContentTooLarge));
+            assert!(matches!(
+                result,
+                Err(failure) if failure.error() == &ModelError::ContentTooLarge
+            ));
             assert_eq!(
-                progress.last(),
-                Some(&ModelProgress::AssistantTextChunk {
-                    text: "pending".to_owned(),
-                })
-            );
-            assert!(
-                !progress
-                    .iter()
-                    .any(|event| matches!(event, ModelProgress::AttemptSettled { .. }))
+                &progress[progress.len() - 2..],
+                &[
+                    ModelProgress::AssistantTextChunk {
+                        text: "pending".to_owned(),
+                    },
+                    ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: AttemptAccounting::UsageUnavailable,
+                    },
+                ]
             );
         }
 
@@ -2766,7 +3647,7 @@ mod tests {
             assert_eq!(original_history, history());
 
             cancel.cancel();
-            assert_eq!(task.await.unwrap(), Err(ModelError::Cancelled));
+            assert!(task.await.unwrap().unwrap_err().is_cancelled());
             fixture.wait_for_disconnect().await;
         }
     }
@@ -2778,7 +3659,8 @@ mod tests {
         use super::*;
         use crate::model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
-            ModelError, ModelHistory, ModelUsage, OpaqueReplayItem, ProviderReplay,
+            ModelError, ModelFailure, ModelHistory, ModelProgress, ModelUsage, OpaqueReplayItem,
+            ProviderReplay,
         };
 
         const COMPLETED_ITEM_ONLY_STREAM: &str = "data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_candidate\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"not terminal\",\"annotations\":[]}],\"status\":\"completed\"}}\n\n";
@@ -2793,6 +3675,19 @@ mod tests {
                 "output_tokens": 11,
                 "output_tokens_details": {"reasoning_tokens": 3},
                 "total_tokens": 34
+            })
+        }
+
+        fn expected_accounting() -> AttemptAccounting {
+            AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
+                model: "gpt-5.6-sol".to_owned(),
+                service_tier: Some("default".to_owned()),
+                input_tokens: Some(23),
+                cached_input_tokens: Some(5),
+                cache_write_input_tokens: Some(7),
+                output_tokens: Some(11),
+                reasoning_output_tokens: Some(3),
+                total_tokens: Some(34),
             })
         }
 
@@ -2919,15 +3814,29 @@ mod tests {
             })
         }
 
-        async fn step(
+        async fn step_with_progress(
             fixture: &Fixture,
             history: &ModelHistory,
-        ) -> Result<crate::model::ModelStep, ModelError> {
+        ) -> (
+            Result<crate::model::ModelStep, ModelFailure>,
+            Vec<ModelProgress>,
+        ) {
             let mut model =
                 OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
             let cancellation = CancellationToken::new();
-            let mut progress = |_| {};
-            model.step(history, &cancellation, &mut progress).await
+            let mut events = Vec::new();
+            let result = {
+                let mut progress = |event| events.push(event);
+                model.step(history, &cancellation, &mut progress).await
+            };
+            (result, events)
+        }
+
+        async fn step(
+            fixture: &Fixture,
+            history: &ModelHistory,
+        ) -> Result<crate::model::ModelStep, ModelFailure> {
+            step_with_progress(fixture, history).await.0
         }
 
         async fn assert_rejected(output: Vec<Value>) {
@@ -2938,10 +3847,19 @@ mod tests {
             )))
             .await;
 
-            let error = step(&fixture, &history("inspect")).await.unwrap_err();
+            let (result, progress) = step_with_progress(&fixture, &history("inspect")).await;
+            let failure = result.unwrap_err();
             assert!(
-                matches!(error, ModelError::InvalidResponse(_)),
-                "unexpected rejection: {error:?}"
+                matches!(failure.error(), ModelError::InvalidResponse(_)),
+                "unexpected rejection: {failure:?}"
+            );
+            assert_eq!(failure.attempts(), &[expected_accounting()]);
+            assert_eq!(
+                progress.last(),
+                Some(&ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: expected_accounting(),
+                })
             );
             assert_eq!(fixture.request_count(), 1);
         }
@@ -2977,19 +3895,7 @@ mod tests {
                     *expected
                 );
             }
-            assert_eq!(
-                completed.attempts,
-                vec![AttemptAccounting::KnownUsage(ModelUsage {
-                    model: "gpt-5.6-sol".to_owned(),
-                    service_tier: Some("default".to_owned()),
-                    input_tokens: Some(23),
-                    cached_input_tokens: Some(5),
-                    cache_write_input_tokens: Some(7),
-                    output_tokens: Some(11),
-                    reasoning_output_tokens: Some(3),
-                    total_tokens: Some(34),
-                })]
-            );
+            assert_eq!(completed.attempts, vec![expected_accounting()]);
 
             let captured = fixture.request();
             assert!(
@@ -3241,40 +4147,99 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rejects_failed_incomplete_error_eof_and_noncompleted_terminal_statuses() {
-            for (stream, expected) in [
+        async fn failed_and_incomplete_terminal_responses_retain_returned_usage() {
+            for (event_type, status, details, code, message) in [
+                (
+                    "response.failed",
+                    "failed",
+                    json!({"error": {"code": "server_error", "message": "failed"}}),
+                    "server_error",
+                    "response failed: failed",
+                ),
+                (
+                    "response.incomplete",
+                    "incomplete",
+                    json!({"incomplete_details": {"reason": "max_output_tokens"}}),
+                    "max_output_tokens",
+                    "response incomplete: max_output_tokens",
+                ),
+            ] {
+                let mut response = json!({
+                    "id": "resp_terminal_failure",
+                    "status": status,
+                    "service_tier": "default",
+                    "output": [],
+                    "usage": usage(),
+                });
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(details.as_object().unwrap().clone());
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([json!({
+                    "type": event_type,
+                    "sequence_number": 1,
+                    "response": response,
+                })])))
+                .await;
+
+                let (result, progress) = step_with_progress(&fixture, &history("inspect")).await;
+                let failure = result.unwrap_err();
+                let provider = failure.provider_failure().unwrap();
+
+                assert_eq!(provider.code(), Some(code));
+                assert_eq!(provider.message(), message);
+                assert_eq!(failure.attempts(), &[expected_accounting()]);
+                assert_eq!(
+                    progress.last(),
+                    Some(&ModelProgress::AttemptSettled {
+                        attempt: 1,
+                        accounting: expected_accounting(),
+                    })
+                );
+                assert_eq!(fixture.request_count(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_semantic_terminal_outcomes_without_restarting() {
+            for (stream, code, message) in [
                 (
                     FAILED_STREAM.to_owned(),
-                    ModelError::Provider("response failed: server_error: failed".to_owned()),
+                    "server_error",
+                    "response failed: failed",
                 ),
                 (
                     INCOMPLETE_STREAM.to_owned(),
-                    ModelError::Provider("response incomplete: max_output_tokens".to_owned()),
+                    "max_output_tokens",
+                    "response incomplete: max_output_tokens",
                 ),
-                (
-                    ERROR_STREAM.to_owned(),
-                    ModelError::Provider("stream error (stream_error): stream failed".to_owned()),
-                ),
-                (
-                    "data: [DONE]\n\n".to_owned(),
-                    ModelError::InvalidResponse("stream ended without a terminal response"),
-                ),
-                (
-                    terminal_stream(
-                        "incomplete",
-                        vec![message("msg_1", "answer")],
-                        Some(usage()),
-                    ),
-                    ModelError::InvalidResponse(
-                        "response.completed did not contain completed status",
-                    ),
-                ),
+                (ERROR_STREAM.to_owned(), "stream_error", "stream failed"),
             ] {
                 let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
+                let error = step(&fixture, &history("inspect")).await.unwrap_err();
+                let provider = error.provider_failure().unwrap();
 
-                assert_eq!(step(&fixture, &history("inspect")).await, Err(expected));
+                assert_eq!(provider.status(), None);
+                assert_eq!(provider.code(), Some(code));
+                assert_eq!(provider.message(), message);
+                assert_eq!(error.attempts(), &[AttemptAccounting::UsageUnavailable]);
                 assert_eq!(fixture.request_count(), 1);
             }
+
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "incomplete",
+                vec![message("msg_1", "answer")],
+                Some(usage()),
+            )))
+            .await;
+            let error = step(&fixture, &history("inspect")).await.unwrap_err();
+
+            assert_eq!(
+                error.error(),
+                &ModelError::InvalidResponse("response.completed did not contain completed status")
+            );
+            assert_eq!(error.attempts(), &[expected_accounting()]);
+            assert_eq!(fixture.request_count(), 1);
         }
 
         #[tokio::test]
@@ -3309,11 +4274,10 @@ mod tests {
             )))
             .await;
 
+            let error = step(&fixture, &history).await.unwrap_err();
             assert_eq!(
-                step(&fixture, &history).await,
-                Err(ModelError::InvalidResponse(
-                    "function call identifier duplicates model history"
-                ))
+                error.error(),
+                &ModelError::InvalidResponse("function call identifier duplicates model history")
             );
             assert_eq!(fixture.request_count(), 1);
         }
@@ -3337,7 +4301,7 @@ mod tests {
             assert_eq!(history, original_history);
 
             cancellation.cancel();
-            assert_eq!(pending.await, Err(ModelError::Cancelled));
+            assert!(pending.await.unwrap_err().is_cancelled());
             fixture.wait_for_disconnect().await;
             assert_eq!(fixture.request_count(), 1);
             assert!(history.entries().iter().all(|entry| matches!(
@@ -3400,10 +4364,9 @@ mod tests {
             ]);
             let fixture = Fixture::start(FixtureReply::OwnedSse(stream)).await;
 
-            assert_eq!(
-                step(&fixture, &history("inspect")).await,
-                Err(ModelError::ContentTooLarge)
-            );
+            let error = step(&fixture, &history("inspect")).await.unwrap_err();
+            assert_eq!(error.error(), &ModelError::ContentTooLarge);
+            assert_eq!(error.attempts(), &[AttemptAccounting::UsageUnavailable]);
             assert_eq!(fixture.request_count(), 1);
         }
 
@@ -3529,10 +4492,10 @@ mod tests {
                 )))
                 .await;
 
-                let result = step(&fixture, &history).await;
+                let failure = step(&fixture, &history).await.unwrap_err();
 
                 assert_eq!(fixture.request_count(), 0, "{case}");
-                assert_eq!(result, Err(expected), "{case}");
+                assert_eq!(failure.error(), &expected, "{case}");
             }
         }
     }

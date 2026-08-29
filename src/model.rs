@@ -42,6 +42,7 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptAccounting {
     KnownUsage(ModelUsage),
+    KnownUsageWithUntrackedRetries(ModelUsage),
     UsageUnavailable,
 }
 
@@ -225,6 +226,71 @@ pub enum ModelHistoryError {
     DuplicateCallId(ModelCallId),
 }
 
+const PROVIDER_FIELD_LIMIT: usize = 256;
+const PROVIDER_MESSAGE_LIMIT: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailure {
+    status: Option<u16>,
+    code: Option<String>,
+    message: String,
+}
+
+impl ProviderFailure {
+    pub(crate) fn new(status: Option<u16>, code: Option<String>, message: String) -> Self {
+        Self {
+            status,
+            code: code.map(|value| bounded_utf8(value, PROVIDER_FIELD_LIMIT)),
+            message: bounded_utf8(message, PROVIDER_MESSAGE_LIMIT),
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn is_authentication(&self) -> bool {
+        self.status == Some(401)
+    }
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_authentication() {
+            formatter.write_str("authentication failure")?;
+        } else {
+            formatter.write_str("provider failure")?;
+        }
+        if let Some(status) = self.status {
+            write!(formatter, " (HTTP {status})")?;
+        }
+        if let Some(code) = &self.code {
+            write!(formatter, " [{code}]")?;
+        }
+        write!(formatter, ": {}", self.message)
+    }
+}
+
+fn bounded_utf8(mut value: String, limit: usize) -> String {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ModelError {
     #[error("model step was cancelled")]
@@ -232,13 +298,57 @@ pub enum ModelError {
     #[error("scripted model exhausted before returning a final message")]
     Exhausted,
     #[error("model provider failed: {0}")]
-    Provider(String),
+    Provider(Box<ProviderFailure>),
     #[error("model request history is invalid: {0}")]
     InvalidHistory(&'static str),
     #[error("model response violated the action protocol: {0}")]
     InvalidResponse(&'static str),
     #[error("model response application content exceeded 16 MiB")]
     ContentTooLarge,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{error}")]
+pub struct ModelFailure {
+    #[source]
+    error: ModelError,
+    attempts: Vec<AttemptAccounting>,
+}
+
+impl ModelFailure {
+    pub fn new(error: ModelError, attempts: Vec<AttemptAccounting>) -> Self {
+        Self { error, attempts }
+    }
+
+    pub fn error(&self) -> &ModelError {
+        &self.error
+    }
+
+    pub fn attempts(&self) -> &[AttemptAccounting] {
+        &self.attempts
+    }
+
+    pub fn provider_failure(&self) -> Option<&ProviderFailure> {
+        match &self.error {
+            ModelError::Provider(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    pub fn is_authentication(&self) -> bool {
+        self.provider_failure()
+            .is_some_and(ProviderFailure::is_authentication)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.error == ModelError::Cancelled
+    }
+}
+
+impl From<ModelError> for ModelFailure {
+    fn from(error: ModelError) -> Self {
+        Self::new(error, Vec::new())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +377,7 @@ pub trait Model: Send + 'static {
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-    ) -> impl Future<Output = Result<ModelStep, ModelError>> + Send + 'a;
+    ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a;
 }
 
 pub const READ_CAPABILITY_DESCRIPTION: &str = "read(path) returns the accepted file as complete exact lines with endings retained. Use standard Python print(\"\".join(lines[start:end]), end=\"\") to inspect a selection.";
@@ -317,10 +427,10 @@ impl Model for ScriptedModel {
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-    ) -> impl Future<Output = Result<ModelStep, ModelError>> + Send + 'a {
+    ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a {
         async move {
             if cancellation.is_cancelled() {
-                return Err(ModelError::Cancelled);
+                return Err(ModelError::Cancelled.into());
             }
 
             let user_requests = history.user_request_count();
@@ -338,12 +448,12 @@ impl Model for ScriptedModel {
                 .ok_or(ModelError::Exhausted)?;
             if !self.delay.is_zero() {
                 tokio::select! {
-                    _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                    _ = cancellation.cancelled() => return Err(ModelError::Cancelled.into()),
                     _ = tokio::time::sleep(self.delay) => {}
                 }
             }
             if cancellation.is_cancelled() {
-                return Err(ModelError::Cancelled);
+                return Err(ModelError::Cancelled.into());
             }
 
             let action_number = self.cursor + 1;
@@ -394,8 +504,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError, ModelHistory,
-        ModelHistoryError, OpaqueReplayItem, ProviderReplay, ScriptedAction, ScriptedModel,
+        CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError, ModelFailure,
+        ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay, ScriptedAction,
+        ScriptedModel,
     };
 
     fn history_with_request(request: &str) -> ModelHistory {
@@ -469,7 +580,7 @@ mod tests {
         ));
         assert_eq!(
             model.step(&history, &cancellation, &mut progress).await,
-            Err(ModelError::Exhausted)
+            Err(ModelFailure::from(ModelError::Exhausted))
         );
 
         history.append_user_request("second request");
@@ -549,7 +660,7 @@ mod tests {
 
         assert_eq!(
             model.step(&history, &cancellation, &mut progress).await,
-            Err(ModelError::Cancelled)
+            Err(ModelFailure::from(ModelError::Cancelled))
         );
         cancel.await.unwrap();
         assert_eq!(model.position(), 0);

@@ -32,7 +32,7 @@ Durable sessions, effectful tools, model selection, multiple providers, interact
 - Durable sessions, restart recovery, branch navigation, rewind, snapshot migration, or multiple Monty runtime bundles.
 - Interactive authentication, credential storage, OAuth, or editing configuration inside Kiki.
 - Automatic context compaction, summarisation, model-step limits, run-cost limits, or user-configurable resource limits.
-- Provider retries after any response event has arrived, retries of semantic failures, or background Responses API cancellation.
+- Retries of semantic provider failures, local validation failures, or background Responses API cancellation.
 - Mouse interaction, per-box selection, per-box expansion, configurable themes, or persistent TUI preferences.
 - Python variable-change detection, arena inspection, or claiming that filesystem and other external effects can be rolled back.
 - Intentionally truncating accepted model output. A response whose counted application content exceeds 16 MiB fails rather than producing a partial action; although this is far above typical 128,000-token output, pathological valid tokenisation could still reach the guard.
@@ -77,7 +77,7 @@ A `response.completed` terminal response is valid only when its ordered output c
 - one completed `execute_python` function-call item and no assistant text, producing `Code`;
 - one completed non-empty assistant message and no function-call items, producing `Message`.
 
-Other output-item kinds, multiple calls or messages, mixed text and calls, unknown calls, malformed arguments, refusals, incomplete or failed responses, stream error events, and EOF without a terminal event fail closed. Function argument deltas may be decoded into a presentation-only Python preview, but only the completed locally validated call may execute.
+Other output-item kinds, multiple calls or messages, mixed text and calls, unknown calls, malformed arguments, refusals, and incomplete or failed responses fail closed. Stream transport errors and EOF without a terminal event may restart the whole model step under the retry policy. Function argument deltas may be decoded into a presentation-only Python preview, but only the completed locally validated call may execute.
 
 Accepted model output is never truncated. The 16 MiB application-content guard counts accumulated UTF-8 bytes from assistant text, reasoning summaries, function arguments, and opaque encrypted replay content as typed events arrive; HTTP and SSE framing are not counted. Crossing it cancels and fails the model step without producing an action. Each retry has an independent budget.
 
@@ -97,7 +97,7 @@ The prompt teaches:
 
 Before constructing the Agent, Kiki builds one immutable startup snapshot containing the Monty worker, workspace root, fixed OpenAI model, prompt source, API-key presence, and typed startup problems with bounded non-secret remediation text. Submission is enabled exactly when the problem list is empty. The prompt override path comes from `KIKI_SYSTEM_PROMPT`; an unreadable or invalid UTF-8 override is a startup problem rather than silently falling back to the shipped prompt.
 
-Startup problems open a read-only TUI configuration view and disable submission. A later OpenAI authentication response is a separate runtime-disabled reason until restart; it does not mutate the startup snapshot. Kiki commits a bounded sanitised failure. Public provider failures may retain HTTP status, provider error code, and request ID plus at most 4 KiB of provider message; they never retain request bodies, headers, SDK debug output, or credential values. Tests inject the configured key into hostile error fields and prove it is absent from configuration, records, events, and rendering.
+Startup problems open a read-only TUI configuration view and disable submission. A later OpenAI authentication response is a separate runtime-disabled reason until restart; it does not mutate the startup snapshot. Kiki commits a bounded sanitised failure. Public provider failures may retain HTTP status, a provider error code capped at 256 bytes, and at most 4 KiB of provider message; they never retain request IDs, request bodies, headers, SDK debug output, or credential values. Tests inject the configured key into hostile error fields and prove it is absent from configuration, records, events, and rendering.
 
 The configuration view states that `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
 
@@ -139,9 +139,11 @@ Any checkpoint-recovery failure overrides a concurrent or initiating cancellatio
 
 ### Retry and provider errors
 
-Disable implicit SDK retries. Each model step permits three total attempts, numbered from one in live progress and diagnostics. Retry only connection failures and HTTP `408`, `409`, `429`, or `5xx` responses before any provider event arrives. Backoff is exponential, jittered, cancellation-aware, and honours `Retry-After` up to 30 seconds.
+Use `async-openai`'s retry middleware with two retries after the initial HTTP request. The SDK owns retries and backoff for HTTP `429`, `5xx`, and Reqwest connection failures, including its supported numeric `Retry-After` handling. Kiki does not duplicate the SDK's HTTP status classification or exact hidden-attempt accounting.
 
-Authentication, validation, refusal, content-filter, incomplete-response, post-event stream, and cancellation outcomes never retry. A retry begins with empty partial presentation state and a fresh 16 MiB budget. Sanitised terminal failures become inspectable failed-run records; compact bounded summaries of earlier attempts stay inside the settled model-step record rather than model history. Any attempt without returned usage may still have been billed and makes the Run cost a lower bound.
+After an SSE transport failure or EOF without a terminal response, Kiki may restart the whole model step up to twice, including when presentation-only output was already streamed. A restart waits through one small cancellable delay, begins with empty partial presentation state, and receives a fresh 16 MiB budget. Partial failed generation never enters model history or executes; an attempt-start event tells presentation to replace rather than concatenate it. There is no provider idle timeout, so a slow stream waits for data, transport failure, or user cancellation.
+
+Authentication, permission, request validation, refusal, content-filter, incomplete-response, completed-action validation, and cancellation outcomes never trigger a Kiki restart. Sanitised terminal failures become inspectable failed-run records. SDK-internal retries may be opaque and potentially billed, so cost accounting is explicitly allowed to be a lower bound without reconstructing exact intermediate diagnostics or usage.
 
 ### Usage and pricing
 
@@ -149,7 +151,7 @@ Request `service_tier: "default"` and record the returned tier. Record total inp
 
 One versioned `gpt-5.6-sol/default` pricing constant records its effective identity and official source. A pure estimator uses it. For at most 272,000 input tokens, per-million rates are $4.00 uncached input, $0.40 cached input, $5.00 cache writes, and $20.00 output. Above 272,000 input tokens, the full request uses $8.00, $0.80, $10.00, and $30.00 respectively. Uncached input is total input minus cached and cache-write tokens; internally inconsistent usage fails accounting rather than producing a cost. Estimated cost is the sum of each token category multiplied by its applicable rate and divided by one million.
 
-Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 moves the same data into completed boxes. Any potentially billable attempt with absent usage, internally inconsistent usage, an incomplete category breakdown, or a returned non-default tier is unpriceable. If other attempts have known estimates, the cumulative figure is labelled a lower bound; if none do, cost is unavailable. It is never calculated with default-tier rates for an unknown tier or presented as zero. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, and unknown interrupted attempts.
+Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 moves the same data into completed boxes. Any potentially billable visible attempt with absent usage, internally inconsistent usage, an incomplete category breakdown, or a returned non-default tier is unpriceable. SDK-internal retry usage need not be reconstructed; when it may be missing, the cumulative figure is conservatively labelled a lower bound. If other visible attempts have known estimates, the cumulative figure remains a lower bound; if none do, cost is unavailable. It is never calculated with default-tier rates for an unknown tier or presented as zero. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, and unknown interrupted attempts.
 
 ### Transcript presentation
 
@@ -201,7 +203,7 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Preserve earlier completed model steps when cancelling later work; reject whole-Run rollback.
 - Keep partial cancelled generation or execution evidence inside the one canonical in-memory `CancelledRun` record, including pre-cancellation output and an external-side-effect warning; durable persistence remains deferred.
 - Restore only the active execution's arena checkpoint; do not imply that external effects were reversed.
-- Retry only explicit provider-transient failures before any event, for at most three attempts; reject implicit SDK retries.
+- Use the SDK's bounded HTTP retry policy, and restart an interrupted stream at most twice even after presentation-only output; never admit or execute partial attempts.
 - Force OpenAI's default service tier and estimate cost with one versioned model/tier pricing constant because OpenAI does not return billed cost; other models and tiers wait for configuration work.
 - Keep Monty's existing execution, memory, and output limits unchanged.
 - Allow unbounded model steps for autonomous work; record runaway cost and context growth as an accepted risk.
@@ -211,7 +213,7 @@ Every dynamic display string passes through one display-only terminal normaliser
 ## Risks and unknowns
 
 - `async-openai` is unofficial and its exact support for Sol's latest Responses events, strict functions, encrypted reasoning, and stateless output-item replay must be proven with an early spike.
-- Retrying a request before receiving an event can still duplicate provider work or billing if the server accepted the request but the response was lost.
+- SDK retries and whole-step stream restarts can duplicate provider work or billing if the server accepted a request whose complete response Kiki did not receive; this is an accepted availability trade-off.
 - Foreground Responses streams have no confirmed server-side cancellation operation. Dropping the stream guarantees only that Kiki ignores further output.
 - Function-call argument deltas are JSON fragments. The incremental Python decoder must handle split escapes and Unicode correctly, though any defect remains presentation-only.
 - Capturing partial stdout after cancellation requires the observation accumulator to outlive the abandoned Monty future without weakening checkpoint recovery.
@@ -245,7 +247,7 @@ Every dynamic display string passes through one display-only terminal normaliser
 
 ### Phase 1: Live OpenAI agent
 
-Begin with an `async-openai` compatibility gate. It must compile on the pinned toolchain and prove, against local fixtures, strict Responses function requests, every required stream terminal outcome, encrypted reasoning retention/replay, reasoning-summary deltas, usage fields, disabled implicit retries, and cancellation by dropping a foreground stream. These fixtures become the permanent OpenAI adapter suite, not a throwaway spike. If the SDK cannot meet any requirement without leaking its types past the adapter, stop for a transport decision rather than silently replacing it.
+Begin with an `async-openai` compatibility gate. It must compile on the pinned toolchain and prove, against local fixtures, strict Responses function requests, every required stream terminal outcome, encrypted reasoning retention/replay, reasoning-summary deltas, usage fields, the plain transport's lack of hidden retries, and cancellation by dropping a foreground stream. These fixtures become the permanent OpenAI adapter suite, not a throwaway spike. If the SDK cannot meet any requirement without leaking its types past the adapter, stop for a transport decision rather than silently replacing it.
 
 Then deliver a complete read-only live-model path:
 
@@ -256,7 +258,7 @@ Then deliver a complete read-only live-model path:
 - immutable startup snapshot, runtime-disabled authentication state, and read-only configuration TUI;
 - native `execute_python` action encoding and fail-closed validation;
 - explicit `store: false` context with encrypted reasoning replay;
-- three-attempt provider-specific retry policy;
+- bounded SDK HTTP retries plus whole-step restart after interrupted streams;
 - cancellation-wins semantics;
 - typed optional generation or execution interruption evidence inside terminal `CancelledRun` and `FailedRun` records;
 - streamed reasoning, assistant text, decoded Python, arena stdout, usage, and settlement in the final private TUI transcript state, rendered plainly;

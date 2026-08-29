@@ -190,15 +190,25 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
     })
 }
 
-pub fn estimate_run_cost(attempts: &[AttemptAccounting]) -> RunCostEstimate {
+pub fn estimate_run_cost<'a>(
+    attempts: impl IntoIterator<Item = &'a AttemptAccounting>,
+) -> RunCostEstimate {
     let mut known_amount = 0_u128;
     let mut has_known = false;
+    let mut is_lower_bound = false;
     let mut has_unpriceable = false;
 
     for attempt in attempts {
-        let AttemptAccounting::KnownUsage(usage) = attempt else {
-            has_unpriceable = true;
-            continue;
+        let usage = match attempt {
+            AttemptAccounting::KnownUsage(usage) => usage,
+            AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
+                is_lower_bound = true;
+                usage
+            }
+            AttemptAccounting::UsageUnavailable => {
+                has_unpriceable = true;
+                continue;
+            }
         };
         let Ok(estimate) = estimate_usage(usage) else {
             has_unpriceable = true;
@@ -216,7 +226,7 @@ pub fn estimate_run_cost(attempts: &[AttemptAccounting]) -> RunCostEstimate {
         amount: UsdNanos(known_amount),
         pricing: GPT_5_6_SOL_DEFAULT_2026_08_27.identity,
     };
-    match (has_known, has_unpriceable) {
+    match (has_known, has_unpriceable || is_lower_bound) {
         (true, true) => RunCostEstimate::LowerBound(estimate),
         (true, false) | (false, false) => RunCostEstimate::Complete(estimate),
         (false, true) => RunCostEstimate::Unavailable,
@@ -441,6 +451,25 @@ mod tests {
             estimate_run_cost(&[AttemptAccounting::KnownUsage(invalid)]),
             RunCostEstimate::Unavailable
         );
+    }
+
+    #[test]
+    fn known_usage_with_untracked_retries_makes_flattened_multi_step_cost_a_lower_bound() {
+        let first_step = [AttemptAccounting::KnownUsageWithUntrackedRetries(usage(
+            200_000, 0, 0, 0, 0,
+        ))];
+        let second_step = [AttemptAccounting::KnownUsageWithUntrackedRetries(usage(
+            0, 0, 0, 1_000_000, 0,
+        ))];
+
+        match estimate_run_cost(
+            [first_step.as_slice(), second_step.as_slice()]
+                .into_iter()
+                .flatten(),
+        ) {
+            RunCostEstimate::LowerBound(estimate) => assert_eq!(amount(estimate), 20_800_000_000),
+            estimate => panic!("expected lower bound, got {estimate:?}"),
+        }
     }
 
     #[test]
