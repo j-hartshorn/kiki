@@ -18,6 +18,7 @@ const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MEMORY: usize = 64 * 1024 * 1024;
 const ERROR_BYTES: usize = 32 * 1024;
+const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
 const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
     max_total_bytes: 256 * 1024,
     max_total_lines: 1_000,
@@ -89,9 +90,32 @@ pub(crate) enum ArenaProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadOutcome {
+pub enum ReadOutcome {
     Success { line_count: usize },
     Failure { message: String },
+}
+
+impl ReadOutcome {
+    fn failure(message: String) -> Self {
+        Self::Failure {
+            message: bounded_interruption_text(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedExecution {
+    pub(crate) began: bool,
+    pub(crate) stdout: Observation,
+    pub(crate) stderr: Observation,
+    pub(crate) read: InterruptedRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptedRead {
+    NoRead,
+    Pending { path: String },
+    Completed { path: String, outcome: ReadOutcome },
 }
 
 #[derive(Debug, Error)]
@@ -109,11 +133,18 @@ pub enum ArenaError {
     #[error("Monty worker version mismatch: expected {expected}, got {actual}")]
     WorkerVersionMismatch { expected: String, actual: String },
     #[error("arena execution was cancelled")]
-    Cancelled,
+    Cancelled {
+        execution: Box<InterruptedExecution>,
+    },
     #[error("arena execution timed out")]
-    TimedOut,
+    TimedOut {
+        execution: Box<InterruptedExecution>,
+    },
     #[error("arena infrastructure failed: {message}")]
-    Infrastructure { message: String },
+    Infrastructure {
+        message: String,
+        execution: Option<Box<InterruptedExecution>>,
+    },
     #[error("arena recovery failed after {original}: {recovery}")]
     RecoveryFailed {
         original: Box<ArenaError>,
@@ -124,7 +155,112 @@ pub enum ArenaError {
     #[error("Monty checkpoint was suspended")]
     SuspendedCheckpoint,
     #[error("unsupported Monty suspension: {message}")]
-    UnsupportedSuspension { message: String },
+    UnsupportedSuspension {
+        message: String,
+        execution: Option<Box<InterruptedExecution>>,
+    },
+}
+
+impl ArenaError {
+    fn unsupported_suspension(message: impl Into<String>) -> Self {
+        Self::UnsupportedSuspension {
+            message: bounded_interruption_text(message.into()),
+            execution: None,
+        }
+    }
+
+    fn with_interrupted_execution(self, execution: InterruptedExecution) -> Self {
+        match self {
+            Self::Cancelled { .. } => Self::Cancelled {
+                execution: Box::new(execution),
+            },
+            Self::TimedOut { .. } => Self::TimedOut {
+                execution: Box::new(execution),
+            },
+            Self::Infrastructure { message, .. } => Self::Infrastructure {
+                message,
+                execution: Some(Box::new(execution)),
+            },
+            Self::UnsupportedSuspension { message, .. } => Self::UnsupportedSuspension {
+                message,
+                execution: Some(Box::new(execution)),
+            },
+            error => error,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InterruptedReadState {
+    pending: Option<String>,
+    completed: Option<(String, ReadOutcome)>,
+}
+
+struct InterruptedExecutionState {
+    streams: StreamAccumulators,
+    read: InterruptedReadState,
+    began: bool,
+}
+
+impl InterruptedExecutionState {
+    fn new() -> Self {
+        Self {
+            streams: StreamAccumulators::new(OBSERVATION_LIMITS),
+            read: InterruptedReadState::default(),
+            began: false,
+        }
+    }
+
+    fn finish(self) -> InterruptedExecution {
+        InterruptedExecution {
+            began: self.began,
+            stdout: self.streams.stdout.finish(),
+            stderr: self.streams.stderr.finish(),
+            read: self.read.finish(),
+        }
+    }
+}
+
+impl InterruptedReadState {
+    fn started(&mut self, path: &str) {
+        assert!(self.pending.is_none(), "only one read can be pending");
+        self.pending = Some(bounded_interruption_text(path.to_owned()));
+    }
+
+    fn finished(&mut self, outcome: ReadOutcome) {
+        let path = self.pending.take().expect("a read must be pending");
+        self.completed = Some((path, outcome));
+    }
+
+    fn finish(self) -> InterruptedRead {
+        match self.pending {
+            Some(path) => InterruptedRead::Pending { path },
+            None => match self.completed {
+                Some((path, outcome)) => InterruptedRead::Completed { path, outcome },
+                None => InterruptedRead::NoRead,
+            },
+        }
+    }
+}
+
+enum AttemptFailure {
+    Cancelled,
+    TimedOut,
+    Driver(ArenaError),
+}
+
+impl AttemptFailure {
+    fn with_interrupted_execution(self, execution: InterruptedExecution) -> ArenaError {
+        match self {
+            Self::Cancelled => ArenaError::Cancelled {
+                execution: Box::new(execution),
+            },
+            Self::TimedOut => ArenaError::TimedOut {
+                execution: Box::new(execution),
+            },
+            Self::Driver(error) => error.with_interrupted_execution(execution),
+        }
+    }
 }
 
 pub struct Arena {
@@ -135,6 +271,8 @@ pub struct Arena {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     execution_timeout: Duration,
+    #[cfg(test)]
+    fail_next_recovery: bool,
 }
 
 impl Arena {
@@ -200,6 +338,8 @@ impl Arena {
             runtime,
             repl_config,
             execution_timeout,
+            #[cfg(test)]
+            fail_next_recovery: false,
         })
     }
 
@@ -229,25 +369,38 @@ impl Arena {
             .limits
             .as_ref()
             .and_then(|limits| limits.max_memory);
+        let mut interruption = InterruptedExecutionState::new();
         let attempt = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(ArenaError::Cancelled),
-            _ = sleep(self.execution_timeout) => Err(ArenaError::TimedOut),
-            result = execute_checkout(&mut checkout, &self.read_tool, code, max_memory, progress) => result,
+            _ = cancellation.cancelled() => Err(AttemptFailure::Cancelled),
+            _ = sleep(self.execution_timeout) => Err(AttemptFailure::TimedOut),
+            result = execute_checkout(
+                &mut checkout,
+                &self.read_tool,
+                code,
+                max_memory,
+                progress,
+                &mut interruption,
+            ) => result.map_err(AttemptFailure::Driver),
         };
 
         match attempt {
-            Ok((execution, state)) => {
+            Ok((outcome, state)) => {
                 self.checkout = Some(checkout);
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
                     state,
                 };
-                Ok(execution)
+                Ok(Execution {
+                    stdout: interruption.streams.stdout.finish(),
+                    stderr: interruption.streams.stderr.finish(),
+                    outcome,
+                })
             }
-            Err(original) => {
+            Err(failure) => {
+                let error = failure.with_interrupted_execution(interruption.finish());
                 drop(checkout);
-                Err(self.recover(original).await)
+                Err(self.recover(error).await)
             }
         }
     }
@@ -282,7 +435,22 @@ impl Arena {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn fail_next_recovery_for_test(&mut self) {
+        self.fail_next_recovery = true;
+    }
+
     async fn recover(&mut self, original: ArenaError) -> ArenaError {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_recovery) {
+            return ArenaError::RecoveryFailed {
+                original: Box::new(original),
+                recovery: Box::new(ArenaError::Infrastructure {
+                    message: "test recovery failure".to_owned(),
+                    execution: None,
+                }),
+            };
+        }
         match self.checkout_from_checkpoint(&self.checkpoint).await {
             Ok(checkout) => {
                 self.checkout = Some(checkout);
@@ -357,6 +525,7 @@ async fn validate_worker_with_timeout(
 fn pool_failure(error: PoolError) -> ArenaError {
     ArenaError::Infrastructure {
         message: error.to_string(),
+        execution: None,
     }
 }
 
@@ -366,10 +535,9 @@ async fn execute_checkout(
     code: &str,
     max_memory: Option<usize>,
     progress: &mut impl FnMut(ArenaProgress),
-) -> Result<(Execution, Vec<u8>), ArenaError> {
-    let (result, streams) = drive(checkout, read_tool, code, progress).await;
-    let stdout = streams.stdout.finish();
-    let stderr = streams.stderr.finish();
+    interruption: &mut InterruptedExecutionState,
+) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
+    let result = drive(checkout, read_tool, code, progress, interruption).await;
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
             ExecutionOutcome::Complete {
@@ -394,6 +562,7 @@ async fn execute_checkout(
         let context = error_text.as_deref().unwrap_or("completed execution");
         ArenaError::Infrastructure {
             message: format!("post-execution checkpoint failed after {context}: {error}"),
+            execution: None,
         }
     })?;
     if unsafe_memory {
@@ -402,16 +571,10 @@ async fn execute_checkout(
                 "unsafe resource memory failure: {}",
                 error_text.expect("memory errors have diagnostics")
             ),
+            execution: None,
         });
     }
-    Ok((
-        Execution {
-            stdout,
-            stderr,
-            outcome,
-        },
-        state,
-    ))
+    Ok((outcome, state))
 }
 
 fn is_unsafe_memory_error(error: &MontyException, max_memory: Option<usize>) -> bool {
@@ -456,9 +619,15 @@ async fn drive(
     read_tool: &ReadTool,
     code: &str,
     progress: &mut impl FnMut(ArenaProgress),
-) -> (Result<MontyObject, DriverError>, StreamAccumulators) {
-    let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
-    let result = 'drive: {
+    interruption: &mut InterruptedExecutionState,
+) -> Result<MontyObject, DriverError> {
+    let InterruptedExecutionState {
+        streams,
+        read,
+        began,
+    } = interruption;
+    *began = true;
+    'drive: {
         let mut on_print = on_print_sync(|stream, text| streams.push(stream, text));
         let mut event = match checkout
             .feed(code, vec![], vec![], false, &mut on_print)
@@ -516,11 +685,9 @@ async fn drive(
                                 }
                                 Ok(event) => {
                                     break 'drive Err(DriverError::Fatal(
-                                        ArenaError::UnsupportedSuspension {
-                                            message: format!(
-                                                "expected one pending read future, got {event:?}"
-                                            ),
-                                        },
+                                        ArenaError::unsupported_suspension(format!(
+                                            "expected one pending read future, got {event:?}"
+                                        )),
                                     ));
                                 }
                                 Err(PoolError::Runtime(error)) => {
@@ -531,18 +698,20 @@ async fn drive(
                                 }
                             };
                         let path = path.clone();
+                        read.started(&path);
                         progress(ArenaProgress::ReadStarted { path: path.clone() });
-                        let read = read_tool.read(&path).await;
-                        let outcome = match &read {
+                        let read_result = read_tool.read(&path).await;
+                        let outcome = match &read_result {
                             Ok(lines) => ReadOutcome::Success {
                                 line_count: lines.len(),
                             },
-                            Err(error) => ReadOutcome::Failure {
-                                message: error.to_string(),
-                            },
+                            Err(error) => ReadOutcome::failure(error.to_string()),
                         };
+                        read.finished(outcome.clone());
+                        #[cfg(test)]
+                        read_tool.wait_after_read_settled().await;
                         progress(ArenaProgress::ReadFinished { path, outcome });
-                        let value = match read {
+                        let value = match read_result {
                             Ok(lines) => ResumeValue::Return(MontyObject::List(
                                 lines.into_iter().map(MontyObject::String).collect(),
                             )),
@@ -595,14 +764,13 @@ async fn drive(
                     Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
                 },
                 TurnEvent::ResolveFutures { pending_call_ids } => {
-                    break 'drive Err(DriverError::Fatal(ArenaError::UnsupportedSuspension {
-                        message: format!("unexpected pending futures: {pending_call_ids:?}"),
-                    }));
+                    break 'drive Err(DriverError::Fatal(ArenaError::unsupported_suspension(
+                        format!("unexpected pending futures: {pending_call_ids:?}"),
+                    )));
                 }
             };
         }
-    };
-    (result, streams)
+    }
 }
 
 fn read_error(error: ReadError) -> MontyException {
@@ -959,6 +1127,11 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
     end
 }
 
+fn bounded_interruption_text(mut text: String) -> String {
+    text.truncate(utf8_prefix_len(&text, INTERRUPTED_EVIDENCE_TEXT_LIMIT));
+    text
+}
+
 fn splitlines_keepends(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -1036,12 +1209,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome, Observation,
-        ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY, RuntimeIdentity,
-        StreamAccumulators, drive, is_unsafe_memory_error, is_unsafe_soft_memory_error,
-        parse_soft_memory_limit, validate_worker, validate_worker_with_timeout,
+        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome,
+        INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, InterruptedRead,
+        OBSERVATION_LIMITS, Observation, ObservationAccumulator, ObservationLimits, PythonError,
+        RUNTIME_IDENTITY, ReadOutcome, RuntimeIdentity, StreamAccumulators, drive,
+        is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
+        validate_worker, validate_worker_with_timeout,
     };
-    use crate::tools::ReadTool;
+    use crate::tools::{ReadTestGate, ReadTool};
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
         max_total_bytes: 100,
@@ -1067,6 +1242,18 @@ mod tests {
         )
         .await
         .expect("create arena")
+    }
+
+    async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
+        let gate = ReadTestGate::new();
+        let read_tool = ReadTool::new(workspace.path())
+            .await
+            .expect("open read tool")
+            .with_test_gate(gate.clone());
+        let arena = Arena::new(worker_path(), read_tool)
+            .await
+            .expect("create arena");
+        (arena, gate)
     }
 
     async fn arena_with_limits(
@@ -1542,6 +1729,44 @@ mod tests {
         assert_eq!(error.omitted_bytes, 40_000 - error.text.len());
     }
 
+    #[test]
+    fn bounds_interruption_diagnostics_and_keeps_protocol_evidence() {
+        let unbounded = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2 + 1);
+        let expected = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2);
+        let mut interruption = InterruptedExecutionState::new();
+        interruption.began = true;
+        interruption.streams.stdout.push("before\n");
+        interruption.read.started("read");
+        interruption
+            .read
+            .finished(ReadOutcome::failure(unbounded.clone()));
+
+        let error = ArenaError::unsupported_suspension(unbounded)
+            .with_interrupted_execution(interruption.finish());
+
+        let ArenaError::UnsupportedSuspension {
+            message,
+            execution: Some(execution),
+        } = error
+        else {
+            panic!("expected unsupported suspension with interruption evidence");
+        };
+        assert_eq!(message, expected);
+        assert!(message.is_char_boundary(message.len()));
+        assert!(execution.began);
+        assert_eq!(execution.stdout.head, "before\n");
+        let InterruptedRead::Completed {
+            path,
+            outcome: ReadOutcome::Failure { message },
+        } = execution.read
+        else {
+            panic!("expected completed failed read evidence");
+        };
+        assert_eq!(path, "read");
+        assert_eq!(message, expected);
+        assert!(message.is_char_boundary(message.len()));
+    }
+
     #[tokio::test]
     async fn ordinary_python_errors_commit_preceding_mutation() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1682,6 +1907,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_cancelled_execution_has_no_driver_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = arena
+            .execute("print('not run')", &cancellation)
+            .await
+            .unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert!(!execution.began);
+        assert_eq!(execution.stdout.total_bytes, 0);
+        assert_eq!(execution.stderr.total_bytes, 0);
+        assert_eq!(execution.read, InterruptedRead::NoRead);
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_short_output_and_pending_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('pending')\nawait read('pending')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert!(execution.began);
+        assert_eq!(execution.stdout.head, "pending\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Pending {
+                path: "pending".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_bounds_the_pending_read_path_in_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let path = "é".repeat(2_049);
+        let code = format!("await read({path:?})");
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        let InterruptedRead::Pending { path } = execution.read else {
+            panic!("expected a pending read");
+        };
+        assert_eq!(path, "é".repeat(2_048));
+        assert!(path.is_char_boundary(path.len()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_the_last_settled_read_outcome() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("settled"), "line\n").unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('before')\nawait read('settled')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its read settled: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Completed {
+                path: "settled".to_owned(),
+                outcome: ReadOutcome::Success { line_count: 1 },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_observation_keeps_existing_head_and_tail_bounds() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let code = format!(
+            "print('x' * {})\nawait read('pending')",
+            OBSERVATION_LIMITS.max_total_bytes
+        );
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(
+            execution.stdout.head.len(),
+            OBSERVATION_LIMITS.max_head_bytes
+        );
+        assert_eq!(
+            execution.stdout.tail.as_deref().map(str::len),
+            Some(OBSERVATION_LIMITS.max_tail_bytes)
+        );
+        assert_eq!(
+            execution.stdout.total_bytes,
+            OBSERVATION_LIMITS.max_total_bytes + 1
+        );
+        assert_eq!(execution.stdout.total_lines, 1);
+        assert_eq!(execution.stdout.omitted_bytes, 1);
+        assert!(execution.stdout.partial_lines);
+    }
+
+    #[tokio::test]
+    async fn successful_execution_keeps_its_existing_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("complete"), "line\n").unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(arena.execute(
+            "print('before')\nawait read('complete')\nprint('after')",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut run => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut run => panic!("execution finished before its read settled: {result:?}"),
+        }
+        gate.resume_driver();
+        let execution = run.await.unwrap();
+
+        assert_eq!(execution.stdout.head, "before\nafter\n");
+        assert_eq!(execution.stdout.tail, None);
+        assert_eq!(execution.stdout.total_bytes, 13);
+    }
+
+    #[tokio::test]
     async fn cancellation_recovers_the_trusted_checkpoint_before_returning() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -1701,7 +2101,7 @@ mod tests {
             .unwrap_err();
         cancel.await.unwrap();
 
-        assert!(matches!(error, ArenaError::Cancelled));
+        assert!(matches!(error, ArenaError::Cancelled { .. }));
         assert_trusted_value(&mut arena).await;
         #[cfg(unix)]
         assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -1720,11 +2120,17 @@ mod tests {
         #[cfg(unix)]
         let previous_pid = arena_worker_pid(&arena);
 
-        let error = execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass")
-            .await
-            .unwrap_err();
+        let error = execute_without_cancellation(
+            &mut arena,
+            "print('before')\nvalue = 99\nwhile True:\n    pass",
+        )
+        .await
+        .unwrap_err();
 
-        assert!(matches!(error, ArenaError::TimedOut));
+        let ArenaError::TimedOut { execution } = error else {
+            panic!("expected interrupted timeout");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
         assert_trusted_value(&mut arena).await;
         #[cfg(unix)]
         assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -1745,12 +2151,22 @@ mod tests {
             );
         });
 
-        let result =
-            execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass").await;
+        let result = execute_without_cancellation(
+            &mut arena,
+            "print('before')\nvalue = 99\nwhile True:\n    pass",
+        )
+        .await;
         killer.join().unwrap();
         let error = result.unwrap_err();
 
-        assert!(matches!(error, ArenaError::Infrastructure { .. }));
+        let ArenaError::Infrastructure {
+            execution: Some(execution),
+            ..
+        } = error
+        else {
+            panic!("expected interrupted infrastructure failure");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
         assert_trusted_value(&mut arena).await;
         assert_ne!(arena_worker_pid(&arena), previous_pid);
     }
@@ -1804,11 +2220,13 @@ mod tests {
             .expect("new arena should have a checkout");
 
         let mut progress = |_| {};
-        let (result, _) = drive(
+        let mut interruption = InterruptedExecutionState::new();
+        let result = drive(
             checkout,
             &arena.read_tool,
             "x = ' ' * (1 << 60)",
             &mut progress,
+            &mut interruption,
         )
         .await;
         let Err(DriverError::Runtime(error)) = result else {
@@ -1844,6 +2262,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forced_recovery_failure_retains_original_interruption_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        arena.fail_next_recovery_for_test();
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('before')\nawait read('pending')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::RecoveryFailed { original, recovery } = error else {
+            panic!("expected recovery failure");
+        };
+        let ArenaError::Cancelled { execution } = *original else {
+            panic!("expected original interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Pending {
+                path: "pending".to_owned()
+            }
+        );
+        assert!(matches!(
+            *recovery,
+            ArenaError::Infrastructure {
+                message,
+                execution: None,
+            } if message == "test recovery failure"
+        ));
+        assert!(arena.checkout.is_none());
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[tokio::test]
     async fn failed_recovery_preserves_original_error_and_a_missing_checkout_self_recovers() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -1861,7 +2320,7 @@ mod tests {
         let ArenaError::RecoveryFailed { original, recovery } = error else {
             panic!("expected recovery failure, got {error:?}");
         };
-        assert!(matches!(*original, ArenaError::Cancelled));
+        assert!(matches!(*original, ArenaError::Cancelled { .. }));
         assert!(matches!(*recovery, ArenaError::Infrastructure { .. }));
         assert!(arena.checkout.is_none());
 

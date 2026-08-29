@@ -115,7 +115,7 @@ impl<M: Model> Agent<M> {
                     };
                     let execution = match execution {
                         Ok(execution) => execution,
-                        Err(ArenaError::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(ArenaError::Cancelled { .. }) => return Err(AgentError::Cancelled),
                         Err(error) => return Err(AgentError::Arena(error)),
                     };
                     let feedback = execution_feedback(&execution);

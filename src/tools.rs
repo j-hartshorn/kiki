@@ -7,6 +7,8 @@ use cap_std::fs::{Dir, File};
 #[cfg(unix)]
 use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use thiserror::Error;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LINES: usize = 100_000;
@@ -20,6 +22,65 @@ struct ReadLimits {
 pub struct ReadTool {
     workspace: Arc<Dir>,
     limits: ReadLimits,
+    #[cfg(test)]
+    test_gate: Option<ReadTestGate>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ReadTestGate {
+    read_started: Arc<Semaphore>,
+    read_allowed: Arc<Semaphore>,
+    read_settled: Arc<Semaphore>,
+    driver_allowed: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl ReadTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            read_started: Arc::new(Semaphore::new(0)),
+            read_allowed: Arc::new(Semaphore::new(0)),
+            read_settled: Arc::new(Semaphore::new(0)),
+            driver_allowed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_read_started(&self) {
+        take_permit(&self.read_started).await;
+    }
+
+    pub(crate) fn resume_read(&self) {
+        self.read_allowed.add_permits(1);
+    }
+
+    pub(crate) async fn wait_until_read_settled(&self) {
+        take_permit(&self.read_settled).await;
+    }
+
+    pub(crate) fn resume_driver(&self) {
+        self.driver_allowed.add_permits(1);
+    }
+
+    async fn wait_before_read(&self) {
+        self.read_started.add_permits(1);
+        take_permit(&self.read_allowed).await;
+    }
+
+    async fn wait_after_read_settled(&self) {
+        self.read_settled.add_permits(1);
+        take_permit(&self.driver_allowed).await;
+    }
+}
+
+#[cfg(test)]
+async fn take_permit(semaphore: &Arc<Semaphore>) {
+    semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("test gate semaphore remains open")
+        .forget();
 }
 
 #[derive(Debug, Error)]
@@ -78,16 +139,38 @@ impl ReadTool {
         })
         .await??;
 
-        Ok(Self { workspace, limits })
+        Ok(Self {
+            workspace,
+            limits,
+            #[cfg(test)]
+            test_gate: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_gate(mut self, test_gate: ReadTestGate) -> Self {
+        self.test_gate = Some(test_gate);
+        self
     }
 
     pub async fn read(&self, path: impl AsRef<Path>) -> Result<Vec<String>, ReadError> {
         let path = path.as_ref().to_path_buf();
         validate_path(&path)?;
+        #[cfg(test)]
+        if let Some(test_gate) = &self.test_gate {
+            test_gate.wait_before_read().await;
+        }
 
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
         tokio::task::spawn_blocking(move || read_file(&workspace, &path, limits)).await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_after_read_settled(&self) {
+        if let Some(test_gate) = &self.test_gate {
+            test_gate.wait_after_read_settled().await;
+        }
     }
 }
 
@@ -162,12 +245,11 @@ mod tests {
     use std::ffi::CString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
-    #[cfg(unix)]
     use std::time::Duration;
 
     use tempfile::TempDir;
 
-    use super::{ReadError, ReadTool};
+    use super::{ReadError, ReadTestGate, ReadTool};
 
     async fn read_tool(workspace: &TempDir) -> ReadTool {
         ReadTool::new(workspace.path()).await.unwrap()
@@ -181,6 +263,25 @@ mod tests {
         ReadTool::with_limits(workspace.path(), max_bytes, max_lines)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_gate_pauses_a_read_until_released() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("paused"), "contents").unwrap();
+        let gate = ReadTestGate::new();
+        let tool = read_tool(&workspace).await.with_test_gate(gate.clone());
+        let mut read = tokio::spawn(async move { tool.read("paused").await });
+
+        gate.wait_until_read_started().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut read)
+                .await
+                .is_err()
+        );
+        gate.resume_read();
+
+        assert_eq!(read.await.unwrap().unwrap(), ["contents"]);
     }
 
     #[tokio::test]
