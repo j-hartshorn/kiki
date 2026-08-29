@@ -185,7 +185,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/runtime.rs`, publisher/controller integration; `src/tui.rs`, receiver wiring) — First fail by filling an undrained progress receiver. Then prove fixed capacity, 4 KiB rejection, FIFO accepted events, per-hop gap-marker propagation, unresolved worker gaps on reliable finish, unresolved TUI gaps on terminal events, terminal completion over the independent reliable path, no deadlock during cancellation/shutdown, and settlement across more than 256 progress emissions spanning several model steps while the TUI progress receiver remains undrained.
 
-**Files** — Modify: `src/runtime.rs`, `src/tui.rs`, `src/main.rs`
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/tui.rs`, `src/main.rs`
 
 **Commit** — `Bound runtime progress delivery`
 

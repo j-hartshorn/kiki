@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
-use crate::runtime::{Record, RunId, RuntimeCommand, RuntimeEvent, StoredRecord};
+use crate::runtime::{
+    ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent,
+    RuntimeProgressReceiver, StoredRecord,
+};
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -55,6 +58,10 @@ struct App {
     prompt: String,
     run_state: RunState,
     latest_run_id: Option<RunId>,
+    settled_run_id: Option<RunId>,
+    current_step_id: Option<ModelStepId>,
+    completed_step_id: Option<ModelStepId>,
+    progress_gap: bool,
     status: String,
     records: Vec<StoredRecord>,
     scroll_from_bottom: usize,
@@ -67,6 +74,10 @@ impl Default for App {
             prompt: String::new(),
             run_state: RunState::Idle,
             latest_run_id: None,
+            settled_run_id: None,
+            current_step_id: None,
+            completed_step_id: None,
+            progress_gap: false,
             status: "idle".to_owned(),
             records: Vec::new(),
             scroll_from_bottom: 0,
@@ -157,52 +168,92 @@ impl App {
 
     fn handle_event(&mut self, event: RuntimeEvent) -> bool {
         match event {
-            RuntimeEvent::RunStarted { run_id } => {
-                if self
-                    .latest_run_id
-                    .is_some_and(|latest_run_id| run_id <= latest_run_id)
-                {
-                    return false;
-                }
-                self.latest_run_id = Some(run_id);
-                self.run_state = RunState::Active(run_id);
-                self.status = format!("run {} started", run_id.0);
-                true
+            RuntimeEvent::RunStarted { run_id } => self.start_run(run_id),
+            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+                self.handle_step_progress(run_id, step_id, format!("model step {}", step_id.0))
             }
-            RuntimeEvent::ModelStepStarted { run_id, step_id }
-                if self.run_state == RunState::Active(run_id) =>
-            {
-                self.set_status(format!("model step {}", step_id.0))
-            }
-            RuntimeEvent::ExecutionStarted { run_id, step_id }
-                if self.run_state == RunState::Active(run_id) =>
-            {
-                self.set_status(format!("running code for step {}", step_id.0))
-            }
-            RuntimeEvent::ToolStarted { run_id, path, .. }
-                if self.run_state == RunState::Active(run_id) =>
-            {
-                self.set_status(format!("reading {path}"))
-            }
+            RuntimeEvent::ModelProgress {
+                run_id,
+                step_id,
+                progress,
+            } => self.handle_step_progress(
+                run_id,
+                step_id,
+                match progress {
+                    crate::model::ModelProgress::AttemptStarted { attempt } => {
+                        format!("model step {} attempt {attempt}", step_id.0)
+                    }
+                    _ => format!("model step {}", step_id.0),
+                },
+            ),
+            RuntimeEvent::ExecutionStarted { run_id, step_id } => self.handle_step_progress(
+                run_id,
+                step_id,
+                format!("running code for step {}", step_id.0),
+            ),
+            RuntimeEvent::ToolStarted {
+                run_id,
+                step_id,
+                path,
+            } => self.handle_step_progress(run_id, step_id, format!("reading {path}")),
             RuntimeEvent::ToolFinished {
                 run_id,
+                step_id,
                 path,
                 outcome,
-                ..
-            } if self.run_state == RunState::Active(run_id) => match outcome {
-                ReadOutcome::Success { line_count } => {
-                    self.set_status(format!("read {path} ({line_count} lines)"))
-                }
-                ReadOutcome::Failure { message } => {
-                    self.set_status(format!("read {path} failed: {message}"))
-                }
+            } => match outcome {
+                ReadOutcome::Success { line_count } => self.handle_step_progress(
+                    run_id,
+                    step_id,
+                    format!("read {path} ({line_count} lines)"),
+                ),
+                ReadOutcome::Failure { message } => self.handle_step_progress(
+                    run_id,
+                    step_id,
+                    format!("read {path} failed: {message}"),
+                ),
             },
-            RuntimeEvent::RecordAppended { record } => {
+            RuntimeEvent::RecordAppended {
+                record,
+                progress_gap,
+            } => {
+                self.progress_gap |= progress_gap;
+                self.latest_run_id = Some(
+                    self.latest_run_id
+                        .map_or(record.run_id, |latest| latest.max(record.run_id)),
+                );
+                if let Record::CompletedExecution { step_id, .. } = &record.record
+                    && self.latest_run_id == Some(record.run_id)
+                {
+                    self.completed_step_id = Some(
+                        self.completed_step_id
+                            .map_or(*step_id, |completed| completed.max(*step_id)),
+                    );
+                }
+                if matches!(
+                    &record.record,
+                    Record::FinalMessage { .. } | Record::CancelledRun | Record::FailedRun { .. }
+                ) {
+                    self.settled_run_id = Some(
+                        self.settled_run_id
+                            .map_or(record.run_id, |settled| settled.max(record.run_id)),
+                    );
+                }
                 self.records.push(record);
                 true
             }
-            RuntimeEvent::RunSettled { run_id } if self.run_state == RunState::Active(run_id) => {
+            RuntimeEvent::RunSettled { run_id }
+                if self
+                    .latest_run_id
+                    .is_none_or(|latest_run_id| run_id >= latest_run_id) =>
+            {
+                self.latest_run_id = Some(run_id);
+                self.settled_run_id = Some(
+                    self.settled_run_id
+                        .map_or(run_id, |settled| settled.max(run_id)),
+                );
                 self.run_state = RunState::Idle;
+                self.current_step_id = None;
                 self.status = "idle".to_owned();
                 true
             }
@@ -219,6 +270,79 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
+        self.progress_gap |= envelope.gap_before;
+        self.handle_event(envelope.item)
+    }
+
+    fn start_run(&mut self, run_id: RunId) -> bool {
+        if self
+            .settled_run_id
+            .is_some_and(|settled_run_id| run_id <= settled_run_id)
+            || self
+                .latest_run_id
+                .is_some_and(|latest_run_id| run_id < latest_run_id)
+            || (self.latest_run_id == Some(run_id) && self.run_state != RunState::Submitting)
+        {
+            return false;
+        }
+        self.latest_run_id = Some(run_id);
+        self.current_step_id = None;
+        self.completed_step_id = None;
+        self.run_state = RunState::Active(run_id);
+        self.status = format!("run {} started", run_id.0);
+        true
+    }
+
+    fn handle_step_progress(
+        &mut self,
+        run_id: RunId,
+        step_id: ModelStepId,
+        status: String,
+    ) -> bool {
+        if self
+            .settled_run_id
+            .is_some_and(|settled_run_id| run_id <= settled_run_id)
+            || self
+                .completed_step_id
+                .is_some_and(|completed_step_id| step_id <= completed_step_id)
+        {
+            return false;
+        }
+        match self.run_state {
+            RunState::Active(active_run_id) if active_run_id == run_id => {}
+            RunState::Submitting
+                if self
+                    .latest_run_id
+                    .is_none_or(|latest_run_id| run_id >= latest_run_id) =>
+            {
+                self.latest_run_id = Some(run_id);
+                self.run_state = RunState::Active(run_id);
+                self.current_step_id = None;
+                self.completed_step_id = None;
+            }
+            RunState::Idle
+                if self
+                    .latest_run_id
+                    .is_none_or(|latest_run_id| run_id > latest_run_id) =>
+            {
+                self.latest_run_id = Some(run_id);
+                self.run_state = RunState::Active(run_id);
+                self.current_step_id = None;
+                self.completed_step_id = None;
+            }
+            _ => return false,
+        }
+        if self
+            .current_step_id
+            .is_some_and(|current_step_id| step_id < current_step_id)
+        {
+            return false;
+        }
+        self.current_step_id = Some(step_id);
+        self.set_status(status)
     }
 
     fn set_status(&mut self, status: String) -> bool {
@@ -272,13 +396,24 @@ impl<F: FnOnce()> Drop for RestoreGuard<F> {
 pub(crate) fn run(
     commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
+    mut progress: RuntimeProgressReceiver,
 ) -> Result<(), TuiError> {
     let mut app = App::default();
     let mut input = CrosstermEvents;
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
-        |terminal| run_loop(terminal, &mut app, &mut input, &commands, &mut events).map(|_| ()),
+        |terminal| {
+            run_loop(
+                terminal,
+                &mut app,
+                &mut input,
+                &commands,
+                &mut events,
+                &mut progress,
+            )
+            .map(|_| ())
+        },
     )
 }
 
@@ -298,9 +433,11 @@ fn run_loop<B: Backend>(
     input: &mut impl EventSource,
     commands: &mpsc::Sender<RuntimeCommand>,
     events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    progress: &mut RuntimeProgressReceiver,
 ) -> Result<usize, TuiError> {
     let mut dirty = true;
     let mut redraws = 0;
+    let mut progress_open = true;
 
     loop {
         if dirty {
@@ -335,6 +472,19 @@ fn run_loop<B: Backend>(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) if quit => return Ok(redraws),
                 Err(TryRecvError::Disconnected) => return Err(TuiError::RuntimeClosed),
+            }
+        }
+
+        if progress_open {
+            loop {
+                match progress.try_recv() {
+                    Ok(envelope) => dirty |= app.handle_progress(envelope),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        progress_open = false;
+                        break;
+                    }
+                }
             }
         }
 
@@ -460,7 +610,9 @@ mod tests {
 
     use super::App;
     use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
-    use crate::runtime::{ModelStepId, Record, RunId, RuntimeCommand, RuntimeEvent, StoredRecord};
+    use crate::runtime::{
+        ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent, StoredRecord,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -620,6 +772,7 @@ mod tests {
         };
         assert!(app.handle_event(RuntimeEvent::RecordAppended {
             record: stale_record.clone(),
+            progress_gap: false,
         }));
         assert_eq!(app.records, [stale_record]);
     }
@@ -678,6 +831,7 @@ mod tests {
                     request: "inspect".to_owned(),
                 },
             },
+            progress_gap: false,
         });
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -687,6 +841,7 @@ mod tests {
                     text: "finished".to_owned(),
                 },
             },
+            progress_gap: false,
         });
         app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
 
@@ -717,12 +872,14 @@ mod tests {
                     },
                 },
             },
+            progress_gap: false,
         });
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
                 run_id: RunId(1),
                 record: Record::CancelledRun,
             },
+            progress_gap: false,
         });
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -731,6 +888,7 @@ mod tests {
                     message: "model failed".to_owned(),
                 },
             },
+            progress_gap: false,
         });
 
         let screen = rendered(&mut app, 60, 16);
@@ -755,6 +913,7 @@ mod tests {
                         request: format!("request {run_id}"),
                     },
                 },
+                progress_gap: false,
             });
         }
 
@@ -786,10 +945,132 @@ mod tests {
                     request: "only line".to_owned(),
                 },
             },
+            progress_gap: false,
         });
         rendered(&mut app, 40, 5);
 
         assert!(!app.handle_key(key(KeyCode::Up)).visible_changed);
+    }
+
+    #[test]
+    fn progress_channels_reject_stale_runs_and_steps_and_keep_terminal_authoritative() {
+        let mut app = App {
+            run_state: super::RunState::Submitting,
+            ..App::default()
+        };
+
+        assert!(app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::UserRequest {
+                    request: "request".to_owned(),
+                },
+            },
+            progress_gap: false,
+        }));
+        assert!(app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(2) },
+            gap_before: true,
+        }));
+        assert!(app.progress_gap);
+        assert!(app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(3),
+            },
+            gap_before: false,
+        }));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(9),
+            },
+            gap_before: false,
+        }));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ExecutionStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(2),
+            },
+            gap_before: false,
+        }));
+
+        let mut completion_first = App::default();
+        completion_first.handle_event(RuntimeEvent::RunStarted { run_id: RunId(3) });
+        completion_first.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(3),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(4),
+                    source: "code".to_owned(),
+                    execution: Execution {
+                        stdout: observation(""),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::Complete { result: None },
+                    },
+                },
+            },
+            progress_gap: false,
+        });
+        assert!(!completion_first.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(3),
+                step_id: ModelStepId(4),
+            },
+            gap_before: false,
+        }));
+
+        assert!(app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(3),
+                    text: "done".to_owned(),
+                },
+            },
+            progress_gap: true,
+        }));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(4),
+                progress: crate::model::ModelProgress::AssistantTextChunk {
+                    text: "late".to_owned(),
+                },
+            },
+            gap_before: false,
+        }));
+        assert!(app.progress_gap);
+    }
+
+    #[test]
+    fn progress_channels_close_without_closing_the_tui() {
+        let backend = TestBackend::new(40, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        let mut input = FakeInput::new([Some(ratatui::crossterm::event::Event::Key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ))]);
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(8);
+        let (_event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel(256);
+        drop(progress_sender);
+
+        assert!(
+            super::run_loop(
+                &mut terminal,
+                &mut app,
+                &mut input,
+                &command_sender,
+                &mut event_receiver,
+                &mut progress_receiver,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            command_receiver.try_recv().unwrap(),
+            RuntimeCommand::Shutdown
+        );
     }
 
     #[test]
@@ -806,6 +1087,7 @@ mod tests {
         ]);
         let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(8);
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel(256);
         event_sender
             .send(RuntimeEvent::RunStarted { run_id: RunId(1) })
             .unwrap();
@@ -819,6 +1101,7 @@ mod tests {
             &mut input,
             &command_sender,
             &mut event_receiver,
+            &mut progress_receiver,
         )
         .unwrap();
 
@@ -843,6 +1126,7 @@ mod tests {
         let mut input = FakeInput::new([None]);
         let (command_sender, _command_receiver) = tokio::sync::mpsc::channel(8);
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel(256);
         drop(event_sender);
 
         let result = super::run_loop(
@@ -851,6 +1135,7 @@ mod tests {
             &mut input,
             &command_sender,
             &mut event_receiver,
+            &mut progress_receiver,
         );
 
         assert!(matches!(result, Err(super::TuiError::RuntimeClosed)));
@@ -869,6 +1154,7 @@ mod tests {
                     request: "small".to_owned(),
                 },
             },
+            progress_gap: false,
         });
 
         for (width, height) in [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (3, 3)] {
@@ -894,6 +1180,7 @@ mod tests {
         let restored_after_loop = Cell::new(false);
         let (command_sender, _command_receiver) = tokio::sync::mpsc::channel(8);
         let (_event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel(256);
         let mut app = App::default();
         let mut input = ErrorInput;
         let loop_result = super::with_terminal(
@@ -909,6 +1196,7 @@ mod tests {
                     &mut input,
                     &command_sender,
                     &mut event_receiver,
+                    &mut progress_receiver,
                 )
                 .map(|_| ())
             },

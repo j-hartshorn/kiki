@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 use crate::agent::Agent;
 use crate::arena::Arena;
 use crate::model::ScriptedModel;
-use crate::runtime::{RuntimeCommand, RuntimeController};
+use crate::runtime::{
+    PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
+};
 use crate::tools::ReadTool;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -41,10 +43,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let arena = runtime.block_on(Arena::new(worker_path, read_tool))?;
     let controller = RuntimeController::new(Agent::new(arena, ScriptedModel::default()));
     let (command_sender, command_receiver) = mpsc::channel(8);
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let controller = runtime.spawn(controller.run(command_receiver, event_sender));
+    let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let (progress_sender, progress_receiver) =
+        mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
+    let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
 
-    let tui_result = tui::run(command_sender.clone(), event_receiver);
+    let tui_result = tui::run(command_sender.clone(), event_receiver, progress_receiver);
     let _ = command_sender.blocking_send(RuntimeCommand::Shutdown);
     let controller_result = runtime.block_on(controller);
 

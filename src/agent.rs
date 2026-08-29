@@ -14,6 +14,7 @@ use crate::model::{
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AgentProgress {
     ModelStepStarted,
+    ModelProgress(ModelProgress),
     ExecutionStarted,
     ToolStarted {
         path: String,
@@ -193,7 +194,9 @@ impl<M: Model> Agent<M> {
                 return Err(AgentError::Cancelled { attempts });
             }
             progress(AgentProgress::ModelStepStarted);
-            let mut model_progress = |_model_progress: ModelProgress| {};
+            let mut model_progress = |model_progress: ModelProgress| {
+                progress(AgentProgress::ModelProgress(model_progress));
+            };
             let model_step = match self
                 .model
                 .step(&self.model_context, cancellation, &mut model_progress)
@@ -777,6 +780,29 @@ mod tests {
             entry,
             ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn agent_forwards_model_progress_to_its_progress_sink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(&workspace, PartialFailureModel).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        let error = {
+            let mut capture = |event| progress.push(event);
+            agent
+                .run_with_progress("inspect", &cancellation, &mut capture)
+                .await
+                .unwrap_err()
+        };
+
+        assert!(matches!(error, AgentError::Model { .. }));
+        assert_eq!(
+            progress.len(),
+            2,
+            "model progress should reach the agent sink"
+        );
     }
 
     #[tokio::test]

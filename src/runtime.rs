@@ -1,9 +1,10 @@
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome};
 use crate::arena::{Execution, ReadOutcome};
-use crate::model::Model;
+use crate::model::{Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RunId(pub(crate) u64);
@@ -55,6 +56,11 @@ pub(crate) enum RuntimeEvent {
         run_id: RunId,
         step_id: ModelStepId,
     },
+    ModelProgress {
+        run_id: RunId,
+        step_id: ModelStepId,
+        progress: ModelProgress,
+    },
     ExecutionStarted {
         run_id: RunId,
         step_id: ModelStepId,
@@ -72,6 +78,7 @@ pub(crate) enum RuntimeEvent {
     },
     RecordAppended {
         record: StoredRecord,
+        progress_gap: bool,
     },
     RunSettled {
         run_id: RunId,
@@ -80,6 +87,53 @@ pub(crate) enum RuntimeEvent {
         active_run_id: RunId,
     },
 }
+
+pub(crate) const PROGRESS_CHANNEL_CAPACITY: usize = 256;
+const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgressEnvelope<T> {
+    pub(crate) item: T,
+    pub(crate) gap_before: bool,
+}
+
+struct ProgressPublisher<T> {
+    sender: mpsc::Sender<ProgressEnvelope<T>>,
+    gap_pending: bool,
+}
+
+impl<T> ProgressPublisher<T> {
+    fn new(sender: mpsc::Sender<ProgressEnvelope<T>>) -> Self {
+        Self {
+            sender,
+            gap_pending: false,
+        }
+    }
+
+    fn publish(&mut self, item: T, upstream_gap: bool, payload_bytes: usize) -> bool {
+        if payload_bytes > PROGRESS_PAYLOAD_LIMIT {
+            self.gap_pending = true;
+            return false;
+        }
+        let gap_before = upstream_gap || self.gap_pending;
+        match self.sender.try_send(ProgressEnvelope { item, gap_before }) {
+            Ok(()) => {
+                self.gap_pending = false;
+                true
+            }
+            Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
+                self.gap_pending = true;
+                false
+            }
+        }
+    }
+
+    fn take_pending_gap(&mut self) -> bool {
+        std::mem::take(&mut self.gap_pending)
+    }
+}
+
+pub(crate) type RuntimeProgressReceiver = mpsc::Receiver<ProgressEnvelope<RuntimeEvent>>;
 
 pub(crate) struct RuntimeController<M: Model> {
     agent: Option<Agent<M>>,
@@ -93,16 +147,94 @@ struct ActiveRun<M: Model> {
     run_id: RunId,
     cancellation: CancellationToken,
     worker: mpsc::UnboundedReceiver<WorkerMessage<M>>,
-    current_step_id: Option<ModelStepId>,
+    progress: mpsc::Receiver<ProgressEnvelope<WorkerProgress>>,
+    progress_open: bool,
+    step_ids: Vec<ModelStepId>,
 }
 
 #[allow(clippy::large_enum_variant)]
 enum WorkerMessage<M: Model> {
-    Progress(AgentProgress),
+    ExecutionCompleted {
+        step_ordinal: u64,
+        source: String,
+        execution: Execution,
+    },
     Finished {
         agent: Agent<M>,
         result: Result<AgentRunOutcome, AgentError>,
+        final_step_ordinal: u64,
+        progress_gap: bool,
     },
+}
+
+struct WorkerProgress {
+    step_ordinal: u64,
+    progress: AgentProgress,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ControllerInput<M: Model> {
+    Command(Option<RuntimeCommand>),
+    Worker(Option<WorkerMessage<M>>),
+    Progress(Option<ProgressEnvelope<WorkerProgress>>),
+}
+
+fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
+    match progress {
+        AgentProgress::ModelProgress(progress) => model_progress_payload_bytes(progress),
+        AgentProgress::ToolStarted { path } => path.len(),
+        AgentProgress::ToolFinished { path, outcome } => {
+            path.len() + read_outcome_payload_bytes(outcome)
+        }
+        AgentProgress::ModelStepStarted
+        | AgentProgress::ExecutionStarted
+        | AgentProgress::ExecutionCompleted { .. } => 0,
+    }
+}
+
+fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
+    match event {
+        RuntimeEvent::ModelProgress { progress, .. } => model_progress_payload_bytes(progress),
+        RuntimeEvent::ToolStarted { path, .. } => path.len(),
+        RuntimeEvent::ToolFinished { path, outcome, .. } => {
+            path.len() + read_outcome_payload_bytes(outcome)
+        }
+        RuntimeEvent::RunStarted { .. }
+        | RuntimeEvent::ModelStepStarted { .. }
+        | RuntimeEvent::ExecutionStarted { .. }
+        | RuntimeEvent::RecordAppended { .. }
+        | RuntimeEvent::RunSettled { .. }
+        | RuntimeEvent::SubmissionRejectedBusy { .. } => 0,
+    }
+}
+
+fn model_progress_payload_bytes(progress: &ModelProgress) -> usize {
+    match progress {
+        ModelProgress::ReasoningSummaryChunk { text }
+        | ModelProgress::AssistantTextChunk { text } => text.len(),
+        ModelProgress::DecodedPythonChunk { code } => code.len(),
+        ModelProgress::AttemptStarted { .. } => 0,
+        ModelProgress::AttemptSettled { accounting, .. } => {
+            attempt_accounting_payload_bytes(accounting)
+        }
+    }
+}
+
+fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting) -> usize {
+    match accounting {
+        crate::model::AttemptAccounting::KnownUsage(usage)
+        | crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
+            usage.model.len() + usage.service_tier.as_ref().map_or(0, String::len)
+        }
+        crate::model::AttemptAccounting::UsageUnavailable => 0,
+    }
+}
+
+fn read_outcome_payload_bytes(outcome: &ReadOutcome) -> usize {
+    match outcome {
+        ReadOutcome::Success { .. } => 0,
+        ReadOutcome::Failure { message } => message.len(),
+    }
 }
 
 impl<M: Model> RuntimeController<M> {
@@ -120,30 +252,55 @@ impl<M: Model> RuntimeController<M> {
         mut self,
         mut commands: mpsc::Receiver<RuntimeCommand>,
         events: mpsc::UnboundedSender<RuntimeEvent>,
+        progress_sender: mpsc::Sender<ProgressEnvelope<RuntimeEvent>>,
     ) -> Vec<StoredRecord> {
+        let mut progress = ProgressPublisher::new(progress_sender);
         let mut commands_open = true;
         let mut shutdown_requested = false;
 
         loop {
             if self.active.is_some() {
-                tokio::select! {
-                    biased;
-                    command = commands.recv(), if commands_open => match command {
-                        Some(command) => self.handle_command(command, &events, &mut shutdown_requested),
-                        None => {
-                            commands_open = false;
-                            shutdown_requested = true;
-                            self.cancel_active();
-                        }
-                    },
-                    message = self.active.as_mut().expect("active run checked before receiving worker message").worker.recv() => {
-                        match message {
-                            Some(message) => self.handle_worker_message(message, &events),
-                            None => {
-                                shutdown_requested = true;
-                                self.handle_worker_closed(&events);
-                            }
-                        }
+                let input = {
+                    let active = self
+                        .active
+                        .as_mut()
+                        .expect("active run checked before receiving worker input");
+                    tokio::select! {
+                        biased;
+                        command = commands.recv(), if commands_open => ControllerInput::Command(command),
+                        message = active.worker.recv() => ControllerInput::Worker(message),
+                        worker_progress = active.progress.recv(), if active.progress_open => ControllerInput::Progress(worker_progress),
+                    }
+                };
+                match input {
+                    ControllerInput::Command(Some(command)) => {
+                        self.handle_command(
+                            command,
+                            &events,
+                            &mut progress,
+                            &mut shutdown_requested,
+                        );
+                    }
+                    ControllerInput::Command(None) => {
+                        commands_open = false;
+                        shutdown_requested = true;
+                        self.cancel_active();
+                    }
+                    ControllerInput::Worker(Some(message)) => {
+                        self.handle_worker_message(message, &events, &mut progress);
+                    }
+                    ControllerInput::Worker(None) => {
+                        shutdown_requested = true;
+                        self.handle_worker_closed(&events, &mut progress);
+                    }
+                    ControllerInput::Progress(Some(progress_envelope)) => {
+                        self.handle_worker_progress(progress_envelope, &mut progress);
+                    }
+                    ControllerInput::Progress(None) => {
+                        self.active
+                            .as_mut()
+                            .expect("active run checked before closing worker progress")
+                            .progress_open = false;
                     }
                 }
             } else {
@@ -151,7 +308,12 @@ impl<M: Model> RuntimeController<M> {
                     return self.records;
                 }
                 match commands.recv().await {
-                    Some(command) => self.handle_command(command, &events, &mut shutdown_requested),
+                    Some(command) => self.handle_command(
+                        command,
+                        &events,
+                        &mut progress,
+                        &mut shutdown_requested,
+                    ),
                     None => return self.records,
                 }
             }
@@ -166,6 +328,7 @@ impl<M: Model> RuntimeController<M> {
         &mut self,
         command: RuntimeCommand,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
         shutdown_requested: &mut bool,
     ) {
         match command {
@@ -178,7 +341,7 @@ impl<M: Model> RuntimeController<M> {
                         },
                     );
                 } else {
-                    self.start_run(request, events);
+                    self.start_run(request, events, progress);
                 }
             }
             RuntimeCommand::Cancel => self.cancel_active(),
@@ -189,15 +352,21 @@ impl<M: Model> RuntimeController<M> {
         }
     }
 
-    fn start_run(&mut self, request: String, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+    fn start_run(
+        &mut self,
+        request: String,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+    ) {
         let run_id = self.next_run_id();
-        self.emit(events, RuntimeEvent::RunStarted { run_id });
+        self.publish_progress(progress, RuntimeEvent::RunStarted { run_id }, false);
         self.append_record(
             events,
             run_id,
             Record::UserRequest {
                 request: request.clone(),
             },
+            false,
         );
 
         let agent = self
@@ -207,22 +376,67 @@ impl<M: Model> RuntimeController<M> {
         let cancellation = CancellationToken::new();
         let cancellation_for_worker = cancellation.clone();
         let (sender, worker) = mpsc::unbounded_channel();
+        let (progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
             let mut agent = agent;
-            let mut progress = |progress| {
-                let _ = sender.send(WorkerMessage::Progress(progress));
+            let (result, final_step_ordinal, progress_gap) = {
+                let mut progress_sender = ProgressPublisher::new(progress_sender);
+                let completion_sender = sender.clone();
+                let mut step_ordinal: u64 = 0;
+                let mut progress = |agent_progress| match agent_progress {
+                    AgentProgress::ModelStepStarted => {
+                        step_ordinal = step_ordinal
+                            .checked_add(1)
+                            .expect("model step ordinal overflowed");
+                        progress_sender.publish(
+                            WorkerProgress {
+                                step_ordinal,
+                                progress: AgentProgress::ModelStepStarted,
+                            },
+                            false,
+                            0,
+                        );
+                    }
+                    AgentProgress::ExecutionCompleted { source, execution } => {
+                        let _ = completion_sender.send(WorkerMessage::ExecutionCompleted {
+                            step_ordinal,
+                            source,
+                            execution,
+                        });
+                    }
+                    agent_progress => {
+                        let payload_bytes = agent_progress_payload_bytes(&agent_progress);
+                        progress_sender.publish(
+                            WorkerProgress {
+                                step_ordinal,
+                                progress: agent_progress,
+                            },
+                            false,
+                            payload_bytes,
+                        );
+                    }
+                };
+                let result = agent
+                    .run_with_progress(request, &cancellation_for_worker, &mut progress)
+                    .await;
+                let progress_gap = progress_sender.take_pending_gap();
+                (result, step_ordinal, progress_gap)
             };
-            let result = agent
-                .run_with_progress(request, &cancellation_for_worker, &mut progress)
-                .await;
-            let _ = sender.send(WorkerMessage::Finished { agent, result });
+            let _ = sender.send(WorkerMessage::Finished {
+                agent,
+                result,
+                final_step_ordinal,
+                progress_gap,
+            });
         });
         drop(worker_task);
         self.active = Some(ActiveRun {
             run_id,
             cancellation,
             worker,
-            current_step_id: None,
+            progress: worker_progress,
+            progress_open: true,
+            step_ids: Vec::new(),
         });
     }
 
@@ -236,10 +450,35 @@ impl<M: Model> RuntimeController<M> {
         &mut self,
         message: WorkerMessage<M>,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
         match message {
-            WorkerMessage::Progress(progress) => self.handle_progress(progress, events),
-            WorkerMessage::Finished { mut agent, result } => {
+            WorkerMessage::ExecutionCompleted {
+                step_ordinal,
+                source,
+                execution,
+            } => {
+                let Some(step_id) = self.step_id_for(step_ordinal) else {
+                    return;
+                };
+                self.append_record(
+                    events,
+                    self.active_run_id(),
+                    Record::CompletedExecution {
+                        step_id,
+                        source,
+                        execution,
+                    },
+                    false,
+                );
+            }
+            WorkerMessage::Finished {
+                mut agent,
+                result,
+                final_step_ordinal,
+                progress_gap,
+            } => {
+                self.drain_worker_progress(progress);
                 let run_id = self.active_run_id();
                 let record = match result {
                     Ok(AgentRunOutcome::FinalMessageStaged) => {
@@ -247,7 +486,9 @@ impl<M: Model> RuntimeController<M> {
                             .admit_staged_final_message()
                             .expect("successful agent outcome must stage a final message");
                         Record::FinalMessage {
-                            step_id: self.current_step_id(),
+                            step_id: self
+                                .step_id_for(final_step_ordinal)
+                                .expect("a final message requires a model step"),
                             text: final_message.text().to_owned(),
                         }
                     }
@@ -257,14 +498,23 @@ impl<M: Model> RuntimeController<M> {
                     },
                 };
                 self.agent = Some(agent);
-                self.append_record(events, run_id, record);
+                self.append_record(
+                    events,
+                    run_id,
+                    record,
+                    progress_gap || progress.take_pending_gap(),
+                );
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;
             }
         }
     }
 
-    fn handle_worker_closed(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+    fn handle_worker_closed(
+        &mut self,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+    ) {
         let run_id = self.active_run_id();
         self.append_record(
             events,
@@ -272,66 +522,97 @@ impl<M: Model> RuntimeController<M> {
             Record::FailedRun {
                 message: "agent worker exited without returning its agent".to_owned(),
             },
+            progress.take_pending_gap(),
         );
         self.emit(events, RuntimeEvent::RunSettled { run_id });
         self.active = None;
     }
 
-    fn handle_progress(
-        &mut self,
-        progress: AgentProgress,
-        events: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        match progress {
-            AgentProgress::ModelStepStarted => {
-                let run_id = self.active_run_id();
-                let step_id = self.next_model_step_id();
-                self.active
-                    .as_mut()
-                    .expect("model progress requires an active run")
-                    .current_step_id = Some(step_id);
-                self.emit(events, RuntimeEvent::ModelStepStarted { run_id, step_id });
-            }
-            AgentProgress::ExecutionStarted => {
-                let (run_id, step_id) = self.active_step();
-                self.emit(events, RuntimeEvent::ExecutionStarted { run_id, step_id });
-            }
-            AgentProgress::ToolStarted { path } => {
-                let (run_id, step_id) = self.active_step();
-                self.emit(
-                    events,
-                    RuntimeEvent::ToolStarted {
-                        run_id,
-                        step_id,
-                        path,
-                    },
-                );
-            }
-            AgentProgress::ToolFinished { path, outcome } => {
-                let (run_id, step_id) = self.active_step();
-                self.emit(
-                    events,
-                    RuntimeEvent::ToolFinished {
-                        run_id,
-                        step_id,
-                        path,
-                        outcome,
-                    },
-                );
-            }
-            AgentProgress::ExecutionCompleted { source, execution } => {
-                let (run_id, step_id) = self.active_step();
-                self.append_record(
-                    events,
-                    run_id,
-                    Record::CompletedExecution {
-                        step_id,
-                        source,
-                        execution,
-                    },
-                );
+    fn drain_worker_progress(&mut self, progress: &mut ProgressPublisher<RuntimeEvent>) {
+        loop {
+            let received = self
+                .active
+                .as_mut()
+                .expect("worker finish requires an active run")
+                .progress
+                .try_recv();
+            match received {
+                Ok(progress_envelope) => self.handle_worker_progress(progress_envelope, progress),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
+    }
+
+    fn handle_worker_progress(
+        &mut self,
+        progress_envelope: ProgressEnvelope<WorkerProgress>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+    ) {
+        let WorkerProgress {
+            step_ordinal,
+            progress: agent_progress,
+        } = progress_envelope.item;
+        let Some(step_id) = self.step_id_for(step_ordinal) else {
+            return;
+        };
+        let run_id = self.active_run_id();
+        let event = match agent_progress {
+            AgentProgress::ModelStepStarted => RuntimeEvent::ModelStepStarted { run_id, step_id },
+            AgentProgress::ModelProgress(progress) => RuntimeEvent::ModelProgress {
+                run_id,
+                step_id,
+                progress,
+            },
+            AgentProgress::ExecutionStarted => RuntimeEvent::ExecutionStarted { run_id, step_id },
+            AgentProgress::ToolStarted { path } => RuntimeEvent::ToolStarted {
+                run_id,
+                step_id,
+                path,
+            },
+            AgentProgress::ToolFinished { path, outcome } => RuntimeEvent::ToolFinished {
+                run_id,
+                step_id,
+                path,
+                outcome,
+            },
+            AgentProgress::ExecutionCompleted { .. } => return,
+        };
+        self.publish_progress(progress, event, progress_envelope.gap_before);
+    }
+
+    fn publish_progress(
+        &self,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+        event: RuntimeEvent,
+        upstream_gap: bool,
+    ) {
+        let payload_bytes = runtime_event_payload_bytes(&event);
+        progress.publish(event, upstream_gap, payload_bytes);
+    }
+
+    fn step_id_for(&mut self, step_ordinal: u64) -> Option<ModelStepId> {
+        let required_steps = usize::try_from(step_ordinal).ok()?;
+        if required_steps == 0 {
+            return None;
+        }
+        let current_steps = self
+            .active
+            .as_ref()
+            .expect("worker message requires an active run")
+            .step_ids
+            .len();
+        for _ in current_steps..required_steps {
+            let step_id = self.next_model_step_id();
+            self.active
+                .as_mut()
+                .expect("worker message requires an active run")
+                .step_ids
+                .push(step_id);
+        }
+        self.active
+            .as_ref()
+            .and_then(|active| active.step_ids.get(required_steps - 1))
+            .copied()
     }
 
     fn active_run_id(&self) -> RunId {
@@ -339,26 +620,6 @@ impl<M: Model> RuntimeController<M> {
             .as_ref()
             .expect("worker message requires an active run")
             .run_id
-    }
-
-    fn active_step(&self) -> (RunId, ModelStepId) {
-        let active = self
-            .active
-            .as_ref()
-            .expect("agent progress requires an active run");
-        (
-            active.run_id,
-            active
-                .current_step_id
-                .expect("execution progress requires a model step"),
-        )
-    }
-
-    fn current_step_id(&self) -> ModelStepId {
-        self.active
-            .as_ref()
-            .and_then(|active| active.current_step_id)
-            .expect("a completed agent run ends on a model step")
     }
 
     fn next_run_id(&mut self) -> RunId {
@@ -384,10 +645,17 @@ impl<M: Model> RuntimeController<M> {
         events: &mpsc::UnboundedSender<RuntimeEvent>,
         run_id: RunId,
         record: Record,
+        progress_gap: bool,
     ) {
         let record = StoredRecord { run_id, record };
         self.records.push(record.clone());
-        self.emit(events, RuntimeEvent::RecordAppended { record });
+        self.emit(
+            events,
+            RuntimeEvent::RecordAppended {
+                record,
+                progress_gap,
+            },
+        );
     }
 
     fn emit(&self, events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
@@ -407,12 +675,19 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        ModelStepId, Record, RunId, RuntimeCommand, RuntimeController, RuntimeEvent, StoredRecord,
+        ActiveRun, ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher,
+        Record, RunId, RuntimeCommand, RuntimeController, RuntimeEvent, RuntimeProgressReceiver,
+        StoredRecord, WorkerMessage, runtime_event_payload_bytes,
     };
     use crate::agent::Agent;
     use crate::arena::{Arena, Execution, ExecutionOutcome, ReadOutcome};
-    use crate::model::{ScriptedAction as ModelAction, ScriptedModel};
+    use crate::model::{
+        Model, ModelAction as CompletedModelAction, ModelCallId, ModelError, ModelFailure,
+        ModelHistory, ModelProgress, ModelStep, ProviderReplay, ScriptedAction as ModelAction,
+        ScriptedModel,
+    };
     use crate::tools::ReadTool;
+    use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -454,12 +729,20 @@ mod tests {
     ) -> (
         mpsc::Sender<RuntimeCommand>,
         mpsc::UnboundedReceiver<RuntimeEvent>,
+        RuntimeProgressReceiver,
         JoinHandle<Vec<StoredRecord>>,
     ) {
         let (command_sender, command_receiver) = mpsc::channel(8);
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        let controller = tokio::spawn(controller.run(command_receiver, event_sender));
-        (command_sender, event_receiver, controller)
+        let (progress_sender, progress_receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+        (
+            command_sender,
+            event_receiver,
+            progress_receiver,
+            controller,
+        )
     }
 
     async fn next_event(events: &mut mpsc::UnboundedReceiver<RuntimeEvent>) -> RuntimeEvent {
@@ -493,25 +776,38 @@ mod tests {
         }
     }
 
-    async fn events_until_execution_started(
-        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    async fn progress_until_execution_started(
+        progress: &mut RuntimeProgressReceiver,
         step_id: ModelStepId,
     ) -> Vec<RuntimeEvent> {
         let mut collected = Vec::new();
         loop {
-            let event = next_event(events).await;
+            let envelope = timeout(TEST_TIMEOUT, progress.recv())
+                .await
+                .expect("runtime should emit progress before the test timeout")
+                .expect("progress channel should remain open");
             let started = matches!(
-                event,
+                envelope.item,
                 RuntimeEvent::ExecutionStarted {
                     step_id: actual_step_id,
                     ..
                 } if actual_step_id == step_id
             );
-            collected.push(event);
+            collected.push(envelope.item);
             if started {
                 return collected;
             }
         }
+    }
+
+    fn drain_progress(
+        progress: &mut RuntimeProgressReceiver,
+    ) -> Vec<ProgressEnvelope<RuntimeEvent>> {
+        let mut collected = Vec::new();
+        while let Ok(envelope) = progress.try_recv() {
+            collected.push(envelope);
+        }
+        collected
     }
 
     async fn shutdown_controller(
@@ -531,6 +827,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted { run_id, step_id } => {
                 format!("model:{}:{}", run_id.0, step_id.0)
             }
+            RuntimeEvent::ModelProgress { .. } => "model-progress".to_owned(),
             RuntimeEvent::ExecutionStarted {
                 run_id, step_id, ..
             } => format!("execution:{}:{}", run_id.0, step_id.0),
@@ -558,7 +855,7 @@ mod tests {
                     )
                 }
             },
-            RuntimeEvent::RecordAppended { record } => record_label(record),
+            RuntimeEvent::RecordAppended { record, .. } => record_label(record),
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
@@ -584,7 +881,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                RuntimeEvent::RecordAppended { record } => Some(record.clone()),
+                RuntimeEvent::RecordAppended { record, .. } => Some(record.clone()),
                 _ => None,
             })
             .collect()
@@ -622,6 +919,337 @@ mod tests {
         &result.head
     }
 
+    fn progress_event(text: String) -> RuntimeEvent {
+        RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk { text },
+        }
+    }
+
+    struct ProgressModel {
+        actions: Vec<CompletedModelAction>,
+        chunks_per_step: usize,
+        next_action: usize,
+    }
+
+    impl ProgressModel {
+        fn new(actions: Vec<CompletedModelAction>, chunks_per_step: usize) -> Self {
+            Self {
+                actions,
+                chunks_per_step,
+                next_action: 0,
+            }
+        }
+    }
+
+    impl Model for ProgressModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                for _ in 0..self.chunks_per_step {
+                    progress(ModelProgress::AssistantTextChunk {
+                        text: "x".to_owned(),
+                    });
+                }
+                let action = self
+                    .actions
+                    .get(self.next_action)
+                    .cloned()
+                    .ok_or(ModelError::Exhausted)?;
+                self.next_action += 1;
+                Ok(ModelStep {
+                    action,
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    async fn progress_controller(
+        workspace: &tempfile::TempDir,
+        model: ProgressModel,
+    ) -> RuntimeController<ProgressModel> {
+        let arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool"),
+        )
+        .await
+        .expect("create arena");
+        RuntimeController::new(Agent::new(arena, model))
+    }
+
+    #[test]
+    fn bounded_progress_publisher_enforces_payload_capacity_fifo_and_gaps() {
+        assert_eq!(PROGRESS_CHANNEL_CAPACITY, 256);
+        let (sender, mut receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut publisher = ProgressPublisher::new(sender);
+
+        assert!(publisher.publish(progress_event("x".repeat(4 * 1024)), false, 4 * 1024,));
+        assert!(!publisher.publish(
+            progress_event("x".repeat(4 * 1024 + 1)),
+            false,
+            4 * 1024 + 1,
+        ));
+        let accepted = receiver
+            .try_recv()
+            .expect("4 KiB progress should be accepted");
+        assert!(!accepted.gap_before);
+        assert!(publisher.publish(progress_event("ok".to_owned()), false, 2));
+        assert!(
+            receiver
+                .try_recv()
+                .expect("post-rejection progress should be accepted")
+                .gap_before
+        );
+
+        for index in 0..PROGRESS_CHANNEL_CAPACITY {
+            assert!(publisher.publish(progress_event(index.to_string()), false, 3));
+        }
+        assert!(!publisher.publish(progress_event("dropped".to_owned()), false, 7));
+        let first = receiver.try_recv().expect("first FIFO item");
+        assert_eq!(
+            first.item,
+            progress_event("0".to_owned()),
+            "accepted progress must remain FIFO"
+        );
+        assert!(publisher.publish(progress_event("recovered".to_owned()), false, 9));
+        for index in 1..PROGRESS_CHANNEL_CAPACITY {
+            assert_eq!(
+                receiver.try_recv().expect("queued FIFO item").item,
+                progress_event(index.to_string())
+            );
+        }
+        let recovered = receiver.try_recv().expect("recovered progress");
+        assert_eq!(recovered.item, progress_event("recovered".to_owned()));
+        assert!(recovered.gap_before);
+    }
+
+    #[test]
+    fn bounded_progress_forwards_upstream_and_local_gaps() {
+        let (worker_sender, mut worker_receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut worker = ProgressPublisher::new(worker_sender);
+        for _ in 0..PROGRESS_CHANNEL_CAPACITY {
+            assert!(worker.publish(progress_event("x".to_owned()), false, 1));
+        }
+        assert!(!worker.publish(progress_event("lost".to_owned()), false, 4));
+        worker_receiver.try_recv().expect("free one worker slot");
+        assert!(worker.publish(progress_event("upstream".to_owned()), false, 8));
+        while worker_receiver.len() > 1 {
+            worker_receiver.try_recv().expect("drain worker progress");
+        }
+        let upstream = worker_receiver.try_recv().expect("upstream gap envelope");
+        assert!(upstream.gap_before);
+
+        let (tui_sender, mut tui_receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut runtime = ProgressPublisher::new(tui_sender);
+        let bytes = runtime_event_payload_bytes(&upstream.item);
+        assert!(runtime.publish(upstream.item, upstream.gap_before, bytes));
+        assert!(
+            tui_receiver
+                .try_recv()
+                .expect("runtime should forward upstream envelope")
+                .gap_before
+        );
+
+        for _ in 0..PROGRESS_CHANNEL_CAPACITY {
+            assert!(runtime.publish(progress_event("x".to_owned()), false, 1));
+        }
+        assert!(!runtime.publish(progress_event("lost".to_owned()), false, 4));
+        tui_receiver.try_recv().expect("free one TUI slot");
+        assert!(runtime.publish(progress_event("local".to_owned()), false, 5));
+        while tui_receiver.len() > 1 {
+            tui_receiver.try_recv().expect("drain TUI progress");
+        }
+        assert!(
+            tui_receiver
+                .try_recv()
+                .expect("runtime local gap envelope")
+                .gap_before
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_progress_keeps_execution_records_and_settlement_reliable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let model = ProgressModel::new(
+            vec![
+                CompletedModelAction::Code {
+                    source: "first = 1".to_owned(),
+                    call_id: ModelCallId::new("first"),
+                },
+                CompletedModelAction::Code {
+                    source: "first + 1".to_owned(),
+                    call_id: ModelCallId::new("second"),
+                },
+                CompletedModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+            200,
+        );
+        let controller = progress_controller(&workspace, model).await;
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "flood".to_owned(),
+            })
+            .await
+            .unwrap();
+        let reliable = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+
+        assert_eq!(progress.len(), PROGRESS_CHANNEL_CAPACITY);
+        assert!(reliable.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { .. },
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(reliable.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::FinalMessage { text, .. },
+                    ..
+                },
+                progress_gap: true,
+            } if text == "done"
+        )));
+        assert!(matches!(
+            reliable.last(),
+            Some(RuntimeEvent::RunSettled { .. })
+        ));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.record, Record::CompletedExecution { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            drain_progress(&mut progress).len(),
+            PROGRESS_CHANNEL_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_progress_marks_an_unresolved_worker_gap_on_the_terminal_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller(&workspace, Vec::new()).await;
+        let agent = controller
+            .agent
+            .take()
+            .expect("idle controller should own its agent");
+        let (_worker_sender, worker) = mpsc::unbounded_channel();
+        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        controller.active = Some(ActiveRun {
+            run_id: RunId(1),
+            cancellation: CancellationToken::new(),
+            worker,
+            progress: worker_progress,
+            progress_open: false,
+            step_ids: Vec::new(),
+        });
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut publisher = ProgressPublisher::new(progress_sender);
+
+        controller.handle_worker_message(
+            WorkerMessage::Finished {
+                agent,
+                result: Err(crate::agent::AgentError::Cancelled {
+                    attempts: Vec::new(),
+                }),
+                final_step_ordinal: 0,
+                progress_gap: true,
+            },
+            &event_sender,
+            &mut publisher,
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CancelledRun,
+                    ..
+                },
+                progress_gap: true,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_progress_cancellation_and_shutdown_do_not_deadlock() {
+        let workspace = tempfile::tempdir().unwrap();
+        let model = ProgressModel::new(
+            vec![CompletedModelAction::Code {
+                source: "while True:\n    pass".to_owned(),
+                call_id: ModelCallId::new("loop"),
+            }],
+            300,
+        );
+        let controller = progress_controller(&workspace, model).await;
+        let (commands, command_receiver) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel".to_owned(),
+            })
+            .await
+            .unwrap();
+        timeout(TEST_TIMEOUT, async {
+            while progress.len() < PROGRESS_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("undrained progress should fill without blocking the worker");
+        commands.send(RuntimeCommand::Shutdown).await.unwrap();
+        let records = timeout(TEST_TIMEOUT, controller)
+            .await
+            .expect("shutdown should settle with a full progress channel")
+            .expect("controller task should not panic");
+
+        assert!(matches!(
+            records.last().map(|record| &record.record),
+            Some(Record::CancelledRun)
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn default_script_emits_ordered_events_and_records() {
         let workspace = tempfile::tempdir().unwrap();
@@ -630,7 +1258,7 @@ mod tests {
             "[package]\nname = \"example\"\n",
         )
         .unwrap();
-        let (commands, mut events, controller) =
+        let (commands, mut events, mut progress, controller) =
             start_controller(default_controller(&workspace).await);
 
         commands
@@ -640,24 +1268,33 @@ mod tests {
             .await
             .unwrap();
         let events = events_until_settled(&mut events).await;
+        let progress = drain_progress(&mut progress);
         let records = shutdown_controller(commands, controller).await;
 
         assert_eq!(
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
-                "run:1",
                 "record:1:user:inspect",
+                "record:1:execution:1",
+                "record:1:execution:2",
+                "record:1:message:3:I inspected Cargo.toml.",
+                "settled:1",
+            ]
+        );
+        assert_eq!(
+            progress
+                .iter()
+                .map(|envelope| event_label(&envelope.item))
+                .collect::<Vec<_>>(),
+            [
+                "run:1",
                 "model:1:1",
                 "execution:1:1",
                 "tool-started:1:1:Cargo.toml",
                 "tool-finished:1:1:Cargo.toml:success:2",
-                "record:1:execution:1",
                 "model:1:2",
                 "execution:1:2",
-                "record:1:execution:2",
                 "model:1:3",
-                "record:1:message:3:I inspected Cargo.toml.",
-                "settled:1",
             ]
         );
         assert_eq!(
@@ -675,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn exhausted_model_commits_one_failed_run_and_settles() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, controller) =
+        let (commands, mut events, _progress, controller) =
             start_controller(controller(&workspace, vec![]).await);
 
         commands
@@ -690,9 +1327,7 @@ mod tests {
         assert_eq!(
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
-                "run:1",
                 "record:1:user:inspect",
-                "model:1:1",
                 "record:1:failed:scripted model exhausted before returning a final message",
                 "settled:1",
             ]
@@ -706,7 +1341,8 @@ mod tests {
                         record: StoredRecord {
                             record: Record::FailedRun { .. },
                             ..
-                        }
+                        },
+                        ..
                     }
                 ))
                 .count(),
@@ -718,7 +1354,8 @@ mod tests {
                 record: StoredRecord {
                     record: Record::CompletedExecution { .. },
                     ..
-                }
+                },
+                ..
             }
         )));
         assert_eq!(records, committed_records(&events));
@@ -728,7 +1365,7 @@ mod tests {
     async fn successful_requests_keep_arena_state_and_monotonic_ids() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
-        let (commands, mut events, controller) =
+        let (commands, mut events, mut progress, controller) =
             start_controller(default_controller(&workspace).await);
 
         commands
@@ -737,20 +1374,22 @@ mod tests {
             })
             .await
             .unwrap();
-        let first_events = events_until_settled(&mut events).await;
+        let _first_events = events_until_settled(&mut events).await;
+        let first_progress = drain_progress(&mut progress);
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
             })
             .await
             .unwrap();
-        let second_events = events_until_settled(&mut events).await;
+        let _second_events = events_until_settled(&mut events).await;
+        let second_progress = drain_progress(&mut progress);
         let records = shutdown_controller(commands, controller).await;
 
         assert_eq!(
-            first_events
+            first_progress
                 .iter()
-                .filter_map(|event| match event {
+                .filter_map(|envelope| match &envelope.item {
                     RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
                     _ => None,
                 })
@@ -762,9 +1401,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            second_events
+            second_progress
                 .iter()
-                .filter_map(|event| match event {
+                .filter_map(|envelope| match &envelope.item {
                     RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
                     _ => None,
                 })
@@ -784,7 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn python_error_execution_is_committed_before_the_next_action() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, controller) = start_controller(
+        let (commands, mut events, _progress, controller) = start_controller(
             controller(
                 &workspace,
                 vec![
@@ -814,15 +1453,9 @@ mod tests {
         assert_eq!(
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
-                "run:1",
                 "record:1:user:continue",
-                "model:1:1",
-                "execution:1:1",
                 "record:1:execution:1",
-                "model:1:2",
-                "execution:1:2",
                 "record:1:execution:2",
-                "model:1:3",
                 "record:1:message:3:done",
                 "settled:1",
             ]
@@ -840,7 +1473,7 @@ mod tests {
     #[tokio::test]
     async fn busy_submission_does_not_allocate_run_or_model_step_ids() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, controller) = start_controller(
+        let (commands, mut events, mut progress, controller) = start_controller(
             controller(
                 &workspace,
                 vec![
@@ -866,13 +1499,33 @@ mod tests {
             })
             .await
             .unwrap();
-        let first_started = events_until_execution_started(&mut events, ModelStepId(2)).await;
+        let first_started = progress_until_execution_started(&mut progress, ModelStepId(2)).await;
         commands
             .send(RuntimeCommand::Submit {
                 request: "rejected".to_owned(),
             })
             .await
             .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { .. },
+                    ..
+                },
+                ..
+            }
+        ));
         assert_eq!(
             next_event(&mut events).await,
             RuntimeEvent::SubmissionRejectedBusy {
@@ -888,17 +1541,16 @@ mod tests {
             })
             .await
             .unwrap();
-        let second_events = events_until_settled(&mut events).await;
+        let _second_events = events_until_settled(&mut events).await;
+        let second_progress = drain_progress(&mut progress);
         let records = shutdown_controller(commands, controller).await;
 
         assert_eq!(
             first_started.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "run:1",
-                "record:1:user:first",
                 "model:1:1",
                 "execution:1:1",
-                "record:1:execution:1",
                 "model:1:2",
                 "execution:1:2",
             ]
@@ -908,9 +1560,9 @@ mod tests {
             ["record:1:cancelled", "settled:1"]
         );
         assert_eq!(
-            second_events
+            second_progress
                 .iter()
-                .filter_map(|event| match event {
+                .filter_map(|envelope| match &envelope.item {
                     RuntimeEvent::RunStarted { run_id } => Some(*run_id),
                     _ => None,
                 })
@@ -918,9 +1570,9 @@ mod tests {
             [RunId(2)]
         );
         assert_eq!(
-            second_events
+            second_progress
                 .iter()
-                .filter_map(|event| match event {
+                .filter_map(|envelope| match &envelope.item {
                     RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
                     _ => None,
                 })
@@ -949,7 +1601,9 @@ mod tests {
         .await;
         let (commands, command_receiver) = mpsc::channel(8);
         let (event_sender, mut events) = mpsc::unbounded_channel();
-        let controller = tokio::spawn(controller.run(command_receiver, event_sender));
+        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
 
         commands
             .send(RuntimeCommand::Submit {
@@ -957,7 +1611,7 @@ mod tests {
             })
             .await
             .unwrap();
-        wait_for_queued_events(&events, 4).await;
+        wait_for_queued_events(&events, 1).await;
         commands.send(RuntimeCommand::Shutdown).await.unwrap();
         let records = timeout(TEST_TIMEOUT, controller)
             .await
@@ -970,14 +1624,7 @@ mod tests {
         }
         assert_eq!(
             drained.iter().map(event_label).collect::<Vec<_>>(),
-            [
-                "run:1",
-                "record:1:user:cancel",
-                "model:1:1",
-                "execution:1:1",
-                "record:1:cancelled",
-                "settled:1",
-            ]
+            ["record:1:user:cancel", "record:1:cancelled", "settled:1",]
         );
         assert_eq!(records, committed_records(&drained));
     }
@@ -985,7 +1632,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_discards_the_active_execution_and_settles_once() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, controller) = start_controller(
+        let (commands, mut events, mut progress, controller) = start_controller(
             controller(
                 &workspace,
                 vec![
@@ -1006,21 +1653,18 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut all_events = events_until_execution_started(&mut events, ModelStepId(1)).await;
+        let progress_events = progress_until_execution_started(&mut progress, ModelStepId(1)).await;
         commands.send(RuntimeCommand::Cancel).await.unwrap();
         commands.send(RuntimeCommand::Cancel).await.unwrap();
-        all_events.extend(events_until_settled(&mut events).await);
+        let reliable_events = events_until_settled(&mut events).await;
 
         assert_eq!(
-            all_events.iter().map(event_label).collect::<Vec<_>>(),
-            [
-                "run:1",
-                "record:1:user:cancel",
-                "model:1:1",
-                "execution:1:1",
-                "record:1:cancelled",
-                "settled:1",
-            ]
+            progress_events.iter().map(event_label).collect::<Vec<_>>(),
+            ["run:1", "model:1:1", "execution:1:1",]
+        );
+        assert_eq!(
+            reliable_events.iter().map(event_label).collect::<Vec<_>>(),
+            ["record:1:user:cancel", "record:1:cancelled", "settled:1",]
         );
         assert!(
             timeout(Duration::from_millis(100), events.recv())
@@ -1048,7 +1692,7 @@ mod tests {
                 text: "done".to_owned(),
             },
         ];
-        let (commands, mut events, controller) =
+        let (commands, mut events, mut progress, controller) =
             start_controller(controller(&workspace, actions).await);
 
         commands
@@ -1057,7 +1701,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let first_started = events_until_execution_started(&mut events, ModelStepId(2)).await;
+        let first_started = progress_until_execution_started(&mut progress, ModelStepId(2)).await;
         commands.send(RuntimeCommand::Cancel).await.unwrap();
         let first_settled = events_until_settled(&mut events).await;
         commands
@@ -1066,29 +1710,33 @@ mod tests {
             })
             .await
             .unwrap();
-        let second_events = events_until_settled(&mut events).await;
+        let _second_events = events_until_settled(&mut events).await;
+        let second_progress = drain_progress(&mut progress);
         let records = shutdown_controller(commands, controller).await;
 
         assert_eq!(
             first_started.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "run:1",
-                "record:1:user:first",
                 "model:1:1",
                 "execution:1:1",
-                "record:1:execution:1",
                 "model:1:2",
                 "execution:1:2",
             ]
         );
         assert_eq!(
             first_settled.iter().map(event_label).collect::<Vec<_>>(),
-            ["record:1:cancelled", "settled:1"]
+            [
+                "record:1:user:first",
+                "record:1:execution:1",
+                "record:1:cancelled",
+                "settled:1",
+            ]
         );
         assert_eq!(
-            second_events
+            second_progress
                 .iter()
-                .filter_map(|event| match event {
+                .filter_map(|envelope| match &envelope.item {
                     RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
                     _ => None,
                 })
@@ -1108,7 +1756,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_waits_for_cancellation_recovery_and_settlement() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, controller) = start_controller(
+        let (commands, mut events, mut progress, controller) = start_controller(
             controller(
                 &workspace,
                 vec![ModelAction::Code {
@@ -1124,33 +1772,30 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut all_events = events_until_execution_started(&mut events, ModelStepId(1)).await;
+        let progress_events = progress_until_execution_started(&mut progress, ModelStepId(1)).await;
         commands.send(RuntimeCommand::Shutdown).await.unwrap();
         let records = timeout(TEST_TIMEOUT, controller)
             .await
             .expect("shutdown should wait only for cancellation recovery")
             .expect("controller task should not panic");
-        all_events.extend(events_until_settled(&mut events).await);
+        let reliable_events = events_until_settled(&mut events).await;
 
         assert_eq!(
-            all_events.iter().map(event_label).collect::<Vec<_>>(),
-            [
-                "run:1",
-                "record:1:user:stop",
-                "model:1:1",
-                "execution:1:1",
-                "record:1:cancelled",
-                "settled:1",
-            ]
+            progress_events.iter().map(event_label).collect::<Vec<_>>(),
+            ["run:1", "model:1:1", "execution:1:1",]
         );
-        assert_eq!(records, committed_records(&all_events));
+        assert_eq!(
+            reliable_events.iter().map(event_label).collect::<Vec<_>>(),
+            ["record:1:user:stop", "record:1:cancelled", "settled:1",]
+        );
+        assert_eq!(records, committed_records(&reliable_events));
     }
 
     #[tokio::test]
     async fn returned_records_are_exactly_the_committed_record_events() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
-        let (commands, mut events, controller) =
+        let (commands, mut events, _progress, controller) =
             start_controller(default_controller(&workspace).await);
 
         commands
@@ -1164,8 +1809,8 @@ mod tests {
 
         assert_eq!(records, committed_records(&events));
         assert_eq!(records.len(), 4);
-        assert_eq!(events.len(), 13);
-        assert!(events.iter().any(|event| matches!(
+        assert_eq!(events.len(), 5);
+        assert!(!events.iter().any(|event| matches!(
             event,
             RuntimeEvent::ToolStarted { .. } | RuntimeEvent::ToolFinished { .. }
         )));
