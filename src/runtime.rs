@@ -63,6 +63,12 @@ pub(crate) enum Record {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeDisabledReason {
+    OpenAiAuthentication,
+    ArenaCheckpointRecoveryFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredRecord {
     pub(crate) run_id: RunId,
     pub(crate) record: Record,
@@ -108,10 +114,17 @@ pub(crate) enum RuntimeEvent {
     SubmissionRejectedBusy {
         active_run_id: RunId,
     },
+    RuntimeDisabled {
+        reason: RuntimeDisabledReason,
+    },
+    SubmissionRejectedDisabled {
+        reason: RuntimeDisabledReason,
+    },
 }
 
 pub(crate) const PROGRESS_CHANNEL_CAPACITY: usize = 256;
 const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
+const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProgressEnvelope<T> {
@@ -159,6 +172,7 @@ pub(crate) type RuntimeProgressReceiver = mpsc::Receiver<ProgressEnvelope<Runtim
 
 pub(crate) struct RuntimeController<M: Model> {
     agent: Option<Agent<M>>,
+    disabled_reason: Option<RuntimeDisabledReason>,
     records: Vec<StoredRecord>,
     next_run_id: u64,
     next_model_step_id: u64,
@@ -228,7 +242,9 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::ExecutionStarted { .. }
         | RuntimeEvent::RecordAppended { .. }
         | RuntimeEvent::RunSettled { .. }
-        | RuntimeEvent::SubmissionRejectedBusy { .. } => 0,
+        | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::RuntimeDisabled { .. }
+        | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
     }
 }
 
@@ -265,6 +281,7 @@ impl<M: Model> RuntimeController<M> {
     pub(crate) fn new(agent: Agent<M>) -> Self {
         Self {
             agent: Some(agent),
+            disabled_reason: None,
             records: Vec::new(),
             next_run_id: 1,
             next_model_step_id: 1,
@@ -362,6 +379,13 @@ impl<M: Model> RuntimeController<M> {
                         events,
                         RuntimeEvent::SubmissionRejectedBusy {
                             active_run_id: active.run_id,
+                        },
+                    );
+                } else if let Some(reason) = &self.disabled_reason {
+                    self.emit(
+                        events,
+                        RuntimeEvent::SubmissionRejectedDisabled {
+                            reason: reason.clone(),
                         },
                     );
                 } else {
@@ -518,6 +542,15 @@ impl<M: Model> RuntimeController<M> {
                     .as_ref()
                     .expect("worker finish requires an active run")
                     .cancellation_requested;
+                let disabled_reason = match &result {
+                    Err(error) if error.is_recovery_failed() => {
+                        Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed)
+                    }
+                    Err(error) if !cancellation_requested && error.is_authentication() => {
+                        Some(RuntimeDisabledReason::OpenAiAuthentication)
+                    }
+                    _ => None,
+                };
                 let record = match result {
                     Err(error) if error.is_recovery_failed() => Record::FailedRun {
                         message: error.to_string(),
@@ -565,13 +598,24 @@ impl<M: Model> RuntimeController<M> {
                         ),
                     },
                 };
-                self.agent = Some(agent);
-                self.append_record(
-                    events,
-                    run_id,
-                    record,
-                    progress_gap || progress.take_pending_gap(),
-                );
+                if let Some(reason) = disabled_reason {
+                    self.disabled_reason = Some(reason.clone());
+                    self.append_record(
+                        events,
+                        run_id,
+                        record,
+                        progress_gap || progress.take_pending_gap(),
+                    );
+                    self.emit(events, RuntimeEvent::RuntimeDisabled { reason });
+                } else {
+                    self.agent = Some(agent);
+                    self.append_record(
+                        events,
+                        run_id,
+                        record,
+                        progress_gap || progress.take_pending_gap(),
+                    );
+                }
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;
             }
@@ -720,9 +764,12 @@ impl<M: Model> RuntimeController<M> {
         &mut self,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
         run_id: RunId,
-        record: Record,
+        mut record: Record,
         progress_gap: bool,
     ) {
+        if let Record::FailedRun { message, .. } = &mut record {
+            *message = bounded_utf8(std::mem::take(message), FAILED_RUN_MESSAGE_LIMIT);
+        }
         let record = StoredRecord { run_id, record };
         self.records.push(record.clone());
         self.emit(
@@ -739,12 +786,28 @@ impl<M: Model> RuntimeController<M> {
     }
 }
 
+fn bounded_utf8(mut value: String, limit: usize) -> String {
+    value.truncate(utf8_prefix_len(&value, limit));
+    value
+}
+
+fn utf8_prefix_len(value: &str, limit: usize) -> usize {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use tokio::sync::{Notify, mpsc};
@@ -753,14 +816,15 @@ mod tests {
 
     use super::{
         ActiveRun, ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher,
-        Record, RunId, RuntimeCommand, RuntimeController, RuntimeEvent, RuntimeProgressReceiver,
-        StoredRecord, WorkerMessage, runtime_event_payload_bytes,
+        Record, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason, RuntimeEvent,
+        RuntimeProgressReceiver, StoredRecord, WorkerMessage, runtime_event_payload_bytes,
     };
     use crate::agent::{
         Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
     };
     use crate::arena::{
         Arena, ArenaError, Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome,
+        RecoveryTestGate,
     };
     use crate::model::{
         AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId, ModelError,
@@ -940,6 +1004,10 @@ mod tests {
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
+            RuntimeEvent::RuntimeDisabled { reason } => format!("disabled:{reason:?}"),
+            RuntimeEvent::SubmissionRejectedDisabled { reason } => {
+                format!("disabled-rejected:{reason:?}")
+            }
         }
     }
 
@@ -1095,6 +1163,135 @@ mod tests {
                     ModelError::Cancelled,
                     vec![AttemptAccounting::UsageUnavailable],
                 ))
+            }
+        }
+    }
+
+    fn provider_failure(status: u16) -> ModelFailure {
+        ModelFailure::new(
+            ModelError::Provider(Box::new(ProviderFailure::new(
+                Some(status),
+                Some("provider_error".to_owned()),
+                "provider request failed".to_owned(),
+            ))),
+            Vec::new(),
+        )
+    }
+
+    struct AuthenticationFailureModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Model for AuthenticationFailureModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(provider_failure(401))
+            }
+        }
+    }
+
+    struct StatusThenMessageModel {
+        status: u16,
+        steps: u8,
+    }
+
+    impl Model for StatusThenMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                if self.steps == 0 {
+                    self.steps += 1;
+                    return Err(provider_failure(self.status));
+                }
+                self.steps += 1;
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "later completed".to_owned(),
+                    },
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct AuthenticationAfterCancellationModel {
+        ready: Arc<Notify>,
+        steps: u8,
+    }
+
+    impl Model for AuthenticationAfterCancellationModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                if self.steps == 0 {
+                    self.steps += 1;
+                    self.ready.notify_one();
+                    cancellation.cancelled().await;
+                    return Err(provider_failure(401));
+                }
+                self.steps += 1;
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "later completed".to_owned(),
+                    },
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct RecoveryFailureModel {
+        calls: Arc<AtomicUsize>,
+        source: String,
+    }
+
+    impl Model for RecoveryFailureModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    CompletedModelAction::Code {
+                        source: self.source.clone(),
+                        call_id: ModelCallId::new("recovery-failure"),
+                    }
+                } else {
+                    CompletedModelAction::Message {
+                        text: "uncertain arena was reused".to_owned(),
+                    }
+                };
+                Ok(ModelStep {
+                    action,
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
             }
         }
     }
@@ -2645,6 +2842,715 @@ mod tests {
         assert!(evidence.reasoning.is_empty());
         assert!(evidence.decoded_python.is_empty());
         assert!(terminal.attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_after_cancellation_drops_the_uncertain_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = ReadTestGate::new();
+        let mut arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool")
+                .with_test_gate(gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        arena.fail_next_recovery_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::new(Agent::new(
+            arena,
+            RecoveryFailureModel {
+                calls: calls.clone(),
+                source: "print('before')\nawait read('blocked')".to_owned(),
+            },
+        ));
+        let (commands, mut events, mut progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        gate.wait_until_read_started().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        let first_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            first_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { terminal, .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ] if matches!(
+                terminal.evidence,
+                Some(TerminalEvidence::Execution(ref evidence))
+                    if evidence.source == "print('before')\nawait read('blocked')"
+                        && evidence.began
+                        && evidence.stdout.head == "before\n"
+                        && matches!(evidence.read, InterruptedRead::Pending { .. })
+                        && evidence.cancellation_warning.is_some()
+                        && matches!(
+                            evidence.failure,
+                            Some(ExecutionFailure::RecoveryFailed { .. })
+                        )
+            )
+        ));
+        drain_progress(&mut progress);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert!(progress.try_recv().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let records = shutdown_controller(commands, task).await;
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_after_timeout_drops_the_uncertain_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = Arena::with_limits(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool"),
+            Duration::from_millis(10),
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .expect("create arena");
+        arena.fail_next_recovery_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::new(Agent::new(
+            arena,
+            RecoveryFailureModel {
+                calls: calls.clone(),
+                source: "while True:\n    pass".to_owned(),
+            },
+        ));
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        let terminal_events = events_until_settled(&mut events).await;
+        let Record::FailedRun { terminal, .. } = &committed_records(&terminal_events)[1].record
+        else {
+            panic!("timed-out recovery failure must produce a failed run");
+        };
+        let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
+            panic!("timed-out recovery failure must retain execution evidence");
+        };
+        assert!(matches!(
+            evidence.failure,
+            Some(ExecutionFailure::RecoveryFailed { .. })
+        ));
+        assert!(matches!(
+            terminal_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdown_controller(commands, task).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_after_infrastructure_error_drops_the_uncertain_agent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool"),
+        )
+        .await
+        .expect("create arena");
+        arena.fail_next_recovery_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::new(Agent::new(
+            arena,
+            RecoveryFailureModel {
+                calls: calls.clone(),
+                source: "x = ' ' * (1 << 60)".to_owned(),
+            },
+        ));
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        let terminal_events = events_until_settled(&mut events).await;
+        let Record::FailedRun { terminal, .. } = &committed_records(&terminal_events)[1].record
+        else {
+            panic!("infrastructure recovery failure must produce a failed run");
+        };
+        let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
+            panic!("infrastructure recovery failure must retain execution evidence");
+        };
+        assert!(matches!(
+            evidence.failure,
+            Some(ExecutionFailure::RecoveryFailed { .. })
+        ));
+        assert!(matches!(
+            terminal_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdown_controller(commands, task).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_overrides_cancellation_arriving_during_recovery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let read_gate = ReadTestGate::new();
+        let recovery_gate = RecoveryTestGate::new();
+        let mut arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool")
+                .with_test_gate(read_gate.clone()),
+        )
+        .await
+        .expect("create arena")
+        .with_recovery_test_gate(recovery_gate.clone());
+        arena.fail_next_recovery_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::new(Agent::new(
+            arena,
+            RecoveryFailureModel {
+                calls: calls.clone(),
+                source: "print('before')\nawait read('blocked')".to_owned(),
+            },
+        ));
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        read_gate.wait_until_read_started().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        recovery_gate.wait_until_recovery_started().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        tokio::task::yield_now().await;
+        recovery_gate.resume_recovery();
+
+        let events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_overrides_accepted_cancellation_and_settles_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller(&workspace, Vec::new()).await;
+        let agent = controller
+            .agent
+            .take()
+            .expect("idle controller should own its agent");
+        let (worker_sender, worker) = mpsc::unbounded_channel();
+        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        controller.active = Some(ActiveRun {
+            run_id: RunId(1),
+            cancellation: CancellationToken::new(),
+            worker,
+            progress: worker_progress,
+            progress_open: false,
+            cancellation_requested: false,
+            step_ids: Vec::new(),
+        });
+        worker_sender
+            .send(WorkerMessage::Finished {
+                agent,
+                result: Err(crate::agent::AgentError::Arena {
+                    error: ArenaError::RecoveryFailed {
+                        original: Box::new(ArenaError::Cancelled {
+                            execution: Box::new(crate::arena::InterruptedExecution {
+                                began: true,
+                                stdout: empty_observation(),
+                                stderr: empty_observation(),
+                                read: InterruptedRead::NoRead,
+                            }),
+                        }),
+                        recovery: Box::new(ArenaError::Infrastructure {
+                            message: "recovery failed".to_owned(),
+                            execution: None,
+                        }),
+                    },
+                    attempts: Vec::new(),
+                    evidence: Box::new(failed_execution_evidence(
+                        ExecutionFailure::RecoveryFailed {
+                            original: "arena execution was cancelled".to_owned(),
+                            recovery: "arena infrastructure failed: recovery failed".to_owned(),
+                        },
+                    )),
+                }),
+                final_step_ordinal: 0,
+                progress_gap: false,
+            })
+            .unwrap();
+        let (commands, command_receiver) = mpsc::channel(2);
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        let terminal_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            terminal_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+        assert_eq!(
+            terminal_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::FailedRun { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert!(progress.try_recv().is_err());
+        let records = shutdown_controller(commands, task).await;
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_failure_bounds_its_display_message_at_a_utf8_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller(&workspace, Vec::new()).await;
+        let agent = controller
+            .agent
+            .take()
+            .expect("idle controller should own its agent");
+        let (worker_sender, worker) = mpsc::unbounded_channel();
+        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let diagnostic = "é".repeat(4 * 1024);
+        controller.active = Some(ActiveRun {
+            run_id: RunId(1),
+            cancellation: CancellationToken::new(),
+            worker,
+            progress: worker_progress,
+            progress_open: false,
+            cancellation_requested: false,
+            step_ids: Vec::new(),
+        });
+        worker_sender
+            .send(WorkerMessage::Finished {
+                agent,
+                result: Err(crate::agent::AgentError::Arena {
+                    error: ArenaError::RecoveryFailed {
+                        original: Box::new(ArenaError::Infrastructure {
+                            message: diagnostic.clone(),
+                            execution: None,
+                        }),
+                        recovery: Box::new(ArenaError::Infrastructure {
+                            message: diagnostic.clone(),
+                            execution: None,
+                        }),
+                    },
+                    attempts: Vec::new(),
+                    evidence: Box::new(failed_execution_evidence(
+                        ExecutionFailure::RecoveryFailed {
+                            original: diagnostic.clone(),
+                            recovery: diagnostic,
+                        },
+                    )),
+                }),
+                final_step_ordinal: 0,
+                progress_gap: false,
+            })
+            .unwrap();
+        let (commands, command_receiver) = mpsc::channel(1);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        let events = events_until_settled(&mut events).await;
+        let Record::FailedRun { message, terminal } = &committed_records(&events)[0].record else {
+            panic!("expected failed terminal record");
+        };
+
+        assert!(message.len() <= 4 * 1024);
+        assert!(message.is_char_boundary(message.len()));
+        assert!(matches!(
+            terminal.evidence,
+            Some(TerminalEvidence::Execution(_))
+        ));
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_authentication_does_not_apply_to_permission_or_server_failures() {
+        for status in [403, 500] {
+            let workspace = tempfile::tempdir().unwrap();
+            let controller =
+                controller_with_model(&workspace, StatusThenMessageModel { status, steps: 0 })
+                    .await;
+            let (commands, mut events, _progress, task) = start_controller(controller);
+
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "first".to_owned(),
+                })
+                .await
+                .unwrap();
+            let failed_events = events_until_settled(&mut events).await;
+            assert!(matches!(
+                failed_events.as_slice(),
+                [
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::UserRequest { .. },
+                            ..
+                        },
+                        ..
+                    },
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::FailedRun { .. },
+                            ..
+                        },
+                        ..
+                    },
+                    RuntimeEvent::RunSettled { run_id: RunId(1) },
+                ]
+            ));
+
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "later".to_owned(),
+                })
+                .await
+                .unwrap();
+            let later_events = events_until_settled(&mut events).await;
+            assert!(matches!(
+                later_events.as_slice(),
+                [
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::UserRequest { .. },
+                            ..
+                        },
+                        ..
+                    },
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::FinalMessage { text, .. },
+                            ..
+                        },
+                        ..
+                    },
+                    RuntimeEvent::RunSettled { run_id: RunId(2) },
+                ] if text == "later completed"
+            ));
+            assert_eq!(shutdown_controller(commands, task).await.len(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_cancellation_wins_over_a_queued_authentication_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ready = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AuthenticationAfterCancellationModel {
+                ready: ready.clone(),
+                steps: 0,
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        ready.notified().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        let cancelled_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            cancelled_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::CancelledRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        let later_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            later_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FinalMessage { text, .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(2) },
+            ] if text == "later completed"
+        ));
+        assert_eq!(shutdown_controller(commands, task).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn disabled_authentication_rejects_later_submission_without_starting_a_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_model(
+            &workspace,
+            AuthenticationFailureModel {
+                calls: calls.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, mut progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        let first_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            first_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::OpenAiAuthentication,
+                },
+                RuntimeEvent::RunSettled { .. },
+            ]
+        ));
+
+        drain_progress(&mut progress);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        let rejection = next_event(&mut events).await;
+
+        assert_eq!(
+            rejection,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(progress.try_recv().is_err());
+        let records = shutdown_controller(commands, task).await;
+        assert_eq!(records.len(), 2);
+
+        let restarted = controller_with_model(
+            &workspace,
+            StatusThenMessageModel {
+                status: 500,
+                steps: 1,
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(restarted);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "after restart".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FinalMessage { text, .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ] if text == "later completed"
+        ));
+        assert_eq!(shutdown_controller(commands, task).await.len(), 2);
     }
 
     #[tokio::test]

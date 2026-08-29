@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use monty_pool::{
@@ -8,6 +10,8 @@ use monty_pool::{
 use monty_types::{ExcType, MontyException, MontyObject, PrintStream, ResourceLimits};
 use thiserror::Error;
 use tokio::process::Command;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -243,6 +247,46 @@ impl InterruptedReadState {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RecoveryTestGate {
+    recovery_started: Arc<Semaphore>,
+    recovery_allowed: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl RecoveryTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            recovery_started: Arc::new(Semaphore::new(0)),
+            recovery_allowed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_recovery_started(&self) {
+        take_test_permit(&self.recovery_started).await;
+    }
+
+    pub(crate) fn resume_recovery(&self) {
+        self.recovery_allowed.add_permits(1);
+    }
+
+    async fn wait_before_failure(&self) {
+        self.recovery_started.add_permits(1);
+        take_test_permit(&self.recovery_allowed).await;
+    }
+}
+
+#[cfg(test)]
+async fn take_test_permit(semaphore: &Arc<Semaphore>) {
+    semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("test gate semaphore remains open")
+        .forget();
+}
+
 enum AttemptFailure {
     Cancelled,
     TimedOut,
@@ -273,6 +317,8 @@ pub struct Arena {
     execution_timeout: Duration,
     #[cfg(test)]
     fail_next_recovery: bool,
+    #[cfg(test)]
+    recovery_test_gate: Option<RecoveryTestGate>,
 }
 
 impl Arena {
@@ -290,7 +336,7 @@ impl Arena {
     }
 
     #[cfg(test)]
-    async fn with_limits(
+    pub(crate) async fn with_limits(
         worker_path: impl AsRef<Path>,
         read_tool: ReadTool,
         execution_timeout: Duration,
@@ -340,6 +386,8 @@ impl Arena {
             execution_timeout,
             #[cfg(test)]
             fail_next_recovery: false,
+            #[cfg(test)]
+            recovery_test_gate: None,
         })
     }
 
@@ -436,13 +484,22 @@ impl Arena {
     }
 
     #[cfg(test)]
-    fn fail_next_recovery_for_test(&mut self) {
+    pub(crate) fn fail_next_recovery_for_test(&mut self) {
         self.fail_next_recovery = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_recovery_test_gate(mut self, recovery_test_gate: RecoveryTestGate) -> Self {
+        self.recovery_test_gate = Some(recovery_test_gate);
+        self
     }
 
     async fn recover(&mut self, original: ArenaError) -> ArenaError {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_recovery) {
+            if let Some(recovery_test_gate) = &self.recovery_test_gate {
+                recovery_test_gate.wait_before_failure().await;
+            }
             return ArenaError::RecoveryFailed {
                 original: Box::new(original),
                 recovery: Box::new(ArenaError::Infrastructure {
@@ -2262,7 +2319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_recovery_failure_retains_original_interruption_evidence() {
+    async fn recovery_failure_retains_original_interruption_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut arena, gate) = arena_with_read_gate(&workspace).await;
         set_trusted_value(&mut arena).await;

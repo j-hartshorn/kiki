@@ -270,7 +270,10 @@ impl App {
                 self.run_state = RunState::Active(active_run_id);
                 self.set_status(format!("run {} is busy", active_run_id.0))
             }
-            _ => false,
+            RuntimeEvent::RunSettled { .. }
+            | RuntimeEvent::SubmissionRejectedBusy { .. }
+            | RuntimeEvent::RuntimeDisabled { .. }
+            | RuntimeEvent::SubmissionRejectedDisabled { .. } => false,
         }
     }
 
@@ -614,8 +617,8 @@ mod tests {
     use super::App;
     use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
     use crate::runtime::{
-        ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent, StoredRecord,
-        TerminalDetails,
+        ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeDisabledReason,
+        RuntimeEvent, StoredRecord, TerminalDetails,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -822,6 +825,21 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)).command,
             Some(RuntimeCommand::Submit { .. })
         ));
+    }
+
+    #[test]
+    fn disabled_runtime_events_do_not_change_tui_state_before_disabled_controls_exist() {
+        let mut app = App::default();
+        let previous_status = app.status.clone();
+
+        assert!(!app.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        }));
+        assert!(!app.handle_event(RuntimeEvent::SubmissionRejectedDisabled {
+            reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+        }));
+        assert_eq!(app.status, previous_status);
+        assert_eq!(app.run_state, super::RunState::Idle);
     }
 
     #[test]

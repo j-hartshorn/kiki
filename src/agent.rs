@@ -321,6 +321,10 @@ impl AgentError {
         )
     }
 
+    pub(crate) fn is_authentication(&self) -> bool {
+        matches!(self, Self::Model { failure, .. } if failure.is_authentication())
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         match self {
             Self::Cancelled { .. } => true,
@@ -774,7 +778,7 @@ mod tests {
         Agent, AgentError, AgentProgress, AgentRunOutcome, ExecutionFailure,
         GenerationEvidenceBuilder, TerminalEvidence,
     };
-    use crate::arena::{Arena, Execution, ExecutionOutcome, Observation, PythonError};
+    use crate::arena::{Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -1035,6 +1039,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_error_delegates_only_model_authentication_failures() {
+        for (status, expected) in [(401, true), (403, false), (500, false)] {
+            let error = AgentError::Model {
+                failure: ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        Some(status),
+                        None,
+                        "provider failed".to_owned(),
+                    ))),
+                    Vec::new(),
+                ),
+                attempts: Vec::new(),
+                evidence: None,
+            };
+
+            assert_eq!(error.is_authentication(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn agent_preserves_final_and_provider_failure_attempt_accounting() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1159,6 +1183,31 @@ mod tests {
         assert_eq!(evidence.reasoning, "retained reasoning");
         assert_eq!(evidence.assistant_text, "retained text");
         assert_eq!(evidence.decoded_python, "print('retained')");
+    }
+
+    #[test]
+    fn recovery_failure_evidence_bounds_original_and_recovery_diagnostics_separately() {
+        let error = ArenaError::RecoveryFailed {
+            original: Box::new(ArenaError::Infrastructure {
+                message: "é".repeat(super::FAILED_STEP_EVIDENCE_LIMIT),
+                execution: None,
+            }),
+            recovery: Box::new(ArenaError::Infrastructure {
+                message: "é".repeat(super::FAILED_STEP_EVIDENCE_LIMIT),
+                execution: None,
+            }),
+        };
+
+        let ExecutionFailure::RecoveryFailed { original, recovery } =
+            super::failure_evidence(&error)
+        else {
+            panic!("recovery error must retain typed diagnostics");
+        };
+
+        assert!(original.len() <= super::FAILED_STEP_EVIDENCE_LIMIT / 2);
+        assert!(original.is_char_boundary(original.len()));
+        assert!(recovery.len() <= super::FAILED_STEP_EVIDENCE_LIMIT / 2);
+        assert!(recovery.is_char_boundary(recovery.len()));
     }
 
     #[test]

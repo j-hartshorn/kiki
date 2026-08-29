@@ -209,7 +209,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/runtime.rs`, controller integration; `src/arena.rs`, worker recovery) — First fail by submitting after deterministic recovery failure. Then cover authentication disablement until restart, recovery failure after timeout/infrastructure error/cancellation, cancellation arriving during failed recovery, `FailedRun` precedence, one terminal settlement, bounded diagnostics, and rejection of later submissions without reusing the uncertain Arena.
 
-**Files** — Modify: `src/agent.rs`, `src/arena.rs`, `src/runtime.rs`
+**Files** — Modify: `src/agent.rs`, `src/arena.rs`, `src/runtime.rs`, `src/tui.rs`
 
 **Commit** — `Disable unusable Agents`
 
