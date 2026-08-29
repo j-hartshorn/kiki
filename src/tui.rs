@@ -232,7 +232,9 @@ impl App {
                 }
                 if matches!(
                     &record.record,
-                    Record::FinalMessage { .. } | Record::CancelledRun | Record::FailedRun { .. }
+                    Record::FinalMessage { .. }
+                        | Record::CancelledRun { .. }
+                        | Record::FailedRun { .. }
                 ) {
                     self.settled_run_id = Some(
                         self.settled_run_id
@@ -557,12 +559,13 @@ fn format_record(stored: &StoredRecord) -> String {
             step_id,
             source,
             execution,
+            ..
         } => format_execution(run_id, step_id.0, source, execution),
-        Record::FinalMessage { step_id, text } => {
+        Record::FinalMessage { step_id, text, .. } => {
             format!("[run {run_id} step {}] kiki: {text}", step_id.0)
         }
-        Record::CancelledRun => format!("[run {run_id}] cancelled"),
-        Record::FailedRun { message } => format!("[run {run_id}] failed: {message}"),
+        Record::CancelledRun { .. } => format!("[run {run_id}] cancelled"),
+        Record::FailedRun { message, .. } => format!("[run {run_id}] failed: {message}"),
     }
 }
 
@@ -612,6 +615,7 @@ mod tests {
     use crate::arena::{Execution, ExecutionOutcome, Observation, ReadOutcome};
     use crate::runtime::{
         ModelStepId, ProgressEnvelope, Record, RunId, RuntimeCommand, RuntimeEvent, StoredRecord,
+        TerminalDetails,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -839,6 +843,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(2),
                     text: "finished".to_owned(),
+                    terminal: TerminalDetails::empty(),
                 },
             },
             progress_gap: false,
@@ -870,6 +875,7 @@ mod tests {
                             result: Some(observation("2")),
                         },
                     },
+                    attempts: Vec::new(),
                 },
             },
             progress_gap: false,
@@ -877,7 +883,9 @@ mod tests {
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
                 run_id: RunId(1),
-                record: Record::CancelledRun,
+                record: Record::CancelledRun {
+                    terminal: TerminalDetails::empty(),
+                },
             },
             progress_gap: false,
         });
@@ -886,6 +894,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::FailedRun {
                     message: "model failed".to_owned(),
+                    terminal: TerminalDetails::empty(),
                 },
             },
             progress_gap: false,
@@ -1008,6 +1017,7 @@ mod tests {
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
                     },
+                    attempts: Vec::new(),
                 },
             },
             progress_gap: false,
@@ -1026,6 +1036,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(3),
                     text: "done".to_owned(),
+                    terminal: TerminalDetails::empty(),
                 },
             },
             progress_gap: true,

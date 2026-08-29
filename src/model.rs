@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+pub(crate) const ACCEPTED_MODEL_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
     Code { source: String },

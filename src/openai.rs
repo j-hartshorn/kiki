@@ -21,7 +21,7 @@ use crate::model::{
 
 const OPENAI_PROVIDER: &str = "openai";
 const FIXED_MODEL: &str = "gpt-5.6-sol";
-const APPLICATION_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+const APPLICATION_CONTENT_LIMIT: usize = crate::model::ACCEPTED_MODEL_CONTENT_LIMIT;
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 

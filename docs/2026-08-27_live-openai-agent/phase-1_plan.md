@@ -197,7 +197,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/runtime.rs`, controller integration; `src/agent.rs`, orchestration) — First fail on cancellation racing an already queued final message. Then deterministically cover cancellation before any provider event, during generation, after valid message, after valid code but before execution, during execution, after successful Arena completion, during provider/Arena failure, and after terminal commitment; duplicate cancellation; exactly one terminal record; exact record/event order; no dangling call; preserved earlier steps; and a later request after successful recovery.
 
-**Files** — Modify: `src/agent.rs`, `src/model.rs`, `src/runtime.rs`
+**Files** — Modify: `src/agent.rs`, `src/model.rs`, `src/openai.rs`, `src/runtime.rs`, `src/tui.rs`
 
 **Commit** — `Serialise Run terminal outcomes`
 
