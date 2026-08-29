@@ -213,6 +213,7 @@ impl App {
                     format!("read {path} failed: {message}"),
                 ),
             },
+            RuntimeEvent::StdoutDelta { .. } | RuntimeEvent::StdoutTruncated { .. } => false,
             RuntimeEvent::RecordAppended {
                 record,
                 progress_gap,
@@ -825,6 +826,29 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)).command,
             Some(RuntimeCommand::Submit { .. })
         ));
+    }
+
+    #[test]
+    fn stdout_progress_is_a_tui_no_op_until_transcript_projection_exists() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        app.handle_event(RuntimeEvent::ModelStepStarted {
+            run_id: RunId(2),
+            step_id: ModelStepId(3),
+        });
+        let status = app.status.clone();
+
+        assert!(!app.handle_event(RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(2),
+            text: "stale stdout".to_owned(),
+        }));
+        assert!(!app.handle_event(RuntimeEvent::StdoutTruncated {
+            run_id: RunId(1),
+            step_id: ModelStepId(2),
+        }));
+        assert_eq!(app.status, status);
+        assert_eq!(app.current_step_id, Some(ModelStepId(3)));
     }
 
     #[test]

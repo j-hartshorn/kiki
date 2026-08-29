@@ -104,6 +104,15 @@ pub(crate) enum RuntimeEvent {
         path: String,
         outcome: ReadOutcome,
     },
+    StdoutDelta {
+        run_id: RunId,
+        step_id: ModelStepId,
+        text: String,
+    },
+    StdoutTruncated {
+        run_id: RunId,
+        step_id: ModelStepId,
+    },
     RecordAppended {
         record: StoredRecord,
         progress_gap: bool,
@@ -224,6 +233,8 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
         AgentProgress::ToolFinished { path, outcome } => {
             path.len() + read_outcome_payload_bytes(outcome)
         }
+        AgentProgress::StdoutDelta { text } => text.len(),
+        AgentProgress::StdoutTruncated => 0,
         AgentProgress::ModelStepStarted
         | AgentProgress::ExecutionStarted
         | AgentProgress::ExecutionCompleted { .. } => 0,
@@ -237,6 +248,8 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         RuntimeEvent::ToolFinished { path, outcome, .. } => {
             path.len() + read_outcome_payload_bytes(outcome)
         }
+        RuntimeEvent::StdoutDelta { text, .. } => text.len(),
+        RuntimeEvent::StdoutTruncated { .. } => 0,
         RuntimeEvent::RunStarted { .. }
         | RuntimeEvent::ModelStepStarted { .. }
         | RuntimeEvent::ExecutionStarted { .. }
@@ -695,6 +708,12 @@ impl<M: Model> RuntimeController<M> {
                 path,
                 outcome,
             },
+            AgentProgress::StdoutDelta { text } => RuntimeEvent::StdoutDelta {
+                run_id,
+                step_id,
+                text,
+            },
+            AgentProgress::StdoutTruncated => RuntimeEvent::StdoutTruncated { run_id, step_id },
             AgentProgress::ExecutionCompleted { .. } => return,
         };
         self.publish_progress(progress, event, progress_envelope.gap_before);
@@ -999,6 +1018,8 @@ mod tests {
                     )
                 }
             },
+            RuntimeEvent::StdoutDelta { .. } => "stdout-delta".to_owned(),
+            RuntimeEvent::StdoutTruncated { .. } => "stdout-truncated".to_owned(),
             RuntimeEvent::RecordAppended { record, .. } => record_label(record),
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
@@ -1504,6 +1525,191 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_progress_marks_a_gap_after_dropping_stdout_progress() {
+        let (limit_sender, mut limit_receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut limit_publisher = ProgressPublisher::new(limit_sender);
+        let allowed = RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            text: "x".repeat(4 * 1024),
+        };
+        assert!(limit_publisher.publish(
+            allowed.clone(),
+            false,
+            runtime_event_payload_bytes(&allowed),
+        ));
+        let rejected = RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            text: "x".repeat(4 * 1024 + 1),
+        };
+        assert!(!limit_publisher.publish(
+            rejected.clone(),
+            false,
+            runtime_event_payload_bytes(&rejected),
+        ));
+        assert_eq!(
+            limit_receiver
+                .try_recv()
+                .expect("4 KiB stdout should be accepted")
+                .item,
+            allowed
+        );
+
+        let (sender, mut receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut publisher = ProgressPublisher::new(sender);
+        let stdout = || RuntimeEvent::StdoutDelta {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            text: "x".to_owned(),
+        };
+
+        for _ in 0..PROGRESS_CHANNEL_CAPACITY {
+            assert!(publisher.publish(stdout(), false, 1));
+        }
+        assert!(!publisher.publish(stdout(), false, 1));
+        receiver.try_recv().expect("free one bounded progress slot");
+        assert!(publisher.publish(
+            RuntimeEvent::StdoutTruncated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+            0,
+        ));
+        while receiver.len() > 1 {
+            receiver.try_recv().expect("drain prior stdout progress");
+        }
+
+        let retained = receiver.try_recv().expect("retained truncation marker");
+        assert!(retained.gap_before);
+        assert!(matches!(
+            retained.item,
+            RuntimeEvent::StdoutTruncated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_forwards_stdout_with_run_and_step_identity_before_terminal_settlement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (commands, mut events, mut progress, controller) = start_controller(
+            controller(
+                &workspace,
+                vec![
+                    ModelAction::Code {
+                        source: "print('live stdout')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ],
+            )
+            .await,
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let progress = drain_progress(&mut progress);
+        let records = shutdown_controller(commands, controller).await;
+
+        assert!(progress.iter().any(|envelope| matches!(
+            &envelope.item,
+            RuntimeEvent::StdoutDelta {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                text,
+            } if text == "live stdout\n"
+        )));
+        assert!(
+            !progress
+                .iter()
+                .any(|envelope| matches!(envelope.item, RuntimeEvent::StdoutTruncated { .. }))
+        );
+        assert!(matches!(
+            records.as_slice(),
+            [
+                StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                StoredRecord {
+                    record: Record::CompletedExecution { .. },
+                    ..
+                },
+                StoredRecord {
+                    record: Record::FinalMessage { text, .. },
+                    ..
+                },
+            ] if text == "done"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::RunSettled { run_id: RunId(1) })
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_stdout_does_not_delay_cancellation_settlement_with_an_undrained_receiver() {
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool")
+                .with_test_gate(gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let controller = RuntimeController::new(Agent::new(
+            arena,
+            ScriptedModel::new(vec![ModelAction::Code {
+                source: "print('before cancellation')\nawait read('blocked')".to_owned(),
+            }]),
+        ));
+        let (commands, mut events, progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel".to_owned(),
+            })
+            .await
+            .unwrap();
+        gate.wait_until_read_started().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert!(
+            !progress.is_empty(),
+            "the receiver stayed deliberately undrained"
+        );
+        assert!(matches!(
+            records.last(),
+            Some(StoredRecord {
+                record: Record::CancelledRun { terminal },
+                ..
+            }) if matches!(
+                terminal.evidence,
+                Some(TerminalEvidence::Execution(ref evidence))
+                    if evidence.stdout.head == "before cancellation\n"
+            )
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::RunSettled { run_id: RunId(1) })
+        ));
+    }
+
     #[tokio::test]
     async fn bounded_progress_keeps_execution_records_and_settlement_reliable() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1722,6 +1928,7 @@ mod tests {
                 "tool-finished:1:1:Cargo.toml:success:2",
                 "model:1:2",
                 "execution:1:2",
+                "stdout-delta",
                 "model:1:3",
             ]
         );

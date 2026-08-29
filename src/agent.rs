@@ -74,6 +74,10 @@ pub(crate) enum AgentProgress {
         path: String,
         outcome: ReadOutcome,
     },
+    StdoutDelta {
+        text: String,
+    },
+    StdoutTruncated,
     ExecutionCompleted {
         source: String,
         execution: Execution,
@@ -525,6 +529,12 @@ impl<M: Model> Agent<M> {
                             }
                             ArenaProgress::ReadFinished { path, outcome } => {
                                 progress(AgentProgress::ToolFinished { path, outcome });
+                            }
+                            ArenaProgress::StdoutDelta { text } => {
+                                progress(AgentProgress::StdoutDelta { text });
+                            }
+                            ArenaProgress::StdoutTruncated => {
+                                progress(AgentProgress::StdoutTruncated);
                             }
                         };
                         self.arena
@@ -1088,6 +1098,60 @@ mod tests {
             entry,
             ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn agent_forwards_live_stdout_without_adding_it_to_model_progress() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "print('live stdout')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        {
+            let mut capture = |event| progress.push(event);
+            assert_eq!(
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+        }
+
+        let stdout = progress
+            .iter()
+            .filter_map(|event| match event {
+                AgentProgress::StdoutDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(stdout, "live stdout\n");
+        assert!(!progress.iter().any(|event| matches!(
+            event,
+            AgentProgress::ModelProgress(_) | AgentProgress::StdoutTruncated
+        )));
+        let completed = agent
+            .model_context
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .next()
+            .expect("completed code should remain the only stdout context source");
+        let CodeResult::Execution { feedback } = completed.result() else {
+            panic!("expected execution feedback");
+        };
+        assert!(feedback.contains("live stdout\n"));
     }
 
     #[tokio::test]

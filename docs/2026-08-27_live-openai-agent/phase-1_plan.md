@@ -221,7 +221,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/arena.rs`, accumulator/integration; `src/runtime.rs`, event integration) — First fail because print output appears only at completion. Then cover immediate first emission, rate-limited subsequent fragments, next-event and 4 KiB flushes, short terminal flushes, maximum payload, fragmented Unicode and CRLF, exactly one truncation marker, no post-budget deltas, unchanged final head/tail, stale step identity, a full progress channel with a gap marker, cancellation responsiveness, and terminal settlement with an undrained receiver.
 
-**Files** — Modify: `src/arena.rs`, `src/agent.rs`, `src/runtime.rs`
+**Files** — Modify: `src/arena.rs`, `src/agent.rs`, `src/runtime.rs`, `src/tui.rs`
 
 **Commit** — `Stream bounded Arena stdout`
 

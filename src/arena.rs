@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
@@ -23,6 +23,8 @@ const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MEMORY: usize = 64 * 1024 * 1024;
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
+const STDOUT_DELTA_BYTES: usize = 4 * 1024;
+const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
     max_total_bytes: 256 * 1024,
     max_total_lines: 1_000,
@@ -91,6 +93,8 @@ pub enum ExecutionOutcome {
 pub(crate) enum ArenaProgress {
     ReadStarted { path: String },
     ReadFinished { path: String, outcome: ReadOutcome },
+    StdoutDelta { text: String },
+    StdoutTruncated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +219,12 @@ impl InterruptedExecutionState {
         }
     }
 
-    fn finish(self) -> InterruptedExecution {
+    fn finish(
+        mut self,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) -> InterruptedExecution {
+        self.streams.flush_stdout(now, progress);
         InterruptedExecution {
             began: self.began,
             stdout: self.streams.stdout.finish(),
@@ -405,7 +414,7 @@ impl Arena {
         &mut self,
         code: &str,
         cancellation: &CancellationToken,
-        progress: &mut impl FnMut(ArenaProgress),
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
     ) -> Result<Execution, ArenaError> {
         self.restore_current_checkpoint_if_needed().await?;
         let mut checkout = self
@@ -446,7 +455,8 @@ impl Arena {
                 })
             }
             Err(failure) => {
-                let error = failure.with_interrupted_execution(interruption.finish());
+                let error = failure
+                    .with_interrupted_execution(interruption.finish(Instant::now(), progress));
                 drop(checkout);
                 Err(self.recover(error).await)
             }
@@ -591,10 +601,11 @@ async fn execute_checkout(
     read_tool: &ReadTool,
     code: &str,
     max_memory: Option<usize>,
-    progress: &mut impl FnMut(ArenaProgress),
+    progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
 ) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
     let result = drive(checkout, read_tool, code, progress, interruption).await;
+    interruption.streams.flush_stdout(Instant::now(), progress);
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
             ExecutionOutcome::Complete {
@@ -675,7 +686,7 @@ async fn drive(
     checkout: &mut Checkout,
     read_tool: &ReadTool,
     code: &str,
-    progress: &mut impl FnMut(ArenaProgress),
+    progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
 ) -> Result<MontyObject, DriverError> {
     let InterruptedExecutionState {
@@ -684,11 +695,18 @@ async fn drive(
         began,
     } = interruption;
     *began = true;
+    macro_rules! with_print {
+        ($on_print:ident => $operation:expr) => {{
+            let mut $on_print = on_print_sync(|stream, text| {
+                streams.push_with_progress(stream, text, Instant::now(), progress);
+            });
+            $operation
+        }};
+    }
     'drive: {
-        let mut on_print = on_print_sync(|stream, text| streams.push(stream, text));
-        let mut event = match checkout
+        let mut event = match with_print!(on_print => checkout
             .feed(code, vec![], vec![], false, &mut on_print)
-            .await
+            .await)
         {
             Ok(event) => event,
             Err(PoolError::Runtime(error)) => break 'drive Err(DriverError::Runtime(error)),
@@ -709,7 +727,7 @@ async fn drive(
                         || method_call
                         || !matches!(args.as_slice(), [MontyObject::String(_)])
                     {
-                        match checkout
+                        match with_print!(on_print => checkout
                             .resume(
                                 ResumeValue::Error(MontyException::new(
                                     ExcType::TypeError,
@@ -719,7 +737,7 @@ async fn drive(
                                 )),
                                 &mut on_print,
                             )
-                            .await
+                            .await)
                         {
                             Ok(event) => event,
                             Err(PoolError::Runtime(error)) => {
@@ -733,27 +751,29 @@ async fn drive(
                         let [MontyObject::String(path)] = args.as_slice() else {
                             unreachable!("read argument was validated above");
                         };
-                        let pending =
-                            match checkout.resume(ResumeValue::Future, &mut on_print).await {
-                                Ok(TurnEvent::ResolveFutures { pending_call_ids })
-                                    if pending_call_ids.as_slice() == [call_id] =>
-                                {
-                                    pending_call_ids
-                                }
-                                Ok(event) => {
-                                    break 'drive Err(DriverError::Fatal(
-                                        ArenaError::unsupported_suspension(format!(
-                                            "expected one pending read future, got {event:?}"
-                                        )),
-                                    ));
-                                }
-                                Err(PoolError::Runtime(error)) => {
-                                    break 'drive Err(DriverError::Runtime(error));
-                                }
-                                Err(error) => {
-                                    break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                                }
-                            };
+                        let pending = match with_print!(on_print => checkout
+                            .resume(ResumeValue::Future, &mut on_print)
+                            .await)
+                        {
+                            Ok(TurnEvent::ResolveFutures { pending_call_ids })
+                                if pending_call_ids.as_slice() == [call_id] =>
+                            {
+                                pending_call_ids
+                            }
+                            Ok(event) => {
+                                break 'drive Err(DriverError::Fatal(
+                                    ArenaError::unsupported_suspension(format!(
+                                        "expected one pending read future, got {event:?}"
+                                    )),
+                                ));
+                            }
+                            Err(PoolError::Runtime(error)) => {
+                                break 'drive Err(DriverError::Runtime(error));
+                            }
+                            Err(error) => {
+                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
+                            }
+                        };
                         let path = path.clone();
                         read.started(&path);
                         progress(ArenaProgress::ReadStarted { path: path.clone() });
@@ -774,9 +794,9 @@ async fn drive(
                             )),
                             Err(error) => ResumeValue::Error(read_error(error)),
                         };
-                        match checkout
+                        match with_print!(on_print => checkout
                             .resume_futures(vec![(pending[0], value)], &mut on_print)
-                            .await
+                            .await)
                         {
                             Ok(event) => event,
                             Err(PoolError::Runtime(error)) => {
@@ -789,7 +809,10 @@ async fn drive(
                     }
                 }
                 TurnEvent::FunctionCall { .. } => {
-                    match checkout.resume(ResumeValue::NotFound, &mut on_print).await {
+                    match with_print!(on_print => checkout
+                        .resume(ResumeValue::NotFound, &mut on_print)
+                        .await)
+                    {
                         Ok(event) => event,
                         Err(PoolError::Runtime(error)) => {
                             break 'drive Err(DriverError::Runtime(error));
@@ -802,7 +825,10 @@ async fn drive(
                         name: "read".to_owned(),
                         docstring: None,
                     });
-                    match checkout.resume_name_lookup(value, &mut on_print).await {
+                    match with_print!(on_print => checkout
+                        .resume_name_lookup(value, &mut on_print)
+                        .await)
+                    {
                         Ok(event) => event,
                         Err(PoolError::Runtime(error)) => {
                             break 'drive Err(DriverError::Runtime(error));
@@ -810,9 +836,9 @@ async fn drive(
                         Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
                     }
                 }
-                TurnEvent::OsCall { .. } => match checkout
+                TurnEvent::OsCall { .. } => match with_print!(on_print => checkout
                     .resume(ResumeValue::NotHandled, &mut on_print)
-                    .await
+                    .await)
                 {
                     Ok(event) => event,
                     Err(PoolError::Runtime(error)) => {
@@ -860,6 +886,15 @@ struct ObservationAccumulator {
     lines: LineCounter,
     whole: Option<String>,
     truncated: Option<TruncatedObservation>,
+    live_stdout: Option<LiveStdout>,
+}
+
+struct LiveStdout {
+    total_bytes: usize,
+    lines: LineCounter,
+    pending: String,
+    last_emitted: Option<Instant>,
+    truncated: bool,
 }
 
 struct TruncatedObservation {
@@ -892,16 +927,125 @@ struct StreamAccumulators {
 impl StreamAccumulators {
     fn new(limits: ObservationLimits) -> Self {
         Self {
-            stdout: ObservationAccumulator::new(limits),
+            stdout: ObservationAccumulator::with_live_stdout(limits),
             stderr: ObservationAccumulator::new(limits),
         }
     }
 
-    fn push(&mut self, stream: PrintStream, text: &str) {
+    fn push_with_progress(
+        &mut self,
+        stream: PrintStream,
+        text: &str,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
         match stream {
-            PrintStream::Stdout => self.stdout.push(text),
+            PrintStream::Stdout => self.stdout.push_live_stdout(text, now, progress),
             PrintStream::Stderr => self.stderr.push(text),
         }
+    }
+
+    fn flush_stdout(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        if let Some(live_stdout) = &mut self.stdout.live_stdout {
+            live_stdout.flush(now, progress);
+        }
+    }
+}
+
+impl LiveStdout {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            lines: LineCounter::default(),
+            pending: String::new(),
+            last_emitted: None,
+            truncated: false,
+        }
+    }
+
+    fn push(
+        &mut self,
+        text: &str,
+        limits: ObservationLimits,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
+        if self.truncated {
+            return;
+        }
+        let accepted = self.accepted_prefix_len(text, limits);
+        if accepted > 0 {
+            let text = &text[..accepted];
+            self.total_bytes += text.len();
+            self.lines.push(text);
+            self.queue(text, now, progress);
+        }
+        if accepted < text.len() {
+            self.flush(now, progress);
+            self.truncated = true;
+            progress(ArenaProgress::StdoutTruncated);
+        }
+    }
+
+    fn accepted_prefix_len(&self, text: &str, limits: ObservationLimits) -> usize {
+        let mut total_bytes = self.total_bytes;
+        let mut lines = self.lines.clone();
+        let mut accepted = 0;
+        for (index, character) in text.char_indices() {
+            let end = index + character.len_utf8();
+            if character.len_utf8() > limits.max_total_bytes.saturating_sub(total_bytes) {
+                break;
+            }
+            lines.push(&text[index..end]);
+            if lines.count() > limits.max_total_lines {
+                break;
+            }
+            total_bytes += character.len_utf8();
+            accepted = end;
+        }
+        accepted
+    }
+
+    fn queue(&mut self, mut text: &str, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        while !text.is_empty() {
+            let available = STDOUT_DELTA_BYTES - self.pending.len();
+            let length = utf8_prefix_len(text, available);
+            if length == 0 {
+                self.publish_next(now, progress);
+                continue;
+            }
+            self.pending.push_str(&text[..length]);
+            text = &text[length..];
+            self.publish_due(now, progress);
+        }
+    }
+
+    fn publish_due(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        let rate_window_open = self.last_emitted.is_none_or(|last_emitted| {
+            now.checked_duration_since(last_emitted)
+                .is_some_and(|elapsed| elapsed >= STDOUT_RATE_WINDOW)
+        });
+        if rate_window_open && !self.pending.is_empty() {
+            self.publish_next(now, progress);
+        }
+        while self.pending.len() >= STDOUT_DELTA_BYTES {
+            self.publish_next(now, progress);
+        }
+    }
+
+    fn flush(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        while !self.pending.is_empty() {
+            self.publish_next(now, progress);
+        }
+    }
+
+    fn publish_next(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        let length = utf8_prefix_len(&self.pending, STDOUT_DELTA_BYTES);
+        assert!(length > 0, "pending stdout must contain valid UTF-8");
+        let remainder = self.pending.split_off(length);
+        let text = std::mem::replace(&mut self.pending, remainder);
+        self.last_emitted = Some(now);
+        progress(ArenaProgress::StdoutDelta { text });
     }
 }
 
@@ -913,6 +1057,26 @@ impl ObservationAccumulator {
             lines: LineCounter::default(),
             whole: Some(String::new()),
             truncated: None,
+            live_stdout: None,
+        }
+    }
+
+    fn with_live_stdout(limits: ObservationLimits) -> Self {
+        Self {
+            live_stdout: Some(LiveStdout::new()),
+            ..Self::new(limits)
+        }
+    }
+
+    fn push_live_stdout(
+        &mut self,
+        text: &str,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
+        self.push(text);
+        if let Some(live_stdout) = &mut self.live_stdout {
+            live_stdout.push(text, self.limits, now, progress);
         }
     }
 
@@ -1113,7 +1277,7 @@ impl Tail {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LineCounter {
     terminated: usize,
     current_nonempty: bool,
@@ -1259,7 +1423,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use monty_types::PrintStream;
     use tempfile::TempDir;
@@ -1594,12 +1758,303 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "2");
     }
 
+    fn push_stdout(
+        streams: &mut StreamAccumulators,
+        text: &str,
+        now: Instant,
+        progress: &mut Vec<super::ArenaProgress>,
+    ) {
+        let mut capture = |event| progress.push(event);
+        streams.push_with_progress(PrintStream::Stdout, text, now, &mut capture);
+    }
+
+    fn flush_stdout(
+        streams: &mut StreamAccumulators,
+        now: Instant,
+        progress: &mut Vec<super::ArenaProgress>,
+    ) {
+        let mut capture = |event| progress.push(event);
+        streams.flush_stdout(now, &mut capture);
+    }
+
+    fn stdout_text(progress: &[super::ArenaProgress]) -> String {
+        progress
+            .iter()
+            .filter_map(|event| match event {
+                super::ArenaProgress::StdoutDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stdout_progress_emits_immediately_then_coalesces_until_the_next_due_producer_event() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "first", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            " second",
+            now + Duration::from_millis(49),
+            &mut progress,
+        );
+        push_stdout(
+            &mut streams,
+            " third",
+            now + Duration::from_millis(50),
+            &mut progress,
+        );
+
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text: first },
+                super::ArenaProgress::StdoutDelta { text: rest },
+            ] if first == "first" && rest == " second third"
+        ));
+    }
+
+    #[test]
+    fn stdout_progress_flushes_utf8_safe_chunks_when_pending_output_reaches_four_kib() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "start", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            &format!("{}é", "x".repeat(4 * 1024 - 1)),
+            now + Duration::from_millis(1),
+            &mut progress,
+        );
+        assert!(
+            streams
+                .stdout
+                .live_stdout
+                .as_ref()
+                .expect("stdout has live state")
+                .pending
+                .len()
+                <= 4 * 1024
+        );
+        flush_stdout(&mut streams, now + Duration::from_millis(2), &mut progress);
+
+        assert_eq!(
+            stdout_text(&progress),
+            format!("start{}é", "x".repeat(4 * 1024 - 1))
+        );
+        assert!(progress.iter().all(|event| match event {
+            super::ArenaProgress::StdoutDelta { text } => text.len() <= 4 * 1024,
+            super::ArenaProgress::StdoutTruncated
+            | super::ArenaProgress::ReadStarted { .. }
+            | super::ArenaProgress::ReadFinished { .. } => true,
+        }));
+        assert!(matches!(
+            progress.get(1),
+            Some(super::ArenaProgress::StdoutDelta { text }) if text.len() == 4 * 1024 - 1
+        ));
+    }
+
+    #[test]
+    fn stdout_progress_flushes_short_pending_output_when_execution_or_interruption_finishes() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "first", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            " pending",
+            now + Duration::from_millis(1),
+            &mut progress,
+        );
+        flush_stdout(&mut streams, now + Duration::from_millis(2), &mut progress);
+
+        assert_eq!(stdout_text(&progress), "first pending");
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text: first },
+                super::ArenaProgress::StdoutDelta { text: pending },
+            ] if first == "first" && pending == " pending"
+        ));
+
+        let mut interruption = InterruptedExecutionState::new();
+        push_stdout(
+            &mut interruption.streams,
+            "again",
+            now + Duration::from_millis(60),
+            &mut progress,
+        );
+        push_stdout(
+            &mut interruption.streams,
+            " later",
+            now + Duration::from_millis(61),
+            &mut progress,
+        );
+        let mut capture = |event| progress.push(event);
+        let interrupted = interruption.finish(now + Duration::from_millis(62), &mut capture);
+
+        assert_eq!(interrupted.stdout.head, "again later");
+        assert_eq!(stdout_text(&progress), "first pendingagain later");
+    }
+
+    #[test]
+    fn stdout_progress_preserves_fragmented_unicode_and_crlf_without_changing_observation() {
+        let now = Instant::now();
+        let fragments = ["head\r", "\n🦀", "\u{2028}tail"];
+        let expected = {
+            let mut accumulator = ObservationAccumulator::new(TEST_LIMITS);
+            for fragment in fragments {
+                accumulator.push(fragment);
+            }
+            accumulator.finish()
+        };
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            push_stdout(
+                &mut streams,
+                fragment,
+                now + Duration::from_millis(index as u64),
+                &mut progress,
+            );
+        }
+        flush_stdout(&mut streams, now + Duration::from_millis(4), &mut progress);
+
+        assert_eq!(stdout_text(&progress), "head\r\n🦀\u{2028}tail");
+        assert_eq!(streams.stdout.finish(), expected);
+    }
+
+    #[test]
+    fn stdout_progress_marks_the_first_suffix_beyond_byte_or_line_limits_once() {
+        let now = Instant::now();
+        let byte_limits = ObservationLimits {
+            max_total_bytes: 5,
+            max_total_lines: 10,
+            max_head_bytes: 5,
+            max_head_lines: 10,
+            max_tail_bytes: 5,
+            max_tail_lines: 10,
+        };
+        let mut bytes = StreamAccumulators::new(byte_limits);
+        let mut byte_progress = Vec::new();
+        push_stdout(&mut bytes, "abcde", now, &mut byte_progress);
+        push_stdout(
+            &mut bytes,
+            "f",
+            now + Duration::from_millis(1),
+            &mut byte_progress,
+        );
+        push_stdout(
+            &mut bytes,
+            "later",
+            now + Duration::from_millis(2),
+            &mut byte_progress,
+        );
+
+        assert_eq!(stdout_text(&byte_progress), "abcde");
+        assert_eq!(
+            byte_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+        assert_eq!(bytes.stdout.finish(), observe("abcdeflater", byte_limits));
+
+        let line_limits = ObservationLimits {
+            max_total_bytes: 100,
+            max_total_lines: 1,
+            max_head_bytes: 100,
+            max_head_lines: 1,
+            max_tail_bytes: 100,
+            max_tail_lines: 1,
+        };
+        let mut lines = StreamAccumulators::new(line_limits);
+        let mut line_progress = Vec::new();
+        push_stdout(&mut lines, "one\r", now, &mut line_progress);
+        push_stdout(
+            &mut lines,
+            "\n",
+            now + Duration::from_millis(1),
+            &mut line_progress,
+        );
+        push_stdout(
+            &mut lines,
+            "two",
+            now + Duration::from_millis(2),
+            &mut line_progress,
+        );
+
+        assert_eq!(stdout_text(&line_progress), "one\r\n");
+        assert_eq!(
+            line_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+
+        let mut actual_bytes = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut actual_byte_progress = Vec::new();
+        let at_limit = "x".repeat(OBSERVATION_LIMITS.max_total_bytes);
+        push_stdout(&mut actual_bytes, &at_limit, now, &mut actual_byte_progress);
+        push_stdout(
+            &mut actual_bytes,
+            "beyond",
+            now + Duration::from_millis(1),
+            &mut actual_byte_progress,
+        );
+        assert_eq!(stdout_text(&actual_byte_progress), at_limit);
+        assert_eq!(
+            actual_byte_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+
+        let mut actual_lines = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut actual_line_progress = Vec::new();
+        let at_limit = "line\n".repeat(OBSERVATION_LIMITS.max_total_lines);
+        push_stdout(&mut actual_lines, &at_limit, now, &mut actual_line_progress);
+        push_stdout(
+            &mut actual_lines,
+            "beyond",
+            now + Duration::from_millis(1),
+            &mut actual_line_progress,
+        );
+        assert_eq!(stdout_text(&actual_line_progress), at_limit);
+        assert_eq!(
+            actual_line_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn routes_stderr_to_its_own_accumulator() {
         let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = |_| {};
 
-        streams.push(PrintStream::Stderr, "warning\n");
-        streams.push(PrintStream::Stdout, "output\n");
+        streams.push_with_progress(
+            PrintStream::Stderr,
+            "warning\n",
+            Instant::now(),
+            &mut progress,
+        );
+        streams.push_with_progress(
+            PrintStream::Stdout,
+            "output\n",
+            Instant::now(),
+            &mut progress,
+        );
 
         assert_eq!(streams.stdout.finish().head, "output\n");
         assert_eq!(streams.stderr.finish().head, "warning\n");
@@ -1798,8 +2253,9 @@ mod tests {
             .read
             .finished(ReadOutcome::failure(unbounded.clone()));
 
+        let mut progress = |_| {};
         let error = ArenaError::unsupported_suspension(unbounded)
-            .with_interrupted_execution(interruption.finish());
+            .with_interrupted_execution(interruption.finish(Instant::now(), &mut progress));
 
         let ArenaError::UnsupportedSuspension {
             message,
@@ -1982,6 +2438,41 @@ mod tests {
         assert_eq!(execution.stdout.total_bytes, 0);
         assert_eq!(execution.stderr.total_bytes, 0);
         assert_eq!(execution.read, InterruptedRead::NoRead);
+    }
+
+    #[tokio::test]
+    async fn stdout_progress_arrives_before_a_gated_read_and_survives_cancellation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+        let error = {
+            let mut capture = |event| progress.push(event);
+            let mut execution = Box::pin(arena.execute_with_progress(
+                "print('before')\nawait read('pending')",
+                &cancellation,
+                &mut capture,
+            ));
+
+            tokio::select! {
+                _ = gate.wait_until_read_started() => {}
+                result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+            }
+            cancellation.cancel();
+            execution.await.unwrap_err()
+        };
+
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text },
+                super::ArenaProgress::ReadStarted { .. },
+            ] if text == "before\n"
+        ));
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
     }
 
     #[tokio::test]
