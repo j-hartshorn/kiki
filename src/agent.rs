@@ -2,17 +2,70 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
-    Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, Observation, PythonError,
-    ReadOutcome,
+    Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
+    InterruptedRead, Observation, PythonError, ReadOutcome,
 };
 use crate::model::{
-    ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
+    ACCEPTED_MODEL_CONTENT_LIMIT, AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId,
+    ModelFailure, ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
+    READ_CAPABILITY_DESCRIPTION,
 };
+const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvidence {
+    Generation(GenerationEvidence),
+    Execution(Box<ExecutionEvidence>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationEvidence {
+    pub(crate) reasoning: String,
+    pub(crate) assistant_text: String,
+    pub(crate) decoded_python: String,
+}
+
+impl GenerationEvidence {
+    fn is_empty(&self) -> bool {
+        self.reasoning.is_empty()
+            && self.assistant_text.is_empty()
+            && self.decoded_python.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionEvidence {
+    pub(crate) source: String,
+    pub(crate) began: bool,
+    pub(crate) stdout: Observation,
+    pub(crate) stderr: Observation,
+    pub(crate) read: InterruptedRead,
+    pub(crate) cancellation_warning: Option<String>,
+    pub(crate) failure: Option<ExecutionFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionFailure {
+    Arena { message: String },
+    RecoveryFailed { original: String, recovery: String },
+}
+
+impl ExecutionFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Arena { message } => message.clone(),
+            Self::RecoveryFailed { original, recovery } => {
+                format!("arena recovery failed after {original}: {recovery}")
+            }
+        }
+    }
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AgentProgress {
     ModelStepStarted,
+    ModelProgress(ModelProgress),
     ExecutionStarted,
     ToolStarted {
         path: String,
@@ -21,36 +74,327 @@ pub(crate) enum AgentProgress {
         path: String,
         outcome: ReadOutcome,
     },
+    StdoutDelta {
+        text: String,
+    },
+    StdoutTruncated,
     ExecutionCompleted {
         source: String,
         execution: Execution,
+        attempts: Vec<AttemptAccounting>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRunOutcome {
+    FinalMessageStaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalMessage {
+    text: String,
+    attempts: Vec<AttemptAccounting>,
+    generation: GenerationEvidence,
+}
+
+impl FinalMessage {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn attempts(&self) -> &[AttemptAccounting] {
+        &self.attempts
+    }
+
+    pub(crate) fn generation_evidence(&self) -> TerminalEvidence {
+        TerminalEvidence::Generation(self.generation.clone())
+    }
+}
+
+struct StagedFinalMessage {
+    final_message: FinalMessage,
+    replay: ProviderReplay,
+}
+
+#[derive(Default)]
+struct GenerationEvidenceBuilder {
+    reasoning: String,
+    assistant_text: String,
+    decoded_python: String,
+}
+
+impl GenerationEvidenceBuilder {
+    fn capture(&mut self, progress: &ModelProgress) {
+        match progress {
+            ModelProgress::AttemptStarted { .. } => *self = Self::default(),
+            ModelProgress::ReasoningSummaryChunk { text } => self.append_reasoning(text),
+            ModelProgress::AssistantTextChunk { text } => self.append_assistant_text(text),
+            ModelProgress::DecodedPythonChunk { code } => self.append_decoded_python(code),
+            ModelProgress::AttemptSettled { .. } => {}
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn evidence(self) -> Option<GenerationEvidence> {
+        let evidence = GenerationEvidence {
+            reasoning: self.reasoning,
+            assistant_text: self.assistant_text,
+            decoded_python: self.decoded_python,
+        };
+        (!evidence.is_empty()).then_some(evidence)
+    }
+
+    fn with_final_message(mut self, text: String) -> GenerationEvidence {
+        self.assistant_text = bounded_utf8(text, ACCEPTED_MODEL_CONTENT_LIMIT);
+        let remaining = ACCEPTED_MODEL_CONTENT_LIMIT - self.assistant_text.len();
+        self.reasoning = bounded_utf8(self.reasoning, remaining);
+        let remaining = remaining - self.reasoning.len();
+        self.decoded_python = bounded_utf8(self.decoded_python, remaining);
+        GenerationEvidence {
+            reasoning: self.reasoning,
+            assistant_text: self.assistant_text,
+            decoded_python: self.decoded_python,
+        }
+    }
+
+    fn append_reasoning(&mut self, text: &str) {
+        let remaining = self.remaining();
+        Self::append(&mut self.reasoning, text, remaining);
+    }
+
+    fn append_assistant_text(&mut self, text: &str) {
+        let remaining = self.remaining();
+        Self::append(&mut self.assistant_text, text, remaining);
+    }
+
+    fn append_decoded_python(&mut self, code: &str) {
+        let remaining = self.remaining();
+        Self::append(&mut self.decoded_python, code, remaining);
+    }
+
+    fn remaining(&self) -> usize {
+        ACCEPTED_MODEL_CONTENT_LIMIT.saturating_sub(
+            self.reasoning.len() + self.assistant_text.len() + self.decoded_python.len(),
+        )
+    }
+
+    fn append(target: &mut String, value: &str, limit: usize) {
+        let end = utf8_prefix_len(value, limit);
+        target.push_str(&value[..end]);
+    }
+}
+
+impl ExecutionEvidence {
+    fn cancelled(source: String, error: Option<&ArenaError>) -> Self {
+        Self::from_error(source, error, true)
+    }
+
+    fn failed(source: String, error: &ArenaError) -> Self {
+        Self::from_error(source, Some(error), contains_cancellation(error))
+    }
+
+    fn from_error(source: String, error: Option<&ArenaError>, cancellation_warning: bool) -> Self {
+        let interrupted = error
+            .and_then(interrupted_execution)
+            .cloned()
+            .unwrap_or_else(empty_interrupted_execution);
+        Self {
+            source,
+            began: interrupted.began,
+            stdout: interrupted.stdout,
+            stderr: interrupted.stderr,
+            read: interrupted.read,
+            cancellation_warning: cancellation_warning.then(|| CANCELLATION_WARNING.to_owned()),
+            failure: error.map(failure_evidence),
+        }
+    }
+
+    fn feedback(&self) -> String {
+        let mut frames = Vec::new();
+        if let Some(failure) = &self.failure {
+            frames.push(format!(
+                "<kiki_failure>\n{}\n</kiki_failure>",
+                failure.message()
+            ));
+        }
+        let state = if self.cancellation_warning.is_some() {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        frames.push(interruption_feedback(self, state));
+        frames.join("\n")
+    }
+}
+
+fn empty_interrupted_execution() -> InterruptedExecution {
+    InterruptedExecution {
+        began: false,
+        stdout: empty_observation(),
+        stderr: empty_observation(),
+        read: InterruptedRead::NoRead,
+    }
+}
+
+fn empty_observation() -> Observation {
+    Observation {
+        head: String::new(),
+        tail: None,
+        head_lines: 0,
+        tail_lines: 0,
+        total_lines: 0,
+        total_bytes: 0,
+        omitted_lines: 0,
+        omitted_bytes: 0,
+        head_ends_mid_line: false,
+        tail_starts_mid_line: false,
+        partial_lines: false,
+    }
+}
+
+fn failure_evidence(error: &ArenaError) -> ExecutionFailure {
+    match error {
+        ArenaError::RecoveryFailed { original, recovery } => ExecutionFailure::RecoveryFailed {
+            original: bounded_utf8(original.to_string(), FAILED_STEP_EVIDENCE_LIMIT / 2),
+            recovery: bounded_utf8(recovery.to_string(), FAILED_STEP_EVIDENCE_LIMIT / 2),
+        },
+        _ => ExecutionFailure::Arena {
+            message: bounded_utf8(error.to_string(), FAILED_STEP_EVIDENCE_LIMIT),
+        },
+    }
+}
+
+fn bounded_utf8(mut value: String, limit: usize) -> String {
+    value.truncate(utf8_prefix_len(&value, limit));
+    value
+}
+
+fn utf8_prefix_len(value: &str, limit: usize) -> usize {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("agent run was cancelled")]
-    Cancelled,
-    #[error(transparent)]
-    Model(#[from] ModelError),
-    #[error(transparent)]
-    Arena(#[from] ArenaError),
+    Cancelled {
+        attempts: Vec<AttemptAccounting>,
+        evidence: Option<Box<TerminalEvidence>>,
+    },
+    #[error("{failure}")]
+    Model {
+        #[source]
+        failure: ModelFailure,
+        attempts: Vec<AttemptAccounting>,
+        evidence: Option<Box<TerminalEvidence>>,
+    },
+    #[error("{error}")]
+    ModelHistory {
+        #[source]
+        error: ModelHistoryError,
+        attempts: Vec<AttemptAccounting>,
+        evidence: Option<Box<TerminalEvidence>>,
+    },
+    #[error("{error}")]
+    Arena {
+        #[source]
+        error: ArenaError,
+        attempts: Vec<AttemptAccounting>,
+        evidence: Box<ExecutionEvidence>,
+    },
+    #[error("agent has no staged final message")]
+    NoStagedFinalMessage,
+    #[error("agent has a staged final message awaiting terminal settlement")]
+    StagedFinalMessageUnresolved,
 }
 
-pub struct Agent {
+impl AgentError {
+    pub(crate) fn is_recovery_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Arena {
+                error: ArenaError::RecoveryFailed { .. },
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn is_authentication(&self) -> bool {
+        matches!(self, Self::Model { failure, .. } if failure.is_authentication())
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Cancelled { .. } => true,
+            Self::Model { failure, .. } => failure.is_cancelled(),
+            Self::Arena {
+                error: ArenaError::Cancelled { .. },
+                ..
+            } => true,
+            Self::ModelHistory { .. }
+            | Self::Arena { .. }
+            | Self::NoStagedFinalMessage
+            | Self::StagedFinalMessageUnresolved => false,
+        }
+    }
+
+    pub fn attempts(&self) -> &[AttemptAccounting] {
+        match self {
+            Self::Cancelled { attempts, .. }
+            | Self::Model { attempts, .. }
+            | Self::ModelHistory { attempts, .. }
+            | Self::Arena { attempts, .. } => attempts,
+            Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => &[],
+        }
+    }
+
+    pub(crate) fn terminal_evidence(&self) -> Option<TerminalEvidence> {
+        match self {
+            Self::Cancelled { evidence, .. }
+            | Self::Model { evidence, .. }
+            | Self::ModelHistory { evidence, .. } => evidence.as_deref().cloned(),
+            Self::Arena { evidence, .. } => Some(TerminalEvidence::Execution(evidence.clone())),
+            Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => None,
+        }
+    }
+}
+
+struct PendingCode {
+    source: String,
+    call_id: ModelCallId,
+    replay: ProviderReplay,
+}
+
+impl PendingCode {
+    fn append(
+        self,
+        history: &mut ModelHistory,
+        result: CodeResult,
+    ) -> Result<(), ModelHistoryError> {
+        history.append_completed_code(self.source, self.call_id, self.replay, result)
+    }
+}
+
+pub struct Agent<M: Model> {
     arena: Arena,
-    model: ScriptedModel,
-    model_context: Vec<ModelContextEntry>,
+    model: M,
+    model_context: ModelHistory,
+    staged_final_message: Option<StagedFinalMessage>,
 }
 
-impl Agent {
-    pub fn new(arena: Arena, model: ScriptedModel) -> Self {
+impl<M: Model> Agent<M> {
+    pub fn new(arena: Arena, model: M) -> Self {
         Self {
             arena,
             model,
-            model_context: vec![ModelContextEntry::ReadCapability {
-                description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-            }],
+            model_context: ModelHistory::new(READ_CAPABILITY_DESCRIPTION),
+            staged_final_message: None,
         }
     }
 
@@ -58,33 +402,125 @@ impl Agent {
         &mut self,
         request: impl Into<String>,
         cancellation: &CancellationToken,
-    ) -> Result<String, AgentError> {
+    ) -> Result<AgentRunOutcome, AgentError> {
         let mut progress = |_| {};
         self.run_with_progress(request, cancellation, &mut progress)
             .await
+    }
+
+    pub fn admit_staged_final_message(&mut self) -> Result<FinalMessage, AgentError> {
+        let StagedFinalMessage {
+            final_message,
+            replay,
+        } = self
+            .staged_final_message
+            .take()
+            .ok_or(AgentError::NoStagedFinalMessage)?;
+        self.model_context
+            .append_final_message(final_message.text.clone(), replay);
+        Ok(final_message)
+    }
+
+    pub fn discard_staged_final_message(&mut self) -> Option<FinalMessage> {
+        self.staged_final_message
+            .take()
+            .map(|staged| staged.final_message)
     }
 
     pub(crate) async fn run_with_progress(
         &mut self,
         request: impl Into<String>,
         cancellation: &CancellationToken,
-        progress: &mut impl FnMut(AgentProgress),
-    ) -> Result<String, AgentError> {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Cancelled);
+        progress: &mut (impl FnMut(AgentProgress) + Send),
+    ) -> Result<AgentRunOutcome, AgentError> {
+        if self.staged_final_message.is_some() {
+            return Err(AgentError::StagedFinalMessageUnresolved);
         }
-        self.model.reset();
-        self.model_context.push(ModelContextEntry::UserRequest {
-            text: request.into(),
-        });
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Cancelled {
+                attempts: Vec::new(),
+                evidence: None,
+            });
+        }
+        self.model_context.append_user_request(request);
+        let mut attempts = Vec::new();
+        let mut generation = GenerationEvidenceBuilder::default();
 
         loop {
             if cancellation.is_cancelled() {
-                return Err(AgentError::Cancelled);
+                return Err(AgentError::Cancelled {
+                    attempts,
+                    evidence: generation
+                        .evidence()
+                        .map(TerminalEvidence::Generation)
+                        .map(Box::new),
+                });
             }
             progress(AgentProgress::ModelStepStarted);
-            match self.model.next_action(&self.model_context)? {
-                ModelAction::Code { source } => {
+            let mut model_progress = |model_progress: ModelProgress| {
+                generation.capture(&model_progress);
+                progress(AgentProgress::ModelProgress(model_progress));
+            };
+            let model_step = match self
+                .model
+                .step(&self.model_context, cancellation, &mut model_progress)
+                .await
+            {
+                Ok(step) => step,
+                Err(failure) => {
+                    attempts.extend(failure.attempts().iter().cloned());
+                    return Err(AgentError::Model {
+                        failure,
+                        attempts,
+                        evidence: generation
+                            .evidence()
+                            .map(TerminalEvidence::Generation)
+                            .map(Box::new),
+                    });
+                }
+            };
+            let ModelStep {
+                action,
+                replay,
+                attempts: step_attempts,
+            } = model_step;
+            attempts.extend(step_attempts.iter().cloned());
+            match action {
+                ModelAction::Code { source, call_id } => {
+                    if self.model_context.contains_call_id(&call_id) {
+                        return Err(AgentError::ModelHistory {
+                            error: ModelHistoryError::DuplicateCallId(call_id),
+                            attempts,
+                            evidence: generation
+                                .evidence()
+                                .map(TerminalEvidence::Generation)
+                                .map(Box::new),
+                        });
+                    }
+                    generation.clear();
+                    let pending = PendingCode {
+                        source,
+                        call_id,
+                        replay,
+                    };
+                    if cancellation.is_cancelled() {
+                        let evidence =
+                            Box::new(ExecutionEvidence::cancelled(pending.source.clone(), None));
+                        if let Err(error) = pending.append(
+                            &mut self.model_context,
+                            CodeResult::cancelled(evidence.feedback()),
+                        ) {
+                            return Err(AgentError::ModelHistory {
+                                error,
+                                attempts,
+                                evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
+                            });
+                        }
+                        return Err(AgentError::Cancelled {
+                            attempts,
+                            evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
+                        });
+                    }
                     progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
@@ -94,30 +530,154 @@ impl Agent {
                             ArenaProgress::ReadFinished { path, outcome } => {
                                 progress(AgentProgress::ToolFinished { path, outcome });
                             }
+                            ArenaProgress::StdoutDelta { text } => {
+                                progress(AgentProgress::StdoutDelta { text });
+                            }
+                            ArenaProgress::StdoutTruncated => {
+                                progress(AgentProgress::StdoutTruncated);
+                            }
                         };
                         self.arena
-                            .execute_with_progress(&source, cancellation, &mut arena_progress)
+                            .execute_with_progress(
+                                &pending.source,
+                                cancellation,
+                                &mut arena_progress,
+                            )
                             .await
                     };
-                    let execution = match execution {
-                        Ok(execution) => execution,
-                        Err(ArenaError::Cancelled) => return Err(AgentError::Cancelled),
-                        Err(error) => return Err(AgentError::Arena(error)),
-                    };
-                    let feedback = execution_feedback(&execution);
-                    self.model_context.push(ModelContextEntry::Execution {
-                        source: source.clone(),
-                        feedback,
-                    });
-                    progress(AgentProgress::ExecutionCompleted { source, execution });
+                    match execution {
+                        Ok(execution) => {
+                            let source = pending.source.clone();
+                            if let Err(error) = pending.append(
+                                &mut self.model_context,
+                                CodeResult::execution(execution_feedback(&execution)),
+                            ) {
+                                return Err(AgentError::ModelHistory {
+                                    error,
+                                    attempts,
+                                    evidence: None,
+                                });
+                            }
+                            progress(AgentProgress::ExecutionCompleted {
+                                source,
+                                execution,
+                                attempts: step_attempts,
+                            });
+                        }
+                        Err(error) => {
+                            let cancelled = matches!(&error, ArenaError::Cancelled { .. });
+                            let evidence = Box::new(if cancelled {
+                                ExecutionEvidence::cancelled(pending.source.clone(), Some(&error))
+                            } else {
+                                ExecutionEvidence::failed(pending.source.clone(), &error)
+                            });
+                            let result = if cancelled {
+                                CodeResult::cancelled(evidence.feedback())
+                            } else {
+                                CodeResult::failure(evidence.feedback())
+                            };
+                            if let Err(history_error) =
+                                pending.append(&mut self.model_context, result)
+                            {
+                                return Err(AgentError::ModelHistory {
+                                    error: history_error,
+                                    attempts,
+                                    evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
+                                });
+                            }
+                            return Err(AgentError::Arena {
+                                error,
+                                attempts,
+                                evidence,
+                            });
+                        }
+                    }
                 }
                 ModelAction::Message { text } => {
-                    self.model_context
-                        .push(ModelContextEntry::FinalMessage { text: text.clone() });
-                    return Ok(text);
+                    self.staged_final_message = Some(StagedFinalMessage {
+                        final_message: FinalMessage {
+                            generation: generation.with_final_message(text.clone()),
+                            text,
+                            attempts,
+                        },
+                        replay,
+                    });
+                    return Ok(AgentRunOutcome::FinalMessageStaged);
                 }
             }
         }
+    }
+}
+
+const CANCELLATION_WARNING: &str = "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.";
+
+fn interrupted_execution(error: &ArenaError) -> Option<&InterruptedExecution> {
+    match error {
+        ArenaError::Cancelled { execution } | ArenaError::TimedOut { execution } => Some(execution),
+        ArenaError::Infrastructure { execution, .. }
+        | ArenaError::UnsupportedSuspension { execution, .. } => execution.as_deref(),
+        ArenaError::RecoveryFailed { original, .. } => interrupted_execution(original),
+        ArenaError::WorkerPathNotAbsolute
+        | ArenaError::WorkerVersionTimedOut
+        | ArenaError::WorkerVersionExecution { .. }
+        | ArenaError::WorkerVersionFailed { .. }
+        | ArenaError::WorkerVersionInvalidOutput
+        | ArenaError::WorkerVersionMismatch { .. }
+        | ArenaError::IncompatibleCheckpoint { .. }
+        | ArenaError::SuspendedCheckpoint => None,
+    }
+}
+
+fn contains_cancellation(error: &ArenaError) -> bool {
+    match error {
+        ArenaError::Cancelled { .. } => true,
+        ArenaError::RecoveryFailed { original, .. } => contains_cancellation(original),
+        ArenaError::WorkerPathNotAbsolute
+        | ArenaError::WorkerVersionTimedOut
+        | ArenaError::WorkerVersionExecution { .. }
+        | ArenaError::WorkerVersionFailed { .. }
+        | ArenaError::WorkerVersionInvalidOutput
+        | ArenaError::WorkerVersionMismatch { .. }
+        | ArenaError::TimedOut { .. }
+        | ArenaError::Infrastructure { .. }
+        | ArenaError::IncompatibleCheckpoint { .. }
+        | ArenaError::SuspendedCheckpoint
+        | ArenaError::UnsupportedSuspension { .. } => false,
+    }
+}
+
+fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
+    let mut frames = vec![format!(
+        "<kiki_execution state=\"{state}\" began=\"{}\">",
+        evidence.began
+    )];
+    if !evidence.began {
+        frames.push("Execution did not begin.".to_owned());
+    }
+    append_output(&mut frames, "stdout", &evidence.stdout);
+    append_output(&mut frames, "stderr", &evidence.stderr);
+    frames.push(render_interrupted_read(&evidence.read));
+    if let Some(warning) = &evidence.cancellation_warning {
+        frames.push(warning.clone());
+    }
+    frames.push("</kiki_execution>".to_owned());
+    frames.join("\n")
+}
+
+fn render_interrupted_read(read: &InterruptedRead) -> String {
+    match read {
+        InterruptedRead::NoRead => "<kiki_read state=\"none\" />".to_owned(),
+        InterruptedRead::Pending { path } => {
+            format!("<kiki_read state=\"pending\" path=\"{path}\" />")
+        }
+        InterruptedRead::Completed { path, outcome } => match outcome {
+            ReadOutcome::Success { line_count } => format!(
+                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"success\" lines=\"{line_count}\" />"
+            ),
+            ReadOutcome::Failure { message } => format!(
+                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"failure\">\n{message}\n</kiki_read>"
+            ),
+        },
     }
 }
 
@@ -216,16 +776,26 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use tempfile::TempDir;
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
-    use super::{Agent, AgentError, AgentProgress};
-    use crate::arena::{Arena, Execution, ExecutionOutcome, Observation, PythonError};
-    use crate::model::{
-        ModelAction, ModelContextEntry, ModelError, READ_CAPABILITY_DESCRIPTION, ScriptedModel,
+    use super::{
+        Agent, AgentError, AgentProgress, AgentRunOutcome, ExecutionFailure,
+        GenerationEvidenceBuilder, TerminalEvidence,
     };
-    use crate::tools::ReadTool;
+    use crate::arena::{Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError};
+    use crate::model::{
+        AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
+        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
+        ProviderFailure, ProviderReplay, READ_CAPABILITY_DESCRIPTION,
+        ScriptedAction as ModelAction, ScriptedModel,
+    };
+    use crate::tools::{ReadTestGate, ReadTool};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -233,7 +803,11 @@ mod tests {
             .expect("MONTY_BIN must point to the monty-runtime 0.0.21 worker")
     }
 
-    async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent {
+    async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent<ScriptedModel> {
+        agent_with_model(workspace, ScriptedModel::new(actions)).await
+    }
+
+    async fn agent_with_model<M: Model>(workspace: &TempDir, model: M) -> Agent<M> {
         let arena = Arena::new(
             worker_path(),
             ReadTool::new(workspace.path())
@@ -242,21 +816,23 @@ mod tests {
         )
         .await
         .expect("create arena");
-        Agent::new(arena, ScriptedModel::new(actions))
+        Agent::new(arena, model)
     }
 
     async fn run_capturing_progress(
-        agent: &mut Agent,
+        agent: &mut Agent<ScriptedModel>,
         request: &str,
         cancellation: &CancellationToken,
     ) -> Result<(String, Vec<AgentProgress>), AgentError> {
         let mut captured = Vec::new();
-        let message = {
+        let outcome = {
             let mut progress = |event| captured.push(event);
             agent
                 .run_with_progress(request, cancellation, &mut progress)
                 .await?
         };
+        assert_eq!(outcome, super::AgentRunOutcome::FinalMessageStaged);
+        let message = agent.admit_staged_final_message()?.text().to_owned();
         Ok((message, captured))
     }
 
@@ -264,9 +840,9 @@ mod tests {
         progress
             .iter()
             .filter_map(|event| match event {
-                AgentProgress::ExecutionCompleted { source, execution } => {
-                    Some((source.as_str(), execution))
-                }
+                AgentProgress::ExecutionCompleted {
+                    source, execution, ..
+                } => Some((source.as_str(), execution)),
                 _ => None,
             })
             .collect()
@@ -319,34 +895,638 @@ mod tests {
         .await;
         let cancellation = CancellationToken::new();
 
-        let message = agent.run("inspect", &cancellation).await.unwrap();
-
-        assert_eq!(message, "done");
         assert_eq!(
-            agent.model.contexts(),
+            agent.run("inspect", &cancellation).await.unwrap(),
+            super::AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(agent.admit_staged_final_message().unwrap().text(), "done");
+        assert_eq!(agent.model.contexts().len(), 2);
+        assert_eq!(
+            agent.model.contexts()[0],
             [
-                vec![
-                    ModelContextEntry::ReadCapability {
-                        description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                    },
-                    ModelContextEntry::UserRequest {
-                        text: "inspect".to_owned(),
-                    },
-                ],
-                vec![
-                    ModelContextEntry::ReadCapability {
-                        description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                    },
-                    ModelContextEntry::UserRequest {
-                        text: "inspect".to_owned(),
-                    },
-                    ModelContextEntry::Execution {
-                        source: "print('hello')".to_owned(),
-                        feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
-                    },
-                ],
+                ModelContextEntry::ReadCapability {
+                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
+                },
+                ModelContextEntry::UserRequest {
+                    text: "inspect".to_owned(),
+                },
             ]
         );
+        let completed = agent.model.contexts()[1]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("second model step should receive completed code");
+        assert_eq!(completed.source(), "print('hello')");
+        assert_eq!(completed.call_id().as_str(), "scripted-1-1");
+        assert_eq!(completed.replay().provider(), "scripted");
+        assert_eq!(completed.replay().items().len(), 1);
+        assert_eq!(
+            completed.result(),
+            &CodeResult::Execution {
+                feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_keeps_a_completed_final_message_staged_until_runtime_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        cancellation.cancel();
+
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
+        let discarded = agent
+            .discard_staged_final_message()
+            .expect("completed final message should remain staged");
+        assert_eq!(discarded.text(), "done");
+        assert!(discarded.attempts().is_empty());
+        assert!(agent.discard_staged_final_message().is_none());
+        assert!(matches!(
+            agent.admit_staged_final_message(),
+            Err(AgentError::NoStagedFinalMessage)
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_admits_a_staged_final_message_exactly_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        let admitted = agent.admit_staged_final_message().unwrap();
+
+        assert_eq!(admitted.text(), "done");
+        assert!(
+            agent
+                .model_context
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+                .count()
+                == 1
+        );
+        assert!(matches!(
+            agent.admit_staged_final_message(),
+            Err(AgentError::NoStagedFinalMessage)
+        ));
+    }
+
+    struct MessageWithAccountingModel;
+
+    impl Model for MessageWithAccountingModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async {
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: vec![AttemptAccounting::UsageUnavailable],
+                })
+            }
+        }
+    }
+
+    struct PartialFailureModel;
+
+    impl Model for PartialFailureModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                progress(ModelProgress::AssistantTextChunk {
+                    text: "partial answer".to_owned(),
+                });
+                Err(ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        Some(500),
+                        Some("failed".to_owned()),
+                        "provider failed".to_owned(),
+                    ))),
+                    vec![AttemptAccounting::UsageUnavailable],
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn agent_error_delegates_only_model_authentication_failures() {
+        for (status, expected) in [(401, true), (403, false), (500, false)] {
+            let error = AgentError::Model {
+                failure: ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        Some(status),
+                        None,
+                        "provider failed".to_owned(),
+                    ))),
+                    Vec::new(),
+                ),
+                attempts: Vec::new(),
+                evidence: None,
+            };
+
+            assert_eq!(error.is_authentication(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_preserves_final_and_provider_failure_attempt_accounting() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        let mut successful = agent_with_model(&workspace, MessageWithAccountingModel).await;
+
+        assert_eq!(
+            successful.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(
+            successful.admit_staged_final_message().unwrap().attempts(),
+            &[AttemptAccounting::UsageUnavailable]
+        );
+
+        let mut failed = agent_with_model(&workspace, PartialFailureModel).await;
+        let error = failed.run("inspect", &cancellation).await.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AgentError::Model { failure, .. }
+                if matches!(failure.error(), ModelError::Provider(_))
+                    && failure.attempts() == [AttemptAccounting::UsageUnavailable]
+        ));
+        assert_eq!(error.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        assert!(!failed.model_context.entries().iter().any(|entry| matches!(
+            entry,
+            ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn agent_forwards_live_stdout_without_adding_it_to_model_progress() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "print('live stdout')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        {
+            let mut capture = |event| progress.push(event);
+            assert_eq!(
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+        }
+
+        let stdout = progress
+            .iter()
+            .filter_map(|event| match event {
+                AgentProgress::StdoutDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(stdout, "live stdout\n");
+        assert!(!progress.iter().any(|event| matches!(
+            event,
+            AgentProgress::ModelProgress(_) | AgentProgress::StdoutTruncated
+        )));
+        let completed = agent
+            .model_context
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .next()
+            .expect("completed code should remain the only stdout context source");
+        let CodeResult::Execution { feedback } = completed.result() else {
+            panic!("expected execution feedback");
+        };
+        assert!(feedback.contains("live stdout\n"));
+    }
+
+    #[tokio::test]
+    async fn agent_forwards_model_progress_to_its_progress_sink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(&workspace, PartialFailureModel).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        let error = {
+            let mut capture = |event| progress.push(event);
+            agent
+                .run_with_progress("inspect", &cancellation, &mut capture)
+                .await
+                .unwrap_err()
+        };
+
+        assert!(matches!(error, AgentError::Model { .. }));
+        assert_eq!(
+            progress.len(),
+            2,
+            "model progress should reach the agent sink"
+        );
+    }
+
+    struct RetriedGenerationCancellationModel {
+        ready: Arc<Notify>,
+    }
+
+    impl Model for RetriedGenerationCancellationModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                progress(ModelProgress::ReasoningSummaryChunk {
+                    text: "discarded reasoning".to_owned(),
+                });
+                progress(ModelProgress::AssistantTextChunk {
+                    text: "discarded text".to_owned(),
+                });
+                progress(ModelProgress::AttemptStarted { attempt: 2 });
+                progress(ModelProgress::ReasoningSummaryChunk {
+                    text: "retained reasoning".to_owned(),
+                });
+                progress(ModelProgress::AssistantTextChunk {
+                    text: "retained text".to_owned(),
+                });
+                progress(ModelProgress::DecodedPythonChunk {
+                    code: "print('retained')".to_owned(),
+                });
+                self.ready.notify_one();
+                cancellation.cancelled().await;
+                Err(ModelError::Cancelled.into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_only_the_active_attempt_generation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ready = Arc::new(Notify::new());
+        let mut agent = agent_with_model(
+            &workspace,
+            RetriedGenerationCancellationModel {
+                ready: ready.clone(),
+            },
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let cancel_when_ready = async {
+            ready.notified().await;
+            cancellation.cancel();
+        };
+
+        let ((), error) = tokio::join!(cancel_when_ready, agent.run("inspect", &cancellation));
+        let AgentError::Model {
+            evidence: Some(evidence),
+            ..
+        } = error.unwrap_err()
+        else {
+            panic!("expected retained generation evidence");
+        };
+        let TerminalEvidence::Generation(evidence) = *evidence else {
+            panic!("expected generation evidence");
+        };
+
+        assert_eq!(evidence.reasoning, "retained reasoning");
+        assert_eq!(evidence.assistant_text, "retained text");
+        assert_eq!(evidence.decoded_python, "print('retained')");
+    }
+
+    #[test]
+    fn recovery_failure_evidence_bounds_original_and_recovery_diagnostics_separately() {
+        let error = ArenaError::RecoveryFailed {
+            original: Box::new(ArenaError::Infrastructure {
+                message: "é".repeat(super::FAILED_STEP_EVIDENCE_LIMIT),
+                execution: None,
+            }),
+            recovery: Box::new(ArenaError::Infrastructure {
+                message: "é".repeat(super::FAILED_STEP_EVIDENCE_LIMIT),
+                execution: None,
+            }),
+        };
+
+        let ExecutionFailure::RecoveryFailed { original, recovery } =
+            super::failure_evidence(&error)
+        else {
+            panic!("recovery error must retain typed diagnostics");
+        };
+
+        assert!(original.len() <= super::FAILED_STEP_EVIDENCE_LIMIT / 2);
+        assert!(original.is_char_boundary(original.len()));
+        assert!(recovery.len() <= super::FAILED_STEP_EVIDENCE_LIMIT / 2);
+        assert!(recovery.is_char_boundary(recovery.len()));
+    }
+
+    #[test]
+    fn generation_evidence_is_utf8_safe_at_the_accepted_content_limit() {
+        let mut generation = GenerationEvidenceBuilder::default();
+        generation.capture(&ModelProgress::AssistantTextChunk {
+            text: "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1),
+        });
+        let evidence = generation.evidence().expect("generation evidence");
+
+        assert_eq!(
+            evidence.assistant_text,
+            "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2)
+        );
+        assert!(
+            evidence
+                .assistant_text
+                .is_char_boundary(evidence.assistant_text.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_discards_a_lost_final_before_the_next_request() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("discarded", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(
+            agent
+                .discard_staged_final_message()
+                .expect("staged final")
+                .text(),
+            "done"
+        );
+        assert_eq!(
+            agent.run("later", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(agent.admit_staged_final_message().unwrap().text(), "done");
+        assert_eq!(
+            agent
+                .model_context
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+                .count(),
+            1
+        );
+        assert!(agent.model_context.entries().iter().any(|entry| matches!(
+            entry,
+            ModelContextEntry::UserRequest { text } if text == "discarded"
+        )));
+    }
+
+    #[tokio::test]
+    async fn agent_uses_interrupted_execution_evidence_for_its_cancelled_code_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Code {
+                source: "lines = await read('Cargo.toml')".to_owned(),
+            }],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let error = {
+            let mut progress = |event| {
+                if matches!(event, AgentProgress::ToolStarted { .. }) {
+                    canceller.cancel();
+                }
+            };
+            agent
+                .run_with_progress("inspect", &cancellation, &mut progress)
+                .await
+                .unwrap_err()
+        };
+
+        let AgentError::Arena {
+            error: crate::arena::ArenaError::Cancelled { execution },
+            evidence,
+            ..
+        } = error
+        else {
+            panic!("expected cancelled execution");
+        };
+        assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.began, execution.began);
+        assert_eq!(evidence.stdout, execution.stdout);
+        assert_eq!(evidence.stderr, execution.stderr);
+        assert_eq!(evidence.read, execution.read);
+        assert_eq!(
+            evidence.cancellation_warning.as_deref(),
+            Some(super::CANCELLATION_WARNING)
+        );
+        let Some(ModelContextEntry::CompletedCode(completed)) =
+            agent.model_context.entries().last()
+        else {
+            panic!("cancelled code should have one compound history result");
+        };
+        let CodeResult::Cancelled { feedback } = completed.result() else {
+            panic!("cancelled execution should have a cancelled code result");
+        };
+        assert_eq!(feedback, &evidence.feedback());
+    }
+
+    #[tokio::test]
+    async fn agent_awaits_an_asynchronously_delayed_complete_model_action() {
+        let workspace = tempfile::tempdir().unwrap();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "delayed_action = 1".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ])
+        .with_delay(Duration::from_millis(50));
+        let mut agent = agent_with_model(&workspace, model).await;
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(agent.run("inspect", &cancellation));
+
+        assert!(timeout(Duration::from_millis(5), &mut run).await.is_err());
+        assert_eq!(
+            run.await.unwrap(),
+            super::AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(agent.admit_staged_final_message().unwrap().text(), "done");
+        assert!(matches!(
+            agent.model_context.entries(),
+            [
+                ModelContextEntry::ReadCapability { .. },
+                ModelContextEntry::UserRequest { .. },
+                ModelContextEntry::CompletedCode(_),
+                ModelContextEntry::FinalMessage { .. },
+            ]
+        ));
+    }
+
+    struct BoundaryCancellationModel {
+        action: CompletedModelAction,
+    }
+
+    impl Model for BoundaryCancellationModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                cancellation.cancel();
+                Ok(ModelStep {
+                    action: self.action.clone(),
+                    replay: ProviderReplay::new("boundary", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_stages_a_completed_message_after_model_boundary_cancellation() {
+        for action in [
+            CompletedModelAction::Code {
+                source: "boundary_action_ran = True".to_owned(),
+                call_id: ModelCallId::new("boundary-code"),
+            },
+            CompletedModelAction::Message {
+                text: "must not be admitted".to_owned(),
+            },
+        ] {
+            let code_action = matches!(action, CompletedModelAction::Code { .. });
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent =
+                agent_with_model(&workspace, BoundaryCancellationModel { action }).await;
+            let cancellation = CancellationToken::new();
+            let mut progress = Vec::new();
+
+            let result = {
+                let mut capture = |event| progress.push(event);
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+            };
+
+            assert!(!progress.iter().any(|event| matches!(
+                event,
+                AgentProgress::ExecutionStarted | AgentProgress::ExecutionCompleted { .. }
+            )));
+            if code_action {
+                let AgentError::Cancelled {
+                    evidence: Some(evidence),
+                    ..
+                } = result.unwrap_err()
+                else {
+                    panic!("cancelled code should retain execution evidence");
+                };
+                let TerminalEvidence::Execution(evidence) = *evidence else {
+                    panic!("cancelled code should retain execution evidence");
+                };
+                assert_eq!(evidence.source, "boundary_action_ran = True");
+                assert!(!evidence.began);
+                assert_eq!(evidence.read, crate::arena::InterruptedRead::NoRead);
+                assert_eq!(
+                    evidence.cancellation_warning.as_deref(),
+                    Some(super::CANCELLATION_WARNING)
+                );
+                let Some(ModelContextEntry::CompletedCode(completed)) =
+                    agent.model_context.entries().last()
+                else {
+                    panic!("cancelled code should be admitted with a result");
+                };
+                let CodeResult::Cancelled { feedback } = completed.result() else {
+                    panic!("cancelled code should have a cancelled result");
+                };
+                assert_eq!(feedback, &evidence.feedback());
+                assert!(feedback.contains("Execution did not begin."));
+                assert!(feedback.contains(
+                    "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
+                ));
+            } else {
+                assert_eq!(result.unwrap(), AgentRunOutcome::FinalMessageStaged);
+                assert!(!agent.model_context.entries().iter().any(|entry| matches!(
+                    entry,
+                    ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
+                )));
+                assert_eq!(
+                    agent
+                        .discard_staged_final_message()
+                        .expect("completed final message should remain staged")
+                        .text(),
+                    "must not be admitted"
+                );
+            }
+            let probe = agent
+                .arena
+                .execute("boundary_action_ran", &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(matches!(probe.outcome, ExecutionOutcome::PythonError(_)));
+        }
     }
 
     #[tokio::test]
@@ -367,6 +1547,7 @@ mod tests {
         let first_cancellation = CancellationToken::new();
 
         agent.run("first", &first_cancellation).await.unwrap();
+        agent.admit_staged_final_message().unwrap();
         let persistent_context = agent.model_context.clone();
         let observed_contexts = agent.model.contexts().to_vec();
         let action_position = agent.model.position();
@@ -375,7 +1556,7 @@ mod tests {
 
         let error = agent.run("cancelled", &cancelled).await.unwrap_err();
 
-        assert!(matches!(error, AgentError::Cancelled));
+        assert!(matches!(error, AgentError::Cancelled { .. }));
         assert_eq!(agent.model_context, persistent_context);
         assert_eq!(agent.model.contexts(), observed_contexts.as_slice());
         assert_eq!(agent.model.position(), action_position);
@@ -400,12 +1581,15 @@ mod tests {
 
         let error = agent.run("inspect", &cancellation).await.unwrap_err();
 
-        assert!(matches!(error, AgentError::Model(ModelError::Exhausted)));
+        assert!(matches!(
+            error,
+            AgentError::Model { failure, .. } if failure.error() == &ModelError::Exhausted
+        ));
         assert_eq!(agent.model.contexts().len(), 1);
         assert_eq!(agent.model.position(), 0);
         assert_eq!(
-            agent.model_context,
-            vec![
+            agent.model_context.entries(),
+            [
                 ModelContextEntry::ReadCapability {
                     description: READ_CAPABILITY_DESCRIPTION.to_owned(),
                 },
@@ -419,11 +1603,22 @@ mod tests {
     #[tokio::test]
     async fn agent_cancellation_recovers_the_arena_without_consuming_later_actions() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut agent = agent(
-            &workspace,
-            vec![
+        fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ReadTool::new(workspace.path())
+                .await
+                .expect("open read tool")
+                .with_test_gate(gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![
                 ModelAction::Code {
-                    source: "while True:\n    pass".to_owned(),
+                    source: "print('before')\nlines = await read('Cargo.toml')".to_owned(),
                 },
                 ModelAction::Code {
                     source: "later_action_ran = True".to_owned(),
@@ -431,27 +1626,107 @@ mod tests {
                 ModelAction::Message {
                     text: "done".to_owned(),
                 },
-            ],
-        )
-        .await;
+            ]),
+        );
         let cancellation = CancellationToken::new();
-        let canceller = cancellation.clone();
-        let cancel = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            canceller.cancel();
-        });
+        let cancel_when_read_starts = async {
+            gate.wait_until_read_started().await;
+            cancellation.cancel();
+        };
 
-        let error = agent.run("cancel", &cancellation).await.unwrap_err();
-        cancel.await.unwrap();
+        let ((), error) = tokio::join!(cancel_when_read_starts, agent.run("cancel", &cancellation));
+        let error = error.unwrap_err();
 
-        assert!(matches!(error, AgentError::Cancelled));
-        assert_eq!(agent.model.contexts().len(), 1);
+        let AgentError::Arena {
+            error: crate::arena::ArenaError::Cancelled { execution },
+            attempts,
+            evidence,
+        } = &error
+        else {
+            panic!("expected cancelled Arena evidence");
+        };
+        assert!(attempts.is_empty());
+        assert_eq!(execution.stdout.head, "before\n");
+        assert_eq!(
+            evidence.source,
+            "print('before')\nlines = await read('Cargo.toml')"
+        );
+        assert_eq!(evidence.stdout, execution.stdout);
+        assert_eq!(evidence.stderr, execution.stderr);
+        assert_eq!(evidence.read, execution.read);
+        assert_eq!(
+            evidence.cancellation_warning.as_deref(),
+            Some(super::CANCELLATION_WARNING)
+        );
+        assert_eq!(
+            agent
+                .model_context
+                .entries()
+                .iter()
+                .filter_map(ModelContextEntry::completed_code)
+                .count(),
+            1
+        );
+        let Some(ModelContextEntry::CompletedCode(completed)) =
+            agent.model_context.entries().last()
+        else {
+            panic!("cancelled code should be admitted with a result");
+        };
+        let CodeResult::Cancelled { feedback } = completed.result() else {
+            panic!("cancelled code should have a cancelled result");
+        };
+        assert_eq!(feedback, &evidence.feedback());
+        assert!(feedback.contains("before\n"));
+        assert!(feedback.contains(
+            "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
+        ));
         let recovered = agent
             .arena
             .execute("1 + 1", &CancellationToken::new())
             .await
             .expect("arena should recover before Agent returns cancellation");
         assert_eq!(result_head(&recovered), "2");
+    }
+
+    #[tokio::test]
+    async fn agent_records_one_failure_result_after_an_arena_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Code {
+                source: "x = ' ' * (1 << 60)".to_owned(),
+            }],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        let error = agent.run("inspect", &cancellation).await.unwrap_err();
+
+        let AgentError::Arena {
+            error: crate::arena::ArenaError::Infrastructure { .. },
+            evidence,
+            ..
+        } = error
+        else {
+            panic!("expected arena infrastructure failure");
+        };
+        assert_eq!(evidence.source, "x = ' ' * (1 << 60)");
+        assert!(evidence.began);
+        assert!(matches!(
+            evidence.failure,
+            Some(ExecutionFailure::Arena { .. })
+        ));
+        let completed = agent
+            .model_context
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        let CodeResult::Failure { feedback } = completed[0].result() else {
+            panic!("arena failure should produce one failed code result");
+        };
+        assert_eq!(feedback, &evidence.feedback());
     }
 
     #[tokio::test]
@@ -485,14 +1760,144 @@ mod tests {
             ExecutionOutcome::PythonError(_)
         ));
         assert_eq!(result_head(executions[1].1), "2");
-        let ModelContextEntry::Execution { feedback, .. } = agent.model.contexts()[1]
+        let completed = agent.model.contexts()[1]
             .last()
-            .expect("following action should receive the Python error")
-        else {
-            panic!("expected completed execution context");
+            .and_then(ModelContextEntry::completed_code)
+            .expect("following action should receive the Python error");
+        let CodeResult::Execution { feedback } = completed.result() else {
+            panic!("expected execution feedback");
         };
         assert!(feedback.contains("<kiki_error omitted_bytes=\"0\">"));
         assert!(feedback.contains("ValueError"));
+    }
+
+    #[tokio::test]
+    async fn agent_admits_one_execution_result_for_success_and_python_error() {
+        for source in ["1 + 1", "raise ValueError('expected')"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent = agent(
+                &workspace,
+                vec![
+                    ModelAction::Code {
+                        source: source.to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ],
+            )
+            .await;
+            let cancellation = CancellationToken::new();
+
+            assert_eq!(
+                agent.run("inspect", &cancellation).await.unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+            let completed = agent
+                .model_context
+                .entries()
+                .iter()
+                .filter_map(ModelContextEntry::completed_code)
+                .collect::<Vec<_>>();
+
+            assert_eq!(completed.len(), 1);
+            assert!(matches!(
+                completed[0].result(),
+                CodeResult::Execution { .. }
+            ));
+            agent.admit_staged_final_message().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_commits_completed_code_before_a_later_cancellation_check() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "value = 1".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "unreachable".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let error = {
+            let mut progress = move |event| {
+                if matches!(event, AgentProgress::ExecutionCompleted { .. }) {
+                    canceller.cancel();
+                }
+            };
+            agent
+                .run_with_progress("inspect", &cancellation, &mut progress)
+                .await
+                .unwrap_err()
+        };
+
+        assert!(matches!(error, AgentError::Cancelled { .. }));
+        let completed = agent
+            .model_context
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        assert!(matches!(
+            completed[0].result(),
+            CodeResult::Execution { .. }
+        ));
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_completed_code_survives_a_later_staged_final_message() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "value = 1".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        cancellation.cancel();
+        let discarded = agent
+            .discard_staged_final_message()
+            .expect("final message should remain staged");
+
+        assert_eq!(discarded.text(), "done");
+        assert!(matches!(
+            agent.model_context.entries().last(),
+            Some(ModelContextEntry::CompletedCode(completed))
+                if matches!(completed.result(), CodeResult::Execution { .. })
+        ));
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
     }
 
     #[test]
@@ -656,7 +2061,10 @@ mod tests {
         assert!(second_request_context.iter().any(|entry| {
             matches!(
                 entry,
-                ModelContextEntry::FinalMessage { text } if text == "I inspected Cargo.toml."
+                ModelContextEntry::FinalMessage { text, replay }
+                    if text == "I inspected Cargo.toml."
+                        && replay.provider() == "scripted"
+                        && replay.items().len() == 1
             )
         }));
         assert_eq!(
@@ -665,11 +2073,13 @@ mod tests {
                 text: "second".to_owned(),
             })
         );
-        let ModelContextEntry::Execution { feedback, .. } = agent.model.contexts()[5]
+        let completed = agent.model.contexts()[5]
             .last()
-            .expect("second final message should receive execution feedback")
-        else {
-            panic!("expected completed execution context");
+            .and_then(ModelContextEntry::completed_code)
+            .expect("second final message should receive execution feedback");
+        assert_eq!(completed.call_id().as_str(), "scripted-2-2");
+        let CodeResult::Execution { feedback } = completed.result() else {
+            panic!("expected execution feedback");
         };
         assert!(feedback.contains("<kiki_result truncated=\"false\" total_lines=\"1\" total_bytes=\"1\">\n<kiki_output_head lines=\"1\" bytes=\"1\" ends_mid_line=\"false\">\n2</kiki_output_head>\n</kiki_result>"));
     }

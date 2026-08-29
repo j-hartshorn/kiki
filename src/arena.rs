@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::path::Path;
-use std::time::Duration;
+#[cfg(test)]
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
@@ -8,6 +10,8 @@ use monty_pool::{
 use monty_types::{ExcType, MontyException, MontyObject, PrintStream, ResourceLimits};
 use thiserror::Error;
 use tokio::process::Command;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +22,9 @@ const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MEMORY: usize = 64 * 1024 * 1024;
 const ERROR_BYTES: usize = 32 * 1024;
+const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
+const STDOUT_DELTA_BYTES: usize = 4 * 1024;
+const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
     max_total_bytes: 256 * 1024,
     max_total_lines: 1_000,
@@ -86,12 +93,37 @@ pub enum ExecutionOutcome {
 pub(crate) enum ArenaProgress {
     ReadStarted { path: String },
     ReadFinished { path: String, outcome: ReadOutcome },
+    StdoutDelta { text: String },
+    StdoutTruncated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadOutcome {
+pub enum ReadOutcome {
     Success { line_count: usize },
     Failure { message: String },
+}
+
+impl ReadOutcome {
+    fn failure(message: String) -> Self {
+        Self::Failure {
+            message: bounded_interruption_text(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedExecution {
+    pub(crate) began: bool,
+    pub(crate) stdout: Observation,
+    pub(crate) stderr: Observation,
+    pub(crate) read: InterruptedRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptedRead {
+    NoRead,
+    Pending { path: String },
+    Completed { path: String, outcome: ReadOutcome },
 }
 
 #[derive(Debug, Error)]
@@ -109,11 +141,18 @@ pub enum ArenaError {
     #[error("Monty worker version mismatch: expected {expected}, got {actual}")]
     WorkerVersionMismatch { expected: String, actual: String },
     #[error("arena execution was cancelled")]
-    Cancelled,
+    Cancelled {
+        execution: Box<InterruptedExecution>,
+    },
     #[error("arena execution timed out")]
-    TimedOut,
+    TimedOut {
+        execution: Box<InterruptedExecution>,
+    },
     #[error("arena infrastructure failed: {message}")]
-    Infrastructure { message: String },
+    Infrastructure {
+        message: String,
+        execution: Option<Box<InterruptedExecution>>,
+    },
     #[error("arena recovery failed after {original}: {recovery}")]
     RecoveryFailed {
         original: Box<ArenaError>,
@@ -124,7 +163,157 @@ pub enum ArenaError {
     #[error("Monty checkpoint was suspended")]
     SuspendedCheckpoint,
     #[error("unsupported Monty suspension: {message}")]
-    UnsupportedSuspension { message: String },
+    UnsupportedSuspension {
+        message: String,
+        execution: Option<Box<InterruptedExecution>>,
+    },
+}
+
+impl ArenaError {
+    fn unsupported_suspension(message: impl Into<String>) -> Self {
+        Self::UnsupportedSuspension {
+            message: bounded_interruption_text(message.into()),
+            execution: None,
+        }
+    }
+
+    fn with_interrupted_execution(self, execution: InterruptedExecution) -> Self {
+        match self {
+            Self::Cancelled { .. } => Self::Cancelled {
+                execution: Box::new(execution),
+            },
+            Self::TimedOut { .. } => Self::TimedOut {
+                execution: Box::new(execution),
+            },
+            Self::Infrastructure { message, .. } => Self::Infrastructure {
+                message,
+                execution: Some(Box::new(execution)),
+            },
+            Self::UnsupportedSuspension { message, .. } => Self::UnsupportedSuspension {
+                message,
+                execution: Some(Box::new(execution)),
+            },
+            error => error,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InterruptedReadState {
+    pending: Option<String>,
+    completed: Option<(String, ReadOutcome)>,
+}
+
+struct InterruptedExecutionState {
+    streams: StreamAccumulators,
+    read: InterruptedReadState,
+    began: bool,
+}
+
+impl InterruptedExecutionState {
+    fn new() -> Self {
+        Self {
+            streams: StreamAccumulators::new(OBSERVATION_LIMITS),
+            read: InterruptedReadState::default(),
+            began: false,
+        }
+    }
+
+    fn finish(
+        mut self,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) -> InterruptedExecution {
+        self.streams.flush_stdout(now, progress);
+        InterruptedExecution {
+            began: self.began,
+            stdout: self.streams.stdout.finish(),
+            stderr: self.streams.stderr.finish(),
+            read: self.read.finish(),
+        }
+    }
+}
+
+impl InterruptedReadState {
+    fn started(&mut self, path: &str) {
+        assert!(self.pending.is_none(), "only one read can be pending");
+        self.pending = Some(bounded_interruption_text(path.to_owned()));
+    }
+
+    fn finished(&mut self, outcome: ReadOutcome) {
+        let path = self.pending.take().expect("a read must be pending");
+        self.completed = Some((path, outcome));
+    }
+
+    fn finish(self) -> InterruptedRead {
+        match self.pending {
+            Some(path) => InterruptedRead::Pending { path },
+            None => match self.completed {
+                Some((path, outcome)) => InterruptedRead::Completed { path, outcome },
+                None => InterruptedRead::NoRead,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RecoveryTestGate {
+    recovery_started: Arc<Semaphore>,
+    recovery_allowed: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl RecoveryTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            recovery_started: Arc::new(Semaphore::new(0)),
+            recovery_allowed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_recovery_started(&self) {
+        take_test_permit(&self.recovery_started).await;
+    }
+
+    pub(crate) fn resume_recovery(&self) {
+        self.recovery_allowed.add_permits(1);
+    }
+
+    async fn wait_before_failure(&self) {
+        self.recovery_started.add_permits(1);
+        take_test_permit(&self.recovery_allowed).await;
+    }
+}
+
+#[cfg(test)]
+async fn take_test_permit(semaphore: &Arc<Semaphore>) {
+    semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("test gate semaphore remains open")
+        .forget();
+}
+
+enum AttemptFailure {
+    Cancelled,
+    TimedOut,
+    Driver(ArenaError),
+}
+
+impl AttemptFailure {
+    fn with_interrupted_execution(self, execution: InterruptedExecution) -> ArenaError {
+        match self {
+            Self::Cancelled => ArenaError::Cancelled {
+                execution: Box::new(execution),
+            },
+            Self::TimedOut => ArenaError::TimedOut {
+                execution: Box::new(execution),
+            },
+            Self::Driver(error) => error.with_interrupted_execution(execution),
+        }
+    }
 }
 
 pub struct Arena {
@@ -135,6 +324,10 @@ pub struct Arena {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     execution_timeout: Duration,
+    #[cfg(test)]
+    fail_next_recovery: bool,
+    #[cfg(test)]
+    recovery_test_gate: Option<RecoveryTestGate>,
 }
 
 impl Arena {
@@ -152,7 +345,7 @@ impl Arena {
     }
 
     #[cfg(test)]
-    async fn with_limits(
+    pub(crate) async fn with_limits(
         worker_path: impl AsRef<Path>,
         read_tool: ReadTool,
         execution_timeout: Duration,
@@ -200,6 +393,10 @@ impl Arena {
             runtime,
             repl_config,
             execution_timeout,
+            #[cfg(test)]
+            fail_next_recovery: false,
+            #[cfg(test)]
+            recovery_test_gate: None,
         })
     }
 
@@ -217,7 +414,7 @@ impl Arena {
         &mut self,
         code: &str,
         cancellation: &CancellationToken,
-        progress: &mut impl FnMut(ArenaProgress),
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
     ) -> Result<Execution, ArenaError> {
         self.restore_current_checkpoint_if_needed().await?;
         let mut checkout = self
@@ -229,25 +426,39 @@ impl Arena {
             .limits
             .as_ref()
             .and_then(|limits| limits.max_memory);
+        let mut interruption = InterruptedExecutionState::new();
         let attempt = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(ArenaError::Cancelled),
-            _ = sleep(self.execution_timeout) => Err(ArenaError::TimedOut),
-            result = execute_checkout(&mut checkout, &self.read_tool, code, max_memory, progress) => result,
+            _ = cancellation.cancelled() => Err(AttemptFailure::Cancelled),
+            _ = sleep(self.execution_timeout) => Err(AttemptFailure::TimedOut),
+            result = execute_checkout(
+                &mut checkout,
+                &self.read_tool,
+                code,
+                max_memory,
+                progress,
+                &mut interruption,
+            ) => result.map_err(AttemptFailure::Driver),
         };
 
         match attempt {
-            Ok((execution, state)) => {
+            Ok((outcome, state)) => {
                 self.checkout = Some(checkout);
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
                     state,
                 };
-                Ok(execution)
+                Ok(Execution {
+                    stdout: interruption.streams.stdout.finish(),
+                    stderr: interruption.streams.stderr.finish(),
+                    outcome,
+                })
             }
-            Err(original) => {
+            Err(failure) => {
+                let error = failure
+                    .with_interrupted_execution(interruption.finish(Instant::now(), progress));
                 drop(checkout);
-                Err(self.recover(original).await)
+                Err(self.recover(error).await)
             }
         }
     }
@@ -282,7 +493,31 @@ impl Arena {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_recovery_for_test(&mut self) {
+        self.fail_next_recovery = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_recovery_test_gate(mut self, recovery_test_gate: RecoveryTestGate) -> Self {
+        self.recovery_test_gate = Some(recovery_test_gate);
+        self
+    }
+
     async fn recover(&mut self, original: ArenaError) -> ArenaError {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_recovery) {
+            if let Some(recovery_test_gate) = &self.recovery_test_gate {
+                recovery_test_gate.wait_before_failure().await;
+            }
+            return ArenaError::RecoveryFailed {
+                original: Box::new(original),
+                recovery: Box::new(ArenaError::Infrastructure {
+                    message: "test recovery failure".to_owned(),
+                    execution: None,
+                }),
+            };
+        }
         match self.checkout_from_checkpoint(&self.checkpoint).await {
             Ok(checkout) => {
                 self.checkout = Some(checkout);
@@ -357,6 +592,7 @@ async fn validate_worker_with_timeout(
 fn pool_failure(error: PoolError) -> ArenaError {
     ArenaError::Infrastructure {
         message: error.to_string(),
+        execution: None,
     }
 }
 
@@ -365,11 +601,11 @@ async fn execute_checkout(
     read_tool: &ReadTool,
     code: &str,
     max_memory: Option<usize>,
-    progress: &mut impl FnMut(ArenaProgress),
-) -> Result<(Execution, Vec<u8>), ArenaError> {
-    let (result, streams) = drive(checkout, read_tool, code, progress).await;
-    let stdout = streams.stdout.finish();
-    let stderr = streams.stderr.finish();
+    progress: &mut (impl FnMut(ArenaProgress) + Send),
+    interruption: &mut InterruptedExecutionState,
+) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
+    let result = drive(checkout, read_tool, code, progress, interruption).await;
+    interruption.streams.flush_stdout(Instant::now(), progress);
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
             ExecutionOutcome::Complete {
@@ -394,6 +630,7 @@ async fn execute_checkout(
         let context = error_text.as_deref().unwrap_or("completed execution");
         ArenaError::Infrastructure {
             message: format!("post-execution checkpoint failed after {context}: {error}"),
+            execution: None,
         }
     })?;
     if unsafe_memory {
@@ -402,16 +639,10 @@ async fn execute_checkout(
                 "unsafe resource memory failure: {}",
                 error_text.expect("memory errors have diagnostics")
             ),
+            execution: None,
         });
     }
-    Ok((
-        Execution {
-            stdout,
-            stderr,
-            outcome,
-        },
-        state,
-    ))
+    Ok((outcome, state))
 }
 
 fn is_unsafe_memory_error(error: &MontyException, max_memory: Option<usize>) -> bool {
@@ -455,14 +686,27 @@ async fn drive(
     checkout: &mut Checkout,
     read_tool: &ReadTool,
     code: &str,
-    progress: &mut impl FnMut(ArenaProgress),
-) -> (Result<MontyObject, DriverError>, StreamAccumulators) {
-    let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
-    let result = 'drive: {
-        let mut on_print = on_print_sync(|stream, text| streams.push(stream, text));
-        let mut event = match checkout
+    progress: &mut (impl FnMut(ArenaProgress) + Send),
+    interruption: &mut InterruptedExecutionState,
+) -> Result<MontyObject, DriverError> {
+    let InterruptedExecutionState {
+        streams,
+        read,
+        began,
+    } = interruption;
+    *began = true;
+    macro_rules! with_print {
+        ($on_print:ident => $operation:expr) => {{
+            let mut $on_print = on_print_sync(|stream, text| {
+                streams.push_with_progress(stream, text, Instant::now(), progress);
+            });
+            $operation
+        }};
+    }
+    'drive: {
+        let mut event = match with_print!(on_print => checkout
             .feed(code, vec![], vec![], false, &mut on_print)
-            .await
+            .await)
         {
             Ok(event) => event,
             Err(PoolError::Runtime(error)) => break 'drive Err(DriverError::Runtime(error)),
@@ -483,7 +727,7 @@ async fn drive(
                         || method_call
                         || !matches!(args.as_slice(), [MontyObject::String(_)])
                     {
-                        match checkout
+                        match with_print!(on_print => checkout
                             .resume(
                                 ResumeValue::Error(MontyException::new(
                                     ExcType::TypeError,
@@ -493,7 +737,7 @@ async fn drive(
                                 )),
                                 &mut on_print,
                             )
-                            .await
+                            .await)
                         {
                             Ok(event) => event,
                             Err(PoolError::Runtime(error)) => {
@@ -507,50 +751,52 @@ async fn drive(
                         let [MontyObject::String(path)] = args.as_slice() else {
                             unreachable!("read argument was validated above");
                         };
-                        let pending =
-                            match checkout.resume(ResumeValue::Future, &mut on_print).await {
-                                Ok(TurnEvent::ResolveFutures { pending_call_ids })
-                                    if pending_call_ids.as_slice() == [call_id] =>
-                                {
-                                    pending_call_ids
-                                }
-                                Ok(event) => {
-                                    break 'drive Err(DriverError::Fatal(
-                                        ArenaError::UnsupportedSuspension {
-                                            message: format!(
-                                                "expected one pending read future, got {event:?}"
-                                            ),
-                                        },
-                                    ));
-                                }
-                                Err(PoolError::Runtime(error)) => {
-                                    break 'drive Err(DriverError::Runtime(error));
-                                }
-                                Err(error) => {
-                                    break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                                }
-                            };
+                        let pending = match with_print!(on_print => checkout
+                            .resume(ResumeValue::Future, &mut on_print)
+                            .await)
+                        {
+                            Ok(TurnEvent::ResolveFutures { pending_call_ids })
+                                if pending_call_ids.as_slice() == [call_id] =>
+                            {
+                                pending_call_ids
+                            }
+                            Ok(event) => {
+                                break 'drive Err(DriverError::Fatal(
+                                    ArenaError::unsupported_suspension(format!(
+                                        "expected one pending read future, got {event:?}"
+                                    )),
+                                ));
+                            }
+                            Err(PoolError::Runtime(error)) => {
+                                break 'drive Err(DriverError::Runtime(error));
+                            }
+                            Err(error) => {
+                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
+                            }
+                        };
                         let path = path.clone();
+                        read.started(&path);
                         progress(ArenaProgress::ReadStarted { path: path.clone() });
-                        let read = read_tool.read(&path).await;
-                        let outcome = match &read {
+                        let read_result = read_tool.read(&path).await;
+                        let outcome = match &read_result {
                             Ok(lines) => ReadOutcome::Success {
                                 line_count: lines.len(),
                             },
-                            Err(error) => ReadOutcome::Failure {
-                                message: error.to_string(),
-                            },
+                            Err(error) => ReadOutcome::failure(error.to_string()),
                         };
+                        read.finished(outcome.clone());
+                        #[cfg(test)]
+                        read_tool.wait_after_read_settled().await;
                         progress(ArenaProgress::ReadFinished { path, outcome });
-                        let value = match read {
+                        let value = match read_result {
                             Ok(lines) => ResumeValue::Return(MontyObject::List(
                                 lines.into_iter().map(MontyObject::String).collect(),
                             )),
                             Err(error) => ResumeValue::Error(read_error(error)),
                         };
-                        match checkout
+                        match with_print!(on_print => checkout
                             .resume_futures(vec![(pending[0], value)], &mut on_print)
-                            .await
+                            .await)
                         {
                             Ok(event) => event,
                             Err(PoolError::Runtime(error)) => {
@@ -563,7 +809,10 @@ async fn drive(
                     }
                 }
                 TurnEvent::FunctionCall { .. } => {
-                    match checkout.resume(ResumeValue::NotFound, &mut on_print).await {
+                    match with_print!(on_print => checkout
+                        .resume(ResumeValue::NotFound, &mut on_print)
+                        .await)
+                    {
                         Ok(event) => event,
                         Err(PoolError::Runtime(error)) => {
                             break 'drive Err(DriverError::Runtime(error));
@@ -576,7 +825,10 @@ async fn drive(
                         name: "read".to_owned(),
                         docstring: None,
                     });
-                    match checkout.resume_name_lookup(value, &mut on_print).await {
+                    match with_print!(on_print => checkout
+                        .resume_name_lookup(value, &mut on_print)
+                        .await)
+                    {
                         Ok(event) => event,
                         Err(PoolError::Runtime(error)) => {
                             break 'drive Err(DriverError::Runtime(error));
@@ -584,9 +836,9 @@ async fn drive(
                         Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
                     }
                 }
-                TurnEvent::OsCall { .. } => match checkout
+                TurnEvent::OsCall { .. } => match with_print!(on_print => checkout
                     .resume(ResumeValue::NotHandled, &mut on_print)
-                    .await
+                    .await)
                 {
                     Ok(event) => event,
                     Err(PoolError::Runtime(error)) => {
@@ -595,14 +847,13 @@ async fn drive(
                     Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
                 },
                 TurnEvent::ResolveFutures { pending_call_ids } => {
-                    break 'drive Err(DriverError::Fatal(ArenaError::UnsupportedSuspension {
-                        message: format!("unexpected pending futures: {pending_call_ids:?}"),
-                    }));
+                    break 'drive Err(DriverError::Fatal(ArenaError::unsupported_suspension(
+                        format!("unexpected pending futures: {pending_call_ids:?}"),
+                    )));
                 }
             };
         }
-    };
-    (result, streams)
+    }
 }
 
 fn read_error(error: ReadError) -> MontyException {
@@ -635,6 +886,15 @@ struct ObservationAccumulator {
     lines: LineCounter,
     whole: Option<String>,
     truncated: Option<TruncatedObservation>,
+    live_stdout: Option<LiveStdout>,
+}
+
+struct LiveStdout {
+    total_bytes: usize,
+    lines: LineCounter,
+    pending: String,
+    last_emitted: Option<Instant>,
+    truncated: bool,
 }
 
 struct TruncatedObservation {
@@ -667,16 +927,125 @@ struct StreamAccumulators {
 impl StreamAccumulators {
     fn new(limits: ObservationLimits) -> Self {
         Self {
-            stdout: ObservationAccumulator::new(limits),
+            stdout: ObservationAccumulator::with_live_stdout(limits),
             stderr: ObservationAccumulator::new(limits),
         }
     }
 
-    fn push(&mut self, stream: PrintStream, text: &str) {
+    fn push_with_progress(
+        &mut self,
+        stream: PrintStream,
+        text: &str,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
         match stream {
-            PrintStream::Stdout => self.stdout.push(text),
+            PrintStream::Stdout => self.stdout.push_live_stdout(text, now, progress),
             PrintStream::Stderr => self.stderr.push(text),
         }
+    }
+
+    fn flush_stdout(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        if let Some(live_stdout) = &mut self.stdout.live_stdout {
+            live_stdout.flush(now, progress);
+        }
+    }
+}
+
+impl LiveStdout {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            lines: LineCounter::default(),
+            pending: String::new(),
+            last_emitted: None,
+            truncated: false,
+        }
+    }
+
+    fn push(
+        &mut self,
+        text: &str,
+        limits: ObservationLimits,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
+        if self.truncated {
+            return;
+        }
+        let accepted = self.accepted_prefix_len(text, limits);
+        if accepted > 0 {
+            let text = &text[..accepted];
+            self.total_bytes += text.len();
+            self.lines.push(text);
+            self.queue(text, now, progress);
+        }
+        if accepted < text.len() {
+            self.flush(now, progress);
+            self.truncated = true;
+            progress(ArenaProgress::StdoutTruncated);
+        }
+    }
+
+    fn accepted_prefix_len(&self, text: &str, limits: ObservationLimits) -> usize {
+        let mut total_bytes = self.total_bytes;
+        let mut lines = self.lines.clone();
+        let mut accepted = 0;
+        for (index, character) in text.char_indices() {
+            let end = index + character.len_utf8();
+            if character.len_utf8() > limits.max_total_bytes.saturating_sub(total_bytes) {
+                break;
+            }
+            lines.push(&text[index..end]);
+            if lines.count() > limits.max_total_lines {
+                break;
+            }
+            total_bytes += character.len_utf8();
+            accepted = end;
+        }
+        accepted
+    }
+
+    fn queue(&mut self, mut text: &str, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        while !text.is_empty() {
+            let available = STDOUT_DELTA_BYTES - self.pending.len();
+            let length = utf8_prefix_len(text, available);
+            if length == 0 {
+                self.publish_next(now, progress);
+                continue;
+            }
+            self.pending.push_str(&text[..length]);
+            text = &text[length..];
+            self.publish_due(now, progress);
+        }
+    }
+
+    fn publish_due(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        let rate_window_open = self.last_emitted.is_none_or(|last_emitted| {
+            now.checked_duration_since(last_emitted)
+                .is_some_and(|elapsed| elapsed >= STDOUT_RATE_WINDOW)
+        });
+        if rate_window_open && !self.pending.is_empty() {
+            self.publish_next(now, progress);
+        }
+        while self.pending.len() >= STDOUT_DELTA_BYTES {
+            self.publish_next(now, progress);
+        }
+    }
+
+    fn flush(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        while !self.pending.is_empty() {
+            self.publish_next(now, progress);
+        }
+    }
+
+    fn publish_next(&mut self, now: Instant, progress: &mut impl FnMut(ArenaProgress)) {
+        let length = utf8_prefix_len(&self.pending, STDOUT_DELTA_BYTES);
+        assert!(length > 0, "pending stdout must contain valid UTF-8");
+        let remainder = self.pending.split_off(length);
+        let text = std::mem::replace(&mut self.pending, remainder);
+        self.last_emitted = Some(now);
+        progress(ArenaProgress::StdoutDelta { text });
     }
 }
 
@@ -688,6 +1057,26 @@ impl ObservationAccumulator {
             lines: LineCounter::default(),
             whole: Some(String::new()),
             truncated: None,
+            live_stdout: None,
+        }
+    }
+
+    fn with_live_stdout(limits: ObservationLimits) -> Self {
+        Self {
+            live_stdout: Some(LiveStdout::new()),
+            ..Self::new(limits)
+        }
+    }
+
+    fn push_live_stdout(
+        &mut self,
+        text: &str,
+        now: Instant,
+        progress: &mut impl FnMut(ArenaProgress),
+    ) {
+        self.push(text);
+        if let Some(live_stdout) = &mut self.live_stdout {
+            live_stdout.push(text, self.limits, now, progress);
         }
     }
 
@@ -888,7 +1277,7 @@ impl Tail {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LineCounter {
     terminated: usize,
     current_nonempty: bool,
@@ -957,6 +1346,11 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+fn bounded_interruption_text(mut text: String) -> String {
+    text.truncate(utf8_prefix_len(&text, INTERRUPTED_EVIDENCE_TEXT_LIMIT));
+    text
 }
 
 fn splitlines_keepends(text: &str) -> Vec<&str> {
@@ -1029,19 +1423,21 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use monty_types::PrintStream;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome, Observation,
-        ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY, RuntimeIdentity,
-        StreamAccumulators, drive, is_unsafe_memory_error, is_unsafe_soft_memory_error,
-        parse_soft_memory_limit, validate_worker, validate_worker_with_timeout,
+        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome,
+        INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, InterruptedRead,
+        OBSERVATION_LIMITS, Observation, ObservationAccumulator, ObservationLimits, PythonError,
+        RUNTIME_IDENTITY, ReadOutcome, RuntimeIdentity, StreamAccumulators, drive,
+        is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
+        validate_worker, validate_worker_with_timeout,
     };
-    use crate::tools::ReadTool;
+    use crate::tools::{ReadTestGate, ReadTool};
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
         max_total_bytes: 100,
@@ -1067,6 +1463,18 @@ mod tests {
         )
         .await
         .expect("create arena")
+    }
+
+    async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
+        let gate = ReadTestGate::new();
+        let read_tool = ReadTool::new(workspace.path())
+            .await
+            .expect("open read tool")
+            .with_test_gate(gate.clone());
+        let arena = Arena::new(worker_path(), read_tool)
+            .await
+            .expect("create arena");
+        (arena, gate)
     }
 
     async fn arena_with_limits(
@@ -1350,12 +1758,303 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "2");
     }
 
+    fn push_stdout(
+        streams: &mut StreamAccumulators,
+        text: &str,
+        now: Instant,
+        progress: &mut Vec<super::ArenaProgress>,
+    ) {
+        let mut capture = |event| progress.push(event);
+        streams.push_with_progress(PrintStream::Stdout, text, now, &mut capture);
+    }
+
+    fn flush_stdout(
+        streams: &mut StreamAccumulators,
+        now: Instant,
+        progress: &mut Vec<super::ArenaProgress>,
+    ) {
+        let mut capture = |event| progress.push(event);
+        streams.flush_stdout(now, &mut capture);
+    }
+
+    fn stdout_text(progress: &[super::ArenaProgress]) -> String {
+        progress
+            .iter()
+            .filter_map(|event| match event {
+                super::ArenaProgress::StdoutDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stdout_progress_emits_immediately_then_coalesces_until_the_next_due_producer_event() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "first", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            " second",
+            now + Duration::from_millis(49),
+            &mut progress,
+        );
+        push_stdout(
+            &mut streams,
+            " third",
+            now + Duration::from_millis(50),
+            &mut progress,
+        );
+
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text: first },
+                super::ArenaProgress::StdoutDelta { text: rest },
+            ] if first == "first" && rest == " second third"
+        ));
+    }
+
+    #[test]
+    fn stdout_progress_flushes_utf8_safe_chunks_when_pending_output_reaches_four_kib() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "start", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            &format!("{}é", "x".repeat(4 * 1024 - 1)),
+            now + Duration::from_millis(1),
+            &mut progress,
+        );
+        assert!(
+            streams
+                .stdout
+                .live_stdout
+                .as_ref()
+                .expect("stdout has live state")
+                .pending
+                .len()
+                <= 4 * 1024
+        );
+        flush_stdout(&mut streams, now + Duration::from_millis(2), &mut progress);
+
+        assert_eq!(
+            stdout_text(&progress),
+            format!("start{}é", "x".repeat(4 * 1024 - 1))
+        );
+        assert!(progress.iter().all(|event| match event {
+            super::ArenaProgress::StdoutDelta { text } => text.len() <= 4 * 1024,
+            super::ArenaProgress::StdoutTruncated
+            | super::ArenaProgress::ReadStarted { .. }
+            | super::ArenaProgress::ReadFinished { .. } => true,
+        }));
+        assert!(matches!(
+            progress.get(1),
+            Some(super::ArenaProgress::StdoutDelta { text }) if text.len() == 4 * 1024 - 1
+        ));
+    }
+
+    #[test]
+    fn stdout_progress_flushes_short_pending_output_when_execution_or_interruption_finishes() {
+        let now = Instant::now();
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        push_stdout(&mut streams, "first", now, &mut progress);
+        push_stdout(
+            &mut streams,
+            " pending",
+            now + Duration::from_millis(1),
+            &mut progress,
+        );
+        flush_stdout(&mut streams, now + Duration::from_millis(2), &mut progress);
+
+        assert_eq!(stdout_text(&progress), "first pending");
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text: first },
+                super::ArenaProgress::StdoutDelta { text: pending },
+            ] if first == "first" && pending == " pending"
+        ));
+
+        let mut interruption = InterruptedExecutionState::new();
+        push_stdout(
+            &mut interruption.streams,
+            "again",
+            now + Duration::from_millis(60),
+            &mut progress,
+        );
+        push_stdout(
+            &mut interruption.streams,
+            " later",
+            now + Duration::from_millis(61),
+            &mut progress,
+        );
+        let mut capture = |event| progress.push(event);
+        let interrupted = interruption.finish(now + Duration::from_millis(62), &mut capture);
+
+        assert_eq!(interrupted.stdout.head, "again later");
+        assert_eq!(stdout_text(&progress), "first pendingagain later");
+    }
+
+    #[test]
+    fn stdout_progress_preserves_fragmented_unicode_and_crlf_without_changing_observation() {
+        let now = Instant::now();
+        let fragments = ["head\r", "\n🦀", "\u{2028}tail"];
+        let expected = {
+            let mut accumulator = ObservationAccumulator::new(TEST_LIMITS);
+            for fragment in fragments {
+                accumulator.push(fragment);
+            }
+            accumulator.finish()
+        };
+        let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = Vec::new();
+
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            push_stdout(
+                &mut streams,
+                fragment,
+                now + Duration::from_millis(index as u64),
+                &mut progress,
+            );
+        }
+        flush_stdout(&mut streams, now + Duration::from_millis(4), &mut progress);
+
+        assert_eq!(stdout_text(&progress), "head\r\n🦀\u{2028}tail");
+        assert_eq!(streams.stdout.finish(), expected);
+    }
+
+    #[test]
+    fn stdout_progress_marks_the_first_suffix_beyond_byte_or_line_limits_once() {
+        let now = Instant::now();
+        let byte_limits = ObservationLimits {
+            max_total_bytes: 5,
+            max_total_lines: 10,
+            max_head_bytes: 5,
+            max_head_lines: 10,
+            max_tail_bytes: 5,
+            max_tail_lines: 10,
+        };
+        let mut bytes = StreamAccumulators::new(byte_limits);
+        let mut byte_progress = Vec::new();
+        push_stdout(&mut bytes, "abcde", now, &mut byte_progress);
+        push_stdout(
+            &mut bytes,
+            "f",
+            now + Duration::from_millis(1),
+            &mut byte_progress,
+        );
+        push_stdout(
+            &mut bytes,
+            "later",
+            now + Duration::from_millis(2),
+            &mut byte_progress,
+        );
+
+        assert_eq!(stdout_text(&byte_progress), "abcde");
+        assert_eq!(
+            byte_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+        assert_eq!(bytes.stdout.finish(), observe("abcdeflater", byte_limits));
+
+        let line_limits = ObservationLimits {
+            max_total_bytes: 100,
+            max_total_lines: 1,
+            max_head_bytes: 100,
+            max_head_lines: 1,
+            max_tail_bytes: 100,
+            max_tail_lines: 1,
+        };
+        let mut lines = StreamAccumulators::new(line_limits);
+        let mut line_progress = Vec::new();
+        push_stdout(&mut lines, "one\r", now, &mut line_progress);
+        push_stdout(
+            &mut lines,
+            "\n",
+            now + Duration::from_millis(1),
+            &mut line_progress,
+        );
+        push_stdout(
+            &mut lines,
+            "two",
+            now + Duration::from_millis(2),
+            &mut line_progress,
+        );
+
+        assert_eq!(stdout_text(&line_progress), "one\r\n");
+        assert_eq!(
+            line_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+
+        let mut actual_bytes = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut actual_byte_progress = Vec::new();
+        let at_limit = "x".repeat(OBSERVATION_LIMITS.max_total_bytes);
+        push_stdout(&mut actual_bytes, &at_limit, now, &mut actual_byte_progress);
+        push_stdout(
+            &mut actual_bytes,
+            "beyond",
+            now + Duration::from_millis(1),
+            &mut actual_byte_progress,
+        );
+        assert_eq!(stdout_text(&actual_byte_progress), at_limit);
+        assert_eq!(
+            actual_byte_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+
+        let mut actual_lines = StreamAccumulators::new(OBSERVATION_LIMITS);
+        let mut actual_line_progress = Vec::new();
+        let at_limit = "line\n".repeat(OBSERVATION_LIMITS.max_total_lines);
+        push_stdout(&mut actual_lines, &at_limit, now, &mut actual_line_progress);
+        push_stdout(
+            &mut actual_lines,
+            "beyond",
+            now + Duration::from_millis(1),
+            &mut actual_line_progress,
+        );
+        assert_eq!(stdout_text(&actual_line_progress), at_limit);
+        assert_eq!(
+            actual_line_progress
+                .iter()
+                .filter(|event| matches!(event, super::ArenaProgress::StdoutTruncated))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn routes_stderr_to_its_own_accumulator() {
         let mut streams = StreamAccumulators::new(TEST_LIMITS);
+        let mut progress = |_| {};
 
-        streams.push(PrintStream::Stderr, "warning\n");
-        streams.push(PrintStream::Stdout, "output\n");
+        streams.push_with_progress(
+            PrintStream::Stderr,
+            "warning\n",
+            Instant::now(),
+            &mut progress,
+        );
+        streams.push_with_progress(
+            PrintStream::Stdout,
+            "output\n",
+            Instant::now(),
+            &mut progress,
+        );
 
         assert_eq!(streams.stdout.finish().head, "output\n");
         assert_eq!(streams.stderr.finish().head, "warning\n");
@@ -1542,6 +2241,45 @@ mod tests {
         assert_eq!(error.omitted_bytes, 40_000 - error.text.len());
     }
 
+    #[test]
+    fn bounds_interruption_diagnostics_and_keeps_protocol_evidence() {
+        let unbounded = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2 + 1);
+        let expected = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2);
+        let mut interruption = InterruptedExecutionState::new();
+        interruption.began = true;
+        interruption.streams.stdout.push("before\n");
+        interruption.read.started("read");
+        interruption
+            .read
+            .finished(ReadOutcome::failure(unbounded.clone()));
+
+        let mut progress = |_| {};
+        let error = ArenaError::unsupported_suspension(unbounded)
+            .with_interrupted_execution(interruption.finish(Instant::now(), &mut progress));
+
+        let ArenaError::UnsupportedSuspension {
+            message,
+            execution: Some(execution),
+        } = error
+        else {
+            panic!("expected unsupported suspension with interruption evidence");
+        };
+        assert_eq!(message, expected);
+        assert!(message.is_char_boundary(message.len()));
+        assert!(execution.began);
+        assert_eq!(execution.stdout.head, "before\n");
+        let InterruptedRead::Completed {
+            path,
+            outcome: ReadOutcome::Failure { message },
+        } = execution.read
+        else {
+            panic!("expected completed failed read evidence");
+        };
+        assert_eq!(path, "read");
+        assert_eq!(message, expected);
+        assert!(message.is_char_boundary(message.len()));
+    }
+
     #[tokio::test]
     async fn ordinary_python_errors_commit_preceding_mutation() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1682,6 +2420,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_cancelled_execution_has_no_driver_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = arena
+            .execute("print('not run')", &cancellation)
+            .await
+            .unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert!(!execution.began);
+        assert_eq!(execution.stdout.total_bytes, 0);
+        assert_eq!(execution.stderr.total_bytes, 0);
+        assert_eq!(execution.read, InterruptedRead::NoRead);
+    }
+
+    #[tokio::test]
+    async fn stdout_progress_arrives_before_a_gated_read_and_survives_cancellation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+        let error = {
+            let mut capture = |event| progress.push(event);
+            let mut execution = Box::pin(arena.execute_with_progress(
+                "print('before')\nawait read('pending')",
+                &cancellation,
+                &mut capture,
+            ));
+
+            tokio::select! {
+                _ = gate.wait_until_read_started() => {}
+                result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+            }
+            cancellation.cancel();
+            execution.await.unwrap_err()
+        };
+
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                super::ArenaProgress::StdoutDelta { text },
+                super::ArenaProgress::ReadStarted { .. },
+            ] if text == "before\n"
+        ));
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_short_output_and_pending_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('pending')\nawait read('pending')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert!(execution.began);
+        assert_eq!(execution.stdout.head, "pending\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Pending {
+                path: "pending".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_bounds_the_pending_read_path_in_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let path = "é".repeat(2_049);
+        let code = format!("await read({path:?})");
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        let InterruptedRead::Pending { path } = execution.read else {
+            panic!("expected a pending read");
+        };
+        assert_eq!(path, "é".repeat(2_048));
+        assert!(path.is_char_boundary(path.len()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_the_last_settled_read_outcome() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("settled"), "line\n").unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('before')\nawait read('settled')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its read settled: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Completed {
+                path: "settled".to_owned(),
+                outcome: ReadOutcome::Success { line_count: 1 },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_observation_keeps_existing_head_and_tail_bounds() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let code = format!(
+            "print('x' * {})\nawait read('pending')",
+            OBSERVATION_LIMITS.max_total_bytes
+        );
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(
+            execution.stdout.head.len(),
+            OBSERVATION_LIMITS.max_head_bytes
+        );
+        assert_eq!(
+            execution.stdout.tail.as_deref().map(str::len),
+            Some(OBSERVATION_LIMITS.max_tail_bytes)
+        );
+        assert_eq!(
+            execution.stdout.total_bytes,
+            OBSERVATION_LIMITS.max_total_bytes + 1
+        );
+        assert_eq!(execution.stdout.total_lines, 1);
+        assert_eq!(execution.stdout.omitted_bytes, 1);
+        assert!(execution.stdout.partial_lines);
+    }
+
+    #[tokio::test]
+    async fn successful_execution_keeps_its_existing_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("complete"), "line\n").unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(arena.execute(
+            "print('before')\nawait read('complete')\nprint('after')",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut run => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut run => panic!("execution finished before its read settled: {result:?}"),
+        }
+        gate.resume_driver();
+        let execution = run.await.unwrap();
+
+        assert_eq!(execution.stdout.head, "before\nafter\n");
+        assert_eq!(execution.stdout.tail, None);
+        assert_eq!(execution.stdout.total_bytes, 13);
+    }
+
+    #[tokio::test]
     async fn cancellation_recovers_the_trusted_checkpoint_before_returning() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -1701,7 +2649,7 @@ mod tests {
             .unwrap_err();
         cancel.await.unwrap();
 
-        assert!(matches!(error, ArenaError::Cancelled));
+        assert!(matches!(error, ArenaError::Cancelled { .. }));
         assert_trusted_value(&mut arena).await;
         #[cfg(unix)]
         assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -1720,11 +2668,17 @@ mod tests {
         #[cfg(unix)]
         let previous_pid = arena_worker_pid(&arena);
 
-        let error = execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass")
-            .await
-            .unwrap_err();
+        let error = execute_without_cancellation(
+            &mut arena,
+            "print('before')\nvalue = 99\nwhile True:\n    pass",
+        )
+        .await
+        .unwrap_err();
 
-        assert!(matches!(error, ArenaError::TimedOut));
+        let ArenaError::TimedOut { execution } = error else {
+            panic!("expected interrupted timeout");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
         assert_trusted_value(&mut arena).await;
         #[cfg(unix)]
         assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -1745,12 +2699,22 @@ mod tests {
             );
         });
 
-        let result =
-            execute_without_cancellation(&mut arena, "value = 99\nwhile True:\n    pass").await;
+        let result = execute_without_cancellation(
+            &mut arena,
+            "print('before')\nvalue = 99\nwhile True:\n    pass",
+        )
+        .await;
         killer.join().unwrap();
         let error = result.unwrap_err();
 
-        assert!(matches!(error, ArenaError::Infrastructure { .. }));
+        let ArenaError::Infrastructure {
+            execution: Some(execution),
+            ..
+        } = error
+        else {
+            panic!("expected interrupted infrastructure failure");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
         assert_trusted_value(&mut arena).await;
         assert_ne!(arena_worker_pid(&arena), previous_pid);
     }
@@ -1804,11 +2768,13 @@ mod tests {
             .expect("new arena should have a checkout");
 
         let mut progress = |_| {};
-        let (result, _) = drive(
+        let mut interruption = InterruptedExecutionState::new();
+        let result = drive(
             checkout,
             &arena.read_tool,
             "x = ' ' * (1 << 60)",
             &mut progress,
+            &mut interruption,
         )
         .await;
         let Err(DriverError::Runtime(error)) = result else {
@@ -1844,6 +2810,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_failure_retains_original_interruption_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        arena.fail_next_recovery_for_test();
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("print('before')\nawait read('pending')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::RecoveryFailed { original, recovery } = error else {
+            panic!("expected recovery failure");
+        };
+        let ArenaError::Cancelled { execution } = *original else {
+            panic!("expected original interrupted cancellation");
+        };
+        assert_eq!(execution.stdout.head, "before\n");
+        assert_eq!(
+            execution.read,
+            InterruptedRead::Pending {
+                path: "pending".to_owned()
+            }
+        );
+        assert!(matches!(
+            *recovery,
+            ArenaError::Infrastructure {
+                message,
+                execution: None,
+            } if message == "test recovery failure"
+        ));
+        assert!(arena.checkout.is_none());
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[tokio::test]
     async fn failed_recovery_preserves_original_error_and_a_missing_checkout_self_recovers() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -1861,7 +2868,7 @@ mod tests {
         let ArenaError::RecoveryFailed { original, recovery } = error else {
             panic!("expected recovery failure, got {error:?}");
         };
-        assert!(matches!(*original, ArenaError::Cancelled));
+        assert!(matches!(*original, ArenaError::Cancelled { .. }));
         assert!(matches!(*recovery, ArenaError::Infrastructure { .. }));
         assert!(arena.checkout.is_none());
 
