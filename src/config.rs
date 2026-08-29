@@ -211,7 +211,6 @@ impl StartupConfiguration {
         &self.snapshot
     }
 
-    #[allow(dead_code)]
     pub(crate) fn ready(&self) -> Option<ReadyStartup<'_>> {
         if !self.snapshot.problems.is_empty() {
             return None;
@@ -257,13 +256,10 @@ impl StartupConfiguration {
 struct StartupConstruction {
     worker_path: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
-    #[allow(dead_code)]
-    prompt_source: PromptSource,
     system_prompt: Option<String>,
     api_key: Option<ApiKey>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct ReadyStartup<'a> {
     worker_path: &'a Path,
     workspace_root: &'a Path,
@@ -271,7 +267,6 @@ pub(crate) struct ReadyStartup<'a> {
     api_key: &'a ApiKey,
 }
 
-#[allow(dead_code)]
 impl<'a> ReadyStartup<'a> {
     pub(crate) fn worker_path(&self) -> &'a Path {
         self.worker_path
@@ -292,7 +287,6 @@ impl<'a> ReadyStartup<'a> {
 
 pub(crate) struct ApiKey(String);
 
-#[allow(dead_code)]
 impl ApiKey {
     pub(crate) fn expose(&self) -> &str {
         &self.0
@@ -391,7 +385,6 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
         construction: StartupConstruction {
             worker_path,
             workspace_root,
-            prompt_source,
             system_prompt,
             api_key,
         },
@@ -701,10 +694,6 @@ mod tests {
         assert_eq!(ready.workspace_root(), workspace_root);
         assert_eq!(ready.system_prompt(), "system instructions");
         assert_eq!(ready.api_key().expose(), api_key);
-        assert_eq!(
-            configuration.construction.prompt_source,
-            PromptSource::Override { path: prompt_path }
-        );
     }
 
     #[test]

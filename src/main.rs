@@ -28,18 +28,12 @@ fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let configuration = config::load();
-    let startup_inputs = {
-        configuration.ready().map(|ready| {
-            (
-                ready.worker_path().to_path_buf(),
-                ready.workspace_root().to_path_buf(),
-                production_model(&ready),
-            )
-        })
-    };
-    let Some((worker_path, workspace_root, model)) = startup_inputs else {
+    let Some(ready) = configuration.ready() else {
         return Ok(tui::run_configuration(configuration.snapshot().clone())?);
     };
+    let worker_path = ready.worker_path().to_path_buf();
+    let workspace_root = ready.workspace_root().to_path_buf();
+    let model = production_model(&ready);
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let read_tool = match runtime.block_on(ReadTool::new(workspace_root)) {

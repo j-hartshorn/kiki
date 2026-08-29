@@ -1192,9 +1192,6 @@ fn format_usage_value(value: Option<u64>) -> String {
 }
 
 fn format_cost(label: &str, attempts: &[&AttemptAccounting]) -> String {
-    if attempts.is_empty() {
-        return format!("{label}: Unavailable (no priceable usage)");
-    }
     match estimate_run_cost(attempts.iter().copied()) {
         RunCostEstimate::Complete(estimate) => format_estimated_cost(label, "Complete", estimate),
         RunCostEstimate::LowerBound(estimate) => {

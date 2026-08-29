@@ -228,8 +228,8 @@ pub fn estimate_run_cost<'a>(
     };
     match (has_known, has_unpriceable || is_lower_bound) {
         (true, true) => RunCostEstimate::LowerBound(estimate),
-        (true, false) | (false, false) => RunCostEstimate::Complete(estimate),
-        (false, true) => RunCostEstimate::Unavailable,
+        (true, false) => RunCostEstimate::Complete(estimate),
+        (false, _) => RunCostEstimate::Unavailable,
     }
 }
 
@@ -443,6 +443,10 @@ mod tests {
         let mut invalid = usage(10, 0, 0, 0, 0);
         invalid.service_tier = Some("priority".to_owned());
 
+        assert_eq!(
+            estimate_run_cost(&[] as &[AttemptAccounting]),
+            RunCostEstimate::Unavailable
+        );
         assert_eq!(
             estimate_run_cost(&[AttemptAccounting::UsageUnavailable]),
             RunCostEstimate::Unavailable

@@ -43,7 +43,6 @@ pub(crate) struct OpenAiModel {
 }
 
 impl OpenAiModel {
-    #[allow(dead_code)]
     pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
     }
@@ -1569,6 +1568,13 @@ mod tests {
     use tokio::time::{Instant, sleep, sleep_until, timeout};
 
     use super::{WireEvent, WireStatus, WireStream, openai_config};
+    use crate::model::ModelHistory;
+
+    fn history() -> ModelHistory {
+        let mut history = ModelHistory::new("read files exactly");
+        history.append_user_request("inspect");
+        history
+    }
 
     const COMPLETED_STREAM: &str = concat!(
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
@@ -2142,16 +2148,9 @@ mod tests {
         use super::super::{APPLICATION_CONTENT_LIMIT, OpenAiModel};
         use super::*;
         use crate::model::{
-            AttemptAccounting, Model, ModelError, ModelFailure, ModelHistory, ModelProgress,
-            ProviderReplay,
+            AttemptAccounting, Model, ModelError, ModelFailure, ModelProgress, ProviderReplay,
         };
         use crate::pricing::{RunCostEstimate, estimate_run_cost};
-
-        fn history() -> ModelHistory {
-            let mut history = ModelHistory::new("read files exactly");
-            history.append_user_request("inspect");
-            history
-        }
 
         async fn step(
             fixture: &Fixture,
@@ -2652,13 +2651,7 @@ mod tests {
 
         use super::super::OpenAiModel;
         use super::*;
-        use crate::model::{Model, ModelFailure, ModelHistory};
-
-        fn history() -> ModelHistory {
-            let mut history = ModelHistory::new("read files exactly");
-            history.append_user_request("inspect");
-            history
-        }
+        use crate::model::{Model, ModelFailure};
 
         fn error_body(message: &str, code: &str) -> String {
             json!({
@@ -2878,12 +2871,6 @@ mod tests {
             }
             stream.push_str("data: [DONE]\n\n");
             stream
-        }
-
-        fn history() -> ModelHistory {
-            let mut history = ModelHistory::new("read files exactly");
-            history.append_user_request("inspect");
-            history
         }
 
         async fn step(
