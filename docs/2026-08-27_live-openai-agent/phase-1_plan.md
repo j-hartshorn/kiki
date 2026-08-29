@@ -245,7 +245,7 @@ Each task ends in exactly one atomic `git commit --signoff` using its listed sub
 
 **Tests** (`src/config.rs`, composition; `src/tui.rs`, configuration) — First fail because one representative invalid startup snapshot exits before Ratatui. Reuse Task 4's validation matrix; here prove that invalid composition opens Ratatui, controls remain read-only, no runtime channel is required, privacy wording and hostile configuration text render safely, and shutdown/terminal restoration work in configured and configuration-only modes.
 
-**Files** — Modify: `src/main.rs`, `src/config.rs`, `src/prompt.rs`, `src/tui.rs`
+**Files** — Modify: `src/main.rs`, `src/config.rs`, `src/tui.rs`
 
 **Commit** — `Show startup configuration`
 

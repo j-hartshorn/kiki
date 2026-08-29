@@ -12,6 +12,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome};
+use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
 use crate::model::{AttemptAccounting, ModelProgress};
 use crate::pricing::{CostEstimate, RunCostEstimate, estimate_run_cost, estimate_usage};
 use crate::runtime::{
@@ -21,6 +22,7 @@ use crate::runtime::{
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STORE_FALSE_PRIVACY_BOUNDARY: &str = "store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.";
 
 trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -61,6 +63,12 @@ enum RunState {
 struct DisplayedRecord {
     record: StoredRecord,
     progress_gap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Configured,
+    ConfigurationOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +122,8 @@ impl LiveStep {
 }
 
 struct App {
+    startup: Option<StartupSnapshot>,
+    mode: AppMode,
     prompt: String,
     run_state: RunState,
     latest_run_id: Option<RunId>,
@@ -130,6 +140,8 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            startup: None,
+            mode: AppMode::Configured,
             prompt: String::new(),
             run_state: RunState::Idle,
             latest_run_id: None,
@@ -153,6 +165,25 @@ struct Update {
 }
 
 impl App {
+    fn configured(startup: StartupSnapshot) -> Self {
+        Self {
+            startup: Some(startup),
+            ..Self::default()
+        }
+    }
+
+    fn configuration(startup: StartupSnapshot) -> Self {
+        Self {
+            startup: Some(startup),
+            mode: AppMode::ConfigurationOnly,
+            ..Self::default()
+        }
+    }
+
+    fn is_configuration_only(&self) -> bool {
+        self.mode == AppMode::ConfigurationOnly
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Update {
         if key.is_release() {
             return Update::default();
@@ -161,7 +192,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
             return Update {
-                command: Some(RuntimeCommand::Shutdown),
+                command: (!self.is_configuration_only()).then_some(RuntimeCommand::Shutdown),
                 visible_changed: false,
                 quit: true,
             };
@@ -186,6 +217,7 @@ impl App {
                 };
                 self.update_scroll(scroll)
             }
+            _ if self.is_configuration_only() => Update::default(),
             KeyCode::Esc if self.run_state != RunState::Idle => Update {
                 command: Some(RuntimeCommand::Cancel),
                 visible_changed: false,
@@ -580,11 +612,12 @@ impl<F: FnOnce()> Drop for RestoreGuard<F> {
 }
 
 pub(crate) fn run(
+    startup: StartupSnapshot,
     commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
 ) -> Result<(), TuiError> {
-    let mut app = App::default();
+    let mut app = App::configured(startup);
     let mut input = CrosstermEvents;
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
@@ -603,6 +636,16 @@ pub(crate) fn run(
     )
 }
 
+pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError> {
+    let mut app = App::configuration(startup);
+    let mut input = CrosstermEvents;
+    with_terminal(
+        || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
+        ratatui::restore,
+        |terminal| run_configuration_loop(terminal, &mut app, &mut input).map(|_| ()),
+    )
+}
+
 fn with_terminal<B: Backend>(
     initialize: impl FnOnce() -> Result<Terminal<B>, TuiError>,
     restore: impl FnOnce(),
@@ -611,6 +654,39 @@ fn with_terminal<B: Backend>(
     let _guard = RestoreGuard::new(restore);
     let mut terminal = initialize()?;
     run(&mut terminal)
+}
+
+fn run_configuration_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    input: &mut impl EventSource,
+) -> Result<usize, TuiError> {
+    let mut dirty = true;
+    let mut redraws = 0;
+
+    loop {
+        if dirty {
+            terminal
+                .draw(|frame| render(frame, app))
+                .map_err(|error| TuiError::Terminal(error.to_string()))?;
+            redraws += 1;
+            dirty = false;
+        }
+
+        if input.poll(POLL_INTERVAL).map_err(TuiError::Input)? {
+            match input.read().map_err(TuiError::Input)? {
+                Event::Key(key) => {
+                    let update = app.handle_key(key);
+                    dirty |= update.visible_changed;
+                    if update.quit {
+                        return Ok(redraws);
+                    }
+                }
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
+            }
+        }
+    }
 }
 
 fn run_loop<B: Backend>(
@@ -682,39 +758,45 @@ fn run_loop<B: Backend>(
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let configuration_only = app.is_configuration_only();
+    let reserved_rows = if configuration_only { 1 } else { 2 };
     app.history_height = if area.width == 0 {
         0
     } else {
-        area.height.saturating_sub(2) as usize
+        area.height.saturating_sub(reserved_rows) as usize
     };
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    frame.render_widget(
-        Paragraph::new(format!(
+    let header = if configuration_only {
+        "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+            .to_owned()
+    } else {
+        format!(
             "Status: {} | Enter submit | Esc cancel | Ctrl-C quit | Up/Down scroll",
             normalise_terminal_text(&app.status)
-        )),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(header),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    if area.height < 2 {
-        return;
+    if !configuration_only && area.height >= 2 {
+        let prompt_y = area.y.saturating_add(area.height - 1);
+        frame.render_widget(
+            Paragraph::new(format!("> {}", normalise_terminal_text(&app.prompt))),
+            Rect::new(area.x, prompt_y, area.width, 1),
+        );
     }
 
-    let prompt_y = area.y.saturating_add(area.height - 1);
-    frame.render_widget(
-        Paragraph::new(format!("> {}", normalise_terminal_text(&app.prompt))),
-        Rect::new(area.x, prompt_y, area.width, 1),
-    );
-
-    if area.height < 3 {
+    let history_height = area.height.saturating_sub(reserved_rows);
+    if history_height == 0 {
         return;
     }
 
     let history = format_history(app);
-    let history_height = area.height - 2;
     let last_page_start = history
         .lines()
         .count()
@@ -728,7 +810,12 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn format_history(app: &App) -> String {
-    let mut entries = Vec::new();
+    let mut entries = app
+        .startup
+        .as_ref()
+        .map(format_startup_configuration)
+        .into_iter()
+        .collect::<Vec<_>>();
     for (index, displayed) in app.records.iter().enumerate() {
         let prior_attempts = app.records[..index]
             .iter()
@@ -755,6 +842,46 @@ fn format_history(app: &App) -> String {
         entries.push(format_live_step(live, &prior_attempts));
     }
     entries.join("\n")
+}
+
+pub(crate) fn format_startup_configuration(snapshot: &StartupSnapshot) -> String {
+    let worker_path = snapshot
+        .worker_path()
+        .map_or("unavailable", |path| path.as_str());
+    let workspace_root = snapshot
+        .workspace_root()
+        .map_or("unavailable", |path| path.as_str());
+    let prompt_source = match snapshot.prompt_source() {
+        PromptProvenance::Bundled { name } => format!("bundled {name}"),
+        PromptProvenance::Override { path } => format!("override {}", path.as_str()),
+    };
+    let api_key_presence = match snapshot.api_key_presence() {
+        ApiKeyPresence::Missing => "missing",
+        ApiKeyPresence::Present => "present",
+    };
+    let submission = match snapshot.submission_availability() {
+        SubmissionAvailability::Available => "available",
+        SubmissionAvailability::Unavailable => "unavailable",
+    };
+    let mut lines = vec![
+        "Startup configuration".to_owned(),
+        format!("Worker: {worker_path}"),
+        format!("Workspace: {workspace_root}"),
+        format!("Model: {}", snapshot.model()),
+        format!("Prompt: {prompt_source}"),
+        format!("OpenAI API key: {api_key_presence}"),
+        format!("Submission: {submission}"),
+    ];
+    if snapshot.problems().is_empty() {
+        lines.push("Problems: none".to_owned());
+    } else {
+        for problem in snapshot.problems() {
+            lines.push(format!("Problem: {}", problem.diagnostic()));
+            lines.push(format!("Remediation: {}", problem.remediation()));
+        }
+    }
+    lines.push(STORE_FALSE_PRIVACY_BOUNDARY.to_owned());
+    normalised_lines(lines)
 }
 
 fn format_record(displayed: &DisplayedRecord, prior_attempts: &[&AttemptAccounting]) -> String {
@@ -1230,6 +1357,139 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Backspace)).visible_changed);
         assert!(!app.prompt.ends_with('🦀'));
         assert!(app.prompt.is_char_boundary(app.prompt.len()));
+    }
+
+    #[test]
+    fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+
+        let history = super::format_history(&app);
+        assert!(history.contains("Startup configuration"));
+        assert!(history.contains("Submission: available"));
+        assert!(history.contains("OpenAI API key: present"));
+        assert!(!history.contains("test-api-key"));
+
+        assert!(app.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).command,
+            Some(RuntimeCommand::Submit {
+                request: "x".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn configuration_controls_are_read_only_and_ctrl_c_needs_no_command() {
+        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        app.prompt = "locked".to_owned();
+        let prompt = app.prompt.clone();
+        let screen = rendered(&mut app, 120, 15);
+        assert!(screen.contains("Configuration only: read-only; submission unavailable"));
+        assert!(!screen.contains("> locked"));
+
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            let update = app.handle_key(key(code));
+            assert!(update.command.is_none());
+            assert!(!update.visible_changed);
+            assert!(!update.quit);
+            assert_eq!(app.prompt, prompt);
+            assert_eq!(app.run_state, super::RunState::Idle);
+        }
+
+        let quit = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(quit.command.is_none());
+        assert!(!quit.visible_changed);
+        assert!(quit.quit);
+        assert_eq!(app.prompt, prompt);
+    }
+
+    #[test]
+    fn configuration_entry_requires_only_a_startup_snapshot() {
+        let _: fn(crate::config::StartupSnapshot) -> Result<(), super::TuiError> =
+            super::run_configuration;
+    }
+
+    #[test]
+    fn configuration_loop_redraws_scrolls_and_handles_tiny_terminals() {
+        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut input = FakeInput::new([
+            None,
+            Some(ratatui::crossterm::event::Event::Key(key(KeyCode::Up))),
+            Some(ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+        ]);
+
+        let redraws = super::run_configuration_loop(&mut terminal, &mut app, &mut input).unwrap();
+
+        assert_eq!(redraws, 2);
+        assert!(app.scroll_from_bottom > 0);
+        assert!(
+            input
+                .timeouts
+                .iter()
+                .all(|timeout| *timeout <= Duration::from_millis(50))
+        );
+
+        for (width, height) in [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (3, 3)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn configuration_loop_restores_the_terminal_after_initialisation_input_and_panic() {
+        let restored_after_initialisation = Cell::new(false);
+        let initialisation_result = super::with_terminal::<TestBackend>(
+            || {
+                Err(super::TuiError::Terminal(
+                    "initialisation failed".to_owned(),
+                ))
+            },
+            || restored_after_initialisation.set(true),
+            |_| Ok(()),
+        );
+        assert!(initialisation_result.is_err());
+        assert!(restored_after_initialisation.get());
+
+        let restored_after_error = Cell::new(false);
+        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        let mut input = ErrorInput;
+        let input_result = super::with_terminal(
+            || {
+                Terminal::new(TestBackend::new(10, 3))
+                    .map_err(|error| super::TuiError::Terminal(error.to_string()))
+            },
+            || restored_after_error.set(true),
+            |terminal| super::run_configuration_loop(terminal, &mut app, &mut input).map(|_| ()),
+        );
+        assert!(matches!(input_result, Err(super::TuiError::Input(_))));
+        assert!(restored_after_error.get());
+
+        let restored_after_panic = Cell::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = super::with_terminal(
+                || {
+                    Terminal::new(TestBackend::new(10, 3))
+                        .map_err(|error| super::TuiError::Terminal(error.to_string()))
+                },
+                || restored_after_panic.set(true),
+                |_| -> Result<(), super::TuiError> { panic!("configuration loop panic") },
+            );
+        }));
+        assert!(result.is_err());
+        assert!(restored_after_panic.get());
     }
 
     #[test]

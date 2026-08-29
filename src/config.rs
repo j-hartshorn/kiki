@@ -543,6 +543,22 @@ fn prompt_source_path(source: &PromptSource) -> &Path {
     path
 }
 
+#[cfg(test)]
+pub(crate) fn ready_snapshot_for_test() -> StartupSnapshot {
+    resolve_startup(StartupInput {
+        worker_path: Some(OsString::from("/opt/kiki/bin/monty")),
+        workspace_root: Ok(PathBuf::from("/workspace/project")),
+        prompt: PromptResolution::Resolved {
+            text: "system instructions".to_owned(),
+            source: PromptSource::Bundled {
+                name: "read_only_agent",
+            },
+        },
+        api_key: Some(OsString::from("test-api-key")),
+    })
+    .snapshot
+}
+
 fn redact(mut text: String, api_key: Option<&str>) -> String {
     if let Some(api_key) = api_key.filter(|api_key| !api_key.is_empty()) {
         text = text.replace(api_key, REDACTED);
@@ -976,5 +992,48 @@ mod tests {
 
         assert!(!inspectable.contains(api_key), "{inspectable}");
         assert!(inspectable.contains("[redacted]"), "{inspectable}");
+    }
+
+    #[test]
+    fn configuration_invalid_snapshot_reaches_the_tui_renderer_without_a_key() {
+        let api_key = "sk-live-CONFIGURATION-SECRET";
+        let configuration = resolve_startup(StartupInput {
+            worker_path: Some(OsString::from(format!("/worker/{api_key}/monty\t\x1b"))),
+            workspace_root: Ok(PathBuf::from(format!("/workspace/{api_key}/project\r"))),
+            prompt: PromptResolution::Resolved {
+                text: "system instructions".to_owned(),
+                source: PromptSource::Override {
+                    path: PathBuf::from(format!("/prompts/{api_key}/agent\t\x1b.md")),
+                },
+            },
+            api_key: Some(OsString::from(api_key)),
+        })
+        .with_worker_construction_failure(format!("worker failure \x1b {api_key}"))
+        .with_workspace_construction_failure(format!("workspace failure \r {api_key}"));
+
+        let rendered = crate::tui::format_startup_configuration(configuration.snapshot());
+
+        assert!(rendered.contains("Worker: /worker/[redacted]/monty    \\x1B"));
+        assert!(rendered.contains("Workspace: /workspace/[redacted]/project\\x0D"));
+        assert!(rendered.contains("Model: gpt-5.6-sol"));
+        assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
+        assert!(rendered.contains("OpenAI API key: present"));
+        assert!(rendered.contains("Submission: unavailable"));
+        assert!(rendered.contains(
+            "Problem: Monty worker construction failed: worker failure \\x1B [redacted]"
+        ));
+        assert!(rendered.contains(
+            "Problem: Workspace construction failed: workspace failure \\x0D [redacted]"
+        ));
+        assert!(rendered.contains("Remediation: Check that MONTY_BIN points to a working monty-runtime 0.0.21 executable, then restart Kiki."));
+        assert!(rendered.contains("Remediation: Check the workspace directory permissions and filesystem access, then restart Kiki."));
+        assert!(rendered.contains("store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."));
+        assert!(!rendered.contains(api_key), "{rendered}");
+        assert!(!rendered.contains('\x1b'), "{rendered}");
+
+        let bundled = resolve_startup(ready_input("key"));
+        let bundled_rendered = crate::tui::format_startup_configuration(bundled.snapshot());
+        assert!(bundled_rendered.contains("Prompt: bundled read_only_agent"));
+        assert!(bundled_rendered.contains("Submission: available"));
     }
 }
