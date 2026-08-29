@@ -101,9 +101,37 @@ impl ProviderReplay {
     }
 }
 
+const CODE_RESULT_FEEDBACK_LIMIT: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeResult {
     Execution { feedback: String },
+    Cancelled { feedback: String },
+    Failure { feedback: String },
+}
+
+impl CodeResult {
+    pub(crate) fn execution(feedback: String) -> Self {
+        Self::Execution { feedback }.bounded()
+    }
+
+    pub(crate) fn cancelled(feedback: String) -> Self {
+        Self::Cancelled { feedback }.bounded()
+    }
+
+    pub(crate) fn failure(feedback: String) -> Self {
+        Self::Failure { feedback }.bounded()
+    }
+
+    fn bounded(mut self) -> Self {
+        let feedback = match &mut self {
+            Self::Execution { feedback }
+            | Self::Cancelled { feedback }
+            | Self::Failure { feedback } => feedback,
+        };
+        *feedback = bounded_utf8(std::mem::take(feedback), CODE_RESULT_FEEDBACK_LIMIT);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +222,7 @@ impl ModelHistory {
                 source,
                 call_id,
                 replay,
-                result,
+                result: result.bounded(),
             }));
         Ok(())
     }
@@ -504,9 +532,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError, ModelFailure,
-        ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay, ScriptedAction,
-        ScriptedModel,
+        CodeResult, CompletedCode, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
+        ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay,
+        ScriptedAction, ScriptedModel,
     };
 
     fn history_with_request(request: &str) -> ModelHistory {
@@ -641,6 +669,86 @@ mod tests {
 
         assert_eq!(error, ModelHistoryError::DuplicateCallId(call_id));
         assert_eq!(history.entries().len(), 3);
+    }
+
+    #[test]
+    fn completed_code_history_admits_each_terminal_result_only_as_a_compound_entry() {
+        let mut history = history_with_request("inspect");
+        for (index, result) in [
+            CodeResult::execution("completed".to_owned()),
+            CodeResult::cancelled("cancelled".to_owned()),
+            CodeResult::failure("failed".to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            history
+                .append_completed_code(
+                    format!("code-{index}"),
+                    ModelCallId::new(format!("call-{index}")),
+                    replay(&format!("opaque-{index}")),
+                    result,
+                )
+                .unwrap();
+        }
+
+        let results = history
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .map(CompletedCode::result)
+            .collect::<Vec<_>>();
+
+        assert!(matches!(results[0], CodeResult::Execution { .. }));
+        assert!(matches!(results[1], CodeResult::Cancelled { .. }));
+        assert!(matches!(results[2], CodeResult::Failure { .. }));
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn code_results_bound_feedback_at_a_utf8_boundary() {
+        let feedback = "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2 + 1);
+        for result in [
+            CodeResult::execution(feedback.clone()),
+            CodeResult::cancelled(feedback.clone()),
+            CodeResult::failure(feedback.clone()),
+        ] {
+            let feedback = match result {
+                CodeResult::Execution { feedback }
+                | CodeResult::Cancelled { feedback }
+                | CodeResult::Failure { feedback } => feedback,
+            };
+            assert_eq!(feedback, "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2));
+            assert!(feedback.is_char_boundary(feedback.len()));
+        }
+    }
+
+    #[test]
+    fn model_history_bounds_direct_code_result_feedback() {
+        let mut history = history_with_request("inspect");
+        history
+            .append_completed_code(
+                "code".to_owned(),
+                ModelCallId::new("call"),
+                replay("opaque"),
+                CodeResult::Failure {
+                    feedback: "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2 + 1),
+                },
+            )
+            .unwrap();
+
+        let Some(CodeResult::Failure { feedback }) = history
+            .entries()
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .map(CompletedCode::result)
+        else {
+            panic!("expected bounded failure result");
+        };
+        assert_eq!(
+            feedback.as_str(),
+            "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2)
+        );
     }
 
     #[tokio::test]

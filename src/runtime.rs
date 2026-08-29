@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentError, AgentProgress};
+use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome};
 use crate::arena::{Execution, ReadOutcome};
 use crate::model::Model;
 
@@ -101,7 +101,7 @@ enum WorkerMessage<M: Model> {
     Progress(AgentProgress),
     Finished {
         agent: Agent<M>,
-        result: Result<String, AgentError>,
+        result: Result<AgentRunOutcome, AgentError>,
     },
 }
 
@@ -239,19 +239,24 @@ impl<M: Model> RuntimeController<M> {
     ) {
         match message {
             WorkerMessage::Progress(progress) => self.handle_progress(progress, events),
-            WorkerMessage::Finished { agent, result } => {
-                self.agent = Some(agent);
+            WorkerMessage::Finished { mut agent, result } => {
                 let run_id = self.active_run_id();
                 let record = match result {
-                    Ok(final_message) => Record::FinalMessage {
-                        step_id: self.current_step_id(),
-                        text: final_message,
-                    },
-                    Err(AgentError::Cancelled) => Record::CancelledRun,
+                    Ok(AgentRunOutcome::FinalMessageStaged) => {
+                        let final_message = agent
+                            .admit_staged_final_message()
+                            .expect("successful agent outcome must stage a final message");
+                        Record::FinalMessage {
+                            step_id: self.current_step_id(),
+                            text: final_message.text().to_owned(),
+                        }
+                    }
+                    Err(error) if error.is_cancelled() => Record::CancelledRun,
                     Err(error) => Record::FailedRun {
                         message: error.to_string(),
                     },
                 };
+                self.agent = Some(agent);
                 self.append_record(events, run_id, record);
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;

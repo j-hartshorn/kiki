@@ -96,7 +96,9 @@ impl OpenAiModel {
                     }
                     input.extend(replay);
                     let output = match completed.result() {
-                        CodeResult::Execution { feedback } => feedback,
+                        CodeResult::Execution { feedback }
+                        | CodeResult::Cancelled { feedback }
+                        | CodeResult::Failure { feedback } => feedback,
                     };
                     input.push(json!({
                         "type": "function_call_output",
