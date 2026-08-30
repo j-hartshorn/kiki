@@ -1137,6 +1137,7 @@ mod tests {
                 self.next_action += 1;
                 Ok(ModelStep {
                     action,
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1243,6 +1244,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1276,6 +1278,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1310,6 +1313,7 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1344,6 +1348,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
                 })
@@ -1400,6 +1405,7 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })

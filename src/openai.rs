@@ -105,7 +105,11 @@ impl OpenAiModel {
                         "output": output
                     }));
                 }
-                ModelContextEntry::FinalMessage { text, replay } => {
+                ModelContextEntry::FinalMessage {
+                    text,
+                    reasoning_summary: _,
+                    replay,
+                } => {
                     let replay = replay_values(replay)?;
                     match validate_replay_output(&replay)? {
                         ValidatedAction::Message { text: replay_text } if replay_text == *text => {}
@@ -604,8 +608,10 @@ impl OpenAiModel {
                 "completed response contained terminal failure details",
             ));
         }
+        let validated_action = validate_output(&response.output)?;
         content.account_output(&response.output)?;
-        let action = match validate_output(&response.output)? {
+        let reasoning_summary = readable_reasoning_summary(&response.output);
+        let action = match validated_action {
             ValidatedAction::Code { source, call_id } => {
                 if history.contains_call_id(&call_id) {
                     return Err(ModelError::InvalidResponse(
@@ -626,6 +632,7 @@ impl OpenAiModel {
         );
         Ok(ModelStep {
             action,
+            reasoning_summary,
             replay,
             attempts: Vec::new(),
         })
@@ -674,6 +681,23 @@ fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
                 .map_err(|_| ModelError::InvalidHistory("opaque OpenAI replay is malformed"))
         })
         .collect()
+}
+
+fn readable_reasoning_summary(output: &[Value]) -> String {
+    let mut summary = String::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    summary.push_str(text);
+                }
+            }
+        }
+    }
+    summary
 }
 
 fn validate_replay_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
@@ -2629,6 +2653,7 @@ mod tests {
             let mut invalid_history = ModelHistory::new("read files exactly");
             invalid_history.append_final_message(
                 "answer".to_owned(),
+                String::new(),
                 ProviderReplay::new("other", Vec::new()),
             );
             let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
@@ -2975,6 +3000,48 @@ mod tests {
                     },
                 ]
             );
+        }
+
+        #[tokio::test]
+        async fn terminal_reasoning_summary_is_authoritative_over_streamed_progress() {
+            for (streamed, expected_progress) in [
+                (
+                    vec![json!({
+                        "type": "response.reasoning_summary_text.delta",
+                        "sequence_number": 1,
+                        "item_id": "rs_1",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "streamed"
+                    })],
+                    "streamed",
+                ),
+                (Vec::new(), ""),
+            ] {
+                let mut events = streamed;
+                events.push(completed_event(
+                    2,
+                    vec![
+                        reasoning("rs_1", "terminal"),
+                        function_call(r#"{"code":"print(1)"}"#),
+                    ],
+                ));
+                let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream(events))).await;
+
+                let (result, progress) = step(&fixture, &history()).await;
+
+                assert_eq!(result.unwrap().reasoning_summary, "terminal");
+                assert_eq!(
+                    progress
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelProgress::ReasoningSummaryChunk { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    expected_progress
+                );
+            }
         }
 
         #[test]
@@ -3889,13 +3956,11 @@ mod tests {
                     call_id: ModelCallId::new("call_1")
                 }
             );
+            assert_eq!(completed.reasoning_summary, "Checking");
             assert_eq!(completed.replay.provider(), "openai");
             assert_eq!(completed.replay.items().len(), 2);
             for (opaque, expected) in completed.replay.items().iter().zip(&output) {
-                assert_eq!(
-                    serde_json::from_slice::<Value>(opaque.as_bytes()).unwrap(),
-                    *expected
-                );
+                assert_eq!(opaque.as_bytes(), serde_json::to_vec(expected).unwrap());
             }
             assert_eq!(completed.attempts, vec![expected_accounting()]);
 
@@ -3915,6 +3980,82 @@ mod tests {
                     json!([{"role": "user", "content": "inspect this project"}])
                 )
             );
+        }
+
+        #[tokio::test]
+        async fn returns_reasoning_summary_parts_in_terminal_provider_order() {
+            let output = vec![
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "first "},
+                        {"type": "summary_text", "text": "second "}
+                    ],
+                    "encrypted_content": "encrypted-first",
+                    "status": "completed"
+                }),
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [
+                        {"type": "summary_text", "text": "third"}
+                    ],
+                    "encrypted_content": "encrypted-second",
+                    "status": "completed"
+                }),
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#),
+            ];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output.clone(),
+                Some(usage()),
+            )))
+            .await;
+
+            let completed = step(&fixture, &history("inspect")).await.unwrap();
+
+            assert_eq!(completed.reasoning_summary, "first second third");
+            for (opaque, expected) in completed.replay.items().iter().zip(output) {
+                assert_eq!(opaque.as_bytes(), serde_json::to_vec(&expected).unwrap());
+            }
+        }
+
+        #[tokio::test]
+        async fn returns_an_empty_summary_without_reasoning_or_with_an_empty_summary() {
+            for output in [
+                vec![function_call(
+                    "fc_1",
+                    "call_1",
+                    "execute_python",
+                    r#"{"code":"print(1)"}"#,
+                )],
+                vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "encrypted_content": "encrypted",
+                        "status": "completed"
+                    }),
+                    function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#),
+                ],
+            ] {
+                let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                    "completed",
+                    output,
+                    Some(usage()),
+                )))
+                .await;
+
+                assert_eq!(
+                    step(&fixture, &history("inspect"))
+                        .await
+                        .unwrap()
+                        .reasoning_summary,
+                    ""
+                );
+            }
         }
 
         #[tokio::test]
@@ -3958,13 +4099,18 @@ mod tests {
                 .append_completed_code(
                     "1 + 1".to_owned(),
                     ModelCallId::new("call_1"),
+                    "First".to_owned(),
                     replay(&code_output),
                     CodeResult::Execution {
                         feedback: "2".to_owned(),
                     },
                 )
                 .unwrap();
-            history.append_final_message("first answer".to_owned(), replay(&message_output));
+            history.append_final_message(
+                "first answer".to_owned(),
+                "Second".to_owned(),
+                replay(&message_output),
+            );
             history.append_user_request("second request");
             let returned_output = vec![
                 reasoning("rs_3", "Third", "encrypted-third"),
@@ -3998,6 +4144,7 @@ mod tests {
                     text: "second answer".to_owned()
                 }
             );
+            assert_eq!(completed.reasoning_summary, "Third");
             assert_eq!(
                 completed.attempts,
                 vec![AttemptAccounting::UsageUnavailable]
@@ -4090,6 +4237,25 @@ mod tests {
                     "content": [{"type": "input_text", "text": "wrong"}],
                     "status": "completed"
                 })],
+                vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_missing_summary",
+                        "encrypted_content": "encrypted",
+                        "status": "completed"
+                    }),
+                    message("msg_1", "answer"),
+                ],
+                vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_malformed_summary",
+                        "summary": [{"type": "summary_text"}],
+                        "encrypted_content": "encrypted",
+                        "status": "completed"
+                    }),
+                    message("msg_1", "answer"),
+                ],
                 vec![
                     json!({
                         "type": "reasoning",
@@ -4257,6 +4423,7 @@ mod tests {
                 .append_completed_code(
                     "1".to_owned(),
                     ModelCallId::new("call_duplicate"),
+                    String::new(),
                     replay(&prior_output),
                     CodeResult::Execution {
                         feedback: "1".to_owned(),
@@ -4395,6 +4562,7 @@ mod tests {
             let mut provider_mismatch = history("first request");
             provider_mismatch.append_final_message(
                 "answer".to_owned(),
+                String::new(),
                 ProviderReplay::new(
                     "other-provider",
                     vec![OpaqueReplayItem::new(b"{}".to_vec())],
@@ -4405,6 +4573,7 @@ mod tests {
             let mut malformed_json = history("first request");
             malformed_json.append_final_message(
                 "answer".to_owned(),
+                String::new(),
                 ProviderReplay::new("openai", vec![OpaqueReplayItem::new(b"not json".to_vec())]),
             );
             malformed_json.append_user_request("continue");
@@ -4412,8 +4581,11 @@ mod tests {
             let mut semantically_malformed = history("first request");
             let mut non_assistant_message = message("msg_1", "answer");
             non_assistant_message["role"] = json!("user");
-            semantically_malformed
-                .append_final_message("answer".to_owned(), replay(&[non_assistant_message]));
+            semantically_malformed.append_final_message(
+                "answer".to_owned(),
+                String::new(),
+                replay(&[non_assistant_message]),
+            );
             semantically_malformed.append_user_request("continue");
 
             let code_replay = replay(&[function_call(
@@ -4427,6 +4599,7 @@ mod tests {
                 .append_completed_code(
                     "2 + 2".to_owned(),
                     ModelCallId::new("call_1"),
+                    String::new(),
                     code_replay.clone(),
                     CodeResult::Execution {
                         feedback: "2".to_owned(),
@@ -4440,6 +4613,7 @@ mod tests {
                 .append_completed_code(
                     "1 + 1".to_owned(),
                     ModelCallId::new("call_2"),
+                    String::new(),
                     code_replay,
                     CodeResult::Execution {
                         feedback: "2".to_owned(),
@@ -4451,6 +4625,7 @@ mod tests {
             let mut text_mismatch = history("first request");
             text_mismatch.append_final_message(
                 "different answer".to_owned(),
+                String::new(),
                 replay(&[message("msg_1", "answer")]),
             );
             text_mismatch.append_user_request("continue");

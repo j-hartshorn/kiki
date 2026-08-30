@@ -113,6 +113,7 @@ impl FinalMessage {
 
 struct StagedFinalMessage {
     final_message: FinalMessage,
+    reasoning_summary: String,
     replay: ProviderReplay,
 }
 
@@ -368,6 +369,7 @@ impl AgentError {
 struct PendingCode {
     source: String,
     call_id: ModelCallId,
+    reasoning_summary: String,
     replay: ProviderReplay,
 }
 
@@ -377,7 +379,13 @@ impl PendingCode {
         history: &mut ModelHistory,
         result: CodeResult,
     ) -> Result<(), ModelHistoryError> {
-        history.append_completed_code(self.source, self.call_id, self.replay, result)
+        history.append_completed_code(
+            self.source,
+            self.call_id,
+            self.reasoning_summary,
+            self.replay,
+            result,
+        )
     }
 }
 
@@ -411,13 +419,17 @@ impl<M: Model> Agent<M> {
     pub fn admit_staged_final_message(&mut self) -> Result<FinalMessage, AgentError> {
         let StagedFinalMessage {
             final_message,
+            reasoning_summary,
             replay,
         } = self
             .staged_final_message
             .take()
             .ok_or(AgentError::NoStagedFinalMessage)?;
-        self.model_context
-            .append_final_message(final_message.text.clone(), replay);
+        self.model_context.append_final_message(
+            final_message.text.clone(),
+            reasoning_summary,
+            replay,
+        );
         Ok(final_message)
     }
 
@@ -481,6 +493,7 @@ impl<M: Model> Agent<M> {
             };
             let ModelStep {
                 action,
+                reasoning_summary,
                 replay,
                 attempts: step_attempts,
             } = model_step;
@@ -501,6 +514,7 @@ impl<M: Model> Agent<M> {
                     let pending = PendingCode {
                         source,
                         call_id,
+                        reasoning_summary,
                         replay,
                     };
                     if cancellation.is_cancelled() {
@@ -600,6 +614,7 @@ impl<M: Model> Agent<M> {
                             text,
                             attempts,
                         },
+                        reasoning_summary,
                         replay,
                     });
                     return Ok(AgentRunOutcome::FinalMessageStaged);
@@ -999,6 +1014,98 @@ mod tests {
         ));
     }
 
+    struct CompletedSummaryModel {
+        step: u8,
+    }
+
+    impl Model for CompletedSummaryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let (action, reasoning_summary) = match self.step {
+                    0 => (
+                        CompletedModelAction::Code {
+                            source: "1 + 1".to_owned(),
+                            call_id: ModelCallId::new("summary-code"),
+                        },
+                        "code summary".to_owned(),
+                    ),
+                    1 => (
+                        CompletedModelAction::Message {
+                            text: "done".to_owned(),
+                        },
+                        "message summary".to_owned(),
+                    ),
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary,
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_admits_completed_summaries_without_streamed_progress() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent_with_model(&workspace, CompletedSummaryModel { step: 0 }).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        {
+            let mut capture = |event| progress.push(event);
+            assert_eq!(
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+        }
+
+        assert!(
+            !progress
+                .iter()
+                .any(|event| matches!(event, AgentProgress::ModelProgress(_)))
+        );
+        let completed = agent
+            .model_context
+            .entries()
+            .iter()
+            .find_map(ModelContextEntry::completed_code)
+            .expect("completed code should be admitted with its result");
+        assert_eq!(completed.call_id().as_str(), "summary-code");
+        assert_eq!(completed.reasoning_summary(), "code summary");
+        assert!(matches!(completed.result(), CodeResult::Execution { .. }));
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
+
+        assert_eq!(agent.admit_staged_final_message().unwrap().text(), "done");
+        assert!(matches!(
+            agent.model_context.entries().last(),
+            Some(ModelContextEntry::FinalMessage {
+                text,
+                reasoning_summary,
+                ..
+            }) if text == "done" && reasoning_summary == "message summary"
+        ));
+    }
+
     struct MessageWithAccountingModel;
 
     impl Model for MessageWithAccountingModel {
@@ -1015,6 +1122,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
                 })
@@ -1439,6 +1547,7 @@ mod tests {
                 cancellation.cancel();
                 Ok(ModelStep {
                     action: self.action.clone(),
+                    reasoning_summary: String::new(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -2061,8 +2170,11 @@ mod tests {
         assert!(second_request_context.iter().any(|entry| {
             matches!(
                 entry,
-                ModelContextEntry::FinalMessage { text, replay }
-                    if text == "I inspected Cargo.toml."
+                ModelContextEntry::FinalMessage {
+                    text,
+                    reasoning_summary: _,
+                    replay,
+                } if text == "I inspected Cargo.toml."
                         && replay.provider() == "scripted"
                         && replay.items().len() == 1
             )

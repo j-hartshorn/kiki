@@ -25,6 +25,7 @@ pub enum ModelAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStep {
     pub action: ModelAction,
+    pub reasoning_summary: String,
     pub replay: ProviderReplay,
     pub attempts: Vec<AttemptAccounting>,
 }
@@ -140,6 +141,7 @@ impl CodeResult {
 pub struct CompletedCode {
     source: String,
     call_id: ModelCallId,
+    reasoning_summary: String,
     replay: ProviderReplay,
     result: CodeResult,
 }
@@ -151,6 +153,10 @@ impl CompletedCode {
 
     pub fn call_id(&self) -> &ModelCallId {
         &self.call_id
+    }
+
+    pub fn reasoning_summary(&self) -> &str {
+        &self.reasoning_summary
     }
 
     pub fn replay(&self) -> &ProviderReplay {
@@ -173,6 +179,7 @@ pub enum ModelContextEntry {
     CompletedCode(CompletedCode),
     FinalMessage {
         text: String,
+        reasoning_summary: String,
         replay: ProviderReplay,
     },
 }
@@ -213,6 +220,7 @@ impl ModelHistory {
         &mut self,
         source: String,
         call_id: ModelCallId,
+        reasoning_summary: String,
         replay: ProviderReplay,
         result: CodeResult,
     ) -> Result<(), ModelHistoryError> {
@@ -223,15 +231,24 @@ impl ModelHistory {
             .push(ModelContextEntry::CompletedCode(CompletedCode {
                 source,
                 call_id,
+                reasoning_summary,
                 replay,
                 result: result.bounded(),
             }));
         Ok(())
     }
 
-    pub fn append_final_message(&mut self, text: String, replay: ProviderReplay) {
-        self.entries
-            .push(ModelContextEntry::FinalMessage { text, replay });
+    pub fn append_final_message(
+        &mut self,
+        text: String,
+        reasoning_summary: String,
+        replay: ProviderReplay,
+    ) {
+        self.entries.push(ModelContextEntry::FinalMessage {
+            text,
+            reasoning_summary,
+            replay,
+        });
     }
 
     pub(crate) fn contains_call_id(&self, call_id: &ModelCallId) -> bool {
@@ -503,6 +520,7 @@ impl Model for ScriptedModel {
             };
             Ok(ModelStep {
                 action,
+                reasoning_summary: String::new(),
                 replay,
                 attempts: Vec::new(),
             })
@@ -575,6 +593,7 @@ mod tests {
         );
         assert_eq!(step.replay.provider(), "scripted");
         assert_eq!(step.replay.items()[0].as_bytes(), b"scripted-1-1");
+        assert_eq!(step.reasoning_summary, "");
         assert!(step.attempts.is_empty());
     }
 
@@ -636,6 +655,7 @@ mod tests {
             .append_completed_code(
                 "print(1)".to_owned(),
                 call_id.clone(),
+                "checked source".to_owned(),
                 replay("opaque-call"),
                 CodeResult::Execution {
                     feedback: "1".to_owned(),
@@ -650,6 +670,7 @@ mod tests {
             .expect("completed code entry");
         assert_eq!(completed.source(), "print(1)");
         assert_eq!(completed.call_id(), &call_id);
+        assert_eq!(completed.reasoning_summary(), "checked source");
         assert_eq!(completed.replay(), &replay("opaque-call"));
         assert_eq!(
             completed.result(),
@@ -662,6 +683,7 @@ mod tests {
             .append_completed_code(
                 "print(2)".to_owned(),
                 call_id.clone(),
+                String::new(),
                 replay("other-call"),
                 CodeResult::Execution {
                     feedback: "2".to_owned(),
@@ -671,6 +693,25 @@ mod tests {
 
         assert_eq!(error, ModelHistoryError::DuplicateCallId(call_id));
         assert_eq!(history.entries().len(), 3);
+    }
+
+    #[test]
+    fn final_message_history_stores_reasoning_summary_beside_opaque_replay() {
+        let mut history = history_with_request("inspect");
+        history.append_final_message(
+            "answer".to_owned(),
+            "checked result".to_owned(),
+            replay("opaque-message"),
+        );
+
+        assert_eq!(
+            history.entries().last(),
+            Some(&ModelContextEntry::FinalMessage {
+                text: "answer".to_owned(),
+                reasoning_summary: "checked result".to_owned(),
+                replay: replay("opaque-message"),
+            })
+        );
     }
 
     #[test]
@@ -688,6 +729,7 @@ mod tests {
                 .append_completed_code(
                     format!("code-{index}"),
                     ModelCallId::new(format!("call-{index}")),
+                    String::new(),
                     replay(&format!("opaque-{index}")),
                     result,
                 )
@@ -732,6 +774,7 @@ mod tests {
             .append_completed_code(
                 "code".to_owned(),
                 ModelCallId::new("call"),
+                String::new(),
                 replay("opaque"),
                 CodeResult::Failure {
                     feedback: "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2 + 1),
