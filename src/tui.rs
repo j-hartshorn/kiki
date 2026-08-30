@@ -58,6 +58,7 @@ struct App {
     transcript: Transcript,
     scroll_from_bottom: usize,
     history_height: usize,
+    history_rows: usize,
 }
 
 impl Default for App {
@@ -68,6 +69,7 @@ impl Default for App {
             transcript: Transcript::default(),
             scroll_from_bottom: 0,
             history_height: 0,
+            history_rows: 0,
         }
     }
 }
@@ -188,12 +190,7 @@ impl App {
     }
 
     fn update_scroll(&mut self, scroll_from_bottom: usize) -> Update {
-        let hidden_lines = self
-            .transcript
-            .history()
-            .lines()
-            .count()
-            .saturating_sub(self.history_height);
+        let hidden_lines = self.history_rows.saturating_sub(self.history_height);
         let scroll_from_bottom = scroll_from_bottom.min(hidden_lines);
         if self.scroll_from_bottom == scroll_from_bottom {
             Update::default()
@@ -392,23 +389,24 @@ fn render(frame: &mut Frame, app: &mut App) {
     } else if app.transcript.is_disabled() {
         format!(
             "Status: {} | Input disabled | Ctrl-C quit | Up/Down scroll",
-            normalise_terminal_text(app.transcript.status())
+            app.transcript.status()
         )
     } else {
         format!(
             "Status: {} | Enter submit | Esc cancel | Ctrl-C quit | Up/Down scroll",
-            normalise_terminal_text(app.transcript.status())
+            app.transcript.status()
         )
     };
     frame.render_widget(
-        Paragraph::new(header),
+        Paragraph::new(normalise_terminal_text(&header)),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
     if !configuration_only && area.height >= 2 {
         let prompt_y = area.y.saturating_add(area.height - 1);
+        let prompt = format!("> {}", app.prompt);
         frame.render_widget(
-            Paragraph::new(format!("> {}", normalise_terminal_text(&app.prompt))),
+            Paragraph::new(normalise_terminal_text(&prompt)),
             Rect::new(area.x, prompt_y, area.width, 1),
         );
     }
@@ -418,16 +416,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let history = app.transcript.history();
-    let last_page_start = history
-        .lines()
-        .count()
-        .saturating_sub(history_height as usize);
-    let scroll = app.scroll_from_bottom.min(last_page_start);
-    let top = last_page_start.saturating_sub(scroll);
-    frame.render_widget(
-        Paragraph::new(history).scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
+    let layout = app.transcript.layout(area.width);
+    app.history_rows = layout.total_height();
+    let last_page_start = app.history_rows.saturating_sub(usize::from(history_height));
+    app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
+    let top = last_page_start.saturating_sub(app.scroll_from_bottom);
+    layout.render(
         Rect::new(area.x, area.y.saturating_add(1), area.width, history_height),
+        top,
+        frame.buffer_mut(),
     );
 }
 
@@ -441,6 +438,7 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::App;
@@ -469,6 +467,13 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::render(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
     }
 
     fn observation(text: &str) -> Observation {
@@ -761,8 +766,8 @@ mod tests {
         let screen = rendered(&mut app, 60, 8);
 
         assert!(screen.starts_with("Status: idle"));
-        let request = screen.find("[run 1] you: inspect").unwrap();
-        let final_message = screen.find("[run 1 step 2] kiki: finished").unwrap();
+        let request = screen.find("you: inspect").unwrap();
+        let final_message = screen.find("finished").unwrap();
         assert!(request < final_message);
         assert!(screen.contains("> "));
     }
@@ -798,6 +803,121 @@ mod tests {
 
         app.handle_key(key(KeyCode::End));
         assert!(rendered(&mut app, 40, 5).contains("request 8"));
+    }
+
+    #[test]
+    fn transcript_scrolling_uses_wrapped_rows() {
+        let mut app = App::default();
+        for (run_id, request) in [
+            (1, "older first second third"),
+            (2, "newer first second third"),
+        ] {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: request.to_owned(),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+
+        rendered(&mut app, 12, 5);
+        assert!(app.history_rows > 2);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
+        assert_eq!(app.scroll_from_bottom, 1);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert_eq!(
+            app.scroll_from_bottom,
+            app.history_rows.saturating_sub(app.history_height)
+        );
+        assert!(app.handle_key(key(KeyCode::End)).visible_changed);
+        assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn transcript_scrolling_survives_temporarily_non_renderable_history() {
+        let mut app = App::default();
+        for run_id in 1..=4 {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: "first second third fourth".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+        rendered(&mut app, 12, 5);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let manual_scroll = app.scroll_from_bottom;
+        let measured_rows = app.history_rows;
+        assert!(manual_scroll > 0);
+
+        for (width, height) in [(0, 0), (1, 2)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+            assert_eq!(app.history_rows, measured_rows);
+            assert_eq!(app.scroll_from_bottom, manual_scroll);
+        }
+
+        rendered(&mut app, 12, 5);
+        assert_eq!(app.scroll_from_bottom, manual_scroll);
+        rendered(&mut app, 120, 5);
+        assert_eq!(
+            app.scroll_from_bottom,
+            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+    }
+
+    #[test]
+    fn transcript_scrolling_clamps_after_authoritative_replacement() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "long live content ".repeat(40),
+            },
+        });
+        rendered(&mut app, 20, 6);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let manual_scroll = app.scroll_from_bottom;
+        assert!(manual_scroll > 0);
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "done".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered(&mut app, 20, 6);
+
+        assert_eq!(
+            app.scroll_from_bottom,
+            app.history_rows.saturating_sub(app.history_height)
+        );
+        assert!(app.scroll_from_bottom < manual_scroll);
+        let replacement_scroll = app.scroll_from_bottom;
+        rendered(&mut app, 120, 6);
+        assert_eq!(
+            app.scroll_from_bottom,
+            app.history_rows.saturating_sub(app.history_height)
+        );
+        assert!(app.scroll_from_bottom <= replacement_scroll);
     }
 
     #[test]
@@ -913,6 +1033,28 @@ mod tests {
         );
 
         assert!(matches!(result, Err(super::TuiError::RuntimeClosed)));
+    }
+
+    #[test]
+    fn transcript_live_markdown_uses_markdown_styles() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "# BoldHeading".to_owned(),
+            },
+        });
+
+        let buffer = rendered_buffer(&mut app, 40, 8);
+        assert!(buffer.content.iter().any(|cell| {
+            cell.symbol() == "B"
+                && cell
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        }));
     }
 
     #[test]
@@ -1102,7 +1244,7 @@ mod tests {
         assert!(history.contains("result: 42"));
         assert!(history.contains("error: boom"));
         assert!(!history.contains("stderr: \n"));
-        assert!(history.contains("source: await read(path)"));
+        assert!(history.contains("await read(path)"));
         assert!(history.contains("stderr: diagnostic"));
         assert!(history.contains("read: completed bad    path failed: read failed"));
         assert!(history.contains("failure: interrupted"));
@@ -1127,8 +1269,8 @@ mod tests {
             progress_gap: false,
         });
         let generation_history = rendered(&mut generation, 120, 40);
-        assert!(generation_history.contains("reasoning: interrupted reasoning"));
-        assert!(generation_history.contains("assistant: interrupted assistant"));
+        assert!(generation_history.contains("interrupted reasoning"));
+        assert!(generation_history.contains("interrupted assistant"));
         assert!(generation_history.contains("code:"));
         assert!(generation_history.contains("interrupted_code()"));
     }
@@ -1238,11 +1380,13 @@ mod tests {
                 text: "live".to_owned(),
             },
         });
+        rendered(&mut app, 50, 5);
         assert_eq!(app.scroll_from_bottom, 0);
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
         let manual_scroll = app.scroll_from_bottom;
         app.handle_event(completed_record(2, 5, "settled", vec![]));
+        rendered(&mut app, 50, 5);
         assert_eq!(app.scroll_from_bottom, manual_scroll);
     }
 
