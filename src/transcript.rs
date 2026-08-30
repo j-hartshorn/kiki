@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::text::Text;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
 
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome};
 use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
+use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress};
 use crate::pricing::{CostEstimate, RunCostEstimate, estimate_run_cost, estimate_usage};
 use crate::runtime::{
@@ -123,11 +124,20 @@ enum TranscriptBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArenaBlock {
+    state: ArenaState,
     title: String,
+    status: Option<String>,
     source: Option<String>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
     metadata: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArenaState {
+    InProgress,
+    Complete,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +159,9 @@ enum NormalisedBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalisedArenaBlock {
+    state: ArenaState,
     title: String,
+    status: Option<String>,
     source: Option<String>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
@@ -176,7 +188,9 @@ impl TranscriptBlock {
                 markdown: normalise_terminal_text(&markdown),
             },
             Self::Arena(arena) => NormalisedBlock::Arena(NormalisedArenaBlock {
+                state: arena.state,
                 title: normalise_terminal_text(&arena.title),
+                status: arena.status.map(|status| normalise_terminal_text(&status)),
                 source: arena.source.map(|source| normalise_terminal_text(&source)),
                 content: arena
                     .content
@@ -209,6 +223,168 @@ impl TranscriptBlock {
     }
 }
 
+const PAGE: Color = Color::Rgb(24, 24, 30);
+const TEXT: Color = Color::Rgb(212, 212, 212);
+const MUTED: Color = Color::Rgb(128, 128, 128);
+const DIM: Color = Color::Rgb(102, 102, 102);
+const USER: Color = Color::Rgb(52, 53, 65);
+const IN_PROGRESS_ARENA: Color = Color::Rgb(40, 40, 50);
+const COMPLETE_ARENA: Color = Color::Rgb(40, 50, 40);
+const ERROR_ARENA: Color = Color::Rgb(60, 40, 40);
+const REASONING: Color = Color::Rgb(30, 30, 36);
+
+pub(crate) fn page_style() -> Style {
+    Style::reset().fg(TEXT).bg(PAGE)
+}
+
+fn card_style(background: Color) -> Style {
+    Style::reset().fg(TEXT).bg(background)
+}
+
+fn muted_card_style(background: Color) -> Style {
+    Style::reset().fg(MUTED).bg(background)
+}
+
+fn dim_card_style(background: Color) -> Style {
+    Style::reset().fg(DIM).bg(background)
+}
+
+fn effective_padding(width: u16, wanted: u16) -> (u16, u16) {
+    let total = wanted.saturating_mul(2).min(width.saturating_sub(1));
+    let left = wanted.min(total.saturating_add(1) / 2);
+    (left, total.saturating_sub(left))
+}
+
+fn logical_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect()
+}
+
+fn code_preview(source: &str, expanded: bool) -> (String, Option<usize>) {
+    let lines = logical_lines(source);
+    if expanded || lines.len() <= 32 {
+        return (source.to_owned(), None);
+    }
+    (lines[..32].join("\n"), Some(lines.len() - 32))
+}
+
+fn execution_lines(content: &[ArenaContent]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for section in content {
+        for (index, line) in logical_lines(&section.text).into_iter().enumerate() {
+            if index == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}: ", section.label), Style::new().fg(MUTED)),
+                    Span::raw(line.to_owned()),
+                ]));
+            } else {
+                lines.push(Line::raw(line.to_owned()));
+            }
+        }
+    }
+    lines
+}
+
+fn execution_preview(content: &[ArenaContent], expanded: bool) -> Vec<Line<'static>> {
+    let lines = execution_lines(content);
+    if expanded || lines.len() <= 16 {
+        return lines;
+    }
+    let omitted = lines.len() - 16;
+    let mut preview = vec![Line::styled(
+        format!("[{omitted} execution lines omitted]"),
+        Style::new().fg(DIM),
+    )];
+    preview.extend(lines.into_iter().skip(omitted));
+    preview
+}
+
+fn text_style(style: Style) -> Style {
+    Style::new()
+        .fg(style.fg.unwrap_or(Color::Reset))
+        .bg(style.bg.unwrap_or(Color::Reset))
+        .add_modifier(style.add_modifier)
+}
+
+fn own_styled_text(text: Text<'_>, style: Style) -> Text<'static> {
+    let base_style = text_style(style);
+    Text {
+        alignment: text.alignment,
+        style: base_style,
+        lines: text
+            .lines
+            .into_iter()
+            .map(|line| Line {
+                style: base_style.patch(line.style),
+                alignment: line.alignment,
+                spans: line
+                    .spans
+                    .into_iter()
+                    .map(|span| {
+                        Span::styled(span.content.into_owned(), base_style.patch(span.style))
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn arena_text(
+    arena: NormalisedArenaBlock,
+    expanded: bool,
+    highlighter: &mut PythonHighlighter,
+    style: Style,
+) -> Text<'static> {
+    let mut lines = vec![Line::styled(
+        arena.title,
+        muted_card_style(style.bg.unwrap_or(PAGE)),
+    )];
+    if let Some(status) = arena.status {
+        lines.push(Line::styled(
+            status,
+            muted_card_style(style.bg.unwrap_or(PAGE)),
+        ));
+    }
+    if arena.progress_gap {
+        lines.push(Line::styled(
+            "display gap: some live progress was dropped",
+            dim_card_style(style.bg.unwrap_or(PAGE)),
+        ));
+    }
+    if let Some(source) = arena.source {
+        lines.push(Line::styled(
+            "code:",
+            muted_card_style(style.bg.unwrap_or(PAGE)),
+        ));
+        let (preview, omitted) = code_preview(&source, expanded);
+        lines.extend(own_styled_text(highlighter.highlight(&preview), style).lines);
+        if let Some(omitted) = omitted {
+            lines.push(Line::styled(
+                format!("[{omitted} code lines omitted]"),
+                dim_card_style(style.bg.unwrap_or(PAGE)),
+            ));
+        }
+    }
+    lines.extend(execution_preview(&arena.content, expanded));
+    lines.extend(
+        arena
+            .metadata
+            .into_iter()
+            .map(|line| Line::styled(line, dim_card_style(style.bg.unwrap_or(PAGE)))),
+    );
+    Text {
+        alignment: None,
+        style: text_style(style),
+        lines,
+    }
+}
+
+#[cfg(test)]
 impl NormalisedBlock {
     fn paragraph(&self) -> Paragraph<'_> {
         let text = match self {
@@ -238,9 +414,13 @@ impl NormalisedBlock {
     }
 }
 
+#[cfg(test)]
 impl NormalisedArenaBlock {
     fn plain_text(&self) -> String {
         let mut lines = vec![self.title.clone()];
+        if let Some(status) = &self.status {
+            lines.push(status.clone());
+        }
         if let Some(source) = &self.source {
             lines.push(format!("code:\n{source}"));
         }
@@ -255,13 +435,98 @@ impl NormalisedArenaBlock {
     }
 }
 
-struct LaidOutBlock {
-    block: NormalisedBlock,
+struct RenderBlock {
+    text: Text<'static>,
+    style: Style,
+    left_padding: u16,
+    right_padding: u16,
+    top_padding: u16,
+    bottom_padding: u16,
     height: usize,
 }
 
+impl RenderBlock {
+    fn new(
+        text: Text<'static>,
+        style: Style,
+        width: u16,
+        horizontal_padding: u16,
+        vertical_padding: u16,
+    ) -> Self {
+        let (left_padding, right_padding) = effective_padding(width, horizontal_padding);
+        let content_width = width.saturating_sub(left_padding.saturating_add(right_padding));
+        let content_height = if content_width > 0 {
+            Paragraph::new(text.clone())
+                .style(style)
+                .wrap(Wrap { trim: false })
+                .line_count(content_width)
+        } else {
+            0
+        };
+        Self {
+            text,
+            style,
+            left_padding,
+            right_padding,
+            top_padding: vertical_padding,
+            bottom_padding: vertical_padding,
+            height: content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2)),
+        }
+    }
+
+    fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
+        let block_bottom = block_top.saturating_add(self.height);
+        let visible_top = block_top.max(top);
+        let visible_bottom = block_bottom.min(top.saturating_add(usize::from(viewport.height)));
+        if visible_top >= visible_bottom {
+            return;
+        }
+        let y = viewport
+            .y
+            .saturating_add(u16::try_from(visible_top.saturating_sub(top)).unwrap_or(u16::MAX));
+        let height = u16::try_from(visible_bottom.saturating_sub(visible_top)).unwrap_or(u16::MAX);
+        let visible = Rect::new(viewport.x, y, viewport.width, height);
+        buffer.set_style(visible, self.style);
+
+        let text_top = block_top.saturating_add(usize::from(self.top_padding));
+        let text_bottom = block_bottom.saturating_sub(usize::from(self.bottom_padding));
+        let visible_text_top = visible_top.max(text_top);
+        let visible_text_bottom = visible_bottom.min(text_bottom);
+        if visible_text_top >= visible_text_bottom {
+            return;
+        }
+        let text_y = viewport.y.saturating_add(
+            u16::try_from(visible_text_top.saturating_sub(top)).unwrap_or(u16::MAX),
+        );
+        let text_height =
+            u16::try_from(visible_text_bottom.saturating_sub(visible_text_top)).unwrap_or(u16::MAX);
+        let text_width = viewport
+            .width
+            .saturating_sub(self.left_padding.saturating_add(self.right_padding));
+        if text_width == 0 {
+            return;
+        }
+        Paragraph::new(self.text.clone())
+            .style(self.style)
+            .wrap(Wrap { trim: false })
+            .scroll((
+                u16::try_from(visible_text_top.saturating_sub(text_top)).unwrap_or(u16::MAX),
+                0,
+            ))
+            .render(
+                Rect::new(
+                    viewport.x.saturating_add(self.left_padding),
+                    text_y,
+                    text_width,
+                    text_height,
+                ),
+                buffer,
+            );
+    }
+}
+
 pub(crate) struct TranscriptLayout {
-    blocks: Vec<LaidOutBlock>,
+    blocks: Vec<RenderBlock>,
     total_height: usize,
 }
 
@@ -271,38 +536,17 @@ impl TranscriptLayout {
     }
 
     pub(crate) fn render(&self, viewport: Rect, top: usize, buffer: &mut Buffer) {
-        let viewport_height = usize::from(viewport.height);
-        if viewport.width == 0 || viewport_height == 0 {
+        if viewport.width == 0 || viewport.height == 0 {
             return;
         }
-        let bottom = top.saturating_add(viewport_height);
+        buffer.set_style(viewport, page_style());
         let mut block_top = 0_usize;
-        for laid_out in &self.blocks {
-            let block_bottom = block_top.saturating_add(laid_out.height);
-            if block_bottom <= top {
-                block_top = block_bottom;
-                continue;
-            }
-            if block_top >= bottom {
+        for block in &self.blocks {
+            if block_top >= top.saturating_add(usize::from(viewport.height)) {
                 break;
             }
-
-            let visible_top = block_top.max(top);
-            let visible_bottom = block_bottom.min(bottom);
-            let y = viewport
-                .y
-                .saturating_add(u16::try_from(visible_top.saturating_sub(top)).unwrap_or(u16::MAX));
-            let height =
-                u16::try_from(visible_bottom.saturating_sub(visible_top)).unwrap_or(u16::MAX);
-            laid_out
-                .block
-                .paragraph()
-                .scroll((
-                    u16::try_from(visible_top.saturating_sub(block_top)).unwrap_or(u16::MAX),
-                    0,
-                ))
-                .render(Rect::new(viewport.x, y, viewport.width, height), buffer);
-            block_top = block_bottom;
+            block.render(viewport, top, block_top, buffer);
+            block_top = block_top.saturating_add(block.height);
         }
     }
 }
@@ -318,6 +562,9 @@ pub(crate) struct Transcript {
     status: String,
     records: Vec<DisplayedRecord>,
     live_step: Option<LiveStep>,
+    show_reasoning: bool,
+    expand_arenas: bool,
+    highlighter: PythonHighlighter,
 }
 
 impl Default for Transcript {
@@ -333,6 +580,9 @@ impl Default for Transcript {
             status: "idle".to_owned(),
             records: Vec::new(),
             live_step: None,
+            show_reasoning: true,
+            expand_arenas: false,
+            highlighter: PythonHighlighter::new(),
         }
     }
 }
@@ -491,16 +741,92 @@ impl Transcript {
         }
     }
 
-    pub(crate) fn layout(&self, width: u16) -> TranscriptLayout {
-        let blocks = self
-            .blocks()
-            .into_iter()
-            .map(TranscriptBlock::normalise)
-            .map(|block| {
-                let height = block.paragraph().line_count(width);
-                LaidOutBlock { block, height }
-            })
-            .collect::<Vec<_>>();
+    pub(crate) fn toggle_reasoning(&mut self) -> bool {
+        self.show_reasoning = !self.show_reasoning;
+        self.blocks()
+            .iter()
+            .any(|block| matches!(block, TranscriptBlock::Reasoning { .. }))
+    }
+
+    pub(crate) fn toggle_arena_expansion(&mut self) -> bool {
+        self.expand_arenas = !self.expand_arenas;
+        self.blocks()
+            .iter()
+            .any(|block| matches!(block, TranscriptBlock::Arena(..)))
+    }
+
+    pub(crate) fn layout(&mut self, width: u16) -> TranscriptLayout {
+        let mut blocks = Vec::new();
+        for block in self.blocks().into_iter().map(TranscriptBlock::normalise) {
+            let render_block = match block {
+                NormalisedBlock::Startup { lines } | NormalisedBlock::Metadata { lines } => {
+                    RenderBlock::new(
+                        own_styled_text(Text::raw(lines.join("\n")), page_style()),
+                        page_style(),
+                        width,
+                        0,
+                        0,
+                    )
+                }
+                NormalisedBlock::User {
+                    request,
+                    progress_gap,
+                } => {
+                    let mut lines = vec![format!("you: {request}")];
+                    append_display_gap(&mut lines, progress_gap);
+                    let style = card_style(USER);
+                    RenderBlock::new(
+                        own_styled_text(Text::raw(lines.join("\n")), style),
+                        style,
+                        width,
+                        1,
+                        1,
+                    )
+                }
+                NormalisedBlock::Reasoning { markdown: source } => {
+                    let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
+                    let text = if self.show_reasoning {
+                        own_styled_text(markdown(&source), style)
+                    } else {
+                        own_styled_text(
+                            Text::raw("reasoning hidden · Ctrl-T to show"),
+                            dim_card_style(REASONING).add_modifier(Modifier::ITALIC),
+                        )
+                    };
+                    RenderBlock::new(text, style, width, 2, 0)
+                }
+                NormalisedBlock::Arena(arena) => {
+                    let background = match arena.state {
+                        ArenaState::InProgress => IN_PROGRESS_ARENA,
+                        ArenaState::Complete => COMPLETE_ARENA,
+                        ArenaState::Error => ERROR_ARENA,
+                    };
+                    let style = card_style(background);
+                    RenderBlock::new(
+                        arena_text(arena, self.expand_arenas, &mut self.highlighter, style),
+                        style,
+                        width,
+                        1,
+                        1,
+                    )
+                }
+                NormalisedBlock::Assistant { markdown: source } => RenderBlock::new(
+                    own_styled_text(markdown(&source), page_style()),
+                    page_style(),
+                    width,
+                    0,
+                    0,
+                ),
+                NormalisedBlock::Status { text } => RenderBlock::new(
+                    own_styled_text(Text::raw(text), page_style()),
+                    page_style(),
+                    width,
+                    0,
+                    0,
+                ),
+            };
+            blocks.push(render_block);
+        }
         let total_height = blocks
             .iter()
             .fold(0_usize, |height, block| height.saturating_add(block.height));
@@ -802,7 +1128,9 @@ fn record_blocks(
             let mut blocks = Vec::new();
             append_reasoning(&mut blocks, reasoning_summary, "");
             blocks.push(TranscriptBlock::Arena(ArenaBlock {
+                state: arena_state(execution),
                 title: format!("[run {run_id} step {}]", step_id.0),
+                status: None,
                 source: Some(source.clone()),
                 content: execution_content(execution),
                 progress_gap: displayed.progress_gap,
@@ -886,14 +1214,15 @@ fn live_blocks(live: &LiveStep, prior_attempts: &[&AttemptAccounting]) -> Vec<Tr
                 text: "truncated".to_owned(),
             });
         }
-        metadata.insert(0, format!("activity: {}", live.activity));
         blocks.push(TranscriptBlock::Arena(ArenaBlock {
+            state: ArenaState::InProgress,
             title: format!(
                 "[run {} step {}] live: {}",
                 live.run_id.0,
                 live.step_id.0,
                 live.phase.label(),
             ),
+            status: Some(format!("activity: {}", live.activity)),
             source: (!live.decoded_python.is_empty()).then(|| live.decoded_python.clone()),
             content,
             progress_gap: live.progress_gap,
@@ -990,7 +1319,9 @@ fn terminal_evidence_blocks(
             let arena_index = (!decoded_python.is_empty()).then(|| {
                 let arena_index = blocks.len();
                 blocks.push(TranscriptBlock::Arena(ArenaBlock {
+                    state: ArenaState::Error,
                     title,
+                    status: None,
                     source: Some(decoded_python.clone()),
                     content: Vec::new(),
                     progress_gap: false,
@@ -1017,6 +1348,13 @@ fn terminal_evidence_blocks(
     }
 }
 
+fn arena_state(execution: &Execution) -> ArenaState {
+    match execution.outcome {
+        ExecutionOutcome::Complete { .. } => ArenaState::Complete,
+        ExecutionOutcome::PythonError(..) => ArenaState::Error,
+    }
+}
+
 fn execution_content(execution: &Execution) -> Vec<ArenaContent> {
     let mut content = Vec::new();
     append_observation(&mut content, "stdout", &execution.stdout);
@@ -1035,14 +1373,7 @@ fn execution_content(execution: &Execution) -> Vec<ArenaContent> {
 }
 
 fn execution_evidence_block(title: String, evidence: &ExecutionEvidence) -> ArenaBlock {
-    let mut content = vec![ArenaContent {
-        label: "execution",
-        text: if evidence.began {
-            "started".to_owned()
-        } else {
-            "not started".to_owned()
-        },
-    }];
+    let mut content = Vec::new();
     append_observation(&mut content, "stdout", &evidence.stdout);
     append_observation(&mut content, "stderr", &evidence.stderr);
     content.push(ArenaContent {
@@ -1062,7 +1393,16 @@ fn execution_evidence_block(title: String, evidence: &ExecutionEvidence) -> Aren
         });
     }
     ArenaBlock {
+        state: ArenaState::Error,
         title,
+        status: Some(format!(
+            "execution: {}",
+            if evidence.began {
+                "started"
+            } else {
+                "not started"
+            }
+        )),
         source: Some(evidence.source.clone()),
         content,
         progress_gap: false,
@@ -1237,13 +1577,15 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        ArenaBlock, ArenaContent, LaidOutBlock, NormalisedBlock, Transcript, TranscriptBlock,
-        TranscriptLayout, markdown, normalise_terminal_text,
+        ArenaBlock, ArenaContent, ArenaState, COMPLETE_ARENA, DIM, ERROR_ARENA, IN_PROGRESS_ARENA,
+        MUTED, NormalisedBlock, PAGE, REASONING, RenderBlock, TEXT, Transcript, TranscriptBlock,
+        TranscriptLayout, USER, markdown, normalise_terminal_text, own_styled_text, page_style,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadOutcome,
     };
+    use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::runtime::{
         ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
@@ -1338,16 +1680,55 @@ mod tests {
 
     fn rendered_text(transcript: &Transcript) -> String {
         transcript
-            .layout(u16::MAX)
-            .blocks
-            .iter()
-            .map(|laid_out| match &laid_out.block {
+            .blocks()
+            .into_iter()
+            .map(TranscriptBlock::normalise)
+            .map(|block| match &block {
                 NormalisedBlock::Reasoning { markdown: source }
                 | NormalisedBlock::Assistant { markdown: source } => markdown(source).to_string(),
                 block => block.plain_text(),
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_layout_text(transcript: &mut Transcript) -> String {
+        transcript
+            .layout(u16::MAX)
+            .blocks
+            .iter()
+            .map(|block| block.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rendered_buffer(transcript: &mut Transcript, width: u16) -> Buffer {
+        let layout = transcript.layout(width);
+        let height = u16::try_from(layout.total_height()).expect("test transcript height");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        layout.render(buffer.area, 0, &mut buffer);
+        buffer
+    }
+
+    fn row_containing(buffer: &Buffer, text: &str) -> usize {
+        (0..buffer.area.height as usize)
+            .find(|row| {
+                buffer.content
+                    [*row * buffer.area.width as usize..(*row + 1) * buffer.area.width as usize]
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .expect("rendered row")
+    }
+
+    fn assert_row_background(buffer: &Buffer, row: usize, background: Color) {
+        for cell in &buffer.content
+            [row * buffer.area.width as usize..(row + 1) * buffer.area.width as usize]
+        {
+            assert_eq!(cell.bg, background);
+        }
     }
 
     fn observation(text: &str) -> Observation {
@@ -1833,19 +2214,17 @@ mod tests {
         );
 
         let layout = transcript.layout(80);
-        let NormalisedBlock::Assistant { markdown: source } = layout
+        let assistant = layout
             .blocks
             .iter()
-            .find_map(|laid_out| match &laid_out.block {
-                NormalisedBlock::Assistant { .. } => Some(&laid_out.block),
-                _ => None,
-            })
-            .expect("settled assistant block")
-        else {
-            unreachable!("assistant block")
-        };
-        let rendered = markdown(source);
-        assert_eq!(rendered.lines[0].style, Style::new().bold());
+            .find(|block| block.text.to_string().contains("Settled heading"))
+            .expect("settled assistant block");
+        assert!(
+            assistant.text.lines[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1938,18 +2317,18 @@ mod tests {
         let live_markdown = live
             .blocks
             .iter()
-            .filter_map(|laid_out| match &laid_out.block {
-                NormalisedBlock::Reasoning { markdown: source }
-                | NormalisedBlock::Assistant { markdown: source } => Some(markdown(source)),
-                _ => None,
+            .filter(|block| {
+                let text = block.text.to_string();
+                text.contains("Live reasoning") || text.contains("Live assistant")
             })
             .collect::<Vec<_>>();
         assert_eq!(live_markdown.len(), 2);
-        assert!(
-            live_markdown
-                .iter()
-                .all(|text| text.lines[0].style == Style::new().bold())
-        );
+        assert!(live_markdown.iter().all(|block| {
+            block.text.lines[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        }));
 
         transcript.apply(
             completed_execution(1, 1, "print('settled')", "# Settled reasoning", Vec::new()),
@@ -1959,12 +2338,14 @@ mod tests {
         let settled_reasoning = settled_layout
             .blocks
             .iter()
-            .find_map(|laid_out| match &laid_out.block {
-                NormalisedBlock::Reasoning { markdown: source } => Some(markdown(source)),
-                _ => None,
-            })
+            .find(|block| block.text.to_string().contains("Settled reasoning"))
             .expect("settled reasoning");
-        assert_eq!(settled_reasoning.lines[0].style, Style::new().bold());
+        assert!(
+            settled_reasoning.text.lines[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         let settled = rendered_text(&transcript);
         assert!(settled.contains("Settled reasoning"));
         assert!(settled.contains("print('settled')"));
@@ -2029,8 +2410,8 @@ mod tests {
         };
         assert_eq!(arena.title, "[run 1 step 1] live: generating");
         assert!(arena.progress_gap);
+        assert_eq!(arena.status.as_deref(), Some("activity: model attempt 1"));
         for line in [
-            "activity: model attempt 1",
             "attempt: 1",
             "attempt 1: model=gpt-5.6-sol",
             "Step estimated cost:",
@@ -2275,7 +2656,9 @@ mod tests {
     #[test]
     fn rendering_keeps_execution_content_literal_and_plain() {
         let block = TranscriptBlock::Arena(ArenaBlock {
+            state: ArenaState::Complete,
             title: "arena".to_owned(),
+            status: None,
             source: Some("**literal source**".to_owned()),
             content: vec![
                 ArenaContent {
@@ -2303,13 +2686,10 @@ mod tests {
             metadata: vec!["**literal metadata**".to_owned()],
         })
         .normalise();
-        let height = block.paragraph().line_count(80);
-        let layout = TranscriptLayout {
-            blocks: vec![LaidOutBlock { block, height }],
-            total_height: height,
-        };
+        let paragraph = block.paragraph();
+        let height = paragraph.line_count(80);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 80, u16::try_from(height).unwrap()));
-        layout.render(buffer.area, 0, &mut buffer);
+        paragraph.render(buffer.area, &mut buffer);
         let rendered = buffer
             .content
             .iter()
@@ -2494,13 +2874,10 @@ mod tests {
             markdown: "日本語 🦀 日本語 🦀".to_owned(),
         }
         .normalise();
-        let height = block.paragraph().line_count(8);
-        let layout = TranscriptLayout {
-            blocks: vec![LaidOutBlock { block, height }],
-            total_height: height,
-        };
+        let paragraph = block.paragraph();
+        let height = paragraph.line_count(8);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, u16::try_from(height).unwrap()));
-        layout.render(buffer.area, 0, &mut buffer);
+        paragraph.render(buffer.area, &mut buffer);
         let rendered_rows = buffer
             .content
             .chunks(8)
@@ -2514,14 +2891,13 @@ mod tests {
         let blocks = ["older", "visible", "newer"]
             .into_iter()
             .map(|text| {
-                let block = TranscriptBlock::Status {
-                    text: text.to_owned(),
-                }
-                .normalise();
-                LaidOutBlock {
-                    height: block.paragraph().line_count(20),
-                    block,
-                }
+                RenderBlock::new(
+                    own_styled_text(ratatui::text::Text::raw(text), page_style()),
+                    page_style(),
+                    20,
+                    0,
+                    0,
+                )
             })
             .collect::<Vec<_>>();
         let layout = TranscriptLayout {
@@ -2560,6 +2936,660 @@ mod tests {
         assert!(!rendered_text(&transcript).contains("display gap"));
         transcript.apply(final_message(1, 2, "settled", Vec::new(), true), false);
         assert!(rendered_text(&transcript).contains("display gap"));
+    }
+
+    #[test]
+    fn cards_use_pi_palette_and_full_width_fills() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "inspect".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "def answer():\n    return 42",
+                "reasoning",
+                Vec::new(),
+            ),
+            false,
+        );
+
+        let layout = transcript.layout(40);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, layout.total_height() as u16));
+        layout.render(buffer.area, 0, &mut buffer);
+
+        let user = buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "y")
+            .expect("user request cell");
+        assert_eq!(user.bg, Color::Rgb(52, 53, 65));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(52, 53, 65));
+    }
+
+    #[test]
+    fn cards_collapse_code_after_32_logical_lines() {
+        let mut short = Transcript::default();
+        let short_source = (1..=32)
+            .map(|line| format!("short code line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        short.apply(
+            completed_execution(1, 1, &format!("{short_source}\n"), "", Vec::new()),
+            false,
+        );
+        assert!(!rendered_layout_text(&mut short).contains("code lines omitted"));
+
+        let mut transcript = Transcript::default();
+        let source = (1..=33)
+            .map(|line| format!("code line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.apply(completed_execution(1, 1, &source, "", Vec::new()), false);
+
+        let history = rendered_layout_text(&mut transcript);
+        assert!(history.contains("code line 32"));
+        assert!(!history.contains("code line 33"));
+        assert!(history.contains("[1 code lines omitted]"));
+    }
+
+    #[test]
+    fn cards_render_code_omission_marker_outside_unclosed_source() {
+        let mut transcript = Transcript::default();
+        let source = (1..=31)
+            .map(|line| format!("line_{line} = {line}"))
+            .chain(std::iter::once("unterminated = \"\"\"".to_owned()))
+            .chain(
+                ["hidden = 33", "still_hidden = 34"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.apply(completed_execution(1, 1, &source, "", Vec::new()), false);
+
+        let buffer = rendered_buffer(&mut transcript, 80);
+        let marker = "[2 code lines omitted]";
+        let marker_row = row_containing(&buffer, marker);
+        for (offset, character) in marker.chars().enumerate() {
+            let cell = &buffer[(offset as u16 + 1, marker_row as u16)];
+            assert_eq!(cell.symbol(), character.to_string());
+            assert_eq!(cell.fg, DIM);
+            assert_eq!(cell.bg, COMPLETE_ARENA);
+        }
+    }
+
+    #[test]
+    fn cards_collapse_combined_execution_content_to_its_tail() {
+        let mut short = Transcript::default();
+        short.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(
+                                &(1..=16)
+                                    .map(|line| format!("short out {line}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            ),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        assert!(!rendered_layout_text(&mut short).contains("execution lines omitted"));
+
+        let mut transcript = Transcript::default();
+        let stdout = (1..=15)
+            .map(|line| format!("out {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(&stdout),
+                            stderr: observation("err"),
+                            outcome: ExecutionOutcome::Complete {
+                                result: Some(observation("done")),
+                            },
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let history = rendered_layout_text(&mut transcript);
+        assert!(!history.contains("stdout: out 1"));
+        assert!(history.contains("[1 execution lines omitted]\nout 2"));
+        assert!(history.contains("stderr: err\nresult: done"));
+    }
+
+    #[test]
+    fn cards_keep_roles_padded_full_width_and_borderless() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "user request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(1, 1, "pass", "reasoning", Vec::new()),
+            false,
+        );
+        transcript.apply(
+            final_message(1, 2, "assistant response", Vec::new(), false),
+            false,
+        );
+
+        let buffer = rendered_buffer(&mut transcript, 40);
+        let user_row = row_containing(&buffer, "you: user request");
+        assert_eq!(buffer[(0, user_row as u16)].symbol(), " ");
+        assert_eq!(buffer[(1, user_row as u16)].symbol(), "y");
+        assert_row_background(&buffer, user_row - 1, USER);
+        assert_row_background(&buffer, user_row, USER);
+        assert_row_background(&buffer, user_row + 1, USER);
+
+        let reasoning_row = row_containing(&buffer, "reasoning");
+        assert_eq!(buffer[(0, reasoning_row as u16)].symbol(), " ");
+        assert_eq!(buffer[(1, reasoning_row as u16)].symbol(), " ");
+        assert_eq!(buffer[(2, reasoning_row as u16)].symbol(), "r");
+        assert_row_background(&buffer, reasoning_row, REASONING);
+        assert_eq!(buffer[(2, reasoning_row as u16)].fg, MUTED);
+        assert!(
+            buffer[(2, reasoning_row as u16)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+
+        let arena_row = row_containing(&buffer, "[run 1 step 1]");
+        assert_eq!(buffer[(0, arena_row as u16)].symbol(), " ");
+        assert_eq!(buffer[(1, arena_row as u16)].symbol(), "[");
+        assert_row_background(&buffer, arena_row - 1, COMPLETE_ARENA);
+        assert_row_background(&buffer, arena_row, COMPLETE_ARENA);
+        assert!(!buffer.content.iter().any(|cell| {
+            matches!(cell.symbol(), "┌" | "┐" | "└" | "┘" | "│" | "─")
+        }));
+
+        let assistant_row = row_containing(&buffer, "assistant response");
+        assert_eq!(buffer[(0, assistant_row as u16)].symbol(), "a");
+        assert_row_background(&buffer, assistant_row, PAGE);
+    }
+
+    #[test]
+    fn cards_map_live_completed_and_terminal_evidence_to_typed_states() {
+        let mut live = Transcript::default();
+        live.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        live.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "live_source".to_owned(),
+                },
+            },
+            false,
+        );
+        let live_buffer = rendered_buffer(&mut live, 40);
+        assert_row_background(
+            &live_buffer,
+            row_containing(&live_buffer, "live_source"),
+            IN_PROGRESS_ARENA,
+        );
+
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "complete_source", "", Vec::new()),
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "python_error_source".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::PythonError(PythonError {
+                                text: "error".to_owned(),
+                                omitted_bytes: 0,
+                            }),
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        for (run_id, source, record) in [
+            (
+                3,
+                "cancelled_source",
+                Record::CancelledRun {
+                    terminal: TerminalDetails {
+                        evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            source: "cancelled_source".to_owned(),
+                            reasoning_summary: String::new(),
+                            began: true,
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            read: InterruptedRead::NoRead,
+                            cancellation_warning: Some("cancelled".to_owned()),
+                            failure: None,
+                        }))),
+                        attempts: Vec::new(),
+                    },
+                },
+            ),
+            (
+                4,
+                "failed_source",
+                Record::FailedRun {
+                    message: "failed".to_owned(),
+                    terminal: TerminalDetails {
+                        evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            source: "failed_source".to_owned(),
+                            reasoning_summary: String::new(),
+                            began: true,
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            read: InterruptedRead::NoRead,
+                            cancellation_warning: None,
+                            failure: Some(ExecutionFailure::Arena {
+                                message: "failed".to_owned(),
+                            }),
+                        }))),
+                        attempts: Vec::new(),
+                    },
+                },
+            ),
+        ] {
+            transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(run_id),
+                        record,
+                    },
+                    progress_gap: false,
+                },
+                false,
+            );
+            assert!(rendered_layout_text(&mut transcript).contains(source));
+        }
+        let buffer = rendered_buffer(&mut transcript, 60);
+        assert_row_background(
+            &buffer,
+            row_containing(&buffer, "complete_source"),
+            COMPLETE_ARENA,
+        );
+        for source in ["python_error_source", "cancelled_source", "failed_source"] {
+            assert_row_background(&buffer, row_containing(&buffer, source), ERROR_ARENA);
+        }
+
+        let mut decoded = Transcript::default();
+        decoded.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(5),
+                    record: Record::FailedRun {
+                        message: "failed".to_owned(),
+                        terminal: TerminalDetails {
+                            evidence: Some(TerminalEvidence::Generation(GenerationEvidence {
+                                reasoning_summary: String::new(),
+                                reasoning: String::new(),
+                                assistant_text: String::new(),
+                                decoded_python: "terminal_decoded_source".to_owned(),
+                            })),
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let decoded_buffer = rendered_buffer(&mut decoded, 60);
+        assert_row_background(
+            &decoded_buffer,
+            row_containing(&decoded_buffer, "terminal_decoded_source"),
+            ERROR_ARENA,
+        );
+    }
+
+    #[test]
+    fn cards_keep_short_source_and_execution_open_and_metadata_outside_budgets() {
+        let mut transcript = Transcript::default();
+        let source = (1..=32)
+            .map(|line| format!("code {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stdout = (1..=16)
+            .map(|line| format!("output {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source,
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(&stdout),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                        },
+                        attempts: vec![usage(1, 1)],
+                    },
+                },
+                progress_gap: true,
+            },
+            false,
+        );
+        let history = rendered_layout_text(&mut transcript);
+        assert!(history.contains("code 32"));
+        assert!(history.contains("stdout: output 1"));
+        assert!(!history.contains("code lines omitted"));
+        assert!(!history.contains("execution lines omitted"));
+        assert!(history.contains("[run 1 step 1]"));
+        assert!(history.contains("display gap: some live progress was dropped"));
+        assert!(history.contains("attempt 1: model=gpt-5.6-sol"));
+        assert!(history.contains("Step estimated cost:"));
+
+        let mut title_only = Transcript::default();
+        title_only.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        title_only.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+        let title_only_history = rendered_layout_text(&mut title_only);
+        assert!(title_only_history.contains("[run 2 step 1] live: executing"));
+        assert!(!title_only_history.contains("code:"));
+    }
+
+    #[test]
+    fn cards_preserve_output_section_order_and_tail_labels() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation("first\nsecond"),
+                            stderr: observation("third"),
+                            outcome: ExecutionOutcome::Complete {
+                                result: Some(observation("fourth")),
+                            },
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let history = rendered_layout_text(&mut transcript);
+        assert!(history.contains("stdout: first\nsecond\nstderr: third\nresult: fourth"));
+        assert!(!history.contains("stdout: second"));
+
+        let mut interrupted = Transcript::default();
+        interrupted.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails {
+                            evidence: Some(TerminalEvidence::Execution(Box::new(
+                                ExecutionEvidence {
+                                    source: "pass".to_owned(),
+                                    reasoning_summary: String::new(),
+                                    began: true,
+                                    stdout: observation("out"),
+                                    stderr: observation("err"),
+                                    read: InterruptedRead::Completed {
+                                        path: "path".to_owned(),
+                                        outcome: ReadOutcome::Failure {
+                                            message: "read failed".to_owned(),
+                                        },
+                                    },
+                                    failure: Some(ExecutionFailure::Arena {
+                                        message: "failure".to_owned(),
+                                    }),
+                                    cancellation_warning: Some("warning".to_owned()),
+                                },
+                            ))),
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let interrupted_history = rendered_layout_text(&mut interrupted);
+        assert!(interrupted_history.contains(
+            "execution: started\ncode:\npass\nstdout: out\nstderr: err\nread: completed path failed: read failed\nfailure: failure\nwarning: warning"
+        ));
+    }
+
+    #[test]
+    fn cards_keep_monty_retention_markers_when_expanded() {
+        let mut transcript = Transcript::default();
+        let mut stdout = observation(
+            &(1..=17)
+                .map(|line| format!("head {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        stdout.tail = Some(
+            (1..=17)
+                .map(|line| format!("tail {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        stdout.omitted_lines = 20;
+        stdout.omitted_bytes = 200;
+        stdout.total_bytes = stdout.head.len() + stdout.tail.as_ref().unwrap().len() + 200;
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout,
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let collapsed = rendered_layout_text(&mut transcript);
+        assert!(collapsed.contains("[19 execution lines omitted]"));
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = rendered_layout_text(&mut transcript);
+        assert!(!expanded.contains("execution lines omitted"));
+        assert!(expanded.contains("[20 lines, 200 bytes omitted]"));
+        assert!(expanded.contains("head 1"));
+        assert!(expanded.contains("tail 17"));
+    }
+
+    #[test]
+    fn cards_highlight_normalised_complete_and_incomplete_python_with_a_plain_fallback() {
+        let mut complete = Transcript::default();
+        complete.apply(
+            completed_execution(1, 1, "def complete():\n    return 42", "", Vec::new()),
+            false,
+        );
+        let complete_buffer = rendered_buffer(&mut complete, 60);
+        let def = complete_buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "d" && cell.fg == Color::Magenta)
+            .expect("highlighted def");
+        assert_eq!(def.bg, COMPLETE_ARENA);
+
+        let mut live = Transcript::default();
+        live.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        live.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "def incomplete(".to_owned(),
+                },
+            },
+            false,
+        );
+        let live_buffer = rendered_buffer(&mut live, 60);
+        assert!(live_buffer.content.iter().any(|cell| cell.symbol() == "d"
+            && cell.fg == Color::Magenta
+            && cell.bg == IN_PROGRESS_ARENA));
+
+        let mut fallback = Transcript {
+            highlighter: PythonHighlighter::fallback_for_test(),
+            ..Transcript::default()
+        };
+        fallback.apply(
+            completed_execution(3, 1, "def fallback(", "", Vec::new()),
+            false,
+        );
+        let fallback_buffer = rendered_buffer(&mut fallback, 60);
+        assert!(
+            fallback_buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "d" && cell.fg == TEXT && cell.bg == COMPLETE_ARENA)
+        );
+        assert!(rendered_layout_text(&mut fallback).contains("def fallback("));
+    }
+
+    #[test]
+    fn cards_toggle_reasoning_and_all_arenas_without_changing_chronology() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let source = (1..=33)
+            .map(|line| format!("code {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.apply(
+            completed_execution(1, 1, &source, "reasoning", Vec::new()),
+            false,
+        );
+        transcript.apply(final_message(1, 2, "answer", Vec::new(), false), false);
+
+        let automatic = rendered_layout_text(&mut transcript);
+        assert!(automatic.contains("[1 code lines omitted]"));
+        assert!(transcript.toggle_reasoning());
+        let hidden = rendered_layout_text(&mut transcript);
+        assert_eq!(
+            hidden.matches("reasoning hidden · Ctrl-T to show").count(),
+            1
+        );
+        assert!(!hidden.contains("reasoning\n"));
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = rendered_layout_text(&mut transcript);
+        assert!(expanded.contains("code 33"));
+        let request = expanded.find("you: request").unwrap();
+        let placeholder = expanded.find("reasoning hidden").unwrap();
+        let arena = expanded.find("[run 1 step 1]").unwrap();
+        let answer = expanded.find("answer").unwrap();
+        assert!(request < placeholder && placeholder < arena && arena < answer);
+    }
+
+    #[test]
+    fn cards_saturate_padding_without_losing_a_content_column() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "user".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(1, 1, "pass", "reasoning", Vec::new()),
+            false,
+        );
+
+        for width in 1..=4 {
+            let layout = transcript.layout(width);
+            assert!(
+                layout.blocks.iter().all(|block| {
+                    block.left_padding.saturating_add(block.right_padding) < width
+                })
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::config::StartupSnapshot;
 use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
-use crate::transcript::{Transcript, normalise_terminal_text};
+use crate::transcript::{Transcript, normalise_terminal_text, page_style};
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -109,14 +109,32 @@ impl App {
         if key.is_release() {
             return Update::default();
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c' | 'C'))
-        {
-            return Update {
-                command: (!self.is_configuration_only()).then_some(RuntimeCommand::Shutdown),
-                visible_changed: false,
-                quit: true,
-            };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => {
+                    return Update {
+                        command: (!self.is_configuration_only())
+                            .then_some(RuntimeCommand::Shutdown),
+                        visible_changed: false,
+                        quit: true,
+                    };
+                }
+                KeyCode::Char('t' | 'T') => {
+                    return Update {
+                        command: None,
+                        visible_changed: self.transcript.toggle_reasoning(),
+                        quit: false,
+                    };
+                }
+                KeyCode::Char('o' | 'O') => {
+                    return Update {
+                        command: None,
+                        visible_changed: self.transcript.toggle_arena_expansion(),
+                        quit: false,
+                    };
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -372,6 +390,7 @@ fn run_loop<B: Backend>(
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    frame.buffer_mut().set_style(area, page_style());
     let configuration_only = app.is_configuration_only();
     let reserved_rows = if configuration_only { 1 } else { 2 };
     app.history_height = if area.width == 0 {
@@ -793,8 +812,8 @@ mod tests {
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
         let one_line_up = rendered(&mut app, 40, 5);
-        assert!(one_line_up.contains("request 5"));
-        assert!(!one_line_up.contains("request 8"));
+        assert!(one_line_up.contains("request 8"));
+        assert!(!one_line_up.contains("request 7"));
 
         app.handle_key(key(KeyCode::Home));
         let oldest = rendered(&mut app, 40, 5);
@@ -1427,6 +1446,252 @@ mod tests {
             |_| Ok(()),
         );
         assert!(restored.get());
+    }
+
+    #[test]
+    fn controls_toggle_reasoning_and_arena_expansion_without_commands() {
+        let mut app = App {
+            prompt: "kept prompt".to_owned(),
+            ..App::default()
+        };
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(1),
+                    source: (1..=33)
+                        .map(|line| format!("code line {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    reasoning_summary: "visible reasoning".to_owned(),
+                    execution: Execution {
+                        stdout: observation(""),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::Complete { result: None },
+                    },
+                    attempts: Vec::new(),
+                },
+            },
+            progress_gap: false,
+        });
+
+        for code in ['t', 'T'] {
+            let update = app.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
+            assert!(update.command.is_none());
+            assert!(update.visible_changed);
+            assert_eq!(app.prompt, "kept prompt");
+        }
+        assert!(rendered(&mut app, 60, 80).contains("visible reasoning"));
+
+        let hidden = app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(hidden.command.is_none());
+        assert!(hidden.visible_changed);
+        let screen = rendered(&mut app, 60, 80);
+        assert!(screen.contains("reasoning hidden · Ctrl-T to show"));
+        assert!(!screen.contains("visible reasoning"));
+
+        for code in ['o', 'O'] {
+            let update = app.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL));
+            assert!(update.command.is_none());
+            assert!(update.visible_changed);
+            assert_eq!(app.prompt, "kept prompt");
+        }
+        assert!(!rendered(&mut app, 60, 40).contains("code line 33"));
+
+        let expanded = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(expanded.command.is_none());
+        assert!(expanded.visible_changed);
+        assert!(rendered(&mut app, 60, 40).contains("code line 33"));
+    }
+
+    #[test]
+    fn controls_work_when_submission_is_disabled_and_are_noops_without_blocks() {
+        let mut disabled = App::default();
+        disabled.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: String::new(),
+                    reasoning_summary: "reasoning".to_owned(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        disabled.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        });
+        assert!(
+            disabled
+                .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(rendered(&mut disabled, 60, 8).contains("reasoning hidden · Ctrl-T to show"));
+
+        let mut configuration = App::configuration(crate::config::load().snapshot().clone());
+        let update =
+            configuration.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(update.command.is_none());
+        assert!(!update.visible_changed);
+        let reasoning =
+            configuration.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(reasoning.command.is_none());
+        assert!(!reasoning.visible_changed);
+        configuration.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(1),
+                    source: (1..=33)
+                        .map(|line| format!("code {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    reasoning_summary: "future reasoning".to_owned(),
+                    execution: Execution {
+                        stdout: observation(""),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::Complete { result: None },
+                    },
+                    attempts: Vec::new(),
+                },
+            },
+            progress_gap: false,
+        });
+        let screen = rendered(&mut configuration, 80, 80);
+        assert!(screen.contains("code 33"));
+        assert!(screen.contains("reasoning hidden · Ctrl-T to show"));
+    }
+
+    #[test]
+    fn controls_redraw_only_when_visible_and_clamp_scroll_after_height_reductions() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::CompletedExecution {
+                    step_id: ModelStepId(1),
+                    source: (1..=33)
+                        .map(|line| format!("code {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    reasoning_summary: (1..=33)
+                        .map(|line| format!("reasoning {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    execution: Execution {
+                        stdout: observation(""),
+                        stderr: observation(""),
+                        outcome: ExecutionOutcome::Complete { result: None },
+                    },
+                    attempts: Vec::new(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered(&mut app, 20, 6);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        rendered(&mut app, 20, 6);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let expanded_scroll = app.scroll_from_bottom;
+        assert!(expanded_scroll > 0);
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        rendered(&mut app, 20, 6);
+        assert_eq!(
+            app.scroll_from_bottom,
+            expanded_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+
+        rendered(&mut app, 20, 6);
+        app.handle_key(key(KeyCode::Home));
+        let reasoning_scroll = app.scroll_from_bottom;
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        rendered(&mut app, 20, 6);
+        assert_eq!(
+            app.scroll_from_bottom,
+            reasoning_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+
+        let backend = TestBackend::new(40, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut redraw_app = App::default();
+        redraw_app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: String::new(),
+                    reasoning_summary: "reasoning".to_owned(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        let mut input = FakeInput::new([
+            Some(ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+            ))),
+            Some(ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+        ]);
+        let (commands, mut received) = tokio::sync::mpsc::channel(1);
+        let (_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress, mut progress_receiver) = tokio::sync::mpsc::channel(1);
+        assert_eq!(
+            super::run_loop(
+                &mut terminal,
+                &mut redraw_app,
+                &mut input,
+                &commands,
+                &mut event_receiver,
+                &mut progress_receiver,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(received.try_recv().unwrap(), RuntimeCommand::Shutdown);
+    }
+
+    #[test]
+    fn controls_are_safe_on_tiny_terminals_without_losing_zero_width_scroll() {
+        let mut app = App::default();
+        app.handle_event(completed_record(
+            1,
+            1,
+            &(1..=33)
+                .map(|line| format!("code {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Vec::new(),
+        ));
+        rendered(&mut app, 20, 5);
+        app.handle_key(key(KeyCode::Home));
+        let scroll = app.scroll_from_bottom;
+        for (width, height) in [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (3, 3)] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+            if width == 0 {
+                assert_eq!(app.scroll_from_bottom, scroll);
+            }
+        }
     }
 
     #[test]

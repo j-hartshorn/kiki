@@ -43,7 +43,7 @@ impl PythonHighlighter {
     }
 
     #[cfg(test)]
-    fn fallback_for_test() -> Self {
+    pub(crate) fn fallback_for_test() -> Self {
         Self::fallback()
     }
 }
