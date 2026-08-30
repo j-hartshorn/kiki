@@ -403,12 +403,12 @@ fn render(frame: &mut Frame, app: &mut App) {
             .to_owned()
     } else if app.transcript.is_disabled() {
         format!(
-            "Status: {} | Input disabled | Ctrl-C quit | Up/Down scroll",
+            "Status: {} | Input disabled | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit | Up/Down scroll",
             app.transcript.status()
         )
     } else {
         format!(
-            "Status: {} | Enter submit | Esc cancel | Ctrl-C quit | Up/Down scroll",
+            "Status: {} | Enter submit | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit | Up/Down scroll",
             app.transcript.status()
         )
     };
