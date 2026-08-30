@@ -939,6 +939,7 @@ fn format_record(displayed: &DisplayedRecord, prior_attempts: &[&AttemptAccounti
             source,
             execution,
             attempts,
+            ..
         } => format_execution(
             run_id,
             step_id.0,
@@ -952,6 +953,7 @@ fn format_record(displayed: &DisplayedRecord, prior_attempts: &[&AttemptAccounti
             step_id,
             text,
             terminal,
+            ..
         } => format_terminal(
             format!("[run {run_id} step {}] kiki: {text}", step_id.0),
             terminal,
@@ -1087,6 +1089,7 @@ fn append_terminal_evidence(lines: &mut Vec<String>, evidence: &TerminalEvidence
             reasoning,
             assistant_text,
             decoded_python,
+            ..
         }) => {
             if !reasoning.is_empty() {
                 lines.push(format!("reasoning: {reasoning}"));
@@ -1758,6 +1761,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(2),
                     text: "finished".to_owned(),
+                    reasoning_summary: String::new(),
                     terminal: TerminalDetails::empty(),
                 },
             },
@@ -1783,6 +1787,7 @@ mod tests {
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(1),
                     source: "print('hello')\n2".to_owned(),
+                    reasoning_summary: String::new(),
                     execution: Execution {
                         stdout: observation("hello\n"),
                         stderr: observation("warning\n"),
@@ -1927,6 +1932,7 @@ mod tests {
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(4),
                     source: "code".to_owned(),
+                    reasoning_summary: String::new(),
                     execution: Execution {
                         stdout: observation(""),
                         stderr: observation(""),
@@ -1951,6 +1957,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(3),
                     text: "done".to_owned(),
+                    reasoning_summary: String::new(),
                     terminal: TerminalDetails::empty(),
                 },
             },
@@ -2182,6 +2189,7 @@ mod tests {
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(step_id),
                     source: source.to_owned(),
+                    reasoning_summary: String::new(),
                     execution: Execution {
                         stdout: observation("authoritative stdout\n"),
                         stderr: observation(""),
@@ -2342,6 +2350,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(2),
                     text: "settled".to_owned(),
+                    reasoning_summary: String::new(),
                     terminal: terminal(None, vec![]),
                 },
             },
@@ -2424,6 +2433,7 @@ mod tests {
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(2),
                     source: "raise RuntimeError()".to_owned(),
+                    reasoning_summary: String::new(),
                     execution: Execution {
                         stdout: observation(""),
                         stderr: observation(""),
@@ -2444,6 +2454,7 @@ mod tests {
                     terminal: terminal(
                         Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
                             source: "await read(path)".to_owned(),
+                            reasoning_summary: String::new(),
                             began: true,
                             stdout: observation("before\n"),
                             stderr: observation("diagnostic\n"),
@@ -2482,6 +2493,7 @@ mod tests {
                 record: Record::CancelledRun {
                     terminal: terminal(
                         Some(TerminalEvidence::Generation(GenerationEvidence {
+                            reasoning_summary: String::new(),
                             reasoning: "interrupted reasoning".to_owned(),
                             assistant_text: "interrupted assistant".to_owned(),
                             decoded_python: "interrupted_code()".to_owned(),
@@ -2509,6 +2521,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(3),
                     text: "final answer".to_owned(),
+                    reasoning_summary: String::new(),
                     terminal: terminal(None, vec![]),
                 },
             },
@@ -2530,6 +2543,7 @@ mod tests {
                 record: Record::FinalMessage {
                     step_id: ModelStepId(2),
                     text: "done".to_owned(),
+                    reasoning_summary: String::new(),
                     terminal: terminal(
                         None,
                         vec![
@@ -2729,6 +2743,7 @@ mod tests {
                     terminal: terminal(
                         Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
                             source: "source\x1b".to_owned(),
+                            reasoning_summary: String::new(),
                             began: true,
                             stdout: observation("terminal stdout\u{009f}"),
                             stderr: observation(""),

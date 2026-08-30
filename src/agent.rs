@@ -20,6 +20,7 @@ pub enum TerminalEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationEvidence {
+    pub(crate) reasoning_summary: String,
     pub(crate) reasoning: String,
     pub(crate) assistant_text: String,
     pub(crate) decoded_python: String,
@@ -27,7 +28,8 @@ pub struct GenerationEvidence {
 
 impl GenerationEvidence {
     fn is_empty(&self) -> bool {
-        self.reasoning.is_empty()
+        self.reasoning_summary.is_empty()
+            && self.reasoning.is_empty()
             && self.assistant_text.is_empty()
             && self.decoded_python.is_empty()
     }
@@ -36,6 +38,7 @@ impl GenerationEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionEvidence {
     pub(crate) source: String,
+    pub(crate) reasoning_summary: String,
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
@@ -80,6 +83,7 @@ pub(crate) enum AgentProgress {
     StdoutTruncated,
     ExecutionCompleted {
         source: String,
+        reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
     },
@@ -106,6 +110,10 @@ impl FinalMessage {
         &self.attempts
     }
 
+    pub(crate) fn reasoning_summary(&self) -> &str {
+        &self.generation.reasoning_summary
+    }
+
     pub(crate) fn generation_evidence(&self) -> TerminalEvidence {
         TerminalEvidence::Generation(self.generation.clone())
     }
@@ -113,7 +121,6 @@ impl FinalMessage {
 
 struct StagedFinalMessage {
     final_message: FinalMessage,
-    reasoning_summary: String,
     replay: ProviderReplay,
 }
 
@@ -141,6 +148,7 @@ impl GenerationEvidenceBuilder {
 
     fn evidence(self) -> Option<GenerationEvidence> {
         let evidence = GenerationEvidence {
+            reasoning_summary: String::new(),
             reasoning: self.reasoning,
             assistant_text: self.assistant_text,
             decoded_python: self.decoded_python,
@@ -148,13 +156,14 @@ impl GenerationEvidenceBuilder {
         (!evidence.is_empty()).then_some(evidence)
     }
 
-    fn with_final_message(mut self, text: String) -> GenerationEvidence {
+    fn with_final_message(mut self, text: String, reasoning_summary: String) -> GenerationEvidence {
         self.assistant_text = bounded_utf8(text, ACCEPTED_MODEL_CONTENT_LIMIT);
         let remaining = ACCEPTED_MODEL_CONTENT_LIMIT - self.assistant_text.len();
         self.reasoning = bounded_utf8(self.reasoning, remaining);
         let remaining = remaining - self.reasoning.len();
         self.decoded_python = bounded_utf8(self.decoded_python, remaining);
         GenerationEvidence {
+            reasoning_summary,
             reasoning: self.reasoning,
             assistant_text: self.assistant_text,
             decoded_python: self.decoded_python,
@@ -189,21 +198,32 @@ impl GenerationEvidenceBuilder {
 }
 
 impl ExecutionEvidence {
-    fn cancelled(source: String, error: Option<&ArenaError>) -> Self {
-        Self::from_error(source, error, true)
+    fn cancelled(source: String, reasoning_summary: String, error: Option<&ArenaError>) -> Self {
+        Self::from_error(source, reasoning_summary, error, true)
     }
 
-    fn failed(source: String, error: &ArenaError) -> Self {
-        Self::from_error(source, Some(error), contains_cancellation(error))
+    fn failed(source: String, reasoning_summary: String, error: &ArenaError) -> Self {
+        Self::from_error(
+            source,
+            reasoning_summary,
+            Some(error),
+            contains_cancellation(error),
+        )
     }
 
-    fn from_error(source: String, error: Option<&ArenaError>, cancellation_warning: bool) -> Self {
+    fn from_error(
+        source: String,
+        reasoning_summary: String,
+        error: Option<&ArenaError>,
+        cancellation_warning: bool,
+    ) -> Self {
         let interrupted = error
             .and_then(interrupted_execution)
             .cloned()
             .unwrap_or_else(empty_interrupted_execution);
         Self {
             source,
+            reasoning_summary,
             began: interrupted.began,
             stdout: interrupted.stdout,
             stderr: interrupted.stderr,
@@ -419,7 +439,6 @@ impl<M: Model> Agent<M> {
     pub fn admit_staged_final_message(&mut self) -> Result<FinalMessage, AgentError> {
         let StagedFinalMessage {
             final_message,
-            reasoning_summary,
             replay,
         } = self
             .staged_final_message
@@ -427,7 +446,7 @@ impl<M: Model> Agent<M> {
             .ok_or(AgentError::NoStagedFinalMessage)?;
         self.model_context.append_final_message(
             final_message.text.clone(),
-            reasoning_summary,
+            final_message.reasoning_summary().to_owned(),
             replay,
         );
         Ok(final_message)
@@ -518,8 +537,11 @@ impl<M: Model> Agent<M> {
                         replay,
                     };
                     if cancellation.is_cancelled() {
-                        let evidence =
-                            Box::new(ExecutionEvidence::cancelled(pending.source.clone(), None));
+                        let evidence = Box::new(ExecutionEvidence::cancelled(
+                            pending.source.clone(),
+                            pending.reasoning_summary.clone(),
+                            None,
+                        ));
                         if let Err(error) = pending.append(
                             &mut self.model_context,
                             CodeResult::cancelled(evidence.feedback()),
@@ -562,6 +584,7 @@ impl<M: Model> Agent<M> {
                     match execution {
                         Ok(execution) => {
                             let source = pending.source.clone();
+                            let reasoning_summary = pending.reasoning_summary.clone();
                             if let Err(error) = pending.append(
                                 &mut self.model_context,
                                 CodeResult::execution(execution_feedback(&execution)),
@@ -574,6 +597,7 @@ impl<M: Model> Agent<M> {
                             }
                             progress(AgentProgress::ExecutionCompleted {
                                 source,
+                                reasoning_summary,
                                 execution,
                                 attempts: step_attempts,
                             });
@@ -581,9 +605,17 @@ impl<M: Model> Agent<M> {
                         Err(error) => {
                             let cancelled = matches!(&error, ArenaError::Cancelled { .. });
                             let evidence = Box::new(if cancelled {
-                                ExecutionEvidence::cancelled(pending.source.clone(), Some(&error))
+                                ExecutionEvidence::cancelled(
+                                    pending.source.clone(),
+                                    pending.reasoning_summary.clone(),
+                                    Some(&error),
+                                )
                             } else {
-                                ExecutionEvidence::failed(pending.source.clone(), &error)
+                                ExecutionEvidence::failed(
+                                    pending.source.clone(),
+                                    pending.reasoning_summary.clone(),
+                                    &error,
+                                )
                             });
                             let result = if cancelled {
                                 CodeResult::cancelled(evidence.feedback())
@@ -610,11 +642,11 @@ impl<M: Model> Agent<M> {
                 ModelAction::Message { text } => {
                     self.staged_final_message = Some(StagedFinalMessage {
                         final_message: FinalMessage {
-                            generation: generation.with_final_message(text.clone()),
+                            generation: generation
+                                .with_final_message(text.clone(), reasoning_summary),
                             text,
                             attempts,
                         },
-                        reasoning_summary,
                         replay,
                     });
                     return Ok(AgentRunOutcome::FinalMessageStaged);
@@ -946,13 +978,7 @@ mod tests {
     #[tokio::test]
     async fn agent_keeps_a_completed_final_message_staged_until_runtime_admission() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut agent = agent(
-            &workspace,
-            vec![ModelAction::Message {
-                text: "done".to_owned(),
-            }],
-        )
-        .await;
+        let mut agent = agent_with_model(&workspace, SummaryMessageModel).await;
         let cancellation = CancellationToken::new();
 
         assert_eq!(
@@ -972,6 +998,7 @@ mod tests {
             .discard_staged_final_message()
             .expect("completed final message should remain staged");
         assert_eq!(discarded.text(), "done");
+        assert_eq!(discarded.reasoning_summary(), "message summary");
         assert!(discarded.attempts().is_empty());
         assert!(agent.discard_staged_final_message().is_none());
         assert!(matches!(
@@ -1078,6 +1105,16 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentProgress::ModelProgress(_)))
         );
+        let execution_reasoning_summary = progress
+            .iter()
+            .find_map(|event| match event {
+                AgentProgress::ExecutionCompleted {
+                    reasoning_summary, ..
+                } => Some(reasoning_summary.as_str()),
+                _ => None,
+            })
+            .expect("completed execution should carry its summary");
+        assert_eq!(execution_reasoning_summary, "code summary");
         let completed = agent
             .model_context
             .entries()
@@ -1095,7 +1132,9 @@ mod tests {
                 .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
         );
 
-        assert_eq!(agent.admit_staged_final_message().unwrap().text(), "done");
+        let final_message = agent.admit_staged_final_message().unwrap();
+        assert_eq!(final_message.text(), "done");
+        assert_eq!(final_message.reasoning_summary(), "message summary");
         assert!(matches!(
             agent.model_context.entries().last(),
             Some(ModelContextEntry::FinalMessage {
@@ -1104,6 +1143,58 @@ mod tests {
                 ..
             }) if text == "done" && reasoning_summary == "message summary"
         ));
+    }
+
+    struct SummaryMessageModel;
+
+    impl Model for SummaryMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async {
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    reasoning_summary: "message summary".to_owned(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct SummaryCodeModel {
+        source: String,
+        reasoning_summary: String,
+    }
+
+    impl Model for SummaryCodeModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                Ok(ModelStep {
+                    action: CompletedModelAction::Code {
+                        source: self.source.clone(),
+                        call_id: ModelCallId::new("summary-code"),
+                    },
+                    reasoning_summary: self.reasoning_summary.clone(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
     }
 
     struct MessageWithAccountingModel;
@@ -1142,6 +1233,9 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
+                progress(ModelProgress::ReasoningSummaryChunk {
+                    text: "partial reasoning".to_owned(),
+                });
                 progress(ModelProgress::AssistantTextChunk {
                     text: "partial answer".to_owned(),
                 });
@@ -1202,6 +1296,19 @@ mod tests {
                     && failure.attempts() == [AttemptAccounting::UsageUnavailable]
         ));
         assert_eq!(error.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        let AgentError::Model {
+            evidence: Some(evidence),
+            ..
+        } = error
+        else {
+            panic!("provider failure should retain its partial generation evidence");
+        };
+        let TerminalEvidence::Generation(evidence) = *evidence else {
+            panic!("provider failure should retain generation evidence");
+        };
+        assert_eq!(evidence.reasoning, "partial reasoning");
+        assert_eq!(evidence.assistant_text, "partial answer");
+        assert!(evidence.reasoning_summary.is_empty());
         assert!(!failed.model_context.entries().iter().any(|entry| matches!(
             entry,
             ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
@@ -1280,7 +1387,7 @@ mod tests {
         assert!(matches!(error, AgentError::Model { .. }));
         assert_eq!(
             progress.len(),
-            2,
+            3,
             "model progress should reach the agent sink"
         );
     }
@@ -1448,11 +1555,12 @@ mod tests {
     async fn agent_uses_interrupted_execution_evidence_for_its_cancelled_code_result() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
-        let mut agent = agent(
+        let mut agent = agent_with_model(
             &workspace,
-            vec![ModelAction::Code {
+            SummaryCodeModel {
                 source: "lines = await read('Cargo.toml')".to_owned(),
-            }],
+                reasoning_summary: "cancelled code summary".to_owned(),
+            },
         )
         .await;
         let cancellation = CancellationToken::new();
@@ -1478,6 +1586,7 @@ mod tests {
             panic!("expected cancelled execution");
         };
         assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert_eq!(evidence.began, execution.began);
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
@@ -1494,7 +1603,9 @@ mod tests {
         let CodeResult::Cancelled { feedback } = completed.result() else {
             panic!("cancelled execution should have a cancelled code result");
         };
+        assert_eq!(completed.reasoning_summary(), "cancelled code summary");
         assert_eq!(feedback, &evidence.feedback());
+        assert!(!feedback.contains("cancelled code summary"));
     }
 
     #[tokio::test]
@@ -1547,7 +1658,7 @@ mod tests {
                 cancellation.cancel();
                 Ok(ModelStep {
                     action: self.action.clone(),
-                    reasoning_summary: String::new(),
+                    reasoning_summary: "boundary summary".to_owned(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1596,6 +1707,7 @@ mod tests {
                     panic!("cancelled code should retain execution evidence");
                 };
                 assert_eq!(evidence.source, "boundary_action_ran = True");
+                assert_eq!(evidence.reasoning_summary, "boundary summary");
                 assert!(!evidence.began);
                 assert_eq!(evidence.read, crate::arena::InterruptedRead::NoRead);
                 assert_eq!(
@@ -1610,7 +1722,9 @@ mod tests {
                 let CodeResult::Cancelled { feedback } = completed.result() else {
                     panic!("cancelled code should have a cancelled result");
                 };
+                assert_eq!(completed.reasoning_summary(), "boundary summary");
                 assert_eq!(feedback, &evidence.feedback());
+                assert!(!feedback.contains("boundary summary"));
                 assert!(feedback.contains("Execution did not begin."));
                 assert!(feedback.contains(
                     "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
@@ -1800,11 +1914,12 @@ mod tests {
     #[tokio::test]
     async fn agent_records_one_failure_result_after_an_arena_failure() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut agent = agent(
+        let mut agent = agent_with_model(
             &workspace,
-            vec![ModelAction::Code {
+            SummaryCodeModel {
                 source: "x = ' ' * (1 << 60)".to_owned(),
-            }],
+                reasoning_summary: "failed code summary".to_owned(),
+            },
         )
         .await;
         let cancellation = CancellationToken::new();
@@ -1820,6 +1935,7 @@ mod tests {
             panic!("expected arena infrastructure failure");
         };
         assert_eq!(evidence.source, "x = ' ' * (1 << 60)");
+        assert_eq!(evidence.reasoning_summary, "failed code summary");
         assert!(evidence.began);
         assert!(matches!(
             evidence.failure,
@@ -1835,7 +1951,9 @@ mod tests {
         let CodeResult::Failure { feedback } = completed[0].result() else {
             panic!("arena failure should produce one failed code result");
         };
+        assert_eq!(completed[0].reasoning_summary(), "failed code summary");
         assert_eq!(feedback, &evidence.feedback());
+        assert!(!feedback.contains("failed code summary"));
     }
 
     #[tokio::test]
@@ -1921,33 +2039,38 @@ mod tests {
     #[tokio::test]
     async fn agent_commits_completed_code_before_a_later_cancellation_check() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut agent = agent(
-            &workspace,
-            vec![
-                ModelAction::Code {
-                    source: "value = 1".to_owned(),
-                },
-                ModelAction::Message {
-                    text: "unreachable".to_owned(),
-                },
-            ],
-        )
-        .await;
+        let mut agent = agent_with_model(&workspace, CompletedSummaryModel { step: 0 }).await;
         let cancellation = CancellationToken::new();
         let canceller = cancellation.clone();
+        let mut progress = Vec::new();
         let error = {
-            let mut progress = move |event| {
+            let mut capture = |event| {
                 if matches!(event, AgentProgress::ExecutionCompleted { .. }) {
                     canceller.cancel();
                 }
+                progress.push(event);
             };
             agent
-                .run_with_progress("inspect", &cancellation, &mut progress)
+                .run_with_progress("inspect", &cancellation, &mut capture)
                 .await
                 .unwrap_err()
         };
 
-        assert!(matches!(error, AgentError::Cancelled { .. }));
+        assert!(matches!(
+            error,
+            AgentError::Cancelled { evidence: None, .. }
+        ));
+        assert!(matches!(
+            progress.as_slice(),
+            [
+                AgentProgress::ModelStepStarted,
+                AgentProgress::ExecutionStarted,
+                AgentProgress::ExecutionCompleted {
+                    reasoning_summary,
+                    ..
+                },
+            ] if reasoning_summary == "code summary"
+        ));
         let completed = agent
             .model_context
             .entries()
@@ -1955,6 +2078,7 @@ mod tests {
             .filter_map(ModelContextEntry::completed_code)
             .collect::<Vec<_>>();
         assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].reasoning_summary(), "code summary");
         assert!(matches!(
             completed[0].result(),
             CodeResult::Execution { .. }

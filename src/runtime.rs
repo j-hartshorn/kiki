@@ -45,12 +45,14 @@ pub(crate) enum Record {
     CompletedExecution {
         step_id: ModelStepId,
         source: String,
+        reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
     },
     FinalMessage {
         step_id: ModelStepId,
         text: String,
+        reasoning_summary: String,
         terminal: TerminalDetails,
     },
     CancelledRun {
@@ -203,6 +205,7 @@ enum WorkerMessage<M: Model> {
     ExecutionCompleted {
         step_ordinal: u64,
         source: String,
+        reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
     },
@@ -460,12 +463,14 @@ impl<M: Model> RuntimeController<M> {
                     }
                     AgentProgress::ExecutionCompleted {
                         source,
+                        reasoning_summary,
                         execution,
                         attempts,
                     } => {
                         let _ = completion_sender.send(WorkerMessage::ExecutionCompleted {
                             step_ordinal,
                             source,
+                            reasoning_summary,
                             execution,
                             attempts,
                         });
@@ -524,6 +529,7 @@ impl<M: Model> RuntimeController<M> {
             WorkerMessage::ExecutionCompleted {
                 step_ordinal,
                 source,
+                reasoning_summary,
                 execution,
                 attempts,
             } => {
@@ -536,6 +542,7 @@ impl<M: Model> RuntimeController<M> {
                     Record::CompletedExecution {
                         step_id,
                         source,
+                        reasoning_summary,
                         execution,
                         attempts,
                     },
@@ -600,6 +607,7 @@ impl<M: Model> RuntimeController<M> {
                                 .step_id_for(final_step_ordinal)
                                 .expect("a final message requires a model step"),
                             text: final_message.text().to_owned(),
+                            reasoning_summary: final_message.reasoning_summary().to_owned(),
                             terminal: TerminalDetails::new(None, final_message.attempts().to_vec()),
                         }
                     }
@@ -1356,6 +1364,106 @@ mod tests {
         }
     }
 
+    struct CompletedSummaryModel {
+        step: u8,
+    }
+
+    impl Model for CompletedSummaryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let (action, reasoning_summary) = match self.step {
+                    0 => (
+                        CompletedModelAction::Code {
+                            source: "1 + 1".to_owned(),
+                            call_id: ModelCallId::new("summary-code"),
+                        },
+                        "code summary".to_owned(),
+                    ),
+                    1 => (
+                        CompletedModelAction::Message {
+                            text: "done".to_owned(),
+                        },
+                        "message summary".to_owned(),
+                    ),
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary,
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct SummaryCodeModel {
+        source: String,
+        reasoning_summary: String,
+        cancel_before_execution: bool,
+    }
+
+    impl Model for SummaryCodeModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                if self.cancel_before_execution {
+                    cancellation.cancel();
+                }
+                Ok(ModelStep {
+                    action: CompletedModelAction::Code {
+                        source: self.source.clone(),
+                        call_id: ModelCallId::new("summary-code"),
+                    },
+                    reasoning_summary: self.reasoning_summary.clone(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct SummaryMessageModel {
+        text: String,
+        reasoning_summary: String,
+    }
+
+    impl Model for SummaryMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async {
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: self.text.clone(),
+                    },
+                    reasoning_summary: self.reasoning_summary.clone(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
     struct CodeThenCancellationModel {
         first_request_step: u8,
         later_request_step: u8,
@@ -1379,13 +1487,16 @@ mod tests {
                         matches!(entry, crate::model::ModelContextEntry::UserRequest { .. })
                     })
                     .count();
-                let action = match requests {
+                let (action, reasoning_summary) = match requests {
                     1 if self.first_request_step == 0 => {
                         self.first_request_step = 1;
-                        CompletedModelAction::Code {
-                            source: "value = 1".to_owned(),
-                            call_id: ModelCallId::new("first-code"),
-                        }
+                        (
+                            CompletedModelAction::Code {
+                                source: "value = 1".to_owned(),
+                                call_id: ModelCallId::new("first-code"),
+                            },
+                            "committed code summary".to_owned(),
+                        )
                     }
                     1 => {
                         self.ready.notify_one();
@@ -1394,18 +1505,24 @@ mod tests {
                     }
                     _ if self.later_request_step == 0 => {
                         self.later_request_step = 1;
-                        CompletedModelAction::Code {
-                            source: "value + 1".to_owned(),
-                            call_id: ModelCallId::new("later-code"),
-                        }
+                        (
+                            CompletedModelAction::Code {
+                                source: "value + 1".to_owned(),
+                                call_id: ModelCallId::new("later-code"),
+                            },
+                            String::new(),
+                        )
                     }
-                    _ => CompletedModelAction::Message {
-                        text: "later done".to_owned(),
-                    },
+                    _ => (
+                        CompletedModelAction::Message {
+                            text: "later done".to_owned(),
+                        },
+                        String::new(),
+                    ),
                 };
                 Ok(ModelStep {
                     action,
-                    reasoning_summary: String::new(),
+                    reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
@@ -1432,6 +1549,7 @@ mod tests {
     fn failed_execution_evidence(failure: ExecutionFailure) -> ExecutionEvidence {
         ExecutionEvidence {
             source: "failed_code()".to_owned(),
+            reasoning_summary: String::new(),
             began: true,
             stdout: empty_observation(),
             stderr: empty_observation(),
@@ -2503,6 +2621,7 @@ mod tests {
         let Some(TerminalEvidence::Generation(evidence)) = &terminal.evidence else {
             panic!("expected generation evidence");
         };
+        assert!(evidence.reasoning_summary.is_empty());
         assert_eq!(evidence.reasoning, "thinking");
         assert_eq!(evidence.assistant_text, "partial answer");
         assert_eq!(evidence.decoded_python, "print('partial')");
@@ -2525,9 +2644,11 @@ mod tests {
         .expect("create arena");
         let controller = RuntimeController::new(Agent::new(
             arena,
-            ScriptedModel::new(vec![ModelAction::Code {
+            SummaryCodeModel {
                 source: "lines = await read('Cargo.toml')".to_owned(),
-            }]),
+                reasoning_summary: "cancelled code summary".to_owned(),
+                cancel_before_execution: false,
+            },
         ));
         let (commands, mut events, _progress, task) = start_controller(controller);
 
@@ -2549,10 +2670,108 @@ mod tests {
             panic!("expected interrupted execution evidence");
         };
         assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert!(evidence.began);
         assert!(matches!(evidence.read, InterruptedRead::Pending { .. }));
         assert!(evidence.cancellation_warning.is_some());
         assert_eq!(terminal.attempts, []);
+    }
+
+    #[tokio::test]
+    async fn terminal_cancellation_after_completed_code_before_execution_retains_its_summary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let controller = controller_with_model(
+            &workspace,
+            SummaryCodeModel {
+                source: "1 + 1".to_owned(),
+                reasoning_summary: "code summary".to_owned(),
+                cancel_before_execution: true,
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel before execution".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(
+            events.iter().map(event_label).collect::<Vec<_>>(),
+            [
+                "record:1:user:cancel before execution",
+                "record:1:cancelled",
+                "settled:1",
+            ]
+        );
+        let Record::CancelledRun { terminal } = &records[1].record else {
+            panic!("expected cancellation terminal record");
+        };
+        let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
+            panic!("expected interrupted execution evidence");
+        };
+        assert_eq!(evidence.reasoning_summary, "code summary");
+        assert!(!evidence.began);
+    }
+
+    #[tokio::test]
+    async fn terminal_arena_failure_retains_completed_code_summary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let controller = controller_with_model(
+            &workspace,
+            SummaryCodeModel {
+                source: "x = ' ' * (1 << 60)".to_owned(),
+                reasoning_summary: "failed code summary".to_owned(),
+                cancel_before_execution: false,
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "fail execution".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+        let Record::FailedRun { terminal, .. } = &records[1].record else {
+            panic!("expected failed terminal record");
+        };
+        let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
+            panic!("expected failed execution evidence");
+        };
+        assert_eq!(evidence.reasoning_summary, "failed code summary");
+        assert!(matches!(
+            evidence.failure,
+            Some(ExecutionFailure::Arena { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2598,6 +2817,65 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_summaries_are_carried_by_reliable_records() {
+        let workspace = tempfile::tempdir().unwrap();
+        let controller = controller_with_model(&workspace, CompletedSummaryModel { step: 0 }).await;
+        let (commands, mut events, mut progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let progress = drain_progress(&mut progress);
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(
+            events.iter().map(event_label).collect::<Vec<_>>(),
+            [
+                "record:1:user:inspect",
+                "record:1:execution:1",
+                "record:1:message:2:done",
+                "settled:1",
+            ]
+        );
+        assert!(
+            !progress
+                .iter()
+                .any(|envelope| matches!(envelope.item, RuntimeEvent::ModelProgress { .. }))
+        );
+        let [
+            StoredRecord {
+                record: Record::UserRequest { .. },
+                ..
+            },
+            StoredRecord {
+                record:
+                    Record::CompletedExecution {
+                        reasoning_summary: code_summary,
+                        ..
+                    },
+                ..
+            },
+            StoredRecord {
+                record:
+                    Record::FinalMessage {
+                        reasoning_summary: message_summary,
+                        ..
+                    },
+                ..
+            },
+        ] = records.as_slice()
+        else {
+            panic!("expected user request, completed execution, and final message");
+        };
+        assert_eq!(code_summary, "code summary");
+        assert_eq!(message_summary, "message summary");
     }
 
     #[tokio::test]
@@ -2712,6 +2990,24 @@ mod tests {
             later_events.last(),
             Some(RuntimeEvent::RunSettled { run_id: RunId(2) })
         ));
+        let committed_execution = records
+            .iter()
+            .find_map(|record| match record {
+                StoredRecord {
+                    run_id: RunId(1),
+                    record:
+                        Record::CompletedExecution {
+                            reasoning_summary, ..
+                        },
+                } => Some(reasoning_summary),
+                _ => None,
+            })
+            .expect("first request should retain its completed summary");
+        assert_eq!(committed_execution, "committed code summary");
+        let Record::CancelledRun { terminal } = &records[2].record else {
+            panic!("first request should end with cancellation");
+        };
+        assert!(terminal.evidence.is_none());
         let later_execution = records
             .iter()
             .find_map(|record| match record {
@@ -2830,6 +3126,7 @@ mod tests {
                     ),
                     attempts: attempts.clone(),
                     evidence: Some(Box::new(TerminalEvidence::Generation(GenerationEvidence {
+                        reasoning_summary: String::new(),
                         reasoning: "thinking".to_owned(),
                         assistant_text: "partial".to_owned(),
                         decoded_python: String::new(),
@@ -2987,11 +3284,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_cancellation_wins_over_an_already_queued_final_message() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller(
+        let mut controller = controller_with_model(
             &workspace,
-            vec![ModelAction::Message {
+            SummaryMessageModel {
                 text: "must not be admitted".to_owned(),
-            }],
+                reasoning_summary: "final summary".to_owned(),
+            },
         )
         .await;
         let mut agent = controller
@@ -3052,6 +3350,7 @@ mod tests {
             panic!("the lost final should be retained as generation evidence");
         };
         assert_eq!(evidence.assistant_text, "must not be admitted");
+        assert_eq!(evidence.reasoning_summary, "final summary");
         assert!(evidence.reasoning.is_empty());
         assert!(evidence.decoded_python.is_empty());
         assert!(terminal.attempts.is_empty());
