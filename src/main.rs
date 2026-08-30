@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod arena;
 pub mod config;
+mod highlight;
 pub mod model;
 mod openai;
 pub mod pricing;
