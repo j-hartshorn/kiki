@@ -794,6 +794,27 @@ impl<M: Model> RuntimeController<M> {
         mut record: Record,
         progress_gap: bool,
     ) {
+        let completed_attempt_count = self
+            .records
+            .iter()
+            .filter(|stored| stored.run_id == run_id)
+            .filter_map(|stored| match &stored.record {
+                Record::CompletedExecution { attempts, .. } => Some(attempts.len()),
+                _ => None,
+            })
+            .sum();
+        match &mut record {
+            Record::FinalMessage { terminal, .. }
+            | Record::CancelledRun { terminal }
+            | Record::FailedRun { terminal, .. } => {
+                terminal.attempts = terminal
+                    .attempts
+                    .get(completed_attempt_count..)
+                    .unwrap_or_default()
+                    .to_vec();
+            }
+            Record::UserRequest { .. } | Record::CompletedExecution { .. } => {}
+        }
         if let Record::FailedRun { message, .. } = &mut record {
             *message = bounded_utf8(std::mem::take(message), FAILED_RUN_MESSAGE_LIMIT);
         }
@@ -1345,10 +1366,14 @@ mod tests {
             async move {
                 let action = match self.step {
                     0 => CompletedModelAction::Code {
-                        source: "1 + 1".to_owned(),
-                        call_id: ModelCallId::new("accounting-code"),
+                        source: "first = 1".to_owned(),
+                        call_id: ModelCallId::new("first-accounting-code"),
                     },
-                    1 => CompletedModelAction::Message {
+                    1 => CompletedModelAction::Code {
+                        source: "second = first + 1".to_owned(),
+                        call_id: ModelCallId::new("second-accounting-code"),
+                    },
+                    2 => CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
                     _ => return Err(ModelError::Exhausted.into()),
@@ -1524,7 +1549,7 @@ mod tests {
                     action,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
-                    attempts: Vec::new(),
+                    attempts: vec![AttemptAccounting::UsageUnavailable],
                 })
             }
         }
@@ -2879,7 +2904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_records_retain_attempts_and_completed_steps_retain_step_attempts() {
+    async fn terminal_records_scope_cumulative_attempts_to_the_residual_step() {
         let workspace = tempfile::tempdir().unwrap();
         let controller = controller_with_model(&workspace, AccountingModel { step: 0 }).await;
         let (commands, mut events, _progress, task) = start_controller(controller);
@@ -2894,20 +2919,26 @@ mod tests {
         commands.send(RuntimeCommand::Cancel).await.unwrap();
         let records = shutdown_controller(commands, task).await;
 
-        let Record::CompletedExecution { attempts, .. } = &records[1].record else {
-            panic!("expected completed execution record");
-        };
-        assert_eq!(attempts.as_slice(), [AttemptAccounting::UsageUnavailable]);
-        let Record::FinalMessage { terminal, .. } = &records[2].record else {
-            panic!("expected final terminal record");
-        };
         assert_eq!(
-            terminal.attempts,
+            events.iter().map(event_label).collect::<Vec<_>>(),
             [
-                AttemptAccounting::UsageUnavailable,
-                AttemptAccounting::UsageUnavailable,
+                "record:1:user:accounting",
+                "record:1:execution:1",
+                "record:1:execution:2",
+                "record:1:message:3:done",
+                "settled:1",
             ]
         );
+        for record in &records[1..3] {
+            let Record::CompletedExecution { attempts, .. } = &record.record else {
+                panic!("expected completed execution record");
+            };
+            assert_eq!(attempts.as_slice(), [AttemptAccounting::UsageUnavailable]);
+        }
+        let Record::FinalMessage { terminal, .. } = &records[3].record else {
+            panic!("expected final terminal record");
+        };
+        assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
         assert_eq!(
             records
                 .iter()
@@ -3004,10 +3035,15 @@ mod tests {
             })
             .expect("first request should retain its completed summary");
         assert_eq!(committed_execution, "committed code summary");
+        let Record::CompletedExecution { attempts, .. } = &records[1].record else {
+            panic!("first request should retain its completed attempt");
+        };
+        assert_eq!(attempts.as_slice(), [AttemptAccounting::UsageUnavailable]);
         let Record::CancelledRun { terminal } = &records[2].record else {
             panic!("first request should end with cancellation");
         };
         assert!(terminal.evidence.is_none());
+        assert!(terminal.attempts.is_empty());
         let later_execution = records
             .iter()
             .find_map(|record| match record {
@@ -3094,7 +3130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_cancellation_overrides_queued_failures_except_recovery_failure() {
+    async fn terminal_failures_scope_residual_attempts_and_cancellation_precedence() {
         #[derive(Clone, Copy)]
         enum FailureKind {
             Provider,
@@ -3102,10 +3138,12 @@ mod tests {
             Recovery,
         }
 
-        for kind in [
-            FailureKind::Provider,
-            FailureKind::Arena,
-            FailureKind::Recovery,
+        for (kind, cancellation_queued) in [
+            (FailureKind::Provider, true),
+            (FailureKind::Arena, true),
+            (FailureKind::Recovery, true),
+            (FailureKind::Provider, false),
+            (FailureKind::Arena, false),
         ] {
             let workspace = tempfile::tempdir().unwrap();
             let mut controller = controller(&workspace, Vec::new()).await;
@@ -3113,7 +3151,27 @@ mod tests {
                 .agent
                 .take()
                 .expect("idle controller should own its agent");
-            let attempts = vec![AttemptAccounting::UsageUnavailable];
+            let attempts = vec![
+                AttemptAccounting::UsageUnavailable,
+                AttemptAccounting::UsageUnavailable,
+            ];
+            let (event_sender, mut events) = mpsc::unbounded_channel();
+            controller.append_record(
+                &event_sender,
+                RunId(1),
+                Record::CompletedExecution {
+                    step_id: ModelStepId(1),
+                    source: "committed()".to_owned(),
+                    reasoning_summary: String::new(),
+                    execution: Execution {
+                        stdout: empty_observation(),
+                        stderr: empty_observation(),
+                        outcome: ExecutionOutcome::Complete { result: None },
+                    },
+                    attempts: vec![AttemptAccounting::UsageUnavailable],
+                },
+                false,
+            );
             let result = match kind {
                 FailureKind::Provider => Err(crate::agent::AgentError::Model {
                     failure: ModelFailure::new(
@@ -3183,8 +3241,9 @@ mod tests {
                 })
                 .unwrap();
             let (commands, command_receiver) = mpsc::channel(1);
-            commands.send(RuntimeCommand::Cancel).await.unwrap();
-            let (event_sender, mut events) = mpsc::unbounded_channel();
+            if cancellation_queued {
+                commands.send(RuntimeCommand::Cancel).await.unwrap();
+            }
             let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             let task =
                 tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
@@ -3193,19 +3252,86 @@ mod tests {
             let records = shutdown_controller(commands, task).await;
             assert_eq!(records, committed_records(&events));
             let terminal = records.last().expect("terminal record");
-            match kind {
-                FailureKind::Provider | FailureKind::Arena => {
+            assert!(matches!(
+                &records[0].record,
+                Record::CompletedExecution { attempts, .. }
+                    if attempts == &[AttemptAccounting::UsageUnavailable]
+            ));
+            assert!(matches!(
+                events.first(),
+                Some(RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(1),
+                        record: Record::CompletedExecution { .. },
+                    },
+                    ..
+                })
+            ));
+            match (kind, cancellation_queued) {
+                (FailureKind::Provider | FailureKind::Arena, true) => {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [
+                            _,
+                            RuntimeEvent::RecordAppended {
+                                record: StoredRecord {
+                                    run_id: RunId(1),
+                                    record: Record::CancelledRun { .. },
+                                },
+                                ..
+                            },
+                            RuntimeEvent::RunSettled { run_id: RunId(1) },
+                        ]
+                    ));
                     let Record::CancelledRun { terminal } = &terminal.record else {
                         panic!("accepted cancellation should win");
                     };
-                    assert_eq!(terminal.attempts, attempts);
+                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
                     assert!(terminal.evidence.is_some());
                 }
-                FailureKind::Recovery => {
+                (FailureKind::Provider | FailureKind::Arena, false) => {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [
+                            _,
+                            RuntimeEvent::RecordAppended {
+                                record: StoredRecord {
+                                    run_id: RunId(1),
+                                    record: Record::FailedRun { .. },
+                                },
+                                ..
+                            },
+                            RuntimeEvent::RunSettled { run_id: RunId(1) },
+                        ]
+                    ));
+                    let Record::FailedRun { terminal, .. } = &terminal.record else {
+                        panic!("ordinary failures should remain failed runs");
+                    };
+                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
+                    assert!(terminal.evidence.is_some());
+                }
+                (FailureKind::Recovery, true) => {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [
+                            _,
+                            RuntimeEvent::RecordAppended {
+                                record: StoredRecord {
+                                    run_id: RunId(1),
+                                    record: Record::FailedRun { .. },
+                                },
+                                ..
+                            },
+                            RuntimeEvent::RuntimeDisabled {
+                                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                            },
+                            RuntimeEvent::RunSettled { run_id: RunId(1) },
+                        ]
+                    ));
                     let Record::FailedRun { terminal, .. } = &terminal.record else {
                         panic!("recovery failure should override cancellation");
                     };
-                    assert_eq!(terminal.attempts, attempts);
+                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
                     let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
                         panic!("expected recovery execution evidence");
                     };
@@ -3214,6 +3340,7 @@ mod tests {
                         Some(ExecutionFailure::RecoveryFailed { .. })
                     ));
                 }
+                (FailureKind::Recovery, false) => unreachable!(),
             }
         }
     }

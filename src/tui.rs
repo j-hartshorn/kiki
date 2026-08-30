@@ -1064,19 +1064,17 @@ fn format_terminal(
 ) -> String {
     let mut lines = vec![header];
     append_display_gap(&mut lines, progress_gap);
-    let terminal_step_attempts = terminal
-        .attempts
-        .get(prior_attempts.len()..)
-        .unwrap_or_default();
-    append_attempts(&mut lines, terminal_step_attempts);
+    append_attempts(&mut lines, &terminal.attempts);
     lines.push(format_cost(
         "Step estimated cost",
-        &terminal_step_attempts.iter().collect::<Vec<_>>(),
-    ));
-    lines.push(format_cost(
-        "Run estimated cost",
         &terminal.attempts.iter().collect::<Vec<_>>(),
     ));
+    let run_attempts = prior_attempts
+        .iter()
+        .copied()
+        .chain(terminal.attempts.iter())
+        .collect::<Vec<_>>();
+    lines.push(format_cost("Run estimated cost", &run_attempts));
     if let Some(evidence) = &terminal.evidence {
         append_terminal_evidence(&mut lines, evidence);
     }
@@ -2546,9 +2544,8 @@ mod tests {
                     reasoning_summary: String::new(),
                     terminal: terminal(
                         None,
-                        vec![
-                            usage(100, 0),
-                            AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
+                        vec![AttemptAccounting::KnownUsageWithUntrackedRetries(
+                            ModelUsage {
                                 model: "gpt-5.6-sol".to_owned(),
                                 service_tier: Some("default".to_owned()),
                                 input_tokens: Some(0),
@@ -2557,8 +2554,8 @@ mod tests {
                                 output_tokens: Some(100),
                                 reasoning_output_tokens: Some(20),
                                 total_tokens: Some(100),
-                            }),
-                        ],
+                            },
+                        )],
                     ),
                 },
             },
