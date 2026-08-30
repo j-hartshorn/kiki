@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,8 +9,8 @@ use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, Term
 use crate::arena::{Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome};
 use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
 use crate::highlight::PythonHighlighter;
-use crate::model::{AttemptAccounting, ModelProgress};
-use crate::pricing::{CostEstimate, RunCostEstimate, estimate_run_cost, estimate_usage};
+use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
+use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::runtime::{
     ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord, TerminalDetails,
 };
@@ -81,7 +79,6 @@ struct LiveStep {
     run_id: RunId,
     step_id: ModelStepId,
     phase: LivePhase,
-    attempt: Option<u32>,
     settled_attempts: Vec<AttemptAccounting>,
     reasoning: String,
     assistant_text: String,
@@ -98,7 +95,6 @@ impl LiveStep {
             run_id,
             step_id,
             phase: LivePhase::Generating,
-            attempt: None,
             settled_attempts: Vec::new(),
             reasoning: String::new(),
             assistant_text: String::new(),
@@ -235,6 +231,10 @@ const REASONING: Color = Color::Rgb(30, 30, 36);
 
 pub(crate) fn page_style() -> Style {
     Style::reset().fg(TEXT).bg(PAGE)
+}
+
+pub(crate) fn muted_page_style() -> Style {
+    page_style().fg(MUTED)
 }
 
 fn card_style(background: Color) -> Style {
@@ -528,11 +528,16 @@ impl RenderBlock {
 pub(crate) struct TranscriptLayout {
     blocks: Vec<RenderBlock>,
     total_height: usize,
+    footer: Option<String>,
 }
 
 impl TranscriptLayout {
     pub(crate) fn total_height(&self) -> usize {
         self.total_height
+    }
+
+    pub(crate) fn footer(&self) -> Option<&str> {
+        self.footer.as_deref()
     }
 
     pub(crate) fn render(&self, viewport: Rect, top: usize, buffer: &mut Buffer) {
@@ -549,6 +554,11 @@ impl TranscriptLayout {
             block_top = block_top.saturating_add(block.height);
         }
     }
+}
+
+struct DisplayProjection {
+    blocks: Vec<TranscriptBlock>,
+    footer: Option<String>,
 }
 
 pub(crate) struct Transcript {
@@ -639,7 +649,6 @@ impl Transcript {
                 self.update_live_step(run_id, step_id, gap_before, status, |live| match progress {
                     ModelProgress::AttemptStarted { attempt } => {
                         live.phase = LivePhase::Generating;
-                        live.attempt = Some(attempt);
                         live.reasoning.clear();
                         live.assistant_text.clear();
                         live.decoded_python.clear();
@@ -756,8 +765,12 @@ impl Transcript {
     }
 
     pub(crate) fn layout(&mut self, width: u16) -> TranscriptLayout {
+        let DisplayProjection {
+            blocks: projected_blocks,
+            footer,
+        } = self.projection();
         let mut blocks = Vec::new();
-        for block in self.blocks().into_iter().map(TranscriptBlock::normalise) {
+        for block in projected_blocks.into_iter().map(TranscriptBlock::normalise) {
             let render_block = match block {
                 NormalisedBlock::Startup { lines } | NormalisedBlock::Metadata { lines } => {
                     RenderBlock::new(
@@ -833,31 +846,34 @@ impl Transcript {
         TranscriptLayout {
             blocks,
             total_height,
+            footer,
         }
     }
 
     fn blocks(&self) -> Vec<TranscriptBlock> {
+        self.projection().blocks
+    }
+
+    fn projection(&self) -> DisplayProjection {
         let mut blocks = self
             .startup
             .as_ref()
             .map(startup_block)
             .into_iter()
             .collect::<Vec<_>>();
-        let mut attempts_by_run = BTreeMap::<RunId, Vec<&AttemptAccounting>>::new();
+        let mut attempts = Vec::new();
         for displayed in &self.records {
-            let prior_attempts = attempts_by_run.entry(displayed.record.run_id).or_default();
-            blocks.extend(record_blocks(displayed, prior_attempts));
-            if let Record::CompletedExecution { attempts, .. } = &displayed.record.record {
-                prior_attempts.extend(attempts);
-            }
+            blocks.extend(record_blocks(displayed));
+            append_record_attempts(&displayed.record.record, &mut attempts);
         }
         if let Some(live) = &self.live_step {
-            let prior_attempts = attempts_by_run
-                .get(&live.run_id)
-                .map_or(&[][..], Vec::as_slice);
-            blocks.extend(live_blocks(live, prior_attempts));
+            blocks.extend(live_blocks(live));
+            attempts.extend(&live.settled_attempts);
         }
-        blocks
+        DisplayProjection {
+            blocks,
+            footer: session_footer(&attempts),
+        }
     }
 
     fn disable(&mut self, reason: RuntimeDisabledReason, clear_submitting: bool) -> bool {
@@ -1107,10 +1123,20 @@ pub(crate) fn format_startup_configuration(snapshot: &StartupSnapshot) -> String
     lines.join("\n")
 }
 
-fn record_blocks(
-    displayed: &DisplayedRecord,
-    prior_attempts: &[&AttemptAccounting],
-) -> Vec<TranscriptBlock> {
+fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a AttemptAccounting>) {
+    match record {
+        Record::CompletedExecution {
+            attempts: record_attempts,
+            ..
+        } => attempts.extend(record_attempts),
+        Record::FinalMessage { terminal, .. }
+        | Record::CancelledRun { terminal }
+        | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
+        Record::UserRequest { .. } => {}
+    }
+}
+
+fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
     let stored = &displayed.record;
     let run_id = stored.run_id.0;
     match &stored.record {
@@ -1134,7 +1160,7 @@ fn record_blocks(
                 source: Some(source.clone()),
                 content: execution_content(execution),
                 progress_gap: displayed.progress_gap,
-                metadata: step_metadata(attempts, prior_attempts),
+                metadata: step_metadata(attempts),
             }));
             blocks
         }
@@ -1155,37 +1181,28 @@ fn record_blocks(
                 markdown: text.clone(),
             });
             append_gap_metadata(&mut blocks, displayed.progress_gap);
-            append_metadata(
-                &mut blocks,
-                step_metadata(&terminal.attempts, prior_attempts),
-            );
+            append_metadata(&mut blocks, step_metadata(&terminal.attempts));
             blocks
         }
         Record::CancelledRun { terminal } => terminal_blocks(
             format!("[run {run_id}] cancelled"),
             terminal,
-            prior_attempts,
             displayed.progress_gap,
         ),
         Record::FailedRun { message, terminal } => terminal_blocks(
             format!("[run {run_id}] failed: {message}"),
             terminal,
-            prior_attempts,
             displayed.progress_gap,
         ),
     }
 }
 
-fn live_blocks(live: &LiveStep, prior_attempts: &[&AttemptAccounting]) -> Vec<TranscriptBlock> {
+fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
     let has_arena_content = live.phase == LivePhase::Executing
         || !live.decoded_python.is_empty()
         || !live.stdout.is_empty()
         || live.stdout_truncated;
-    let mut metadata = Vec::new();
-    if let Some(attempt) = live.attempt {
-        metadata.push(format!("attempt: {attempt}"));
-    }
-    metadata.extend(step_metadata(&live.settled_attempts, prior_attempts));
+    let metadata = step_metadata(&live.settled_attempts);
 
     let mut blocks = Vec::new();
     if !has_arena_content {
@@ -1249,7 +1266,6 @@ fn live_blocks(live: &LiveStep, prior_attempts: &[&AttemptAccounting]) -> Vec<Tr
 fn terminal_blocks(
     title: String,
     terminal: &TerminalDetails,
-    prior_attempts: &[&AttemptAccounting],
     progress_gap: bool,
 ) -> Vec<TranscriptBlock> {
     let mut evidence_blocks = Vec::new();
@@ -1262,16 +1278,13 @@ fn terminal_blocks(
             unreachable!("terminal evidence arena")
         };
         arena.progress_gap = progress_gap;
-        arena.metadata = step_metadata(&terminal.attempts, prior_attempts);
+        arena.metadata = step_metadata(&terminal.attempts);
         evidence_blocks
     } else {
         let mut blocks = vec![TranscriptBlock::Status { text: title }];
         blocks.append(&mut evidence_blocks);
         append_gap_metadata(&mut blocks, progress_gap);
-        append_metadata(
-            &mut blocks,
-            step_metadata(&terminal.attempts, prior_attempts),
-        );
+        append_metadata(&mut blocks, step_metadata(&terminal.attempts));
         blocks
     }
 }
@@ -1410,23 +1423,106 @@ fn execution_evidence_block(title: String, evidence: &ExecutionEvidence) -> Aren
     }
 }
 
-fn step_metadata(
-    attempts: &[AttemptAccounting],
-    prior_attempts: &[&AttemptAccounting],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    append_attempts(&mut lines, attempts);
-    lines.push(format_cost(
-        "Step estimated cost",
-        &attempts.iter().collect::<Vec<_>>(),
-    ));
-    let run_attempts = prior_attempts
+#[derive(Default)]
+struct SessionAccounting {
+    input: Option<u128>,
+    output: Option<u128>,
+    cache_read: Option<u128>,
+    cache_write: Option<u128>,
+    reasoning: Option<u128>,
+    total: Option<u128>,
+}
+
+impl SessionAccounting {
+    fn add(&mut self, attempt: &AttemptAccounting) {
+        let (AttemptAccounting::KnownUsage(usage)
+        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage)) = attempt
+        else {
+            return;
+        };
+        add_total(&mut self.input, usage.input_tokens);
+        add_total(&mut self.output, usage.output_tokens);
+        add_total(&mut self.cache_read, usage.cached_input_tokens);
+        add_total(&mut self.cache_write, usage.cache_write_input_tokens);
+        add_total(&mut self.reasoning, usage.reasoning_output_tokens);
+        add_total(&mut self.total, usage.total_tokens);
+    }
+}
+
+fn session_footer(attempts: &[&AttemptAccounting]) -> Option<String> {
+    let mut accounting = SessionAccounting::default();
+    for attempt in attempts {
+        accounting.add(attempt);
+    }
+    let mut fields = Vec::new();
+    for (label, total) in [
+        ("↑", accounting.input),
+        ("↓", accounting.output),
+        ("R", accounting.cache_read),
+        ("W", accounting.cache_write),
+        ("r", accounting.reasoning),
+        ("Σ", accounting.total),
+    ] {
+        if let Some(total) = total {
+            fields.push(format!("{label}{total}"));
+        }
+    }
+    if let Some(cost) = estimated_cost(attempts.iter().copied()) {
+        fields.push(cost);
+    }
+    (!fields.is_empty()).then(|| fields.join(" "))
+}
+
+fn add_total(total: &mut Option<u128>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or_default().saturating_add(u128::from(value)));
+    }
+}
+
+fn step_metadata(attempts: &[AttemptAccounting]) -> Vec<String> {
+    let mut lines = attempts
         .iter()
-        .copied()
-        .chain(attempts.iter())
+        .enumerate()
+        .map(|(index, attempt)| compact_attempt(index + 1, attempt))
         .collect::<Vec<_>>();
-    lines.push(format_cost("Run estimated cost", &run_attempts));
+    if let Some(cost) = estimated_cost(attempts.iter()) {
+        lines.push(format!("cost {cost}"));
+    }
     lines
+}
+
+fn compact_attempt(index: usize, attempt: &AttemptAccounting) -> String {
+    let mut fields = vec![format!("#{index}")];
+    if let AttemptAccounting::KnownUsage(usage)
+    | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) = attempt
+    {
+        append_usage_fields(&mut fields, usage);
+    }
+    fields.join(" ")
+}
+
+fn append_usage_fields(fields: &mut Vec<String>, usage: &ModelUsage) {
+    for (label, value) in [
+        ("↑", usage.input_tokens),
+        ("↓", usage.output_tokens),
+        ("R", usage.cached_input_tokens),
+        ("W", usage.cache_write_input_tokens),
+        ("r", usage.reasoning_output_tokens),
+        ("Σ", usage.total_tokens),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{label}{value}"));
+        }
+    }
+}
+
+fn estimated_cost<'a>(attempts: impl IntoIterator<Item = &'a AttemptAccounting>) -> Option<String> {
+    match estimate_run_cost(attempts) {
+        RunCostEstimate::Complete(estimate) | RunCostEstimate::LowerBound(estimate) => {
+            Some(format_usd(estimate.amount().as_nanos()))
+        }
+        RunCostEstimate::Unavailable => None,
+    }
 }
 
 fn format_interrupted_read(read: &InterruptedRead) -> String {
@@ -1466,64 +1562,6 @@ fn append_display_gap(lines: &mut Vec<String>, progress_gap: bool) {
     if progress_gap {
         lines.push("display gap: some live progress was dropped".to_owned());
     }
-}
-
-fn append_attempts(lines: &mut Vec<String>, attempts: &[AttemptAccounting]) {
-    for (index, attempt) in attempts.iter().enumerate() {
-        match attempt {
-            AttemptAccounting::KnownUsage(usage)
-            | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
-                let priceability = if estimate_usage(usage).is_ok() {
-                    "priceable"
-                } else {
-                    "unpriceable"
-                };
-                lines.push(format!(
-                    "attempt {}: model={} tier={} input={} cached-input={} cache-write-input={} output={} reasoning-output={} total={} ({priceability})",
-                    index + 1,
-                    usage.model,
-                    usage.service_tier.as_deref().unwrap_or("unavailable"),
-                    format_usage_value(usage.input_tokens),
-                    format_usage_value(usage.cached_input_tokens),
-                    format_usage_value(usage.cache_write_input_tokens),
-                    format_usage_value(usage.output_tokens),
-                    format_usage_value(usage.reasoning_output_tokens),
-                    format_usage_value(usage.total_tokens),
-                ));
-            }
-            AttemptAccounting::UsageUnavailable => {
-                lines.push(format!(
-                    "attempt {}: model=unavailable tier=unavailable input=unavailable cached-input=unavailable cache-write-input=unavailable output=unavailable reasoning-output=unavailable total=unavailable (unpriceable)",
-                    index + 1
-                ));
-            }
-        }
-    }
-}
-
-fn format_usage_value(value: Option<u64>) -> String {
-    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
-}
-
-fn format_cost(label: &str, attempts: &[&AttemptAccounting]) -> String {
-    match estimate_run_cost(attempts.iter().copied()) {
-        RunCostEstimate::Complete(estimate) => format_estimated_cost(label, "Complete", estimate),
-        RunCostEstimate::LowerBound(estimate) => {
-            format_estimated_cost(label, "LowerBound", estimate)
-        }
-        RunCostEstimate::Unavailable => format!("{label}: Unavailable (no priceable usage)"),
-    }
-}
-
-fn format_estimated_cost(label: &str, completeness: &str, estimate: CostEstimate) -> String {
-    let pricing = estimate.pricing();
-    format!(
-        "{label}: {completeness} {} USD ({}/{} pricing {})",
-        format_usd(estimate.amount().as_nanos()),
-        pricing.model,
-        pricing.service_tier,
-        pricing.version,
-    )
 }
 
 fn format_usd(nanodollars: u128) -> String {
@@ -1760,6 +1798,26 @@ mod tests {
         })
     }
 
+    fn detailed_usage(
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
+        total: Option<u64>,
+    ) -> AttemptAccounting {
+        AttemptAccounting::KnownUsage(ModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: input,
+            cached_input_tokens: cache_read,
+            cache_write_input_tokens: cache_write,
+            output_tokens: output,
+            reasoning_output_tokens: reasoning,
+            total_tokens: total,
+        })
+    }
+
     fn completed_execution(
         run_id: u64,
         step_id: u64,
@@ -1942,7 +2000,7 @@ mod tests {
         assert!(!history.contains("discarded reasoning"));
         assert!(!history.contains("discarded_code()"));
         assert!(history.contains("retained answer"));
-        assert!(history.contains("attempt 1: model=gpt-5.6-sol"));
+        assert!(history.contains("#1 ↑100 ↓0 R0 W0 r0 Σ100"));
         assert!(history.contains("display gap"));
     }
 
@@ -2047,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_folds_disjoint_attempts_forward_by_run() {
+    fn accounting_folds_disjoint_attempts_forward_by_run() {
         let mut transcript = Transcript::default();
         transcript.apply(
             completed_execution(1, 1, "first()", "", vec![usage(100, 0)]),
@@ -2060,9 +2118,169 @@ mod tests {
         );
 
         let history = rendered_text(&transcript);
-        assert_eq!(history.matches("attempt 1: model=gpt-5.6-sol").count(), 2);
-        assert!(history.contains("Run estimated cost: Complete $0.0024 USD"));
+        assert_eq!(history.matches("#1").count(), 2);
+        assert!(history.contains("cost $0.0004"));
+        assert!(history.contains("cost $0.002"));
+        assert!(!history.contains("Run estimated cost"));
         assert!(history.contains("[run 2 step 2]\ncode:"));
+    }
+
+    #[test]
+    fn accounting_compacts_attempt_fields_and_omits_unavailable_values() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "accounting()",
+                "",
+                vec![
+                    detailed_usage(Some(100), Some(20), Some(10), Some(5), Some(5), Some(120)),
+                    detailed_usage(Some(0), None, Some(0), None, Some(0), Some(0)),
+                    AttemptAccounting::UsageUnavailable,
+                ],
+            ),
+            false,
+        );
+
+        let blocks = transcript.blocks();
+        let arena = blocks
+            .iter()
+            .find_map(|block| match block {
+                TranscriptBlock::Arena(arena) => Some(arena),
+                _ => None,
+            })
+            .expect("accounting arena");
+        assert_eq!(
+            arena.metadata,
+            [
+                "#1 ↑100 ↓20 R10 W5 r5 Σ120",
+                "#2 ↑0 R0 r0 Σ0",
+                "#3",
+                "cost $0.000769",
+            ]
+        );
+
+        assert_eq!(
+            transcript.layout(1).footer(),
+            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+        );
+
+        let mut unavailable = Transcript::default();
+        unavailable.apply(
+            completed_execution(
+                2,
+                1,
+                "unavailable()",
+                "",
+                vec![AttemptAccounting::UsageUnavailable],
+            ),
+            false,
+        );
+        let unavailable_blocks = unavailable.blocks();
+        let [TranscriptBlock::Arena(unavailable_arena)] = unavailable_blocks.as_slice() else {
+            panic!("unavailable accounting arena")
+        };
+        assert_eq!(unavailable_arena.metadata, ["#1"]);
+        assert_eq!(unavailable.layout(1).footer(), None);
+
+        let AttemptAccounting::KnownUsage(mut partial_usage) =
+            detailed_usage(Some(7), None, None, None, None, None)
+        else {
+            unreachable!("known usage helper")
+        };
+        partial_usage.service_tier = Some("priority".to_owned());
+        let mut unpriceable = Transcript::default();
+        unpriceable.apply(
+            completed_execution(
+                3,
+                1,
+                "unpriceable()",
+                "",
+                vec![AttemptAccounting::KnownUsage(partial_usage)],
+            ),
+            false,
+        );
+        let unpriceable_blocks = unpriceable.blocks();
+        let [TranscriptBlock::Arena(unpriceable_arena)] = unpriceable_blocks.as_slice() else {
+            panic!("unpriceable accounting arena")
+        };
+        assert_eq!(unpriceable_arena.metadata, ["#1 ↑7"]);
+        assert_eq!(unpriceable.layout(1).footer(), Some("↑7"));
+
+        let mut complete = Transcript::default();
+        complete.apply(
+            completed_execution(
+                2,
+                1,
+                "complete()",
+                "",
+                vec![detailed_usage(
+                    Some(100),
+                    Some(20),
+                    Some(10),
+                    Some(5),
+                    Some(5),
+                    Some(120),
+                )],
+            ),
+            false,
+        );
+        assert!(rendered_text(&complete).contains("cost $0.000769"));
+
+        let history = rendered_text(&transcript);
+        for verbose in [
+            "attempt 1:",
+            "model=",
+            "tier=",
+            "pricing",
+            "Complete",
+            "LowerBound",
+            "USD",
+            "Run estimated cost",
+            "unavailable",
+        ] {
+            assert!(!history.contains(verbose), "{history}");
+        }
+    }
+
+    #[test]
+    fn accounting_keeps_attempts_step_local_across_live_and_terminal_replacement() {
+        let first = detailed_usage(Some(100), Some(0), Some(0), Some(0), Some(0), Some(100));
+        let residual = detailed_usage(Some(0), Some(100), Some(0), Some(0), Some(20), Some(100));
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: first.clone(),
+                },
+            },
+            false,
+        );
+        assert_eq!(rendered_text(&transcript).matches("#1 ↑100").count(), 1);
+
+        transcript.apply(completed_execution(1, 1, "first()", "", vec![first]), false);
+        transcript.apply(final_message(1, 2, "done", vec![residual], false), false);
+        transcript.apply(
+            completed_execution(
+                2,
+                1,
+                "other()",
+                "",
+                vec![AttemptAccounting::UsageUnavailable],
+            ),
+            false,
+        );
+
+        let history = rendered_text(&transcript);
+        assert_eq!(history.matches("#1 ↑100").count(), 1);
+        assert_eq!(history.matches("#1 ↑0 ↓100").count(), 1);
+        assert!(history.ends_with("#1"));
+        assert!(!history.contains("Run estimated cost"));
     }
 
     #[test]
@@ -2277,14 +2495,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             roles,
-            [
-                "user",
-                "reasoning",
-                "arena",
-                "reasoning",
-                "assistant",
-                "metadata"
-            ]
+            ["user", "reasoning", "arena", "reasoning", "assistant"]
         );
     }
 
@@ -2411,19 +2622,7 @@ mod tests {
         assert_eq!(arena.title, "[run 1 step 1] live: generating");
         assert!(arena.progress_gap);
         assert_eq!(arena.status.as_deref(), Some("activity: model attempt 1"));
-        for line in [
-            "attempt: 1",
-            "attempt 1: model=gpt-5.6-sol",
-            "Step estimated cost:",
-            "Run estimated cost:",
-        ] {
-            assert!(
-                arena
-                    .metadata
-                    .iter()
-                    .any(|metadata| metadata.starts_with(line))
-            );
-        }
+        assert_eq!(arena.metadata, ["#1 ↑1 ↓1 R0 W0 r0 Σ2", "cost $0.000024"]);
 
         let rendered = rendered_text(&transcript);
         assert_eq!(
@@ -2586,11 +2785,9 @@ mod tests {
             assert_eq!(arenas.len(), 1);
             assert_eq!(arenas[0].title, title);
             assert!(arenas[0].progress_gap);
-            assert!(
-                arenas[0]
-                    .metadata
-                    .iter()
-                    .any(|line| line.starts_with("attempt 1:"))
+            assert_eq!(
+                arenas[0].metadata,
+                ["#1 ↑1 ↓1 R0 W0 r0 Σ2", "cost $0.000024"]
             );
         }
     }
@@ -2618,8 +2815,8 @@ mod tests {
         assert!(blocks.iter().any(|block| {
             matches!(block, TranscriptBlock::Metadata { lines } if lines.len() == 1 && lines[0] == "display gap: some live progress was dropped")
         }));
-        assert!(blocks.iter().any(|block| {
-            matches!(block, TranscriptBlock::Metadata { lines } if lines.iter().any(|line| line.starts_with("Step estimated cost:")))
+        assert!(!blocks.iter().any(|block| {
+            matches!(block, TranscriptBlock::Metadata { lines } if lines.iter().any(|line| line.starts_with("cost $")))
         }));
         assert!(
             !blocks
@@ -2903,6 +3100,7 @@ mod tests {
         let layout = TranscriptLayout {
             total_height: blocks.iter().map(|block| block.height).sum(),
             blocks,
+            footer: None,
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
         layout.render(buffer.area, 1, &mut buffer);
@@ -3334,8 +3532,8 @@ mod tests {
         assert!(!history.contains("execution lines omitted"));
         assert!(history.contains("[run 1 step 1]"));
         assert!(history.contains("display gap: some live progress was dropped"));
-        assert!(history.contains("attempt 1: model=gpt-5.6-sol"));
-        assert!(history.contains("Step estimated cost:"));
+        assert!(history.contains("#1 ↑1 ↓1 R0 W0 r0 Σ2"));
+        assert!(history.contains("cost $0.000024"));
 
         let mut title_only = Transcript::default();
         title_only.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);

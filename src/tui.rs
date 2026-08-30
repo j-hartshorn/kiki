@@ -4,6 +4,7 @@ use std::time::Duration;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
@@ -14,7 +15,7 @@ use crate::config::StartupSnapshot;
 use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
-use crate::transcript::{Transcript, normalise_terminal_text, page_style};
+use crate::transcript::{Transcript, muted_page_style, normalise_terminal_text, page_style};
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -391,17 +392,12 @@ fn run_loop<B: Backend>(
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, page_style());
-    let configuration_only = app.is_configuration_only();
-    let reserved_rows = if configuration_only { 1 } else { 2 };
-    app.history_height = if area.width == 0 {
-        0
-    } else {
-        area.height.saturating_sub(reserved_rows) as usize
-    };
     if area.width == 0 || area.height == 0 {
+        app.history_height = 0;
         return;
     }
 
+    let configuration_only = app.is_configuration_only();
     let header = if configuration_only {
         "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
             .to_owned()
@@ -421,30 +417,91 @@ fn render(frame: &mut Frame, app: &mut App) {
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    if !configuration_only && area.height >= 2 {
-        let prompt_y = area.y.saturating_add(area.height - 1);
+    if !configuration_only && area.height < 3 {
+        app.history_height = 0;
+        if area.height == 2 {
+            let prompt = format!("> {}", app.prompt);
+            frame.render_widget(
+                Paragraph::new(normalise_terminal_text(&prompt)),
+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            );
+        }
+        return;
+    }
+    if configuration_only && area.height == 1 {
+        app.history_height = 0;
+        return;
+    }
+
+    let layout = app.transcript.layout(area.width);
+    let footer = (!configuration_only)
+        .then(|| layout.footer())
+        .flatten()
+        .map(|footer| truncate_footer(&normalise_terminal_text(footer), area.width));
+    let reserved_rows = if configuration_only {
+        1
+    } else {
+        2 + u16::from(footer.is_some())
+    };
+    let history_height = area.height.saturating_sub(reserved_rows);
+    app.history_height = usize::from(history_height);
+    app.history_rows = layout.total_height();
+    let last_page_start = app.history_rows.saturating_sub(app.history_height);
+    app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
+
+    if !configuration_only {
+        let prompt_y = area
+            .y
+            .saturating_add(area.height - 1 - u16::from(footer.is_some()));
         let prompt = format!("> {}", app.prompt);
         frame.render_widget(
             Paragraph::new(normalise_terminal_text(&prompt)),
             Rect::new(area.x, prompt_y, area.width, 1),
         );
     }
-
-    let history_height = area.height.saturating_sub(reserved_rows);
-    if history_height == 0 {
-        return;
+    if let Some(footer) = footer {
+        frame.render_widget(
+            Paragraph::new(footer).style(muted_page_style()),
+            Rect::new(
+                area.x,
+                area.y.saturating_add(area.height - 1),
+                area.width,
+                1,
+            ),
+        );
     }
 
-    let layout = app.transcript.layout(area.width);
-    app.history_rows = layout.total_height();
-    let last_page_start = app.history_rows.saturating_sub(usize::from(history_height));
-    app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-    let top = last_page_start.saturating_sub(app.scroll_from_bottom);
-    layout.render(
-        Rect::new(area.x, area.y.saturating_add(1), area.width, history_height),
-        top,
-        frame.buffer_mut(),
-    );
+    if history_height > 0 {
+        let top = last_page_start.saturating_sub(app.scroll_from_bottom);
+        layout.render(
+            Rect::new(area.x, area.y.saturating_add(1), area.width, history_height),
+            top,
+            frame.buffer_mut(),
+        );
+    }
+}
+
+fn truncate_footer(footer: &str, width: u16) -> String {
+    if Line::raw(footer).width() <= usize::from(width) {
+        return footer.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut prefix = String::new();
+    let prefix_width = usize::from(width - 1);
+    for character in footer.chars() {
+        prefix.push(character);
+        if Line::raw(&prefix).width() > prefix_width {
+            prefix.pop();
+            break;
+        }
+    }
+    prefix.push('…');
+    prefix
 }
 
 #[cfg(test)]
@@ -1172,6 +1229,26 @@ mod tests {
         })
     }
 
+    fn detailed_usage(
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
+        total: Option<u64>,
+    ) -> AttemptAccounting {
+        AttemptAccounting::KnownUsage(ModelUsage {
+            model: "gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: input,
+            cached_input_tokens: cache_read,
+            cache_write_input_tokens: cache_write,
+            output_tokens: output,
+            reasoning_output_tokens: reasoning,
+            total_tokens: total,
+        })
+    }
+
     fn terminal(
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
@@ -1318,7 +1395,261 @@ mod tests {
     }
 
     #[test]
-    fn transcript_renders_per_step_and_cumulative_costs_without_double_counting() {
+    fn footer_places_prompt_above_accounting_at_prioritised_heights() {
+        let mut app = App {
+            prompt: "ask".to_owned(),
+            ..App::default()
+        };
+        app.handle_event(completed_record(
+            1,
+            1,
+            "accounting()",
+            vec![detailed_usage(
+                Some(100),
+                Some(20),
+                Some(10),
+                Some(5),
+                Some(5),
+                Some(120),
+            )],
+        ));
+
+        assert!(rendered(&mut app, 80, 0).is_empty());
+        let one = rendered(&mut app, 80, 1);
+        assert!(one.starts_with("Status:"));
+        assert!(!one.contains("> ask"));
+        let two = rendered(&mut app, 80, 2);
+        assert!(
+            two.lines()
+                .nth(1)
+                .is_some_and(|row| row.starts_with("> ask"))
+        );
+
+        let three = rendered(&mut app, 80, 3);
+        let rows = three.lines().collect::<Vec<_>>();
+        assert!(rows[0].starts_with("Status:"));
+        assert!(rows[1].starts_with("> ask"));
+        assert_eq!(rows[2].trim_end(), "↑100 ↓20 R10 W5 r5 Σ120 $0.000769");
+        let larger = rendered(&mut app, 80, 6);
+        assert!(
+            larger
+                .lines()
+                .nth(4)
+                .is_some_and(|row| row.starts_with("> ask"))
+        );
+        assert_eq!(
+            larger.lines().nth(5).map(str::trim_end),
+            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+        );
+        assert_eq!(app.history_height, 3);
+        assert!(app.history_rows > 0);
+    }
+
+    #[test]
+    fn footer_is_absent_without_metrics_or_in_configuration_only_mode() {
+        let mut without_metrics = App {
+            prompt: "ask".to_owned(),
+            ..App::default()
+        };
+        without_metrics.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "request".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let screen = rendered(&mut without_metrics, 80, 3);
+        assert!(
+            screen
+                .lines()
+                .nth(2)
+                .is_some_and(|row| row.starts_with("> ask"))
+        );
+        assert!(!screen.contains('↑'));
+
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        configuration.handle_event(completed_record(1, 1, "code()", vec![usage(1, 1)]));
+        assert!(!rendered(&mut configuration, 80, 5).contains("↑1 ↓1 R0 W0 r0 Σ2 $"));
+    }
+
+    #[test]
+    fn footer_truncates_to_one_display_row_with_an_ellipsis() {
+        let mut app = App::default();
+        app.handle_event(completed_record(
+            1,
+            1,
+            "accounting()",
+            vec![detailed_usage(
+                Some(100),
+                Some(20),
+                Some(10),
+                Some(5),
+                Some(5),
+                Some(120),
+            )],
+        ));
+
+        let one = rendered(&mut app, 1, 3);
+        assert_eq!(one.lines().nth(2), Some("…"));
+        let narrow = rendered(&mut app, 12, 3);
+        let footer = narrow.lines().nth(2).expect("footer row").trim_end();
+        assert!(footer.ends_with('…'));
+        assert!(footer.starts_with("↑100"));
+        assert_eq!(super::truncate_footer("↑1 日本", 6), "↑1 日…");
+        assert_eq!(super::truncate_footer("text", 0), "");
+    }
+
+    #[test]
+    fn footer_aggregates_disjoint_reliable_attempts_after_live_replacement() {
+        let first = detailed_usage(Some(100), Some(20), Some(10), Some(5), Some(5), Some(120));
+        let residual = detailed_usage(None, Some(10), None, Some(0), Some(0), Some(10));
+        let mut wrong_tier =
+            match detailed_usage(Some(7), Some(0), Some(0), Some(0), Some(0), Some(7)) {
+                AttemptAccounting::KnownUsage(usage) => usage,
+                _ => unreachable!("known usage helper"),
+            };
+        wrong_tier.service_tier = Some("priority".to_owned());
+
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "first prompt".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: first.clone(),
+            },
+        });
+        assert_eq!(
+            rendered(&mut app, 80, 5).lines().last().map(str::trim_end),
+            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+        );
+
+        app.handle_event(completed_record(1, 1, "first()", vec![first]));
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(2),
+                    text: "done".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: terminal(None, vec![residual]),
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::UserRequest {
+                    request: "second prompt".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        app.handle_event(completed_record(
+            2,
+            1,
+            "other()",
+            vec![AttemptAccounting::KnownUsage(wrong_tier)],
+        ));
+
+        assert_eq!(
+            rendered(&mut app, 80, 8).lines().last().map(str::trim_end),
+            Some("↑107 ↓30 R10 W5 r5 Σ137 $0.000769")
+        );
+    }
+
+    #[test]
+    fn footer_reserves_history_and_preserves_bottom_and_manual_scroll() {
+        let mut app = App::default();
+        for run_id in 1..=4 {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: format!("request {run_id}"),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+        rendered(&mut app, 20, 5);
+        assert_eq!(app.history_height, 3);
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(5) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(5),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: usage(1, 1),
+            },
+        });
+        rendered(&mut app, 20, 5);
+        assert_eq!(app.history_height, 2);
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let manual_scroll = app.scroll_from_bottom;
+        assert!(manual_scroll > 0);
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(5),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "settled".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered(&mut app, 20, 5);
+        assert_eq!(app.history_height, 3);
+        assert_eq!(
+            app.scroll_from_bottom,
+            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+    }
+
+    #[test]
+    fn footer_keeps_scroll_when_dimensions_are_non_renderable() {
+        let mut app = App::default();
+        for run_id in 1..=4 {
+            app.handle_event(completed_record(run_id, 1, "code()", vec![usage(1, 1)]));
+        }
+        rendered(&mut app, 20, 5);
+        app.handle_key(key(KeyCode::Home));
+        let scroll = app.scroll_from_bottom;
+        assert!(scroll > 0);
+
+        rendered(&mut app, 20, 0);
+        assert_eq!(app.scroll_from_bottom, scroll);
+        let backend = TestBackend::new(0, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.scroll_from_bottom, scroll);
+    }
+
+    #[test]
+    fn transcript_renders_compact_step_and_session_costs_without_double_counting() {
         let mut app = App::default();
         app.handle_event(completed_record(1, 1, "first()", vec![usage(100, 0)]));
         app.handle_event(RuntimeEvent::RecordAppended {
@@ -1359,12 +1690,11 @@ mod tests {
         });
 
         let history = rendered(&mut app, 120, 40);
-        assert_eq!(history.matches("attempt 1: model=gpt-5.6-sol").count(), 2);
-        assert!(history.contains("Step estimated cost: Complete $0.0004 USD"));
-        assert!(history.contains("Step estimated cost: LowerBound $0.002 USD"));
-        assert!(history.contains("Run estimated cost: LowerBound $0.0024 USD"));
-        assert!(history.contains("Step estimated cost: Unavailable"));
-        assert!(history.contains("Run estimated cost: Unavailable"));
+        assert_eq!(history.matches("#1").count(), 3);
+        assert!(history.contains("cost $0.0004"));
+        assert!(history.contains("cost $0.002"));
+        assert!(history.contains("↑100 ↓100 R0 W0 r20 Σ200 $0.0024"));
+        assert!(!history.contains("Run estimated cost"));
         assert!(!history.contains("Unavailable $0"));
 
         let mut active = App::default();
@@ -1378,9 +1708,7 @@ mod tests {
                 accounting: usage(0, 100),
             },
         });
-        assert!(
-            rendered(&mut active, 120, 40).contains("Run estimated cost: Complete $0.0024 USD")
-        );
+        assert!(rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 r0 Σ200 $0.0024"));
     }
 
     #[test]
