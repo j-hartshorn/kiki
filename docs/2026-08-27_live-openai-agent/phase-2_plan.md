@@ -1,0 +1,198 @@
+# Plan: Live OpenAI agent — Phase 2: Inspectable streaming transcript
+
+## Source
+
+- Spec: `docs/2026-08-27_live-openai-agent/spec.md`, Phase 2
+
+## Acceptance criteria
+
+- Completed readable reasoning summaries are retained beside opaque provider replay in model history, then carried through reliable runtime records. Replay order and encrypted continuation behaviour remain unchanged.
+- Missing or dropped progress cannot erase a completed summary. Partial summaries remain presentation evidence only when a step never completes.
+- User prompts render as neutral Pi-style cards. Assistant text and reasoning render streaming GitHub-Flavoured Markdown, including tables, task lists, links, blockquotes, strikethrough, and fenced code. Raw HTML is literal and images use text fallbacks.
+- Reasoning is retained, shown by default in a subtly grey padded italic card, and globally hidden or shown with `Ctrl-T`; hidden blocks leave a discoverable placeholder.
+- Each Python action and its output share one full-width background card: muted blue while active, green when complete, and red on error or cancellation. Final assistant Markdown follows all arena cards.
+- Arena Python is Tree-sitter highlighted during and after generation. Incomplete Python and highlighting errors preserve every character through a plain-code fallback.
+- Automatic collapse occurs only above 32 logical code lines or 16 logical execution-content lines. Collapsed code keeps its head and collapsed output keeps its tail. `Ctrl-O` globally expands or restores automatic collapse. Status and metrics remain visible.
+- Execution content is ordered stdout, non-empty stderr, result or Python error, interruption details, then cancellation warning.
+- Completed cards show compact available per-step usage and estimated cost. A single non-wrapping footer row immediately beneath the prompt shows available session-wide input, output, cache-read, cache-write, reasoning, total-token, and cost totals; it truncates with an ellipsis at narrow widths.
+- Costs use ordinary `$…` with no lower-bound marker; unavailable metrics are omitted. Each attempt appears in exactly one reliable display record so session totals need no duplicate suppression. Documentation retains the caveat that opaque retries may make displayed cost lower than billing.
+- Terminal normalisation, stale-event rejection, authoritative settlement, progress-gap indication, follow-at-bottom scrolling, preserved manual scroll, tiny-terminal safety, dirty-only redraws, and terminal restoration remain intact.
+- `tui-markdown` is used without Syntect. Provider, Arena, retry, cancellation, pricing, and model-context replay semantics otherwise remain unchanged.
+
+## Overall validation
+
+```sh
+cargo fmt --all -- --check
+cargo check --all-targets
+
+env -u OPENAI_API_KEY \
+  MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty \
+  cargo test --all-targets -- --test-threads=1
+
+cargo clippy --all-targets -- -D warnings
+
+test "$(rg -l 'tui_markdown' src --glob '*.rs')" = "src/transcript.rs"
+test "$(rg -l 'tree_sitter_(highlight|python)' src --glob '*.rs')" = "src/highlight.rs"
+! cargo tree -e normal | rg -q '(^| )syntect v'
+
+test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
+test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"
+test "$(rg -l 'cap_std' src --glob '*.rs')" = "src/tools.rs"
+```
+
+Expected: formatting, compilation, all credential-free tests, Clippy, and dependency-isolation checks pass; Syntect is absent.
+
+Manual live validation:
+
+```sh
+OPENAI_API_KEY=... \
+MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty \
+cargo run
+```
+
+Expected: a multi-step request streams GitHub-Flavoured Markdown, retained reasoning, highlighted Python, live stdout, and settled card colours. `Ctrl-T`, `Ctrl-O`, scrolling, and the session footer work without changing agent behaviour.
+
+## Planning context
+
+- `ModelStep` returns action, opaque replay, and attempt accounting, but no authoritative readable reasoning summary (`src/model.rs:14-30`). OpenAI replay already preserves completed reasoning items, including encrypted content (`src/openai.rs:591-637`, `src/openai.rs:755-800`).
+- Model history stores replay beside completed code or final messages (`src/model.rs:140-178`). Adding the readable summary there keeps model state complete while OpenAI request construction can continue replaying only the opaque provider items (`src/openai.rs:78-120`).
+- Successful execution and final-message records currently omit reasoning (`src/runtime.rs:38-64`); interrupted terminal evidence already retains partial reasoning (`src/agent.rs:16-50`). Terminal attempt vectors are cumulative while completed-execution attempts are step-local, forcing the current TUI to recover terminal-step accounting by slicing prior attempts (`src/tui.rs:1057-1082`).
+- Reliable records and lossy progress are intentionally separate. Completed summaries must follow the reliable path; streamed prefixes remain presentation-only (`src/runtime.rs:139-179`, `src/runtime.rs:439-496`).
+- `App` currently mixes transcript authority, live state, event acceptance, input, scrolling, and terminal layout. Rendering reconstructs one flat string and repeatedly scans preceding records for accounting, making a private Display Projection the narrowest seam for Phase 2 (`src/tui.rs:129-167`, `src/tui.rs:853-886`).
+- Phase 2 introduces `src/transcript.rs` as that private Display Projection. It owns transcript entries, live-to-settled replacement, stale-event rejection, presentation preferences, Markdown and card projection, wrapped-height measurement, and session accounting. `src/tui.rs` retains terminal ownership, prompt editing, command dispatch, viewport scrolling, and drawing.
+- Terminal normalisation remains the final safety rule before dynamic text enters Markdown, highlighting, or Ratatui (`src/tui.rs:1238-1287`).
+- `tui-markdown 0.3.9` supports Ratatui 0.30 and the selected GitHub-Flavoured Markdown features. Its Syntect-backed default feature is disabled.
+- Tree-sitter highlighting is isolated in `src/highlight.rs` using `tree-sitter-highlight 0.26.13` and `tree-sitter-python 0.25.0`; plain text remains the display fallback.
+- Ratatui's pinned `0.30.2` exposes matching wrapped-row measurement through `unstable-rendered-line-info`. Maki uses the same feature rather than maintaining duplicate wrapping rules.
+- Pi's reference cards use one-cell-padded, borderless state backgrounds and the dark colours `#282832`, `#283228`, and `#3c2828` (`.research/pi/source/packages/coding-agent/src/modes/interactive/components/tool-execution.ts:56-73`, `.research/pi/source/packages/coding-agent/src/modes/interactive/theme/dark.json:17-19`).
+- Existing tests are colocated module tests. TUI tests already provide fake input, TestBackend rendering, scrolling, stale-event, dirty-redraw, tiny-terminal, and terminal-restoration coverage (`src/tui.rs:1289-1349`, `src/tui.rs:1490-2790`).
+
+## Tasks
+
+Each task ends in one atomic `git commit --signoff` using its listed subject, after its verification passes.
+
+### Task 1: Prove GitHub-Flavoured Markdown rendering
+
+**Changes** — Add exact `tui-markdown 0.3.9` without default features and enable Ratatui's pinned `unstable-rendered-line-info` feature. Create the private transcript module with a narrow Markdown adapter. Prove selected GitHub-Flavoured Markdown rendering, custom styling, partial-prefix reparsing, and wrapped-height measurement. Raw HTML remains literal and images become text fallbacks.
+
+**Tests** (`src/transcript.rs`, adapter compatibility) — First fail without the dependency. Cover headings, tables, task lists, links, blockquotes, strikethrough, fenced code, raw HTML, images, incomplete delimiters, fences and tables, valid UTF-8 prefixes, and agreement between measured and rendered wrapped rows.
+
+**Files** — Modify: `Cargo.toml`, `Cargo.lock`, `src/main.rs`; Create: `src/transcript.rs`
+
+**Commit** — `Prove GFM transcript rendering`
+
+**Verification** — `cargo test transcript::tests::markdown_compatibility -- --test-threads=1 && cargo check --all-targets && test "$(rg -l 'tui_markdown' src --glob '*.rs')" = "src/transcript.rs" && ! cargo tree -e normal | rg -q '(^| )syntect v'` — the selected GitHub-Flavoured Markdown and wrapping fixtures pass without Syntect.
+
+### Task 2: Add Tree-sitter Python highlighting
+
+**Changes** — Add exact compatible Tree-sitter highlighter and Python grammar dependencies. Create one display-only Python highlighter which converts complete or incomplete source into Ratatui spans and preserves all normalised text. Any initialisation or highlighting error falls back to plain code.
+
+**Tests** (`src/highlight.rs`, adapter unit) — First fail without the highlighter. Cover complete Python, every valid UTF-8 prefix of representative incomplete Python, comments, keywords, functions, strings and numbers, exact text reconstruction, newline preservation, and forced fallback.
+
+**Files** — Modify: `Cargo.toml`, `Cargo.lock`, `src/main.rs`; Create: `src/highlight.rs`
+
+**Commit** — `Add Tree-sitter Python highlighting`
+
+**Verification** — `cargo test highlight::tests -- --test-threads=1 && cargo check --all-targets && test "$(rg -l 'tree_sitter_(highlight|python)' src --glob '*.rs')" = "src/highlight.rs"` — complete, partial, and fallback fixtures preserve text and apply expected styles.
+
+### Task 3: Preserve completed reasoning summaries
+
+**Changes** — Add authoritative readable reasoning to `ModelStep` and store it beside opaque replay in completed-code and final-message model-history entries. OpenAI extracts summaries from the validated completed output in provider order; streamed chunks are not the authoritative source. Scripted steps and test models default to no summary. Carry the summary through Agent pending-code and staged-message values into model-history admission, without widening runtime records yet. OpenAI history construction continues replaying only the original opaque items.
+
+**Tests** (`src/model.rs`, model history; `src/openai.rs`, adapter fixtures; `src/agent.rs`, context admission) — First fail when a completed fixture's readable summary is unavailable. Prove code and message summaries coexist with unchanged encrypted replay, multiple summary parts retain order, missing summaries are empty, malformed responses still fail closed, Agent admission retains the summary, and the next OpenAI request body is unchanged.
+
+**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/agent.rs`, affected `ModelStep` fixtures in `src/runtime.rs`
+
+**Commit** — `Preserve completed reasoning summaries`
+
+**Verification** — `cargo test model::tests -- --test-threads=1 && cargo test openai::tests::action_protocol -- --test-threads=1 && cargo test openai::tests::streaming -- --test-threads=1 && MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test agent::tests -- --test-threads=1` — readable summaries pass through Agent admission as authoritative application state without altering opaque replay or request construction.
+
+### Task 4: Record reasoning in reliable outcomes
+
+**Changes** — Widen the reliable presentation path established by Task 3: carry completed summaries through execution completion, interruption evidence, worker settlement, and canonical runtime records. Successful execution and final-message records receive authoritative summaries even when no progress arrived. Cancellation after a completed code action retains that summary in execution evidence; failures before completion retain only bounded progress evidence.
+
+**Tests** (`src/agent.rs`, orchestration; `src/runtime.rs`, controller integration) — First fail with a model returning a completed summary but emitting no summary progress. Cover successful code, final message, cancellation before and during execution, Arena failure, queued-final cancellation, missing progress, unchanged context admission, and reliable record and event ordering.
+
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, affected fixtures in `src/tui.rs`
+
+**Commit** — `Record reasoning in reliable outcomes`
+
+**Verification** — `MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test agent::tests -- --test-threads=1 && MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test runtime::tests -- --test-threads=1` — every completed or interrupted outcome carries the correct reliable summary without changing settlement semantics.
+
+### Task 5: Scope terminal attempt accounting
+
+**Changes** — Make reliable display accounting disjoint before the new projection depends on it. Keep each completed-execution record's step-local attempts; when committing a final, cancelled, or failed terminal record, retain only cumulative attempts not already represented by that Run's completed-execution records. In the same commit, update the Phase 1 terminal formatter to treat terminal attempts as step-local and combine preceding execution attempts with them only when calculating the temporary cumulative Run row. Keep Agent and pricing semantics unchanged.
+
+**Tests** (`src/runtime.rs`, controller integration; `src/tui.rs`, compatibility rendering) — First fail when a multi-step terminal record repeats earlier execution attempts. Cover final message, cancellation, provider failure, Arena failure, cancellation immediately after a committed execution, multiple earlier executions, and exact record and event order. Prove every attempt appears in one reliable record, the terminal step still displays its residual attempts, and the Phase 1 cumulative estimate remains unchanged when folded.
+
+**Files** — Modify: `src/runtime.rs`, `src/tui.rs`
+
+**Commit** — `Scope terminal attempt accounting`
+
+**Verification** — `MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test runtime::tests::terminal -- --test-threads=1 && cargo test tui::tests::transcript_renders_per_step_and_cumulative_costs_without_double_counting -- --exact --test-threads=1` — terminal records contain only uncommitted step attempts and the Phase 1 display remains correct.
+
+### Task 6: Extract the transcript Display Projection
+
+**Changes** — Move committed display entries, live-step state, run and step authority, stale-event rejection, progress-gap ownership, live-to-settled replacement, and presentation preferences from `App` into `src/transcript.rs`. Keep the current plain presentation temporarily. Replace repeated prefix scans with one forward fold. `App` retains terminal ownership, prompt editing, command dispatch, viewport scrolling, and drawing.
+
+**Tests** (`src/transcript.rs`, projection unit; `src/tui.rs`, integration) — Start with characterisation tests for current behaviour. Then prove reliable records beat lossy progress, obsolete progress is ignored without visible change, retries reset only live attempt content, completed summaries survive replacement, old runs remain scrollable, gaps settle correctly, and current input and runtime behaviour is unchanged.
+
+**Files** — Modify: `src/transcript.rs`, `src/tui.rs`
+
+**Commit** — `Extract transcript display projection`
+
+**Verification** — `cargo test transcript::tests::projection -- --test-threads=1 && cargo test tui::tests -- --test-threads=1` — transcript authority is local to the new module with no visible regression.
+
+### Task 7: Render structured streaming blocks
+
+**Changes** — Replace the flat history string with typed transcript blocks rendered and measured independently. Assistant messages and reasoning use the GitHub-Flavoured Markdown adapter while streaming and after settlement. Execution output remains plain terminal-safe text. Render each block through the same wrapping rules used for height measurement, allowing partial viewport rendering without building an unbounded off-screen buffer. Preserve user, reasoning, arena, and final-message chronology plus every partial-generation form.
+
+Move the single terminal normaliser to the final transcript-rendering seam so raw content is normalised before Markdown or highlighting and never normalised twice.
+
+**Tests** (`src/transcript.rs`, projection and rendering; `src/tui.rs`, viewport integration) — First fail on styled GitHub-Flavoured Markdown output. Cover live-prefix convergence, authoritative replacement, final response below arena activity, interrupted reasoning, code and text forms, hostile controls in every source, CJK and emoji wrapping, progress gaps, viewport clipping, bottom-following, manual-scroll preservation, and tiny terminals.
+
+**Files** — Modify: `src/transcript.rs`, `src/tui.rs`
+
+**Commit** — `Render structured streaming transcript`
+
+**Verification** — `cargo test transcript::tests::rendering -- --test-threads=1 && cargo test tui::tests::transcript -- --test-threads=1 && cargo test tui::tests::normalise -- --test-threads=1` — typed blocks stream, settle, wrap, scroll, and normalise safely.
+
+### Task 8: Add Pi-style cards and controls
+
+**Changes** — Apply the fixed Pi-derived dark palette and borderless full-width cards: neutral padded user cards; two-cell-padded, subtly grey, italic reasoning cards; one-cell-padded blue, green, or red arena cards; and unboxed final assistant Markdown.
+
+Add `Ctrl-T` reasoning visibility and placeholder behaviour. Add `Ctrl-O` global arena expansion. Automatic mode keeps short sections open, shows the first 32 code lines, and shows the last 16 combined execution-content lines with omission markers. Title, status, display-gap, usage, and cost metadata do not consume preview lines. Integrate Tree-sitter for live and settled arena Python.
+
+**Tests** (`src/transcript.rs`, visual policy; `src/tui.rs`, input and render integration) — First fail on card styles and shortcuts. Assert TestBackend cell colours, padding, ordering, exact 32/33 and 16/17 boundaries, output-tail selection, Monty truncation plus display collapse, short-card behaviour, global toggles, hidden-reasoning placeholders, incomplete highlighted Python, dirty redraws, and scroll clamping after height-reducing toggles.
+
+**Files** — Modify: `src/transcript.rs`, `src/tui.rs`
+
+**Commit** — `Add Pi-style transcript controls`
+
+**Verification** — `cargo test transcript::tests::cards -- --test-threads=1 && cargo test tui::tests::controls -- --test-threads=1 && cargo test tui::tests::transcript_keyboard_scrolling -- --test-threads=1` — card states, preview policy, highlighting, shortcuts, and scroll behaviour match the specification.
+
+### Task 9: Show compact transcript accounting
+
+**Changes** — Replace verbose accounting rows with compact Pi-style per-step card metadata; remove the Phase 1 cumulative Run-cost row. Add one non-wrapping session-footer row immediately beneath the prompt, ordered input, output, cache-read, cache-write, reasoning, total tokens, then estimated cost. Truncate the row with an ellipsis at terminal width. Show it only when at least one metric is available and the terminal has at least three rows; header and prompt take priority at smaller heights. Dynamically reserve its row from the history viewport.
+
+Fold disjoint completed-execution and terminal attempt records once, adding only the current live step's settled attempts while it remains provisional. Omit unavailable fields. Render complete and lower-bound known estimates identically as ordinary `$…`, as approved; never invent zero. Keep following the bottom when `scroll_from_bottom` is zero; otherwise preserve and safely clamp the offset when the footer appears or disappears.
+
+**Tests** (`src/transcript.rs`, accounting projection; `src/tui.rs`, layout) — First fail on verbose rows. Cover all token categories, multiple attempts and Runs, active-to-settled replacement, one forward fold over disjoint reliable records, partially available usage, omitted unavailable metrics, ordinary-dollar lower-bound rendering, session persistence across prompts, exact footer ordering, one-row truncation with ellipsis, dynamic history-height reservation, footer appearance while following the bottom or manually scrolled, height-zero-to-three terminals, and no invented zero.
+
+**Files** — Modify: `src/transcript.rs`, `src/tui.rs`
+
+**Commit** — `Show compact transcript accounting`
+
+**Verification** — `cargo test transcript::tests::accounting -- --test-threads=1 && cargo test tui::tests::footer -- --test-threads=1` — card and session accounting remain accurate to reported data and fit the terminal layout.
+
+### Task 10: Document transcript presentation
+
+**Changes** — Document GitHub-Flavoured Markdown rendering, retained reasoning, card states, collapse thresholds, `Ctrl-T`, `Ctrl-O`, session footer fields, estimated-cost caveat, Tree-sitter fallback, and the manual live demonstration. Update visible TUI key hints to match.
+
+**Tests** — No new behavioural test applies; controls and rendering are covered in Tasks 8 and 9. Review the documentation diff against the listed behaviour rather than coupling tests to prose.
+
+**Files** — Modify: `README.md`, `src/tui.rs`
+
+**Commit** — `Document transcript presentation`
+
+**Verification** — `git diff --check -- README.md src/tui.rs && cargo fmt --all -- --check` — the reviewed documentation diff covers every listed behaviour and source remains formatted.

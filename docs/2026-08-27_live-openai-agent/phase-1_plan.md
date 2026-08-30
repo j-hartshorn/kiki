@@ -4,6 +4,8 @@
 
 - Spec: `docs/2026-08-27_live-openai-agent/spec.md`, Phase 1
 
+This plan records the pre-implementation baseline used for the completed Phase 1 work; its present-tense planning context is historical rather than a description of the current code.
+
 ## Acceptance criteria
 
 - With valid startup configuration, Kiki submits TUI requests to OpenAI's standard Responses endpoint using fixed `gpt-5.6-sol`; with missing or invalid startup configuration, it opens a read-only configuration view and cannot submit.

@@ -2,16 +2,16 @@
 
 ## Context
 
-Kiki's first vertical slice proves the internal path from TUI input through a scripted model, persistent Monty arena, bounded `read` capability, runtime records, and terminal projection. The binary still constructs `ScriptedModel` directly, so it does not prove provider networking, streamed model output, action framing, reasoning continuation, retry behaviour, authentication, or live-model prompting (`src/main.rs:39`, `src/model.rs:24-59`).
+Kiki's first vertical slice proved the internal path from TUI input through a scripted model, persistent Monty arena, bounded `read` capability, runtime records, and terminal projection. Phase 1 of this specification subsequently delivered the live `OpenAiModel`, asynchronous Model port, explicit replay, streaming progress, retries, cancellation evidence, configuration, accounting, and plain structured transcript (`src/main.rs:25-59`, `src/model.rs:14-30`, `src/tui.rs:853-886`).
 
-The principal unknown identified by the first-slice specification is whether a real provider can reliably produce complete Kiki actions while partial output remains presentation-only (`docs/2026-08-26_first-vertical-slice/spec.md:138-164`). OpenAI is the first provider named by the Vision (`docs/VISION.md:40-48`).
+The principal unknown identified by the first-slice specification was whether a real provider could reliably produce complete Kiki actions while partial output remained presentation-only (`docs/2026-08-26_first-vertical-slice/spec.md:138-164`). Phase 1 resolved that integration path for OpenAI, the first provider named by the Vision (`docs/VISION.md:40-48`). Phase 2 now addresses the intended inspectable presentation.
 
 This change adds a real, read-only OpenAI path using `gpt-5.6-sol` and the Responses API. OpenAI's native `execute_python` function call encodes Kiki's `Code` action; ordinary assistant text encodes its final `Message` action. Completed Python continues to execute in Kiki's persistent arena, where `read(path)` is available as an async function. Partial provider output never becomes executable.
 
 The work is split into two independently demonstrable phases:
 
 1. **Live OpenAI agent** establishes provider correctness, prompting, configuration, stateless reasoning-aware context, retries, cancellation records, usage accounting, and a basic streamed projection.
-2. **Inspectable streaming transcript** adds the intended highlighted, paired, collapsible code-and-output presentation without changing provider or execution semantics.
+2. **Inspectable streaming transcript** adds the intended highlighted, paired, collapsible code-and-output presentation, retained readable reasoning, streaming GitHub-Flavoured Markdown, and compact accounting without changing provider or execution semantics.
 
 Durable sessions, effectful tools, model selection, multiple providers, interactive authentication, and general theme configuration remain later work.
 
@@ -23,7 +23,7 @@ Durable sessions, effectful tools, model selection, multiple providers, interact
 - Stream reasoning summaries, Python generation, assistant text, and arena stdout for presentation without allowing partial data to execute or enter authoritative model context.
 - Keep Kiki authoritative for model history by replaying explicit local context, including opaque encrypted reasoning and function-call relationships, with OpenAI storage disabled.
 - Make authentication, retries, cancellation, usage, estimated cost, and configuration state explicit, bounded, inspectable, and independently testable.
-- Present each Python action together with its output in a highlighted, stateful, collapsible arena box, followed by the final assistant response.
+- Present each Python action together with its output in a highlighted, stateful, collapsible arena box, followed by a GitHub-Flavoured Markdown assistant response.
 
 ## Non-goals
 
@@ -41,15 +41,15 @@ Durable sessions, effectful tools, model selection, multiple providers, interact
 
 ## Key discoveries
 
-- `Agent` is currently coupled to a synchronous concrete `ScriptedModel`; the first real provider creates the first justified model interface and asynchronous model-step boundary (`src/agent.rs:40-91`, `src/model.rs:24-59`).
-- Kiki already separates typed model actions, Agent sequencing, runtime commitment, and TUI projection. Provider-specific SDK and wire types can therefore remain inside one adapter (`src/model.rs:1-19`, `src/runtime.rs:12-85`).
-- Current model context records user requests, completed Python source and feedback, and final messages, but lacks provider output items, action IDs, encrypted reasoning, usage, and cancelled-step outcomes (`src/model.rs:7-12`).
+- Phase 1 established an asynchronous provider-neutral Model port implemented by both `ScriptedModel` and `OpenAiModel`; provider-specific SDK and wire types remain confined to the OpenAI adapter (`src/model.rs:14-30`, `src/openai.rs:1-24`).
+- Kiki separates typed model actions, Agent sequencing, runtime commitment, and TUI projection. Phase 2 can therefore widen canonical readable reasoning and presentation without changing provider execution semantics (`src/model.rs:14-30`, `src/runtime.rs:38-121`).
+- Model context now records user requests, compound completed Python calls and results, final messages, provider output items, action IDs, and encrypted reasoning. It does not yet expose completed readable reasoning summaries as provider-neutral application state (`src/model.rs:67-103`, `src/model.rs:140-234`).
 - OpenAI stateless continuation with `store: false` requires replaying every prior output item in order. Reasoning models require `reasoning.encrypted_content`; completed function calls must be paired with matching `function_call_output` items ([OpenAI stateless reasoning guidance](https://developers.openai.com/api/docs/guides/deployment-checklist)).
 - `gpt-5.6-sol` supports Responses streaming and function calling, with a 1,050,000-token context window and 128,000 maximum output tokens ([model reference](https://developers.openai.com/api/docs/models/gpt-5.6-sol)).
 - OpenAI returns token usage, including cached and cache-write details, but not billed cost. Cost therefore requires a versioned local pricing constant for the fixed model and tier ([usage reference](https://developers.openai.com/api/docs/guides/prompt-caching), [pricing](https://developers.openai.com/api/docs/pricing)).
 - `async-openai` provides typed Responses API streaming and function-call events but is unofficial. Keeping it behind a narrow adapter limits dependency and protocol churn.
-- Current arena progress reports `read` lifecycle only; Monty print callbacks feed final observation accumulators without publishing stdout deltas. Live results require extending the existing accumulator path rather than adding a second execution source (`src/arena.rs:86-95`, `src/arena.rs:459-588`, `src/arena.rs:662-680`).
-- Current cancellation discards an active execution record and restores its pre-execution arena checkpoint. That hides partial output and would hide possible future external effects; the terminal cancellation record needs typed interrupted-step evidence (`src/agent.rs:80-115`, `src/runtime.rs:22-40`).
+- Arena progress now reports `read` lifecycle and bounded stdout deltas from the same accumulator which produces final observations (`src/arena.rs:93-99`, `src/arena.rs:883-1159`).
+- Cancellation now restores the active execution checkpoint and commits typed bounded interrupted-step evidence. Completed readable reasoning still needs to travel beside successful execution and final-message records rather than relying on lossy progress (`src/agent.rs:15-50`, `src/runtime.rs:38-64`).
 - Pi's parallel tool execution passes one cancellation signal to every started call, waits for them to settle, retains completed results, converts cooperative cancellation to explicit error results, emits completion events in actual order, and stores tool results in source order (`.research/pi/source/packages/agent/src/agent-loop.ts:489-552`, `.research/pi/source/packages/agent/src/agent-loop.ts:670-710`).
 - The TUI currently renders one flat string history. Highlighted paired cards, thinking visibility, expansion state, streamed output, and generic visual states require a structured display projection rather than parsing formatted text (`src/tui.rs:54-73`, `src/tui.rs:347-445`).
 - Ratatui already receives runtime events within a bounded 50 ms poll and redraws only on visible changes; provider and arena streaming can reuse this wake path (`src/tui.rs:17`, `src/tui.rs:295-342`).
@@ -60,7 +60,7 @@ Durable sessions, effectful tools, model selection, multiple providers, interact
 
 Introduce one asynchronous Kiki-owned Model port. `ScriptedModel` implements it without streaming; `OpenAiModel` implements it through `async-openai`. Prompt, client, model, endpoint, and credentials are bound when constructing the adapter. The port receives only ordered Kiki model history, cancellation, and a provider-neutral progress sink.
 
-A completed outcome is either `Code`, carrying source, call identifier, opaque replay payload, and optional usage, or `Message`, carrying text, opaque replay payload, and optional usage. Cancelled and failed port errors carry bounded public diagnostics and presentation-only partial content. Terminal wire state, provider identity, retries, and display projection remain implementation details rather than port fields. OpenAI SDK types, credentials, SSE events, and response-item conversion remain inside the OpenAI adapter. The Agent owns model history; the runtime commits Kiki typed records.
+A completed outcome is either `Code`, carrying source, call identifier, readable reasoning summary, opaque replay payload, and optional usage, or `Message`, carrying text, readable reasoning summary, opaque replay payload, and optional usage. The readable summary is retained beside the opaque replay in application model state but is not separately added to provider input. Cancelled and failed port errors carry bounded public diagnostics and presentation-only partial content. Terminal wire state, provider identity, retries, and display projection remain implementation details rather than port fields. OpenAI SDK types, credentials, SSE events, and response-item conversion remain inside the OpenAI adapter. The Agent owns model history; the runtime commits Kiki typed records.
 
 A completed `Message` becomes eligible for future model context atomically after terminal response validation. A completed `Code` call and its opaque provider output become context-eligible only together with exactly one associated execution result or cancellation result. No caller can observe or replay a dangling function call.
 
@@ -103,7 +103,7 @@ The configuration view states that `store: false` disables retained Response obj
 
 ### Explicit model context
 
-Kiki remains authoritative for context and sends `store: false`. Model history contains user requests, final messages, and compound completed-code entries. One completed-code entry structurally contains its canonical source, call identifier, provider-tagged opaque replay items, and exactly one execution, cancellation, or failure result. A pending call exists only as local active-step state, so admitted history cannot contain a dangling call.
+Kiki remains authoritative for context and sends `store: false`. Model history contains user requests, final messages, and compound completed-code entries. Completed model outputs retain their readable reasoning summary beside provider-tagged opaque replay items. One completed-code entry structurally contains its canonical source, call identifier, readable summary, opaque replay items, and exactly one execution, cancellation, or failure result. A pending call exists only as local active-step state, so admitted history cannot contain a dangling call.
 
 The OpenAI adapter requests encrypted reasoning in response output, preserves all completed output items in provider order, and renders each compound code entry as those items followed by its matching `function_call_output`. Opaque continuation data remains local and hidden from Monty and the display. Canonical `CancelledRun` and `FailedRun` records remain runtime history; only protocol-required code-call cancellation or failure results enter OpenAI model history. A future provider switch may discard incompatible opaque data while retaining canonical visible history.
 
@@ -151,7 +151,9 @@ Request `service_tier: "default"` and record the returned tier. Record total inp
 
 One versioned `gpt-5.6-sol/default` pricing constant records its effective identity and official source. A pure estimator uses it. For at most 272,000 input tokens, per-million rates are $4.00 uncached input, $0.40 cached input, $5.00 cache writes, and $20.00 output. Above 272,000 input tokens, the full request uses $8.00, $0.80, $10.00, and $30.00 respectively. Uncached input is total input minus cached and cache-write tokens; internally inconsistent usage fails accounting rather than producing a cost. Estimated cost is the sum of each token category multiplied by its applicable rate and divided by one million.
 
-Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 moves the same data into completed boxes. Any potentially billable visible attempt with absent usage, internally inconsistent usage, an incomplete category breakdown, or a returned non-default tier is unpriceable. SDK-internal retry usage need not be reconstructed; when it may be missing, the cumulative figure is conservatively labelled a lower bound. If other visible attempts have known estimates, the cumulative figure remains a lower bound; if none do, cost is unavailable. It is never calculated with default-tier rates for an unknown tier or presented as zero. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, and unknown interrupted attempts.
+Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 moves available per-step values into compact completed-card metadata and adds session-wide reported totals beneath the prompt for input, output, cache-read, cache-write, reasoning, total tokens, and estimated cost. The session footer is exactly one non-wrapping row immediately below the prompt, ordered left to right and truncated with an ellipsis at the terminal width. It appears only when at least one metric is available and the terminal has at least three rows; otherwise header and prompt take priority. Its appearance reduces the history viewport by one row. Bottom-following and manual `scroll_from_bottom` behaviour remain unchanged and clamp safely when the available history height changes.
+
+Unavailable metrics are omitted. Complete and lower-bound known estimates both render as ordinary `$…`; this deliberately Pi-like presentation may understate actual billing when SDK-internal retries are opaque, so the documentation retains that caveat. No estimate is calculated with default-tier rates for an unknown tier or invented as zero. Reliable runtime records store each attempt once for display accounting: completed-execution records remain step-local, while terminal details retain only attempts not already committed by earlier execution records. Session totals therefore fold disjoint completed, terminal, and current-live attempts without presentation-layer slicing. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, unknown interrupted attempts, aggregation without double counting, footer truncation, and dynamic viewport height.
 
 ### Transcript presentation
 
@@ -161,26 +163,27 @@ Each Python action appears in one arena box containing, in order:
 
 1. complete Python source;
 2. stdout when non-empty;
-3. final expression result or Python error;
-4. cancellation warning when applicable.
+3. stderr when non-empty;
+4. final expression result or Python error;
+5. interruption details and cancellation warning when applicable.
 
-No empty stderr section is shown. The final assistant response always appears below preceding arena boxes.
+The final assistant response always appears below preceding arena boxes. Assistant responses and readable reasoning summaries render as GitHub-Flavoured Markdown while streaming and after settlement. Tables, task lists, links, blockquotes, strikethrough, and fenced code are supported; raw HTML remains literal and images use text fallbacks. Markdown fenced code remains plainly styled rather than introducing a second syntax-highlighting engine.
 
-Arena boxes map to three visual states:
+User requests appear in neutral padded cards. Arena boxes use borderless, full-width, one-cell-padded backgrounds modelled on Pi's dark presentation and map to three visual states:
 
 - in progress: muted blue;
 - complete: muted green;
 - error or cancellation: muted red.
 
-In collapsed mode, short boxes remain fully visible. Longer boxes show up to 12 code lines and 20 output lines. One keyboard shortcut toggles all arena boxes between collapsed and expanded presentation.
+Automatic collapse leaves short boxes fully visible. Longer boxes show the first 32 logical code lines and the last 16 logical execution-content lines, with explicit omission markers. Execution content includes stdout, non-empty stderr, result or error, interruption details, and cancellation warnings; title, status, display-gap, usage, and cost metadata remain visible outside that budget. `Ctrl-O` toggles every arena box between automatic collapse and expanded presentation.
 
 Python uses Tree-sitter highlighting, including while partial code streams. Plain code is the accepted fallback only if Tree-sitter cannot build on the pinned toolchain or safely render the incomplete valid UTF-8 streaming fixtures.
 
-Reasoning summaries appear in a separate subtly grey box with horizontal padding and subdued text. They have an independent show/hide keyboard toggle and do not use lifecycle colours.
+Reasoning summaries are retained after settlement and appear as GitHub-Flavoured Markdown in a separate subtly grey, borderless box with two-cell horizontal padding and subdued italic text. `Ctrl-T` hides or shows every reasoning box; a hidden box leaves one dim, discoverable placeholder. Reasoning does not use lifecycle colours.
 
 Live stdout extends the same bounded observation which becomes the final execution record. The existing ten-second execution deadline, 64 MiB memory limit, and 256 KiB / 1,000-line retained observation remain unchanged. There is no model-step limit.
 
-Every dynamic display string passes through one display-only terminal normaliser before reaching Ratatui, including user requests, provider text, reasoning summaries, Python source, stdout, results, errors, paths, usage labels, and configuration diagnostics. It treats LF and CRLF as structural line breaks, expands each tab to four spaces, and renders lone CR plus every remaining C0, C1, escape, OSC, and delete control as uppercase ASCII `\\xNN` notation, for example ESC as `\\x1B`. Raw canonical content and model context remain unchanged. Hostile control-sequence fixtures cover every display source.
+Every dynamic display string passes through one display-only terminal normaliser before Markdown parsing, Tree-sitter highlighting, or Ratatui rendering, including user requests, provider text, reasoning summaries, Python source, stdout, results, errors, paths, usage labels, and configuration diagnostics. It treats LF and CRLF as structural line breaks, expands each tab to four spaces, and renders lone CR plus every remaining C0, C1, escape, OSC, and delete control as uppercase ASCII `\\xNN` notation, for example ESC as `\\x1B`. Raw canonical content and model context remain unchanged. Hostile control-sequence fixtures cover every display source.
 
 ## Key decisions and trade-offs
 
@@ -196,15 +199,17 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Show missing configuration inside Kiki rather than exiting or waiting for a failed submission.
 - Stream decoded Python previews for the sole known function schema; the final complete parse remains authoritative.
 - Stream and retain valid model output without truncation; use 16 MiB only as a fail-closed transport guard.
-- Give reasoning its own subdued display and visibility toggle rather than treating it as an execution-state box.
+- Retain readable reasoning summaries beside opaque encrypted replay in application model state; only opaque replay is rendered back into provider input.
+- Render assistant text and readable reasoning as streaming GitHub-Flavoured Markdown through `tui-markdown` without its Syntect feature; raw HTML is literal and images are textual.
+- Give reasoning its own subdued display and `Ctrl-T` visibility toggle rather than treating it as an execution-state box.
 - Use only three generic arena-box states: in progress, complete, and error.
-- Collapse arena boxes only when their code or output exceeds fixed preview limits; reject terminal-relative limits as unpredictable.
+- Collapse arena boxes only above 32 code or 16 execution-content lines; show code from the head, output from the tail, and use `Ctrl-O` for global expansion.
 - Pair every Python action with its stdout and result; keep final assistant text below all arena activity.
 - Preserve earlier completed model steps when cancelling later work; reject whole-Run rollback.
 - Keep partial cancelled generation or execution evidence inside the one canonical in-memory `CancelledRun` record, including pre-cancellation output and an external-side-effect warning; durable persistence remains deferred.
 - Restore only the active execution's arena checkpoint; do not imply that external effects were reversed.
 - Use the SDK's bounded HTTP retry policy, and restart an interrupted stream at most twice even after presentation-only output; never admit or execute partial attempts.
-- Force OpenAI's default service tier and estimate cost with one versioned model/tier pricing constant because OpenAI does not return billed cost; other models and tiers wait for configuration work.
+- Force OpenAI's default service tier and estimate cost with one versioned model/tier pricing constant because OpenAI does not return billed cost; Phase 2 favours Pi-like ordinary-dollar totals over a visible lower-bound marker, accepting possible understatement from opaque retries.
 - Keep Monty's existing execution, memory, and output limits unchanged.
 - Allow unbounded model steps for autonomous work; record runaway cost and context growth as an accepted risk.
 - Use deterministic local HTTP/SSE fixtures plus an opt-in live smoke test; never require credentials in the ordinary suite.
@@ -221,9 +226,11 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Coalescing bounds event frequency and retained content, but a single already-deserialised SDK event can allocate before Kiki applies its 16 MiB application-content guard.
 - No model-step or aggregate context limit means a model can accumulate substantial cost and memory before OpenAI rejects the context or the user cancels.
 - Opaque encrypted reasoning and provider output items complicate future model switching. Only canonical visible context is portable.
-- The local pricing constant can become stale or disagree with promotional or account-specific billing. Every cost remains labelled estimated and carries a pricing identity.
+- The local pricing constant can become stale or disagree with promotional or account-specific billing. The estimator retains its pricing identity, while Phase 2's compact display deliberately omits that identity and relies on the documented estimated-cost caveat.
 - Prompt wording is a behavioural dependency. Deterministic tests can verify construction and protocol rules, but only an opt-in live evaluation can show that Sol uses persistent arena state and inner Python tools effectively.
+- `tui-markdown` describes itself as experimental; permanent GFM, partial-prefix, wrapping, and terminal-safety fixtures limit dependency risk.
 - Tree-sitter highlighting remains required unless it cannot build on the pinned Rust toolchain or safely render the incomplete valid UTF-8 fixtures used by streaming tests; those concrete failures permit the approved plain-code fallback.
+- Rendering known lower-bound estimates as ordinary dollar totals can understate actual billing after opaque SDK retries; this is an accepted Pi-fidelity trade-off and remains documented.
 - The concrete startup snapshot may need replacement when another provider arrives; this slice deliberately avoids a provider registry.
 - Monty still cannot produce Python stderr in this version; the typed stderr boundary remains unproven with worker-backed Python.
 
@@ -238,7 +245,9 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Current Sol token pricing and long-context threshold: [OpenAI pricing](https://developers.openai.com/api/docs/pricing).
 - `async-openai` with only the Responses and Rustls features needed by the adapter.
 - Serde JSON support for strict completed-action validation and opaque provider-item retention.
+- `tui-markdown 0.3.9` without its Syntect-backed default feature for Phase 2 GitHub-Flavoured Markdown.
 - Tree-sitter highlighting and the Python grammar for Phase 2, subject to the approved plain-text fallback.
+- Ratatui's narrowly enabled `unstable-rendered-line-info` feature on the pinned `0.30.2` release so wrapped measurement matches rendering.
 - Existing Tokio, cancellation-token, Ratatui, and exact Monty `0.0.21` dependencies.
 - `OPENAI_API_KEY` only for the opt-in live test and demonstration; ordinary tests use local deterministic fixtures.
 - The exact `monty-runtime 0.0.21` worker configured by the existing `MONTY_BIN` development setting.
@@ -271,19 +280,18 @@ Verification stays at module interfaces: adapter fixtures cover wire protocol an
 
 ### Phase 2: Inspectable streaming transcript
 
-Retain Phase 1's private transcript state and runtime records, replacing only its plain rendering with the intended structured presentation:
+Retain Phase 1's provider and execution semantics while widening application records and replacing the plain transcript with the intended structured presentation:
 
-- paired Python-and-output arena boxes;
-- stdout before expression result or Python error;
+- authoritative readable reasoning summaries retained beside opaque replay and carried through reliable records;
+- streaming GitHub-Flavoured Markdown for assistant text and reasoning;
+- neutral Pi-style user cards and paired Python-and-output arena boxes;
+- stdout and non-empty stderr before the expression result or Python error;
 - final assistant response below all arena boxes;
 - Tree-sitter Python highlighting during and after generation;
 - muted blue, green, and red generic arena states;
-- collapsed mode with 12 code lines and 20 output lines;
-- automatic collapse only after a section crosses its limit;
-- global expand/collapse-arena shortcut;
-- subdued padded reasoning boxes;
-- independent show/hide-thinking shortcut;
-- per-step token/cost presentation and cumulative Run total;
+- automatic collapse above 32 code lines or 16 execution-content lines, retaining the output tail;
+- `Ctrl-O` global arena expansion and `Ctrl-T` reasoning visibility;
+- compact per-step token/cost presentation and session totals beneath the prompt;
 - cancelled cards showing partial content and the external-side-effect warning;
 - the existing scroll rule: follow new content while at the bottom, otherwise preserve `scroll_from_bottom`;
 - stale-event rejection, tiny-terminal rendering, and dirty-only redraws.
