@@ -7,6 +7,7 @@ pub mod pricing;
 pub mod prompt;
 pub mod runtime;
 pub mod tools;
+mod transcript;
 pub mod tui;
 
 use std::error::Error;
