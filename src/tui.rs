@@ -2,10 +2,13 @@ use std::io;
 use std::time::Duration;
 
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -55,6 +58,7 @@ enum AppMode {
 
 struct App {
     mode: AppMode,
+    enhanced_keyboard: bool,
     prompt: String,
     transcript: Transcript,
     scroll_from_bottom: usize,
@@ -66,6 +70,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             mode: AppMode::Configured,
+            enhanced_keyboard: false,
             prompt: String::new(),
             transcript: Transcript::default(),
             scroll_from_bottom: 0,
@@ -173,13 +178,23 @@ impl App {
             }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.prompt.len() + character.len_utf8() <= MAX_PROMPT_BYTES =>
+                    && self.push_prompt(character) =>
             {
-                self.prompt.push(character);
                 Update {
                     command: None,
                     visible_changed: true,
                     quit: false,
+                }
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.push_prompt('\n') {
+                    Update {
+                        command: None,
+                        visible_changed: true,
+                        quit: false,
+                    }
+                } else {
+                    Update::default()
                 }
             }
             KeyCode::Enter if self.transcript.is_idle() && !self.prompt.is_empty() => {
@@ -194,6 +209,14 @@ impl App {
             }
             _ => Update::default(),
         }
+    }
+
+    fn push_prompt(&mut self, character: char) -> bool {
+        if self.prompt.len() + character.len_utf8() > MAX_PROMPT_BYTES {
+            return false;
+        }
+        self.prompt.push(character);
+        true
     }
 
     fn handle_event(&mut self, event: RuntimeEvent) -> bool {
@@ -256,15 +279,22 @@ pub(crate) fn run(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
-            run_loop(
-                terminal,
-                &mut app,
-                &mut input,
-                &commands,
-                &mut events,
-                &mut progress,
+            with_keyboard_enhancement(
+                enable_keyboard_enhancement,
+                disable_keyboard_enhancement,
+                |enhanced_keyboard| {
+                    app.enhanced_keyboard = enhanced_keyboard;
+                    run_loop(
+                        terminal,
+                        &mut app,
+                        &mut input,
+                        &commands,
+                        &mut events,
+                        &mut progress,
+                    )
+                    .map(|_| ())
+                },
             )
-            .map(|_| ())
         },
     )
 }
@@ -287,6 +317,33 @@ fn with_terminal<B: Backend>(
     let _guard = RestoreGuard::new(restore);
     let mut terminal = initialize()?;
     run(&mut terminal)
+}
+
+fn enable_keyboard_enhancement() -> io::Result<bool> {
+    if !ratatui::crossterm::terminal::supports_keyboard_enhancement()? {
+        return Ok(false);
+    }
+    let mut stdout = io::stdout();
+    ratatui::crossterm::execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
+    Ok(true)
+}
+
+fn disable_keyboard_enhancement() {
+    let mut stdout = io::stdout();
+    let _ = ratatui::crossterm::execute!(stdout, PopKeyboardEnhancementFlags);
+}
+
+fn with_keyboard_enhancement<T>(
+    enable: impl FnOnce() -> io::Result<bool>,
+    disable: impl FnOnce(),
+    run: impl FnOnce(bool) -> T,
+) -> T {
+    let enabled = enable().unwrap_or(false);
+    let _guard = enabled.then(|| RestoreGuard::new(disable));
+    run(enabled)
 }
 
 fn run_configuration_loop<B: Backend>(
@@ -389,6 +446,8 @@ fn run_loop<B: Backend>(
     }
 }
 
+const PROMPT_GUTTER_WIDTH: u16 = 2;
+
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, page_style());
@@ -407,8 +466,13 @@ fn render(frame: &mut Frame, app: &mut App) {
             app.transcript.status()
         )
     } else {
+        let enhanced_keyboard_hint = if app.enhanced_keyboard {
+            " | Shift-Enter newline"
+        } else {
+            ""
+        };
         format!(
-            "Status: {} | Enter submit | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit | Up/Down scroll",
+            "Status: {} | Enter submit{enhanced_keyboard_hint} | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit | Up/Down scroll",
             app.transcript.status()
         )
     };
@@ -417,67 +481,193 @@ fn render(frame: &mut Frame, app: &mut App) {
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    if !configuration_only && area.height < 3 {
-        app.history_height = 0;
-        if area.height == 2 {
-            let prompt = format!("> {}", app.prompt);
-            frame.render_widget(
-                Paragraph::new(normalise_terminal_text(&prompt)),
-                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-            );
+    if configuration_only {
+        if area.height == 1 {
+            app.history_height = 0;
+            return;
         }
+        let _ = render_history(
+            frame,
+            app,
+            Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(1),
+            ),
+        );
         return;
     }
-    if configuration_only && area.height == 1 {
+
+    if area.height == 1 {
         app.history_height = 0;
         return;
     }
 
-    let layout = app.transcript.layout(area.width);
-    let footer = (!configuration_only)
-        .then(|| layout.footer())
-        .flatten()
-        .map(|footer| truncate_footer(&normalise_terminal_text(footer), area.width));
-    let reserved_rows = if configuration_only {
-        1
-    } else {
-        2 + u16::from(footer.is_some())
-    };
-    let history_height = area.height.saturating_sub(reserved_rows);
-    app.history_height = usize::from(history_height);
+    let bottom_rule = Rect::new(
+        area.x,
+        area.y.saturating_add(area.height.saturating_sub(1)),
+        area.width,
+        1,
+    );
+    if area.height == 2 {
+        render_rule(frame, bottom_rule, None);
+        app.history_height = 0;
+        return;
+    }
+    if area.height == 3 {
+        render_rule(
+            frame,
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            None,
+        );
+        render_rule(frame, bottom_rule, None);
+        app.history_height = 0;
+        return;
+    }
+
+    let prompt = normalise_terminal_text(&app.prompt);
+    let prompt_rows = prompt_rows(&prompt, area.width);
+    let prompt_box_height = prompt_box_height(area.height, prompt_rows);
+    let prompt_top = area
+        .y
+        .saturating_add(area.height.saturating_sub(prompt_box_height));
+    let content_height = prompt_box_height.saturating_sub(2);
+    let content = Rect::new(
+        area.x,
+        prompt_top.saturating_add(1),
+        area.width,
+        content_height,
+    );
+    let history = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(prompt_box_height),
+    );
+    let footer = render_history(frame, app, history);
+    render_rule(frame, Rect::new(area.x, prompt_top, area.width, 1), None);
+    render_prompt(frame, &prompt, content, prompt_rows);
+    render_rule(frame, bottom_rule, footer.as_deref());
+}
+
+fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Option<String> {
+    let layout = app.transcript.layout(viewport.width);
+    let footer = layout
+        .footer()
+        .map(normalise_terminal_text)
+        .filter(|footer| !footer.is_empty());
+    app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
     let last_page_start = app.history_rows.saturating_sub(app.history_height);
     app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-
-    if !configuration_only {
-        let prompt_y = area
-            .y
-            .saturating_add(area.height - 1 - u16::from(footer.is_some()));
-        let prompt = format!("> {}", app.prompt);
-        frame.render_widget(
-            Paragraph::new(normalise_terminal_text(&prompt)),
-            Rect::new(area.x, prompt_y, area.width, 1),
-        );
-    }
-    if let Some(footer) = footer {
-        frame.render_widget(
-            Paragraph::new(footer).style(muted_page_style()),
-            Rect::new(
-                area.x,
-                area.y.saturating_add(area.height - 1),
-                area.width,
-                1,
-            ),
-        );
-    }
-
-    if history_height > 0 {
+    if viewport.height > 0 {
         let top = last_page_start.saturating_sub(app.scroll_from_bottom);
-        layout.render(
-            Rect::new(area.x, area.y.saturating_add(1), area.width, history_height),
-            top,
-            frame.buffer_mut(),
-        );
+        layout.render(viewport, top, frame.buffer_mut());
+    }
+    footer
+}
+
+fn prompt_text(prompt: &str) -> Text<'_> {
+    prompt.split('\n').map(Line::from).collect()
+}
+
+fn prompt_rows(prompt: &str, width: u16) -> usize {
+    let text_width = width.saturating_sub(PROMPT_GUTTER_WIDTH);
+    if text_width == 0 {
+        return 1;
+    }
+    Paragraph::new(prompt_text(prompt))
+        .wrap(Wrap { trim: false })
+        .line_count(text_width)
+        .max(1)
+}
+
+fn prompt_box_height(height: u16, prompt_rows: usize) -> u16 {
+    if height <= 1 {
+        return 0;
+    }
+    if height <= 3 {
+        return height - 1;
+    }
+    let capacity = usize::from(height)
+        .saturating_div(3)
+        .max(3)
+        .min(usize::from(height.saturating_sub(1)));
+    let content_height = prompt_rows.min(capacity.saturating_sub(2)).max(1);
+    u16::try_from(content_height.saturating_add(2)).unwrap_or(height.saturating_sub(1))
+}
+
+fn render_prompt(frame: &mut Frame, prompt: &str, content: Rect, prompt_rows: usize) {
+    if content.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new("> "),
+        Rect::new(
+            content.x,
+            content.y,
+            content.width.min(PROMPT_GUTTER_WIDTH),
+            1,
+        ),
+    );
+    let text_width = content.width.saturating_sub(PROMPT_GUTTER_WIDTH);
+    if text_width == 0 {
+        return;
+    }
+    let visible_rows = usize::from(content.height);
+    let top = prompt_rows.saturating_sub(visible_rows);
+    frame.render_widget(
+        Paragraph::new(prompt_text(prompt))
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
+        Rect::new(
+            content.x.saturating_add(PROMPT_GUTTER_WIDTH),
+            content.y,
+            text_width,
+            content.height,
+        ),
+    );
+}
+
+fn render_rule(frame: &mut Frame, area: Rect, footer: Option<&str>) {
+    frame.render_widget(Paragraph::new(footer_rule(footer, area.width)), area);
+}
+
+fn footer_rule(footer: Option<&str>, width: u16) -> Line<'static> {
+    let Some(footer) = footer else {
+        return Line::raw("─".repeat(usize::from(width)));
+    };
+    match width {
+        0 => Line::raw(""),
+        1 => Line::styled(truncate_footer(footer, 1), muted_page_style()),
+        2 => Line::from(vec![
+            Span::styled(truncate_footer(footer, 1), muted_page_style()),
+            Span::raw("─"),
+        ]),
+        3 => Line::from(vec![
+            Span::raw("─"),
+            Span::styled(truncate_footer(footer, 1), muted_page_style()),
+            Span::raw("─"),
+        ]),
+        4 => Line::from(vec![
+            Span::raw("─"),
+            Span::styled(truncate_footer(footer, 1), muted_page_style()),
+            Span::raw(" ─"),
+        ]),
+        _ => {
+            let footer = truncate_footer(footer, width - 4);
+            let footer_width = Line::raw(&footer).width();
+            let leading_rules = usize::from(width).saturating_sub(footer_width.saturating_add(3));
+            Line::from(vec![
+                Span::raw("─".repeat(leading_rules)),
+                Span::raw(" "),
+                Span::styled(footer, muted_page_style()),
+                Span::raw(" ─"),
+            ])
+        }
     }
 }
 
@@ -491,22 +681,21 @@ fn truncate_footer(footer: &str, width: u16) -> String {
     if width == 1 {
         return "…".to_owned();
     }
-    let mut prefix = String::new();
-    let prefix_width = usize::from(width - 1);
-    for character in footer.chars() {
-        prefix.push(character);
-        if Line::raw(&prefix).width() > prefix_width {
-            prefix.pop();
+    let suffix_width = usize::from(width - 1);
+    let mut suffix = String::new();
+    for character in footer.chars().rev() {
+        let character_width = Line::raw(character.to_string()).width();
+        if character_width.saturating_add(Line::raw(&suffix).width()) > suffix_width {
             break;
         }
+        suffix.insert(0, character);
     }
-    prefix.push('…');
-    prefix
+    format!("…{suffix}")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -515,12 +704,13 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::App;
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadOutcome,
+        Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadCall,
+        ReadOutcome,
     };
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::runtime::{
@@ -530,6 +720,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shifted_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     fn rendered(app: &mut App, width: u16, height: u16) -> String {
@@ -630,6 +824,83 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_edits_a_multiline_prompt_without_submitting() {
+        let mut app = App::default();
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.handle_key(shifted_key(KeyCode::Enter)).command, None);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.prompt, "f\ng");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).command,
+            Some(RuntimeCommand::Submit {
+                request: "f\ng".to_owned(),
+            })
+        );
+
+        let mut active = App::default();
+        active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        assert!(
+            active
+                .handle_key(shifted_key(KeyCode::Enter))
+                .visible_changed
+        );
+        assert_eq!(active.prompt, "\n");
+        assert!(active.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert_eq!(active.prompt, "\nx");
+        assert!(active.handle_key(key(KeyCode::Enter)).command.is_none());
+
+        let mut disabled = App::default();
+        disabled.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        });
+        disabled.prompt = "locked".to_owned();
+        for event in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Enter),
+            shifted_key(KeyCode::Enter),
+        ] {
+            assert!(!disabled.handle_key(event).visible_changed);
+        }
+        assert_eq!(disabled.prompt, "locked");
+
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        configuration.prompt = "locked".to_owned();
+        for event in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Backspace),
+            key(KeyCode::Enter),
+            shifted_key(KeyCode::Enter),
+        ] {
+            assert!(!configuration.handle_key(event).visible_changed);
+        }
+        assert_eq!(configuration.prompt, "locked");
+
+        let mut bounded = App {
+            prompt: "a".repeat(super::MAX_PROMPT_BYTES - 1),
+            ..App::default()
+        };
+        assert!(
+            bounded
+                .handle_key(shifted_key(KeyCode::Enter))
+                .visible_changed
+        );
+        assert_eq!(bounded.prompt.len(), super::MAX_PROMPT_BYTES);
+        let limit_reached = bounded.handle_key(shifted_key(KeyCode::Enter));
+        assert!(limit_reached.command.is_none());
+        assert!(!limit_reached.visible_changed);
+        assert!(!bounded.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert!(bounded.handle_key(key(KeyCode::Backspace)).visible_changed);
+        assert_eq!(bounded.prompt, "a".repeat(super::MAX_PROMPT_BYTES - 1));
+
+        let before_release = active.prompt.clone();
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+        assert!(!active.handle_key(release).visible_changed);
+        assert_eq!(active.prompt, before_release);
+    }
+
+    #[test]
     fn prompt_enforces_its_byte_limit_and_backspaces_unicode() {
         let mut app = App {
             prompt: "a".repeat(super::MAX_PROMPT_BYTES - '🦀'.len_utf8()),
@@ -663,6 +934,29 @@ mod tests {
                 request: "x".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn configured_header_without_keyboard_enhancement_omits_newline_hint() {
+        let mut app = App::default();
+
+        let header = rendered(&mut app, 120, 4);
+
+        assert!(header.starts_with("Status: idle | Enter submit"));
+        assert!(!header.contains("Shift-Enter newline"));
+    }
+
+    #[test]
+    fn configured_header_with_keyboard_enhancement_advertises_newline_hint() {
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+
+        let header = rendered(&mut app, 120, 4);
+
+        assert!(header.starts_with("Status: idle | Enter submit"));
+        assert!(header.contains("Shift-Enter newline"));
     }
 
     #[test]
@@ -779,6 +1073,66 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_enhancement_pops_before_terminal_restore_and_fails_soft() {
+        let calls = RefCell::new(Vec::new());
+        let enabled = Cell::new(false);
+        let result = {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_keyboard_enhancement(
+                || {
+                    calls.borrow_mut().push("push");
+                    Ok(true)
+                },
+                || calls.borrow_mut().push("pop"),
+                |available| {
+                    enabled.set(available);
+                    Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned()))
+                },
+            )
+        };
+        assert!(result.is_err());
+        assert!(enabled.get());
+        assert_eq!(calls.into_inner(), ["push", "pop", "restore"]);
+
+        for enable in [Ok(false), Err(io::Error::other("push failed"))] {
+            let calls = RefCell::new(Vec::new());
+            let enabled = Cell::new(true);
+            {
+                let _terminal_restore =
+                    super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+                super::with_keyboard_enhancement(
+                    || enable,
+                    || calls.borrow_mut().push("pop"),
+                    |available| {
+                        enabled.set(available);
+                        calls.borrow_mut().push("run");
+                    },
+                );
+            }
+            assert!(!enabled.get());
+            assert_eq!(calls.into_inner(), ["run", "restore"]);
+        }
+
+        let calls = RefCell::new(Vec::new());
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_keyboard_enhancement(
+                || {
+                    calls.borrow_mut().push("push");
+                    Ok(true)
+                },
+                || calls.borrow_mut().push("pop"),
+                |available| -> () {
+                    assert!(available);
+                    panic!("loop panic")
+                },
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(calls.into_inner(), ["push", "pop", "restore"]);
+    }
+
+    #[test]
     fn active_run_accepts_cancel_but_not_submit_and_ctrl_c_shuts_down() {
         let mut app = App::default();
         assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(7) }));
@@ -801,7 +1155,14 @@ mod tests {
         assert!(app.handle_event(RuntimeEvent::RuntimeDisabled {
             reason: RuntimeDisabledReason::OpenAiAuthentication,
         }));
-        assert!(rendered(&mut app, 120, 15).contains("Input disabled"));
+        let disabled_screen = rendered(&mut app, 120, 15);
+        assert!(disabled_screen.contains("Input disabled"));
+        assert!(
+            !disabled_screen
+                .lines()
+                .next()
+                .is_some_and(|header| header.contains("Shift-Enter newline"))
+        );
 
         app.prompt = "saved prompt".to_owned();
         assert!(!app.handle_key(key(KeyCode::Char('x'))).visible_changed);
@@ -839,10 +1200,10 @@ mod tests {
         });
         app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
 
-        let screen = rendered(&mut app, 60, 8);
+        let screen = rendered(&mut app, 60, 12);
 
         assert!(screen.starts_with("Status: idle"));
-        let request = screen.find("you: inspect").unwrap();
+        let request = screen.find("inspect").unwrap();
         let final_message = screen.find("finished").unwrap();
         assert!(request < final_message);
         assert!(screen.contains("> "));
@@ -863,22 +1224,41 @@ mod tests {
             });
         }
 
-        let newest = rendered(&mut app, 40, 5);
+        let newest = rendered(&mut app, 40, 7);
         assert!(newest.contains("request 8"));
         assert!(!newest.contains("request 1"));
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
-        let one_line_up = rendered(&mut app, 40, 5);
+        let one_line_up = rendered(&mut app, 40, 7);
         assert!(one_line_up.contains("request 8"));
         assert!(!one_line_up.contains("request 7"));
 
         app.handle_key(key(KeyCode::Home));
-        let oldest = rendered(&mut app, 40, 5);
+        let oldest = rendered(&mut app, 40, 7);
         assert!(oldest.contains("request 1"));
         assert!(!oldest.contains("request 8"));
 
         app.handle_key(key(KeyCode::End));
-        assert!(rendered(&mut app, 40, 5).contains("request 8"));
+        assert!(rendered(&mut app, 40, 7).contains("request 8"));
+    }
+
+    #[test]
+    fn transcript_scrolls_nested_arena_frames_between_source_and_output() {
+        let mut app = App::default();
+        let source = (1..=33)
+            .map(|line| format!("source line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_event(completed_record(1, 1, &source, Vec::new()));
+
+        let newest = rendered(&mut app, 40, 8);
+        assert!(newest.contains("42"), "{newest}");
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let oldest = rendered(&mut app, 40, 8);
+        assert!(oldest.contains("╭code"));
+        assert!(oldest.contains("╭"));
+        assert!(app.handle_key(key(KeyCode::End)).visible_changed);
+        assert!(rendered(&mut app, 40, 8).contains("42"));
     }
 
     #[test]
@@ -1008,7 +1388,7 @@ mod tests {
             },
             progress_gap: false,
         });
-        rendered(&mut app, 40, 5);
+        rendered(&mut app, 40, 7);
 
         assert!(!app.handle_key(key(KeyCode::Up)).visible_changed);
     }
@@ -1275,6 +1655,7 @@ mod tests {
                         outcome: ExecutionOutcome::Complete {
                             result: Some(observation("42")),
                         },
+                        read_calls: Vec::new(),
                     },
                     attempts,
                 },
@@ -1301,6 +1682,7 @@ mod tests {
                             text: "boom".to_owned(),
                             omitted_bytes: 0,
                         }),
+                        read_calls: Vec::new(),
                     },
                     attempts: vec![],
                 },
@@ -1324,6 +1706,7 @@ mod tests {
                                     message: "read failed".to_owned(),
                                 },
                             },
+                            read_calls: Vec::new(),
                             failure: Some(ExecutionFailure::Arena {
                                 message: "interrupted".to_owned(),
                             }),
@@ -1337,14 +1720,26 @@ mod tests {
         });
 
         let history = rendered(&mut app, 120, 40);
-        assert!(history.contains("result: 42"));
-        assert!(history.contains("error: boom"));
-        assert!(!history.contains("stderr: \n"));
-        assert!(history.contains("await read(path)"));
-        assert!(history.contains("stderr: diagnostic"));
-        assert!(history.contains("read: completed bad    path failed: read failed"));
-        assert!(history.contains("failure: interrupted"));
-        assert!(history.contains("warning: cancelled warning"));
+        for text in [
+            "result",
+            "42",
+            "error",
+            "boom",
+            "await read(path)",
+            "stderr",
+            "diagnostic",
+            "read",
+            "completed bad    path failed: read failed",
+            "failure",
+            "interrupted",
+            "warning",
+            "cancelled warning",
+        ] {
+            assert!(history.contains(text), "{history}");
+        }
+        for flattened_label in ["result: 42", "error: boom", "stderr: diagnostic"] {
+            assert!(!history.contains(flattened_label), "{history}");
+        }
 
         let mut generation = App::default();
         generation.handle_event(RuntimeEvent::RecordAppended {
@@ -1367,7 +1762,7 @@ mod tests {
         let generation_history = rendered(&mut generation, 120, 40);
         assert!(generation_history.contains("interrupted reasoning"));
         assert!(generation_history.contains("interrupted assistant"));
-        assert!(generation_history.contains("code:"));
+        assert!(generation_history.contains("code"));
         assert!(generation_history.contains("interrupted_code()"));
     }
 
@@ -1395,6 +1790,184 @@ mod tests {
     }
 
     #[test]
+    fn configured_prompt_box_is_bottom_anchored_and_footer_is_embedded() {
+        let mut app = App {
+            prompt: "ask".to_owned(),
+            ..App::default()
+        };
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "history".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+
+        let without_accounting = rendered(&mut app, 80, 12);
+        let without_rows = without_accounting.lines().collect::<Vec<_>>();
+        assert_eq!(without_rows[9], "─".repeat(80));
+        assert!(without_rows[10].starts_with("> ask"));
+        assert_eq!(without_rows[11], "─".repeat(80));
+        assert_eq!(app.history_height, 8);
+
+        app.handle_event(completed_record(1, 1, "accounting()", vec![usage(1, 1)]));
+        let with_accounting = rendered(&mut app, 80, 12);
+        let with_rows = with_accounting.lines().collect::<Vec<_>>();
+        assert_eq!(with_rows[9], "─".repeat(80));
+        assert!(with_rows[10].starts_with("> ask"));
+        assert!(with_rows[11].starts_with('─'));
+        assert!(with_rows[11].ends_with("↑1 ↓1 R0 W0 r0 Σ2 $0.000024 ─"));
+        assert_eq!(app.history_height, 8);
+    }
+
+    #[test]
+    fn prompt_preserves_empty_and_trailing_logical_lines() {
+        for (prompt, height, expected_rows, rule_row, prompt_row) in [
+            ("\n", 12, 2, 8, "> "),
+            ("abc\n", 12, 2, 8, "> abc"),
+            ("abc\n\n\n", 21, 4, 15, "> abc"),
+        ] {
+            assert_eq!(super::prompt_rows(prompt, 8), expected_rows);
+
+            let mut app = App {
+                prompt: prompt.to_owned(),
+                ..App::default()
+            };
+            let screen = rendered(&mut app, 8, height);
+            let rows = screen.lines().collect::<Vec<_>>();
+            assert_eq!(rows[rule_row], "─".repeat(8));
+            assert!(rows[rule_row + 1].starts_with(prompt_row));
+        }
+    }
+
+    #[test]
+    fn prompt_wraps_above_its_fixed_baseline_and_clips_to_the_newest_tail() {
+        let mut app = App {
+            prompt: "old\nabcdefghij".to_owned(),
+            ..App::default()
+        };
+
+        let screen = rendered(&mut app, 8, 12);
+        let rows = screen.lines().collect::<Vec<_>>();
+        assert_eq!(rows[8], "─".repeat(8));
+        assert!(rows[9].starts_with("> abcdef"));
+        assert!(rows[10].starts_with("  ghij"));
+        assert_eq!(rows[11], "─".repeat(8));
+        assert_eq!(app.history_height, 7);
+    }
+
+    #[test]
+    fn prompt_chrome_is_safe_at_small_dimensions_and_configuration_stays_unchanged() {
+        let mut app = App::default();
+        for height in 0..=6 {
+            for width in 0..=2 {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| super::render(frame, &mut app))
+                    .unwrap();
+            }
+        }
+
+        let normal_header = rendered(&mut app, 80, 4);
+        assert!(
+            normal_header
+                .lines()
+                .next()
+                .is_some_and(|header| !header.contains("Shift-Enter newline"))
+        );
+
+        let three_rows = rendered(&mut app, 10, 3);
+        let rows = three_rows.lines().collect::<Vec<_>>();
+        assert!(rows[0].starts_with("Status:"));
+        assert_eq!(rows[1], "─".repeat(10));
+        assert_eq!(rows[2], "─".repeat(10));
+
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        configuration.prompt = "hidden".to_owned();
+        let configuration_screen = rendered(&mut configuration, 80, 15);
+        assert!(configuration_screen.starts_with("Configuration only:"));
+        assert!(configuration_screen.contains("Startup configuration"));
+        assert!(!configuration_screen.contains("Shift-Enter newline"));
+        assert!(!configuration_screen.contains("> hidden"));
+        assert!(!configuration_screen.contains('─'));
+        assert_eq!(configuration.history_height, 14);
+    }
+
+    #[test]
+    fn prompt_growth_preserves_scroll_and_footer_does_not_change_history_height() {
+        let mut app = App::default();
+        for run_id in 1..=8 {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: format!("history line {run_id}"),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 8);
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        app.prompt = "a".repeat(19);
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 7);
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        app.prompt.clear();
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 8);
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        let manual_scroll = app.scroll_from_bottom;
+
+        app.prompt = "a".repeat(19);
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 7);
+        assert_eq!(
+            app.scroll_from_bottom,
+            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+        let manual_scroll = app.scroll_from_bottom;
+
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(9) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(9),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: usage(1, 1),
+            },
+        });
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 7);
+        assert_eq!(
+            app.scroll_from_bottom,
+            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+
+        app.prompt.clear();
+        rendered(&mut app, 20, 12);
+        assert_eq!(app.history_height, 8);
+        assert_eq!(
+            app.scroll_from_bottom,
+            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
+        );
+        let cached_scroll = app.scroll_from_bottom;
+        let backend = TestBackend::new(0, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.scroll_from_bottom, cached_scroll);
+    }
+
+    #[test]
     fn footer_places_prompt_above_accounting_at_prioritised_heights() {
         let mut app = App {
             prompt: "ask".to_owned(),
@@ -1419,17 +1992,20 @@ mod tests {
         assert!(one.starts_with("Status:"));
         assert!(!one.contains("> ask"));
         let two = rendered(&mut app, 80, 2);
-        assert!(
-            two.lines()
-                .nth(1)
-                .is_some_and(|row| row.starts_with("> ask"))
-        );
+        assert!(two.lines().nth(1).is_some_and(|row| row == "─".repeat(80)));
 
         let three = rendered(&mut app, 80, 3);
         let rows = three.lines().collect::<Vec<_>>();
         assert!(rows[0].starts_with("Status:"));
-        assert!(rows[1].starts_with("> ask"));
-        assert_eq!(rows[2].trim_end(), "↑100 ↓20 R10 W5 r5 Σ120 $0.000769");
+        assert_eq!(rows[1], "─".repeat(80));
+        assert_eq!(rows[2], "─".repeat(80));
+
+        let four = rendered(&mut app, 80, 4);
+        let rows = four.lines().collect::<Vec<_>>();
+        assert!(rows[2].starts_with("> ask"));
+        assert!(rows[3].ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"));
+        assert_eq!(app.history_height, 0);
+
         let larger = rendered(&mut app, 80, 6);
         assert!(
             larger
@@ -1437,11 +2013,13 @@ mod tests {
                 .nth(4)
                 .is_some_and(|row| row.starts_with("> ask"))
         );
-        assert_eq!(
-            larger.lines().nth(5).map(str::trim_end),
-            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+        assert!(
+            larger
+                .lines()
+                .nth(5)
+                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"))
         );
-        assert_eq!(app.history_height, 3);
+        assert_eq!(app.history_height, 2);
         assert!(app.history_rows > 0);
     }
 
@@ -1460,12 +2038,18 @@ mod tests {
             },
             progress_gap: false,
         });
-        let screen = rendered(&mut without_metrics, 80, 3);
+        let screen = rendered(&mut without_metrics, 80, 4);
         assert!(
             screen
                 .lines()
                 .nth(2)
                 .is_some_and(|row| row.starts_with("> ask"))
+        );
+        assert!(
+            screen
+                .lines()
+                .nth(3)
+                .is_some_and(|row| row == "─".repeat(80))
         );
         assert!(!screen.contains('↑'));
 
@@ -1491,14 +2075,20 @@ mod tests {
             )],
         ));
 
-        let one = rendered(&mut app, 1, 3);
-        assert_eq!(one.lines().nth(2), Some("…"));
-        let narrow = rendered(&mut app, 12, 3);
-        let footer = narrow.lines().nth(2).expect("footer row").trim_end();
-        assert!(footer.ends_with('…'));
-        assert!(footer.starts_with("↑100"));
-        assert_eq!(super::truncate_footer("↑1 日本", 6), "↑1 日…");
+        let one = rendered(&mut app, 1, 4);
+        assert_eq!(one.lines().nth(3), Some("…"));
+        let narrow = rendered(&mut app, 12, 4);
+        let footer = narrow.lines().nth(3).expect("footer row");
+        assert!(footer.starts_with('─'));
+        assert!(footer.ends_with('─'));
+        assert!(footer.contains('…'));
+        let cjk_suffix = super::truncate_footer("prefix 日本 $9", 6);
+        assert_eq!(cjk_suffix, "…本 $9");
+        assert_eq!(super::Line::raw(cjk_suffix).width(), 6);
         assert_eq!(super::truncate_footer("text", 0), "");
+        assert_eq!(super::truncate_footer("text", 1), "…");
+        assert_eq!(super::footer_rule(Some("footer"), 0).width(), 0);
+        assert_eq!(super::footer_rule(Some("footer"), 1).width(), 1);
     }
 
     #[test]
@@ -1531,9 +2121,11 @@ mod tests {
                 accounting: first.clone(),
             },
         });
-        assert_eq!(
-            rendered(&mut app, 80, 5).lines().last().map(str::trim_end),
-            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+        assert!(
+            rendered(&mut app, 80, 5)
+                .lines()
+                .last()
+                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"))
         );
 
         app.handle_event(completed_record(1, 1, "first()", vec![first]));
@@ -1567,9 +2159,11 @@ mod tests {
             vec![AttemptAccounting::KnownUsage(wrong_tier)],
         ));
 
-        assert_eq!(
-            rendered(&mut app, 80, 8).lines().last().map(str::trim_end),
-            Some("↑107 ↓30 R10 W5 r5 Σ137 $0.000769")
+        assert!(
+            rendered(&mut app, 80, 8)
+                .lines()
+                .last()
+                .is_some_and(|row| row.ends_with("↑107 ↓30 R10 W5 r5 Σ137 $0.000769 ─"))
         );
     }
 
@@ -1588,7 +2182,7 @@ mod tests {
             });
         }
         rendered(&mut app, 20, 5);
-        assert_eq!(app.history_height, 3);
+        assert_eq!(app.history_height, 1);
         assert_eq!(app.scroll_from_bottom, 0);
 
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(5) });
@@ -1601,7 +2195,7 @@ mod tests {
             },
         });
         rendered(&mut app, 20, 5);
-        assert_eq!(app.history_height, 2);
+        assert_eq!(app.history_height, 1);
         assert_eq!(app.scroll_from_bottom, 0);
 
         assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
@@ -1620,7 +2214,7 @@ mod tests {
             progress_gap: false,
         });
         rendered(&mut app, 20, 5);
-        assert_eq!(app.history_height, 3);
+        assert_eq!(app.history_height, 1);
         assert_eq!(
             app.scroll_from_bottom,
             manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
@@ -1690,9 +2284,8 @@ mod tests {
         });
 
         let history = rendered(&mut app, 120, 40);
-        assert_eq!(history.matches("#1").count(), 3);
-        assert!(history.contains("cost $0.0004"));
-        assert!(history.contains("cost $0.002"));
+        assert!(history.contains("↑100 ↓0 R0 W0 r0 Σ100 · $0.0004"));
+        assert!(history.contains("↑0 ↓100 R0 W0 r20 Σ100 · $0.002"));
         assert!(history.contains("↑100 ↓100 R0 W0 r20 Σ200 $0.0024"));
         assert!(!history.contains("Run estimated cost"));
         assert!(!history.contains("Unavailable $0"));
@@ -1796,6 +2389,9 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
+                        read_calls: (1..=20)
+                            .map(|line_count| ReadCall::Success { line_count })
+                            .collect(),
                     },
                     attempts: Vec::new(),
                 },
@@ -1824,12 +2420,18 @@ mod tests {
             assert!(update.visible_changed);
             assert_eq!(app.prompt, "kept prompt");
         }
-        assert!(!rendered(&mut app, 60, 40).contains("code line 33"));
+        let collapsed = rendered(&mut app, 60, 40);
+        assert!(!collapsed.contains("code line 33"));
+        assert!(collapsed.contains("[4 earlier tool calls omitted]"));
 
         let expanded = app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(expanded.command.is_none());
         assert!(expanded.visible_changed);
-        assert!(rendered(&mut app, 60, 40).contains("code line 33"));
+        let expanded = rendered(&mut app, 60, 40);
+        assert!(expanded.contains("code line 33"));
+        assert!(!expanded.contains("earlier tool calls omitted"));
+        assert!(expanded.contains("read · 1 lines"));
+        assert!(expanded.contains("read · 20 lines"));
     }
 
     #[test]
@@ -1880,6 +2482,7 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
+                        read_calls: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -1911,6 +2514,7 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
+                        read_calls: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -2019,6 +2623,30 @@ mod tests {
             if width == 0 {
                 assert_eq!(app.scroll_from_bottom, scroll);
             }
+        }
+    }
+
+    #[test]
+    fn status_header_uses_concise_activity_without_identifiers() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(73) });
+        assert!(rendered(&mut app, 120, 4).starts_with("Status: starting run"));
+        app.handle_event(RuntimeEvent::ModelStepStarted {
+            run_id: RunId(73),
+            step_id: ModelStepId(91),
+        });
+        assert!(rendered(&mut app, 120, 4).starts_with("Status: generating"));
+        app.handle_event(RuntimeEvent::ToolStarted {
+            run_id: RunId(73),
+            step_id: ModelStepId(91),
+            path: "Cargo.toml".to_owned(),
+        });
+
+        let screen = rendered(&mut app, 120, 4);
+        let header = screen.lines().next().expect("status header");
+        assert!(header.starts_with("Status: reading Cargo.toml"));
+        for hidden in ["run 73", "step 91", "attempt"] {
+            assert!(!header.contains(hidden), "{header}");
         }
     }
 

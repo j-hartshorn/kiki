@@ -81,6 +81,7 @@ pub struct Execution {
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) outcome: ExecutionOutcome,
+    pub(crate) read_calls: Vec<ReadCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,11 +113,30 @@ impl ReadOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadCall {
+    Success { line_count: usize },
+    Failed,
+    Pending,
+}
+
+impl ReadCall {
+    fn from_outcome(outcome: &ReadOutcome) -> Self {
+        match outcome {
+            ReadOutcome::Success { line_count } => Self::Success {
+                line_count: *line_count,
+            },
+            ReadOutcome::Failure { .. } => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterruptedExecution {
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) read: InterruptedRead,
+    pub(crate) read_calls: Vec<ReadCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +222,7 @@ impl ArenaError {
 struct InterruptedReadState {
     pending: Option<String>,
     completed: Option<(String, ReadOutcome)>,
+    read_calls: Vec<ReadCall>,
 }
 
 struct InterruptedExecutionState {
@@ -220,16 +241,23 @@ impl InterruptedExecutionState {
     }
 
     fn finish(
-        mut self,
+        self,
         now: Instant,
         progress: &mut impl FnMut(ArenaProgress),
     ) -> InterruptedExecution {
-        self.streams.flush_stdout(now, progress);
+        let InterruptedExecutionState {
+            mut streams,
+            read,
+            began,
+        } = self;
+        streams.flush_stdout(now, progress);
+        let (read, read_calls) = read.finish();
         InterruptedExecution {
-            began: self.began,
-            stdout: self.streams.stdout.finish(),
-            stderr: self.streams.stderr.finish(),
-            read: self.read.finish(),
+            began,
+            stdout: streams.stdout.finish(),
+            stderr: streams.stderr.finish(),
+            read,
+            read_calls,
         }
     }
 }
@@ -238,21 +266,32 @@ impl InterruptedReadState {
     fn started(&mut self, path: &str) {
         assert!(self.pending.is_none(), "only one read can be pending");
         self.pending = Some(bounded_interruption_text(path.to_owned()));
+        self.read_calls.push(ReadCall::Pending);
     }
 
     fn finished(&mut self, outcome: ReadOutcome) {
         let path = self.pending.take().expect("a read must be pending");
+        let call = self
+            .read_calls
+            .last_mut()
+            .expect("a read call must be pending");
+        assert!(
+            matches!(call, ReadCall::Pending),
+            "the last read must be pending"
+        );
+        *call = ReadCall::from_outcome(&outcome);
         self.completed = Some((path, outcome));
     }
 
-    fn finish(self) -> InterruptedRead {
-        match self.pending {
+    fn finish(self) -> (InterruptedRead, Vec<ReadCall>) {
+        let read = match self.pending {
             Some(path) => InterruptedRead::Pending { path },
             None => match self.completed {
                 Some((path, outcome)) => InterruptedRead::Completed { path, outcome },
                 None => InterruptedRead::NoRead,
             },
-        }
+        };
+        (read, self.read_calls)
     }
 }
 
@@ -452,6 +491,7 @@ impl Arena {
                     stdout: interruption.streams.stdout.finish(),
                     stderr: interruption.streams.stderr.finish(),
                     outcome,
+                    read_calls: interruption.read.read_calls,
                 })
             }
             Err(failure) => {
@@ -1433,7 +1473,7 @@ mod tests {
         Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome,
         INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, InterruptedRead,
         OBSERVATION_LIMITS, Observation, ObservationAccumulator, ObservationLimits, PythonError,
-        RUNTIME_IDENTITY, ReadOutcome, RuntimeIdentity, StreamAccumulators, drive,
+        RUNTIME_IDENTITY, ReadCall, ReadOutcome, RuntimeIdentity, StreamAccumulators, drive,
         is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         validate_worker, validate_worker_with_timeout,
     };
@@ -2473,6 +2513,93 @@ mod tests {
             panic!("expected interrupted cancellation");
         };
         assert_eq!(execution.stdout.head, "before\n");
+    }
+
+    #[tokio::test]
+    async fn read_call_trace_keeps_ordered_successes_and_failures() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("lines"), "one\ntwo\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "lines = await read('lines')\ntry:\n    await read('/outside')\nexcept ValueError:\n    pass\nlen(lines)",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.read_calls,
+            [ReadCall::Success { line_count: 2 }, ReadCall::Failed]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_call_trace_keeps_pending_calls_when_cancellation_interrupts_a_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute("await read('pending')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.read_calls, [ReadCall::Pending]);
+    }
+
+    #[tokio::test]
+    async fn read_call_trace_keeps_settled_outcomes_when_cancellation_precedes_progress() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("settled"), "line\n").unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute("await read('settled')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its read settled: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.read_calls, [ReadCall::Success { line_count: 1 }]);
+    }
+
+    #[tokio::test]
+    async fn read_call_trace_keeps_every_call_beyond_the_display_preview_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("lines"), "line\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "for _ in range(20):\n    await read('lines')",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.read_calls.len(), 20);
+        assert!(
+            execution
+                .read_calls
+                .iter()
+                .all(|call| *call == ReadCall::Success { line_count: 1 })
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.21 --locked --root /tmp/kiki-monty-0.0.21
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override.
+Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override. Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
@@ -24,6 +24,8 @@ Launch Kiki from the workspace the agent may read:
 cargo run
 ```
 
+Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
+
 ## Privacy and costs
 
 `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
@@ -32,8 +34,9 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 
 ## Controls and availability
 
-- Type to edit the single-line prompt. Input is limited to 16 KiB.
+- Type to edit the configured prompt. Input is limited to 16 KiB.
 - `Enter` submits while idle.
+- The `Shift-Enter newline` header hint appears only when enhanced modified-key reporting is available; then `Shift-Enter` inserts a newline.
 - `Esc` cancels the active run.
 - `Ctrl-C` shuts down.
 - `Ctrl-T` toggles all retained reasoning. Reasoning is shown by default; hidden blocks show a placeholder.
@@ -42,17 +45,17 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - `PageUp` / `PageDown` scroll ten lines.
 - `Home` / `End` jump to the oldest / newest history.
 
-Missing or invalid startup configuration opens a read-only configuration-only view, where prompt editing and submission are disabled. An OpenAI authentication failure or failed arena checkpoint recovery disables runtime submission until Kiki restarts. `Ctrl-T` and `Ctrl-O` affect applicable retained transcript content only, not submission availability.
+Missing or invalid startup configuration opens a read-only configuration-only view, where prompt editing and submission are disabled. An OpenAI authentication failure or failed arena checkpoint recovery makes the runtime prompt read-only until Kiki restarts. `Ctrl-T` and `Ctrl-O` affect applicable retained transcript content only, not submission availability.
 
 ## Transcript presentation
 
 Assistant responses and retained reasoning stream and settle as GitHub-Flavoured Markdown (GFM), including tables, task lists, links, blockquotes, strikethrough, and fenced code. Raw HTML is shown literally and images use textual fallbacks. Fenced Markdown code is not Tree-sitter highlighted.
 
-Retained reasoning is shown by default in a subtly grey, padded italic card; `Ctrl-T` hides every reasoning block behind a `reasoning hidden · Ctrl-T to show` placeholder. Reasoning has no lifecycle colour. Arena cards are borderless and full width: blue while in progress, green when complete, and red on error or cancellation. A final assistant response appears below its arena cards. Each arena card includes its title and status, source, execution content, display-gap and usage/cost metadata. Execution content is ordered stdout, non-empty stderr, result or Python error, interruption details, then any cancellation warning.
+User requests appear in neutral cards without a `you:` label. RunId and ModelStepId remain authoritative but are not displayed; live display identifies current activity instead. Retained reasoning is shown by default in a subtly grey, italic, borderless card with two-cell horizontal and one-row top-and-bottom padding; `Ctrl-T` hides every reasoning block behind a `reasoning hidden · Ctrl-T to show` placeholder. Reasoning has no lifecycle colour. Every arena uses a full-width rounded outer frame with its existing lifecycle background: blue while in progress, green when complete, and red on error or cancellation. Ordinary settled frames have no heading; live and error frames keep concise activity, status, or diagnostics exactly once inside the frame. Each available arena section is a separately closed, muted-border box in order: `code`, `tool calls`, then `stdout`, non-empty `stderr`, `result` or `error`, interrupted `read`, `failure`, `warning`, and current `stdout preview`. Empty sections are omitted. After an execution settles, `tool calls` retains one path-free row for every valid host `read`: `read · N lines`, `read · failed`, or `read · pending`. It is authoritative completion evidence, not lossy live progress or model context; it stores no paths, arguments, error text, or user text. Reported fields across a step's attempts aggregate into one muted, right-aligned, unboxed accounting line inside the outer frame after a blank separator; multiple attempts may be identified compactly. A final assistant response appears below its arena cards as a neutral page-background, borderless block with one-row top-and-bottom padding and no side padding or label. Execution content is ordered stdout, non-empty stderr, result or Python error, interruption details, then any cancellation warning.
 
-Automatic collapse applies only when source exceeds 32 logical lines or combined execution content exceeds 16 logical lines. It keeps the source head and execution-output tail, marking omitted lines; titles, status, display-gap, usage, and cost metadata do not consume those budgets. `Ctrl-O` expands retained card content or restores automatic collapse; it cannot recover content outside retention bounds. Tree-sitter highlights exact partial and settled Python source. If highlighting fails, Kiki shows the exact source as plain text.
+Automatic collapse applies only when source exceeds 32 logical lines or combined execution-content lines exceeds 16 logical lines. It keeps the source head and execution tail, marking omitted lines; section labels and borders, live activity, failure or cancellation diagnostics, display-gap, and accounting do not consume those budgets. `tool calls` has its own automatic preview: it shows the latest 16 rows, preceded by `[N earlier tool calls omitted]` when needed. The tool-call trace is deliberately unbounded per execution; this display collapse is its only bound. `Ctrl-O` expands every retained source, tool-call, and execution row together or restores automatic collapse; it cannot recover source or execution content outside their existing retention bounds. Tree-sitter highlights exact partial and settled Python source. If highlighting fails, Kiki shows the exact source as plain text.
 
-The session footer appears in one row immediately beneath the prompt, in this order when reported: `↑` reported input, `↓` reported output, `R` cached input, `W` cache-write input, `r` reasoning output, `Σ` provider-reported total, `$` local estimated cost. `r` is an informational subset of output, not an additional total; `Σ` is not recomputed locally. Missing values are omitted. The row truncates with an ellipsis on narrow terminals and is absent in the configuration-only view. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
+The configured prompt is bottom anchored between full-width top and always-present bottom rules. It wraps and preserves explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then shows its newest tail. The session footer sits right-aligned inside the prompt's bottom rule, in this order when reported: `↑` reported input, `↓` reported output, `R` cached input, `W` cache-write input, `r` reasoning output, `Σ` provider-reported total, `$` local estimated cost. It never adds or moves a row; on narrow terminals it truncates its left side with `…` to preserve the rightmost totals and cost. `r` is an informational subset of output, not an additional total; `Σ` is not recomputed locally. Missing values are omitted. The footer is absent without metrics and in the configuration-only view. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
 
 ## Manual interactive transcript demonstration
 
@@ -70,7 +73,7 @@ Submit this prompt:
 Use the Python arena in separate steps. First read `README.md` into persistent Python state named `readme` and print its character count. In a later Python step, use that retained `readme` value to count its `## ` headings and print the count. Then return a GFM response with a heading, task list, link to `README.md`, and fenced code block.
 ```
 
-Check streamed GFM and reasoning, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, `Ctrl-T` and `Ctrl-O`, scrolling, and the session footer.
+Check streamed GFM and reasoning, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, unlabelled user cards, activity without internal identifiers, a closed rounded lifecycle frame with closed labelled source and execution sections, unboxed accounting, and the neutral borderless assistant block. On a terminal with enhanced modified-key reporting, verify `Shift-Enter` adds a prompt newline; verify the bottom-anchored wrapping prompt, `Ctrl-T`, `Ctrl-O`, scrolling, and the right-aligned footer embedded in its bottom rule, including left-side ellipsis truncation that preserves the cost.
 
 ## Deterministic verification
 

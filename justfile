@@ -1,3 +1,5 @@
+set dotenv-load
+
 export MONTY_BIN := "/tmp/kiki-monty-0.0.21/bin/monty"
 
 check:

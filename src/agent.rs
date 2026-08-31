@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    InterruptedRead, Observation, PythonError, ReadOutcome,
+    InterruptedRead, Observation, PythonError, ReadCall, ReadOutcome,
 };
 use crate::model::{
     ACCEPTED_MODEL_CONTENT_LIMIT, AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId,
@@ -43,6 +43,7 @@ pub struct ExecutionEvidence {
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) read: InterruptedRead,
+    pub(crate) read_calls: Vec<ReadCall>,
     pub(crate) cancellation_warning: Option<String>,
     pub(crate) failure: Option<ExecutionFailure>,
 }
@@ -228,6 +229,7 @@ impl ExecutionEvidence {
             stdout: interrupted.stdout,
             stderr: interrupted.stderr,
             read: interrupted.read,
+            read_calls: interrupted.read_calls,
             cancellation_warning: cancellation_warning.then(|| CANCELLATION_WARNING.to_owned()),
             failure: error.map(failure_evidence),
         }
@@ -257,6 +259,7 @@ fn empty_interrupted_execution() -> InterruptedExecution {
         stdout: empty_observation(),
         stderr: empty_observation(),
         read: InterruptedRead::NoRead,
+        read_calls: Vec::new(),
     }
 }
 
@@ -835,7 +838,9 @@ mod tests {
         Agent, AgentError, AgentProgress, AgentRunOutcome, ExecutionFailure,
         GenerationEvidenceBuilder, TerminalEvidence,
     };
-    use crate::arena::{Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError};
+    use crate::arena::{
+        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ReadCall,
+    };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -1490,6 +1495,29 @@ mod tests {
     }
 
     #[test]
+    fn execution_evidence_copies_original_read_calls_after_recovery_failure() {
+        let mut interrupted = super::empty_interrupted_execution();
+        interrupted.read_calls = vec![ReadCall::Success { line_count: 3 }, ReadCall::Failed];
+        let error = ArenaError::RecoveryFailed {
+            original: Box::new(ArenaError::Cancelled {
+                execution: Box::new(interrupted),
+            }),
+            recovery: Box::new(ArenaError::Infrastructure {
+                message: "recovery failed".to_owned(),
+                execution: None,
+            }),
+        };
+
+        let evidence = super::ExecutionEvidence::failed("source".to_owned(), String::new(), &error);
+
+        assert_eq!(
+            evidence.read_calls,
+            [ReadCall::Success { line_count: 3 }, ReadCall::Failed]
+        );
+        assert!(!evidence.feedback().contains("tool calls"));
+    }
+
+    #[test]
     fn generation_evidence_is_utf8_safe_at_the_accepted_content_limit() {
         let mut generation = GenerationEvidenceBuilder::default();
         generation.capture(&ModelProgress::AssistantTextChunk {
@@ -1877,6 +1905,7 @@ mod tests {
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
         assert_eq!(evidence.read, execution.read);
+        assert_eq!(evidence.read_calls, execution.read_calls);
         assert_eq!(
             evidence.cancellation_warning.as_deref(),
             Some(super::CANCELLATION_WARNING)
@@ -1899,6 +1928,7 @@ mod tests {
             panic!("cancelled code should have a cancelled result");
         };
         assert_eq!(feedback, &evidence.feedback());
+        assert!(!feedback.contains("tool calls"));
         assert!(feedback.contains("before\n"));
         assert!(feedback.contains(
             "Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled."
@@ -2180,6 +2210,7 @@ mod tests {
                     },
                 )),
             },
+            read_calls: Vec::new(),
         };
 
         assert_eq!(
@@ -2355,6 +2386,7 @@ mod tests {
                 text: "<error>".to_owned(),
                 omitted_bytes: 3,
             }),
+            read_calls: Vec::new(),
         };
 
         assert_eq!(

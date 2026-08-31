@@ -4,13 +4,11 @@ use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, H
 
 const HIGHLIGHT_NAMES: [&str; 5] = ["comment", "keyword", "function", "string", "number"];
 
-#[allow(dead_code)]
 pub(crate) struct PythonHighlighter {
     state: Option<(Highlighter, Box<HighlightConfiguration>)>,
 }
 
 impl PythonHighlighter {
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         let mut configuration = match HighlightConfiguration::new(
             tree_sitter_python::LANGUAGE.into(),
@@ -29,7 +27,6 @@ impl PythonHighlighter {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn highlight<'a>(&mut self, source: &'a str) -> Text<'a> {
         let Some((highlighter, configuration)) = &mut self.state else {
             return plain_text(source);

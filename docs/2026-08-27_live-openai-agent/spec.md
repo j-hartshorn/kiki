@@ -48,7 +48,7 @@ Durable sessions, effectful tools, model selection, multiple providers, interact
 - `gpt-5.6-sol` supports Responses streaming and function calling, with a 1,050,000-token context window and 128,000 maximum output tokens ([model reference](https://developers.openai.com/api/docs/models/gpt-5.6-sol)).
 - OpenAI returns token usage, including cached and cache-write details, but not billed cost. Cost therefore requires a versioned local pricing constant for the fixed model and tier ([usage reference](https://developers.openai.com/api/docs/guides/prompt-caching), [pricing](https://developers.openai.com/api/docs/pricing)).
 - `async-openai` provides typed Responses API streaming and function-call events but is unofficial. Keeping it behind a narrow adapter limits dependency and protocol churn.
-- Arena progress now reports `read` lifecycle and bounded stdout deltas from the same accumulator which produces final observations (`src/arena.rs:93-99`, `src/arena.rs:883-1159`).
+- Arena progress reports `read` lifecycle and bounded stdout deltas from the same accumulator which produces final observations. Each terminal execution now also carries an authoritative typed read-call trace independent of lossy progress (`src/arena.rs:93-125`, `src/arena.rs:883-1159`).
 - Cancellation now restores the active execution checkpoint and commits typed bounded interrupted-step evidence. Completed readable reasoning still needs to travel beside successful execution and final-message records rather than relying on lossy progress (`src/agent.rs:15-50`, `src/runtime.rs:38-64`).
 - Pi's parallel tool execution passes one cancellation signal to every started call, waits for them to settle, retains completed results, converts cooperative cancellation to explicit error results, emits completion events in actual order, and stores tool results in source order (`.research/pi/source/packages/agent/src/agent-loop.ts:489-552`, `.research/pi/source/packages/agent/src/agent-loop.ts:670-710`).
 - The TUI currently renders one flat string history. Highlighted paired cards, thinking visibility, expansion state, streamed output, and generic visual states require a structured display projection rather than parsing formatted text (`src/tui.rs:54-73`, `src/tui.rs:347-445`).
@@ -92,6 +92,7 @@ The prompt teaches:
 - retaining large values in Python and printing focused selections;
 - execution feedback and Python-error behaviour;
 - `execute_python` versus final assistant text;
+- not repeating executed Python in the final reply unless asked;
 - read-only host capabilities;
 - untrusted file and output content.
 
@@ -131,7 +132,9 @@ The cases are:
 - after `FinalMessage` or `FailedRun` commitment, a later cancellation changes nothing;
 - earlier completed model steps remain committed in every case.
 
-`CancelledRun` carries an optional typed generation or execution interruption. Execution evidence includes source, bounded partial stdout, the current `read` outcome when one completed, whether execution began, and this warning: `Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.` Its model-visible cancellation result carries the same bounded evidence. Earlier completed executions remain separate canonical records; no second cancellation record is added.
+`CancelledRun` carries an optional typed generation or execution interruption. Execution evidence includes source, bounded partial stdout, the existing detailed current `read` outcome when one completed, whether execution began, and this warning: `Execution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.` Its model-visible cancellation result carries the same bounded evidence. Earlier completed executions remain separate canonical records; no second cancellation record is added.
+
+Every completed or interrupted Python execution also retains an authoritative, unbounded-per-execution typed trace of valid host `read` calls in start order. A valid host read adds `Pending` at its start and replaces that entry with its settled success line count or failure state before any lossy `ReadFinished` progress. Cancellation while awaiting retains `Pending`; cancellation after settlement retains the settled outcome, including when progress is absent. The trace stores no path, arguments, error text, or user text. It follows the reliable `Execution` and interrupted execution-evidence paths only: it is display evidence, not model history, `CodeResult` feedback, a progress event, or provider wire data. Existing live path/status and detailed interrupted-read evidence remain unchanged.
 
 A non-cancellation Arena failure after a valid `Code` call places exactly one bounded failure `function_call_output` in compound model history and matching optional failed-step evidence inside `FailedRun`, recording whether checkpoint recovery succeeded. It never leaves a dangling call identifier or claims that uncertain state committed. Normal Python exceptions remain completed execution results under the existing commit policy.
 
@@ -151,35 +154,41 @@ Request `service_tier: "default"` and record the returned tier. Record total inp
 
 One versioned `gpt-5.6-sol/default` pricing constant records its effective identity and official source. A pure estimator uses it. For at most 272,000 input tokens, per-million rates are $4.00 uncached input, $0.40 cached input, $5.00 cache writes, and $20.00 output. Above 272,000 input tokens, the full request uses $8.00, $0.80, $10.00, and $30.00 respectively. Uncached input is total input minus cached and cache-write tokens; internally inconsistent usage fails accounting rather than producing a cost. Estimated cost is the sum of each token category multiplied by its applicable rate and divided by one million.
 
-Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 moves available per-step values into compact completed-card metadata and adds session-wide reported totals beneath the prompt for input, output, cache-read, cache-write, reasoning, total tokens, and estimated cost. The session footer is exactly one non-wrapping row immediately below the prompt, ordered left to right and truncated with an ellipsis at the terminal width. It appears only when at least one metric is available and the terminal has at least three rows; otherwise header and prompt take priority. Its appearance reduces the history viewport by one row. Bottom-following and manual `scroll_from_bottom` behaviour remain unchanged and clamp safely when the available history height changes.
+Phase 1 shows per-step usage, estimated cost, and the cumulative known Run cost as plain rows. Phase 2 aggregates reported fields across each step's attempts into one compact muted, right-aligned line after a blank separator; multiple attempts may have a compact count. It adds session-wide reported totals for input, output, cache-read, cache-write, reasoning, total tokens, and estimated cost. The session footer is non-wrapping and right-aligned inside the prompt's always-present bottom rule. It appears only when at least one metric is available, never adds or moves a row, and truncates its left side with `…` to preserve the rightmost totals and cost. Bottom-following and manual `scroll_from_bottom` behaviour remain unchanged and clamp safely when prompt growth changes the available history height.
 
-Unavailable metrics are omitted. Complete and lower-bound known estimates both render as ordinary `$…`; this deliberately Pi-like presentation may understate actual billing when SDK-internal retries are opaque, so the documentation retains that caveat. No estimate is calculated with default-tier rates for an unknown tier or invented as zero. Reliable runtime records store each attempt once for display accounting: completed-execution records remain step-local, while terminal details retain only attempts not already committed by earlier execution records. Session totals therefore fold disjoint completed, terminal, and current-live attempts without presentation-layer slicing. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, unknown interrupted attempts, aggregation without double counting, footer truncation, and dynamic viewport height.
+Unavailable metrics are omitted. Complete and lower-bound known estimates both render as ordinary `$…`; this deliberately Pi-like presentation may understate actual billing when SDK-internal retries are opaque, so the documentation retains that caveat. No estimate is calculated with default-tier rates for an unknown tier or invented as zero. Reliable runtime records store each attempt once for display accounting: completed-execution records remain step-local, while terminal details retain only attempts not already committed by earlier execution records. Session totals therefore fold disjoint completed, terminal, and current-live attempts without presentation-layer slicing. Fixture tests cover cache categories, exactly 272,000 versus 272,001 input tokens, reasoning non-duplication, returned-tier mismatch, inconsistent breakdowns, unknown interrupted attempts, aggregation without double counting, embedded footer truncation, and prompt-driven viewport height.
 
 ### Transcript presentation
 
 Use a structured display projection rather than parsing formatted record text.
 
-Each Python action appears in one arena box containing, in order:
+Each Python action appears in one full-width rounded outer arena frame containing separately closed, labelled available sections in order:
 
-1. complete Python source;
-2. stdout when non-empty;
-3. stderr when non-empty;
-4. final expression result or Python error;
-5. interruption details and cancellation warning when applicable.
+1. complete Python source in `code`;
+2. path-free `tool calls` after settlement when at least one valid host `read` started;
+3. `stdout` when non-empty;
+4. `stderr` when non-empty;
+5. `result` or `error`;
+6. interrupted `read`, `failure`, and `warning` when applicable;
+7. current `stdout preview` when applicable.
 
-The final assistant response always appears below preceding arena boxes. Assistant responses and readable reasoning summaries render as GitHub-Flavoured Markdown while streaming and after settlement. Tables, task lists, links, blockquotes, strikethrough, and fenced code are supported; raw HTML remains literal and images use text fallbacks. Markdown fenced code remains plainly styled rather than introducing a second syntax-highlighting engine.
+Section borders are muted and bodies have one-cell padding where width permits. Empty sections are omitted; borders, titles, and padding do not consume collapse budgets.
 
-User requests appear in neutral padded cards. Arena boxes use borderless, full-width, one-cell-padded backgrounds modelled on Pi's dark presentation and map to three visual states:
+The final assistant response always appears below preceding arena boxes as a neutral page-background block with one-row top-and-bottom padding and no side padding, label, or border. Assistant responses and readable reasoning summaries render as GitHub-Flavoured Markdown while streaming and after settlement. Tables, task lists, links, blockquotes, strikethrough, and fenced code are supported; raw HTML remains literal and images use text fallbacks. Markdown fenced code remains plainly styled rather than introducing a second syntax-highlighting engine.
 
-- in progress: muted blue;
-- complete: muted green;
-- error or cancellation: muted red.
+User requests appear in neutral padded cards without a `you:` label. RunId and ModelStepId remain authoritative but are never displayed. Each arena uses one full-width rounded outer frame with its existing lifecycle background and foreground:
 
-Automatic collapse leaves short boxes fully visible. Longer boxes show the first 32 logical code lines and the last 16 logical execution-content lines, with explicit omission markers. Execution content includes stdout, non-empty stderr, result or error, interruption details, and cancellation warnings; title, status, display-gap, usage, and cost metadata remain visible outside that budget. `Ctrl-O` toggles every arena box between automatic collapse and expanded presentation.
+- in progress: muted blue with concise current activity;
+- complete: muted green with no ordinary heading;
+- error or cancellation: muted red with diagnostics retained exactly once.
+
+The outer frame provides the lifecycle fill; its nested labelled section boxes provide source and execution separation without introducing lifecycle colours. Current live `read` activity remains status, and existing detailed interrupted `read` evidence remains an available section. The settled `tool calls` section formats only `read · N lines`, `read · failed`, and `read · pending`; it does not expose paths, arguments, errors, or user text. Accounting stays unboxed and muted/right-aligned inside the outer frame after its blank separator. Automatic collapse leaves short boxes fully visible. Longer boxes show the first 32 logical code lines and the last 16 combined execution-content lines, with explicit omission markers. Execution content includes stdout, non-empty stderr, result or error, interruption details, cancellation warnings, and current stdout preview; visible retained content still appears in its own labelled box. `tool calls` has its own budget: in automatic mode it shows its latest 16 rows and `[N earlier tool calls omitted]` inside its box before them. This is a display budget only; storage remains unbounded for that execution. Live activity, diagnostics, display-gap, accounting, borders, and titles remain visible outside the source and execution budgets. `Ctrl-O` toggles source, tool calls, and execution output together between automatic collapse and expanded presentation. At narrow widths, borders and padding degrade without losing renderable text or panicking.
 
 Python uses Tree-sitter highlighting, including while partial code streams. Plain code is the accepted fallback only if Tree-sitter cannot build on the pinned toolchain or safely render the incomplete valid UTF-8 streaming fixtures.
 
-Reasoning summaries are retained after settlement and appear as GitHub-Flavoured Markdown in a separate subtly grey, borderless box with two-cell horizontal padding and subdued italic text. `Ctrl-T` hides or shows every reasoning box; a hidden box leaves one dim, discoverable placeholder. Reasoning does not use lifecycle colours.
+Reasoning summaries are retained after settlement and appear as GitHub-Flavoured Markdown in a separate subtly grey, borderless box with two-cell horizontal padding, one-row top-and-bottom padding, and subdued italic text. `Ctrl-T` hides or shows every reasoning box; a hidden box leaves one dim, discoverable placeholder. Reasoning does not use lifecycle colours.
+
+The configured prompt is bottom anchored between full-width top and bottom rules. It wraps and preserves explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then shows its newest tail. `Enter` submits. The `Shift-Enter newline` header hint appears only when enhanced modified-key reporting is available; then `Shift-Enter` inserts a newline. Disabled and configuration-only views remain read-only.
 
 Live stdout extends the same bounded observation which becomes the final execution record. The existing ten-second execution deadline, 64 MiB memory limit, and 256 KiB / 1,000-line retained observation remain unchanged. There is no model-step limit.
 
@@ -203,7 +212,8 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Render assistant text and readable reasoning as streaming GitHub-Flavoured Markdown through `tui-markdown` without its Syntect feature; raw HTML is literal and images are textual.
 - Give reasoning its own subdued display and `Ctrl-T` visibility toggle rather than treating it as an execution-state box.
 - Use only three generic arena-box states: in progress, complete, and error.
-- Collapse arena boxes only above 32 code or 16 execution-content lines; show code from the head, output from the tail, and use `Ctrl-O` for global expansion.
+- Collapse arena boxes only above 32 code or 16 combined execution-content lines; show code from the head, output from the tail in its remaining labelled sections, and use `Ctrl-O` for global expansion.
+- Retain the typed read-call trace without a storage cap for each Python execution, accepting the memory trade-off explicitly chosen by the user; its path-free last-16 preview is display-only and expands with `Ctrl-O`.
 - Pair every Python action with its stdout and result; keep final assistant text below all arena activity.
 - Preserve earlier completed model steps when cancelling later work; reject whole-Run rollback.
 - Keep partial cancelled generation or execution evidence inside the one canonical in-memory `CancelledRun` record, including pre-cancellation output and an external-side-effect warning; durable persistence remains deferred.
@@ -222,7 +232,7 @@ Every dynamic display string passes through one display-only terminal normaliser
 - Foreground Responses streams have no confirmed server-side cancellation operation. Dropping the stream guarantees only that Kiki ignores further output.
 - Function-call argument deltas are JSON fragments. The incremental Python decoder must handle split escapes and Unicode correctly, though any defect remains presentation-only.
 - Capturing partial stdout after cancellation requires the observation accumulator to outlive the abandoned Monty future without weakening checkpoint recovery.
-- The current single in-flight `read` can settle around cancellation; its completed outcome must remain inspectable. General concurrent-effect settlement waits for concurrent or effectful tools.
+- The current single in-flight `read` can settle around cancellation; its completed outcome and unbounded ordered path-free trace must remain inspectable. General concurrent-effect settlement waits for concurrent or effectful tools.
 - Coalescing bounds event frequency and retained content, but a single already-deserialised SDK event can allocate before Kiki applies its 16 MiB application-content guard.
 - No model-step or aggregate context limit means a model can accumulate substantial cost and memory before OpenAI rejects the context or the user cancels.
 - Opaque encrypted reasoning and provider output items complicate future model switching. Only canonical visible context is portable.
@@ -291,7 +301,7 @@ Retain Phase 1's provider and execution semantics while widening application rec
 - muted blue, green, and red generic arena states;
 - automatic collapse above 32 code lines or 16 execution-content lines, retaining the output tail;
 - `Ctrl-O` global arena expansion and `Ctrl-T` reasoning visibility;
-- compact per-step token/cost presentation and session totals beneath the prompt;
+- compact per-step token/cost presentation and session totals in the prompt's bottom rule;
 - cancelled cards showing partial content and the external-side-effect warning;
 - the existing scroll rule: follow new content while at the bottom, otherwise preserve `scroll_from_bottom`;
 - stale-event rejection, tiny-terminal rendering, and dirty-only redraws.

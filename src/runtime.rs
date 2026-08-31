@@ -871,8 +871,8 @@ mod tests {
         Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, InterruptedRead, Observation, ReadOutcome,
-        RecoveryTestGate,
+        Arena, ArenaError, Execution, ExecutionOutcome, InterruptedRead, Observation, ReadCall,
+        ReadOutcome, RecoveryTestGate,
     };
     use crate::model::{
         AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId, ModelError,
@@ -1579,6 +1579,7 @@ mod tests {
             stdout: empty_observation(),
             stderr: empty_observation(),
             read: InterruptedRead::NoRead,
+            read_calls: Vec::new(),
             cancellation_warning: None,
             failure: Some(failure),
         }
@@ -1929,6 +1930,56 @@ mod tests {
         assert_eq!(
             drain_progress(&mut progress).len(),
             PROGRESS_CHANNEL_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_execution_records_keep_read_calls_when_lossy_tool_progress_drops() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input"), "one\ntwo\n").unwrap();
+        let model = ProgressModel::new(
+            vec![
+                CompletedModelAction::Code {
+                    source: "await read('input')".to_owned(),
+                    call_id: ModelCallId::new("read-input"),
+                },
+                CompletedModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+            PROGRESS_CHANNEL_CAPACITY + 1,
+        );
+        let (commands, mut events, mut progress, controller) =
+            start_controller(progress_controller(&workspace, model).await);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let reliable = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+
+        let execution = completed_execution(&records, RunId(1), ModelStepId(1));
+        assert_eq!(execution.read_calls, [ReadCall::Success { line_count: 2 }]);
+        assert!(reliable.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if execution.read_calls == [ReadCall::Success { line_count: 2 }]
+        )));
+        assert!(
+            !drain_progress(&mut progress)
+                .iter()
+                .any(|envelope| matches!(
+                    envelope.item,
+                    RuntimeEvent::ToolStarted { .. } | RuntimeEvent::ToolFinished { .. }
+                ))
         );
     }
 
@@ -3167,6 +3218,7 @@ mod tests {
                         stdout: empty_observation(),
                         stderr: empty_observation(),
                         outcome: ExecutionOutcome::Complete { result: None },
+                        read_calls: Vec::new(),
                     },
                     attempts: vec![AttemptAccounting::UsageUnavailable],
                 },
@@ -3806,6 +3858,7 @@ mod tests {
                                 stdout: empty_observation(),
                                 stderr: empty_observation(),
                                 read: InterruptedRead::NoRead,
+                                read_calls: Vec::new(),
                             }),
                         }),
                         recovery: Box::new(ArenaError::Infrastructure {

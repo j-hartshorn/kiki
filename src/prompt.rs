@@ -113,6 +113,7 @@ mod tests {
         assert_concept(&["large", "python variables", "print", "focused selections"]);
         assert_concept(&["execution feedback", "python error", "committed"]);
         assert_concept(&["execute_python", "final assistant text", "exactly one"]);
+        assert_concept(&["do not repeat", "executed python", "unless the user asks"]);
         assert_concept(&["read-only", "only host capability"]);
         assert_concept(&["untrusted", "files", "output", "instructions"]);
 
