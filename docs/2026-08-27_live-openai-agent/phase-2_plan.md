@@ -237,3 +237,21 @@ Project the typed trace through `ArenaBlock` and `NormalisedArenaBlock`, then pr
 **Files** — Modify: `README.md`, `docs/2026-08-27_live-openai-agent/spec.md`, `docs/2026-08-27_live-openai-agent/phase-2_plan.md`, `src/arena.rs`, `src/agent.rs`, `src/runtime.rs`, `src/transcript.rs`, `src/tui.rs`.
 
 **Verification** — Focused Arena, Agent, Runtime, Transcript, and TUI tests; credential-free all-target tests with `MONTY_BIN`; `cargo fmt --all -- --check`; `cargo check --all-targets`; `cargo clippy --all-targets -- -D warnings`; dependency-isolation checks; and `git diff --check`.
+
+### Post-08df866 approved feedback (#12, #13, #14)
+
+**Decision** — Supersede the earlier source-head and standalone code/output omission-marker directions above. Historical tasks remain historical; tool-call omission remains an in-body tool-call row.
+
+**#12** — In automatic mode, retain the latest 32 logical code lines rather than the first 32. `Ctrl-O` restores the exact full source.
+
+**#13** — Keep the latest 16 combined execution-content lines in canonical section order. Attribute skipped code and execution lines to their original sections and title each affected closed section `<label> · N earlier line(s) omitted`. Retain a non-empty execution section as a closed two-border box when the shared tail budget hides its whole body. Do not render standalone or body omission markers for code or execution content. Keep lifecycle fills, muted borders, body padding, direct clipping, terminal normalisation, syntax highlighting, accounting, and `Ctrl-O` expansion unchanged; narrow widths fall back to wrapped labels without overwriting a section corner.
+
+**#14** — Replace the direct prompt string with a private, focused `PromptEditor`. It owns UTF-8 text, a grapheme-boundary caret, preferred visual column, Unicode deletion, hard-wrap measurement, and its caret-visible prompt viewport. `App` only maps terminal events to semantic edits and retains history, runtime, and terminal policy. The configured prompt has a hardware cursor; arrows edit, Page keys scroll history, and read-only views keep history navigation.
+
+**Tests** — First fail on a 33-line source retaining its 32-line tail with a singular border-owned count and `Ctrl-O` restoration. Cover combined output-tail attribution through stdout, stderr, result, and a fully omitted retained section; per-section counts sum to the prior global omission count. Cover pluralisation, narrow fallback/wrapping, intact corners, and the unchanged in-body tool-call marker. Add `src/prompt_editor.rs` seam tests for middle insertion/take, extended grapheme movement and deletion, middle 16 KiB rejection, UAX#29 word and logical-line operations, visual CJK/emoji navigation, explicit empty/trailing rows, exact full-row cursor placement, and viewport following. Extend `src/tui.rs` TestBackend tests for cursor visibility and coordinates, modifier and Ctrl fallbacks, editable versus read-only navigation, enhanced `Shift-Enter`, terminal-safe input, transcript scrolling, and nested-arena coexistence.
+
+**Files** — Add: `src/prompt_editor.rs`. Modify: `Cargo.toml`, `Cargo.lock`, `src/main.rs`, `src/transcript.rs`, `src/tui.rs`, `README.md`, `docs/2026-08-27_live-openai-agent/spec.md`, and this plan.
+
+**Verification** — Run focused transcript-collapse, prompt-editor, TUI control/history/terminal, and nested-scrolling tests; transcript and full TUI suites; `cargo fmt --all -- --check`; `cargo check --all-targets`; credential-free all-target tests with `MONTY_BIN`; `cargo clippy --all-targets -- -D warnings`; dependency isolation including `unicode_segmentation` only in `src/prompt_editor.rs`; and `git diff --check`.
+
+**Commit** — `Improve transcript editing`

@@ -6,6 +6,7 @@ pub mod model;
 mod openai;
 pub mod pricing;
 pub mod prompt;
+mod prompt_editor;
 pub mod runtime;
 pub mod tools;
 mod transcript;

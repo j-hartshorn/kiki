@@ -309,7 +309,7 @@ fn code_preview(source: &str, expanded: bool) -> (String, Option<usize>) {
     if expanded || lines.len() <= 32 {
         return (source.to_owned(), None);
     }
-    (lines[..32].join("\n"), Some(lines.len() - 32))
+    (lines[lines.len() - 32..].join("\n"), Some(lines.len() - 32))
 }
 
 fn tool_call_text(
@@ -349,12 +349,25 @@ fn tool_call_text(
     })
 }
 
-struct ExecutionPreview {
+struct ExecutionPreviewSection {
+    label: &'static str,
+    text: String,
     omitted: Option<usize>,
-    content: Vec<ArenaContent>,
 }
 
-fn execution_preview(content: &[ArenaContent], expanded: bool) -> ExecutionPreview {
+fn omission_title(label: &str, omitted: Option<usize>) -> String {
+    omitted.map_or_else(
+        || label.to_owned(),
+        |omitted| {
+            format!(
+                "{label} · {omitted} earlier line{} omitted",
+                if omitted == 1 { "" } else { "s" }
+            )
+        },
+    )
+}
+
+fn execution_preview(content: &[ArenaContent], expanded: bool) -> Vec<ExecutionPreviewSection> {
     let line_count = content
         .iter()
         .map(|section| logical_lines(&section.text).len())
@@ -367,18 +380,16 @@ fn execution_preview(content: &[ArenaContent], expanded: bool) -> ExecutionPrevi
         let lines = logical_lines(&section.text);
         let skip = skipped.min(lines.len());
         skipped -= skip;
-        if skip < lines.len() {
-            preview.push(ArenaContent {
+        if skip < lines.len() || skip > 0 {
+            preview.push(ExecutionPreviewSection {
                 label: section.label,
                 text: lines[skip..].join("\n"),
+                omitted: (skip > 0).then_some(skip),
             });
         }
     }
 
-    ExecutionPreview {
-        omitted,
-        content: preview,
-    }
+    preview
 }
 
 fn text_style(style: Style) -> Style {
@@ -513,7 +524,7 @@ impl ArenaText {
 }
 
 struct ArenaSection {
-    title: &'static str,
+    title: String,
     body: ArenaText,
     fallback_label: Option<ArenaText>,
     framed: bool,
@@ -523,8 +534,9 @@ struct ArenaSection {
 }
 
 impl ArenaSection {
-    fn new(label: &'static str, body: Text<'static>, style: Style, width: u16) -> Self {
-        let label_width = u16::try_from(Line::raw(label).width()).unwrap_or(u16::MAX);
+    fn new(title: impl Into<String>, body: Text<'static>, style: Style, width: u16) -> Self {
+        let title = title.into();
+        let label_width = u16::try_from(Line::raw(&title).width()).unwrap_or(u16::MAX);
         let framed = width >= label_width.saturating_add(2);
         let horizontal_padding = u16::from(framed && width.saturating_sub(2) >= 3);
         let body_width = if framed {
@@ -535,7 +547,7 @@ impl ArenaSection {
         let body = ArenaText::new(body, style, body_width);
         let fallback_label = (!framed).then(|| {
             ArenaText::new(
-                literal_text(label, muted_card_style(style.bg.unwrap_or(PAGE))),
+                literal_text(&title, muted_card_style(style.bg.unwrap_or(PAGE))),
                 muted_card_style(style.bg.unwrap_or(PAGE)),
                 width,
             )
@@ -549,7 +561,7 @@ impl ArenaSection {
                 .saturating_add(body.height)
         };
         Self {
-            title: label,
+            title,
             body,
             fallback_label,
             framed,
@@ -569,7 +581,7 @@ impl ArenaSection {
                     height: self.height,
                     x,
                     width: self.width,
-                    title: Some(self.title),
+                    title: Some(&self.title),
                     style: muted_card_style(self.body.style.bg.unwrap_or(PAGE)),
                 },
                 buffer,
@@ -670,15 +682,10 @@ impl ArenaRenderBlock {
 
         if let Some(source) = arena.source.filter(|source| !source.is_empty()) {
             let (preview, omitted) = code_preview(&source, expanded);
-            let mut code = own_styled_text(highlighter.highlight(&preview), style);
-            if let Some(omitted) = omitted {
-                code.lines.push(Line::styled(
-                    format!("[{omitted} code lines omitted]"),
-                    dim_card_style(background),
-                ));
-            }
+            let code = own_styled_text(highlighter.highlight(&preview), style);
+            let title = omission_title("code", omitted);
             items.push(ArenaItem::Section(ArenaSection::new(
-                "code",
+                title,
                 code,
                 style,
                 content_width,
@@ -694,18 +701,9 @@ impl ArenaRenderBlock {
             )));
         }
 
-        let preview = execution_preview(&arena.content, expanded);
-        if let Some(omitted) = preview.omitted {
-            let marker = format!("[{omitted} execution lines omitted]");
-            items.push(ArenaItem::Text(ArenaText::new(
-                literal_text(&marker, dim_card_style(background)),
-                dim_card_style(background),
-                content_width,
-            )));
-        }
-        for content in preview.content {
+        for content in execution_preview(&arena.content, expanded) {
             items.push(ArenaItem::Section(ArenaSection::new(
-                content.label,
+                omission_title(content.label, content.omitted),
                 literal_execution_text(&content.text, style),
                 style,
                 content_width,
@@ -3893,8 +3891,8 @@ mod tests {
 
         let collapsed = rendered_layout_text(&mut transcript);
         for marker in [
-            "[1 code lines omitted]",
-            "[2 execution lines omitted]",
+            "code · 1 earlier line omitted",
+            "stdout · 2 earlier lines omitted",
             "[4 earlier tool calls omitted]",
         ] {
             assert!(collapsed.contains(marker), "{collapsed}");
@@ -3912,8 +3910,8 @@ mod tests {
         assert!(transcript.toggle_arena_expansion());
         let expanded = rendered_layout_text(&mut transcript);
         for omitted in [
-            "code lines omitted",
-            "execution lines omitted",
+            "earlier line omitted",
+            "earlier lines omitted",
             "earlier tool calls omitted",
         ] {
             assert!(!expanded.contains(omitted), "{expanded}");
@@ -4007,7 +4005,7 @@ mod tests {
     }
 
     #[test]
-    fn cards_collapse_code_after_32_logical_lines() {
+    fn cards_collapse_code_tail_with_omission_in_its_border_title() {
         let mut short = Transcript::default();
         let short_source = (1..=32)
             .map(|line| format!("short code line {line}"))
@@ -4017,23 +4015,38 @@ mod tests {
             completed_execution(1, 1, &format!("{short_source}\n"), "", Vec::new()),
             false,
         );
-        assert!(!rendered_layout_text(&mut short).contains("code lines omitted"));
+        assert!(!rendered_layout_text(&mut short).contains("earlier line omitted"));
 
         let mut transcript = Transcript::default();
         let source = (1..=33)
-            .map(|line| format!("code line {line}"))
+            .map(|line| format!("code line {line:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         transcript.apply(completed_execution(1, 1, &source, "", Vec::new()), false);
 
-        let history = rendered_layout_text(&mut transcript);
-        assert!(history.contains("code line 32"));
-        assert!(!history.contains("code line 33"));
-        assert!(history.contains("[1 code lines omitted]"));
+        let collapsed = rendered_layout_text(&mut transcript);
+        assert!(!collapsed.contains("code line 01"));
+        for line in 2..=33 {
+            assert!(
+                collapsed.contains(&format!("code line {line:02}")),
+                "{collapsed}"
+            );
+        }
+        assert!(
+            collapsed.contains("╭code · 1 earlier line omitted"),
+            "{collapsed}"
+        );
+        assert!(!collapsed.contains("[1 code lines omitted]"), "{collapsed}");
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = rendered_layout_text(&mut transcript);
+        assert!(expanded.contains("code line 01"));
+        assert!(expanded.contains("╭code"), "{expanded}");
+        assert!(!expanded.contains("earlier line omitted"), "{expanded}");
     }
 
     #[test]
-    fn cards_render_code_omission_marker_outside_unclosed_source() {
+    fn cards_render_unclosed_source_omission_in_its_border_title() {
         let mut transcript = Transcript::default();
         let source = (1..=31)
             .map(|line| format!("line_{line} = {line}"))
@@ -4048,21 +4061,13 @@ mod tests {
         transcript.apply(completed_execution(1, 1, &source, "", Vec::new()), false);
 
         let buffer = rendered_buffer(&mut transcript, 80);
-        let marker = "[2 code lines omitted]";
-        let marker_row = row_containing(&buffer, marker);
-        let marker_column = (0..buffer.area.width)
-            .find(|column| buffer[(*column, marker_row as u16)].symbol() == "[")
-            .expect("code marker");
-        for (offset, character) in marker.chars().enumerate() {
-            let cell = &buffer[(marker_column + offset as u16, marker_row as u16)];
-            assert_eq!(cell.symbol(), character.to_string());
-            assert_eq!(cell.fg, DIM);
-            assert_eq!(cell.bg, COMPLETE_ARENA);
-        }
+        closed_section(&buffer, "code · 2 earlier lines omitted");
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(!rendered.contains("[2 code lines omitted]"), "{rendered}");
     }
 
     #[test]
-    fn cards_collapse_combined_execution_content_to_its_tail() {
+    fn cards_collapse_execution_tail_with_omission_in_its_section_title() {
         let mut short = Transcript::default();
         short.apply(
             RuntimeEvent::RecordAppended {
@@ -4090,10 +4095,10 @@ mod tests {
             },
             false,
         );
-        assert!(!rendered_layout_text(&mut short).contains("execution lines omitted"));
+        assert!(!rendered_layout_text(&mut short).contains("earlier line omitted"));
 
         let mut transcript = Transcript::default();
-        let stdout = (1..=15)
+        let stdout = (1..=17)
             .map(|line| format!("out {line:02}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -4121,24 +4126,168 @@ mod tests {
             false,
         );
 
-        let buffer = rendered_buffer(&mut transcript, 80);
-        for label in ["stdout", "stderr", "result"] {
-            closed_section(&buffer, label);
-        }
+        let collapsed = rendered_layout_text(&mut transcript);
         assert!(
-            row_containing(&buffer, "[1 execution lines omitted]")
-                < row_containing(&buffer, "stdout")
+            collapsed.contains("╭stdout · 3 earlier lines omitted"),
+            "{collapsed}"
         );
-        assert!(row_containing(&buffer, "stdout") < row_containing(&buffer, "out 02"));
-        assert!(row_containing(&buffer, "out 02") < row_containing(&buffer, "stderr"));
-        assert!(row_containing(&buffer, "stderr") < row_containing(&buffer, "stderr-body"));
-        assert!(row_containing(&buffer, "stderr-body") < row_containing(&buffer, "result"));
-        assert!(row_containing(&buffer, "result") < row_containing(&buffer, "done"));
-        let rendered = rendered_layout_text(&mut transcript);
-        assert!(!rendered.contains("out 01"));
-        for line in 2..=15 {
-            assert!(rendered.contains(&format!("out {line:02}")));
+        assert!(
+            !collapsed.contains("[3 execution lines omitted]"),
+            "{collapsed}"
+        );
+        for line in 1..=3 {
+            assert!(
+                !collapsed.contains(&format!("out {line:02}")),
+                "{collapsed}"
+            );
         }
+        for line in 4..=17 {
+            assert!(collapsed.contains(&format!("out {line:02}")), "{collapsed}");
+        }
+        assert!(collapsed.contains("stderr-body"));
+        assert!(collapsed.contains("done"));
+        assert_eq!(
+            (4..=17)
+                .map(|line| format!("out {line:02}"))
+                .filter(|line| collapsed.contains(line))
+                .count()
+                + usize::from(collapsed.contains("stderr-body"))
+                + usize::from(collapsed.contains("done")),
+            16
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = rendered_layout_text(&mut transcript);
+        assert!(expanded.contains("╭stdout"), "{expanded}");
+        assert!(!expanded.contains("earlier lines omitted"), "{expanded}");
+        for line in 1..=17 {
+            assert!(expanded.contains(&format!("out {line:02}")), "{expanded}");
+        }
+    }
+
+    #[test]
+    fn cards_keep_fully_omitted_sections_with_their_own_omission_titles() {
+        let stdout = (1..=4)
+            .map(|line| format!("stdout {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stderr = (1..=20)
+            .map(|line| format!("stderr {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(&stdout),
+                            stderr: observation(&stderr),
+                            outcome: ExecutionOutcome::Complete {
+                                result: Some(observation("result-tail")),
+                            },
+                            read_calls: Vec::new(),
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let buffer = rendered_buffer(&mut transcript, 80);
+        let (stdout_top, stdout_bottom, _) =
+            closed_section(&buffer, "stdout · 4 earlier lines omitted");
+        assert_eq!(stdout_bottom, stdout_top + 1);
+        closed_section(&buffer, "stderr · 5 earlier lines omitted");
+        closed_section(&buffer, "result");
+
+        let collapsed = rendered_layout_text(&mut transcript);
+        assert!(
+            !collapsed.contains("[9 execution lines omitted]"),
+            "{collapsed}"
+        );
+        for line in 1..=4 {
+            assert!(
+                !collapsed.contains(&format!("stdout {line:02}")),
+                "{collapsed}"
+            );
+        }
+        for line in 1..=5 {
+            assert!(
+                !collapsed.contains(&format!("stderr {line:02}")),
+                "{collapsed}"
+            );
+        }
+        for line in 6..=20 {
+            assert!(
+                collapsed.contains(&format!("stderr {line:02}")),
+                "{collapsed}"
+            );
+        }
+        assert!(collapsed.contains("result-tail"));
+        let omitted = collapsed
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" earlier line").and_then(|(prefix, _)| {
+                    prefix
+                        .rsplit_once(" · ")
+                        .and_then(|(_, count)| count.parse::<usize>().ok())
+                })
+            })
+            .sum::<usize>();
+        assert_eq!(omitted, (4 + 20 + 1) - 16);
+    }
+
+    #[test]
+    fn cards_wrap_omission_titles_without_overwriting_section_corners() {
+        let mut singular = Transcript::default();
+        singular.apply(
+            completed_execution(
+                1,
+                1,
+                &(1..=33)
+                    .map(|line| format!("code {line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "",
+                Vec::new(),
+            ),
+            false,
+        );
+
+        let bordered = rendered_buffer(&mut singular, 35);
+        closed_section(&bordered, "code · 1 earlier line omitted");
+
+        let narrow = rendered_buffer(&mut singular, 24);
+        assert!(
+            row_containing(&narrow, "code · 1 earlier") < row_containing(&narrow, "line omitted")
+        );
+
+        let mut plural = Transcript::default();
+        plural.apply(
+            completed_execution(
+                1,
+                1,
+                &(1..=34)
+                    .map(|line| format!("code {line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "",
+                Vec::new(),
+            ),
+            false,
+        );
+        let plural = rendered_layout_text(&mut plural);
+        assert!(
+            plural.contains("╭code · 2 earlier lines omitted"),
+            "{plural}"
+        );
     }
 
     #[test]
@@ -4581,8 +4730,8 @@ mod tests {
         let history = rendered_layout_text(&mut transcript);
         assert!(history.contains("code 32"));
         assert!(history.contains("output 1"));
-        assert!(!history.contains("code lines omitted"));
-        assert!(!history.contains("execution lines omitted"));
+        assert!(!history.contains("earlier line omitted"));
+        assert!(!history.contains("earlier lines omitted"));
         assert!(!history.contains("[run"));
         assert!(history.contains("display gap: some live progress was dropped"));
         assert!(history.contains("↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"));
@@ -4748,10 +4897,13 @@ mod tests {
             false,
         );
         let collapsed = rendered_layout_text(&mut transcript);
-        assert!(collapsed.contains("[19 execution lines omitted]"));
+        assert!(
+            collapsed.contains("stdout · 19 earlier lines omitted"),
+            "{collapsed}"
+        );
         assert!(transcript.toggle_arena_expansion());
         let expanded = rendered_layout_text(&mut transcript);
-        assert!(!expanded.contains("execution lines omitted"));
+        assert!(!expanded.contains("earlier lines omitted"));
         assert!(expanded.contains("[20 lines, 200 bytes omitted]"));
         assert!(expanded.contains("head 1"));
         assert!(expanded.contains("tail 17"));
@@ -4834,7 +4986,10 @@ mod tests {
         transcript.apply(final_message(1, 2, "answer", Vec::new(), false), false);
 
         let automatic = rendered_layout_text(&mut transcript);
-        assert!(automatic.contains("[1 code lines omitted]"));
+        assert!(
+            automatic.contains("code · 1 earlier line omitted"),
+            "{automatic}"
+        );
         assert!(transcript.toggle_reasoning());
         let hidden = rendered_layout_text(&mut transcript);
         assert_eq!(

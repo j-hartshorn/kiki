@@ -1345,6 +1345,7 @@ dependencies = [
  "tree-sitter-highlight",
  "tree-sitter-python",
  "tui-markdown",
+ "unicode-segmentation",
 ]
 
 [[package]]
