@@ -2981,8 +2981,8 @@ mod tests {
         let expanded = rendered(&mut app, 60, 40);
         assert!(expanded.contains("code line 33"));
         assert!(!expanded.contains("earlier tool calls omitted"));
-        assert!(expanded.contains("read · 1 lines"));
-        assert!(expanded.contains("read · 20 lines"));
+        assert!(expanded.contains("read · 1 byte"));
+        assert!(expanded.contains("read · 20 bytes"));
     }
 
     #[test]

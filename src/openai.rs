@@ -71,15 +71,10 @@ impl OpenAiModel {
     }
 
     fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
-        let mut instructions = self.prompt.clone();
         let mut input = Vec::new();
 
         for entry in history.entries() {
             match entry {
-                ModelContextEntry::ReadCapability { description } => {
-                    instructions.push_str("\n\n");
-                    instructions.push_str(description);
-                }
                 ModelContextEntry::UserRequest { text } => {
                     input.push(json!({"role": "user", "content": text}));
                 }
@@ -127,7 +122,7 @@ impl OpenAiModel {
 
         Ok(json!({
             "model": self.model,
-            "instructions": instructions,
+            "instructions": self.prompt,
             "input": input,
             "stream": true,
             "store": false,
@@ -1596,7 +1591,7 @@ mod tests {
     use crate::model::ModelHistory;
 
     fn history() -> ModelHistory {
-        let mut history = ModelHistory::new("read files exactly");
+        let mut history = ModelHistory::new();
         history.append_user_request("inspect");
         history
     }
@@ -2652,7 +2647,7 @@ mod tests {
             );
             assert_eq!(invalid.request_count(), 1);
 
-            let mut invalid_history = ModelHistory::new("read files exactly");
+            let mut invalid_history = ModelHistory::new();
             invalid_history.append_final_message(
                 "answer".to_owned(),
                 String::new(),
@@ -3865,7 +3860,7 @@ mod tests {
         }
 
         fn history(request: &str) -> ModelHistory {
-            let mut history = ModelHistory::new("read files exactly");
+            let mut history = ModelHistory::new();
             history.append_user_request(request);
             history
         }
@@ -3995,7 +3990,7 @@ mod tests {
             assert_eq!(
                 captured.body,
                 expected_request(
-                    "system prompt\n\nread files exactly",
+                    "system prompt",
                     json!([{"role": "user", "content": "inspect this project"}])
                 )
             );
@@ -4171,7 +4166,7 @@ mod tests {
             assert_eq!(
                 fixture.request().body,
                 expected_request(
-                    "system prompt\n\nread files exactly",
+                    "system prompt",
                     json!([
                         {"role": "user", "content": "first request"},
                         code_output[0].clone(),
@@ -4492,10 +4487,12 @@ mod tests {
             assert!(pending.await.unwrap_err().is_cancelled());
             fixture.wait_for_disconnect().await;
             assert_eq!(fixture.request_count(), 1);
-            assert!(history.entries().iter().all(|entry| matches!(
-                entry,
-                ModelContextEntry::ReadCapability { .. } | ModelContextEntry::UserRequest { .. }
-            )));
+            assert!(
+                history
+                    .entries()
+                    .iter()
+                    .all(|entry| matches!(entry, ModelContextEntry::UserRequest { .. }))
+            );
         }
 
         #[tokio::test]
@@ -4719,7 +4716,7 @@ mod tests {
     const LIVE_CLEANUP_TIMEOUT_MESSAGE: &str =
         "live runtime controller did not stop within ten seconds";
     const LIVE_RECORDS: &str = "live runtime records did not match the scenario";
-    const FIRST_REQUEST: &str = "Work through this exact sequence before replying. Use at least two separate execute_python steps. First successfully execute `lines = await read(\"README.md\")` and retain the returned lines in the persistent arena. In a later separate step, use `lines` and print only a focused, non-empty selection. Do not combine those Python steps. After both executions complete, provide a concise nonblank final answer.";
+    const FIRST_REQUEST: &str = "Work through this exact sequence before replying. Use at least two separate execute_python steps. First successfully execute `contents = await read(\"README.md\")` and retain the returned string in the persistent arena. In a later separate step, use `contents` and print only a focused, non-empty selection. Do not combine those Python steps. After both executions complete, provide a concise nonblank final answer.";
     const CANCELLATION_REQUEST: &str = "Begin this request with execute_python and do not send a final message before starting that work.";
     const FOLLOW_UP_REQUEST: &str = "Provide a concise nonblank final response confirming that you can continue after the cancelled request.";
 
@@ -4852,15 +4849,15 @@ mod tests {
                         self.run_mut(*run_id).streamed_content |= !code.is_empty();
                     }
                 },
-                RuntimeEvent::ToolUpdated { run_id, call, .. }
-                    if matches!(
-                        call,
+                RuntimeEvent::ToolUpdated {
+                    run_id,
+                    call:
                         crate::arena::ToolCall {
                             tool: crate::arena::ToolName::Read,
                             summary: crate::arena::ToolCallSummary::Count(_),
-                        }
-                    ) =>
-                {
+                        },
+                    ..
+                } => {
                     self.run_mut(*run_id).successful_read = true;
                 }
                 RuntimeEvent::RecordAppended { record, .. } => {
@@ -4982,10 +4979,10 @@ mod tests {
                 super::OpenAiModel::new(ready.system_prompt(), ready.api_key().expose()),
             )
         };
-        let read_tool = crate::tools::ReadTool::new(workspace_root)
+        let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
-        let arena = crate::arena::Arena::new(worker_path, read_tool)
+        let arena = crate::arena::Arena::new(worker_path, tool_host)
             .await
             .map_err(|_| LIVE_SETUP_ARENA)?;
         let runtime =

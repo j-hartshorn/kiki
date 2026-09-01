@@ -344,7 +344,9 @@ fn tool_call_label(call: ToolCall) -> String {
     let summary = match call.summary {
         ToolCallSummary::Pending => "pending".to_owned(),
         ToolCallSummary::Failed => "failed".to_owned(),
-        ToolCallSummary::Count(count) => format!("{count} {}", call.tool.count_label()),
+        ToolCallSummary::Count(count) => {
+            format!("{count} {}", call.tool.count_label(count))
+        }
     };
     format!("{} · {summary}", call.tool.label())
 }
@@ -3822,7 +3824,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        for row in ["read · 1 lines", "read · failed", "read · pending"] {
+        for row in ["read · 1 byte", "read · failed", "read · pending"] {
             assert!(calls.contains(row), "{calls}");
         }
         for forbidden in ["authoritative-path", "live-path", "host error message"] {
@@ -3863,7 +3865,7 @@ mod tests {
         let marker_cell = &collapsed_buffer[(marker_column, marker_row as u16)];
         assert_eq!(marker_cell.fg, DIM);
         assert_eq!(marker_cell.bg, COMPLETE_ARENA);
-        let ordinary_row = row_containing(&collapsed_buffer, "read · 5 lines");
+        let ordinary_row = row_containing(&collapsed_buffer, "read · 5 bytes");
         let ordinary_column = (0..collapsed_buffer.area.width)
             .find(|column| collapsed_buffer[(*column, ordinary_row as u16)].symbol() == "r")
             .expect("tool-call row");
@@ -3879,10 +3881,10 @@ mod tests {
         ] {
             assert!(collapsed.contains(marker), "{collapsed}");
         }
-        assert!(!collapsed.contains("read · 1 lines"));
+        assert!(!collapsed.contains("read · 1 byte"));
         for line_count in 5..=20 {
             assert!(
-                collapsed.contains(&format!("read · {line_count} lines")),
+                collapsed.contains(&format!("read · {line_count} bytes")),
                 "{collapsed}"
             );
         }
@@ -4457,7 +4459,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert_eq!(rendered.matches("running code").count(), 1);
-        assert_eq!(rendered.matches("read · 12 lines").count(), 2);
+        assert_eq!(rendered.matches("read · 12 bytes").count(), 2);
         assert!(rendered.contains("╭tool calls"));
         assert!(!rendered.contains("read · pending"));
         assert!(!rendered.contains("README.md"));
@@ -5075,7 +5077,7 @@ mod tests {
             },
             false,
         );
-        assert_eq!(transcript.status(), "read · 12 lines");
+        assert_eq!(transcript.status(), "read · 12 bytes");
         transcript.apply(
             RuntimeEvent::SubmissionRejectedBusy {
                 active_run_id: RunId(3),

@@ -854,7 +854,7 @@ mod tests {
         ModelFailure, ModelHistory, ModelProgress, ModelStep, ProviderFailure, ProviderReplay,
         ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::tools::{ReadTestGate, ReadTool};
+    use crate::tools::{ReadTestGate, ToolHost};
     use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -871,9 +871,9 @@ mod tests {
     ) -> RuntimeController<M> {
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -1027,7 +1027,11 @@ mod tests {
             ToolCallSummary::Pending => format!("{}:pending", call.tool.label()),
             ToolCallSummary::Failed => format!("{}:failed", call.tool.label()),
             ToolCallSummary::Count(count) => {
-                format!("{}:{count} {}", call.tool.label(), call.tool.count_label())
+                format!(
+                    "{}:{count} {}",
+                    call.tool.label(),
+                    call.tool.count_label(count)
+                )
             }
         }
     }
@@ -1783,9 +1787,9 @@ mod tests {
         let gate = ReadTestGate::new();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(gate.clone()),
         )
         .await
@@ -1936,7 +1940,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::Read,
-                summary: ToolCallSummary::Count(2),
+                summary: ToolCallSummary::Count(8),
             }]
         );
         assert!(reliable.iter().any(|event| matches!(
@@ -1949,7 +1953,7 @@ mod tests {
                 ..
             } if execution.tool_calls == [ToolCall {
                 tool: ToolName::Read,
-                summary: ToolCallSummary::Count(2),
+                summary: ToolCallSummary::Count(8),
             }]
         )));
         assert!(
@@ -2101,7 +2105,7 @@ mod tests {
                 "model:1:1",
                 "execution:1:1",
                 "tool-updated:1:1:read:pending",
-                "tool-updated:1:1:read:2 lines",
+                "tool-updated:1:1:read:27 bytes",
                 "model:1:2",
                 "execution:1:2",
                 "stdout-delta",
@@ -2687,9 +2691,9 @@ mod tests {
         let gate = ReadTestGate::new();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(gate.clone()),
         )
         .await
@@ -2697,7 +2701,7 @@ mod tests {
         let controller = RuntimeController::new(Agent::new(
             arena,
             SummaryCodeModel {
-                source: "lines = await read('Cargo.toml')".to_owned(),
+                source: "contents = await read('Cargo.toml')".to_owned(),
                 reasoning_summary: "cancelled code summary".to_owned(),
                 cancel_before_execution: false,
             },
@@ -2721,7 +2725,7 @@ mod tests {
         let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
             panic!("expected interrupted execution evidence");
         };
-        assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.source, "contents = await read('Cargo.toml')");
         assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert!(evidence.began);
         assert_eq!(
@@ -3523,9 +3527,9 @@ mod tests {
         let gate = ReadTestGate::new();
         let mut arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(gate.clone()),
         )
         .await
@@ -3613,9 +3617,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = Arena::with_limits(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
             Duration::from_millis(10),
             Some(64 * 1024 * 1024),
         )
@@ -3683,9 +3687,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -3753,9 +3757,9 @@ mod tests {
         let recovery_gate = RecoveryTestGate::new();
         let mut arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(read_gate.clone()),
         )
         .await

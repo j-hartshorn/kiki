@@ -17,8 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
-    tools::{ReadError, ReadTool},
+    tools::{
+        ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolResult, ToolValue,
+        bootstrap_source,
+    },
 };
+
+pub(crate) use crate::tools::ToolName;
 
 const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,25 +104,6 @@ pub(crate) enum ArenaProgress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolName {
-    Read,
-}
-
-impl ToolName {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-        }
-    }
-
-    pub(crate) fn count_label(self) -> &'static str {
-        match self {
-            Self::Read => "lines",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolCallSummary {
     Pending,
     Failed,
@@ -172,6 +158,7 @@ impl ToolTraceState {
             .expect("tool call token must identify an admitted row")
     }
 
+    #[cfg(test)]
     fn calls(&self) -> &[ToolCall] {
         &self.calls
     }
@@ -359,7 +346,7 @@ impl AttemptFailure {
 pub struct Arena {
     pool: Pool,
     checkout: Option<Checkout>,
-    read_tool: ReadTool,
+    tool_host: ToolHost,
     checkpoint: Checkpoint,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
@@ -371,13 +358,13 @@ pub struct Arena {
 }
 
 impl Arena {
-    pub async fn new(
+    pub(crate) async fn new(
         worker_path: impl AsRef<Path>,
-        read_tool: ReadTool,
+        tool_host: ToolHost,
     ) -> Result<Self, ArenaError> {
         Self::open(
             worker_path.as_ref().to_path_buf(),
-            read_tool,
+            tool_host,
             ARENA_EXECUTION_TIMEOUT,
             Some(ARENA_MAX_MEMORY_BYTES),
         )
@@ -387,13 +374,13 @@ impl Arena {
     #[cfg(test)]
     pub(crate) async fn with_limits(
         worker_path: impl AsRef<Path>,
-        read_tool: ReadTool,
+        tool_host: ToolHost,
         execution_timeout: Duration,
         max_memory: Option<usize>,
     ) -> Result<Self, ArenaError> {
         Self::open(
             worker_path.as_ref().to_path_buf(),
-            read_tool,
+            tool_host,
             execution_timeout,
             max_memory,
         )
@@ -402,7 +389,7 @@ impl Arena {
 
     async fn open(
         worker_path: std::path::PathBuf,
-        read_tool: ReadTool,
+        tool_host: ToolHost,
         execution_timeout: Duration,
         max_memory: Option<usize>,
     ) -> Result<Self, ArenaError> {
@@ -419,6 +406,7 @@ impl Arena {
             ..ReplConfig::default()
         };
         let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
+        bootstrap(&mut checkout).await?;
         let state = checkout.dump().await.map_err(pool_failure)?;
         let checkpoint = Checkpoint {
             identity: runtime.clone(),
@@ -428,7 +416,7 @@ impl Arena {
         Ok(Self {
             pool,
             checkout: Some(checkout),
-            read_tool,
+            tool_host,
             checkpoint,
             runtime,
             repl_config,
@@ -473,7 +461,7 @@ impl Arena {
             _ = sleep(self.execution_timeout) => Err(AttemptFailure::TimedOut),
             result = execute_checkout(
                 &mut checkout,
-                &self.read_tool,
+                &self.tool_host,
                 code,
                 max_memory,
                 progress,
@@ -637,15 +625,30 @@ fn pool_failure(error: PoolError) -> ArenaError {
     }
 }
 
+async fn bootstrap(checkout: &mut Checkout) -> Result<(), ArenaError> {
+    let source = bootstrap_source();
+    let mut on_print = on_print_sync(|_, _| {});
+    match checkout
+        .feed(&source, vec![], vec![], false, &mut on_print)
+        .await
+        .map_err(pool_failure)?
+    {
+        TurnEvent::Complete(MontyObject::None) => Ok(()),
+        event => Err(ArenaError::unsupported_suspension(format!(
+            "tool bootstrap did not complete: {event:?}"
+        ))),
+    }
+}
+
 async fn execute_checkout(
     checkout: &mut Checkout,
-    read_tool: &ReadTool,
+    tool_host: &ToolHost,
     code: &str,
     max_memory: Option<usize>,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
 ) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
-    let result = drive(checkout, read_tool, code, progress, interruption).await;
+    let result = drive(checkout, tool_host, code, progress, interruption).await;
     interruption.streams.flush_stdout(Instant::now(), progress);
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
@@ -725,7 +728,7 @@ enum DriverError {
 
 async fn drive(
     checkout: &mut Checkout,
-    read_tool: &ReadTool,
+    tool_host: &ToolHost,
     code: &str,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
@@ -763,19 +766,28 @@ async fn drive(
                     kwargs,
                     call_id,
                     method_call,
-                } if function_name == "read" => {
-                    if !kwargs.is_empty()
-                        || method_call
-                        || !matches!(args.as_slice(), [MontyObject::String(_)])
-                    {
+                } => {
+                    let Some(tool) = ToolName::from_private_name(&function_name) else {
+                        event = match with_print!(on_print => checkout
+                            .resume(ResumeValue::NotFound, &mut on_print)
+                            .await)
+                        {
+                            Ok(event) => event,
+                            Err(PoolError::Runtime(error)) => {
+                                break 'drive Err(DriverError::Runtime(error));
+                            }
+                            Err(error) => {
+                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
+                            }
+                        };
+                        continue;
+                    };
+                    if method_call || !kwargs.is_empty() {
                         match with_print!(on_print => checkout
                             .resume(
-                                ResumeValue::Error(MontyException::new(
-                                    ExcType::TypeError,
-                                    Some(
-                                        "read() expects one positional string argument".to_owned(),
-                                    ),
-                                )),
+                                ResumeValue::Error(tool_error(ToolError::type_error(
+                                    "host functions accept positional arguments only",
+                                ))),
                                 &mut on_print,
                             )
                             .await)
@@ -789,8 +801,27 @@ async fn drive(
                             }
                         }
                     } else {
-                        let [MontyObject::String(path)] = args.as_slice() else {
-                            unreachable!("read argument was validated above");
+                        let arguments = match args
+                            .into_iter()
+                            .map(tool_value_from_monty)
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(arguments) => ToolValue::List(arguments),
+                            Err(error) => {
+                                event = match with_print!(on_print => checkout
+                                    .resume(ResumeValue::Error(tool_error(error)), &mut on_print)
+                                    .await)
+                                {
+                                    Ok(event) => event,
+                                    Err(PoolError::Runtime(error)) => {
+                                        break 'drive Err(DriverError::Runtime(error));
+                                    }
+                                    Err(error) => {
+                                        break 'drive Err(DriverError::Fatal(pool_failure(error)));
+                                    }
+                                };
+                                continue;
+                            }
                         };
                         let pending = match with_print!(on_print => checkout
                             .resume(ResumeValue::Future, &mut on_print)
@@ -804,7 +835,7 @@ async fn drive(
                             Ok(event) => {
                                 break 'drive Err(DriverError::Fatal(
                                     ArenaError::unsupported_suspension(format!(
-                                        "expected one pending read future, got {event:?}"
+                                        "expected one pending host future, got {event:?}"
                                     )),
                                 ));
                             }
@@ -815,27 +846,30 @@ async fn drive(
                                 break 'drive Err(DriverError::Fatal(pool_failure(error)));
                             }
                         };
-                        let token = tools.admit(ToolName::Read);
+                        let token = tools.admit(tool);
                         progress(ArenaProgress::ToolUpdated {
                             call: tools.call(token),
                         });
-                        let read_result = read_tool.read(path).await;
-                        let summary = match &read_result {
-                            Ok(lines) => ToolCallSummary::Count(lines.len()),
-                            Err(_) => ToolCallSummary::Failed,
-                        };
-                        let call = tools.settle(token, summary);
+                        let result = tool_host
+                            .call(HostToolCall {
+                                call_id,
+                                tool,
+                                arguments,
+                            })
+                            .await;
+                        assert_eq!(
+                            result.call_id, call_id,
+                            "tool result must retain its call ID"
+                        );
+                        let call = tools.settle(token, tool_summary(&result));
                         #[cfg(test)]
-                        read_tool.wait_after_read_settled().await;
+                        tool_host.wait_after_read_settled().await;
                         progress(ArenaProgress::ToolUpdated { call });
-                        let value = match read_result {
-                            Ok(lines) => ResumeValue::Return(MontyObject::List(
-                                lines.into_iter().map(MontyObject::String).collect(),
-                            )),
-                            Err(error) => ResumeValue::Error(read_error(error)),
-                        };
                         match with_print!(on_print => checkout
-                            .resume_futures(vec![(pending[0], value)], &mut on_print)
+                            .resume_futures(
+                                vec![(pending[0], tool_resume_value(result))],
+                                &mut on_print,
+                            )
                             .await)
                         {
                             Ok(event) => event,
@@ -848,23 +882,12 @@ async fn drive(
                         }
                     }
                 }
-                TurnEvent::FunctionCall { .. } => {
-                    match with_print!(on_print => checkout
-                        .resume(ResumeValue::NotFound, &mut on_print)
-                        .await)
-                    {
-                        Ok(event) => event,
-                        Err(PoolError::Runtime(error)) => {
-                            break 'drive Err(DriverError::Runtime(error));
-                        }
-                        Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
-                    }
-                }
                 TurnEvent::NameLookup { name } => {
-                    let value = (name == "read").then(|| MontyObject::Function {
-                        name: "read".to_owned(),
-                        docstring: None,
-                    });
+                    let value =
+                        ToolName::from_private_name(&name).map(|tool| MontyObject::Function {
+                            name: tool.private_name().to_owned(),
+                            docstring: None,
+                        });
                     match with_print!(on_print => checkout
                         .resume_name_lookup(value, &mut on_print)
                         .await)
@@ -896,17 +919,81 @@ async fn drive(
     }
 }
 
-fn read_error(error: ReadError) -> MontyException {
-    let exc_type = match error {
-        ReadError::Io(_) => ExcType::OSError,
-        ReadError::Blocking(_) => ExcType::RuntimeError,
-        ReadError::AbsolutePath
-        | ReadError::ParentPath
-        | ReadError::NonRegularFile
-        | ReadError::ByteLimitExceeded { .. }
-        | ReadError::InvalidUtf8 => ExcType::ValueError,
+fn tool_value_from_monty(value: MontyObject) -> Result<ToolValue, ToolError> {
+    match value {
+        MontyObject::None => Ok(ToolValue::None),
+        MontyObject::Bool(value) => Ok(ToolValue::Bool(value)),
+        MontyObject::Int(value) => Ok(ToolValue::Integer(value)),
+        MontyObject::Float(value) => Ok(ToolValue::Float(value)),
+        MontyObject::String(value) => Ok(ToolValue::String(value)),
+        MontyObject::List(values) => values
+            .into_iter()
+            .map(tool_value_from_monty)
+            .collect::<Result<Vec<_>, _>>()
+            .map(ToolValue::List),
+        MontyObject::Dict(values) => values
+            .into_iter()
+            .map(|(key, value)| {
+                let MontyObject::String(key) = key else {
+                    return Err(ToolError::type_error(
+                        "host dictionaries require string keys",
+                    ));
+                };
+                Ok((key, tool_value_from_monty(value)?))
+            })
+            .collect::<Result<_, _>>()
+            .map(ToolValue::Dictionary),
+        value => Err(ToolError::type_error(format!(
+            "host functions do not accept {} values",
+            value.type_name()
+        ))),
+    }
+}
+
+fn tool_value_to_monty(value: ToolValue) -> MontyObject {
+    match value {
+        ToolValue::None => MontyObject::None,
+        ToolValue::Bool(value) => MontyObject::Bool(value),
+        ToolValue::Integer(value) => MontyObject::Int(value),
+        ToolValue::Float(value) => MontyObject::Float(value),
+        ToolValue::String(value) => MontyObject::String(value),
+        ToolValue::List(values) => {
+            MontyObject::List(values.into_iter().map(tool_value_to_monty).collect())
+        }
+        ToolValue::Dictionary(values) => MontyObject::dict(
+            values
+                .into_iter()
+                .map(|(key, value)| (MontyObject::String(key), tool_value_to_monty(value)))
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn tool_error(error: ToolError) -> MontyException {
+    let exc_type = match error.kind {
+        ToolErrorKind::Type => ExcType::TypeError,
+        ToolErrorKind::FileNotFound => ExcType::FileNotFoundError,
+        ToolErrorKind::IsADirectory => ExcType::IsADirectoryError,
+        ToolErrorKind::Permission => ExcType::PermissionError,
+        ToolErrorKind::Value => ExcType::ValueError,
+        ToolErrorKind::Os => ExcType::OSError,
     };
     MontyException::new(exc_type, Some(error.to_string()))
+}
+
+fn tool_resume_value(result: ToolResult) -> ResumeValue {
+    match result.result {
+        Ok(value) => ResumeValue::Return(tool_value_to_monty(value)),
+        Err(error) => ResumeValue::Error(tool_error(error)),
+    }
+}
+
+fn tool_summary(result: &ToolResult) -> ToolCallSummary {
+    match &result.result {
+        Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
+        Ok(_) => ToolCallSummary::Count(0),
+        Err(_) => ToolCallSummary::Failed,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1476,7 +1563,7 @@ mod tests {
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::tools::{ReadTestGate, ReadTool};
+    use crate::tools::{ReadTestGate, ToolHost};
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
         max_total_bytes: 100,
@@ -1496,9 +1583,9 @@ mod tests {
     async fn arena(workspace: &TempDir) -> Arena {
         Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena")
@@ -1506,11 +1593,11 @@ mod tests {
 
     async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
         let gate = ReadTestGate::new();
-        let read_tool = ReadTool::new(workspace.path())
+        let tool_host = ToolHost::new(workspace.path())
             .await
-            .expect("open read tool")
+            .expect("open tool host")
             .with_test_gate(gate.clone());
-        let arena = Arena::new(worker_path(), read_tool)
+        let arena = Arena::new(worker_path(), tool_host)
             .await
             .expect("create arena");
         (arena, gate)
@@ -1523,9 +1610,9 @@ mod tests {
     ) -> Arena {
         Arena::with_limits(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
             execution_timeout,
             max_memory,
         )
@@ -1754,22 +1841,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_returns_exact_line_endings() {
+    async fn read_returns_one_exact_string_that_survives_checkpoint_restore() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("lines.txt"), "first\r\nsecond\nlast").unwrap();
+        let contents = "first\r\nsecond\nlast";
+        fs::write(workspace.path().join("lines.txt"), contents).unwrap();
         let mut arena = arena(&workspace).await;
+        let checkpoint = arena.checkpoint();
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "lines = await read('lines.txt')\n''.join(lines)",
+            "contents = await read('lines.txt')\ncontents == 'first\\r\\nsecond\\nlast'",
         )
         .await
         .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
 
-        assert_eq!(
-            complete(&execution).unwrap().head,
-            "'first\\r\\nsecond\\nlast'"
-        );
+        arena.restore(checkpoint).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "(await read(path='./lines.txt')) == 'first\\r\\nsecond\\nlast'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
     }
 
     #[tokio::test]
@@ -1780,7 +1874,7 @@ mod tests {
         for code in [
             "await read(1)",
             "await read()",
-            "await read(path='lines.txt')",
+            "await _kiki_read(path='lines.txt')",
         ] {
             let execution = execute_without_cancellation(&mut arena, code)
                 .await
@@ -1791,15 +1885,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_failures_are_model_visible_python_errors() {
+    async fn read_maps_invalid_and_missing_paths_to_the_specified_exceptions() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
         let mut arena = arena(&workspace).await;
 
-        let execution = execute_without_cancellation(&mut arena, "await read('/outside')")
+        for (path, expected) in [
+            ("/outside", "PermissionError"),
+            ("missing", "FileNotFoundError"),
+            ("directory", "IsADirectoryError"),
+            ("nested/../file", "PermissionError"),
+        ] {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                &format!(
+                    "result = 'allowed'\ntry:\n    await read({path:?})\nexcept Exception as error:\n    result = type(error).__name__\nresult"
+                ),
+            )
             .await
             .unwrap();
 
-        assert!(python_error(&execution).text.contains("ValueError"));
+            assert_eq!(complete(&execution).unwrap().head, format!("'{expected}'"));
+        }
+    }
+
+    #[tokio::test]
+    async fn private_host_calls_reject_malformed_and_unsupported_neutral_values_as_type_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for argument in ["{'path': 'file'}", "b'file'", "('file',)"] {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                &format!(
+                    "result = 'allowed'\ntry:\n    await _kiki_read({argument})\nexcept Exception as error:\n    result = type(error).__name__\nresult"
+                ),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(complete(&execution).unwrap().head, "'TypeError'");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_exposes_symlink_and_other_path_errors_as_builtin_exceptions() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("inside"), "inside").unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("directory/file"), "file").unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("directory", workspace.path().join("directory-link")).unwrap();
+        let fifo = workspace.path().join("fifo");
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut arena = arena(&workspace).await;
+
+        for (path, expected) in [
+            ("inside-link", "PermissionError"),
+            ("outside-link", "PermissionError"),
+            ("directory-link/file", "PermissionError"),
+            ("fifo", "ValueError"),
+        ] {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                &format!(
+                    "result = 'allowed'\ntry:\n    await read({path:?})\nexcept Exception as error:\n    result = type(error).__name__\nresult"
+                ),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(complete(&execution).unwrap().head, format!("'{expected}'"));
+        }
     }
 
     #[tokio::test]
@@ -1837,13 +2006,13 @@ mod tests {
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "print('before')\nlines = await read('lines.txt')\nprint('after')\nlen(lines)",
+            "print('before')\ncontents = await read('lines.txt')\nprint('after')\nlen(contents)",
         )
         .await
         .unwrap();
 
         assert_eq!(execution.stdout.head, "before\nafter\n");
-        assert_eq!(complete(&execution).unwrap().head, "2");
+        assert_eq!(complete(&execution).unwrap().head, "8");
     }
 
     fn push_stdout(
@@ -2565,7 +2734,7 @@ mod tests {
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "lines = await read('lines')\ntry:\n    await read('/outside')\nexcept ValueError:\n    pass\nlen(lines)",
+            "contents = await read('lines')\ntry:\n    await read('/outside')\nexcept PermissionError:\n    pass\nlen(contents)",
         )
         .await
         .unwrap();
@@ -2575,7 +2744,7 @@ mod tests {
             [
                 ToolCall {
                     tool: ToolName::Read,
-                    summary: ToolCallSummary::Count(2),
+                    summary: ToolCallSummary::Count(8),
                 },
                 ToolCall {
                     tool: ToolName::Read,
@@ -2638,7 +2807,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::Read,
-                summary: ToolCallSummary::Count(1),
+                summary: ToolCallSummary::Count(5),
             }]
         );
     }
@@ -2661,7 +2830,7 @@ mod tests {
             *call
                 == ToolCall {
                     tool: ToolName::Read,
-                    summary: ToolCallSummary::Count(1),
+                    summary: ToolCallSummary::Count(5),
                 }
         }));
     }
@@ -2753,7 +2922,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::Read,
-                summary: ToolCallSummary::Count(1),
+                summary: ToolCallSummary::Count(5),
             }]
         );
     }
@@ -2966,7 +3135,7 @@ mod tests {
         let mut interruption = InterruptedExecutionState::new();
         let result = drive(
             checkout,
-            &arena.read_tool,
+            &arena.tool_host,
             "x = ' ' * (1 << 60)",
             &mut progress,
             &mut interruption,

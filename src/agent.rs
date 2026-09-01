@@ -8,7 +8,7 @@ use crate::arena::{
 use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
-    ModelHistoryError, ModelProgress, ModelStep, ProviderReplay, READ_CAPABILITY_DESCRIPTION,
+    ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 
@@ -417,7 +417,7 @@ impl<M: Model> Agent<M> {
         Self {
             arena,
             model,
-            model_context: ModelHistory::new(READ_CAPABILITY_DESCRIPTION),
+            model_context: ModelHistory::new(),
             staged_final_message: None,
         }
     }
@@ -817,10 +817,9 @@ mod tests {
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ProviderFailure, ProviderReplay, READ_CAPABILITY_DESCRIPTION,
-        ScriptedAction as ModelAction, ScriptedModel,
+        ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::tools::{ReadTestGate, ReadTool};
+    use crate::tools::{ReadTestGate, ToolHost};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -835,9 +834,9 @@ mod tests {
     async fn agent_with_model<M: Model>(workspace: &TempDir, model: M) -> Agent<M> {
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -928,14 +927,9 @@ mod tests {
         assert_eq!(agent.model.contexts().len(), 2);
         assert_eq!(
             agent.model.contexts()[0],
-            [
-                ModelContextEntry::ReadCapability {
-                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                },
-                ModelContextEntry::UserRequest {
-                    text: "inspect".to_owned(),
-                },
-            ]
+            [ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]
         );
         let completed = agent.model.contexts()[1]
             .last()
@@ -1577,7 +1571,7 @@ mod tests {
         let mut agent = agent_with_model(
             &workspace,
             SummaryCodeModel {
-                source: "lines = await read('Cargo.toml')".to_owned(),
+                source: "contents = await read('Cargo.toml')".to_owned(),
                 reasoning_summary: "cancelled code summary".to_owned(),
             },
         )
@@ -1604,7 +1598,7 @@ mod tests {
         else {
             panic!("expected cancelled execution");
         };
-        assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.source, "contents = await read('Cargo.toml')");
         assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert_eq!(evidence.began, execution.began);
         assert_eq!(evidence.stdout, execution.stdout);
@@ -1652,7 +1646,6 @@ mod tests {
         assert!(matches!(
             agent.model_context.entries(),
             [
-                ModelContextEntry::ReadCapability { .. },
                 ModelContextEntry::UserRequest { .. },
                 ModelContextEntry::CompletedCode(_),
                 ModelContextEntry::FinalMessage { .. },
@@ -1831,14 +1824,9 @@ mod tests {
         assert_eq!(agent.model.position(), 0);
         assert_eq!(
             agent.model_context.entries(),
-            [
-                ModelContextEntry::ReadCapability {
-                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                },
-                ModelContextEntry::UserRequest {
-                    text: "inspect".to_owned(),
-                },
-            ]
+            [ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]
         );
     }
 
@@ -1849,9 +1837,9 @@ mod tests {
         let gate = ReadTestGate::new();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(gate.clone()),
         )
         .await
@@ -1860,7 +1848,7 @@ mod tests {
             arena,
             ScriptedModel::new(vec![
                 ModelAction::Code {
-                    source: "print('before')\nlines = await read('Cargo.toml')".to_owned(),
+                    source: "print('before')\ncontents = await read('Cargo.toml')".to_owned(),
                 },
                 ModelAction::Code {
                     source: "later_action_ran = True".to_owned(),
@@ -1891,7 +1879,7 @@ mod tests {
         assert_eq!(execution.stdout.head, "before\n");
         assert_eq!(
             evidence.source,
-            "print('before')\nlines = await read('Cargo.toml')"
+            "print('before')\ncontents = await read('Cargo.toml')"
         );
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
@@ -2245,15 +2233,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_default_script_reads_retained_lines_and_returns_its_final_message() {
+    async fn agent_default_script_reads_retained_contents_and_returns_its_final_message() {
         let workspace = tempfile::tempdir().unwrap();
         let cargo_toml = "[package]\nname = \"example\"\n";
         fs::write(workspace.path().join("Cargo.toml"), cargo_toml).unwrap();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -2269,18 +2257,18 @@ mod tests {
         assert_eq!(executions.len(), 2);
         assert_eq!(
             executions[0].0,
-            "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\nlines = await read(\"Cargo.toml\")"
+            "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")"
         );
         assert_eq!(
             executions[1].0,
-            "print(\"\".join(lines[0:20]), end=\"\")\nrequest_count"
+            "print(contents[0:20], end=\"\")\nrequest_count"
         );
-        assert_eq!(executions[1].1.stdout.head, cargo_toml);
+        assert_eq!(executions[1].1.stdout.head, &cargo_toml[..20]);
         assert_eq!(result_head(executions[1].1), "1");
         assert_eq!(
             agent.model.contexts()[0][0],
-            ModelContextEntry::ReadCapability {
-                description: "read(path) returns the accepted file as complete exact lines with endings retained. Use standard Python print(\"\".join(lines[start:end]), end=\"\") to inspect a selection.".to_owned(),
+            ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
             }
         );
     }
@@ -2291,9 +2279,9 @@ mod tests {
         fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
