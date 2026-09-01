@@ -17,7 +17,7 @@
 - Per-step accounting aggregates reported fields across that step's attempts into one muted right-aligned line after a blank separator; multiple attempts may be identified compactly. The session footer shows available session-wide input, output, cache-read, cache-write, reasoning, total-token, and cost totals right-aligned inside the prompt's always-present bottom rule. It never adds or moves a row, truncates its left side with `…` on narrow terminals to preserve rightmost totals and cost, and is absent without metrics and in configuration-only mode.
 - Costs use ordinary `$…` with no lower-bound marker; unavailable metrics are omitted, including no invented zero. Each attempt appears in exactly one reliable display record so session totals need no duplicate suppression. Documentation retains the caveat that opaque retries may make displayed cost lower than billing.
 - The configured prompt is bottom anchored between full-width top and bottom rules, wraps and preserves explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then shows its newest tail. `Enter` submits. The `Shift-Enter newline` header hint appears only when enhanced modified-key reporting is available; then `Shift-Enter` inserts a newline. Disabled and configuration-only views remain read-only.
-- Terminal normalisation, stale-event rejection, authoritative settlement, progress-gap indication, follow-at-bottom scrolling, preserved manual scroll, tiny-terminal safety, dirty-only redraws, and terminal restoration remain intact.
+- Terminal normalisation, stale-event rejection, authoritative settlement, progress-gap indication, follow-at-bottom scrolling, preserved manual scroll, tiny-terminal safety, dirty-only redraws, terminal restoration, and three-row mouse-wheel history scrolling remain intact.
 - `tui-markdown` is used without Syntect. Provider, Arena, retry, cancellation, pricing, and model-context replay semantics otherwise remain unchanged.
 
 ## Overall validation
@@ -255,3 +255,15 @@ Project the typed trace through `ArenaBlock` and `NormalisedArenaBlock`, then pr
 **Verification** — Run focused transcript-collapse, prompt-editor, TUI control/history/terminal, and nested-scrolling tests; transcript and full TUI suites; `cargo fmt --all -- --check`; `cargo check --all-targets`; credential-free all-target tests with `MONTY_BIN`; `cargo clippy --all-targets -- -D warnings`; dependency isolation including `unicode_segmentation` only in `src/prompt_editor.rs`; and `git diff --check`.
 
 **Commit** — `Improve transcript editing`
+
+### Post-100b064 approved feedback (mouse-wheel transcript scrolling)
+
+**Decision** — Supersede only the earlier blanket mouse-interaction non-goal. Historical tasks remain historical: wheel scrolling changes neither prompt editing nor runtime input authority; other mouse events remain ignored.
+
+**Changes** — Enable Crossterm mouse capture after terminal initialisation for configured and configuration-only sessions. Disable it before normal Ratatui restoration on success, loop error, and enable failure, and via `Drop` during panic unwind. Report mouse-capture enable I/O errors as `TuiError::Terminal`. Route `ScrollUp` and `ScrollDown` in both loops through `App`'s existing clamped scroll update, by three rows per event.
+
+**Tests** — At the configured and configuration-only loop seams, cover exact three-row up scrolling, down scrolling to newest history, and ignored mouse input. At the capture lifecycle seam, cover success, loop error, enable failure, and panic cleanup.
+
+**Files** — Modify: `README.md`, `docs/2026-08-27_live-openai-agent/spec.md`, this plan, `src/tui.rs`.
+
+**Verification** — Focused mouse-wheel and capture-lifecycle TUI tests; `cargo fmt --all -- --check`; `cargo check --all-targets`; and `git diff --check`.

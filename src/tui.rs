@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
@@ -22,6 +23,7 @@ pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{Transcript, muted_page_style, normalise_terminal_text, page_style};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
 
 trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -111,6 +113,20 @@ impl App {
 
     fn is_submission_disabled(&self) -> bool {
         self.is_configuration_only() || self.transcript.is_disabled()
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Update {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.update_scroll(
+                self.scroll_from_bottom
+                    .saturating_add(MOUSE_WHEEL_SCROLL_ROWS),
+            ),
+            MouseEventKind::ScrollDown => self.update_scroll(
+                self.scroll_from_bottom
+                    .saturating_sub(MOUSE_WHEEL_SCROLL_ROWS),
+            ),
+            _ => Update::default(),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Update {
@@ -305,22 +321,24 @@ pub(crate) fn run(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
-            with_keyboard_enhancement(
-                enable_keyboard_enhancement,
-                disable_keyboard_enhancement,
-                |enhanced_keyboard| {
-                    app.enhanced_keyboard = enhanced_keyboard;
-                    run_loop(
-                        terminal,
-                        &mut app,
-                        &mut input,
-                        &commands,
-                        &mut events,
-                        &mut progress,
-                    )
-                    .map(|_| ())
-                },
-            )
+            with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
+                with_keyboard_enhancement(
+                    enable_keyboard_enhancement,
+                    disable_keyboard_enhancement,
+                    |enhanced_keyboard| {
+                        app.enhanced_keyboard = enhanced_keyboard;
+                        run_loop(
+                            terminal,
+                            &mut app,
+                            &mut input,
+                            &commands,
+                            &mut events,
+                            &mut progress,
+                        )
+                        .map(|_| ())
+                    },
+                )
+            })
         },
     )
 }
@@ -331,7 +349,11 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
-        |terminal| run_configuration_loop(terminal, &mut app, &mut input).map(|_| ()),
+        |terminal| {
+            with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
+                run_configuration_loop(terminal, &mut app, &mut input).map(|_| ())
+            })
+        },
     )
 }
 
@@ -343,6 +365,29 @@ fn with_terminal<B: Backend>(
     let _guard = RestoreGuard::new(restore);
     let mut terminal = initialize()?;
     run(&mut terminal)
+}
+
+fn enable_mouse_capture() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    ratatui::crossterm::execute!(stdout, EnableMouseCapture)
+}
+
+fn disable_mouse_capture() {
+    let mut stdout = io::stdout();
+    let _ = ratatui::crossterm::execute!(stdout, DisableMouseCapture);
+}
+
+fn with_mouse_capture<T>(
+    enable: impl FnOnce() -> io::Result<()>,
+    disable: impl FnOnce(),
+    run: impl FnOnce() -> Result<T, TuiError>,
+) -> Result<T, TuiError> {
+    if let Err(error) = enable() {
+        disable();
+        return Err(TuiError::Terminal(error.to_string()));
+    }
+    let _guard = RestoreGuard::new(disable);
+    run()
 }
 
 fn enable_keyboard_enhancement() -> io::Result<bool> {
@@ -398,6 +443,7 @@ fn run_configuration_loop<B: Backend>(
                         return Ok(redraws);
                     }
                 }
+                Event::Mouse(mouse) => dirty |= app.handle_mouse(mouse).visible_changed,
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -439,6 +485,7 @@ fn run_loop<B: Backend>(
                     }
                     quit = update.quit;
                 }
+                Event::Mouse(mouse) => dirty |= app.handle_mouse(mouse).visible_changed,
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -726,7 +773,10 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use ratatui::layout::Position;
 
     use super::App;
@@ -871,6 +921,59 @@ mod tests {
                 .take()
                 .ok_or_else(|| io::Error::other("no fake input ready"))
         }
+    }
+
+    fn app_with_history(mut app: App) -> App {
+        for run_id in 1..=8 {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: format!("request {run_id}"),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+        app
+    }
+
+    fn mouse(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn quit_event() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+    }
+
+    fn run_transcript_loop(app: &mut App, input: &mut FakeInput) -> usize {
+        let backend = TestBackend::new(40, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (command_sender, _command_receiver) = tokio::sync::mpsc::channel(8);
+        let (_event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel(256);
+
+        super::run_loop(
+            &mut terminal,
+            app,
+            input,
+            &command_sender,
+            &mut event_receiver,
+            &mut progress_receiver,
+        )
+        .unwrap()
+    }
+
+    fn run_configuration_loop(app: &mut App, input: &mut FakeInput) -> usize {
+        let backend = TestBackend::new(40, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        super::run_configuration_loop(&mut terminal, app, input).unwrap()
     }
 
     struct ErrorInput;
@@ -1465,6 +1568,87 @@ mod tests {
     }
 
     #[test]
+    fn mouse_capture_disables_on_success_error_and_panic() {
+        let calls = RefCell::new(Vec::new());
+        {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_mouse_capture(
+                || {
+                    calls.borrow_mut().push("enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("disable"),
+                || {
+                    calls.borrow_mut().push("run");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(calls.into_inner(), ["enable", "run", "disable", "restore"]);
+
+        let calls = RefCell::new(Vec::new());
+        let result = {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_mouse_capture(
+                || {
+                    calls.borrow_mut().push("enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("disable"),
+                || {
+                    calls.borrow_mut().push("run");
+                    Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned()))
+                },
+            )
+        };
+        assert!(result.is_err());
+        assert_eq!(calls.into_inner(), ["enable", "run", "disable", "restore"]);
+
+        let calls = RefCell::new(Vec::new());
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            let _ = super::with_mouse_capture(
+                || {
+                    calls.borrow_mut().push("enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("disable"),
+                || -> Result<(), super::TuiError> {
+                    calls.borrow_mut().push("run");
+                    panic!("loop panic")
+                },
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(calls.into_inner(), ["enable", "run", "disable", "restore"]);
+    }
+
+    #[test]
+    fn mouse_capture_enable_failure_still_restores_the_terminal() {
+        let calls = RefCell::new(Vec::new());
+        let result = {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_mouse_capture(
+                || {
+                    calls.borrow_mut().push("enable");
+                    Err(io::Error::other("enable failed"))
+                },
+                || calls.borrow_mut().push("disable"),
+                || {
+                    calls.borrow_mut().push("run");
+                    Ok(())
+                },
+            )
+        };
+
+        assert!(
+            matches!(result, Err(super::TuiError::Terminal(message)) if message == "enable failed")
+        );
+        assert_eq!(calls.into_inner(), ["enable", "disable", "restore"]);
+    }
+
+    #[test]
     fn active_run_accepts_cancel_but_not_submit_and_ctrl_c_shuts_down() {
         let mut app = App::default();
         assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(7) }));
@@ -1722,6 +1906,64 @@ mod tests {
         rendered(&mut app, 40, 7);
 
         assert!(!app.handle_key(key(KeyCode::PageUp)).visible_changed);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_history() {
+        let mut app = app_with_history(App::default());
+        let mut input = FakeInput::new([
+            Some(mouse(MouseEventKind::Down(MouseButton::Left))),
+            Some(mouse(MouseEventKind::ScrollUp)),
+            Some(quit_event()),
+        ]);
+
+        let redraws = run_transcript_loop(&mut app, &mut input);
+
+        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(redraws, 2);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_towards_newest_history() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 40, 7);
+        assert!(app.update_scroll(3).visible_changed);
+        let mut input =
+            FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
+
+        run_transcript_loop(&mut app, &mut input);
+
+        assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn configuration_mouse_wheel_scrolls_transcript_history() {
+        let mut app =
+            app_with_history(App::configuration(crate::config::load().snapshot().clone()));
+        let mut input = FakeInput::new([
+            Some(mouse(MouseEventKind::Down(MouseButton::Left))),
+            Some(mouse(MouseEventKind::ScrollUp)),
+            Some(quit_event()),
+        ]);
+
+        let redraws = run_configuration_loop(&mut app, &mut input);
+
+        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(redraws, 2);
+    }
+
+    #[test]
+    fn configuration_mouse_wheel_scrolls_towards_newest_history() {
+        let mut app =
+            app_with_history(App::configuration(crate::config::load().snapshot().clone()));
+        rendered(&mut app, 40, 7);
+        assert!(app.update_scroll(3).visible_changed);
+        let mut input =
+            FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
+
+        run_configuration_loop(&mut app, &mut input);
+
+        assert_eq!(app.scroll_from_bottom, 0);
     }
 
     #[test]
