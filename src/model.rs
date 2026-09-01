@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const ACCEPTED_MODEL_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+use crate::config::constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
@@ -273,9 +273,6 @@ pub enum ModelHistoryError {
     DuplicateCallId(ModelCallId),
 }
 
-const PROVIDER_FIELD_LIMIT: usize = 256;
-const PROVIDER_MESSAGE_LIMIT: usize = 4 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailure {
     status: Option<u16>,
@@ -287,7 +284,7 @@ impl ProviderFailure {
     pub(crate) fn new(status: Option<u16>, code: Option<String>, message: String) -> Self {
         Self {
             status,
-            code: code.map(|value| bounded_utf8(value, PROVIDER_FIELD_LIMIT)),
+            code: code.map(|value| bounded_utf8(value, PROVIDER_CODE_LIMIT)),
             message: bounded_utf8(message, PROVIDER_MESSAGE_LIMIT),
         }
     }

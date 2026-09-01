@@ -5,10 +5,10 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
     InterruptedRead, Observation, PythonError, ReadCall, ReadOutcome,
 };
+use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
-    ACCEPTED_MODEL_CONTENT_LIMIT, AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId,
-    ModelFailure, ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
-    READ_CAPABILITY_DESCRIPTION,
+    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
+    ModelHistoryError, ModelProgress, ModelStep, ProviderReplay, READ_CAPABILITY_DESCRIPTION,
 };
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 
@@ -1521,13 +1521,13 @@ mod tests {
     fn generation_evidence_is_utf8_safe_at_the_accepted_content_limit() {
         let mut generation = GenerationEvidenceBuilder::default();
         generation.capture(&ModelProgress::AssistantTextChunk {
-            text: "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1),
+            text: "é".repeat(crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1),
         });
         let evidence = generation.evidence().expect("generation evidence");
 
         assert_eq!(
             evidence.assistant_text,
-            "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2)
+            "é".repeat(crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT / 2)
         );
         assert!(
             evidence

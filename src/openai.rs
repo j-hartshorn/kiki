@@ -13,15 +13,16 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
-use crate::model::{
-    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
-    ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
-    ProviderFailure, ProviderReplay,
+use crate::{
+    config::constants::{ACCEPTED_MODEL_CONTENT_LIMIT, FIXED_MODEL},
+    model::{
+        AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay,
+    },
 };
 
 const OPENAI_PROVIDER: &str = "openai";
-const FIXED_MODEL: &str = "gpt-5.6-sol";
-const APPLICATION_CONTENT_LIMIT: usize = crate::model::ACCEPTED_MODEL_CONTENT_LIMIT;
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -979,7 +980,7 @@ impl ApplicationContentGuard {
             .bytes
             .checked_add(additional)
             .ok_or(ModelError::ContentTooLarge)?;
-        if bytes > APPLICATION_CONTENT_LIMIT {
+        if bytes > ACCEPTED_MODEL_CONTENT_LIMIT {
             return Err(ModelError::ContentTooLarge);
         }
         self.bytes = bytes;
@@ -1629,7 +1630,7 @@ mod tests {
         let model = super::OpenAiModel::new("system prompt", "test-api-key");
 
         assert_eq!(model.prompt, "system prompt");
-        assert_eq!(model.model, super::FIXED_MODEL);
+        assert_eq!(model.model, crate::config::constants::FIXED_MODEL);
         assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
         assert_eq!(
             model.client.config().url("/responses"),
@@ -2169,8 +2170,9 @@ mod tests {
         use tokio::time::timeout;
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{APPLICATION_CONTENT_LIMIT, OpenAiModel};
+        use super::super::OpenAiModel;
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, Model, ModelError, ModelFailure, ModelProgress, ProviderReplay,
         };
@@ -2451,7 +2453,7 @@ mod tests {
                     "sequence_number": 1,
                     "output_index": 0,
                     "content_index": 0,
-                    "text": "x".repeat(APPLICATION_CONTENT_LIMIT)
+                    "text": "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT)
                 })
             );
             let fixture = Fixture::start_sequence(vec![
@@ -2714,10 +2716,25 @@ mod tests {
             let error = failure(&fixture, "fixture-key").await;
             let failure = error.provider_failure().unwrap();
 
-            assert_eq!(failure.message(), "é".repeat(2_048));
-            assert_eq!(failure.message().len(), 4 * 1024);
-            assert_eq!(failure.code(), Some("é".repeat(128).as_str()));
-            assert_eq!(failure.code().unwrap().len(), 256);
+            assert_eq!(
+                failure.message(),
+                "é".repeat(crate::config::constants::PROVIDER_MESSAGE_LIMIT / 2)
+            );
+            assert_eq!(
+                failure.message().len(),
+                crate::config::constants::PROVIDER_MESSAGE_LIMIT
+            );
+            assert_eq!(
+                failure.code(),
+                Some(
+                    "é".repeat(crate::config::constants::PROVIDER_CODE_LIMIT / 2)
+                        .as_str()
+                )
+            );
+            assert_eq!(
+                failure.code().unwrap().len(),
+                crate::config::constants::PROVIDER_CODE_LIMIT
+            );
         }
 
         #[tokio::test]
@@ -2780,10 +2797,11 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         use super::super::{
-            APPLICATION_CONTENT_LIMIT, OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT,
-            PresentationBatcher, PresentationKind,
+            OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT, PresentationBatcher,
+            PresentationKind,
         };
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
             ModelHistory, ModelProgress, ModelUsage,
@@ -3635,7 +3653,7 @@ mod tests {
 
         #[tokio::test]
         async fn flushes_pending_progress_when_the_content_guard_is_exhausted() {
-            let oversized = "x".repeat(APPLICATION_CONTENT_LIMIT);
+            let oversized = "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT);
             let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
                 json!({
                     "type": "response.reasoning_summary_text.delta",
@@ -3724,8 +3742,9 @@ mod tests {
     mod action_protocol {
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{APPLICATION_CONTENT_LIMIT, ApplicationContentGuard, OpenAiModel};
+        use super::super::{ApplicationContentGuard, OpenAiModel};
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
             ModelError, ModelFailure, ModelHistory, ModelProgress, ModelUsage, OpaqueReplayItem,
@@ -4481,7 +4500,7 @@ mod tests {
 
         #[tokio::test]
         async fn application_content_guard_counts_all_guarded_fields_as_events_arrive() {
-            let quarter = APPLICATION_CONTENT_LIMIT / 4;
+            let quarter = ACCEPTED_MODEL_CONTENT_LIMIT / 4;
             let fragment = "x".repeat(quarter);
             let stream = event_stream([
                 json!({
@@ -4544,10 +4563,10 @@ mod tests {
             for ids in [["rs_1", "rs_2"], ["duplicate", "duplicate"]] {
                 let mut first = reasoning(ids[0], "", "");
                 first["encrypted_content"] =
-                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                    Value::String("x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1));
                 let mut second = reasoning(ids[1], "", "");
                 second["encrypted_content"] =
-                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                    Value::String("x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1));
                 let mut content = ApplicationContentGuard::default();
 
                 assert_eq!(

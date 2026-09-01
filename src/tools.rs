@@ -10,13 +10,11 @@ use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 
-const MAX_BYTES: usize = 4 * 1024 * 1024;
-const MAX_LINES: usize = 100_000;
+use crate::config::constants::FILE_MAX_BYTES;
 
 #[derive(Clone, Copy)]
 struct ReadLimits {
     max_bytes: usize,
-    max_lines: usize,
 }
 
 pub struct ReadTool {
@@ -93,8 +91,6 @@ pub enum ReadError {
     NonRegularFile,
     #[error("file exceeds the {limit}-byte limit")]
     ByteLimitExceeded { limit: usize },
-    #[error("file exceeds the {limit}-line limit")]
-    LineLimitExceeded { limit: usize },
     #[error("file is not valid UTF-8")]
     InvalidUtf8,
     #[error("filesystem operation failed")]
@@ -108,27 +104,15 @@ impl ReadTool {
         Self::open(
             workspace.as_ref().to_path_buf(),
             ReadLimits {
-                max_bytes: MAX_BYTES,
-                max_lines: MAX_LINES,
+                max_bytes: FILE_MAX_BYTES,
             },
         )
         .await
     }
 
     #[cfg(test)]
-    async fn with_limits(
-        workspace: impl AsRef<Path>,
-        max_bytes: usize,
-        max_lines: usize,
-    ) -> Result<Self, ReadError> {
-        Self::open(
-            workspace.as_ref().to_path_buf(),
-            ReadLimits {
-                max_bytes,
-                max_lines,
-            },
-        )
-        .await
+    async fn with_limits(workspace: impl AsRef<Path>, max_bytes: usize) -> Result<Self, ReadError> {
+        Self::open(workspace.as_ref().to_path_buf(), ReadLimits { max_bytes }).await
     }
 
     async fn open(workspace: PathBuf, limits: ReadLimits) -> Result<Self, ReadError> {
@@ -214,14 +198,6 @@ fn read_file(workspace: &Dir, path: &Path, limits: ReadLimits) -> Result<Vec<Str
 
     let contents = String::from_utf8(read_limited(&mut file, limits.max_bytes)?)
         .map_err(|_| ReadError::InvalidUtf8)?;
-    let line_count = contents.bytes().filter(|byte| *byte == b'\n').count()
-        + usize::from(!contents.is_empty() && !contents.ends_with('\n'));
-    if line_count > limits.max_lines {
-        return Err(ReadError::LineLimitExceeded {
-            limit: limits.max_lines,
-        });
-    }
-
     Ok(contents.split_inclusive('\n').map(str::to_owned).collect())
 }
 
@@ -255,12 +231,8 @@ mod tests {
         ReadTool::new(workspace.path()).await.unwrap()
     }
 
-    async fn read_tool_with_limits(
-        workspace: &TempDir,
-        max_bytes: usize,
-        max_lines: usize,
-    ) -> ReadTool {
-        ReadTool::with_limits(workspace.path(), max_bytes, max_lines)
+    async fn read_tool_with_limits(workspace: &TempDir, max_bytes: usize) -> ReadTool {
+        ReadTool::with_limits(workspace.path(), max_bytes)
             .await
             .unwrap()
     }
@@ -438,7 +410,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("large"), "12345").unwrap();
 
-        let error = read_tool_with_limits(&workspace, 4, 100)
+        let error = read_tool_with_limits(&workspace, 4)
             .await
             .read("large")
             .await
@@ -448,16 +420,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_file_over_line_limit() {
+    async fn accepts_file_with_more_than_the_previous_line_limit() {
         let workspace = TempDir::new().unwrap();
-        fs::write(workspace.path().join("many-lines"), "one\ntwo\nthree\n").unwrap();
+        fs::write(
+            workspace.path().join("many-lines"),
+            "line\n".repeat(100_001),
+        )
+        .unwrap();
 
-        let error = read_tool_with_limits(&workspace, 100, 2)
+        let lines = read_tool(&workspace)
             .await
             .read("many-lines")
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, ReadError::LineLimitExceeded { limit: 2 }));
+        assert_eq!(lines.len(), 100_001);
     }
 }

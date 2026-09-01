@@ -15,12 +15,13 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::{ReadError, ReadTool};
+use crate::{
+    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
+    tools::{ReadError, ReadTool},
+};
 
 const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_MEMORY: usize = 64 * 1024 * 1024;
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
@@ -377,8 +378,8 @@ impl Arena {
         Self::open(
             worker_path.as_ref().to_path_buf(),
             read_tool,
-            EXECUTION_TIMEOUT,
-            Some(MAX_MEMORY),
+            ARENA_EXECUTION_TIMEOUT,
+            Some(ARENA_MAX_MEMORY_BYTES),
         )
         .await
     }
@@ -904,7 +905,6 @@ fn read_error(error: ReadError) -> MontyException {
         | ReadError::ParentPath
         | ReadError::NonRegularFile
         | ReadError::ByteLimitExceeded { .. }
-        | ReadError::LineLimitExceeded { .. }
         | ReadError::InvalidUtf8 => ExcType::ValueError,
     };
     MontyException::new(exc_type, Some(error.to_string()))
@@ -1667,9 +1667,15 @@ mod tests {
             .as_ref()
             .expect("arena should configure Monty resource limits");
 
-        assert_eq!(arena.execution_timeout, Duration::from_secs(10));
+        assert_eq!(
+            arena.execution_timeout,
+            crate::config::constants::ARENA_EXECUTION_TIMEOUT
+        );
         assert_eq!(limits.max_duration, None);
-        assert_eq!(limits.max_memory, Some(64 * 1024 * 1024));
+        assert_eq!(
+            limits.max_memory,
+            Some(crate::config::constants::ARENA_MAX_MEMORY_BYTES)
+        );
     }
 
     #[tokio::test]
