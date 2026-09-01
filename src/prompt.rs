@@ -110,11 +110,12 @@ mod tests {
         for signature in [
             "async def read(path: str) -> str:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+            "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
-        for unavailable in ["glob(", "grep(", "write(", "edit(", "run("] {
+        for unavailable in ["grep(", "write(", "edit(", "run("] {
             assert!(!reference.contains(unavailable));
         }
     }

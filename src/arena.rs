@@ -1982,6 +1982,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glob_returns_directory_entries_for_default_and_explicit_roots_after_restore() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("src/nested")).unwrap();
+        fs::write(workspace.path().join("src/direct.rs"), "four").unwrap();
+        fs::write(workspace.path().join("src/nested/mod.rs"), "five").unwrap();
+        let mut arena = arena(&workspace).await;
+        let checkpoint = arena.checkpoint();
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entries = await glob('*.rs')\n[entry.path for entry in entries] == ['src/direct.rs', 'src/nested/mod.rs']",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        arena.restore(checkpoint).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entry = (await glob('nested/*.rs', 'src'))[0]\nentry.path == 'src/nested/mod.rs' and entry.kind == 'file' and entry.size_bytes == 4",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn private_glob_accepts_one_or_two_positional_strings_and_maps_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/file.rs"), "").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entries = await _kiki_glob('*.rs')\nlen(entries)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "1");
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entries = await _kiki_glob('*.rs', 'src')\nentries[0]['path']",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'src/file.rs'");
+
+        for code in [
+            "await _kiki_glob()",
+            "await _kiki_glob(1)",
+            "await _kiki_glob('*.rs', '.', '.')",
+            "await _kiki_glob(pattern='*.rs')",
+            "await _kiki_glob({'pattern': '*.rs'})",
+        ] {
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("TypeError"));
+        }
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "result = 'allowed'\ntry:\n    await glob('[')\nexcept Exception as error:\n    result = type(error).__name__\nresult",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'ValueError'");
+    }
+
+    #[tokio::test]
+    async fn glob_call_trace_counts_returned_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("a.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/b.rs"), "").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(&mut arena, "len(await glob('*.rs'))")
+            .await
+            .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "2");
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::from_private_name("_kiki_glob")
+                    .expect("glob must be an active host tool"),
+                summary: ToolCallSummary::Count(2),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_read_is_a_model_visible_python_error() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;

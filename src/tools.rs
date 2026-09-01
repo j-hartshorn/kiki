@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -6,9 +7,11 @@ use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, File};
+use cap_std::fs::{Dir, File, Metadata};
 #[cfg(unix)]
 use cap_std::fs::{OpenOptions, OpenOptionsExt};
+use globset::{GlobBuilder, GlobMatcher};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::Semaphore;
@@ -32,6 +35,7 @@ pub(crate) enum ToolValue {
 pub(crate) enum ToolName {
     Read,
     ListDir,
+    Glob,
 }
 
 impl ToolName {
@@ -39,6 +43,7 @@ impl ToolName {
         match self {
             Self::Read => "read",
             Self::ListDir => "list_dir",
+            Self::Glob => "glob",
         }
     }
 
@@ -46,6 +51,7 @@ impl ToolName {
         match self {
             Self::Read => "_kiki_read",
             Self::ListDir => "_kiki_list_dir",
+            Self::Glob => "_kiki_glob",
         }
     }
 
@@ -64,8 +70,8 @@ impl ToolName {
         match (self, count) {
             (Self::Read, 1) => "byte",
             (Self::Read, _) => "bytes",
-            (Self::ListDir, 1) => "entry",
-            (Self::ListDir, _) => "entries",
+            (Self::ListDir | Self::Glob, 1) => "entry",
+            (Self::ListDir | Self::Glob, _) => "entries",
         }
     }
 }
@@ -135,11 +141,11 @@ impl ToolError {
         };
         let message = match kind {
             ToolErrorKind::FileNotFound => "workspace path was not found".to_owned(),
+            ToolErrorKind::NotADirectory => "path is not a directory".to_owned(),
             ToolErrorKind::Permission => "workspace access was denied".to_owned(),
             ToolErrorKind::Os => "filesystem operation failed".to_owned(),
             ToolErrorKind::Type
             | ToolErrorKind::IsADirectory
-            | ToolErrorKind::NotADirectory
             | ToolErrorKind::Value
             | ToolErrorKind::Runtime => {
                 unreachable!("I/O errors map only to filesystem exception categories")
@@ -270,6 +276,19 @@ const LIST_DIR_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     default: Some(ToolDefault::String(".")),
 }];
 
+const GLOB_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "pattern",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: Some(ToolDefault::String(".")),
+    },
+];
+
 pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
         name: ToolName::Read,
@@ -282,6 +301,12 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         parameters: LIST_DIR_PARAMETERS,
         result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
         description: "List immediate workspace directory entries.",
+    },
+    ToolDefinition {
+        name: ToolName::Glob,
+        parameters: GLOB_PARAMETERS,
+        result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
+        description: "Match workspace filesystem entries recursively.",
     },
 ];
 
@@ -644,6 +669,7 @@ impl ToolHost {
         let result = match tool {
             ToolName::Read => self.read(arguments).await,
             ToolName::ListDir => self.list_dir(arguments).await,
+            ToolName::Glob => self.glob(arguments).await,
         };
         ToolResult { call_id, result }
     }
@@ -681,6 +707,17 @@ impl ToolHost {
         .map(ToolValue::List)
     }
 
+    async fn glob(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+        let (pattern, path) = glob_arguments(arguments)?;
+        let matcher = compile_glob(&pattern)?;
+        let workspace = Arc::clone(&self.workspace);
+        let limits = self.limits;
+        tokio::task::spawn_blocking(move || glob_directory(&workspace, &path, matcher, limits))
+            .await
+            .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+            .map(ToolValue::List)
+    }
+
     #[cfg(test)]
     pub(crate) async fn wait_after_read_settled(&self) {
         if let Some(test_gate) = &self.test_gate {
@@ -714,6 +751,23 @@ fn list_dir_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
         [ToolValue::String(path)] => normalise_path(path),
         _ => Err(ToolError::type_error(
             "list_dir() expects zero or one positional string argument",
+        )),
+    }
+}
+
+fn glob_arguments(arguments: ToolValue) -> Result<(String, PathBuf), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "glob() expects one or two positional string arguments",
+        ));
+    };
+    match arguments.as_slice() {
+        [ToolValue::String(pattern)] => Ok((pattern.clone(), PathBuf::new())),
+        [ToolValue::String(pattern), ToolValue::String(path)] => {
+            Ok((pattern.clone(), normalise_path(path)?))
+        }
+        _ => Err(ToolError::type_error(
+            "glob() expects one or two positional string arguments",
         )),
     }
 }
@@ -855,6 +909,259 @@ fn list_directory(
         .collect()
 }
 
+fn compile_glob(pattern: &str) -> Result<(GlobMatcher, bool), ToolError> {
+    let mut builder = GlobBuilder::new(pattern);
+    let glob = builder
+        .literal_separator(true)
+        .case_insensitive(false)
+        .build()
+        .map_err(|_| ToolError::value("glob pattern is invalid"))?;
+    Ok((glob.compile_matcher(), !pattern.contains('/')))
+}
+
+#[derive(Clone)]
+struct IgnoreMatchers {
+    rgignore: Gitignore,
+    ignore: Gitignore,
+    gitignore: Gitignore,
+}
+
+struct GlobDirectory {
+    directory: Dir,
+    path: PathBuf,
+    ignores: Vec<IgnoreMatchers>,
+}
+
+fn glob_directory(
+    workspace: &Dir,
+    root: &Path,
+    matcher: (GlobMatcher, bool),
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    let (matcher, basename_only) = matcher;
+    let root_directory = open_directory_root(workspace, root)?;
+    let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    let mut root_path = PathBuf::new();
+    let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
+    for component in root.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("glob roots are normalised before traversal");
+        };
+        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
+        root_path.push(component);
+        ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
+    }
+
+    let mut directories = vec![GlobDirectory {
+        directory: root_directory,
+        path: root_path,
+        ignores,
+    }];
+    let mut entries = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in directory.directory.entries().map_err(ToolError::from_io)? {
+            let entry = entry.map_err(ToolError::from_io)?;
+            let name = entry.file_name();
+            let path = directory.path.join(&name);
+            let metadata = directory
+                .directory
+                .symlink_metadata(&name)
+                .map_err(ToolError::from_io)?;
+            if is_hidden_name(&name) || is_ignored(&directory.ignores, &path, metadata.is_dir()) {
+                continue;
+            }
+            let name = name
+                .to_str()
+                .ok_or_else(|| ToolError::value("directory entry name is not valid UTF-8"))?;
+            let relative_path = path
+                .strip_prefix(root)
+                .expect("glob entries remain beneath their requested root");
+            if matches_glob(&matcher, basename_only, name, relative_path) {
+                if entries.len() == limits.max_collection_items {
+                    return Err(ToolError::runtime(format!(
+                        "glob results exceed the {}-entry limit",
+                        limits.max_collection_items
+                    )));
+                }
+                entries.push((normalised_path_string(&path), entry_kind(&metadata)?));
+            }
+            if metadata.is_dir() {
+                let child = open_directory_no_follow(&directory.directory, Path::new(name))?;
+                let mut child_ignores = directory.ignores.clone();
+                child_ignores.push(directory_ignore_matchers(&child, &path)?);
+                directories.push(GlobDirectory {
+                    directory: child,
+                    path,
+                    ignores: child_ignores,
+                });
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut payload_bytes = 0;
+    entries
+        .into_iter()
+        .map(|(path, (kind, size_bytes))| {
+            payload_bytes += path.len() + kind.len();
+            if payload_bytes > limits.max_collection_payload_bytes {
+                return Err(ToolError::runtime(format!(
+                    "glob results exceed the {}-byte payload limit",
+                    limits.max_collection_payload_bytes
+                )));
+            }
+            Ok(directory_entry_value(path, kind, size_bytes))
+        })
+        .collect()
+}
+
+fn matches_glob(
+    matcher: &GlobMatcher,
+    basename_only: bool,
+    name: &str,
+    relative_path: &Path,
+) -> bool {
+    if basename_only {
+        matcher.is_match(name)
+    } else {
+        matcher.is_match(normalised_path_string(relative_path))
+    }
+}
+
+fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
+}
+
+fn is_ignored(matchers: &[IgnoreMatchers], path: &Path, is_dir: bool) -> bool {
+    if let Some(ignored) = ignored_by_family(
+        matchers.iter().rev().map(|matchers| &matchers.rgignore),
+        path,
+        is_dir,
+    ) {
+        return ignored;
+    }
+    if let Some(ignored) = ignored_by_family(
+        matchers.iter().rev().map(|matchers| &matchers.ignore),
+        path,
+        is_dir,
+    ) {
+        return ignored;
+    }
+    ignored_by_family(
+        matchers.iter().rev().map(|matchers| &matchers.gitignore),
+        path,
+        is_dir,
+    )
+    .unwrap_or(false)
+}
+
+fn ignored_by_family<'a>(
+    matchers: impl Iterator<Item = &'a Gitignore>,
+    path: &Path,
+    is_dir: bool,
+) -> Option<bool> {
+    for matcher in matchers {
+        let matched = matcher.matched(path, is_dir);
+        if matched.is_ignore() {
+            return Some(true);
+        }
+        if matched.is_whitelist() {
+            return Some(false);
+        }
+    }
+    None
+}
+
+fn directory_ignore_matchers(directory: &Dir, path: &Path) -> Result<IgnoreMatchers, ToolError> {
+    Ok(IgnoreMatchers {
+        rgignore: directory_ignore_matcher(directory, path, ".rgignore")?,
+        ignore: directory_ignore_matcher(directory, path, ".ignore")?,
+        gitignore: directory_ignore_matcher(directory, path, ".gitignore")?,
+    })
+}
+
+fn directory_ignore_matcher(
+    directory: &Dir,
+    path: &Path,
+    name: &str,
+) -> Result<Gitignore, ToolError> {
+    let mut builder = GitignoreBuilder::new(path);
+    if let Some(contents) = read_ignore_file(directory, Path::new(name))? {
+        let contents = String::from_utf8(contents)
+            .map_err(|_| ToolError::value("project ignore rules are not valid UTF-8"))?;
+        let source = path.join(name);
+        for (index, line) in contents.lines().enumerate() {
+            let line = if index == 0 {
+                line.trim_start_matches('\u{feff}')
+            } else {
+                line
+            };
+            builder
+                .add_line(Some(source.clone()), line)
+                .map_err(|_| ToolError::value("project ignore rules are invalid"))?;
+        }
+    }
+    builder
+        .build()
+        .map_err(|_| ToolError::value("project ignore rules are invalid"))
+}
+
+fn read_ignore_file(directory: &Dir, name: &Path) -> Result<Option<Vec<u8>>, ToolError> {
+    let metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ToolError::from_io(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        directory.open_with(name, &options).map_err(no_follow_io)?
+    };
+    #[cfg(not(unix))]
+    let mut file = directory.open(name).map_err(ToolError::from_io)?;
+    if !file.metadata().map_err(ToolError::from_io)?.is_file() {
+        return Ok(None);
+    }
+
+    Ok(Some(read_limited(&mut file, FILE_MAX_BYTES)?))
+}
+
+fn entry_kind(metadata: &Metadata) -> Result<(&'static str, Option<i64>), ToolError> {
+    if metadata.file_type().is_symlink() {
+        Ok(("symlink", None))
+    } else if metadata.is_file() {
+        Ok((
+            "file",
+            Some(
+                i64::try_from(metadata.len())
+                    .map_err(|_| ToolError::new(ToolErrorKind::Os, "file size is too large"))?,
+            ),
+        ))
+    } else if metadata.is_dir() {
+        Ok(("directory", None))
+    } else {
+        Ok(("other", None))
+    }
+}
+
+fn directory_entry_value(path: String, kind: &str, size_bytes: Option<i64>) -> ToolValue {
+    ToolValue::Dictionary(BTreeMap::from([
+        ("path".to_owned(), ToolValue::String(path)),
+        ("kind".to_owned(), ToolValue::String(kind.to_owned())),
+        (
+            "size_bytes".to_owned(),
+            size_bytes.map_or(ToolValue::None, ToolValue::Integer),
+        ),
+    ]))
+}
+
 fn normalised_path_string(path: &Path) -> String {
     path.components()
         .map(|component| {
@@ -974,8 +1281,11 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::constants::FILE_MAX_BYTES;
+
     use super::{
-        ToolCall, ToolErrorKind, ToolHost, ToolName, ToolValue, bootstrap_source, prompt_reference,
+        ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName, ToolValue, bootstrap_source,
+        prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -1043,6 +1353,62 @@ mod tests {
 
     async fn list_dir_error(host: &ToolHost, path: &str) -> ToolErrorKind {
         list_dir_path(host, path).await.unwrap_err()
+    }
+
+    fn glob_tool() -> ToolName {
+        ToolName::from_private_name("_kiki_glob").expect("glob must be an active host tool")
+    }
+
+    async fn glob(
+        host: &ToolHost,
+        arguments: Vec<ToolValue>,
+    ) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: glob_tool(),
+                arguments: ToolValue::List(arguments),
+            })
+            .await;
+        assert_eq!(result.call_id, 7);
+        match result.result {
+            Ok(ToolValue::List(entries)) => Ok(entries),
+            Ok(value) => panic!("glob returned {value:?} instead of a list"),
+            Err(error) => Err(error.kind),
+        }
+    }
+
+    async fn glob_path(
+        host: &ToolHost,
+        pattern: &str,
+        path: &str,
+    ) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        glob(
+            host,
+            vec![
+                ToolValue::String(pattern.to_owned()),
+                ToolValue::String(path.to_owned()),
+            ],
+        )
+        .await
+    }
+
+    async fn glob_error(host: &ToolHost, pattern: &str, path: &str) -> ToolErrorKind {
+        glob_path(host, pattern, path).await.unwrap_err()
+    }
+
+    async fn glob_failure(host: &ToolHost, pattern: &str, path: &str) -> ToolError {
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: glob_tool(),
+                arguments: ToolValue::List(vec![
+                    ToolValue::String(pattern.to_owned()),
+                    ToolValue::String(path.to_owned()),
+                ]),
+            })
+            .await;
+        result.result.unwrap_err()
     }
 
     fn directory_entry(path: &str, kind: &str, size_bytes: Option<i64>) -> ToolValue {
@@ -1434,8 +1800,371 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn glob_rejects_invalid_patterns_and_malformed_arguments() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(glob_error(&host, "[", ".").await, ToolErrorKind::Value);
+        for arguments in [
+            ToolValue::None,
+            ToolValue::String("*.rs".to_owned()),
+            ToolValue::List(Vec::new()),
+            ToolValue::List(vec![ToolValue::String("*.rs".to_owned()), ToolValue::None]),
+            ToolValue::List(vec![
+                ToolValue::String("*.rs".to_owned()),
+                ToolValue::String(".".to_owned()),
+                ToolValue::String("extra".to_owned()),
+            ]),
+            ToolValue::Dictionary(Default::default()),
+        ] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 1,
+                    tool: glob_tool(),
+                    arguments,
+                })
+                .await;
+            assert!(matches!(result.result, Err(ref error) if error.kind == ToolErrorKind::Type));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_maps_direct_root_kinds_and_intermediate_symlinks_to_errors() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::create_dir(outside.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            glob_error(&host, "*", "missing").await,
+            ToolErrorKind::FileNotFound
+        );
+        for path in ["file", "fifo", "socket"] {
+            assert_eq!(
+                glob_error(&host, "*", path).await,
+                ToolErrorKind::NotADirectory
+            );
+        }
+        for path in [
+            "inside-link",
+            "outside-link",
+            "broken-link",
+            "inside-link/file",
+            "outside-link/file",
+        ] {
+            assert_eq!(
+                glob_error(&host, "*", path).await,
+                ToolErrorKind::Permission
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_matches_root_relative_and_basename_patterns() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("src/nested/deeper")).unwrap();
+        fs::write(workspace.path().join("src/direct.rs"), "").unwrap();
+        fs::write(workspace.path().join("src/nested/mod.rs"), "").unwrap();
+        fs::write(workspace.path().join("src/nested/deeper/lib.rs"), "").unwrap();
+        fs::write(workspace.path().join("src/nested/mod.py"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            glob_path(&host, "nested/*.rs", "src").await.unwrap(),
+            [directory_entry("src/nested/mod.rs", "file", Some(0))]
+        );
+        assert_eq!(
+            glob_path(&host, "nested/deeper/*.rs", "src").await.unwrap(),
+            [directory_entry("src/nested/deeper/lib.rs", "file", Some(0))]
+        );
+        assert_eq!(
+            glob_path(&host, "*.rs", "src").await.unwrap(),
+            [
+                directory_entry("src/direct.rs", "file", Some(0)),
+                directory_entry("src/nested/deeper/lib.rs", "file", Some(0)),
+                directory_entry("src/nested/mod.rs", "file", Some(0)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_filters_hidden_descendants_but_traverses_an_explicit_hidden_root() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join(".hidden/nested")).unwrap();
+        fs::create_dir(workspace.path().join("visible")).unwrap();
+        fs::write(workspace.path().join(".hidden/kept.rs"), "").unwrap();
+        fs::write(workspace.path().join(".hidden/nested/.hidden.rs"), "").unwrap();
+        fs::write(workspace.path().join("visible/.hidden.rs"), "").unwrap();
+        fs::write(workspace.path().join("visible/kept.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            glob_path(&host, "*.rs", ".").await.unwrap(),
+            [directory_entry("visible/kept.rs", "file", Some(0))]
+        );
+        assert_eq!(
+            glob_path(&host, "*.rs", ".hidden").await.unwrap(),
+            [directory_entry(".hidden/kept.rs", "file", Some(0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_uses_nearest_rgignore_rule_and_negation() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".rgignore"), "*.rs\n").unwrap();
+        fs::write(workspace.path().join("ignored.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/.rgignore"), "!kept.rs\n").unwrap();
+        fs::write(workspace.path().join("nested/ignored.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/kept.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            glob_path(&host, "*.rs", ".").await.unwrap(),
+            [directory_entry("nested/kept.rs", "file", Some(0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_prefers_ancestor_rgignore_over_nested_gitignore_whitelist() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".rgignore"), "candidate.rs\n").unwrap();
+        fs::write(
+            workspace.path().join("nested/.gitignore"),
+            "!candidate.rs\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("nested/candidate.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(glob_path(&host, "*.rs", ".").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn glob_prefers_root_ignore_over_root_and_nested_gitignore() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".ignore"), "*.rs\n").unwrap();
+        fs::write(workspace.path().join(".gitignore"), "!root.rs\n").unwrap();
+        fs::write(workspace.path().join("nested/.gitignore"), "!nested.rs\n").unwrap();
+        fs::write(workspace.path().join("root.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/nested.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(glob_path(&host, "*.rs", ".").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn glob_prefers_rgignore_over_ignore_and_gitignore() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join(".gitignore"), "candidate.rs\n").unwrap();
+        fs::write(workspace.path().join(".ignore"), "!candidate.rs\n").unwrap();
+        fs::write(workspace.path().join(".rgignore"), "candidate.rs\n").unwrap();
+        fs::write(workspace.path().join("candidate.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(glob_path(&host, "*.rs", ".").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_oversized_or_invalid_ignore_files_without_paths() {
+        let oversized = TempDir::new().unwrap();
+        fs::write(
+            oversized.path().join(".rgignore"),
+            vec![b'x'; FILE_MAX_BYTES + 1],
+        )
+        .unwrap();
+        fs::write(oversized.path().join("candidate.rs"), "").unwrap();
+        let error = glob_failure(&tool_host(&oversized).await, "*.rs", ".").await;
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert!(
+            !error
+                .to_string()
+                .contains(&oversized.path().display().to_string())
+        );
+
+        let invalid_utf8 = TempDir::new().unwrap();
+        fs::write(invalid_utf8.path().join(".ignore"), [0xff]).unwrap();
+        fs::write(invalid_utf8.path().join("candidate.rs"), "").unwrap();
+        let error = glob_failure(&tool_host(&invalid_utf8).await, "*.rs", ".").await;
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert!(
+            !error
+                .to_string()
+                .contains(&invalid_utf8.path().display().to_string())
+        );
+
+        let malformed = TempDir::new().unwrap();
+        fs::write(malformed.path().join(".gitignore"), "[z-a]\n").unwrap();
+        fs::write(malformed.path().join("candidate.rs"), "").unwrap();
+        let error = glob_failure(&tool_host(&malformed).await, "*.rs", ".").await;
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert!(
+            !error
+                .to_string()
+                .contains(&malformed.path().display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_traverses_an_explicit_parent_ignored_root() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("ignored-root")).unwrap();
+        fs::write(workspace.path().join(".gitignore"), "ignored-root/\n").unwrap();
+        fs::write(workspace.path().join("ignored-root/kept.rs"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(glob_path(&host, "*.rs", ".").await.unwrap().is_empty());
+        assert_eq!(
+            glob_path(&host, "*.rs", "ignored-root").await.unwrap(),
+            [directory_entry("ignored-root/kept.rs", "file", Some(0))]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn glob_filters_hidden_and_ignored_non_utf8_names_before_rejecting_visible_ones() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let hidden = TempDir::new().unwrap();
+        fs::write(hidden.path().join(OsStr::from_bytes(b".\xff")), "").unwrap();
+        fs::write(hidden.path().join("kept.rs"), "").unwrap();
+        assert_eq!(
+            glob_path(&tool_host(&hidden).await, "*.rs", ".")
+                .await
+                .unwrap(),
+            [directory_entry("kept.rs", "file", Some(0))]
+        );
+
+        let ignored = TempDir::new().unwrap();
+        fs::write(ignored.path().join(".gitignore"), "ignored-*\n").unwrap();
+        fs::write(ignored.path().join(OsStr::from_bytes(b"ignored-\xff")), "").unwrap();
+        fs::write(ignored.path().join("kept.rs"), "").unwrap();
+        assert_eq!(
+            glob_path(&tool_host(&ignored).await, "*.rs", ".")
+                .await
+                .unwrap(),
+            [directory_entry("kept.rs", "file", Some(0))]
+        );
+
+        let visible = TempDir::new().unwrap();
+        fs::write(visible.path().join(OsStr::from_bytes(b"visible-\xff")), "").unwrap();
+        assert_eq!(
+            glob_error(&tool_host(&visible).await, "*.rs", ".").await,
+            ToolErrorKind::Value
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_reports_symlinks_and_other_entries_without_descending_or_blocking() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::write(workspace.path().join("inside/file.rs"), "").unwrap();
+        fs::create_dir(outside.path().join("outside")).unwrap();
+        fs::write(outside.path().join("outside/file.rs"), "").unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        let entries = tokio::time::timeout(Duration::from_millis(100), glob_path(&host, "*", "."))
+            .await
+            .expect("globbing a FIFO must not block")
+            .unwrap();
+        assert_eq!(
+            entries,
+            [
+                directory_entry("fifo", "other", None),
+                directory_entry("inside", "directory", None),
+                directory_entry("inside-link", "symlink", None),
+                directory_entry("inside/file.rs", "file", Some(0)),
+                directory_entry("outside-link", "symlink", None),
+                directory_entry("socket", "other", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_returns_workspace_relative_paths_in_stable_order() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("z"), "").unwrap();
+        fs::write(workspace.path().join("a"), "").unwrap();
+        fs::write(workspace.path().join("nested/b"), "").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            glob_path(&host, "*", "./").await.unwrap(),
+            [
+                directory_entry("a", "file", Some(0)),
+                directory_entry("nested", "directory", None),
+                directory_entry("nested/b", "file", Some(0)),
+                directory_entry("z", "file", Some(0)),
+            ]
+        );
+        assert_eq!(
+            glob_path(&host, "*", "nested").await.unwrap(),
+            [directory_entry("nested/b", "file", Some(0))]
+        );
+        for path in ["/outside", "../outside", "nested/../file"] {
+            assert_eq!(
+                glob_error(&host, "*", path).await,
+                ToolErrorKind::Permission
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_enforces_exact_item_and_payload_limits_without_partial_results() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("aa"), "").unwrap();
+        fs::write(workspace.path().join("bb"), "").unwrap();
+
+        let at_limit = tool_host_with_collection_limits(&workspace, 2, 12).await;
+        assert_eq!(
+            glob_path(&at_limit, "*", ".").await.unwrap(),
+            [
+                directory_entry("aa", "file", Some(0)),
+                directory_entry("bb", "file", Some(0)),
+            ]
+        );
+
+        let over_items = tool_host_with_collection_limits(&workspace, 1, 12).await;
+        assert_eq!(
+            glob_path(&over_items, "*", ".").await,
+            Err(ToolErrorKind::Runtime)
+        );
+        let over_payload = tool_host_with_collection_limits(&workspace, 2, 11).await;
+        assert_eq!(
+            glob_path(&over_payload, "*", ".").await,
+            Err(ToolErrorKind::Runtime)
+        );
+    }
+
     #[test]
-    fn generated_sources_share_read_and_list_dir_definitions() {
+    fn generated_sources_share_active_tool_definitions() {
         assert_eq!(
             bootstrap_source(),
             concat!(
@@ -1450,20 +2179,24 @@ mod tests {
                 "    return await _kiki_read(path)\n\n",
                 "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
                 "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
-                "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]"
+                "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
+                "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
+                "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
+                "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]"
             )
         );
         let reference = prompt_reference();
         for signature in [
             "async def read(path: str) -> str:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+            "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
-        for unavailable in ["glob(", "grep(", "write(", "edit(", "run("] {
+        for unavailable in ["grep(", "write(", "edit(", "run("] {
             assert!(!reference.contains(unavailable));
         }
     }
