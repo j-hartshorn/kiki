@@ -1,2 +1,4 @@
 /target
 /.env
+/worktrees/*
+!/worktrees/README.md
