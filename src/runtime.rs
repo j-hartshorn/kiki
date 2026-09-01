@@ -3,7 +3,7 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEvidence};
-use crate::arena::{Execution, ReadOutcome};
+use crate::arena::{Execution, ToolCall};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -95,16 +95,10 @@ pub(crate) enum RuntimeEvent {
         run_id: RunId,
         step_id: ModelStepId,
     },
-    ToolStarted {
+    ToolUpdated {
         run_id: RunId,
         step_id: ModelStepId,
-        path: String,
-    },
-    ToolFinished {
-        run_id: RunId,
-        step_id: ModelStepId,
-        path: String,
-        outcome: ReadOutcome,
+        call: ToolCall,
     },
     StdoutDelta {
         run_id: RunId,
@@ -232,10 +226,7 @@ enum ControllerInput<M: Model> {
 fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
     match progress {
         AgentProgress::ModelProgress(progress) => model_progress_payload_bytes(progress),
-        AgentProgress::ToolStarted { path } => path.len(),
-        AgentProgress::ToolFinished { path, outcome } => {
-            path.len() + read_outcome_payload_bytes(outcome)
-        }
+        AgentProgress::ToolUpdated { .. } => 0,
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
         AgentProgress::ModelStepStarted
@@ -247,10 +238,7 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
 fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
     match event {
         RuntimeEvent::ModelProgress { progress, .. } => model_progress_payload_bytes(progress),
-        RuntimeEvent::ToolStarted { path, .. } => path.len(),
-        RuntimeEvent::ToolFinished { path, outcome, .. } => {
-            path.len() + read_outcome_payload_bytes(outcome)
-        }
+        RuntimeEvent::ToolUpdated { .. } => 0,
         RuntimeEvent::StdoutDelta { text, .. } => text.len(),
         RuntimeEvent::StdoutTruncated { .. } => 0,
         RuntimeEvent::RunStarted { .. }
@@ -283,13 +271,6 @@ fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting
             usage.model.len() + usage.service_tier.as_ref().map_or(0, String::len)
         }
         crate::model::AttemptAccounting::UsageUnavailable => 0,
-    }
-}
-
-fn read_outcome_payload_bytes(outcome: &ReadOutcome) -> usize {
-    match outcome {
-        ReadOutcome::Success { .. } => 0,
-        ReadOutcome::Failure { message } => message.len(),
     }
 }
 
@@ -705,16 +686,10 @@ impl<M: Model> RuntimeController<M> {
                 progress,
             },
             AgentProgress::ExecutionStarted => RuntimeEvent::ExecutionStarted { run_id, step_id },
-            AgentProgress::ToolStarted { path } => RuntimeEvent::ToolStarted {
+            AgentProgress::ToolUpdated { call } => RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
-                path,
-            },
-            AgentProgress::ToolFinished { path, outcome } => RuntimeEvent::ToolFinished {
-                run_id,
-                step_id,
-                path,
-                outcome,
+                call,
             },
             AgentProgress::StdoutDelta { text } => RuntimeEvent::StdoutDelta {
                 run_id,
@@ -871,8 +846,8 @@ mod tests {
         Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, InterruptedRead, Observation, ReadCall,
-        ReadOutcome, RecoveryTestGate,
+        Arena, ArenaError, Execution, ExecutionOutcome, Observation, RecoveryTestGate, ToolCall,
+        ToolCallSummary, ToolName,
     };
     use crate::model::{
         AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId, ModelError,
@@ -1023,30 +998,16 @@ mod tests {
             RuntimeEvent::ExecutionStarted {
                 run_id, step_id, ..
             } => format!("execution:{}:{}", run_id.0, step_id.0),
-            RuntimeEvent::ToolStarted {
+            RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
-                path,
-            } => format!("tool-started:{}:{}:{path}", run_id.0, step_id.0),
-            RuntimeEvent::ToolFinished {
-                run_id,
-                step_id,
-                path,
-                outcome,
-            } => match outcome {
-                ReadOutcome::Success { line_count } => {
-                    format!(
-                        "tool-finished:{}:{}:{path}:success:{line_count}",
-                        run_id.0, step_id.0
-                    )
-                }
-                ReadOutcome::Failure { message } => {
-                    format!(
-                        "tool-finished:{}:{}:{path}:failure:{message}",
-                        run_id.0, step_id.0
-                    )
-                }
-            },
+                call,
+            } => format!(
+                "tool-updated:{}:{}:{}",
+                run_id.0,
+                step_id.0,
+                tool_call_label(*call)
+            ),
             RuntimeEvent::StdoutDelta { .. } => "stdout-delta".to_owned(),
             RuntimeEvent::StdoutTruncated { .. } => "stdout-truncated".to_owned(),
             RuntimeEvent::RecordAppended { record, .. } => record_label(record),
@@ -1057,6 +1018,16 @@ mod tests {
             RuntimeEvent::RuntimeDisabled { reason } => format!("disabled:{reason:?}"),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => {
                 format!("disabled-rejected:{reason:?}")
+            }
+        }
+    }
+
+    fn tool_call_label(call: ToolCall) -> String {
+        match call.summary {
+            ToolCallSummary::Pending => format!("{}:pending", call.tool.label()),
+            ToolCallSummary::Failed => format!("{}:failed", call.tool.label()),
+            ToolCallSummary::Count(count) => {
+                format!("{}:{count} {}", call.tool.label(), call.tool.count_label())
             }
         }
     }
@@ -1578,8 +1549,7 @@ mod tests {
             began: true,
             stdout: empty_observation(),
             stderr: empty_observation(),
-            read: InterruptedRead::NoRead,
-            read_calls: Vec::new(),
+            tool_calls: Vec::new(),
             cancellation_warning: None,
             failure: Some(failure),
         }
@@ -1934,7 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reliable_execution_records_keep_read_calls_when_lossy_tool_progress_drops() {
+    async fn reliable_execution_records_keep_tool_calls_when_lossy_progress_drops() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("input"), "one\ntwo\n").unwrap();
         let model = ProgressModel::new(
@@ -1962,7 +1932,13 @@ mod tests {
         let records = shutdown_controller(commands, controller).await;
 
         let execution = completed_execution(&records, RunId(1), ModelStepId(1));
-        assert_eq!(execution.read_calls, [ReadCall::Success { line_count: 2 }]);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(2),
+            }]
+        );
         assert!(reliable.iter().any(|event| matches!(
             event,
             RuntimeEvent::RecordAppended {
@@ -1971,15 +1947,15 @@ mod tests {
                     ..
                 },
                 ..
-            } if execution.read_calls == [ReadCall::Success { line_count: 2 }]
+            } if execution.tool_calls == [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(2),
+            }]
         )));
         assert!(
             !drain_progress(&mut progress)
                 .iter()
-                .any(|envelope| matches!(
-                    envelope.item,
-                    RuntimeEvent::ToolStarted { .. } | RuntimeEvent::ToolFinished { .. }
-                ))
+                .any(|envelope| matches!(envelope.item, RuntimeEvent::ToolUpdated { .. }))
         );
     }
 
@@ -2124,8 +2100,8 @@ mod tests {
                 "run:1",
                 "model:1:1",
                 "execution:1:1",
-                "tool-started:1:1:Cargo.toml",
-                "tool-finished:1:1:Cargo.toml:success:2",
+                "tool-updated:1:1:read:pending",
+                "tool-updated:1:1:read:2 lines",
                 "model:1:2",
                 "execution:1:2",
                 "stdout-delta",
@@ -2748,7 +2724,13 @@ mod tests {
         assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
         assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert!(evidence.began);
-        assert!(matches!(evidence.read, InterruptedRead::Pending { .. }));
+        assert_eq!(
+            evidence.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
         assert!(evidence.cancellation_warning.is_some());
         assert_eq!(terminal.attempts, []);
     }
@@ -3218,7 +3200,7 @@ mod tests {
                         stdout: empty_observation(),
                         stderr: empty_observation(),
                         outcome: ExecutionOutcome::Complete { result: None },
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts: vec![AttemptAccounting::UsageUnavailable],
                 },
@@ -3595,7 +3577,10 @@ mod tests {
                     if evidence.source == "print('before')\nawait read('blocked')"
                         && evidence.began
                         && evidence.stdout.head == "before\n"
-                        && matches!(evidence.read, InterruptedRead::Pending { .. })
+                        && evidence.tool_calls == [ToolCall {
+                            tool: ToolName::Read,
+                            summary: ToolCallSummary::Pending,
+                        }]
                         && evidence.cancellation_warning.is_some()
                         && matches!(
                             evidence.failure,
@@ -3857,8 +3842,7 @@ mod tests {
                                 began: true,
                                 stdout: empty_observation(),
                                 stderr: empty_observation(),
-                                read: InterruptedRead::NoRead,
-                                read_calls: Vec::new(),
+                                tool_calls: Vec::new(),
                             }),
                         }),
                         recovery: Box::new(ArenaError::Infrastructure {
@@ -4264,9 +4248,10 @@ mod tests {
         assert_eq!(records, committed_records(&events));
         assert_eq!(records.len(), 4);
         assert_eq!(events.len(), 5);
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::ToolStarted { .. } | RuntimeEvent::ToolFinished { .. }
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ToolUpdated { .. }))
+        );
     }
 }

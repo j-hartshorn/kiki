@@ -82,7 +82,7 @@ pub struct Execution {
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) outcome: ExecutionOutcome,
-    pub(crate) read_calls: Vec<ReadCall>,
+    pub(crate) tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,41 +93,91 @@ pub enum ExecutionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ArenaProgress {
-    ReadStarted { path: String },
-    ReadFinished { path: String, outcome: ReadOutcome },
+    ToolUpdated { call: ToolCall },
     StdoutDelta { text: String },
     StdoutTruncated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadOutcome {
-    Success { line_count: usize },
-    Failure { message: String },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolName {
+    Read,
 }
 
-impl ReadOutcome {
-    fn failure(message: String) -> Self {
-        Self::Failure {
-            message: bounded_interruption_text(message),
+impl ToolName {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+        }
+    }
+
+    pub(crate) fn count_label(self) -> &'static str {
+        match self {
+            Self::Read => "lines",
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadCall {
-    Success { line_count: usize },
-    Failed,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallSummary {
     Pending,
+    Failed,
+    Count(usize),
 }
 
-impl ReadCall {
-    fn from_outcome(outcome: &ReadOutcome) -> Self {
-        match outcome {
-            ReadOutcome::Success { line_count } => Self::Success {
-                line_count: *line_count,
-            },
-            ReadOutcome::Failure { .. } => Self::Failed,
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolCall {
+    pub(crate) tool: ToolName,
+    pub(crate) summary: ToolCallSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolCallToken(usize);
+
+#[derive(Debug, Default)]
+struct ToolTraceState {
+    calls: Vec<ToolCall>,
+}
+
+impl ToolTraceState {
+    fn admit(&mut self, tool: ToolName) -> ToolCallToken {
+        let token = ToolCallToken(self.calls.len());
+        self.calls.push(ToolCall {
+            tool,
+            summary: ToolCallSummary::Pending,
+        });
+        token
+    }
+
+    fn settle(&mut self, token: ToolCallToken, summary: ToolCallSummary) -> ToolCall {
+        assert!(
+            !matches!(summary, ToolCallSummary::Pending),
+            "a tool call must settle to a terminal summary"
+        );
+        let call = self
+            .calls
+            .get_mut(token.0)
+            .expect("tool call token must identify an admitted row");
+        assert!(
+            matches!(call.summary, ToolCallSummary::Pending),
+            "a tool call must settle once"
+        );
+        call.summary = summary;
+        *call
+    }
+
+    fn call(&self, token: ToolCallToken) -> ToolCall {
+        *self
+            .calls
+            .get(token.0)
+            .expect("tool call token must identify an admitted row")
+    }
+
+    fn calls(&self) -> &[ToolCall] {
+        &self.calls
+    }
+
+    fn into_calls(self) -> Vec<ToolCall> {
+        self.calls
     }
 }
 
@@ -136,15 +186,7 @@ pub struct InterruptedExecution {
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
-    pub(crate) read: InterruptedRead,
-    pub(crate) read_calls: Vec<ReadCall>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InterruptedRead {
-    NoRead,
-    Pending { path: String },
-    Completed { path: String, outcome: ReadOutcome },
+    pub(crate) tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Error)]
@@ -219,16 +261,9 @@ impl ArenaError {
     }
 }
 
-#[derive(Default)]
-struct InterruptedReadState {
-    pending: Option<String>,
-    completed: Option<(String, ReadOutcome)>,
-    read_calls: Vec<ReadCall>,
-}
-
 struct InterruptedExecutionState {
     streams: StreamAccumulators,
-    read: InterruptedReadState,
+    tools: ToolTraceState,
     began: bool,
 }
 
@@ -236,7 +271,7 @@ impl InterruptedExecutionState {
     fn new() -> Self {
         Self {
             streams: StreamAccumulators::new(OBSERVATION_LIMITS),
-            read: InterruptedReadState::default(),
+            tools: ToolTraceState::default(),
             began: false,
         }
     }
@@ -248,51 +283,16 @@ impl InterruptedExecutionState {
     ) -> InterruptedExecution {
         let InterruptedExecutionState {
             mut streams,
-            read,
+            tools,
             began,
         } = self;
         streams.flush_stdout(now, progress);
-        let (read, read_calls) = read.finish();
         InterruptedExecution {
             began,
             stdout: streams.stdout.finish(),
             stderr: streams.stderr.finish(),
-            read,
-            read_calls,
+            tool_calls: tools.into_calls(),
         }
-    }
-}
-
-impl InterruptedReadState {
-    fn started(&mut self, path: &str) {
-        assert!(self.pending.is_none(), "only one read can be pending");
-        self.pending = Some(bounded_interruption_text(path.to_owned()));
-        self.read_calls.push(ReadCall::Pending);
-    }
-
-    fn finished(&mut self, outcome: ReadOutcome) {
-        let path = self.pending.take().expect("a read must be pending");
-        let call = self
-            .read_calls
-            .last_mut()
-            .expect("a read call must be pending");
-        assert!(
-            matches!(call, ReadCall::Pending),
-            "the last read must be pending"
-        );
-        *call = ReadCall::from_outcome(&outcome);
-        self.completed = Some((path, outcome));
-    }
-
-    fn finish(self) -> (InterruptedRead, Vec<ReadCall>) {
-        let read = match self.pending {
-            Some(path) => InterruptedRead::Pending { path },
-            None => match self.completed {
-                Some((path, outcome)) => InterruptedRead::Completed { path, outcome },
-                None => InterruptedRead::NoRead,
-            },
-        };
-        (read, self.read_calls)
     }
 }
 
@@ -492,7 +492,7 @@ impl Arena {
                     stdout: interruption.streams.stdout.finish(),
                     stderr: interruption.streams.stderr.finish(),
                     outcome,
-                    read_calls: interruption.read.read_calls,
+                    tool_calls: interruption.tools.into_calls(),
                 })
             }
             Err(failure) => {
@@ -732,7 +732,7 @@ async fn drive(
 ) -> Result<MontyObject, DriverError> {
     let InterruptedExecutionState {
         streams,
-        read,
+        tools,
         began,
     } = interruption;
     *began = true;
@@ -815,20 +815,19 @@ async fn drive(
                                 break 'drive Err(DriverError::Fatal(pool_failure(error)));
                             }
                         };
-                        let path = path.clone();
-                        read.started(&path);
-                        progress(ArenaProgress::ReadStarted { path: path.clone() });
-                        let read_result = read_tool.read(&path).await;
-                        let outcome = match &read_result {
-                            Ok(lines) => ReadOutcome::Success {
-                                line_count: lines.len(),
-                            },
-                            Err(error) => ReadOutcome::failure(error.to_string()),
+                        let token = tools.admit(ToolName::Read);
+                        progress(ArenaProgress::ToolUpdated {
+                            call: tools.call(token),
+                        });
+                        let read_result = read_tool.read(path).await;
+                        let summary = match &read_result {
+                            Ok(lines) => ToolCallSummary::Count(lines.len()),
+                            Err(_) => ToolCallSummary::Failed,
                         };
-                        read.finished(outcome.clone());
+                        let call = tools.settle(token, summary);
                         #[cfg(test)]
                         read_tool.wait_after_read_settled().await;
-                        progress(ArenaProgress::ReadFinished { path, outcome });
+                        progress(ArenaProgress::ToolUpdated { call });
                         let value = match read_result {
                             Ok(lines) => ResumeValue::Return(MontyObject::List(
                                 lines.into_iter().map(MontyObject::String).collect(),
@@ -1471,10 +1470,10 @@ mod tests {
 
     use super::{
         Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome,
-        INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, InterruptedRead,
-        OBSERVATION_LIMITS, Observation, ObservationAccumulator, ObservationLimits, PythonError,
-        RUNTIME_IDENTITY, ReadCall, ReadOutcome, RuntimeIdentity, StreamAccumulators, drive,
-        is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
+        INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, OBSERVATION_LIMITS,
+        Observation, ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY,
+        RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName, ToolTraceState,
+        drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{ReadTestGate, ReadTool};
@@ -1560,6 +1559,49 @@ mod tests {
         let mut accumulator = ObservationAccumulator::new(limits);
         accumulator.push(text);
         accumulator.finish()
+    }
+
+    #[test]
+    fn tool_trace_preserves_admission_order_with_safe_summaries() {
+        let fixture_path = "secrets/fixture-path";
+        let fixture_error = "fixture error must not be retained";
+        let mut trace = ToolTraceState::default();
+        let first = trace.admit(ToolName::Read);
+        let second = trace.admit(ToolName::Read);
+
+        assert_eq!(
+            trace.calls(),
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+            ]
+        );
+
+        trace.settle(second, ToolCallSummary::Failed);
+        trace.settle(first, ToolCallSummary::Count(2));
+
+        assert_eq!(
+            trace.calls(),
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(2),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
+        );
+        let retained = format!("{trace:?}");
+        assert!(!retained.contains(fixture_path));
+        assert!(!retained.contains(fixture_error));
     }
 
     #[tokio::test]
@@ -1893,9 +1935,8 @@ mod tests {
         );
         assert!(progress.iter().all(|event| match event {
             super::ArenaProgress::StdoutDelta { text } => text.len() <= 4 * 1024,
-            super::ArenaProgress::StdoutTruncated
-            | super::ArenaProgress::ReadStarted { .. }
-            | super::ArenaProgress::ReadFinished { .. } => true,
+            super::ArenaProgress::StdoutTruncated | super::ArenaProgress::ToolUpdated { .. } =>
+                true,
         }));
         assert!(matches!(
             progress.get(1),
@@ -2288,16 +2329,14 @@ mod tests {
     }
 
     #[test]
-    fn bounds_interruption_diagnostics_and_keeps_protocol_evidence() {
+    fn bounds_interruption_diagnostics_and_keeps_tool_evidence() {
         let unbounded = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2 + 1);
         let expected = "é".repeat(INTERRUPTED_EVIDENCE_TEXT_LIMIT / 2);
         let mut interruption = InterruptedExecutionState::new();
         interruption.began = true;
         interruption.streams.stdout.push("before\n");
-        interruption.read.started("read");
-        interruption
-            .read
-            .finished(ReadOutcome::failure(unbounded.clone()));
+        let token = interruption.tools.admit(ToolName::Read);
+        interruption.tools.settle(token, ToolCallSummary::Failed);
 
         let mut progress = |_| {};
         let error = ArenaError::unsupported_suspension(unbounded)
@@ -2314,16 +2353,13 @@ mod tests {
         assert!(message.is_char_boundary(message.len()));
         assert!(execution.began);
         assert_eq!(execution.stdout.head, "before\n");
-        let InterruptedRead::Completed {
-            path,
-            outcome: ReadOutcome::Failure { message },
-        } = execution.read
-        else {
-            panic!("expected completed failed read evidence");
-        };
-        assert_eq!(path, "read");
-        assert_eq!(message, expected);
-        assert!(message.is_char_boundary(message.len()));
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Failed,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2483,7 +2519,7 @@ mod tests {
         assert!(!execution.began);
         assert_eq!(execution.stdout.total_bytes, 0);
         assert_eq!(execution.stderr.total_bytes, 0);
-        assert_eq!(execution.read, InterruptedRead::NoRead);
+        assert!(execution.tool_calls.is_empty());
     }
 
     #[tokio::test]
@@ -2512,7 +2548,7 @@ mod tests {
             progress.as_slice(),
             [
                 super::ArenaProgress::StdoutDelta { text },
-                super::ArenaProgress::ReadStarted { .. },
+                super::ArenaProgress::ToolUpdated { call: ToolCall { tool: ToolName::Read, summary: ToolCallSummary::Pending } },
             ] if text == "before\n"
         ));
         let ArenaError::Cancelled { execution } = error else {
@@ -2535,8 +2571,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            execution.read_calls,
-            [ReadCall::Success { line_count: 2 }, ReadCall::Failed]
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(2),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
         );
     }
 
@@ -2557,7 +2602,13 @@ mod tests {
         let ArenaError::Cancelled { execution } = error else {
             panic!("expected interrupted cancellation");
         };
-        assert_eq!(execution.read_calls, [ReadCall::Pending]);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2583,7 +2634,13 @@ mod tests {
         let ArenaError::Cancelled { execution } = error else {
             panic!("expected interrupted cancellation");
         };
-        assert_eq!(execution.read_calls, [ReadCall::Success { line_count: 1 }]);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(1),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2599,17 +2656,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(execution.read_calls.len(), 20);
-        assert!(
-            execution
-                .read_calls
-                .iter()
-                .all(|call| *call == ReadCall::Success { line_count: 1 })
-        );
+        assert_eq!(execution.tool_calls.len(), 20);
+        assert!(execution.tool_calls.iter().all(|call| {
+            *call
+                == ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(1),
+                }
+        }));
     }
 
     #[tokio::test]
-    async fn cancellation_retains_short_output_and_pending_read() {
+    async fn cancellation_retains_short_output_and_a_pending_tool_call() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut arena, gate) = arena_with_read_gate(&workspace).await;
         let cancellation = CancellationToken::new();
@@ -2629,15 +2687,16 @@ mod tests {
         assert!(execution.began);
         assert_eq!(execution.stdout.head, "pending\n");
         assert_eq!(
-            execution.read,
-            InterruptedRead::Pending {
-                path: "pending".to_owned()
-            }
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            }]
         );
     }
 
     #[tokio::test]
-    async fn cancellation_bounds_the_pending_read_path_in_evidence() {
+    async fn cancellation_does_not_retain_the_pending_read_path() {
         let workspace = tempfile::tempdir().unwrap();
         let (mut arena, gate) = arena_with_read_gate(&workspace).await;
         let cancellation = CancellationToken::new();
@@ -2655,11 +2714,14 @@ mod tests {
         let ArenaError::Cancelled { execution } = error else {
             panic!("expected interrupted cancellation");
         };
-        let InterruptedRead::Pending { path } = execution.read else {
-            panic!("expected a pending read");
-        };
-        assert_eq!(path, "é".repeat(2_048));
-        assert!(path.is_char_boundary(path.len()));
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
+        assert!(!format!("{execution:?}").contains(&path));
     }
 
     #[tokio::test]
@@ -2688,11 +2750,11 @@ mod tests {
         };
         assert_eq!(execution.stdout.head, "before\n");
         assert_eq!(
-            execution.read,
-            InterruptedRead::Completed {
-                path: "settled".to_owned(),
-                outcome: ReadOutcome::Success { line_count: 1 },
-            }
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(1),
+            }]
         );
     }
 
@@ -2967,10 +3029,11 @@ mod tests {
         };
         assert_eq!(execution.stdout.head, "before\n");
         assert_eq!(
-            execution.read,
-            InterruptedRead::Pending {
-                path: "pending".to_owned()
-            }
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            }]
         );
         assert!(matches!(
             *recovery,

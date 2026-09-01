@@ -4804,10 +4804,7 @@ mod tests {
                     run_id, step_id, ..
                 }
                 | RuntimeEvent::ExecutionStarted { run_id, step_id }
-                | RuntimeEvent::ToolStarted {
-                    run_id, step_id, ..
-                }
-                | RuntimeEvent::ToolFinished {
+                | RuntimeEvent::ToolUpdated {
                     run_id, step_id, ..
                 }
                 | RuntimeEvent::StdoutDelta {
@@ -4855,17 +4852,16 @@ mod tests {
                         self.run_mut(*run_id).streamed_content |= !code.is_empty();
                     }
                 },
-                RuntimeEvent::ToolFinished {
-                    run_id,
-                    path,
-                    outcome,
-                    ..
-                } => {
-                    if path == "README.md"
-                        && matches!(outcome, crate::arena::ReadOutcome::Success { .. })
-                    {
-                        self.run_mut(*run_id).successful_read = true;
-                    }
+                RuntimeEvent::ToolUpdated { run_id, call, .. }
+                    if matches!(
+                        call,
+                        crate::arena::ToolCall {
+                            tool: crate::arena::ToolName::Read,
+                            summary: crate::arena::ToolCallSummary::Count(_),
+                        }
+                    ) =>
+                {
+                    self.run_mut(*run_id).successful_read = true;
                 }
                 RuntimeEvent::RecordAppended { record, .. } => {
                     let run = self.run_mut(record.run_id);
@@ -4892,7 +4888,7 @@ mod tests {
                     self.disabled_events += 1;
                 }
                 RuntimeEvent::ExecutionStarted { .. }
-                | RuntimeEvent::ToolStarted { .. }
+                | RuntimeEvent::ToolUpdated { .. }
                 | RuntimeEvent::StdoutDelta { .. }
                 | RuntimeEvent::StdoutTruncated { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}

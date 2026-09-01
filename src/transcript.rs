@@ -6,9 +6,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
 
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
-use crate::arena::{
-    Execution, ExecutionOutcome, InterruptedRead, Observation, ReadCall, ReadOutcome,
-};
+use crate::arena::{Execution, ExecutionOutcome, Observation, ToolCall, ToolCallSummary};
 use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress};
@@ -86,6 +84,7 @@ struct LiveStep {
     decoded_python: String,
     stdout: String,
     stdout_truncated: bool,
+    tool_calls: Vec<ToolCall>,
     progress_gap: bool,
     activity: String,
 }
@@ -102,6 +101,7 @@ impl LiveStep {
             decoded_python: String::new(),
             stdout: String::new(),
             stdout_truncated: false,
+            tool_calls: Vec::new(),
             progress_gap,
             activity: "generating".to_owned(),
         }
@@ -141,7 +141,7 @@ struct ArenaBlock {
     heading: Option<String>,
     status: Option<String>,
     source: Option<String>,
-    tool_calls: Vec<ReadCall>,
+    tool_calls: Vec<ToolCall>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
     accounting: Option<String>,
@@ -193,7 +193,7 @@ struct NormalisedArenaBlock {
     heading: Option<String>,
     status: Option<String>,
     source: Option<String>,
-    tool_calls: Vec<ReadCall>,
+    tool_calls: Vec<ToolCall>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
     accounting: Option<String>,
@@ -313,15 +313,15 @@ fn code_preview(source: &str, expanded: bool) -> (String, Option<usize>) {
 }
 
 fn tool_call_text(
-    read_calls: &[ReadCall],
+    tool_calls: &[ToolCall],
     expanded: bool,
     background: Color,
 ) -> Option<Text<'static>> {
-    if read_calls.is_empty() {
+    if tool_calls.is_empty() {
         return None;
     }
-    let omitted = (!expanded && read_calls.len() > 16).then(|| read_calls.len() - 16);
-    let mut lines = Vec::with_capacity(read_calls.len().min(16) + usize::from(omitted.is_some()));
+    let omitted = (!expanded && tool_calls.len() > 16).then(|| tool_calls.len() - 16);
+    let mut lines = Vec::with_capacity(tool_calls.len().min(16) + usize::from(omitted.is_some()));
     if let Some(omitted) = omitted {
         lines.push(Line::styled(
             format!("[{omitted} earlier tool calls omitted]"),
@@ -329,24 +329,24 @@ fn tool_call_text(
         ));
     }
     lines.extend(
-        read_calls[omitted.unwrap_or_default()..]
+        tool_calls[omitted.unwrap_or_default()..]
             .iter()
-            .map(|call| {
-                Line::styled(
-                    match call {
-                        ReadCall::Success { line_count } => format!("read · {line_count} lines"),
-                        ReadCall::Failed => "read · failed".to_owned(),
-                        ReadCall::Pending => "read · pending".to_owned(),
-                    },
-                    card_style(background),
-                )
-            }),
+            .map(|call| Line::styled(tool_call_label(*call), card_style(background))),
     );
     Some(Text {
         alignment: None,
         style: card_style(background),
         lines,
     })
+}
+
+fn tool_call_label(call: ToolCall) -> String {
+    let summary = match call.summary {
+        ToolCallSummary::Pending => "pending".to_owned(),
+        ToolCallSummary::Failed => "failed".to_owned(),
+        ToolCallSummary::Count(count) => format!("{count} {}", call.tool.count_label()),
+    };
+    format!("{} · {summary}", call.tool.label())
 }
 
 struct ExecutionPreviewSection {
@@ -1150,32 +1150,12 @@ impl Transcript {
                     live.activity = "running code".to_owned();
                 },
             ),
-            RuntimeEvent::ToolStarted {
+            RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
-                path,
-            } => self.update_live_step(
-                run_id,
-                step_id,
-                gap_before,
-                Some(format!("reading {path}")),
-                |live| {
-                    live.phase = LivePhase::Executing;
-                    live.activity = format!("reading {path}");
-                },
-            ),
-            RuntimeEvent::ToolFinished {
-                run_id,
-                step_id,
-                path,
-                outcome,
+                call,
             } => {
-                let activity = match outcome {
-                    ReadOutcome::Success { line_count } => {
-                        format!("read {path} ({line_count} lines)")
-                    }
-                    ReadOutcome::Failure { message } => format!("read {path} failed: {message}"),
-                };
+                let activity = tool_call_label(call);
                 self.update_live_step(
                     run_id,
                     step_id,
@@ -1184,6 +1164,16 @@ impl Transcript {
                     |live| {
                         live.phase = LivePhase::Executing;
                         live.activity = activity;
+                        if matches!(call.summary, ToolCallSummary::Pending) {
+                            live.tool_calls.push(call);
+                        } else if let Some(pending) =
+                            live.tool_calls.iter_mut().rev().find(|pending| {
+                                pending.tool == call.tool
+                                    && matches!(pending.summary, ToolCallSummary::Pending)
+                            })
+                        {
+                            *pending = call;
+                        }
                     },
                 )
             }
@@ -1633,7 +1623,7 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
                 heading: None,
                 status: None,
                 source: Some(source.clone()),
-                tool_calls: execution.read_calls.clone(),
+                tool_calls: execution.tool_calls.clone(),
                 content: execution_content(execution),
                 progress_gap: displayed.progress_gap,
                 accounting: step_accounting(attempts),
@@ -1700,7 +1690,7 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
             heading: Some(live.phase.label().to_owned()),
             status: (live.activity != live.phase.label()).then(|| live.activity.clone()),
             source: (!live.decoded_python.is_empty()).then(|| live.decoded_python.clone()),
-            tool_calls: Vec::new(),
+            tool_calls: live.tool_calls.clone(),
             content,
             progress_gap: live.progress_gap,
             accounting,
@@ -1900,10 +1890,6 @@ fn execution_evidence_block(
     let mut content = Vec::new();
     append_observation(&mut content, "stdout", &evidence.stdout);
     append_observation(&mut content, "stderr", &evidence.stderr);
-    content.push(ArenaContent {
-        label: "read",
-        text: format_interrupted_read(&evidence.read),
-    });
     if let Some(failure) = &evidence.failure {
         content.push(ArenaContent {
             label: "failure",
@@ -1928,7 +1914,7 @@ fn execution_evidence_block(
             }
         )),
         source: Some(evidence.source.clone()),
-        tool_calls: evidence.read_calls.clone(),
+        tool_calls: evidence.tool_calls.clone(),
         content,
         progress_gap,
         accounting,
@@ -2025,17 +2011,6 @@ fn estimated_cost<'a>(attempts: impl IntoIterator<Item = &'a AttemptAccounting>)
     }
 }
 
-fn format_interrupted_read(read: &InterruptedRead) -> String {
-    match read {
-        InterruptedRead::NoRead => "none".to_owned(),
-        InterruptedRead::Pending { path } => format!("pending {path}"),
-        InterruptedRead::Completed { path, outcome } => match outcome {
-            ReadOutcome::Success { line_count } => format!("completed {path} ({line_count} lines)"),
-            ReadOutcome::Failure { message } => format!("completed {path} failed: {message}"),
-        },
-    }
-}
-
 fn format_execution_failure(failure: &ExecutionFailure) -> String {
     match failure {
         ExecutionFailure::Arena { message } => message.clone(),
@@ -2122,8 +2097,7 @@ mod tests {
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadCall,
-        ReadOutcome,
+        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
     };
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
@@ -2393,7 +2367,7 @@ mod tests {
                         outcome: ExecutionOutcome::Complete {
                             result: Some(observation("42")),
                         },
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts,
                 },
@@ -2402,12 +2376,12 @@ mod tests {
         }
     }
 
-    fn completed_execution_with_read_calls(
+    fn completed_execution_with_tool_calls(
         run_id: u64,
         step_id: u64,
         source: &str,
         stdout: &str,
-        read_calls: Vec<ReadCall>,
+        tool_calls: Vec<ToolCall>,
     ) -> RuntimeEvent {
         RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -2422,7 +2396,7 @@ mod tests {
                         outcome: ExecutionOutcome::Complete {
                             result: Some(observation("result")),
                         },
-                        read_calls,
+                        tool_calls,
                     },
                     attempts: Vec::new(),
                 },
@@ -2929,7 +2903,7 @@ mod tests {
                                 text: "boom".to_owned(),
                                 omitted_bytes: 0,
                             }),
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -2951,13 +2925,10 @@ mod tests {
                                     began: true,
                                     stdout: observation("before\n"),
                                     stderr: observation("diagnostic\n"),
-                                    read: InterruptedRead::Completed {
-                                        path: "bad\tpath".to_owned(),
-                                        outcome: ReadOutcome::Failure {
-                                            message: "read failed".to_owned(),
-                                        },
-                                    },
-                                    read_calls: Vec::new(),
+                                    tool_calls: vec![ToolCall {
+                                        tool: ToolName::Read,
+                                        summary: ToolCallSummary::Failed,
+                                    }],
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "interrupted".to_owned(),
                                     }),
@@ -3000,7 +2971,7 @@ mod tests {
             "error: boom",
             "code:\nawait read(path)",
             "stderr: diagnostic",
-            "read: completed bad    path failed: read failed",
+            "tool calls:\nread · failed",
             "failure: interrupted",
             "warning: cancelled warning",
             "interrupted reasoning",
@@ -3327,8 +3298,7 @@ mod tests {
                             began: true,
                             stdout: observation(""),
                             stderr: observation(""),
-                            read: InterruptedRead::NoRead,
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                             failure: None,
                             cancellation_warning: None,
                         }))),
@@ -3529,7 +3499,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("**literal result**")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::UsageUnavailable],
                     },
@@ -3567,10 +3537,13 @@ mod tests {
         let mut transcript = Transcript::default();
         transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(99) }, false);
         transcript.apply(
-            RuntimeEvent::ToolStarted {
+            RuntimeEvent::ToolUpdated {
                 run_id: RunId(99),
                 step_id: ModelStepId(1),
-                path: hostile.to_owned(),
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
             },
             false,
         );
@@ -3601,7 +3574,7 @@ mod tests {
                                 text: hostile.to_owned(),
                                 omitted_bytes: 0,
                             }),
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::KnownUsage(ModelUsage {
                             model: hostile.to_owned(),
@@ -3667,13 +3640,10 @@ mod tests {
                                     began: true,
                                     stdout: observation(hostile),
                                     stderr: observation(hostile),
-                                    read: InterruptedRead::Completed {
-                                        path: hostile.to_owned(),
-                                        outcome: ReadOutcome::Failure {
-                                            message: hostile.to_owned(),
-                                        },
-                                    },
-                                    read_calls: Vec::new(),
+                                    tool_calls: vec![ToolCall {
+                                        tool: ToolName::Read,
+                                        summary: ToolCallSummary::Failed,
+                                    }],
                                     failure: Some(ExecutionFailure::RecoveryFailed {
                                         original: hostile.to_owned(),
                                         recovery: hostile.to_owned(),
@@ -3804,12 +3774,21 @@ mod tests {
             false,
         );
         let expected_calls = vec![
-            ReadCall::Success { line_count: 1 },
-            ReadCall::Failed,
-            ReadCall::Pending,
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(1),
+            },
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Failed,
+            },
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            },
         ];
         transcript.apply(
-            completed_execution_with_read_calls(
+            completed_execution_with_tool_calls(
                 1,
                 1,
                 "await read('authoritative-path')",
@@ -3865,11 +3844,14 @@ mod tests {
             .map(|line| format!("output {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let read_calls = (1..=20)
-            .map(|line_count| ReadCall::Success { line_count })
+        let tool_calls = (1..=20)
+            .map(|count| ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(count),
+            })
             .collect();
         transcript.apply(
-            completed_execution_with_read_calls(1, 1, &source, &stdout, read_calls),
+            completed_execution_with_tool_calls(1, 1, &source, &stdout, tool_calls),
             false,
         );
 
@@ -3925,13 +3907,14 @@ mod tests {
     fn cards_wrap_and_scroll_tool_call_sections_with_their_outer_frame() {
         let mut transcript = Transcript::default();
         transcript.apply(
-            completed_execution_with_read_calls(
+            completed_execution_with_tool_calls(
                 1,
                 1,
                 "pass",
                 "",
-                vec![ReadCall::Success {
-                    line_count: usize::MAX,
+                vec![ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(usize::MAX),
                 }],
             ),
             false,
@@ -4086,7 +4069,7 @@ mod tests {
                             ),
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4116,7 +4099,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("done")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4190,7 +4173,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("result-tail")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4307,7 +4290,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("done")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4372,7 +4355,7 @@ mod tests {
                             stdout: observation(""),
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4427,10 +4410,13 @@ mod tests {
             false,
         );
         transcript.apply(
-            RuntimeEvent::ToolStarted {
+            RuntimeEvent::ToolUpdated {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
-                path: "README.md".to_owned(),
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
             },
             false,
         );
@@ -4450,11 +4436,13 @@ mod tests {
             false,
         );
         transcript.apply(
-            RuntimeEvent::ToolFinished {
+            RuntimeEvent::ToolUpdated {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
-                path: "README.md".to_owned(),
-                outcome: ReadOutcome::Success { line_count: 12 },
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(12),
+                },
             },
             false,
         );
@@ -4469,8 +4457,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert_eq!(rendered.matches("running code").count(), 1);
-        assert_eq!(rendered.matches("read README.md (12 lines)").count(), 1);
-        assert!(!rendered.contains("╭read"));
+        assert_eq!(rendered.matches("read · 12 lines").count(), 2);
+        assert!(rendered.contains("╭tool calls"));
+        assert!(!rendered.contains("read · pending"));
+        assert!(!rendered.contains("README.md"));
     }
 
     #[test]
@@ -4517,7 +4507,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("UVW")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4588,7 +4578,7 @@ mod tests {
                                 text: "error".to_owned(),
                                 omitted_bytes: 0,
                             }),
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4609,8 +4599,7 @@ mod tests {
                             began: true,
                             stdout: observation(""),
                             stderr: observation(""),
-                            read: InterruptedRead::NoRead,
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                             cancellation_warning: Some("cancelled".to_owned()),
                             failure: None,
                         }))),
@@ -4630,8 +4619,7 @@ mod tests {
                             began: true,
                             stdout: observation(""),
                             stderr: observation(""),
-                            read: InterruptedRead::NoRead,
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                             cancellation_warning: None,
                             failure: Some(ExecutionFailure::Arena {
                                 message: "failed".to_owned(),
@@ -4718,7 +4706,7 @@ mod tests {
                             stdout: observation(&stdout),
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: vec![usage(1, 1)],
                     },
@@ -4767,7 +4755,7 @@ mod tests {
                             outcome: ExecutionOutcome::Complete {
                                 result: Some(observation("fourth")),
                             },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -4803,13 +4791,10 @@ mod tests {
                                     began: true,
                                     stdout: observation("output body"),
                                     stderr: observation("diagnostic body"),
-                                    read: InterruptedRead::Completed {
-                                        path: "path".to_owned(),
-                                        outcome: ReadOutcome::Failure {
-                                            message: "read failed".to_owned(),
-                                        },
-                                    },
-                                    read_calls: vec![ReadCall::Failed],
+                                    tool_calls: vec![ToolCall {
+                                        tool: ToolName::Read,
+                                        summary: ToolCallSummary::Failed,
+                                    }],
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "failure".to_owned(),
                                     }),
@@ -4830,7 +4815,6 @@ mod tests {
             "tool calls",
             "stdout",
             "stderr",
-            "read",
             "failure",
             "warning",
         ] {
@@ -4845,9 +4829,7 @@ mod tests {
             ("stdout", "output body"),
             ("output body", "stderr"),
             ("stderr", "diagnostic body"),
-            ("diagnostic body", "╭read"),
-            ("╭read", "completed path failed: read failed"),
-            ("completed path failed: read failed", "failure"),
+            ("diagnostic body", "failure"),
             ("failure", "warning"),
         ] {
             assert!(
@@ -4887,7 +4869,7 @@ mod tests {
                             stdout,
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
-                            read_calls: Vec::new(),
+                            tool_calls: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -5071,24 +5053,29 @@ mod tests {
         );
         assert_eq!(transcript.status(), "running code");
         transcript.apply(
-            RuntimeEvent::ToolStarted {
+            RuntimeEvent::ToolUpdated {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
-                path: "Cargo.toml".to_owned(),
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
             },
             false,
         );
-        assert_eq!(transcript.status(), "reading Cargo.toml");
+        assert_eq!(transcript.status(), "read · pending");
         transcript.apply(
-            RuntimeEvent::ToolFinished {
+            RuntimeEvent::ToolUpdated {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
-                path: "Cargo.toml".to_owned(),
-                outcome: ReadOutcome::Success { line_count: 12 },
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(12),
+                },
             },
             false,
         );
-        assert_eq!(transcript.status(), "read Cargo.toml (12 lines)");
+        assert_eq!(transcript.status(), "read · 12 lines");
         transcript.apply(
             RuntimeEvent::SubmissionRejectedBusy {
                 active_run_id: RunId(3),

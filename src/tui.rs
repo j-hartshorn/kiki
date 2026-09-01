@@ -782,8 +782,7 @@ mod tests {
     use super::App;
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, InterruptedRead, Observation, PythonError, ReadCall,
-        ReadOutcome,
+        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
     };
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{PromptEdit, PromptEditor};
@@ -2225,7 +2224,7 @@ mod tests {
                         outcome: ExecutionOutcome::Complete {
                             result: Some(observation("42")),
                         },
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts,
                 },
@@ -2252,7 +2251,7 @@ mod tests {
                             text: "boom".to_owned(),
                             omitted_bytes: 0,
                         }),
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts: vec![],
                 },
@@ -2270,13 +2269,10 @@ mod tests {
                             began: true,
                             stdout: observation("before\n"),
                             stderr: observation("diagnostic\n"),
-                            read: InterruptedRead::Completed {
-                                path: "bad\tpath".to_owned(),
-                                outcome: ReadOutcome::Failure {
-                                    message: "read failed".to_owned(),
-                                },
-                            },
-                            read_calls: Vec::new(),
+                            tool_calls: vec![ToolCall {
+                                tool: ToolName::Read,
+                                summary: ToolCallSummary::Failed,
+                            }],
                             failure: Some(ExecutionFailure::Arena {
                                 message: "interrupted".to_owned(),
                             }),
@@ -2298,8 +2294,8 @@ mod tests {
             "await read(path)",
             "stderr",
             "diagnostic",
-            "read",
-            "completed bad    path failed: read failed",
+            "tool calls",
+            "read · failed",
             "failure",
             "interrupted",
             "warning",
@@ -2940,8 +2936,11 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
-                        read_calls: (1..=20)
-                            .map(|line_count| ReadCall::Success { line_count })
+                        tool_calls: (1..=20)
+                            .map(|count| ToolCall {
+                                tool: ToolName::Read,
+                                summary: ToolCallSummary::Count(count),
+                            })
                             .collect(),
                     },
                     attempts: Vec::new(),
@@ -3034,7 +3033,7 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -3066,7 +3065,7 @@ mod tests {
                         stdout: observation(""),
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
-                        read_calls: Vec::new(),
+                        tool_calls: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -3188,15 +3187,18 @@ mod tests {
             step_id: ModelStepId(91),
         });
         assert!(rendered(&mut app, 120, 4).starts_with("Status: generating"));
-        app.handle_event(RuntimeEvent::ToolStarted {
+        app.handle_event(RuntimeEvent::ToolUpdated {
             run_id: RunId(73),
             step_id: ModelStepId(91),
-            path: "Cargo.toml".to_owned(),
+            call: ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            },
         });
 
         let screen = rendered(&mut app, 120, 4);
         let header = screen.lines().next().expect("status header");
-        assert!(header.starts_with("Status: reading Cargo.toml"));
+        assert!(header.starts_with("Status: read · pending"));
         for hidden in ["run 73", "step 91", "attempt"] {
             assert!(!header.contains(hidden), "{header}");
         }
@@ -3213,14 +3215,18 @@ mod tests {
         }
         assert!(app.prompt.is_empty());
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
-        app.handle_event(RuntimeEvent::ToolStarted {
+        app.handle_event(RuntimeEvent::ToolUpdated {
             run_id: RunId(1),
             step_id: ModelStepId(1),
-            path: "path\u{009d}unsafe".to_owned(),
+            call: ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Pending,
+            },
         });
 
         let screen = rendered(&mut app, 120, 30);
-        assert!(screen.contains("reading path\\x9Dunsafe"));
+        assert!(screen.contains("read · pending"));
+        assert!(!screen.contains("path\\x9Dunsafe"));
         assert!(!screen.chars().any(|character| {
             matches!(character, '\u{1b}' | '\u{7f}') || character.is_control() && character != '\n'
         }));

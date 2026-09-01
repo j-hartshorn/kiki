@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    InterruptedRead, Observation, PythonError, ReadCall, ReadOutcome,
+    Observation, PythonError, ToolCall,
 };
 use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
@@ -42,8 +42,7 @@ pub struct ExecutionEvidence {
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
-    pub(crate) read: InterruptedRead,
-    pub(crate) read_calls: Vec<ReadCall>,
+    pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) cancellation_warning: Option<String>,
     pub(crate) failure: Option<ExecutionFailure>,
 }
@@ -71,12 +70,8 @@ pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
     ExecutionStarted,
-    ToolStarted {
-        path: String,
-    },
-    ToolFinished {
-        path: String,
-        outcome: ReadOutcome,
+    ToolUpdated {
+        call: ToolCall,
     },
     StdoutDelta {
         text: String,
@@ -228,8 +223,7 @@ impl ExecutionEvidence {
             began: interrupted.began,
             stdout: interrupted.stdout,
             stderr: interrupted.stderr,
-            read: interrupted.read,
-            read_calls: interrupted.read_calls,
+            tool_calls: interrupted.tool_calls,
             cancellation_warning: cancellation_warning.then(|| CANCELLATION_WARNING.to_owned()),
             failure: error.map(failure_evidence),
         }
@@ -258,8 +252,7 @@ fn empty_interrupted_execution() -> InterruptedExecution {
         began: false,
         stdout: empty_observation(),
         stderr: empty_observation(),
-        read: InterruptedRead::NoRead,
-        read_calls: Vec::new(),
+        tool_calls: Vec::new(),
     }
 }
 
@@ -563,11 +556,8 @@ impl<M: Model> Agent<M> {
                     progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
-                            ArenaProgress::ReadStarted { path } => {
-                                progress(AgentProgress::ToolStarted { path });
-                            }
-                            ArenaProgress::ReadFinished { path, outcome } => {
-                                progress(AgentProgress::ToolFinished { path, outcome });
+                            ArenaProgress::ToolUpdated { call } => {
+                                progress(AgentProgress::ToolUpdated { call });
                             }
                             ArenaProgress::StdoutDelta { text } => {
                                 progress(AgentProgress::StdoutDelta { text });
@@ -706,29 +696,11 @@ fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
     }
     append_output(&mut frames, "stdout", &evidence.stdout);
     append_output(&mut frames, "stderr", &evidence.stderr);
-    frames.push(render_interrupted_read(&evidence.read));
     if let Some(warning) = &evidence.cancellation_warning {
         frames.push(warning.clone());
     }
     frames.push("</kiki_execution>".to_owned());
     frames.join("\n")
-}
-
-fn render_interrupted_read(read: &InterruptedRead) -> String {
-    match read {
-        InterruptedRead::NoRead => "<kiki_read state=\"none\" />".to_owned(),
-        InterruptedRead::Pending { path } => {
-            format!("<kiki_read state=\"pending\" path=\"{path}\" />")
-        }
-        InterruptedRead::Completed { path, outcome } => match outcome {
-            ReadOutcome::Success { line_count } => format!(
-                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"success\" lines=\"{line_count}\" />"
-            ),
-            ReadOutcome::Failure { message } => format!(
-                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"failure\">\n{message}\n</kiki_read>"
-            ),
-        },
-    }
 }
 
 fn execution_feedback(execution: &Execution) -> String {
@@ -839,7 +811,8 @@ mod tests {
         GenerationEvidenceBuilder, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ReadCall,
+        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
+        ToolCallSummary, ToolName,
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -1495,9 +1468,18 @@ mod tests {
     }
 
     #[test]
-    fn execution_evidence_copies_original_read_calls_after_recovery_failure() {
+    fn execution_evidence_copies_original_tool_calls_after_recovery_failure() {
         let mut interrupted = super::empty_interrupted_execution();
-        interrupted.read_calls = vec![ReadCall::Success { line_count: 3 }, ReadCall::Failed];
+        interrupted.tool_calls = vec![
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(3),
+            },
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Failed,
+            },
+        ];
         let error = ArenaError::RecoveryFailed {
             original: Box::new(ArenaError::Cancelled {
                 execution: Box::new(interrupted),
@@ -1511,8 +1493,17 @@ mod tests {
         let evidence = super::ExecutionEvidence::failed("source".to_owned(), String::new(), &error);
 
         assert_eq!(
-            evidence.read_calls,
-            [ReadCall::Success { line_count: 3 }, ReadCall::Failed]
+            evidence.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(3),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
         );
         assert!(!evidence.feedback().contains("tool calls"));
     }
@@ -1595,7 +1586,7 @@ mod tests {
         let canceller = cancellation.clone();
         let error = {
             let mut progress = |event| {
-                if matches!(event, AgentProgress::ToolStarted { .. }) {
+                if matches!(event, AgentProgress::ToolUpdated { .. }) {
                     canceller.cancel();
                 }
             };
@@ -1618,7 +1609,7 @@ mod tests {
         assert_eq!(evidence.began, execution.began);
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
-        assert_eq!(evidence.read, execution.read);
+        assert_eq!(evidence.tool_calls, execution.tool_calls);
         assert_eq!(
             evidence.cancellation_warning.as_deref(),
             Some(super::CANCELLATION_WARNING)
@@ -1737,7 +1728,7 @@ mod tests {
                 assert_eq!(evidence.source, "boundary_action_ran = True");
                 assert_eq!(evidence.reasoning_summary, "boundary summary");
                 assert!(!evidence.began);
-                assert_eq!(evidence.read, crate::arena::InterruptedRead::NoRead);
+                assert!(evidence.tool_calls.is_empty());
                 assert_eq!(
                     evidence.cancellation_warning.as_deref(),
                     Some(super::CANCELLATION_WARNING)
@@ -1904,8 +1895,7 @@ mod tests {
         );
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
-        assert_eq!(evidence.read, execution.read);
-        assert_eq!(evidence.read_calls, execution.read_calls);
+        assert_eq!(evidence.tool_calls, execution.tool_calls);
         assert_eq!(
             evidence.cancellation_warning.as_deref(),
             Some(super::CANCELLATION_WARNING)
@@ -2210,7 +2200,7 @@ mod tests {
                     },
                 )),
             },
-            read_calls: Vec::new(),
+            tool_calls: Vec::new(),
         };
 
         assert_eq!(
@@ -2386,7 +2376,7 @@ mod tests {
                 text: "<error>".to_owned(),
                 omitted_bytes: 3,
             }),
-            read_calls: Vec::new(),
+            tool_calls: Vec::new(),
         };
 
         assert_eq!(
