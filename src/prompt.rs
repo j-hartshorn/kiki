@@ -106,6 +106,19 @@ mod tests {
         }
     }
 
+    fn assert_generated_tool_reference(reference: &str) {
+        for signature in [
+            "async def read(path: str) -> str:",
+            "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+        ] {
+            assert_eq!(reference.matches(signature).count(), 1);
+        }
+        assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
+        for unavailable in ["glob(", "grep(", "write(", "edit(", "run("] {
+            assert!(!reference.contains(unavailable));
+        }
+    }
+
     #[test]
     fn bundled_prompt_keeps_shared_agent_behaviour_outside_the_tool_reference() {
         assert_concept(&[
@@ -149,12 +162,11 @@ mod tests {
             resolved.text(),
             format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference())
         );
-        assert_eq!(
+        assert_generated_tool_reference(
             resolved
                 .text()
-                .matches("async def read(path: str) -> str:")
-                .count(),
-            1
+                .strip_prefix(format!("{BUNDLED_PROMPT}\n\n").as_str())
+                .expect("bundled prompt is preserved verbatim before the managed reference"),
         );
         assert!(
             resolved
@@ -174,7 +186,8 @@ mod tests {
     fn an_override_takes_exact_precedence_and_reports_only_its_path() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("nested")).unwrap();
-        const OVERRIDE: &str = "private override text: read is mentioned independently";
+        const OVERRIDE: &str =
+            "private override text: async def read(path: str) -> str: is mentioned independently";
         fs::write(directory.path().join("override.md"), OVERRIDE).unwrap();
         let override_path = directory
             .path()
@@ -193,7 +206,13 @@ mod tests {
                 .text()
                 .matches("async def read(path: str) -> str:")
                 .count(),
-            1
+            2
+        );
+        assert_generated_tool_reference(
+            resolved
+                .text()
+                .strip_prefix(format!("{OVERRIDE}\n\n").as_str())
+                .expect("override is preserved verbatim before the managed reference"),
         );
         assert_eq!(
             resolved.source(),

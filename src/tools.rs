@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File};
@@ -11,7 +13,9 @@ use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 
-use crate::config::constants::FILE_MAX_BYTES;
+use crate::config::constants::{
+    COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -27,18 +31,21 @@ pub(crate) enum ToolValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolName {
     Read,
+    ListDir,
 }
 
 impl ToolName {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Read => "read",
+            Self::ListDir => "list_dir",
         }
     }
 
     pub(crate) fn private_name(self) -> &'static str {
         match self {
             Self::Read => "_kiki_read",
+            Self::ListDir => "_kiki_list_dir",
         }
     }
 
@@ -57,6 +64,8 @@ impl ToolName {
         match (self, count) {
             (Self::Read, 1) => "byte",
             (Self::Read, _) => "bytes",
+            (Self::ListDir, 1) => "entry",
+            (Self::ListDir, _) => "entries",
         }
     }
 }
@@ -79,8 +88,10 @@ pub(crate) enum ToolErrorKind {
     Type,
     FileNotFound,
     IsADirectory,
+    NotADirectory,
     Permission,
     Value,
+    Runtime,
     Os,
 }
 
@@ -111,9 +122,14 @@ impl ToolError {
         Self::new(ToolErrorKind::Value, message)
     }
 
+    fn runtime(message: impl Into<String>) -> Self {
+        Self::new(ToolErrorKind::Runtime, message)
+    }
+
     fn from_io(error: std::io::Error) -> Self {
         let kind = match error.kind() {
             std::io::ErrorKind::NotFound => ToolErrorKind::FileNotFound,
+            std::io::ErrorKind::NotADirectory => ToolErrorKind::NotADirectory,
             std::io::ErrorKind::PermissionDenied => ToolErrorKind::Permission,
             _ => ToolErrorKind::Os,
         };
@@ -121,7 +137,11 @@ impl ToolError {
             ToolErrorKind::FileNotFound => "workspace path was not found".to_owned(),
             ToolErrorKind::Permission => "workspace access was denied".to_owned(),
             ToolErrorKind::Os => "filesystem operation failed".to_owned(),
-            ToolErrorKind::Type | ToolErrorKind::IsADirectory | ToolErrorKind::Value => {
+            ToolErrorKind::Type
+            | ToolErrorKind::IsADirectory
+            | ToolErrorKind::NotADirectory
+            | ToolErrorKind::Value
+            | ToolErrorKind::Runtime => {
                 unreachable!("I/O errors map only to filesystem exception categories")
             }
         };
@@ -133,30 +153,79 @@ impl ToolError {
 pub(crate) struct ToolParameter {
     name: &'static str,
     value_type: ToolValueType,
+    default: Option<ToolDefault>,
+}
+
+#[derive(Clone, Copy)]
+enum ToolDefault {
+    String(&'static str),
+}
+
+impl ToolDefault {
+    fn source(self) -> String {
+        match self {
+            Self::String(value) => format!("{value:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ToolValueType {
     String,
+    OptionalInteger,
 }
 
 impl ToolValueType {
     fn annotation(self) -> &'static str {
         match self {
             Self::String => "str",
+            Self::OptionalInteger => "int | None",
         }
     }
 }
 
 #[derive(Clone, Copy)]
+struct ToolRecordField {
+    name: &'static str,
+    value_type: ToolValueType,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToolRecord {
+    name: &'static str,
+    fields: &'static [ToolRecordField],
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum ToolResultShape {
     String,
+    RecordList(&'static ToolRecord),
 }
 
 impl ToolResultShape {
-    fn annotation(self) -> &'static str {
+    fn annotation(self) -> String {
         match self {
-            Self::String => "str",
+            Self::String => "str".to_owned(),
+            Self::RecordList(record) => format!("list[{}]", record.name),
+        }
+    }
+
+    fn record(self) -> Option<&'static ToolRecord> {
+        match self {
+            Self::String => None,
+            Self::RecordList(record) => Some(record),
+        }
+    }
+
+    fn bootstrap_return(self, private_name: &str, arguments: &str) -> String {
+        match self {
+            Self::String => format!("await {private_name}({arguments})"),
+            Self::RecordList(record) => {
+                format!(
+                    "[{}(**row) for row in await {private_name}({arguments})]",
+                    record.name
+                )
+            }
         }
     }
 }
@@ -172,32 +241,130 @@ pub(crate) struct ToolDefinition {
 const READ_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     name: "path",
     value_type: ToolValueType::String,
+    default: None,
 }];
 
-pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[ToolDefinition {
-    name: ToolName::Read,
-    parameters: READ_PARAMETERS,
-    result: ToolResultShape::String,
-    description: "Read one complete UTF-8 workspace file.",
+const DIRECTORY_ENTRY_FIELDS: &[ToolRecordField] = &[
+    ToolRecordField {
+        name: "path",
+        value_type: ToolValueType::String,
+    },
+    ToolRecordField {
+        name: "kind",
+        value_type: ToolValueType::String,
+    },
+    ToolRecordField {
+        name: "size_bytes",
+        value_type: ToolValueType::OptionalInteger,
+    },
+];
+
+const DIRECTORY_ENTRY: ToolRecord = ToolRecord {
+    name: "DirectoryEntry",
+    fields: DIRECTORY_ENTRY_FIELDS,
+};
+
+const LIST_DIR_PARAMETERS: &[ToolParameter] = &[ToolParameter {
+    name: "path",
+    value_type: ToolValueType::String,
+    default: Some(ToolDefault::String(".")),
 }];
+
+pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
+    ToolDefinition {
+        name: ToolName::Read,
+        parameters: READ_PARAMETERS,
+        result: ToolResultShape::String,
+        description: "Read one complete UTF-8 workspace file.",
+    },
+    ToolDefinition {
+        name: ToolName::ListDir,
+        parameters: LIST_DIR_PARAMETERS,
+        result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
+        description: "List immediate workspace directory entries.",
+    },
+];
 
 pub(crate) fn bootstrap_source() -> String {
-    ACTIVE_TOOLS
+    let records = record_definitions()
+        .into_iter()
+        .map(ToolRecord::bootstrap_definition)
+        .collect::<Vec<_>>();
+    let wrappers = ACTIVE_TOOLS
         .iter()
         .map(|definition| definition.bootstrap_wrapper())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .collect::<Vec<_>>();
+    [
+        (!records.is_empty()).then(|| {
+            format!(
+                "from dataclasses import dataclass\n\n{}",
+                records.join("\n\n")
+            )
+        }),
+        (!wrappers.is_empty()).then(|| wrappers.join("\n\n")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n")
 }
 
 pub(crate) fn prompt_reference() -> String {
+    let records = record_definitions()
+        .into_iter()
+        .map(ToolRecord::prompt_skeleton)
+        .collect::<Vec<_>>();
     let definitions = ACTIVE_TOOLS
         .iter()
         .map(|definition| definition.prompt_skeleton())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .collect::<Vec<_>>();
+    let source = [
+        (!records.is_empty()).then(|| {
+            format!(
+                "from dataclasses import dataclass\n\n{}",
+                records.join("\n\n")
+            )
+        }),
+        (!definitions.is_empty()).then(|| definitions.join("\n\n")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Await every host call.\n\n{definitions}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Await every host call.\n\n{source}\n"
     )
+}
+
+fn record_definitions() -> Vec<&'static ToolRecord> {
+    let mut records: Vec<&'static ToolRecord> = Vec::new();
+    for definition in ACTIVE_TOOLS {
+        let Some(record) = definition.result.record() else {
+            continue;
+        };
+        if !records.iter().any(|defined| defined.name == record.name) {
+            records.push(record);
+        }
+    }
+    records
+}
+
+impl ToolRecord {
+    fn bootstrap_definition(&self) -> String {
+        format!("@dataclass\nclass {}:\n{}", self.name, self.fields_source())
+    }
+
+    fn prompt_skeleton(&self) -> String {
+        self.bootstrap_definition()
+    }
+
+    fn fields_source(&self) -> String {
+        self.fields
+            .iter()
+            .map(|field| format!("    {}: {}", field.name, field.value_type.annotation()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl ToolDefinition {
@@ -205,7 +372,17 @@ impl ToolDefinition {
         let parameters = self
             .parameters
             .iter()
-            .map(|parameter| format!("{}: {}", parameter.name, parameter.value_type.annotation()))
+            .map(|parameter| {
+                let default = parameter
+                    .default
+                    .map(|default| format!(" = {}", default.source()))
+                    .unwrap_or_default();
+                format!(
+                    "{}: {}{default}",
+                    parameter.name,
+                    parameter.value_type.annotation()
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!(
@@ -225,11 +402,11 @@ impl ToolDefinition {
 
     fn bootstrap_wrapper(self) -> String {
         format!(
-            "{}\n    \"\"\"{}\"\"\"\n    return await {}({})",
+            "{}\n    \"\"\"{}\"\"\"\n    return {}",
             self.signature(),
             self.description,
-            self.name.private_name(),
-            self.arguments(),
+            self.result
+                .bootstrap_return(self.name.private_name(), &self.arguments()),
         )
     }
 
@@ -243,15 +420,19 @@ impl ToolDefinition {
 }
 
 #[derive(Clone, Copy)]
-struct ReadLimits {
-    max_bytes: usize,
+struct ToolLimits {
+    max_file_bytes: usize,
+    max_collection_items: usize,
+    max_collection_payload_bytes: usize,
 }
 
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
-    limits: ReadLimits,
+    limits: ToolLimits,
     #[cfg(test)]
     test_gate: Option<ReadTestGate>,
+    #[cfg(test)]
+    list_dir_test_gate: Option<ListDirTestGate>,
 }
 
 #[cfg(test)]
@@ -311,6 +492,67 @@ async fn take_permit(semaphore: &Arc<Semaphore>) {
         .forget();
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ListDirTestGate {
+    state: Arc<(Mutex<ListDirTestGateState>, Condvar)>,
+}
+
+#[cfg(test)]
+struct ListDirTestGateState {
+    started: bool,
+    allowed: bool,
+}
+
+#[cfg(test)]
+impl ListDirTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(ListDirTestGateState {
+                    started: false,
+                    allowed: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    pub(crate) async fn wait_until_list_dir_started(&self) {
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || {
+            let (lock, changed) = &*state;
+            let mut state = lock.lock().expect("test gate mutex is not poisoned");
+            while !state.started {
+                state = changed
+                    .wait(state)
+                    .expect("test gate mutex is not poisoned");
+            }
+        })
+        .await
+        .expect("test gate waiter completes");
+    }
+
+    pub(crate) fn resume_list_dir(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.allowed = true;
+        changed.notify_all();
+    }
+
+    fn wait_before_list_dir(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.started = true;
+        changed.notify_all();
+        while !state.allowed {
+            state = changed
+                .wait(state)
+                .expect("test gate mutex is not poisoned");
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ToolHostError {
     #[error("workspace operation failed")]
@@ -323,8 +565,10 @@ impl ToolHost {
     pub(crate) async fn new(workspace: impl AsRef<Path>) -> Result<Self, ToolHostError> {
         Self::open(
             workspace.as_ref().to_path_buf(),
-            ReadLimits {
-                max_bytes: FILE_MAX_BYTES,
+            ToolLimits {
+                max_file_bytes: FILE_MAX_BYTES,
+                max_collection_items: COLLECTION_MAX_ITEMS,
+                max_collection_payload_bytes: COLLECTION_MAX_PAYLOAD_BYTES,
             },
         )
         .await
@@ -335,10 +579,35 @@ impl ToolHost {
         workspace: impl AsRef<Path>,
         max_bytes: usize,
     ) -> Result<Self, ToolHostError> {
-        Self::open(workspace.as_ref().to_path_buf(), ReadLimits { max_bytes }).await
+        Self::open(
+            workspace.as_ref().to_path_buf(),
+            ToolLimits {
+                max_file_bytes: max_bytes,
+                max_collection_items: COLLECTION_MAX_ITEMS,
+                max_collection_payload_bytes: COLLECTION_MAX_PAYLOAD_BYTES,
+            },
+        )
+        .await
     }
 
-    async fn open(workspace: PathBuf, limits: ReadLimits) -> Result<Self, ToolHostError> {
+    #[cfg(test)]
+    pub(crate) async fn with_collection_limits(
+        workspace: impl AsRef<Path>,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Self, ToolHostError> {
+        Self::open(
+            workspace.as_ref().to_path_buf(),
+            ToolLimits {
+                max_file_bytes: FILE_MAX_BYTES,
+                max_collection_items: max_items,
+                max_collection_payload_bytes: max_payload_bytes,
+            },
+        )
+        .await
+    }
+
+    async fn open(workspace: PathBuf, limits: ToolLimits) -> Result<Self, ToolHostError> {
         let workspace = tokio::task::spawn_blocking(move || {
             Dir::open_ambient_dir(workspace, ambient_authority()).map(Arc::new)
         })
@@ -349,12 +618,20 @@ impl ToolHost {
             limits,
             #[cfg(test)]
             test_gate: None,
+            #[cfg(test)]
+            list_dir_test_gate: None,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_test_gate(mut self, test_gate: ReadTestGate) -> Self {
         self.test_gate = Some(test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_list_dir_test_gate(mut self, list_dir_test_gate: ListDirTestGate) -> Self {
+        self.list_dir_test_gate = Some(list_dir_test_gate);
         self
     }
 
@@ -366,6 +643,7 @@ impl ToolHost {
         } = call;
         let result = match tool {
             ToolName::Read => self.read(arguments).await,
+            ToolName::ListDir => self.list_dir(arguments).await,
         };
         ToolResult { call_id, result }
     }
@@ -379,10 +657,28 @@ impl ToolHost {
 
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
-        tokio::task::spawn_blocking(move || read_file(&workspace, &path, limits))
+        tokio::task::spawn_blocking(move || read_file(&workspace, &path, limits.max_file_bytes))
             .await
             .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
             .map(ToolValue::String)
+    }
+
+    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+        let path = list_dir_path(arguments)?;
+        let workspace = Arc::clone(&self.workspace);
+        let limits = self.limits;
+        #[cfg(test)]
+        let test_gate = self.list_dir_test_gate.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(test_gate) = test_gate {
+                test_gate.wait_before_list_dir();
+            }
+            list_directory(&workspace, &path, limits)
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+        .map(ToolValue::List)
     }
 
     #[cfg(test)]
@@ -407,6 +703,21 @@ fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
     normalise_path(path)
 }
 
+fn list_dir_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "list_dir() expects zero or one positional string argument",
+        ));
+    };
+    match arguments.as_slice() {
+        [] => Ok(PathBuf::new()),
+        [ToolValue::String(path)] => normalise_path(path),
+        _ => Err(ToolError::type_error(
+            "list_dir() expects zero or one positional string argument",
+        )),
+    }
+}
+
 fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
     let path = Path::new(path);
     let mut normalised = PathBuf::new();
@@ -427,7 +738,7 @@ fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
     Ok(normalised)
 }
 
-fn read_file(workspace: &Dir, path: &Path, limits: ReadLimits) -> Result<String, ToolError> {
+fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, ToolError> {
     let (parent, file_name) = open_parent(workspace, path)?;
     let metadata = parent
         .symlink_metadata(&file_name)
@@ -446,10 +757,9 @@ fn read_file(workspace: &Dir, path: &Path, limits: ReadLimits) -> Result<String,
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
-    if metadata.len() > limits.max_bytes as u64 {
+    if metadata.len() > max_bytes as u64 {
         return Err(ToolError::value(format!(
-            "file exceeds the {}-byte limit",
-            limits.max_bytes
+            "file exceeds the {max_bytes}-byte limit"
         )));
     }
 
@@ -470,8 +780,113 @@ fn read_file(workspace: &Dir, path: &Path, limits: ReadLimits) -> Result<String,
         return Err(ToolError::value("path is not a regular file"));
     }
 
-    String::from_utf8(read_limited(&mut file, limits.max_bytes)?)
+    String::from_utf8(read_limited(&mut file, max_bytes)?)
         .map_err(|_| ToolError::value("file is not valid UTF-8"))
+}
+
+fn list_directory(
+    workspace: &Dir,
+    path: &Path,
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    let directory = open_directory_root(workspace, path)?;
+    let base_path = normalised_path_string(path);
+    let mut entries = Vec::new();
+
+    for entry in directory.entries().map_err(ToolError::from_io)? {
+        let entry = entry.map_err(ToolError::from_io)?;
+        let file_name = entry.file_name();
+        let name = file_name
+            .to_str()
+            .ok_or_else(|| ToolError::value("directory entry name is not valid UTF-8"))?;
+        let metadata = directory
+            .symlink_metadata(&file_name)
+            .map_err(ToolError::from_io)?;
+        let (kind, size_bytes) = if metadata.file_type().is_symlink() {
+            ("symlink", None)
+        } else if metadata.is_file() {
+            (
+                "file",
+                Some(
+                    i64::try_from(metadata.len())
+                        .map_err(|_| ToolError::new(ToolErrorKind::Os, "file size is too large"))?,
+                ),
+            )
+        } else if metadata.is_dir() {
+            ("directory", None)
+        } else {
+            ("other", None)
+        };
+        let path = if base_path.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{base_path}/{name}")
+        };
+        entries.push((path, kind, size_bytes));
+        if entries.len() > limits.max_collection_items {
+            return Err(ToolError::runtime(format!(
+                "directory listing exceeds the {}-entry limit",
+                limits.max_collection_items
+            )));
+        }
+    }
+
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut payload_bytes = 0;
+    entries
+        .into_iter()
+        .map(|(path, kind, size_bytes)| {
+            payload_bytes += path.len() + kind.len();
+            if payload_bytes > limits.max_collection_payload_bytes {
+                return Err(ToolError::runtime(format!(
+                    "directory listing exceeds the {}-byte payload limit",
+                    limits.max_collection_payload_bytes
+                )));
+            }
+            Ok(ToolValue::Dictionary(BTreeMap::from([
+                ("path".to_owned(), ToolValue::String(path)),
+                ("kind".to_owned(), ToolValue::String(kind.to_owned())),
+                (
+                    "size_bytes".to_owned(),
+                    size_bytes.map_or(ToolValue::None, ToolValue::Integer),
+                ),
+            ])))
+        })
+        .collect()
+}
+
+fn normalised_path_string(path: &Path) -> String {
+    path.components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .expect("normalised paths originate from UTF-8 tool arguments")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn open_directory_root(workspace: &Dir, path: &Path) -> Result<Dir, ToolError> {
+    let (parent, file_name) = open_parent(workspace, path)?;
+    if path.as_os_str().is_empty() {
+        return Ok(parent);
+    }
+    let metadata = parent
+        .symlink_metadata(&file_name)
+        .map_err(ToolError::from_io)?;
+    if metadata.file_type().is_symlink() {
+        return Err(ToolError::permission(
+            "workspace paths cannot traverse symbolic links",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(ToolError::new(
+            ToolErrorKind::NotADirectory,
+            "path is not a directory",
+        ));
+    }
+    open_directory_no_follow(&parent, &file_name)
 }
 
 fn open_parent(workspace: &Dir, path: &Path) -> Result<(Dir, PathBuf), ToolError> {
@@ -546,8 +961,10 @@ fn read_limited(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, ToolError>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
     #[cfg(unix)]
     use std::ffi::CString;
@@ -571,6 +988,16 @@ mod tests {
             .unwrap()
     }
 
+    async fn tool_host_with_collection_limits(
+        workspace: &TempDir,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> ToolHost {
+        ToolHost::with_collection_limits(workspace.path(), max_items, max_payload_bytes)
+            .await
+            .unwrap()
+    }
+
     async fn read(host: &ToolHost, path: &str) -> Result<String, ToolErrorKind> {
         let result = host
             .call(ToolCall {
@@ -589,6 +1016,251 @@ mod tests {
 
     async fn read_error(host: &ToolHost, path: &str) -> ToolErrorKind {
         read(host, path).await.unwrap_err()
+    }
+
+    async fn list_dir(
+        host: &ToolHost,
+        arguments: Vec<ToolValue>,
+    ) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::ListDir,
+                arguments: ToolValue::List(arguments),
+            })
+            .await;
+        assert_eq!(result.call_id, 7);
+        match result.result {
+            Ok(ToolValue::List(entries)) => Ok(entries),
+            Ok(value) => panic!("list_dir returned {value:?} instead of a list"),
+            Err(error) => Err(error.kind),
+        }
+    }
+
+    async fn list_dir_path(host: &ToolHost, path: &str) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        list_dir(host, vec![ToolValue::String(path.to_owned())]).await
+    }
+
+    async fn list_dir_error(host: &ToolHost, path: &str) -> ToolErrorKind {
+        list_dir_path(host, path).await.unwrap_err()
+    }
+
+    fn directory_entry(path: &str, kind: &str, size_bytes: Option<i64>) -> ToolValue {
+        ToolValue::Dictionary(BTreeMap::from([
+            ("path".to_owned(), ToolValue::String(path.to_owned())),
+            ("kind".to_owned(), ToolValue::String(kind.to_owned())),
+            (
+                "size_bytes".to_owned(),
+                size_bytes.map_or(ToolValue::None, ToolValue::Integer),
+            ),
+        ]))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_maps_direct_root_kinds_to_distinct_errors() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::create_dir(outside.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        for path in ["missing"] {
+            assert_eq!(
+                list_dir_error(&host, path).await,
+                ToolErrorKind::FileNotFound
+            );
+        }
+        for path in ["file", "fifo", "socket"] {
+            assert_eq!(
+                list_dir_error(&host, path).await,
+                ToolErrorKind::NotADirectory
+            );
+        }
+        for path in ["inside-link", "outside-link", "broken-link"] {
+            assert_eq!(list_dir_error(&host, path).await, ToolErrorKind::Permission);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_lists_sorted_immediate_entries_without_filtering() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("z"), "z").unwrap();
+        fs::write(workspace.path().join("a-file"), "file").unwrap();
+        fs::create_dir(workspace.path().join("b-directory")).unwrap();
+        fs::write(workspace.path().join(".hidden"), "hidden").unwrap();
+        fs::write(workspace.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(workspace.path().join("ignored.txt"), "ignored").unwrap();
+        std::os::unix::fs::symlink("a-file", workspace.path().join("c-link")).unwrap();
+        create_fifo(&workspace.path().join("d-fifo"));
+        let host = tool_host(&workspace).await;
+
+        let entries = tokio::time::timeout(Duration::from_millis(100), list_dir(&host, Vec::new()))
+            .await
+            .expect("listing a FIFO must not block")
+            .unwrap();
+
+        assert_eq!(
+            entries,
+            [
+                directory_entry(".gitignore", "file", Some(12)),
+                directory_entry(".hidden", "file", Some(6)),
+                directory_entry("a-file", "file", Some(4)),
+                directory_entry("b-directory", "directory", None),
+                directory_entry("c-link", "symlink", None),
+                directory_entry("d-fifo", "other", None),
+                directory_entry("ignored.txt", "file", Some(7)),
+                directory_entry("z", "file", Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_normalises_workspace_relative_output_paths() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("nested/file"), "contents").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            list_dir_path(&host, "./nested//.").await.unwrap(),
+            [directory_entry("nested/file", "file", Some(8))]
+        );
+        for path in ["/outside", "../outside", "nested/../file"] {
+            assert_eq!(list_dir_error(&host, path).await, ToolErrorKind::Permission);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_refuses_inside_and_outside_intermediate_symlinks() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::create_dir(outside.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        for path in ["inside-link/file", "outside-link/file"] {
+            assert_eq!(list_dir_error(&host, path).await, ToolErrorKind::Permission);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn list_dir_rejects_any_non_utf8_entry_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("valid"), "contents").unwrap();
+        fs::write(
+            workspace.path().join(OsStr::from_bytes(b"\xff")),
+            "contents",
+        )
+        .unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(list_dir(&host, Vec::new()).await, Err(ToolErrorKind::Value));
+    }
+
+    #[tokio::test]
+    async fn list_dir_enforces_exact_item_and_payload_limits_without_results() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("aa"), "").unwrap();
+        fs::write(workspace.path().join("bb"), "").unwrap();
+
+        let at_item_limit = tool_host_with_collection_limits(&workspace, 2, 12).await;
+        assert_eq!(
+            list_dir(&at_item_limit, Vec::new()).await.unwrap(),
+            [
+                directory_entry("aa", "file", Some(0)),
+                directory_entry("bb", "file", Some(0)),
+            ]
+        );
+
+        let over_item_limit = tool_host_with_collection_limits(&workspace, 1, 12).await;
+        assert_eq!(
+            list_dir(&over_item_limit, Vec::new()).await,
+            Err(ToolErrorKind::Runtime)
+        );
+
+        let at_payload_limit = tool_host_with_collection_limits(&workspace, 2, 12).await;
+        assert_eq!(
+            list_dir(&at_payload_limit, Vec::new()).await.unwrap().len(),
+            2
+        );
+        let over_payload_limit = tool_host_with_collection_limits(&workspace, 2, 11).await;
+        assert_eq!(
+            list_dir(&over_payload_limit, Vec::new()).await,
+            Err(ToolErrorKind::Runtime)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_rejects_malformed_arguments_as_type_errors() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        for arguments in [
+            ToolValue::None,
+            ToolValue::Bool(true),
+            ToolValue::Integer(1),
+            ToolValue::Float(1.0),
+            ToolValue::String("path".to_owned()),
+            ToolValue::List(vec![ToolValue::None]),
+            ToolValue::List(vec![ToolValue::String("a".to_owned()), ToolValue::None]),
+            ToolValue::Dictionary(Default::default()),
+        ] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 1,
+                    tool: ToolName::ListDir,
+                    arguments,
+                })
+                .await;
+            assert!(matches!(result.result, Err(ref error) if error.kind == ToolErrorKind::Type));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_list_dir_does_not_stop_a_read_future() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let gate = super::ListDirTestGate::new();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_list_dir_test_gate(gate.clone()),
+        );
+        let list_host = Arc::clone(&host);
+        let mut listing = tokio::spawn(async move { list_dir(&list_host, Vec::new()).await });
+
+        gate.wait_until_list_dir_started().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), read(&host, "file"))
+                .await
+                .expect("read should make progress while listing is blocked")
+                .unwrap(),
+            "contents"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut listing)
+                .await
+                .is_err()
+        );
+        gate.resume_list_dir();
+        assert_eq!(listing.await.unwrap().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -763,23 +1435,36 @@ mod tests {
     }
 
     #[test]
-    fn generated_sources_share_one_read_definition() {
+    fn generated_sources_share_read_and_list_dir_definitions() {
         assert_eq!(
             bootstrap_source(),
             concat!(
+                "from dataclasses import dataclass\n\n",
+                "@dataclass\n",
+                "class DirectoryEntry:\n",
+                "    path: str\n",
+                "    kind: str\n",
+                "    size_bytes: int | None\n\n",
                 "async def read(path: str) -> str:\n",
                 "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
-                "    return await _kiki_read(path)"
+                "    return await _kiki_read(path)\n\n",
+                "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
+                "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
+                "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]"
             )
         );
         let reference = prompt_reference();
-        assert_eq!(
-            reference
-                .matches("async def read(path: str) -> str:")
-                .count(),
-            1
-        );
+        for signature in [
+            "async def read(path: str) -> str:",
+            "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+        ] {
+            assert_eq!(reference.matches(signature).count(), 1);
+        }
+        assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
+        for unavailable in ["glob(", "grep(", "write(", "edit(", "run("] {
+            assert!(!reference.contains(unavailable));
+        }
     }
 }

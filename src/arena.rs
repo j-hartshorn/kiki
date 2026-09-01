@@ -974,8 +974,10 @@ fn tool_error(error: ToolError) -> MontyException {
         ToolErrorKind::Type => ExcType::TypeError,
         ToolErrorKind::FileNotFound => ExcType::FileNotFoundError,
         ToolErrorKind::IsADirectory => ExcType::IsADirectoryError,
+        ToolErrorKind::NotADirectory => ExcType::NotADirectoryError,
         ToolErrorKind::Permission => ExcType::PermissionError,
         ToolErrorKind::Value => ExcType::ValueError,
+        ToolErrorKind::Runtime => ExcType::RuntimeError,
         ToolErrorKind::Os => ExcType::OSError,
     };
     MontyException::new(exc_type, Some(error.to_string()))
@@ -991,6 +993,7 @@ fn tool_resume_value(result: ToolResult) -> ResumeValue {
 fn tool_summary(result: &ToolResult) -> ToolCallSummary {
     match &result.result {
         Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
+        Ok(ToolValue::List(entries)) => ToolCallSummary::Count(entries.len()),
         Ok(_) => ToolCallSummary::Count(0),
         Err(_) => ToolCallSummary::Failed,
     }
@@ -1591,6 +1594,21 @@ mod tests {
         .expect("create arena")
     }
 
+    async fn arena_with_collection_limits(
+        workspace: &TempDir,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Arena {
+        Arena::new(
+            worker_path(),
+            ToolHost::with_collection_limits(workspace.path(), max_items, max_payload_bytes)
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena")
+    }
+
     async fn arena_with_read_gate(workspace: &TempDir) -> (Arena, ReadTestGate) {
         let gate = ReadTestGate::new();
         let tool_host = ToolHost::new(workspace.path())
@@ -1864,6 +1882,103 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn list_dir_returns_dataclass_entries_and_survives_checkpoint_restore() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "four").unwrap();
+        let mut arena = arena(&workspace).await;
+        let checkpoint = arena.checkpoint();
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entries = await list_dir()\nentry = entries[0]\nentry.path == 'file' and entry.kind == 'file' and entry.size_bytes == 4",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        arena.restore(checkpoint).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entry = (await list_dir('./'))[0]\nentry.path == 'file'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn private_list_dir_accepts_zero_or_one_positional_string_arguments() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "entries = await _kiki_list_dir()\nentries[0]['path']",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'file'");
+
+        for code in [
+            "await _kiki_list_dir(1)",
+            "await _kiki_list_dir('.', '.')",
+            "await _kiki_list_dir(path='.')",
+            "await _kiki_list_dir({'path': '.'})",
+        ] {
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("TypeError"));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_maps_not_a_directory_and_collection_overflow_to_builtin_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "result = 'allowed'\ntry:\n    await list_dir('file')\nexcept Exception as error:\n    result = type(error).__name__\nresult",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'NotADirectoryError'");
+
+        let mut arena = arena_with_collection_limits(&workspace, 0, usize::MAX).await;
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "result = 'allowed'\ntry:\n    await list_dir()\nexcept Exception as error:\n    result = type(error).__name__\nresult",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'RuntimeError'");
+    }
+
+    #[tokio::test]
+    async fn list_dir_call_trace_counts_returned_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "").unwrap();
+        fs::write(workspace.path().join("b"), "").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(&mut arena, "len(await list_dir())")
+            .await
+            .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "2");
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::ListDir,
+                summary: ToolCallSummary::Count(2),
+            }]
+        );
     }
 
     #[tokio::test]
