@@ -136,6 +136,14 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c' | 'C') => {
+                    if !self.is_submission_disabled() && !self.prompt.is_empty() {
+                        self.prompt.take();
+                        return Update {
+                            command: None,
+                            visible_changed: true,
+                            quit: false,
+                        };
+                    }
                     return Update {
                         command: (!self.is_configuration_only())
                             .then_some(RuntimeCommand::Shutdown),
@@ -221,6 +229,22 @@ impl App {
         match key.code {
             KeyCode::Left if command => Some(PromptEdit::LineStart),
             KeyCode::Right if command => Some(PromptEdit::LineEnd),
+            KeyCode::Up if command => Some(PromptEdit::PromptStart),
+            KeyCode::Down if command => Some(PromptEdit::PromptEnd),
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Some(PromptEdit::WordLeft)
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                Some(PromptEdit::WordRight)
+            }
             KeyCode::Left if key.modifiers.is_empty() => Some(PromptEdit::Left),
             KeyCode::Right if key.modifiers.is_empty() => Some(PromptEdit::Right),
             KeyCode::Up if key.modifiers.is_empty() => Some(PromptEdit::Up),
@@ -232,18 +256,40 @@ impl App {
                 Some(PromptEdit::DeletePreviousWord)
             }
             KeyCode::Backspace => Some(PromptEdit::DeletePreviousGrapheme),
+            KeyCode::Delete if command => Some(PromptEdit::DeleteToLineEnd),
             KeyCode::Delete => Some(PromptEdit::DeleteNextGrapheme),
             KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::LineStart)
             }
+            KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(PromptEdit::Left)
+            }
+            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(PromptEdit::DeleteNextGrapheme)
+            }
             KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::LineEnd)
+            }
+            KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(PromptEdit::Right)
+            }
+            KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(PromptEdit::DeleteToLineEnd)
             }
             KeyCode::Char('w' | 'W') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::DeletePreviousWord)
             }
             KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::DeleteToLineStart)
+            }
+            KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(PromptEdit::WordLeft)
+            }
+            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(PromptEdit::DeleteNextWord)
+            }
+            KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(PromptEdit::WordRight)
             }
             KeyCode::Char(character)
                 if !key.modifiers.intersects(
@@ -545,7 +591,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             ""
         };
         format!(
-            "Status: {} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit",
+            "Status: {} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C clear/quit",
             app.transcript.status()
         )
     };
@@ -1173,6 +1219,136 @@ mod tests {
     }
 
     #[test]
+    fn alt_word_navigation_moves_without_inserting_terminal_letters() {
+        for event in [
+            modified_key(KeyCode::Char('b'), KeyModifiers::ALT),
+            modified_key(KeyCode::Left, KeyModifiers::ALT),
+        ] {
+            let mut app = app_with_prompt("one two");
+            assert!(app.handle_key(event).visible_changed);
+            type_prompt(&mut app, ">");
+            assert_eq!(submitted_prompt(&mut app), "one >two");
+        }
+
+        for event in [
+            modified_key(KeyCode::Char('f'), KeyModifiers::ALT),
+            modified_key(KeyCode::Right, KeyModifiers::ALT),
+        ] {
+            let mut app = app_with_prompt("one two");
+            assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+            for _ in 0..4 {
+                assert!(app.handle_key(key(KeyCode::Right)).visible_changed);
+            }
+            assert!(app.handle_key(event).visible_changed);
+            type_prompt(&mut app, "!");
+            assert_eq!(submitted_prompt(&mut app), "one two!");
+        }
+    }
+
+    #[test]
+    fn control_navigation_shortcuts_move_by_character_and_word() {
+        let mut app = app_with_prompt("one two");
+        assert!(
+            app.handle_key(modified_key(KeyCode::Left, KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        type_prompt(&mut app, ">");
+        assert_eq!(submitted_prompt(&mut app), "one >two");
+
+        let mut app = app_with_prompt("one two");
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert!(
+            app.handle_key(modified_key(KeyCode::Right, KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        type_prompt(&mut app, ">");
+        assert_eq!(submitted_prompt(&mut app), "one> two");
+
+        let mut app = app_with_prompt("abc");
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('b'), KeyModifiers::CONTROL,))
+                .visible_changed
+        );
+        type_prompt(&mut app, ">");
+        assert_eq!(submitted_prompt(&mut app), "ab>c");
+
+        let mut app = app_with_prompt("abc");
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('f'), KeyModifiers::CONTROL,))
+                .visible_changed
+        );
+        type_prompt(&mut app, ">");
+        assert_eq!(submitted_prompt(&mut app), "a>bc");
+    }
+
+    #[test]
+    fn command_up_and_down_move_to_prompt_boundaries() {
+        for modifiers in [KeyModifiers::SUPER, KeyModifiers::META] {
+            let mut app = app_with_prompt("one\ntwo");
+            assert!(
+                app.handle_key(modified_key(KeyCode::Up, modifiers))
+                    .visible_changed
+            );
+            type_prompt(&mut app, ">");
+            assert_eq!(submitted_prompt(&mut app), ">one\ntwo");
+
+            let mut app = app_with_prompt("one\ntwo");
+            assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+            assert!(
+                app.handle_key(modified_key(KeyCode::Down, modifiers))
+                    .visible_changed
+            );
+            type_prompt(&mut app, ">");
+            assert_eq!(submitted_prompt(&mut app), "one\ntwo>");
+        }
+    }
+
+    #[test]
+    fn control_d_deletes_the_next_grapheme() {
+        let mut app = app_with_prompt("🦀x");
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL,))
+                .visible_changed
+        );
+        assert_eq!(submitted_prompt(&mut app), "x");
+    }
+
+    #[test]
+    fn alt_d_deletes_the_next_word() {
+        for (prompt, offset, expected) in [("one two", 4, "one "), ("can't", 3, "can")] {
+            let mut app = app_with_prompt(prompt);
+            assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+            for _ in 0..offset {
+                assert!(app.handle_key(key(KeyCode::Right)).visible_changed);
+            }
+
+            assert!(
+                app.handle_key(modified_key(KeyCode::Char('d'), KeyModifiers::ALT,))
+                    .visible_changed
+            );
+            assert_eq!(submitted_prompt(&mut app), expected);
+        }
+    }
+
+    #[test]
+    fn control_k_and_command_delete_remove_to_line_end() {
+        for event in [
+            modified_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Delete, KeyModifiers::SUPER),
+            modified_key(KeyCode::Delete, KeyModifiers::META),
+        ] {
+            let mut app = app_with_prompt("one\ntwo");
+            assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+            assert!(app.handle_key(key(KeyCode::Right)).visible_changed);
+            assert!(app.handle_key(event).visible_changed);
+            assert_eq!(submitted_prompt(&mut app), "one\nt");
+        }
+    }
+
+    #[test]
     fn editable_prompt_maps_word_line_and_portable_modifier_shortcuts() {
         for event in [
             modified_key(KeyCode::Backspace, KeyModifiers::ALT),
@@ -1372,10 +1548,11 @@ mod tests {
     fn configured_header_without_keyboard_enhancement_omits_newline_hint() {
         let mut app = App::default();
 
-        let header = rendered(&mut app, 120, 4);
+        let header = rendered(&mut app, 200, 4);
 
         assert!(header.starts_with("Status: idle | Enter submit"));
         assert!(header.contains("Arrows edit | PgUp/PgDn scroll"));
+        assert!(header.contains("Ctrl-C clear/quit"));
         assert!(!header.contains("Up/Down scroll"));
         assert!(!header.contains("Shift-Enter newline"));
     }
@@ -1649,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn active_run_accepts_cancel_but_not_submit_and_ctrl_c_shuts_down() {
+    fn active_run_accepts_cancel_but_not_submit() {
         let mut app = App::default();
         assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(7) }));
         app.handle_key(key(KeyCode::Char('x')));
@@ -1659,10 +1836,27 @@ mod tests {
             app.handle_key(key(KeyCode::Esc)).command,
             Some(RuntimeCommand::Cancel)
         );
+    }
 
-        let shutdown = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert_eq!(shutdown.command, Some(RuntimeCommand::Shutdown));
-        assert!(shutdown.quit);
+    #[test]
+    fn ctrl_c_clears_a_prompt_then_shuts_down_when_it_is_empty() {
+        for active in [false, true] {
+            let mut app = app_with_prompt("draft");
+            if active {
+                assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(7) }));
+            }
+
+            let clear = app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(clear.command.is_none());
+            assert!(clear.visible_changed);
+            assert!(!clear.quit);
+            assert!(app.prompt.is_empty());
+
+            let shutdown = app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert_eq!(shutdown.command, Some(RuntimeCommand::Shutdown));
+            assert!(!shutdown.visible_changed);
+            assert!(shutdown.quit);
+        }
     }
 
     #[test]
