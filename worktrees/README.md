@@ -17,3 +17,5 @@ git branch -d work/<descriptive-slug>
 ```
 
 Use the same descriptive slug for the branch and directory. Remove a discarded worktree with `git worktree remove worktrees/<descriptive-slug>` and then `git branch -D work/<descriptive-slug>`.
+
+Planning work and documentation updates can happen on main, no need for a branch or worktree to create a spec or plan.
