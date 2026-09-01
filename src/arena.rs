@@ -2077,6 +2077,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_returns_dataclass_matches_and_survives_checkpoint_restore() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("lines.txt"),
+            "skip\nmatch first\r\nmatch last",
+        )
+        .unwrap();
+        let mut arena = arena(&workspace).await;
+        let checkpoint = arena.checkpoint();
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "matches = await grep('^match')\nfirst = matches[0]\nfirst.path == 'lines.txt' and first.line == 2 and first.text == 'match first' and len(matches) == 2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        arena.restore(checkpoint).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "match = (await grep('last', './lines.txt'))[0]\nmatch.path == 'lines.txt' and match.line == 3 and match.text == 'match last'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn private_grep_accepts_one_to_three_positional_arguments_and_maps_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/file.rs"), "match\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "matches = await _kiki_grep('match')\nlen(matches)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "1");
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "matches = await _kiki_grep('match', 'src')\nmatches[0]['path']",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'src/file.rs'");
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "matches = await _kiki_grep('match', 'src', '*.rs')\nmatches[0]['path']",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'src/file.rs'");
+
+        let execution =
+            execute_without_cancellation(&mut arena, "len(await _kiki_grep('match', 'src', None))")
+                .await
+                .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "1");
+
+        for code in [
+            "await _kiki_grep()",
+            "await _kiki_grep(1)",
+            "await _kiki_grep('match', '.', 1)",
+            "await _kiki_grep('match', '.', None, 'extra')",
+            "await _kiki_grep(pattern='match')",
+            "await _kiki_grep({'pattern': 'match'})",
+        ] {
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("TypeError"));
+        }
+
+        for code in ["await grep('[')", "await grep('match', '.', '[')"] {
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("ValueError"));
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_call_trace_counts_returned_matches() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.rs"), "match\n").unwrap();
+        fs::write(workspace.path().join("b.rs"), "match\nmatch\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(&mut arena, "len(await grep('match'))")
+            .await
+            .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "3");
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::from_private_name("_kiki_grep")
+                    .expect("grep must be an active host tool"),
+                summary: ToolCallSummary::Count(3),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_read_is_a_model_visible_python_error() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;

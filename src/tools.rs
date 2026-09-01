@@ -11,6 +11,9 @@ use cap_std::fs::{Dir, File, Metadata};
 #[cfg(unix)]
 use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use globset::{GlobBuilder, GlobMatcher};
+use grep_matcher::LineTerminator;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkError, SinkMatch};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use thiserror::Error;
 #[cfg(test)]
@@ -36,6 +39,7 @@ pub(crate) enum ToolName {
     Read,
     ListDir,
     Glob,
+    Grep,
 }
 
 impl ToolName {
@@ -44,6 +48,7 @@ impl ToolName {
             Self::Read => "read",
             Self::ListDir => "list_dir",
             Self::Glob => "glob",
+            Self::Grep => "grep",
         }
     }
 
@@ -52,6 +57,7 @@ impl ToolName {
             Self::Read => "_kiki_read",
             Self::ListDir => "_kiki_list_dir",
             Self::Glob => "_kiki_glob",
+            Self::Grep => "_kiki_grep",
         }
     }
 
@@ -72,6 +78,8 @@ impl ToolName {
             (Self::Read, _) => "bytes",
             (Self::ListDir | Self::Glob, 1) => "entry",
             (Self::ListDir | Self::Glob, _) => "entries",
+            (Self::Grep, 1) => "match",
+            (Self::Grep, _) => "matches",
         }
     }
 }
@@ -165,12 +173,14 @@ pub(crate) struct ToolParameter {
 #[derive(Clone, Copy)]
 enum ToolDefault {
     String(&'static str),
+    None,
 }
 
 impl ToolDefault {
     fn source(self) -> String {
         match self {
             Self::String(value) => format!("{value:?}"),
+            Self::None => "None".to_owned(),
         }
     }
 }
@@ -178,14 +188,18 @@ impl ToolDefault {
 #[derive(Clone, Copy)]
 pub(crate) enum ToolValueType {
     String,
+    Integer,
     OptionalInteger,
+    OptionalString,
 }
 
 impl ToolValueType {
     fn annotation(self) -> &'static str {
         match self {
             Self::String => "str",
+            Self::Integer => "int",
             Self::OptionalInteger => "int | None",
+            Self::OptionalString => "str | None",
         }
     }
 }
@@ -270,6 +284,26 @@ const DIRECTORY_ENTRY: ToolRecord = ToolRecord {
     fields: DIRECTORY_ENTRY_FIELDS,
 };
 
+const GREP_MATCH_FIELDS: &[ToolRecordField] = &[
+    ToolRecordField {
+        name: "path",
+        value_type: ToolValueType::String,
+    },
+    ToolRecordField {
+        name: "line",
+        value_type: ToolValueType::Integer,
+    },
+    ToolRecordField {
+        name: "text",
+        value_type: ToolValueType::String,
+    },
+];
+
+const GREP_MATCH: ToolRecord = ToolRecord {
+    name: "GrepMatch",
+    fields: GREP_MATCH_FIELDS,
+};
+
 const LIST_DIR_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     name: "path",
     value_type: ToolValueType::String,
@@ -286,6 +320,24 @@ const GLOB_PARAMETERS: &[ToolParameter] = &[
         name: "path",
         value_type: ToolValueType::String,
         default: Some(ToolDefault::String(".")),
+    },
+];
+
+const GREP_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "pattern",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: Some(ToolDefault::String(".")),
+    },
+    ToolParameter {
+        name: "file_glob",
+        value_type: ToolValueType::OptionalString,
+        default: Some(ToolDefault::None),
     },
 ];
 
@@ -307,6 +359,12 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         parameters: GLOB_PARAMETERS,
         result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
         description: "Match workspace filesystem entries recursively.",
+    },
+    ToolDefinition {
+        name: ToolName::Grep,
+        parameters: GREP_PARAMETERS,
+        result: ToolResultShape::RecordList(&GREP_MATCH),
+        description: "Search workspace file contents with a regular expression.",
     },
 ];
 
@@ -670,6 +728,7 @@ impl ToolHost {
             ToolName::Read => self.read(arguments).await,
             ToolName::ListDir => self.list_dir(arguments).await,
             ToolName::Glob => self.glob(arguments).await,
+            ToolName::Grep => self.grep(arguments).await,
         };
         ToolResult { call_id, result }
     }
@@ -716,6 +775,23 @@ impl ToolHost {
             .await
             .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
             .map(ToolValue::List)
+    }
+
+    async fn grep(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+        let (pattern, path, file_glob) = grep_arguments(arguments)?;
+        let matcher = compile_regex(&pattern)?;
+        let file_glob = match file_glob {
+            Some(file_glob) => compile_glob(&file_glob)?,
+            None => compile_glob("*")?,
+        };
+        let workspace = Arc::clone(&self.workspace);
+        let limits = self.limits;
+        tokio::task::spawn_blocking(move || {
+            grep_workspace(&workspace, &path, matcher, file_glob, limits)
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+        .map(ToolValue::List)
     }
 
     #[cfg(test)]
@@ -768,6 +844,37 @@ fn glob_arguments(arguments: ToolValue) -> Result<(String, PathBuf), ToolError> 
         }
         _ => Err(ToolError::type_error(
             "glob() expects one or two positional string arguments",
+        )),
+    }
+}
+
+fn grep_arguments(arguments: ToolValue) -> Result<(String, PathBuf, Option<String>), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "grep() expects one to three positional arguments: string pattern, string path, optional string file_glob",
+        ));
+    };
+    match arguments.as_slice() {
+        [ToolValue::String(pattern)] => Ok((pattern.clone(), PathBuf::new(), None)),
+        [ToolValue::String(pattern), ToolValue::String(path)] => {
+            Ok((pattern.clone(), normalise_path(path)?, None))
+        }
+        [
+            ToolValue::String(pattern),
+            ToolValue::String(path),
+            ToolValue::None,
+        ] => Ok((pattern.clone(), normalise_path(path)?, None)),
+        [
+            ToolValue::String(pattern),
+            ToolValue::String(path),
+            ToolValue::String(file_glob),
+        ] => Ok((
+            pattern.clone(),
+            normalise_path(path)?,
+            Some(file_glob.clone()),
+        )),
+        _ => Err(ToolError::type_error(
+            "grep() expects one to three positional arguments: string pattern, string path, optional string file_glob",
         )),
     }
 }
@@ -919,6 +1026,14 @@ fn compile_glob(pattern: &str) -> Result<(GlobMatcher, bool), ToolError> {
     Ok((glob.compile_matcher(), !pattern.contains('/')))
 }
 
+fn compile_regex(pattern: &str) -> Result<RegexMatcher, ToolError> {
+    let mut builder = RegexMatcherBuilder::new();
+    builder.multi_line(true).crlf(true).ban_byte(Some(b'\0'));
+    builder
+        .build(pattern)
+        .map_err(|_| ToolError::value("regular expression is invalid"))
+}
+
 #[derive(Clone)]
 struct IgnoreMatchers {
     rgignore: Gitignore,
@@ -1011,6 +1126,377 @@ fn glob_directory(
                 )));
             }
             Ok(directory_entry_value(path, kind, size_bytes))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct GrepMatchValue {
+    path: String,
+    line: i64,
+    text: String,
+}
+
+struct GrepDirectory {
+    directory: Dir,
+    path: PathBuf,
+    ignores: Vec<IgnoreMatchers>,
+}
+
+enum GrepFileFailure {
+    Binary,
+    InvalidUtf8,
+    NotRegular,
+    Tool(ToolError),
+}
+
+enum GrepSearchError {
+    Io(std::io::Error),
+    InvalidUtf8,
+    Other,
+}
+
+impl SinkError for GrepSearchError {
+    fn error_message<T: std::fmt::Display>(_message: T) -> Self {
+        Self::Other
+    }
+
+    fn error_io(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+struct GrepSink {
+    path: String,
+    matches: Vec<GrepMatchValue>,
+    payload_bytes: usize,
+    max_items: usize,
+    max_payload_bytes: usize,
+    overflowed: bool,
+    binary: bool,
+}
+
+impl GrepSink {
+    fn new(path: String, max_items: usize, max_payload_bytes: usize) -> Self {
+        Self {
+            path,
+            matches: Vec::new(),
+            payload_bytes: 0,
+            max_items,
+            max_payload_bytes,
+            overflowed: false,
+            binary: false,
+        }
+    }
+}
+
+impl Sink for GrepSink {
+    type Error = GrepSearchError;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        matched: &SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.matches.len() == self.max_items {
+            self.overflowed = true;
+            return Ok(true);
+        }
+        let text = matched
+            .bytes()
+            .strip_suffix(b"\n")
+            .and_then(|text| text.strip_suffix(b"\r").or(Some(text)))
+            .unwrap_or(matched.bytes());
+        let text = std::str::from_utf8(text).map_err(|_| GrepSearchError::InvalidUtf8)?;
+        let Some(payload_bytes) = self
+            .payload_bytes
+            .checked_add(self.path.len())
+            .and_then(|bytes| bytes.checked_add(text.len()))
+            .filter(|bytes| *bytes <= self.max_payload_bytes)
+        else {
+            self.overflowed = true;
+            return Ok(true);
+        };
+        let line = matched.line_number().ok_or(GrepSearchError::Other)?;
+        let line = i64::try_from(line).map_err(|_| GrepSearchError::Other)?;
+        self.matches.push(GrepMatchValue {
+            path: self.path.clone(),
+            line,
+            text: text.to_owned(),
+        });
+        self.payload_bytes = payload_bytes;
+        Ok(true)
+    }
+
+    fn binary_data(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        _binary_byte_offset: u64,
+    ) -> Result<bool, Self::Error> {
+        self.binary = true;
+        Ok(false)
+    }
+}
+
+struct Utf8ValidatingReader<R> {
+    reader: R,
+    pending: Vec<u8>,
+    invalid_utf8: bool,
+}
+
+impl<R> Utf8ValidatingReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pending: Vec::new(),
+            invalid_utf8: false,
+        }
+    }
+
+    fn invalid_utf8_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
+    }
+}
+
+impl<R: Read> Read for Utf8ValidatingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let count = self.reader.read(buffer)?;
+        if count == 0 {
+            if self.pending.is_empty() {
+                return Ok(0);
+            }
+            self.invalid_utf8 = true;
+            return Err(Self::invalid_utf8_error());
+        }
+
+        self.pending.extend_from_slice(&buffer[..count]);
+        match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.clear(),
+            Err(error) if error.error_len().is_some() => {
+                self.invalid_utf8 = true;
+                return Err(Self::invalid_utf8_error());
+            }
+            Err(error) => {
+                self.pending.drain(..error.valid_up_to());
+            }
+        }
+        Ok(count)
+    }
+}
+
+fn grep_workspace(
+    workspace: &Dir,
+    root: &Path,
+    matcher: RegexMatcher,
+    file_glob: (GlobMatcher, bool),
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    if root.as_os_str().is_empty() {
+        return grep_directory(workspace, root, &matcher, &file_glob, limits);
+    }
+
+    let (parent, file_name) = open_parent(workspace, root)?;
+    let metadata = parent
+        .symlink_metadata(&file_name)
+        .map_err(ToolError::from_io)?;
+    if metadata.file_type().is_symlink() {
+        return Err(ToolError::permission(
+            "workspace paths cannot traverse symbolic links",
+        ));
+    }
+    if metadata.is_dir() {
+        return grep_directory(workspace, root, &matcher, &file_glob, limits);
+    }
+    if !metadata.is_file() {
+        return Err(ToolError::value("path is not a regular file"));
+    }
+
+    let name = file_name
+        .to_str()
+        .expect("normalised paths originate from UTF-8 tool arguments");
+    if !matches_glob(&file_glob.0, file_glob.1, name, Path::new(name)) {
+        return Ok(Vec::new());
+    }
+    let path = normalised_path_string(root);
+    grep_regular_file(&parent, &file_name, path, &matcher, limits, 0, 0)
+        .map_err(grep_explicit_error)
+        .map(grep_values)
+}
+
+fn grep_directory(
+    workspace: &Dir,
+    root: &Path,
+    matcher: &RegexMatcher,
+    file_glob: &(GlobMatcher, bool),
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    let root_directory = open_directory_root(workspace, root)?;
+    let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    let mut root_path = PathBuf::new();
+    let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
+    for component in root.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("grep roots are normalised before traversal");
+        };
+        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
+        root_path.push(component);
+        ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
+    }
+
+    let mut directories = vec![GrepDirectory {
+        directory: root_directory,
+        path: root_path,
+        ignores,
+    }];
+    let mut matches = Vec::new();
+    let mut payload_bytes = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in directory.directory.entries().map_err(ToolError::from_io)? {
+            let entry = entry.map_err(ToolError::from_io)?;
+            let name = entry.file_name();
+            let path = directory.path.join(&name);
+            let metadata = directory
+                .directory
+                .symlink_metadata(&name)
+                .map_err(ToolError::from_io)?;
+            if is_hidden_name(&name) || is_ignored(&directory.ignores, &path, metadata.is_dir()) {
+                continue;
+            }
+            let name = name
+                .to_str()
+                .ok_or_else(|| ToolError::value("directory entry name is not valid UTF-8"))?;
+            if metadata.is_file() {
+                let relative_path = path
+                    .strip_prefix(root)
+                    .expect("grep entries remain beneath their requested root");
+                if matches_glob(&file_glob.0, file_glob.1, name, relative_path) {
+                    let file_matches = match grep_regular_file(
+                        &directory.directory,
+                        Path::new(name),
+                        normalised_path_string(&path),
+                        matcher,
+                        limits,
+                        matches.len(),
+                        payload_bytes,
+                    ) {
+                        Ok(matches) => matches,
+                        Err(
+                            GrepFileFailure::Binary
+                            | GrepFileFailure::InvalidUtf8
+                            | GrepFileFailure::NotRegular,
+                        ) => continue,
+                        Err(GrepFileFailure::Tool(error)) => return Err(error),
+                    };
+                    payload_bytes += file_matches
+                        .iter()
+                        .map(|matched| matched.path.len() + matched.text.len())
+                        .sum::<usize>();
+                    matches.extend(file_matches);
+                }
+            } else if metadata.is_dir() {
+                let child = open_directory_no_follow(&directory.directory, Path::new(name))?;
+                let mut child_ignores = directory.ignores.clone();
+                child_ignores.push(directory_ignore_matchers(&child, &path)?);
+                directories.push(GrepDirectory {
+                    directory: child,
+                    path,
+                    ignores: child_ignores,
+                });
+            }
+        }
+    }
+
+    matches.sort_by(|left, right| left.path.cmp(&right.path).then(left.line.cmp(&right.line)));
+    Ok(grep_values(matches))
+}
+
+fn grep_regular_file(
+    parent: &Dir,
+    name: &Path,
+    path: String,
+    matcher: &RegexMatcher,
+    limits: ToolLimits,
+    existing_items: usize,
+    existing_payload_bytes: usize,
+) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
+    #[cfg(unix)]
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        parent.open_with(name, &options).map_err(no_follow_io)
+    }
+    .map_err(GrepFileFailure::Tool)?;
+    #[cfg(not(unix))]
+    let mut file = parent
+        .open(name)
+        .map_err(ToolError::from_io)
+        .map_err(GrepFileFailure::Tool)?;
+    if !file
+        .metadata()
+        .map_err(ToolError::from_io)
+        .map_err(GrepFileFailure::Tool)?
+        .is_file()
+    {
+        return Err(GrepFileFailure::NotRegular);
+    }
+
+    let mut searcher_builder = SearcherBuilder::new();
+    searcher_builder
+        .line_terminator(LineTerminator::crlf())
+        .binary_detection(BinaryDetection::quit(b'\0'))
+        .bom_sniffing(false);
+    let mut searcher = searcher_builder.build();
+    let mut reader = Utf8ValidatingReader::new(&mut file);
+    let mut sink = GrepSink::new(
+        path,
+        limits.max_collection_items.saturating_sub(existing_items),
+        limits
+            .max_collection_payload_bytes
+            .saturating_sub(existing_payload_bytes),
+    );
+    let result = searcher.search_reader(matcher, &mut reader, &mut sink);
+    if sink.binary {
+        return Err(GrepFileFailure::Binary);
+    }
+    match result {
+        Ok(()) if sink.overflowed => Err(GrepFileFailure::Tool(ToolError::runtime(format!(
+            "grep results exceed the {}-match or {}-byte payload limit",
+            limits.max_collection_items, limits.max_collection_payload_bytes
+        )))),
+        Ok(()) => Ok(sink.matches),
+        Err(GrepSearchError::InvalidUtf8) => Err(GrepFileFailure::InvalidUtf8),
+        Err(GrepSearchError::Io(_)) if reader.invalid_utf8 => Err(GrepFileFailure::InvalidUtf8),
+        Err(GrepSearchError::Io(error)) => Err(GrepFileFailure::Tool(ToolError::from_io(error))),
+        Err(GrepSearchError::Other) => Err(GrepFileFailure::Tool(ToolError::new(
+            ToolErrorKind::Os,
+            "regular expression search failed",
+        ))),
+    }
+}
+
+fn grep_explicit_error(error: GrepFileFailure) -> ToolError {
+    match error {
+        GrepFileFailure::Binary => ToolError::value("file contains binary data"),
+        GrepFileFailure::InvalidUtf8 => ToolError::value("file is not valid UTF-8"),
+        GrepFileFailure::NotRegular => ToolError::value("path is not a regular file"),
+        GrepFileFailure::Tool(error) => error,
+    }
+}
+
+fn grep_values(matches: Vec<GrepMatchValue>) -> Vec<ToolValue> {
+    matches
+        .into_iter()
+        .map(|matched| {
+            ToolValue::Dictionary(BTreeMap::from([
+                ("path".to_owned(), ToolValue::String(matched.path)),
+                ("line".to_owned(), ToolValue::Integer(matched.line)),
+                ("text".to_owned(), ToolValue::String(matched.text)),
+            ]))
         })
         .collect()
 }
@@ -1284,8 +1770,8 @@ mod tests {
     use crate::config::constants::FILE_MAX_BYTES;
 
     use super::{
-        ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName, ToolValue, bootstrap_source,
-        prompt_reference,
+        ACTIVE_TOOLS, ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName, ToolValue,
+        Utf8ValidatingReader, bootstrap_source, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -1359,6 +1845,10 @@ mod tests {
         ToolName::from_private_name("_kiki_glob").expect("glob must be an active host tool")
     }
 
+    fn grep_tool() -> ToolName {
+        ToolName::from_private_name("_kiki_grep").expect("grep must be an active host tool")
+    }
+
     async fn glob(
         host: &ToolHost,
         arguments: Vec<ToolValue>,
@@ -1411,6 +1901,50 @@ mod tests {
         result.result.unwrap_err()
     }
 
+    async fn grep(
+        host: &ToolHost,
+        arguments: Vec<ToolValue>,
+    ) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: grep_tool(),
+                arguments: ToolValue::List(arguments),
+            })
+            .await;
+        assert_eq!(result.call_id, 7);
+        match result.result {
+            Ok(ToolValue::List(matches)) => Ok(matches),
+            Ok(value) => panic!("grep returned {value:?} instead of a list"),
+            Err(error) => Err(error.kind),
+        }
+    }
+
+    async fn grep_path(
+        host: &ToolHost,
+        pattern: &str,
+        path: &str,
+        file_glob: Option<&str>,
+    ) -> Result<Vec<ToolValue>, ToolErrorKind> {
+        let mut arguments = vec![
+            ToolValue::String(pattern.to_owned()),
+            ToolValue::String(path.to_owned()),
+        ];
+        if let Some(file_glob) = file_glob {
+            arguments.push(ToolValue::String(file_glob.to_owned()));
+        }
+        grep(host, arguments).await
+    }
+
+    async fn grep_error(
+        host: &ToolHost,
+        pattern: &str,
+        path: &str,
+        file_glob: Option<&str>,
+    ) -> ToolErrorKind {
+        grep_path(host, pattern, path, file_glob).await.unwrap_err()
+    }
+
     fn directory_entry(path: &str, kind: &str, size_bytes: Option<i64>) -> ToolValue {
         ToolValue::Dictionary(BTreeMap::from([
             ("path".to_owned(), ToolValue::String(path.to_owned())),
@@ -1419,6 +1953,14 @@ mod tests {
                 "size_bytes".to_owned(),
                 size_bytes.map_or(ToolValue::None, ToolValue::Integer),
             ),
+        ]))
+    }
+
+    fn grep_match(path: &str, line: i64, text: &str) -> ToolValue {
+        ToolValue::Dictionary(BTreeMap::from([
+            ("path".to_owned(), ToolValue::String(path.to_owned())),
+            ("line".to_owned(), ToolValue::Integer(line)),
+            ("text".to_owned(), ToolValue::String(text.to_owned())),
         ]))
     }
 
@@ -2164,6 +2706,472 @@ mod tests {
     }
 
     #[test]
+    fn grep_is_the_fourth_active_tool_with_match_evidence_labels() {
+        assert_eq!(
+            ACTIVE_TOOLS
+                .iter()
+                .map(|definition| definition.name.name())
+                .collect::<Vec<_>>(),
+            ["read", "list_dir", "glob", "grep"]
+        );
+        assert_eq!(ToolName::Grep.count_label(1), "match");
+        assert_eq!(ToolName::Grep.count_label(2), "matches");
+    }
+
+    #[tokio::test]
+    async fn grep_returns_one_record_per_matching_line_in_stable_path_and_line_order() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("src/nested")).unwrap();
+        fs::write(workspace.path().join("src/z.rs"), "match z\nmatch again\n").unwrap();
+        fs::write(
+            workspace.path().join("src/nested/a.rs"),
+            "skip\r\nmatch a\r\nmatch last",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("src/nested/a.py"), "match python\n").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            grep_path(&host, "^match", "src", Some("*.rs"))
+                .await
+                .unwrap(),
+            [
+                grep_match("src/nested/a.rs", 2, "match a"),
+                grep_match("src/nested/a.rs", 3, "match last"),
+                grep_match("src/z.rs", 1, "match z"),
+                grep_match("src/z.rs", 2, "match again"),
+            ]
+        );
+        assert_eq!(
+            grep_path(&host, "match", "src", Some("nested/*.rs"))
+                .await
+                .unwrap(),
+            [
+                grep_match("src/nested/a.rs", 2, "match a"),
+                grep_match("src/nested/a.rs", 3, "match last"),
+            ]
+        );
+        assert_eq!(
+            grep_path(&host, "^match a$", "src", Some("nested/*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("src/nested/a.rs", 2, "match a")]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_invalid_patterns_and_malformed_arguments() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            grep_error(&host, "[", ".", None).await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            grep_error(&host, "match", ".", Some("[")).await,
+            ToolErrorKind::Value
+        );
+        for arguments in [
+            ToolValue::None,
+            ToolValue::String("match".to_owned()),
+            ToolValue::List(Vec::new()),
+            ToolValue::List(vec![ToolValue::String("match".to_owned()), ToolValue::None]),
+            ToolValue::List(vec![
+                ToolValue::String("match".to_owned()),
+                ToolValue::String(".".to_owned()),
+                ToolValue::Integer(1),
+            ]),
+            ToolValue::List(vec![
+                ToolValue::String("match".to_owned()),
+                ToolValue::String(".".to_owned()),
+                ToolValue::None,
+                ToolValue::String("extra".to_owned()),
+            ]),
+            ToolValue::Dictionary(Default::default()),
+        ] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 1,
+                    tool: grep_tool(),
+                    arguments,
+                })
+                .await;
+            assert!(matches!(result.result, Err(ref error) if error.kind == ToolErrorKind::Type));
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_searches_files_larger_than_the_read_limit() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("large"),
+            format!("{}\nmatch\n", "x".repeat(FILE_MAX_BYTES)),
+        )
+        .unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            grep_path(&host, "^match$", "large", None).await.unwrap(),
+            [grep_match("large", 2, "match")]
+        );
+    }
+
+    #[test]
+    fn utf8_validating_reader_checks_chunk_boundaries_and_eof() {
+        use std::io::Read;
+
+        struct ChunkedReader {
+            chunks: Vec<Vec<u8>>,
+            next: usize,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+                let Some(chunk) = self.chunks.get(self.next) else {
+                    return Ok(0);
+                };
+                self.next += 1;
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut valid = Utf8ValidatingReader::new(ChunkedReader {
+            chunks: vec![b"match \xe2".to_vec(), b"\x82".to_vec(), b"\xac\n".to_vec()],
+            next: 0,
+        });
+        let mut contents = Vec::new();
+        valid.read_to_end(&mut contents).unwrap();
+        assert_eq!(std::str::from_utf8(&contents).unwrap(), "match €\n");
+
+        let mut invalid = Utf8ValidatingReader::new(ChunkedReader {
+            chunks: vec![b"match \xe2".to_vec(), b"(".to_vec()],
+            next: 0,
+        });
+        assert_eq!(
+            invalid.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut incomplete = Utf8ValidatingReader::new(ChunkedReader {
+            chunks: vec![b"match \xe2".to_vec()],
+            next: 0,
+        });
+        assert_eq!(
+            incomplete.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_classifies_roots_refuses_symlinks_and_never_opens_other_entries() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "match\n").unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("directory/file"), "match\n").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        fs::create_dir(outside.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("file", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        std::os::unix::fs::symlink("directory", workspace.path().join("directory-link")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            grep_path(&host, "match", "file", None).await.unwrap(),
+            [grep_match("file", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", "directory", None).await.unwrap(),
+            [grep_match("directory/file", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", "./directory//.", None)
+                .await
+                .unwrap(),
+            [grep_match("directory/file", 1, "match")]
+        );
+        for path in ["/outside", "../outside", "directory/../file"] {
+            assert_eq!(
+                grep_error(&host, "match", path, None).await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            grep_error(&host, "match", "missing", None).await,
+            ToolErrorKind::FileNotFound
+        );
+        for path in [
+            "inside-link",
+            "outside-link",
+            "broken-link",
+            "directory-link",
+            "directory-link/file",
+            "outside-link/file",
+        ] {
+            assert_eq!(
+                grep_error(&host, "match", path, None).await,
+                ToolErrorKind::Permission
+            );
+        }
+        for path in ["fifo", "socket"] {
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    grep_error(&host, "match", path, None)
+                )
+                .await
+                .expect("grepping an other entry must not block"),
+                ToolErrorKind::Value
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_applies_the_file_glob_before_explicit_file_content_validation() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("binary.txt"), b"match\n\0").unwrap();
+        fs::write(workspace.path().join("invalid.txt"), b"match\n\xff").unwrap();
+        fs::write(
+            workspace.path().join("utf16.txt"),
+            b"\xff\xfem\0a\0t\0c\0h\0\n\0",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("kept.rs"), "match\n").unwrap();
+        let host = tool_host(&workspace).await;
+
+        for path in ["binary.txt", "invalid.txt", "utf16.txt"] {
+            assert!(
+                grep_path(&host, "match", path, Some("*.rs"))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                grep_error(&host, "match", path, Some("*.txt")).await,
+                ToolErrorKind::Value
+            );
+        }
+        assert_eq!(
+            grep_path(&host, "match", "kept.rs", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("kept.rs", 1, "match")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_skips_traversed_non_regular_binary_invalid_and_symlink_entries() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("kept.rs"), "match\n").unwrap();
+        fs::write(workspace.path().join("binary.rs"), b"match\n\0").unwrap();
+        fs::write(workspace.path().join("invalid.rs"), b"not a match\n\xff").unwrap();
+        fs::write(
+            workspace.path().join("late-binary.rs"),
+            format!("match\n{}\0", "x".repeat(64 * 1024)),
+        )
+        .unwrap();
+        let mut late_invalid = format!("match\n{}", "x".repeat(64 * 1024)).into_bytes();
+        late_invalid.push(0xff);
+        fs::write(workspace.path().join("late-invalid.rs"), late_invalid).unwrap();
+        create_fifo(&workspace.path().join("fifo.rs"));
+        fs::write(outside.path().join("outside.rs"), "match\n").unwrap();
+        fs::create_dir(workspace.path().join("linked-directory")).unwrap();
+        fs::write(
+            workspace.path().join("linked-directory/match.rs"),
+            "match\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "linked-directory",
+            workspace.path().join("inside-directory-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("kept.rs", workspace.path().join("inside-link.rs")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.rs"),
+            workspace.path().join("outside-link.rs"),
+        )
+        .unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                grep_path(&host, "match", ".", Some("*.rs")),
+            )
+            .await
+            .expect("grepping a traversed FIFO must not block")
+            .unwrap(),
+            [
+                grep_match("kept.rs", 1, "match"),
+                grep_match("linked-directory/match.rs", 1, "match"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_reuses_hidden_and_project_ignore_filtering_but_accepts_explicit_roots() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join(".hidden/nested")).unwrap();
+        fs::create_dir(workspace.path().join("ignored-root")).unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".hidden/kept.rs"), "match\n").unwrap();
+        fs::write(
+            workspace.path().join(".hidden/nested/.hidden.rs"),
+            "match\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("ignored-root/kept.rs"), "match\n").unwrap();
+        fs::write(
+            workspace.path().join(".gitignore"),
+            "ignored-root/\n*.tmp\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("ignored.tmp"), "match\n").unwrap();
+        fs::write(workspace.path().join("nested/.rgignore"), "*.rs\n").unwrap();
+        fs::write(workspace.path().join("nested/ignored.rs"), "match\n").unwrap();
+        fs::write(workspace.path().join("nested/kept.rs"), "match\n").unwrap();
+        fs::write(workspace.path().join("visible.rs"), "match\n").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            grep_path(&host, "match", ".", Some("*.rs")).await.unwrap(),
+            [grep_match("visible.rs", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", ".hidden", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match(".hidden/kept.rs", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", ".hidden/kept.rs", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match(".hidden/kept.rs", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", "ignored-root", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("ignored-root/kept.rs", 1, "match")]
+        );
+        assert_eq!(
+            grep_path(&host, "match", "ignored-root/kept.rs", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("ignored-root/kept.rs", 1, "match")]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_preserves_ignore_family_precedence_and_negation() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".rgignore"), "candidate.rs\n").unwrap();
+        fs::write(
+            workspace.path().join("nested/.gitignore"),
+            "!candidate.rs\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("nested/candidate.rs"), "match\n").unwrap();
+        let host = tool_host(&workspace).await;
+        assert!(
+            grep_path(&host, "match", ".", Some("*.rs"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join(".rgignore"), "*.rs\n").unwrap();
+        fs::write(workspace.path().join("nested/.rgignore"), "!kept.rs\n").unwrap();
+        fs::write(workspace.path().join("nested/ignored.rs"), "match\n").unwrap();
+        fs::write(workspace.path().join("nested/kept.rs"), "match\n").unwrap();
+        let host = tool_host(&workspace).await;
+        assert_eq!(
+            grep_path(&host, "match", ".", Some("*.rs")).await.unwrap(),
+            [grep_match("nested/kept.rs", 1, "match")]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn grep_filters_hidden_and_ignored_non_utf8_names_before_rejecting_visible_ones() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let hidden = TempDir::new().unwrap();
+        fs::write(hidden.path().join(OsStr::from_bytes(b".\xff")), "match\n").unwrap();
+        fs::write(hidden.path().join("kept.rs"), "match\n").unwrap();
+        assert_eq!(
+            grep_path(&tool_host(&hidden).await, "match", ".", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("kept.rs", 1, "match")]
+        );
+
+        let ignored = TempDir::new().unwrap();
+        fs::write(ignored.path().join(".gitignore"), "ignored-*\n").unwrap();
+        fs::write(
+            ignored.path().join(OsStr::from_bytes(b"ignored-\xff")),
+            "match\n",
+        )
+        .unwrap();
+        fs::write(ignored.path().join("kept.rs"), "match\n").unwrap();
+        assert_eq!(
+            grep_path(&tool_host(&ignored).await, "match", ".", Some("*.rs"))
+                .await
+                .unwrap(),
+            [grep_match("kept.rs", 1, "match")]
+        );
+
+        let visible = TempDir::new().unwrap();
+        fs::write(
+            visible.path().join(OsStr::from_bytes(b"visible-\xff")),
+            "match\n",
+        )
+        .unwrap();
+        assert_eq!(
+            grep_error(&tool_host(&visible).await, "match", ".", Some("*.rs")).await,
+            ToolErrorKind::Value
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_enforces_exact_item_and_payload_limits_without_partial_results() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("aa"), "match\n").unwrap();
+        fs::write(workspace.path().join("bb"), "match\n").unwrap();
+
+        let at_limit = tool_host_with_collection_limits(&workspace, 2, 14).await;
+        assert_eq!(
+            grep_path(&at_limit, "match", ".", None).await.unwrap(),
+            [grep_match("aa", 1, "match"), grep_match("bb", 1, "match")]
+        );
+        let over_items = tool_host_with_collection_limits(&workspace, 1, 14).await;
+        assert_eq!(
+            grep_error(&over_items, "match", ".", None).await,
+            ToolErrorKind::Runtime
+        );
+        let over_payload = tool_host_with_collection_limits(&workspace, 2, 13).await;
+        assert_eq!(
+            grep_error(&over_payload, "match", ".", None).await,
+            ToolErrorKind::Runtime
+        );
+    }
+
+    #[test]
     fn generated_sources_share_active_tool_definitions() {
         assert_eq!(
             bootstrap_source(),
@@ -2174,6 +3182,11 @@ mod tests {
                 "    path: str\n",
                 "    kind: str\n",
                 "    size_bytes: int | None\n\n",
+                "@dataclass\n",
+                "class GrepMatch:\n",
+                "    path: str\n",
+                "    line: int\n",
+                "    text: str\n\n",
                 "async def read(path: str) -> str:\n",
                 "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
                 "    return await _kiki_read(path)\n\n",
@@ -2182,7 +3195,10 @@ mod tests {
                 "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
                 "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
                 "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
-                "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]"
+                "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
+                "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
+                "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
+                "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]"
             )
         );
         let reference = prompt_reference();
@@ -2190,13 +3206,15 @@ mod tests {
             "async def read(path: str) -> str:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
+            "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
+        assert_eq!(reference.matches("class GrepMatch:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
-        for unavailable in ["grep(", "write(", "edit(", "run("] {
+        for unavailable in ["write(", "edit(", "run("] {
             assert!(!reference.contains(unavailable));
         }
     }
