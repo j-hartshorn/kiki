@@ -6,7 +6,9 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
 
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
-use crate::arena::{Execution, ExecutionOutcome, Observation, ToolCall, ToolCallSummary};
+use crate::arena::{
+    Execution, ExecutionOutcome, Observation, ToolCall, ToolCallSummary, ToolCallToken,
+};
 use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress};
@@ -85,6 +87,7 @@ struct LiveStep {
     stdout: String,
     stdout_truncated: bool,
     tool_calls: Vec<ToolCall>,
+    tool_call_tokens: Vec<ToolCallToken>,
     progress_gap: bool,
     activity: String,
 }
@@ -102,6 +105,7 @@ impl LiveStep {
             stdout: String::new(),
             stdout_truncated: false,
             tool_calls: Vec::new(),
+            tool_call_tokens: Vec::new(),
             progress_gap,
             activity: "generating".to_owned(),
         }
@@ -1155,6 +1159,7 @@ impl Transcript {
             RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
+                token,
                 call,
             } => {
                 let activity = tool_call_label(call);
@@ -1168,13 +1173,13 @@ impl Transcript {
                         live.activity = activity;
                         if matches!(call.summary, ToolCallSummary::Pending) {
                             live.tool_calls.push(call);
-                        } else if let Some(pending) =
-                            live.tool_calls.iter_mut().rev().find(|pending| {
-                                pending.tool == call.tool
-                                    && matches!(pending.summary, ToolCallSummary::Pending)
-                            })
+                            live.tool_call_tokens.push(token);
+                        } else if let Some(index) = live
+                            .tool_call_tokens
+                            .iter()
+                            .position(|pending| *pending == token)
                         {
-                            *pending = call;
+                            live.tool_calls[index] = call;
                         }
                     },
                 )
@@ -2099,7 +2104,8 @@ mod tests {
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
+        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
+        ToolCallToken, ToolName,
     };
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
@@ -3542,6 +3548,7 @@ mod tests {
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(99),
                 step_id: ModelStepId(1),
+                token: ToolCallToken::for_test(0),
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
@@ -4415,6 +4422,7 @@ mod tests {
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                token: ToolCallToken::for_test(0),
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
@@ -4441,6 +4449,7 @@ mod tests {
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                token: ToolCallToken::for_test(0),
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),
@@ -4463,6 +4472,68 @@ mod tests {
         assert!(rendered.contains("╭tool calls"));
         assert!(!rendered.contains("read · pending"));
         assert!(!rendered.contains("README.md"));
+    }
+
+    #[test]
+    fn live_tool_updates_target_their_opaque_trace_tokens() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+        for token in [ToolCallToken::for_test(0), ToolCallToken::for_test(1)] {
+            transcript.apply(
+                RuntimeEvent::ToolUpdated {
+                    run_id: RunId(1),
+                    step_id: ModelStepId(1),
+                    token,
+                    call: ToolCall {
+                        tool: ToolName::Read,
+                        summary: ToolCallSummary::Pending,
+                    },
+                },
+                false,
+            );
+        }
+        for (token, summary) in [
+            (ToolCallToken::for_test(0), ToolCallSummary::Count(5)),
+            (ToolCallToken::for_test(1), ToolCallSummary::Failed),
+        ] {
+            transcript.apply(
+                RuntimeEvent::ToolUpdated {
+                    run_id: RunId(1),
+                    step_id: ModelStepId(1),
+                    token,
+                    call: ToolCall {
+                        tool: ToolName::Read,
+                        summary,
+                    },
+                },
+                false,
+            );
+        }
+
+        assert_eq!(
+            transcript
+                .live_step
+                .as_ref()
+                .expect("tool updates create a live step")
+                .tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(5),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -5058,6 +5129,7 @@ mod tests {
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
+                token: ToolCallToken::for_test(0),
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Pending,
@@ -5070,6 +5142,7 @@ mod tests {
             RuntimeEvent::ToolUpdated {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
+                token: ToolCallToken::for_test(0),
                 call: ToolCall {
                     tool: ToolName::Read,
                     summary: ToolCallSummary::Count(12),

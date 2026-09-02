@@ -782,7 +782,8 @@ mod tests {
     use super::App;
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
+        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
+        ToolCallToken, ToolName,
     };
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{PromptEdit, PromptEditor};
@@ -3190,6 +3191,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ToolUpdated {
             run_id: RunId(73),
             step_id: ModelStepId(91),
+            token: ToolCallToken::for_test(1_234_567),
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
@@ -3199,7 +3201,7 @@ mod tests {
         let screen = rendered(&mut app, 120, 4);
         let header = screen.lines().next().expect("status header");
         assert!(header.starts_with("Status: read · pending"));
-        for hidden in ["run 73", "step 91", "attempt"] {
+        for hidden in ["run 73", "step 91", "attempt", "1234567"] {
             assert!(!header.contains(hidden), "{header}");
         }
     }
@@ -3218,6 +3220,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ToolUpdated {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            token: ToolCallToken::for_test(0),
             call: ToolCall {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,

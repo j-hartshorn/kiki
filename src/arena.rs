@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::{StreamExt, stream};
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
@@ -16,7 +17,7 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
+    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, TOOL_CONCURRENCY_LIMIT},
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolResult, ToolValue,
         bootstrap_source,
@@ -98,8 +99,13 @@ pub enum ExecutionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ArenaProgress {
-    ToolUpdated { call: ToolCall },
-    StdoutDelta { text: String },
+    ToolUpdated {
+        token: ToolCallToken,
+        call: ToolCall,
+    },
+    StdoutDelta {
+        text: String,
+    },
     StdoutTruncated,
 }
 
@@ -117,7 +123,14 @@ pub(crate) struct ToolCall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ToolCallToken(usize);
+pub(crate) struct ToolCallToken(usize);
+
+#[cfg(test)]
+impl ToolCallToken {
+    pub(crate) fn for_test(value: usize) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Debug, Default)]
 struct ToolTraceState {
@@ -726,6 +739,13 @@ enum DriverError {
     Fatal(ArenaError),
 }
 
+struct PendingToolCall {
+    call_id: u32,
+    tool: ToolName,
+    arguments: ToolValue,
+    token: ToolCallToken,
+}
+
 async fn drive(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
@@ -757,6 +777,7 @@ async fn drive(
             Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
         };
 
+        let mut pending_calls = Vec::new();
         loop {
             event = match event {
                 TurnEvent::Complete(value) => break 'drive Ok(value),
@@ -823,53 +844,19 @@ async fn drive(
                                 continue;
                             }
                         };
-                        let pending = match with_print!(on_print => checkout
-                            .resume(ResumeValue::Future, &mut on_print)
-                            .await)
-                        {
-                            Ok(TurnEvent::ResolveFutures { pending_call_ids })
-                                if pending_call_ids.as_slice() == [call_id] =>
-                            {
-                                pending_call_ids
-                            }
-                            Ok(event) => {
-                                break 'drive Err(DriverError::Fatal(
-                                    ArenaError::unsupported_suspension(format!(
-                                        "expected one pending host future, got {event:?}"
-                                    )),
-                                ));
-                            }
-                            Err(PoolError::Runtime(error)) => {
-                                break 'drive Err(DriverError::Runtime(error));
-                            }
-                            Err(error) => {
-                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                            }
-                        };
                         let token = tools.admit(tool);
                         progress(ArenaProgress::ToolUpdated {
+                            token,
                             call: tools.call(token),
                         });
-                        let result = tool_host
-                            .call(HostToolCall {
-                                call_id,
-                                tool,
-                                arguments,
-                            })
-                            .await;
-                        assert_eq!(
-                            result.call_id, call_id,
-                            "tool result must retain its call ID"
-                        );
-                        let call = tools.settle(token, tool_summary(&result));
-                        #[cfg(test)]
-                        tool_host.wait_after_read_settled().await;
-                        progress(ArenaProgress::ToolUpdated { call });
+                        pending_calls.push(PendingToolCall {
+                            call_id,
+                            tool,
+                            arguments,
+                            token,
+                        });
                         match with_print!(on_print => checkout
-                            .resume_futures(
-                                vec![(pending[0], tool_resume_value(result))],
-                                &mut on_print,
-                            )
+                            .resume(ResumeValue::Future, &mut on_print)
                             .await)
                         {
                             Ok(event) => event,
@@ -910,13 +897,81 @@ async fn drive(
                     Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
                 },
                 TurnEvent::ResolveFutures { pending_call_ids } => {
-                    break 'drive Err(DriverError::Fatal(ArenaError::unsupported_suspension(
-                        format!("unexpected pending futures: {pending_call_ids:?}"),
-                    )));
+                    let pending = std::mem::take(&mut pending_calls);
+                    if !matches_pending_batch(&pending, &pending_call_ids) {
+                        break 'drive Err(DriverError::Fatal(ArenaError::unsupported_suspension(
+                            format!(
+                                "pending futures did not match admitted calls: {pending_call_ids:?}"
+                            ),
+                        )));
+                    }
+                    let mut results = BTreeMap::new();
+                    let mut calls = stream::iter(pending)
+                        .map(|call| async move {
+                            let result = tool_host
+                                .call(HostToolCall {
+                                    call_id: call.call_id,
+                                    tool: call.tool,
+                                    arguments: call.arguments,
+                                })
+                                .await;
+                            (call.token, call.call_id, result)
+                        })
+                        .buffer_unordered(TOOL_CONCURRENCY_LIMIT);
+                    while let Some((token, expected_call_id, result)) = calls.next().await {
+                        assert_eq!(
+                            result.call_id, expected_call_id,
+                            "tool result must retain its call ID"
+                        );
+                        let call_id = result.call_id;
+                        let summary = tool_summary(&result);
+                        assert!(
+                            results.insert(call_id, result).is_none(),
+                            "a host tool call must settle once"
+                        );
+                        let call = tools.settle(token, summary);
+                        #[cfg(test)]
+                        tool_host.wait_after_read_settled().await;
+                        progress(ArenaProgress::ToolUpdated { token, call });
+                        #[cfg(test)]
+                        tool_host.note_batch_driver_settled(call_id);
+                    }
+                    let results = pending_call_ids
+                        .into_iter()
+                        .map(|call_id| {
+                            let result = results
+                                .remove(&call_id)
+                                .expect("validated call ID must settle");
+                            (call_id, tool_resume_value(result))
+                        })
+                        .collect();
+                    #[cfg(test)]
+                    tool_host.note_batch_driver_resume_futures();
+                    match with_print!(on_print => checkout.resume_futures(results, &mut on_print).await)
+                    {
+                        Ok(event) => event,
+                        Err(PoolError::Runtime(error)) => {
+                            break 'drive Err(DriverError::Runtime(error));
+                        }
+                        Err(error) => {
+                            break 'drive Err(DriverError::Fatal(pool_failure(error)));
+                        }
+                    }
                 }
             };
         }
     }
+}
+
+fn matches_pending_batch(calls: &[PendingToolCall], pending_call_ids: &[u32]) -> bool {
+    let admitted = calls
+        .iter()
+        .map(|call| call.call_id)
+        .collect::<BTreeSet<_>>();
+    let requested = pending_call_ids.iter().copied().collect::<BTreeSet<_>>();
+    admitted.len() == calls.len()
+        && requested.len() == pending_call_ids.len()
+        && admitted == requested
 }
 
 fn tool_value_from_monty(value: MontyObject) -> Result<ToolValue, ToolError> {
@@ -1566,7 +1621,7 @@ mod tests {
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::tools::{ReadTestGate, ToolHost};
+    use crate::tools::{BatchTestGate, ReadTestGate, ToolHost};
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
         max_total_bytes: 100,
@@ -1621,6 +1676,18 @@ mod tests {
         (arena, gate)
     }
 
+    async fn arena_with_batch_gate(workspace: &TempDir) -> (Arena, BatchTestGate) {
+        let gate = BatchTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_batch_test_gate(gate.clone());
+        let arena = Arena::new(worker_path(), tool_host)
+            .await
+            .expect("create arena");
+        (arena, gate)
+    }
+
     async fn arena_with_limits(
         workspace: &TempDir,
         execution_timeout: Duration,
@@ -1658,6 +1725,30 @@ mod tests {
             panic!("expected Python error, got {:?}", execution.outcome);
         };
         error
+    }
+
+    fn gathered_reads(count: usize) -> String {
+        let calls = (0..count)
+            .map(|index| format!("read('file-{index}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("import asyncio\nawait asyncio.gather({calls})")
+    }
+
+    fn assert_interrupted_batch_trace(tool_calls: &[ToolCall]) {
+        assert_eq!(tool_calls.len(), 18);
+        assert_eq!(
+            tool_calls[0],
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(1),
+            }
+        );
+        assert!(
+            tool_calls[1..]
+                .iter()
+                .all(|call| matches!(call.summary, ToolCallSummary::Pending))
+        );
     }
 
     fn observe(text: &str, limits: ObservationLimits) -> Observation {
@@ -2184,6 +2275,22 @@ mod tests {
                 summary: ToolCallSummary::Count(3),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn exposes_only_the_four_phase_one_host_functions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "match\n").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "contents = await read('file')\nlisted = await list_dir()\nmatched = await glob('*')\nfound = await grep('match')\ntry:\n    await write('new', 'contents')\nexcept NameError:\n    write_missing = True\ntry:\n    await edit('file', 'match', 'changed')\nexcept NameError:\n    edit_missing = True\ntry:\n    await run('pwd')\nexcept NameError:\n    run_missing = True\ncontents == 'match\\n' and listed[0].path == 'file' and matched[0].path == 'file' and found[0].path == 'file' and write_missing and edit_missing and run_missing",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
     }
 
     #[tokio::test]
@@ -3037,13 +3144,420 @@ mod tests {
             progress.as_slice(),
             [
                 super::ArenaProgress::StdoutDelta { text },
-                super::ArenaProgress::ToolUpdated { call: ToolCall { tool: ToolName::Read, summary: ToolCallSummary::Pending } },
+                super::ArenaProgress::ToolUpdated { call: ToolCall { tool: ToolName::Read, summary: ToolCallSummary::Pending }, .. },
             ] if text == "before\n"
         ));
         let ArenaError::Cancelled { execution } = error else {
             panic!("expected interrupted cancellation");
         };
         assert_eq!(execution.stdout.head, "before\n");
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_resumes_every_read_in_argument_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("first"), "first").unwrap();
+        fs::write(workspace.path().join("second"), "second").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "import asyncio\nvalues = await asyncio.gather(read('first'), read('second'))\nvalues == ['first', 'second']",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(5),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(6),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_runs_all_read_only_tools_concurrently() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "match\n").unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "import asyncio\nresults = await asyncio.gather(read('file'), list_dir(), glob('*'), grep('match'))\nresults[0] == 'match\\n' and len(results[1]) == len(results[2]) == len(results[3]) == 1",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(4) => {}
+            result = &mut execution => panic!("execution finished before all inspection calls started: {result:?}"),
+        }
+        assert_eq!(gate.active_call_ids().len(), 4);
+        for call_id in gate.started_call_ids() {
+            gate.release(call_id);
+        }
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(6),
+                },
+                ToolCall {
+                    tool: ToolName::ListDir,
+                    summary: ToolCallSummary::Count(1),
+                },
+                ToolCall {
+                    tool: ToolName::Glob,
+                    summary: ToolCallSummary::Count(1),
+                },
+                ToolCall {
+                    tool: ToolName::Grep,
+                    summary: ToolCallSummary::Count(1),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_settles_siblings_when_one_tool_fails() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("present"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "import asyncio\nawait asyncio.gather(read('missing'), read('present'))",
+        )
+        .await
+        .unwrap();
+
+        assert!(python_error(&execution).text.contains("FileNotFoundError"));
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(8),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_correlates_reversed_host_settlement_to_trace_rows() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("first"), "first").unwrap();
+        fs::write(workspace.path().join("second"), "second").unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+        let execution = {
+            let mut capture = |event| progress.push(event);
+            let mut execution = Box::pin(arena.execute_with_progress(
+                "import asyncio\nvalues = await asyncio.gather(read('first'), read('second'))\nvalues == ['first', 'second']",
+                &cancellation,
+                &mut capture,
+            ));
+
+            tokio::select! {
+                _ = gate.wait_until_calls_started(2) => {}
+                result = &mut execution => panic!("execution finished before both calls started: {result:?}"),
+            }
+            let call_ids = gate.started_call_ids();
+            assert_eq!(call_ids.len(), 2);
+            gate.release(call_ids[1]);
+            tokio::select! {
+                _ = gate.wait_until_driver_settled() => {}
+                result = &mut execution => panic!("execution finished before the reversed call settled: {result:?}"),
+            }
+            assert_eq!(gate.driver_settled_call_ids(), [call_ids[1]]);
+            gate.release(call_ids[0]);
+            tokio::select! {
+                _ = gate.wait_until_driver_settled() => {}
+                result = &mut execution => panic!("execution finished before the first call settled: {result:?}"),
+            }
+            execution.await.unwrap()
+        };
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(5),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(6),
+                },
+            ]
+        );
+        assert_eq!(gate.resume_futures_calls(), 1);
+        let updates = progress
+            .into_iter()
+            .filter_map(|event| match event {
+                super::ArenaProgress::ToolUpdated { token, call } => Some((token, call)),
+                super::ArenaProgress::StdoutDelta { .. }
+                | super::ArenaProgress::StdoutTruncated => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            updates.as_slice(),
+            [
+                (first_token, ToolCall { summary: ToolCallSummary::Pending, .. }),
+                (second_token, ToolCall { summary: ToolCallSummary::Pending, .. }),
+                (settled_second, ToolCall { summary: ToolCallSummary::Count(6), .. }),
+                (settled_first, ToolCall { summary: ToolCallSummary::Count(5), .. }),
+            ] if settled_first == first_token && settled_second == second_token
+        ));
+    }
+
+    #[tokio::test]
+    async fn asyncio_gather_limits_active_host_calls_and_queues_the_rest() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..17 {
+            fs::write(
+                workspace.path().join(format!("file-{index}")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let calls = (0..17)
+            .map(|index| format!("read('file-{index}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let code = format!(
+            "import asyncio\nvalues = await asyncio.gather({calls})\nvalues == [str(index) for index in range(17)]"
+        );
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut execution => panic!("execution finished before 16 calls started: {result:?}"),
+        }
+        let started = gate.started_call_ids();
+        assert_eq!(started.len(), 16);
+        assert_eq!(gate.active_call_ids().len(), 16);
+        assert_eq!(gate.maximum_active(), 16);
+        for call_id in started {
+            gate.release(call_id);
+        }
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut execution => panic!("execution finished before the queued call started: {result:?}"),
+        }
+        let queued_call = *gate
+            .started_call_ids()
+            .last()
+            .expect("queued call must have started");
+        gate.release(queued_call);
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(execution.tool_calls.len(), 17);
+        assert_eq!(gate.maximum_active(), 16);
+        assert_eq!(gate.resume_futures_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_gathered_tool_does_not_stop_queued_siblings() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 1..17 {
+            fs::write(
+                workspace.path().join(format!("file-{index}")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let calls = std::iter::once("read('missing')".to_owned())
+            .chain((1..17).map(|index| format!("read('file-{index}')")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let code = format!("import asyncio\nawait asyncio.gather({calls})");
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut execution => panic!("execution finished before 16 calls started: {result:?}"),
+        }
+        for call_id in gate.started_call_ids() {
+            gate.release(call_id);
+        }
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut execution => panic!("execution finished before the queued sibling started: {result:?}"),
+        }
+        let queued_call = *gate
+            .started_call_ids()
+            .last()
+            .expect("queued sibling must have started");
+        gate.release(queued_call);
+
+        let execution = execution.await.unwrap();
+        assert!(python_error(&execution).text.contains("FileNotFoundError"));
+        assert_eq!(execution.tool_calls.len(), 17);
+        assert!(matches!(
+            execution.tool_calls.first(),
+            Some(ToolCall {
+                summary: ToolCallSummary::Failed,
+                ..
+            })
+        ));
+        assert!(
+            execution.tool_calls[1..]
+                .iter()
+                .all(|call| matches!(call.summary, ToolCallSummary::Count(_)))
+        );
+        assert_eq!(gate.resume_futures_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_gathers_dispatch_later_batches_after_the_first_settles() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "a").unwrap();
+        fs::write(workspace.path().join("b"), "b").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "import asyncio\nasync def inspect(path):\n    first = await read(path)\n    rest = await asyncio.gather(read(path), read(path))\n    return first + rest[0] + rest[1]\nresults = await asyncio.gather(inspect('a'), inspect('b'))\nresults == ['aaa', 'bbb']",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(execution.tool_calls.len(), 6);
+        assert!(execution.tool_calls.iter().all(|call| {
+            *call
+                == ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(1),
+                }
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_active_batch_calls_and_restores_the_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..18 {
+            fs::write(
+                workspace.path().join(format!("file-{index}")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        let cancellation = CancellationToken::new();
+        let code = format!("value = 99\n{}", gathered_reads(18));
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut execution => panic!("execution finished before 16 calls started: {result:?}"),
+        }
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("the first batch call must have started");
+        gate.release(released_call);
+        tokio::select! {
+            _ = gate.wait_until_driver_settled() => {}
+            result = &mut execution => panic!("execution finished before the released call settled: {result:?}"),
+        }
+        assert_eq!(gate.driver_settled_call_ids(), [released_call]);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut execution => panic!("execution finished before the queued call started: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(gate.started_call_ids().len(), 17);
+        assert!(gate.active_call_ids().is_empty());
+        assert_eq!(gate.maximum_active(), 16);
+        assert_interrupted_batch_trace(&execution.tool_calls);
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_drops_active_batch_calls_and_restores_the_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..18 {
+            fs::write(
+                workspace.path().join(format!("file-{index}")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = BatchTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_batch_test_gate(gate.clone());
+        let mut arena = Arena::with_limits(
+            worker_path(),
+            tool_host,
+            Duration::from_secs(1),
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .expect("create arena");
+        set_trusted_value(&mut arena).await;
+        let cancellation = CancellationToken::new();
+        let code = format!("value = 99\n{}", gathered_reads(18));
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut execution => panic!("execution finished before 16 calls started: {result:?}"),
+        }
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("the first batch call must have started");
+        gate.release(released_call);
+        tokio::select! {
+            _ = gate.wait_until_driver_settled() => {}
+            result = &mut execution => panic!("execution finished before the released call settled: {result:?}"),
+        }
+        assert_eq!(gate.driver_settled_call_ids(), [released_call]);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut execution => panic!("execution finished before the queued call started: {result:?}"),
+        }
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::TimedOut { execution } = error else {
+            panic!("expected interrupted timeout");
+        };
+        assert_eq!(gate.started_call_ids().len(), 17);
+        assert!(gate.active_call_ids().is_empty());
+        assert_eq!(gate.maximum_active(), 16);
+        assert_interrupted_batch_trace(&execution.tool_calls);
+        assert_trusted_value(&mut arena).await;
     }
 
     #[tokio::test]

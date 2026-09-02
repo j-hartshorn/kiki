@@ -3,7 +3,7 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEvidence};
-use crate::arena::{Execution, ToolCall};
+use crate::arena::{Execution, ToolCall, ToolCallToken};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -98,6 +98,7 @@ pub(crate) enum RuntimeEvent {
     ToolUpdated {
         run_id: RunId,
         step_id: ModelStepId,
+        token: ToolCallToken,
         call: ToolCall,
     },
     StdoutDelta {
@@ -686,9 +687,10 @@ impl<M: Model> RuntimeController<M> {
                 progress,
             },
             AgentProgress::ExecutionStarted => RuntimeEvent::ExecutionStarted { run_id, step_id },
-            AgentProgress::ToolUpdated { call } => RuntimeEvent::ToolUpdated {
+            AgentProgress::ToolUpdated { token, call } => RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
+                token,
                 call,
             },
             AgentProgress::StdoutDelta { text } => RuntimeEvent::StdoutDelta {
@@ -1002,6 +1004,7 @@ mod tests {
                 run_id,
                 step_id,
                 call,
+                ..
             } => format!(
                 "tool-updated:{}:{}:{}",
                 run_id.0,
@@ -1914,7 +1917,8 @@ mod tests {
         let model = ProgressModel::new(
             vec![
                 CompletedModelAction::Code {
-                    source: "await read('input')".to_owned(),
+                    source: "import asyncio\nawait asyncio.gather(read('input'), read('missing'))"
+                        .to_owned(),
                     call_id: ModelCallId::new("read-input"),
                 },
                 CompletedModelAction::Message {
@@ -1938,10 +1942,16 @@ mod tests {
         let execution = completed_execution(&records, RunId(1), ModelStepId(1));
         assert_eq!(
             execution.tool_calls,
-            [ToolCall {
-                tool: ToolName::Read,
-                summary: ToolCallSummary::Count(8),
-            }]
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(8),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
         );
         assert!(reliable.iter().any(|event| matches!(
             event,
@@ -1951,10 +1961,16 @@ mod tests {
                     ..
                 },
                 ..
-            } if execution.tool_calls == [ToolCall {
-                tool: ToolName::Read,
-                summary: ToolCallSummary::Count(8),
-            }]
+            } if execution.tool_calls == [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(8),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
         )));
         assert!(
             !drain_progress(&mut progress)

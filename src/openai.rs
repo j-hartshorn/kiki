@@ -3997,6 +3997,64 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sends_the_generated_phase_one_reference_with_only_execute_python() {
+            let output = vec![function_call(
+                "fc_1",
+                "call_1",
+                "execute_python",
+                r#"{"code":"print(1)"}"#,
+            )];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output,
+                Some(usage()),
+            )))
+            .await;
+            let reference = crate::tools::prompt_reference();
+            let prompt = format!("arbitrary base prompt\n\n{reference}");
+            let mut model = OpenAiModel::with_endpoint(&prompt, "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+
+            model
+                .step(&history("inspect"), &cancellation, &mut progress)
+                .await
+                .unwrap();
+
+            let request = fixture.request().body;
+            let instructions = request["instructions"]
+                .as_str()
+                .expect("instructions are a string");
+            assert_eq!(instructions, prompt);
+            for signature in [
+                "async def read(path: str) -> str:",
+                "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+                "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
+                "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+            ] {
+                assert_eq!(instructions.matches(signature).count(), 1);
+            }
+            assert!(instructions.contains("asyncio.gather"));
+            assert!(!instructions.contains("write("));
+            assert!(!instructions.contains("edit("));
+            assert!(!instructions.contains("run("));
+            assert_eq!(
+                request["tools"],
+                json!([{
+                    "type": "function",
+                    "name": "execute_python",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                        "additionalProperties": false,
+                    },
+                }])
+            );
+        }
+
+        #[tokio::test]
         async fn returns_reasoning_summary_parts_in_terminal_provider_order() {
             let output = vec![
                 json!({

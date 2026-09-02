@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    Observation, PythonError, ToolCall,
+    Observation, PythonError, ToolCall, ToolCallToken,
 };
 use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
@@ -71,6 +71,7 @@ pub(crate) enum AgentProgress {
     ModelProgress(ModelProgress),
     ExecutionStarted,
     ToolUpdated {
+        token: ToolCallToken,
         call: ToolCall,
     },
     StdoutDelta {
@@ -556,8 +557,8 @@ impl<M: Model> Agent<M> {
                     progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
-                            ArenaProgress::ToolUpdated { call } => {
-                                progress(AgentProgress::ToolUpdated { call });
+                            ArenaProgress::ToolUpdated { token, call } => {
+                                progress(AgentProgress::ToolUpdated { token, call });
                             }
                             ArenaProgress::StdoutDelta { text } => {
                                 progress(AgentProgress::StdoutDelta { text });
@@ -1285,6 +1286,44 @@ mod tests {
             entry,
             ModelContextEntry::CompletedCode(_) | ModelContextEntry::FinalMessage { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn agent_forwards_opaque_tool_row_tokens() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "await read('file')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        let (_, progress) = run_capturing_progress(&mut agent, "inspect", &cancellation)
+            .await
+            .unwrap();
+        let updates = progress
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentProgress::ToolUpdated { token, call } => Some((token, call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            updates.as_slice(),
+            [
+                (pending, ToolCall { summary: ToolCallSummary::Pending, .. }),
+                (settled, ToolCall { summary: ToolCallSummary::Count(8), .. }),
+            ] if pending == settled
+        ));
     }
 
     #[tokio::test]

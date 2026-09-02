@@ -117,6 +117,18 @@ mod tests {
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
+        for guidance in [
+            "Every host call must be awaited.",
+            "independent calls expected to succeed",
+            "Keep dependent calls sequential.",
+            "Avoid unbounded fan-out.",
+            "A gather failure can follow completed host calls",
+            "Keep model-visible output focused.",
+            "five-minute deadline",
+            "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
+        ] {
+            assert!(reference.contains(guidance), "missing `{guidance}`");
+        }
         for unavailable in ["write(", "edit(", "run("] {
             assert!(!reference.contains(unavailable));
         }
@@ -132,8 +144,13 @@ mod tests {
             "survive",
         ]);
         assert_concept(&["host access", "tool reference"]);
-        assert_concept(&["large", "python variables", "print", "focused selections"]);
         assert_concept(&["execution feedback", "python error", "committed"]);
+        for managed_guidance in ["asyncio.gather", "focused", "five-minute deadline"] {
+            assert!(
+                !BUNDLED_PROMPT.contains(managed_guidance),
+                "bundled prompt must not duplicate managed `{managed_guidance}` guidance"
+            );
+        }
         assert_concept(&["execute_python", "final assistant text", "exactly one"]);
         assert_concept(&["do not repeat", "executed python", "unless the user asks"]);
         assert_concept(&["untrusted", "files", "output", "instructions"]);

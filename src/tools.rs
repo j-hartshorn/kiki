@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +19,7 @@ use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkError, SinkMatch
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use thiserror::Error;
 #[cfg(test)]
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES,
@@ -415,7 +417,7 @@ pub(crate) fn prompt_reference() -> String {
     .collect::<Vec<_>>()
     .join("\n\n");
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Await every host call.\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables. Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
@@ -516,6 +518,8 @@ pub(crate) struct ToolHost {
     test_gate: Option<ReadTestGate>,
     #[cfg(test)]
     list_dir_test_gate: Option<ListDirTestGate>,
+    #[cfg(test)]
+    batch_test_gate: Option<BatchTestGate>,
 }
 
 #[cfg(test)]
@@ -562,6 +566,173 @@ impl ReadTestGate {
     async fn wait_after_read_settled(&self) {
         self.read_settled.add_permits(1);
         take_permit(&self.driver_allowed).await;
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct BatchTestGate {
+    state: Arc<Mutex<BatchTestGateState>>,
+    started: Arc<Semaphore>,
+    driver_settled: Arc<Semaphore>,
+    changed: Arc<Notify>,
+}
+
+#[cfg(test)]
+struct BatchTestGateState {
+    active_call_ids: BTreeSet<u32>,
+    started_call_ids: Vec<u32>,
+    released_call_ids: BTreeSet<u32>,
+    driver_settled_call_ids: Vec<u32>,
+    maximum_active: usize,
+    resume_futures_calls: usize,
+}
+
+#[cfg(test)]
+impl BatchTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BatchTestGateState {
+                active_call_ids: BTreeSet::new(),
+                started_call_ids: Vec::new(),
+                released_call_ids: BTreeSet::new(),
+                driver_settled_call_ids: Vec::new(),
+                maximum_active: 0,
+                resume_futures_calls: 0,
+            })),
+            started: Arc::new(Semaphore::new(0)),
+            driver_settled: Arc::new(Semaphore::new(0)),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_calls_started(&self, count: usize) {
+        for _ in 0..count {
+            take_permit(&self.started).await;
+        }
+    }
+
+    pub(crate) async fn wait_until_driver_settled(&self) {
+        take_permit(&self.driver_settled).await;
+    }
+
+    pub(crate) fn driver_settled_call_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .driver_settled_call_ids
+            .clone()
+    }
+
+    pub(crate) fn started_call_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .started_call_ids
+            .clone()
+    }
+
+    pub(crate) fn active_call_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .active_call_ids
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn maximum_active(&self) -> usize {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .maximum_active
+    }
+
+    pub(crate) fn resume_futures_calls(&self) -> usize {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .resume_futures_calls
+    }
+
+    pub(crate) fn release(&self, call_id: u32) {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .released_call_ids
+            .insert(call_id);
+        self.changed.notify_waiters();
+    }
+
+    fn note_driver_settled(&self, call_id: u32) {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .driver_settled_call_ids
+            .push(call_id);
+        self.driver_settled.add_permits(1);
+    }
+
+    fn note_resume_futures(&self) {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .resume_futures_calls += 1;
+    }
+
+    fn start_call(&self, call_id: u32) -> BatchTestCall {
+        let mut state = self.state.lock().expect("test gate mutex is not poisoned");
+        assert!(
+            state.active_call_ids.insert(call_id),
+            "test gate call IDs must be unique"
+        );
+        state.started_call_ids.push(call_id);
+        state.maximum_active = state.maximum_active.max(state.active_call_ids.len());
+        self.started.add_permits(1);
+        BatchTestCall {
+            gate: self.clone(),
+            call_id,
+        }
+    }
+}
+
+#[cfg(test)]
+struct BatchTestCall {
+    gate: BatchTestGate,
+    call_id: u32,
+}
+
+#[cfg(test)]
+impl BatchTestCall {
+    async fn wait_until_released(&self) {
+        loop {
+            let notified = self.gate.changed.notified();
+            if self
+                .gate
+                .state
+                .lock()
+                .expect("test gate mutex is not poisoned")
+                .released_call_ids
+                .contains(&self.call_id)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BatchTestCall {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .active_call_ids
+            .remove(&self.call_id);
+        self.gate.changed.notify_waiters();
     }
 }
 
@@ -703,6 +874,8 @@ impl ToolHost {
             test_gate: None,
             #[cfg(test)]
             list_dir_test_gate: None,
+            #[cfg(test)]
+            batch_test_gate: None,
         })
     }
 
@@ -718,12 +891,27 @@ impl ToolHost {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_batch_test_gate(mut self, batch_test_gate: BatchTestGate) -> Self {
+        self.batch_test_gate = Some(batch_test_gate);
+        self
+    }
+
     pub(crate) async fn call(&self, call: ToolCall) -> ToolResult {
         let ToolCall {
             call_id,
             tool,
             arguments,
         } = call;
+        #[cfg(test)]
+        let batch_call = self
+            .batch_test_gate
+            .as_ref()
+            .map(|gate| gate.start_call(call_id));
+        #[cfg(test)]
+        if let Some(batch_call) = &batch_call {
+            batch_call.wait_until_released().await;
+        }
         let result = match tool {
             ToolName::Read => self.read(arguments).await,
             ToolName::ListDir => self.list_dir(arguments).await,
@@ -792,6 +980,20 @@ impl ToolHost {
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_batch_driver_settled(&self, call_id: u32) {
+        if let Some(batch_test_gate) = &self.batch_test_gate {
+            batch_test_gate.note_driver_settled(call_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_batch_driver_resume_futures(&self) {
+        if let Some(batch_test_gate) = &self.batch_test_gate {
+            batch_test_gate.note_resume_futures();
+        }
     }
 
     #[cfg(test)]
@@ -2169,6 +2371,49 @@ mod tests {
         );
         gate.resume_list_dir();
         assert_eq!(listing.await.unwrap().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_test_gate_tracks_independent_host_calls_per_host() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("first"), "first").unwrap();
+        fs::write(workspace.path().join("second"), "second").unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_batch_test_gate(gate.clone()),
+        );
+        let first_host = Arc::clone(&host);
+        let first = tokio::spawn(async move {
+            first_host
+                .call(ToolCall {
+                    call_id: 1,
+                    tool: ToolName::Read,
+                    arguments: ToolValue::List(vec![ToolValue::String("first".to_owned())]),
+                })
+                .await
+        });
+        let second_host = Arc::clone(&host);
+        let second = tokio::spawn(async move {
+            second_host
+                .call(ToolCall {
+                    call_id: 2,
+                    tool: ToolName::Read,
+                    arguments: ToolValue::List(vec![ToolValue::String("second".to_owned())]),
+                })
+                .await
+        });
+
+        gate.wait_until_calls_started(2).await;
+        assert_eq!(gate.active_call_ids(), [1, 2]);
+        assert_eq!(gate.maximum_active(), 2);
+        for call_id in gate.started_call_ids() {
+            gate.release(call_id);
+        }
+
+        assert!(first.await.unwrap().result.is_ok());
+        assert!(second.await.unwrap().result.is_ok());
     }
 
     #[tokio::test]
