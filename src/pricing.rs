@@ -1,4 +1,7 @@
-use crate::model::{AttemptAccounting, ModelUsage};
+use crate::{
+    config::constants::FIXED_MODEL,
+    model::{AttemptAccounting, ModelUsage},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PricingIdentity {
@@ -32,7 +35,7 @@ impl ModelPricing {
 
 pub const GPT_5_6_SOL_DEFAULT_2026_08_27: ModelPricing = ModelPricing {
     identity: PricingIdentity {
-        model: "gpt-5.6-sol",
+        model: FIXED_MODEL,
         service_tier: "default",
         version: "2026-08-27",
         source: "https://developers.openai.com/api/docs/pricing",
@@ -262,7 +265,7 @@ mod tests {
     fn pricing_constant_has_versioned_official_identity() {
         let identity = GPT_5_6_SOL_DEFAULT_2026_08_27.identity();
 
-        assert_eq!(identity.model, "gpt-5.6-sol");
+        assert_eq!(identity.model, crate::config::constants::FIXED_MODEL);
         assert_eq!(identity.service_tier, "default");
         assert_eq!(identity.version, "2026-08-27");
         assert_eq!(

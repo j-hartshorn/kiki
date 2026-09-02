@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 
 use crate::prompt::{self, PromptError, PromptSource, ResolvedPrompt};
 
+pub(crate) mod constants;
+
+use self::constants::FIXED_MODEL;
+
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
-const FIXED_MODEL: &str = "gpt-5.6-sol";
 const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 1_024;
 const MAX_STARTUP_REMEDIATION_BYTES: usize = 512;
 const MAX_STARTUP_PATH_BYTES: usize = 1_024;
@@ -618,7 +621,7 @@ mod tests {
 
         assert_eq!(snapshot.worker_path().unwrap().as_str(), WORKER_PATH);
         assert_eq!(snapshot.workspace_root().unwrap().as_str(), WORKSPACE_ROOT);
-        assert_eq!(snapshot.model(), "gpt-5.6-sol");
+        assert_eq!(snapshot.model(), crate::config::constants::FIXED_MODEL);
         assert_eq!(
             snapshot.prompt_source(),
             &PromptProvenance::Bundled {

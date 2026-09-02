@@ -13,15 +13,16 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
-use crate::model::{
-    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
-    ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
-    ProviderFailure, ProviderReplay,
+use crate::{
+    config::constants::{ACCEPTED_MODEL_CONTENT_LIMIT, FIXED_MODEL},
+    model::{
+        AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay,
+    },
 };
 
 const OPENAI_PROVIDER: &str = "openai";
-const FIXED_MODEL: &str = "gpt-5.6-sol";
-const APPLICATION_CONTENT_LIMIT: usize = crate::model::ACCEPTED_MODEL_CONTENT_LIMIT;
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -70,15 +71,10 @@ impl OpenAiModel {
     }
 
     fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
-        let mut instructions = self.prompt.clone();
         let mut input = Vec::new();
 
         for entry in history.entries() {
             match entry {
-                ModelContextEntry::ReadCapability { description } => {
-                    instructions.push_str("\n\n");
-                    instructions.push_str(description);
-                }
                 ModelContextEntry::UserRequest { text } => {
                     input.push(json!({"role": "user", "content": text}));
                 }
@@ -126,7 +122,7 @@ impl OpenAiModel {
 
         Ok(json!({
             "model": self.model,
-            "instructions": instructions,
+            "instructions": self.prompt,
             "input": input,
             "stream": true,
             "store": false,
@@ -979,7 +975,7 @@ impl ApplicationContentGuard {
             .bytes
             .checked_add(additional)
             .ok_or(ModelError::ContentTooLarge)?;
-        if bytes > APPLICATION_CONTENT_LIMIT {
+        if bytes > ACCEPTED_MODEL_CONTENT_LIMIT {
             return Err(ModelError::ContentTooLarge);
         }
         self.bytes = bytes;
@@ -1595,7 +1591,7 @@ mod tests {
     use crate::model::ModelHistory;
 
     fn history() -> ModelHistory {
-        let mut history = ModelHistory::new("read files exactly");
+        let mut history = ModelHistory::new();
         history.append_user_request("inspect");
         history
     }
@@ -1629,7 +1625,7 @@ mod tests {
         let model = super::OpenAiModel::new("system prompt", "test-api-key");
 
         assert_eq!(model.prompt, "system prompt");
-        assert_eq!(model.model, super::FIXED_MODEL);
+        assert_eq!(model.model, crate::config::constants::FIXED_MODEL);
         assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
         assert_eq!(
             model.client.config().url("/responses"),
@@ -2169,8 +2165,9 @@ mod tests {
         use tokio::time::timeout;
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{APPLICATION_CONTENT_LIMIT, OpenAiModel};
+        use super::super::OpenAiModel;
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, Model, ModelError, ModelFailure, ModelProgress, ProviderReplay,
         };
@@ -2451,7 +2448,7 @@ mod tests {
                     "sequence_number": 1,
                     "output_index": 0,
                     "content_index": 0,
-                    "text": "x".repeat(APPLICATION_CONTENT_LIMIT)
+                    "text": "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT)
                 })
             );
             let fixture = Fixture::start_sequence(vec![
@@ -2650,7 +2647,7 @@ mod tests {
             );
             assert_eq!(invalid.request_count(), 1);
 
-            let mut invalid_history = ModelHistory::new("read files exactly");
+            let mut invalid_history = ModelHistory::new();
             invalid_history.append_final_message(
                 "answer".to_owned(),
                 String::new(),
@@ -2714,10 +2711,25 @@ mod tests {
             let error = failure(&fixture, "fixture-key").await;
             let failure = error.provider_failure().unwrap();
 
-            assert_eq!(failure.message(), "é".repeat(2_048));
-            assert_eq!(failure.message().len(), 4 * 1024);
-            assert_eq!(failure.code(), Some("é".repeat(128).as_str()));
-            assert_eq!(failure.code().unwrap().len(), 256);
+            assert_eq!(
+                failure.message(),
+                "é".repeat(crate::config::constants::PROVIDER_MESSAGE_LIMIT / 2)
+            );
+            assert_eq!(
+                failure.message().len(),
+                crate::config::constants::PROVIDER_MESSAGE_LIMIT
+            );
+            assert_eq!(
+                failure.code(),
+                Some(
+                    "é".repeat(crate::config::constants::PROVIDER_CODE_LIMIT / 2)
+                        .as_str()
+                )
+            );
+            assert_eq!(
+                failure.code().unwrap().len(),
+                crate::config::constants::PROVIDER_CODE_LIMIT
+            );
         }
 
         #[tokio::test]
@@ -2780,10 +2792,11 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         use super::super::{
-            APPLICATION_CONTENT_LIMIT, OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT,
-            PresentationBatcher, PresentationKind,
+            OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT, PresentationBatcher,
+            PresentationKind,
         };
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
             ModelHistory, ModelProgress, ModelUsage,
@@ -3635,7 +3648,7 @@ mod tests {
 
         #[tokio::test]
         async fn flushes_pending_progress_when_the_content_guard_is_exhausted() {
-            let oversized = "x".repeat(APPLICATION_CONTENT_LIMIT);
+            let oversized = "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT);
             let fixture = Fixture::start(FixtureReply::OwnedSse(event_stream([
                 json!({
                     "type": "response.reasoning_summary_text.delta",
@@ -3724,8 +3737,9 @@ mod tests {
     mod action_protocol {
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{APPLICATION_CONTENT_LIMIT, ApplicationContentGuard, OpenAiModel};
+        use super::super::{ApplicationContentGuard, OpenAiModel};
         use super::*;
+        use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
             ModelError, ModelFailure, ModelHistory, ModelProgress, ModelUsage, OpaqueReplayItem,
@@ -3846,7 +3860,7 @@ mod tests {
         }
 
         fn history(request: &str) -> ModelHistory {
-            let mut history = ModelHistory::new("read files exactly");
+            let mut history = ModelHistory::new();
             history.append_user_request(request);
             history
         }
@@ -3976,9 +3990,67 @@ mod tests {
             assert_eq!(
                 captured.body,
                 expected_request(
-                    "system prompt\n\nread files exactly",
+                    "system prompt",
                     json!([{"role": "user", "content": "inspect this project"}])
                 )
+            );
+        }
+
+        #[tokio::test]
+        async fn sends_the_generated_phase_one_reference_with_only_execute_python() {
+            let output = vec![function_call(
+                "fc_1",
+                "call_1",
+                "execute_python",
+                r#"{"code":"print(1)"}"#,
+            )];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output,
+                Some(usage()),
+            )))
+            .await;
+            let reference = crate::tools::prompt_reference();
+            let prompt = format!("arbitrary base prompt\n\n{reference}");
+            let mut model = OpenAiModel::with_endpoint(&prompt, "fixture-key", &fixture.endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+
+            model
+                .step(&history("inspect"), &cancellation, &mut progress)
+                .await
+                .unwrap();
+
+            let request = fixture.request().body;
+            let instructions = request["instructions"]
+                .as_str()
+                .expect("instructions are a string");
+            assert_eq!(instructions, prompt);
+            for signature in [
+                "async def read(path: str) -> str:",
+                "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+                "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
+                "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+            ] {
+                assert_eq!(instructions.matches(signature).count(), 1);
+            }
+            assert!(instructions.contains("asyncio.gather"));
+            assert!(!instructions.contains("write("));
+            assert!(!instructions.contains("edit("));
+            assert!(!instructions.contains("run("));
+            assert_eq!(
+                request["tools"],
+                json!([{
+                    "type": "function",
+                    "name": "execute_python",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                        "additionalProperties": false,
+                    },
+                }])
             );
         }
 
@@ -4152,7 +4224,7 @@ mod tests {
             assert_eq!(
                 fixture.request().body,
                 expected_request(
-                    "system prompt\n\nread files exactly",
+                    "system prompt",
                     json!([
                         {"role": "user", "content": "first request"},
                         code_output[0].clone(),
@@ -4473,15 +4545,17 @@ mod tests {
             assert!(pending.await.unwrap_err().is_cancelled());
             fixture.wait_for_disconnect().await;
             assert_eq!(fixture.request_count(), 1);
-            assert!(history.entries().iter().all(|entry| matches!(
-                entry,
-                ModelContextEntry::ReadCapability { .. } | ModelContextEntry::UserRequest { .. }
-            )));
+            assert!(
+                history
+                    .entries()
+                    .iter()
+                    .all(|entry| matches!(entry, ModelContextEntry::UserRequest { .. }))
+            );
         }
 
         #[tokio::test]
         async fn application_content_guard_counts_all_guarded_fields_as_events_arrive() {
-            let quarter = APPLICATION_CONTENT_LIMIT / 4;
+            let quarter = ACCEPTED_MODEL_CONTENT_LIMIT / 4;
             let fragment = "x".repeat(quarter);
             let stream = event_stream([
                 json!({
@@ -4544,10 +4618,10 @@ mod tests {
             for ids in [["rs_1", "rs_2"], ["duplicate", "duplicate"]] {
                 let mut first = reasoning(ids[0], "", "");
                 first["encrypted_content"] =
-                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                    Value::String("x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1));
                 let mut second = reasoning(ids[1], "", "");
                 second["encrypted_content"] =
-                    Value::String("x".repeat(APPLICATION_CONTENT_LIMIT / 2 + 1));
+                    Value::String("x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1));
                 let mut content = ApplicationContentGuard::default();
 
                 assert_eq!(
@@ -4700,7 +4774,7 @@ mod tests {
     const LIVE_CLEANUP_TIMEOUT_MESSAGE: &str =
         "live runtime controller did not stop within ten seconds";
     const LIVE_RECORDS: &str = "live runtime records did not match the scenario";
-    const FIRST_REQUEST: &str = "Work through this exact sequence before replying. Use at least two separate execute_python steps. First successfully execute `lines = await read(\"README.md\")` and retain the returned lines in the persistent arena. In a later separate step, use `lines` and print only a focused, non-empty selection. Do not combine those Python steps. After both executions complete, provide a concise nonblank final answer.";
+    const FIRST_REQUEST: &str = "Work through this exact sequence before replying. Use at least two separate execute_python steps. First successfully execute `contents = await read(\"README.md\")` and retain the returned string in the persistent arena. In a later separate step, use `contents` and print only a focused, non-empty selection. Do not combine those Python steps. After both executions complete, provide a concise nonblank final answer.";
     const CANCELLATION_REQUEST: &str = "Begin this request with execute_python and do not send a final message before starting that work.";
     const FOLLOW_UP_REQUEST: &str = "Provide a concise nonblank final response confirming that you can continue after the cancelled request.";
 
@@ -4785,10 +4859,7 @@ mod tests {
                     run_id, step_id, ..
                 }
                 | RuntimeEvent::ExecutionStarted { run_id, step_id }
-                | RuntimeEvent::ToolStarted {
-                    run_id, step_id, ..
-                }
-                | RuntimeEvent::ToolFinished {
+                | RuntimeEvent::ToolUpdated {
                     run_id, step_id, ..
                 }
                 | RuntimeEvent::StdoutDelta {
@@ -4836,17 +4907,16 @@ mod tests {
                         self.run_mut(*run_id).streamed_content |= !code.is_empty();
                     }
                 },
-                RuntimeEvent::ToolFinished {
+                RuntimeEvent::ToolUpdated {
                     run_id,
-                    path,
-                    outcome,
+                    call:
+                        crate::arena::ToolCall {
+                            tool: crate::arena::ToolName::Read,
+                            summary: crate::arena::ToolCallSummary::Count(_),
+                        },
                     ..
                 } => {
-                    if path == "README.md"
-                        && matches!(outcome, crate::arena::ReadOutcome::Success { .. })
-                    {
-                        self.run_mut(*run_id).successful_read = true;
-                    }
+                    self.run_mut(*run_id).successful_read = true;
                 }
                 RuntimeEvent::RecordAppended { record, .. } => {
                     let run = self.run_mut(record.run_id);
@@ -4873,7 +4943,7 @@ mod tests {
                     self.disabled_events += 1;
                 }
                 RuntimeEvent::ExecutionStarted { .. }
-                | RuntimeEvent::ToolStarted { .. }
+                | RuntimeEvent::ToolUpdated { .. }
                 | RuntimeEvent::StdoutDelta { .. }
                 | RuntimeEvent::StdoutTruncated { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
@@ -4967,10 +5037,10 @@ mod tests {
                 super::OpenAiModel::new(ready.system_prompt(), ready.api_key().expose()),
             )
         };
-        let read_tool = crate::tools::ReadTool::new(workspace_root)
+        let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
-        let arena = crate::arena::Arena::new(worker_path, read_tool)
+        let arena = crate::arena::Arena::new(worker_path, tool_host)
             .await
             .map_err(|_| LIVE_SETUP_ARENA)?;
         let runtime =

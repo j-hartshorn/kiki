@@ -23,7 +23,7 @@ use crate::openai::OpenAiModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
-use crate::tools::ReadTool;
+use crate::tools::ToolHost;
 
 fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
     OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
@@ -39,14 +39,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model = production_model(&ready);
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-    let read_tool = match runtime.block_on(ReadTool::new(workspace_root)) {
-        Ok(read_tool) => read_tool,
+    let tool_host = match runtime.block_on(ToolHost::new(workspace_root)) {
+        Ok(tool_host) => tool_host,
         Err(error) => {
             let configuration = configuration.with_workspace_construction_failure(error);
             return Ok(tui::run_configuration(configuration.snapshot().clone())?);
         }
     };
-    let arena = match runtime.block_on(Arena::new(worker_path, read_tool)) {
+    let arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);

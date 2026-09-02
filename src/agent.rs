@@ -3,12 +3,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    InterruptedRead, Observation, PythonError, ReadCall, ReadOutcome,
+    Observation, PythonError, ToolCall, ToolCallToken,
 };
+use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
-    ACCEPTED_MODEL_CONTENT_LIMIT, AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId,
-    ModelFailure, ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
-    READ_CAPABILITY_DESCRIPTION,
+    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
+    ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 
@@ -42,8 +42,7 @@ pub struct ExecutionEvidence {
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
-    pub(crate) read: InterruptedRead,
-    pub(crate) read_calls: Vec<ReadCall>,
+    pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) cancellation_warning: Option<String>,
     pub(crate) failure: Option<ExecutionFailure>,
 }
@@ -71,12 +70,9 @@ pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
     ExecutionStarted,
-    ToolStarted {
-        path: String,
-    },
-    ToolFinished {
-        path: String,
-        outcome: ReadOutcome,
+    ToolUpdated {
+        token: ToolCallToken,
+        call: ToolCall,
     },
     StdoutDelta {
         text: String,
@@ -228,8 +224,7 @@ impl ExecutionEvidence {
             began: interrupted.began,
             stdout: interrupted.stdout,
             stderr: interrupted.stderr,
-            read: interrupted.read,
-            read_calls: interrupted.read_calls,
+            tool_calls: interrupted.tool_calls,
             cancellation_warning: cancellation_warning.then(|| CANCELLATION_WARNING.to_owned()),
             failure: error.map(failure_evidence),
         }
@@ -258,8 +253,7 @@ fn empty_interrupted_execution() -> InterruptedExecution {
         began: false,
         stdout: empty_observation(),
         stderr: empty_observation(),
-        read: InterruptedRead::NoRead,
-        read_calls: Vec::new(),
+        tool_calls: Vec::new(),
     }
 }
 
@@ -424,7 +418,7 @@ impl<M: Model> Agent<M> {
         Self {
             arena,
             model,
-            model_context: ModelHistory::new(READ_CAPABILITY_DESCRIPTION),
+            model_context: ModelHistory::new(),
             staged_final_message: None,
         }
     }
@@ -563,11 +557,8 @@ impl<M: Model> Agent<M> {
                     progress(AgentProgress::ExecutionStarted);
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
-                            ArenaProgress::ReadStarted { path } => {
-                                progress(AgentProgress::ToolStarted { path });
-                            }
-                            ArenaProgress::ReadFinished { path, outcome } => {
-                                progress(AgentProgress::ToolFinished { path, outcome });
+                            ArenaProgress::ToolUpdated { token, call } => {
+                                progress(AgentProgress::ToolUpdated { token, call });
                             }
                             ArenaProgress::StdoutDelta { text } => {
                                 progress(AgentProgress::StdoutDelta { text });
@@ -706,29 +697,11 @@ fn interruption_feedback(evidence: &ExecutionEvidence, state: &str) -> String {
     }
     append_output(&mut frames, "stdout", &evidence.stdout);
     append_output(&mut frames, "stderr", &evidence.stderr);
-    frames.push(render_interrupted_read(&evidence.read));
     if let Some(warning) = &evidence.cancellation_warning {
         frames.push(warning.clone());
     }
     frames.push("</kiki_execution>".to_owned());
     frames.join("\n")
-}
-
-fn render_interrupted_read(read: &InterruptedRead) -> String {
-    match read {
-        InterruptedRead::NoRead => "<kiki_read state=\"none\" />".to_owned(),
-        InterruptedRead::Pending { path } => {
-            format!("<kiki_read state=\"pending\" path=\"{path}\" />")
-        }
-        InterruptedRead::Completed { path, outcome } => match outcome {
-            ReadOutcome::Success { line_count } => format!(
-                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"success\" lines=\"{line_count}\" />"
-            ),
-            ReadOutcome::Failure { message } => format!(
-                "<kiki_read state=\"completed\" path=\"{path}\" outcome=\"failure\">\n{message}\n</kiki_read>"
-            ),
-        },
-    }
 }
 
 fn execution_feedback(execution: &Execution) -> String {
@@ -839,15 +812,15 @@ mod tests {
         GenerationEvidenceBuilder, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ReadCall,
+        Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
+        ToolCallSummary, ToolName,
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ProviderFailure, ProviderReplay, READ_CAPABILITY_DESCRIPTION,
-        ScriptedAction as ModelAction, ScriptedModel,
+        ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::tools::{ReadTestGate, ReadTool};
+    use crate::tools::{ReadTestGate, ToolHost};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -862,9 +835,9 @@ mod tests {
     async fn agent_with_model<M: Model>(workspace: &TempDir, model: M) -> Agent<M> {
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -955,14 +928,9 @@ mod tests {
         assert_eq!(agent.model.contexts().len(), 2);
         assert_eq!(
             agent.model.contexts()[0],
-            [
-                ModelContextEntry::ReadCapability {
-                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                },
-                ModelContextEntry::UserRequest {
-                    text: "inspect".to_owned(),
-                },
-            ]
+            [ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]
         );
         let completed = agent.model.contexts()[1]
             .last()
@@ -1321,6 +1289,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_forwards_opaque_tool_row_tokens() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "await read('file')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        let (_, progress) = run_capturing_progress(&mut agent, "inspect", &cancellation)
+            .await
+            .unwrap();
+        let updates = progress
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentProgress::ToolUpdated { token, call } => Some((token, call)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            updates.as_slice(),
+            [
+                (pending, ToolCall { summary: ToolCallSummary::Pending, .. }),
+                (settled, ToolCall { summary: ToolCallSummary::Count(8), .. }),
+            ] if pending == settled
+        ));
+    }
+
+    #[tokio::test]
     async fn agent_forwards_live_stdout_without_adding_it_to_model_progress() {
         let workspace = tempfile::tempdir().unwrap();
         let mut agent = agent(
@@ -1495,9 +1501,18 @@ mod tests {
     }
 
     #[test]
-    fn execution_evidence_copies_original_read_calls_after_recovery_failure() {
+    fn execution_evidence_copies_original_tool_calls_after_recovery_failure() {
         let mut interrupted = super::empty_interrupted_execution();
-        interrupted.read_calls = vec![ReadCall::Success { line_count: 3 }, ReadCall::Failed];
+        interrupted.tool_calls = vec![
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(3),
+            },
+            ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Failed,
+            },
+        ];
         let error = ArenaError::RecoveryFailed {
             original: Box::new(ArenaError::Cancelled {
                 execution: Box::new(interrupted),
@@ -1511,8 +1526,17 @@ mod tests {
         let evidence = super::ExecutionEvidence::failed("source".to_owned(), String::new(), &error);
 
         assert_eq!(
-            evidence.read_calls,
-            [ReadCall::Success { line_count: 3 }, ReadCall::Failed]
+            evidence.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(3),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
         );
         assert!(!evidence.feedback().contains("tool calls"));
     }
@@ -1521,13 +1545,13 @@ mod tests {
     fn generation_evidence_is_utf8_safe_at_the_accepted_content_limit() {
         let mut generation = GenerationEvidenceBuilder::default();
         generation.capture(&ModelProgress::AssistantTextChunk {
-            text: "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1),
+            text: "é".repeat(crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1),
         });
         let evidence = generation.evidence().expect("generation evidence");
 
         assert_eq!(
             evidence.assistant_text,
-            "é".repeat(super::ACCEPTED_MODEL_CONTENT_LIMIT / 2)
+            "é".repeat(crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT / 2)
         );
         assert!(
             evidence
@@ -1586,7 +1610,7 @@ mod tests {
         let mut agent = agent_with_model(
             &workspace,
             SummaryCodeModel {
-                source: "lines = await read('Cargo.toml')".to_owned(),
+                source: "contents = await read('Cargo.toml')".to_owned(),
                 reasoning_summary: "cancelled code summary".to_owned(),
             },
         )
@@ -1595,7 +1619,7 @@ mod tests {
         let canceller = cancellation.clone();
         let error = {
             let mut progress = |event| {
-                if matches!(event, AgentProgress::ToolStarted { .. }) {
+                if matches!(event, AgentProgress::ToolUpdated { .. }) {
                     canceller.cancel();
                 }
             };
@@ -1613,12 +1637,12 @@ mod tests {
         else {
             panic!("expected cancelled execution");
         };
-        assert_eq!(evidence.source, "lines = await read('Cargo.toml')");
+        assert_eq!(evidence.source, "contents = await read('Cargo.toml')");
         assert_eq!(evidence.reasoning_summary, "cancelled code summary");
         assert_eq!(evidence.began, execution.began);
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
-        assert_eq!(evidence.read, execution.read);
+        assert_eq!(evidence.tool_calls, execution.tool_calls);
         assert_eq!(
             evidence.cancellation_warning.as_deref(),
             Some(super::CANCELLATION_WARNING)
@@ -1661,7 +1685,6 @@ mod tests {
         assert!(matches!(
             agent.model_context.entries(),
             [
-                ModelContextEntry::ReadCapability { .. },
                 ModelContextEntry::UserRequest { .. },
                 ModelContextEntry::CompletedCode(_),
                 ModelContextEntry::FinalMessage { .. },
@@ -1737,7 +1760,7 @@ mod tests {
                 assert_eq!(evidence.source, "boundary_action_ran = True");
                 assert_eq!(evidence.reasoning_summary, "boundary summary");
                 assert!(!evidence.began);
-                assert_eq!(evidence.read, crate::arena::InterruptedRead::NoRead);
+                assert!(evidence.tool_calls.is_empty());
                 assert_eq!(
                     evidence.cancellation_warning.as_deref(),
                     Some(super::CANCELLATION_WARNING)
@@ -1840,14 +1863,9 @@ mod tests {
         assert_eq!(agent.model.position(), 0);
         assert_eq!(
             agent.model_context.entries(),
-            [
-                ModelContextEntry::ReadCapability {
-                    description: READ_CAPABILITY_DESCRIPTION.to_owned(),
-                },
-                ModelContextEntry::UserRequest {
-                    text: "inspect".to_owned(),
-                },
-            ]
+            [ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]
         );
     }
 
@@ -1858,9 +1876,9 @@ mod tests {
         let gate = ReadTestGate::new();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool")
+                .expect("open tool host")
                 .with_test_gate(gate.clone()),
         )
         .await
@@ -1869,7 +1887,7 @@ mod tests {
             arena,
             ScriptedModel::new(vec![
                 ModelAction::Code {
-                    source: "print('before')\nlines = await read('Cargo.toml')".to_owned(),
+                    source: "print('before')\ncontents = await read('Cargo.toml')".to_owned(),
                 },
                 ModelAction::Code {
                     source: "later_action_ran = True".to_owned(),
@@ -1900,12 +1918,11 @@ mod tests {
         assert_eq!(execution.stdout.head, "before\n");
         assert_eq!(
             evidence.source,
-            "print('before')\nlines = await read('Cargo.toml')"
+            "print('before')\ncontents = await read('Cargo.toml')"
         );
         assert_eq!(evidence.stdout, execution.stdout);
         assert_eq!(evidence.stderr, execution.stderr);
-        assert_eq!(evidence.read, execution.read);
-        assert_eq!(evidence.read_calls, execution.read_calls);
+        assert_eq!(evidence.tool_calls, execution.tool_calls);
         assert_eq!(
             evidence.cancellation_warning.as_deref(),
             Some(super::CANCELLATION_WARNING)
@@ -2210,7 +2227,7 @@ mod tests {
                     },
                 )),
             },
-            read_calls: Vec::new(),
+            tool_calls: Vec::new(),
         };
 
         assert_eq!(
@@ -2255,15 +2272,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_default_script_reads_retained_lines_and_returns_its_final_message() {
+    async fn agent_default_script_reads_retained_contents_and_returns_its_final_message() {
         let workspace = tempfile::tempdir().unwrap();
         let cargo_toml = "[package]\nname = \"example\"\n";
         fs::write(workspace.path().join("Cargo.toml"), cargo_toml).unwrap();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -2279,18 +2296,18 @@ mod tests {
         assert_eq!(executions.len(), 2);
         assert_eq!(
             executions[0].0,
-            "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\nlines = await read(\"Cargo.toml\")"
+            "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")"
         );
         assert_eq!(
             executions[1].0,
-            "print(\"\".join(lines[0:20]), end=\"\")\nrequest_count"
+            "print(contents[0:20], end=\"\")\nrequest_count"
         );
-        assert_eq!(executions[1].1.stdout.head, cargo_toml);
+        assert_eq!(executions[1].1.stdout.head, &cargo_toml[..20]);
         assert_eq!(result_head(executions[1].1), "1");
         assert_eq!(
             agent.model.contexts()[0][0],
-            ModelContextEntry::ReadCapability {
-                description: "read(path) returns the accepted file as complete exact lines with endings retained. Use standard Python print(\"\".join(lines[start:end]), end=\"\") to inspect a selection.".to_owned(),
+            ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
             }
         );
     }
@@ -2301,9 +2318,9 @@ mod tests {
         fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
         let arena = Arena::new(
             worker_path(),
-            ReadTool::new(workspace.path())
+            ToolHost::new(workspace.path())
                 .await
-                .expect("open read tool"),
+                .expect("open tool host"),
         )
         .await
         .expect("create arena");
@@ -2386,7 +2403,7 @@ mod tests {
                 text: "<error>".to_owned(),
                 omitted_bytes: 3,
             }),
-            read_calls: Vec::new(),
+            tool_calls: Vec::new(),
         };
 
         assert_eq!(

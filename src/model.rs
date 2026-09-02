@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const ACCEPTED_MODEL_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+use crate::config::constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
@@ -170,9 +170,6 @@ impl CompletedCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelContextEntry {
-    ReadCapability {
-        description: String,
-    },
     UserRequest {
         text: String,
     },
@@ -198,12 +195,16 @@ pub struct ModelHistory {
     entries: Vec<ModelContextEntry>,
 }
 
+impl Default for ModelHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelHistory {
-    pub fn new(read_capability: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            entries: vec![ModelContextEntry::ReadCapability {
-                description: read_capability.into(),
-            }],
+            entries: Vec::new(),
         }
     }
 
@@ -273,9 +274,6 @@ pub enum ModelHistoryError {
     DuplicateCallId(ModelCallId),
 }
 
-const PROVIDER_FIELD_LIMIT: usize = 256;
-const PROVIDER_MESSAGE_LIMIT: usize = 4 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailure {
     status: Option<u16>,
@@ -287,7 +285,7 @@ impl ProviderFailure {
     pub(crate) fn new(status: Option<u16>, code: Option<String>, message: String) -> Self {
         Self {
             status,
-            code: code.map(|value| bounded_utf8(value, PROVIDER_FIELD_LIMIT)),
+            code: code.map(|value| bounded_utf8(value, PROVIDER_CODE_LIMIT)),
             message: bounded_utf8(message, PROVIDER_MESSAGE_LIMIT),
         }
     }
@@ -427,8 +425,6 @@ pub trait Model: Send + 'static {
     ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a;
 }
 
-pub const READ_CAPABILITY_DESCRIPTION: &str = "read(path) returns the accepted file as complete exact lines with endings retained. Use standard Python print(\"\".join(lines[start:end]), end=\"\") to inspect a selection.";
-
 pub struct ScriptedModel {
     actions: Vec<ScriptedAction>,
     cursor: usize,
@@ -532,10 +528,10 @@ impl Default for ScriptedModel {
     fn default() -> Self {
         Self::new(vec![
             ScriptedAction::Code {
-                source: "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\nlines = await read(\"Cargo.toml\")".to_owned(),
+                source: "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")".to_owned(),
             },
             ScriptedAction::Code {
-                source: "print(\"\".join(lines[0:20]), end=\"\")\nrequest_count".to_owned(),
+                source: "print(contents[0:20], end=\"\")\nrequest_count".to_owned(),
             },
             ScriptedAction::Message {
                 text: "I inspected Cargo.toml.".to_owned(),
@@ -558,7 +554,7 @@ mod tests {
     };
 
     fn history_with_request(request: &str) -> ModelHistory {
-        let mut history = ModelHistory::new("read files");
+        let mut history = ModelHistory::new();
         history.append_user_request(request);
         history
     }
@@ -692,7 +688,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, ModelHistoryError::DuplicateCallId(call_id));
-        assert_eq!(history.entries().len(), 3);
+        assert_eq!(history.entries().len(), 2);
     }
 
     #[test]
