@@ -397,7 +397,7 @@ pub(crate) fn bootstrap_source() -> String {
 pub(crate) fn prompt_reference() -> String {
     let records = record_definitions()
         .into_iter()
-        .map(ToolRecord::prompt_skeleton)
+        .map(ToolRecord::bootstrap_definition)
         .collect::<Vec<_>>();
     let definitions = ACTIVE_TOOLS
         .iter()
@@ -437,10 +437,6 @@ fn record_definitions() -> Vec<&'static ToolRecord> {
 impl ToolRecord {
     fn bootstrap_definition(&self) -> String {
         format!("@dataclass\nclass {}:\n{}", self.name, self.fields_source())
-    }
-
-    fn prompt_skeleton(&self) -> String {
-        self.bootstrap_definition()
     }
 
     fn fields_source(&self) -> String {
@@ -1126,18 +1122,7 @@ fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, T
         )));
     }
 
-    #[cfg(unix)]
-    let mut file = {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-        parent
-            .open_with(&file_name, &options)
-            .map_err(no_follow_io)?
-    };
-    #[cfg(not(unix))]
-    let mut file = parent.open(&file_name).map_err(ToolError::from_io)?;
+    let mut file = open_file_no_follow(&parent, &file_name)?;
     let metadata = file.metadata().map_err(ToolError::from_io)?;
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
@@ -1243,10 +1228,28 @@ struct IgnoreMatchers {
     gitignore: Gitignore,
 }
 
-struct GlobDirectory {
+struct SearchDirectory {
     directory: Dir,
     path: PathBuf,
     ignores: Vec<IgnoreMatchers>,
+}
+
+fn root_ignore_context(
+    workspace: &Dir,
+    root: &Path,
+) -> Result<(PathBuf, Vec<IgnoreMatchers>), ToolError> {
+    let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    let mut root_path = PathBuf::new();
+    let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
+    for component in root.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("search roots are normalised before traversal");
+        };
+        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
+        root_path.push(component);
+        ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
+    }
+    Ok((root_path, ignores))
 }
 
 fn glob_directory(
@@ -1257,19 +1260,9 @@ fn glob_directory(
 ) -> Result<Vec<ToolValue>, ToolError> {
     let (matcher, basename_only) = matcher;
     let root_directory = open_directory_root(workspace, root)?;
-    let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
-    let mut root_path = PathBuf::new();
-    let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
-    for component in root.components() {
-        let Component::Normal(component) = component else {
-            unreachable!("glob roots are normalised before traversal");
-        };
-        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
-        root_path.push(component);
-        ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
-    }
+    let (root_path, ignores) = root_ignore_context(workspace, root)?;
 
-    let mut directories = vec![GlobDirectory {
+    let mut directories = vec![SearchDirectory {
         directory: root_directory,
         path: root_path,
         ignores,
@@ -1306,7 +1299,7 @@ fn glob_directory(
                 let child = open_directory_no_follow(&directory.directory, Path::new(name))?;
                 let mut child_ignores = directory.ignores.clone();
                 child_ignores.push(directory_ignore_matchers(&child, &path)?);
-                directories.push(GlobDirectory {
+                directories.push(SearchDirectory {
                     directory: child,
                     path,
                     ignores: child_ignores,
@@ -1337,12 +1330,6 @@ struct GrepMatchValue {
     path: String,
     line: i64,
     text: String,
-}
-
-struct GrepDirectory {
-    directory: Dir,
-    path: PathBuf,
-    ignores: Vec<IgnoreMatchers>,
 }
 
 enum GrepFileFailure {
@@ -1536,19 +1523,9 @@ fn grep_directory(
     limits: ToolLimits,
 ) -> Result<Vec<ToolValue>, ToolError> {
     let root_directory = open_directory_root(workspace, root)?;
-    let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
-    let mut root_path = PathBuf::new();
-    let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
-    for component in root.components() {
-        let Component::Normal(component) = component else {
-            unreachable!("grep roots are normalised before traversal");
-        };
-        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
-        root_path.push(component);
-        ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
-    }
+    let (root_path, ignores) = root_ignore_context(workspace, root)?;
 
-    let mut directories = vec![GrepDirectory {
+    let mut directories = vec![SearchDirectory {
         directory: root_directory,
         path: root_path,
         ignores,
@@ -1602,7 +1579,7 @@ fn grep_directory(
                 let child = open_directory_no_follow(&directory.directory, Path::new(name))?;
                 let mut child_ignores = directory.ignores.clone();
                 child_ignores.push(directory_ignore_matchers(&child, &path)?);
-                directories.push(GrepDirectory {
+                directories.push(SearchDirectory {
                     directory: child,
                     path,
                     ignores: child_ignores,
@@ -1624,20 +1601,7 @@ fn grep_regular_file(
     existing_items: usize,
     existing_payload_bytes: usize,
 ) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
-    #[cfg(unix)]
-    let mut file = {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-        parent.open_with(name, &options).map_err(no_follow_io)
-    }
-    .map_err(GrepFileFailure::Tool)?;
-    #[cfg(not(unix))]
-    let mut file = parent
-        .open(name)
-        .map_err(ToolError::from_io)
-        .map_err(GrepFileFailure::Tool)?;
+    let mut file = open_file_no_follow(parent, name).map_err(GrepFileFailure::Tool)?;
     if !file
         .metadata()
         .map_err(ToolError::from_io)
@@ -1804,16 +1768,7 @@ fn read_ignore_file(directory: &Dir, name: &Path) -> Result<Option<Vec<u8>>, Too
         return Ok(None);
     }
 
-    #[cfg(unix)]
-    let mut file = {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-        directory.open_with(name, &options).map_err(no_follow_io)?
-    };
-    #[cfg(not(unix))]
-    let mut file = directory.open(name).map_err(ToolError::from_io)?;
+    let mut file = open_file_no_follow(directory, name)?;
     if !file.metadata().map_err(ToolError::from_io)?.is_file() {
         return Ok(None);
     }
@@ -1901,6 +1856,20 @@ fn open_parent(workspace: &Dir, path: &Path) -> Result<(Dir, PathBuf), ToolError
         directory = open_directory_no_follow(&directory, &component)?;
     }
     unreachable!("normalised paths contain at least one component")
+}
+
+#[cfg(unix)]
+fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    parent.open_with(name, &options).map_err(no_follow_io)
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+    parent.open(name).map_err(ToolError::from_io)
 }
 
 #[cfg(unix)]
