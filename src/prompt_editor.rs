@@ -9,14 +9,20 @@ pub(crate) enum PromptEdit {
     InsertNewline,
     Left,
     Right,
+    WordLeft,
+    WordRight,
     Up,
     Down,
+    PromptStart,
+    PromptEnd,
     LineStart,
     LineEnd,
     DeletePreviousGrapheme,
     DeleteNextGrapheme,
     DeletePreviousWord,
+    DeleteNextWord,
     DeleteToLineStart,
+    DeleteToLineEnd,
 }
 
 #[derive(Default)]
@@ -61,14 +67,20 @@ impl PromptEditor {
             PromptEdit::InsertNewline => self.insert('\n'),
             PromptEdit::Left => self.move_left(),
             PromptEdit::Right => self.move_right(),
+            PromptEdit::WordLeft => self.move_word_left(),
+            PromptEdit::WordRight => self.move_word_right(),
             PromptEdit::Up => self.move_vertical(width, true),
             PromptEdit::Down => self.move_vertical(width, false),
+            PromptEdit::PromptStart => self.move_to(0),
+            PromptEdit::PromptEnd => self.move_to(self.text.len()),
             PromptEdit::LineStart => self.move_to(self.line_start()),
             PromptEdit::LineEnd => self.move_to(self.line_end()),
             PromptEdit::DeletePreviousGrapheme => self.delete_previous_grapheme(),
             PromptEdit::DeleteNextGrapheme => self.delete_next_grapheme(),
             PromptEdit::DeletePreviousWord => self.delete_previous_word(),
+            PromptEdit::DeleteNextWord => self.delete_next_word(),
             PromptEdit::DeleteToLineStart => self.delete_to_line_start(),
+            PromptEdit::DeleteToLineEnd => self.delete_to_line_end(),
             PromptEdit::Insert(_) => false,
         }
     }
@@ -130,6 +142,33 @@ impl PromptEditor {
         self.move_to(self.caret + grapheme.len())
     }
 
+    fn move_word_left(&mut self) -> bool {
+        let start = self
+            .text
+            .split_word_bound_indices()
+            .take_while(|(index, _)| *index < self.caret)
+            .filter(|(_, word)| !word.chars().all(char::is_whitespace))
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(0);
+        self.move_to(start)
+    }
+
+    fn move_word_right(&mut self) -> bool {
+        self.move_to(self.next_word_end())
+    }
+
+    fn next_word_end(&self) -> usize {
+        self.text
+            .split_word_bound_indices()
+            .filter(|(_, word)| !word.chars().all(char::is_whitespace))
+            .find_map(|(index, word)| {
+                let end = index + word.len();
+                (end > self.caret).then_some(end)
+            })
+            .unwrap_or(self.text.len())
+    }
+
     fn move_vertical(&mut self, width: u16, up: bool) -> bool {
         let rows = visual_rows(&self.text, usize::from(width));
         let Some((row, column)) =
@@ -188,8 +227,16 @@ impl PromptEditor {
         self.delete(word_start..self.caret)
     }
 
+    fn delete_next_word(&mut self) -> bool {
+        self.delete(self.caret..self.next_word_end())
+    }
+
     fn delete_to_line_start(&mut self) -> bool {
         self.delete(self.line_start()..self.caret)
+    }
+
+    fn delete_to_line_end(&mut self) -> bool {
+        self.delete(self.caret..self.line_end())
     }
 
     fn delete(&mut self, range: std::ops::Range<usize>) -> bool {
@@ -400,6 +447,31 @@ mod tests {
             editor.text(),
             format!("{}🦀a", "a".repeat(MAX_PROMPT_BYTES - '🦀'.len_utf8() - 1))
         );
+    }
+
+    #[test]
+    fn word_movement_preserves_uax_context_around_interior_carets() {
+        for text in ["can't", "12,345"] {
+            let punctuation = text.find(['\'', ',']).unwrap();
+
+            let mut editor = from_text(text);
+            assert!(editor.apply(PromptEdit::LineStart, 80));
+            for _ in 0..=punctuation {
+                assert!(editor.apply(PromptEdit::Right, 80));
+            }
+            assert!(editor.apply(PromptEdit::WordLeft, 80));
+            assert!(editor.apply(PromptEdit::Insert('>'), 80));
+            assert_eq!(editor.text(), format!(">{text}"));
+
+            let mut editor = from_text(text);
+            assert!(editor.apply(PromptEdit::LineStart, 80));
+            for _ in 0..punctuation {
+                assert!(editor.apply(PromptEdit::Right, 80));
+            }
+            assert!(editor.apply(PromptEdit::WordRight, 80));
+            assert!(editor.apply(PromptEdit::Insert('>'), 80));
+            assert_eq!(editor.text(), format!("{text}>"));
+        }
     }
 
     #[test]
