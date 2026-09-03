@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-openai = { version = "=0.41.3", default-features = false, features = ["byot", "middleware", "responses", "rustls"] }
+arboard = { version = "=3.6.1", default-features = false }
 blake3 = "1"
 cap-std = "4"
 futures = "0.3"

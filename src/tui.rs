@@ -1,10 +1,10 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
@@ -15,9 +15,11 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::StartupSnapshot;
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout};
 use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
+use crate::selection::{DocumentPosition, Selection};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{Transcript, muted_page_style, normalise_terminal_text, page_style};
@@ -58,6 +60,64 @@ enum AppMode {
     ConfigurationOnly,
 }
 
+#[derive(Clone, Copy)]
+struct HistoryViewport {
+    area: Rect,
+    document_top: usize,
+}
+
+impl HistoryViewport {
+    fn position(self, column: u16, row: u16, document_top: usize) -> Option<DocumentPosition> {
+        (column >= self.area.x
+            && column < self.area.right()
+            && row >= self.area.y
+            && row < self.area.bottom())
+        .then(|| {
+            DocumentPosition::new(
+                document_top.saturating_add(usize::from(row.saturating_sub(self.area.y))),
+                column,
+            )
+        })
+    }
+
+    fn edge(self, row: u16) -> Option<Edge> {
+        if row == self.area.top() {
+            Some(Edge::Older)
+        } else if row == self.area.bottom().saturating_sub(1) {
+            Some(Edge::Newer)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Edge {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Copy)]
+struct Drag {
+    anchor: DocumentPosition,
+    column: u16,
+    row: u16,
+    edge: Option<Edge>,
+    next_tick: Instant,
+}
+
+#[derive(Clone, Copy)]
+enum Notice {
+    Copied,
+    CopyFailed,
+}
+
+struct Flash {
+    next_tick: Instant,
+    transitions: u8,
+    highlighted: bool,
+}
+
 struct App {
     mode: AppMode,
     enhanced_keyboard: bool,
@@ -67,6 +127,13 @@ struct App {
     scroll_from_bottom: usize,
     history_height: usize,
     history_rows: usize,
+    history_viewport: Option<HistoryViewport>,
+    selection: Option<Selection>,
+    drag: Option<Drag>,
+    pending_copy: bool,
+    pending_copy_text: Option<String>,
+    notice: Option<Notice>,
+    flash: Option<Flash>,
 }
 
 impl Default for App {
@@ -80,6 +147,13 @@ impl Default for App {
             scroll_from_bottom: 0,
             history_height: 0,
             history_rows: 0,
+            history_viewport: None,
+            selection: None,
+            drag: None,
+            pending_copy: false,
+            pending_copy_text: None,
+            notice: None,
+            flash: None,
         }
     }
 }
@@ -115,8 +189,9 @@ impl App {
         self.is_configuration_only() || self.transcript.is_disabled()
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> Update {
-        match mouse.kind {
+    fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        let notice_cleared = self.clear_notice();
+        let mut update = match mouse.kind {
             MouseEventKind::ScrollUp => self.update_scroll(
                 self.scroll_from_bottom
                     .saturating_add(MOUSE_WHEEL_SCROLL_ROWS),
@@ -125,11 +200,27 @@ impl App {
                 self.scroll_from_bottom
                     .saturating_sub(MOUSE_WHEEL_SCROLL_ROWS),
             ),
+            MouseEventKind::Down(MouseButton::Left) => self.begin_selection(mouse, now),
+            MouseEventKind::Drag(MouseButton::Left) => Update {
+                command: None,
+                visible_changed: self.update_drag(mouse, now),
+                quit: false,
+            },
+            MouseEventKind::Up(MouseButton::Left) => self.finish_selection(mouse, now),
             _ => Update::default(),
-        }
+        };
+        update.visible_changed |= notice_cleared;
+        update
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Update {
+        let notice_cleared = self.clear_notice();
+        let mut update = self.handle_key_inner(key);
+        update.visible_changed |= notice_cleared;
+        update
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Update {
         if key.is_release() {
             return Update::default();
         }
@@ -152,16 +243,24 @@ impl App {
                     };
                 }
                 KeyCode::Char('t' | 'T') => {
+                    let visible_changed = self.transcript.toggle_reasoning();
+                    if visible_changed {
+                        self.invalidate_selection();
+                    }
                     return Update {
                         command: None,
-                        visible_changed: self.transcript.toggle_reasoning(),
+                        visible_changed,
                         quit: false,
                     };
                 }
                 KeyCode::Char('o' | 'O') => {
+                    let visible_changed = self.transcript.toggle_arena_expansion();
+                    if visible_changed {
+                        self.invalidate_selection();
+                    }
                     return Update {
                         command: None,
-                        visible_changed: self.transcript.toggle_arena_expansion(),
+                        visible_changed,
                         quit: false,
                     };
                 }
@@ -204,6 +303,188 @@ impl App {
             };
         }
         Update::default()
+    }
+
+    fn begin_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        let visible_changed = self.invalidate_selection();
+        let Some(position) = self
+            .history_viewport
+            .and_then(|viewport| viewport.position(mouse.column, mouse.row, viewport.document_top))
+        else {
+            return Update {
+                command: None,
+                visible_changed,
+                quit: false,
+            };
+        };
+        self.drag = Some(Drag {
+            anchor: position,
+            column: mouse.column,
+            row: mouse.row,
+            edge: None,
+            next_tick: now + POLL_INTERVAL,
+        });
+        Update {
+            command: None,
+            visible_changed,
+            quit: false,
+        }
+    }
+
+    fn update_drag(&mut self, mouse: MouseEvent, now: Instant) -> bool {
+        let Some(viewport) = self.history_viewport else {
+            return false;
+        };
+        let Some(focus) = viewport.position(mouse.column, mouse.row, viewport.document_top) else {
+            if let Some(drag) = &mut self.drag {
+                drag.edge = None;
+            }
+            return false;
+        };
+        let Some(drag) = &mut self.drag else {
+            return false;
+        };
+        drag.column = mouse.column;
+        drag.row = mouse.row;
+        drag.edge = viewport.edge(mouse.row);
+        drag.next_tick = now + POLL_INTERVAL;
+        let selection = Selection::from_inclusive_cells(drag.anchor, focus);
+        let visible_changed = self.selection != selection;
+        self.selection = selection;
+        visible_changed
+    }
+
+    fn finish_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        let visible_changed = self.update_drag(mouse, now);
+        if self.drag.take().is_some() && self.selection.is_some() {
+            self.pending_copy = true;
+            return Update {
+                command: None,
+                visible_changed: true,
+                quit: false,
+            };
+        }
+        Update {
+            command: None,
+            visible_changed,
+            quit: false,
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        self.tick_edge_scroll(now) | self.tick_flash(now)
+    }
+
+    fn tick_edge_scroll(&mut self, now: Instant) -> bool {
+        let Some(drag) = self.drag else {
+            return false;
+        };
+        let Some(edge) = drag.edge else {
+            return false;
+        };
+        if now < drag.next_tick {
+            return false;
+        }
+        let scroll = match edge {
+            Edge::Older => self.scroll_from_bottom.saturating_add(1),
+            Edge::Newer => self.scroll_from_bottom.saturating_sub(1),
+        };
+        if !self.update_scroll(scroll).visible_changed {
+            if let Some(drag) = &mut self.drag {
+                drag.edge = None;
+            }
+            return false;
+        }
+        let Some(viewport) = self.history_viewport else {
+            return false;
+        };
+        let focus = viewport
+            .position(drag.column, drag.row, self.history_document_top())
+            .expect("drag position remains within history viewport");
+        self.selection = Selection::from_inclusive_cells(drag.anchor, focus);
+        if let Some(drag) = &mut self.drag {
+            drag.next_tick = now + POLL_INTERVAL;
+        }
+        true
+    }
+
+    fn tick_flash(&mut self, now: Instant) -> bool {
+        let Some(flash) = &mut self.flash else {
+            return false;
+        };
+        if now < flash.next_tick {
+            return false;
+        }
+        flash.highlighted = !flash.highlighted;
+        flash.transitions = flash.transitions.saturating_add(1);
+        if flash.transitions == 4 {
+            self.flash = None;
+        } else {
+            flash.next_tick = now + Duration::from_millis(100);
+        }
+        true
+    }
+
+    fn history_document_top(&self) -> usize {
+        self.history_rows
+            .saturating_sub(self.history_height)
+            .saturating_sub(self.scroll_from_bottom)
+    }
+
+    fn selection_for_render(&self) -> Option<Selection> {
+        self.flash
+            .as_ref()
+            .is_none_or(|flash| flash.highlighted)
+            .then_some(self.selection)
+            .flatten()
+    }
+
+    fn finish_pending_copy(&mut self, clipboard: &mut impl ClipboardPort, now: Instant) -> bool {
+        let Some(text) = self.pending_copy_text.take() else {
+            return false;
+        };
+        if clipboard.write_text(&text).is_ok() {
+            self.notice = Some(Notice::Copied);
+            self.flash = Some(Flash {
+                next_tick: now + Duration::from_millis(100),
+                transitions: 0,
+                highlighted: true,
+            });
+        } else {
+            self.notice = Some(Notice::CopyFailed);
+            self.flash = None;
+        }
+        true
+    }
+
+    fn notice(&self) -> Option<&'static str> {
+        match self.notice {
+            Some(Notice::Copied) => Some("Copied"),
+            Some(Notice::CopyFailed) => Some("Copy failed"),
+            None => None,
+        }
+    }
+
+    fn clear_notice(&mut self) -> bool {
+        self.notice.take().is_some()
+    }
+
+    fn invalidate_selection(&mut self) -> bool {
+        let visible_changed =
+            self.selection.is_some() || self.notice.is_some() || self.flash.is_some();
+        self.selection = None;
+        self.drag = None;
+        self.pending_copy = false;
+        self.pending_copy_text = None;
+        self.notice = None;
+        self.flash = None;
+        visible_changed
+    }
+
+    fn history_unavailable(&mut self) {
+        self.history_height = 0;
+        self.history_viewport = None;
+        self.invalidate_selection();
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<Update> {
@@ -316,7 +597,11 @@ impl App {
     }
 
     fn handle_event_with_gap(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
-        self.transcript.apply(event, gap_before)
+        let visible_changed = self.transcript.apply(event, gap_before);
+        if visible_changed {
+            self.invalidate_selection();
+        }
+        visible_changed
     }
 
     fn update_scroll(&mut self, scroll_from_bottom: usize) -> Update {
@@ -363,6 +648,7 @@ pub(crate) fn run(
 ) -> Result<(), TuiError> {
     let mut app = App::configured(startup);
     let mut input = CrosstermEvents;
+    let mut clipboard = LocalClipboard::new();
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
@@ -380,6 +666,7 @@ pub(crate) fn run(
                             &commands,
                             &mut events,
                             &mut progress,
+                            &mut clipboard,
                         )
                         .map(|_| ())
                     },
@@ -392,12 +679,13 @@ pub(crate) fn run(
 pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError> {
     let mut app = App::configuration(startup);
     let mut input = CrosstermEvents;
+    let mut clipboard = LocalClipboard::new();
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
             with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
-                run_configuration_loop(terminal, &mut app, &mut input).map(|_| ())
+                run_configuration_loop(terminal, &mut app, &mut input, &mut clipboard).map(|_| ())
             })
         },
     )
@@ -463,21 +751,30 @@ fn with_keyboard_enhancement<T>(
     run(enabled)
 }
 
+fn draw_frame<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    clipboard: &mut impl ClipboardPort,
+) -> Result<bool, TuiError> {
+    terminal
+        .draw(|frame| render(frame, app))
+        .map_err(|error| TuiError::Terminal(error.to_string()))?;
+    Ok(app.finish_pending_copy(clipboard, Instant::now()))
+}
+
 fn run_configuration_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     input: &mut impl EventSource,
+    clipboard: &mut impl ClipboardPort,
 ) -> Result<usize, TuiError> {
     let mut dirty = true;
     let mut redraws = 0;
 
     loop {
         if dirty {
-            terminal
-                .draw(|frame| render(frame, app))
-                .map_err(|error| TuiError::Terminal(error.to_string()))?;
+            dirty = draw_frame(terminal, app, clipboard)?;
             redraws += 1;
-            dirty = false;
         }
 
         if input.poll(POLL_INTERVAL).map_err(TuiError::Input)? {
@@ -489,11 +786,19 @@ fn run_configuration_loop<B: Backend>(
                         return Ok(redraws);
                     }
                 }
-                Event::Mouse(mouse) => dirty |= app.handle_mouse(mouse).visible_changed,
-                Event::Resize(_, _) => dirty = true,
+                Event::Mouse(mouse) => {
+                    dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
+                }
+                Event::Resize(_, _) => {
+                    app.invalidate_selection();
+                    dirty = true;
+                }
+                Event::Paste(_) => dirty |= app.clear_notice(),
                 _ => {}
             }
         }
+
+        dirty |= app.tick(Instant::now());
     }
 }
 
@@ -504,6 +809,7 @@ fn run_loop<B: Backend>(
     commands: &mpsc::Sender<RuntimeCommand>,
     events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
     progress: &mut RuntimeProgressReceiver,
+    clipboard: &mut impl ClipboardPort,
 ) -> Result<usize, TuiError> {
     let mut dirty = true;
     let mut redraws = 0;
@@ -511,11 +817,8 @@ fn run_loop<B: Backend>(
 
     loop {
         if dirty {
-            terminal
-                .draw(|frame| render(frame, app))
-                .map_err(|error| TuiError::Terminal(error.to_string()))?;
+            dirty = draw_frame(terminal, app, clipboard)?;
             redraws += 1;
-            dirty = false;
         }
 
         let mut quit = false;
@@ -531,8 +834,14 @@ fn run_loop<B: Backend>(
                     }
                     quit = update.quit;
                 }
-                Event::Mouse(mouse) => dirty |= app.handle_mouse(mouse).visible_changed,
-                Event::Resize(_, _) => dirty = true,
+                Event::Mouse(mouse) => {
+                    dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
+                }
+                Event::Resize(_, _) => {
+                    app.invalidate_selection();
+                    dirty = true;
+                }
+                Event::Paste(_) => dirty |= app.clear_notice(),
                 _ => {}
             }
         }
@@ -562,6 +871,8 @@ fn run_loop<B: Backend>(
         if quit {
             return Ok(redraws);
         }
+
+        dirty |= app.tick(Instant::now());
     }
 }
 
@@ -571,17 +882,28 @@ fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, page_style());
     if area.width == 0 || area.height == 0 {
-        app.history_height = 0;
+        app.history_unavailable();
         return;
     }
 
     let configuration_only = app.is_configuration_only();
+    let notice = app.notice();
     let header = if configuration_only {
-        "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
-            .to_owned()
+        notice.map_or_else(
+            || {
+                "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                    .to_owned()
+            },
+            |notice| {
+                format!(
+                    "{notice} | Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                )
+            },
+        )
     } else if app.transcript.is_disabled() {
+        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {} | Input disabled | Up/Down scroll | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit",
+            "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit",
             app.transcript.status()
         )
     } else {
@@ -590,8 +912,9 @@ fn render(frame: &mut Frame, app: &mut App) {
         } else {
             ""
         };
+        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C clear/quit",
+            "Status: {}{notice} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C clear/quit",
             app.transcript.status()
         )
     };
@@ -602,7 +925,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     if configuration_only {
         if area.height == 1 {
-            app.history_height = 0;
+            app.history_unavailable();
             return;
         }
         let _ = render_history(
@@ -619,7 +942,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if area.height == 1 {
-        app.history_height = 0;
+        app.history_unavailable();
         return;
     }
 
@@ -631,7 +954,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     );
     if area.height == 2 {
         render_rule(frame, bottom_rule, None);
-        app.history_height = 0;
+        app.history_unavailable();
         return;
     }
     if area.height == 3 {
@@ -641,7 +964,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             None,
         );
         render_rule(frame, bottom_rule, None);
-        app.history_height = 0;
+        app.history_unavailable();
         return;
     }
 
@@ -680,13 +1003,41 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Option<St
         .footer()
         .map(normalise_terminal_text)
         .filter(|footer| !footer.is_empty());
+    if viewport.is_empty() {
+        app.history_unavailable();
+        return footer;
+    }
+    if app
+        .history_viewport
+        .is_some_and(|history| history.area != viewport)
+    {
+        app.invalidate_selection();
+    }
     app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
     let last_page_start = app.history_rows.saturating_sub(app.history_height);
     app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-    if viewport.height > 0 {
-        let top = last_page_start.saturating_sub(app.scroll_from_bottom);
+    let top = last_page_start.saturating_sub(app.scroll_from_bottom);
+    app.history_viewport = Some(HistoryViewport {
+        area: viewport,
+        document_top: top,
+    });
+    if let Some(selection) = app.selection_for_render() {
+        layout.render_with_selection(viewport, top, Some(selection), frame.buffer_mut());
+    } else {
         layout.render(viewport, top, frame.buffer_mut());
+    }
+    if app.pending_copy {
+        app.pending_copy = false;
+        let text = app
+            .selection
+            .map(|selection| layout.extract_selection(selection))
+            .unwrap_or_default();
+        if text.is_empty() {
+            app.invalidate_selection();
+        } else {
+            app.pending_copy_text = Some(text);
+        }
     }
     footer
 }
@@ -814,7 +1165,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};
@@ -831,6 +1182,7 @@ mod tests {
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
         ToolCallToken, ToolName,
     };
+    use crate::clipboard::{ClipboardError, ClipboardPort};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{PromptEdit, PromptEditor};
     use crate::runtime::{
@@ -923,6 +1275,18 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
+        for row in buffer.area.top()..buffer.area.bottom() {
+            let rendered = (buffer.area.left()..buffer.area.right())
+                .map(|column| buffer[(column, row)].symbol())
+                .collect::<String>();
+            if let Some(column) = rendered.find(text) {
+                return (u16::try_from(column).expect("test terminal column"), row);
+            }
+        }
+        panic!("rendered text: {text}")
+    }
+
     fn observation(text: &str) -> Observation {
         Observation {
             head: text.to_owned(),
@@ -969,6 +1333,27 @@ mod tests {
         }
     }
 
+    struct FakeClipboard {
+        writes: Vec<String>,
+        result: Result<(), ClipboardError>,
+    }
+
+    impl FakeClipboard {
+        fn available() -> Self {
+            Self {
+                writes: Vec::new(),
+                result: Ok(()),
+            }
+        }
+    }
+
+    impl ClipboardPort for FakeClipboard {
+        fn write_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+            self.writes.push(text.to_owned());
+            self.result
+        }
+    }
+
     fn app_with_history(mut app: App) -> App {
         for run_id in 1..=8 {
             app.handle_event(RuntimeEvent::RecordAppended {
@@ -985,12 +1370,20 @@ mod tests {
     }
 
     fn mouse(kind: MouseEventKind) -> Event {
-        Event::Mouse(MouseEvent {
+        mouse_at(kind, 0, 0)
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(mouse_event(kind, column, row))
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
             kind,
-            column: 0,
-            row: 0,
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
-        })
+        }
     }
 
     fn quit_event() -> Event {
@@ -998,6 +1391,15 @@ mod tests {
     }
 
     fn run_transcript_loop(app: &mut App, input: &mut FakeInput) -> usize {
+        let mut clipboard = FakeClipboard::available();
+        run_transcript_loop_with_clipboard(app, input, &mut clipboard)
+    }
+
+    fn run_transcript_loop_with_clipboard(
+        app: &mut App,
+        input: &mut FakeInput,
+        clipboard: &mut FakeClipboard,
+    ) -> usize {
         let backend = TestBackend::new(40, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let (command_sender, _command_receiver) = tokio::sync::mpsc::channel(8);
@@ -1011,15 +1413,71 @@ mod tests {
             &command_sender,
             &mut event_receiver,
             &mut progress_receiver,
+            clipboard,
         )
         .unwrap()
     }
 
     fn run_configuration_loop(app: &mut App, input: &mut FakeInput) -> usize {
-        let backend = TestBackend::new(40, 7);
+        let mut clipboard = FakeClipboard::available();
+        run_configuration_loop_with_clipboard(app, input, &mut clipboard)
+    }
+
+    fn run_configuration_loop_with_clipboard(
+        app: &mut App,
+        input: &mut FakeInput,
+        clipboard: &mut FakeClipboard,
+    ) -> usize {
+        run_configuration_loop_with_clipboard_at(app, input, clipboard, 40, 7)
+    }
+
+    fn run_configuration_loop_with_clipboard_at(
+        app: &mut App,
+        input: &mut FakeInput,
+        clipboard: &mut FakeClipboard,
+        width: u16,
+        height: u16,
+    ) -> usize {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        super::run_configuration_loop(&mut terminal, app, input).unwrap()
+        super::run_configuration_loop(&mut terminal, app, input, clipboard).unwrap()
+    }
+
+    fn app_with_pending_copy(text: &str) -> (App, Instant) {
+        let mut app = App::default();
+        let now = queue_copy(&mut app, text, 60, 12);
+        (app, now)
+    }
+
+    fn queue_copy(app: &mut App, text: &str, width: u16, height: u16) -> Instant {
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: text.to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let buffer = rendered_buffer(app, width, height);
+        let (column, row) = cell_start(&buffer, text);
+        let end = column + u16::try_from(text.len() - 1).unwrap();
+        let now = Instant::now();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), end, row),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), end, row),
+            now,
+        );
+        rendered_buffer(app, width, height);
+        now
     }
 
     struct ErrorInput;
@@ -1620,7 +2078,13 @@ mod tests {
             ))),
         ]);
 
-        let redraws = super::run_configuration_loop(&mut terminal, &mut app, &mut input).unwrap();
+        let redraws = super::run_configuration_loop(
+            &mut terminal,
+            &mut app,
+            &mut input,
+            &mut FakeClipboard::available(),
+        )
+        .unwrap();
 
         assert_eq!(redraws, 2);
         assert!(app.scroll_from_bottom > 0);
@@ -1664,7 +2128,15 @@ mod tests {
                     .map_err(|error| super::TuiError::Terminal(error.to_string()))
             },
             || restored_after_error.set(true),
-            |terminal| super::run_configuration_loop(terminal, &mut app, &mut input).map(|_| ()),
+            |terminal| {
+                super::run_configuration_loop(
+                    terminal,
+                    &mut app,
+                    &mut input,
+                    &mut FakeClipboard::available(),
+                )
+                .map(|_| ())
+            },
         );
         assert!(matches!(input_result, Err(super::TuiError::Input(_))));
         assert!(restored_after_error.get());
@@ -2103,6 +2575,566 @@ mod tests {
     }
 
     #[test]
+    fn primary_drag_copies_unwrapped_logical_history_text() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: text.to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let mut input = FakeInput::new([
+            Some(mouse_at(MouseEventKind::Down(MouseButton::Left), 1, 1)),
+            Some(mouse_at(MouseEventKind::Drag(MouseButton::Left), 38, 2)),
+            Some(mouse_at(MouseEventKind::Up(MouseButton::Left), 38, 2)),
+            None,
+            Some(quit_event()),
+        ]);
+        let mut clipboard = FakeClipboard::available();
+
+        assert_eq!(
+            run_transcript_loop_with_clipboard(&mut app, &mut input, &mut clipboard),
+            4
+        );
+
+        assert_eq!(clipboard.writes, [text]);
+    }
+
+    #[test]
+    fn backwards_drag_across_cards_copies_display_order_and_highlights_only_content() {
+        let first = "first selectable card";
+        let second = "second selectable card";
+        let mut app = App::default();
+        for (run_id, request) in [(1, first), (2, second)] {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(run_id),
+                    record: Record::UserRequest {
+                        request: request.to_owned(),
+                    },
+                },
+                progress_gap: false,
+            });
+        }
+        let initial = rendered_buffer(&mut app, 60, 12);
+        let (first_column, first_row) = cell_start(&initial, first);
+        let (second_column, second_row) = cell_start(&initial, second);
+        let now = Instant::now();
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                second_column + u16::try_from(second.len() - 1).unwrap(),
+                second_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                first_column,
+                first_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                first_column,
+                first_row,
+            ),
+            now,
+        );
+
+        let selected = rendered_buffer(&mut app, 60, 12);
+        assert!(
+            selected[(first_column, first_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            !selected[(first_column - 1, first_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+        assert!(super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert_eq!(clipboard.writes, [format!("{first}\n\n{second}")]);
+    }
+
+    #[test]
+    fn edge_drag_scrolls_one_row_per_cadence_and_stops_on_release() {
+        let mut app = app_with_history(App::default());
+        let initial = rendered_buffer(&mut app, 40, 7);
+        let (column, row) = cell_start(&initial, "request 8");
+        let end_column = column + u16::try_from("request 8".len() - 1).unwrap();
+        let viewport = app.history_viewport.expect("history viewport");
+        let now = Instant::now();
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), end_column, row),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                viewport.area.top(),
+            ),
+            now,
+        );
+        assert!(!app.tick(now + Duration::from_millis(49)));
+        assert!(app.tick(now + Duration::from_millis(50)));
+        assert_eq!(app.scroll_from_bottom, 1);
+        rendered_buffer(&mut app, 40, 7);
+        assert!(app.tick(now + Duration::from_millis(100)));
+        assert_eq!(app.scroll_from_bottom, 2);
+        rendered_buffer(&mut app, 40, 7);
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                viewport.area.top(),
+            ),
+            now + Duration::from_millis(100),
+        );
+        assert!(app.drag.is_none());
+        assert!(!app.tick(now + Duration::from_millis(150)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+        super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+        assert_eq!(clipboard.writes.len(), 1);
+        assert!(clipboard.writes[0].contains("request 7"));
+        assert!(clipboard.writes[0].contains("request 8"));
+    }
+
+    #[test]
+    fn successful_copy_flashes_four_times_and_retains_the_selection() {
+        let (mut app, now) = app_with_pending_copy("flash selection");
+        let mut clipboard = FakeClipboard::available();
+
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes, ["flash selection"]);
+        assert_eq!(app.notice(), Some("Copied"));
+        assert!(app.selection_for_render().is_some());
+        for (elapsed, highlighted) in [(100, false), (200, true), (300, false), (400, true)] {
+            assert!(app.tick(now + Duration::from_millis(elapsed)));
+            assert_eq!(app.selection_for_render().is_some(), highlighted);
+        }
+        assert!(app.flash.is_none());
+        assert!(app.selection.is_some());
+        assert_eq!(app.notice(), Some("Copied"));
+    }
+
+    #[test]
+    fn failed_copy_is_generic_nonfatal_and_keeps_an_ordinary_highlight() {
+        let (mut app, now) = app_with_pending_copy("failed selection");
+        let mut clipboard = FakeClipboard {
+            writes: Vec::new(),
+            result: Err(ClipboardError),
+        };
+
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(clipboard.writes, ["failed selection"]);
+        assert_eq!(app.notice(), Some("Copy failed"));
+        assert!(app.flash.is_none());
+        assert!(app.selection_for_render().is_some());
+        assert!(rendered(&mut app, 60, 12).starts_with("Status: idle |"));
+        assert!(rendered(&mut app, 60, 12).contains("Copy failed"));
+    }
+
+    #[test]
+    fn selection_copy_works_while_active_disabled_and_configuration_only() {
+        let text = "mode copy";
+        let mut active = App::default();
+        active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        let active_now = queue_copy(&mut active, text, 60, 12);
+        let mut active_clipboard = FakeClipboard::available();
+        active.finish_pending_copy(&mut active_clipboard, active_now);
+        assert_eq!(active_clipboard.writes, [text]);
+
+        let mut disabled = App::default();
+        disabled.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        });
+        let disabled_now = queue_copy(&mut disabled, text, 60, 12);
+        let mut disabled_clipboard = FakeClipboard::available();
+        disabled.finish_pending_copy(&mut disabled_clipboard, disabled_now);
+        assert_eq!(disabled_clipboard.writes, [text]);
+
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        let configuration_now = queue_copy(&mut configuration, text, 120, 15);
+        let mut configuration_clipboard = FakeClipboard::available();
+        configuration.finish_pending_copy(&mut configuration_clipboard, configuration_now);
+        assert_eq!(configuration_clipboard.writes, [text]);
+    }
+
+    #[test]
+    fn decoration_only_selection_clears_without_a_clipboard_write() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "content".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered_buffer(&mut app, 60, 12);
+        let viewport = app.history_viewport.expect("history viewport");
+        let now = Instant::now();
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                viewport.area.x,
+                viewport.area.y,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                viewport.area.x + 1,
+                viewport.area.y,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                viewport.area.x + 1,
+                viewport.area.y,
+            ),
+            now,
+        );
+        rendered_buffer(&mut app, 60, 12);
+        let mut clipboard = FakeClipboard::available();
+
+        assert!(!app.finish_pending_copy(&mut clipboard, now));
+        assert!(clipboard.writes.is_empty());
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn configuration_loop_copies_with_an_injected_clipboard() {
+        let text = "configuration loop copy";
+        let mut app = App::configuration(crate::config::ready_snapshot_for_test());
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: text.to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let buffer = rendered_buffer(&mut app, 120, 15);
+        let (column, row) = cell_start(&buffer, text);
+        let end = column + u16::try_from(text.len() - 1).unwrap();
+        let mut input = FakeInput::new([
+            Some(mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            )),
+            Some(mouse_at(MouseEventKind::Drag(MouseButton::Left), end, row)),
+            Some(mouse_at(MouseEventKind::Up(MouseButton::Left), end, row)),
+            None,
+            Some(quit_event()),
+        ]);
+        let mut clipboard = FakeClipboard::available();
+
+        assert_eq!(
+            run_configuration_loop_with_clipboard_at(&mut app, &mut input, &mut clipboard, 120, 15,),
+            4
+        );
+        assert_eq!(clipboard.writes, [text]);
+    }
+
+    #[test]
+    fn new_primary_down_replaces_the_retained_selection_and_feedback() {
+        let (mut app, now) = app_with_pending_copy("first selection");
+        let mut clipboard = FakeClipboard::available();
+        app.finish_pending_copy(&mut clipboard, now);
+        let buffer = rendered_buffer(&mut app, 60, 12);
+        let (column, row) = cell_start(&buffer, "first selection");
+
+        assert!(
+            app.handle_mouse(
+                mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+                now,
+            )
+            .visible_changed
+        );
+        assert!(app.selection.is_none());
+        assert!(app.notice().is_none());
+        assert!(app.flash.is_none());
+        assert!(app.drag.is_some());
+    }
+
+    #[test]
+    fn input_clears_the_notice_without_clearing_a_completed_selection() {
+        let (mut app, now) = app_with_pending_copy("notice selection");
+        let mut clipboard = FakeClipboard::available();
+        app.finish_pending_copy(&mut clipboard, now);
+
+        assert!(app.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert!(app.notice().is_none());
+        assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn paste_clears_copy_feedback_without_affecting_prompt_or_selection() {
+        let mut configured = App::default();
+        set_prompt(&mut configured, "keep");
+        let now = queue_copy(&mut configured, "copied selection", 40, 7);
+        let mut copied_clipboard = FakeClipboard::available();
+        assert!(configured.finish_pending_copy(&mut copied_clipboard, now));
+        let copied_selection = configured.selection;
+        let mut configured_input = FakeInput::new([Some(Event::Paste("ignored".to_owned()))]);
+        let mut configured_terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        let (commands, _command_receiver) = tokio::sync::mpsc::channel(1);
+        let (event_sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress_sender, mut progress) = tokio::sync::mpsc::channel(1);
+        drop(event_sender);
+
+        assert!(matches!(
+            super::run_loop(
+                &mut configured_terminal,
+                &mut configured,
+                &mut configured_input,
+                &commands,
+                &mut events,
+                &mut progress,
+                &mut copied_clipboard,
+            ),
+            Err(super::TuiError::RuntimeClosed)
+        ));
+        assert!(configured.notice().is_none());
+        assert_eq!(configured.selection, copied_selection);
+        assert_eq!(configured.prompt.text(), "keep");
+
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut configuration, "keep");
+        let now = queue_copy(&mut configuration, "failed selection", 40, 7);
+        let mut failed_clipboard = FakeClipboard {
+            writes: Vec::new(),
+            result: Err(ClipboardError),
+        };
+        assert!(configuration.finish_pending_copy(&mut failed_clipboard, now));
+        let failed_selection = configuration.selection;
+        let mut configuration_input =
+            FakeInput::new([Some(Event::Paste("ignored".to_owned())), Some(quit_event())]);
+
+        assert_eq!(
+            run_configuration_loop_with_clipboard(
+                &mut configuration,
+                &mut configuration_input,
+                &mut failed_clipboard,
+            ),
+            2
+        );
+        assert!(configuration.notice().is_none());
+        assert_eq!(configuration.selection, failed_selection);
+        assert_eq!(configuration.prompt.text(), "keep");
+    }
+
+    #[test]
+    fn completed_selection_survives_history_scrolling_but_not_stale_changes() {
+        let mut app = app_with_history(App::default());
+        let now = queue_copy(&mut app, "retained selection", 60, 7);
+        let mut clipboard = FakeClipboard::available();
+        app.finish_pending_copy(&mut clipboard, now);
+
+        assert!(
+            app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 0, 0), now)
+                .visible_changed
+        );
+        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
+        assert!(app.selection.is_some());
+        assert_eq!(app.notice(), None);
+
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(9),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "new history".to_owned(),
+            },
+        });
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn selection_invalidates_when_history_geometry_or_layout_changes() {
+        let (mut prompt_growth, _) = app_with_pending_copy("prompt geometry");
+        set_prompt(&mut prompt_growth, &"x".repeat(120));
+        rendered_buffer(&mut prompt_growth, 60, 12);
+        assert!(prompt_growth.selection.is_none());
+
+        let (mut resized, now) = app_with_pending_copy("resize geometry");
+        let mut resized_clipboard = FakeClipboard::available();
+        resized.finish_pending_copy(&mut resized_clipboard, now);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Resize(61, 12)), Some(quit_event())]);
+        let (commands, _received) = tokio::sync::mpsc::channel(1);
+        let (_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_progress, mut progress_receiver) = tokio::sync::mpsc::channel(1);
+        super::run_loop(
+            &mut terminal,
+            &mut resized,
+            &mut input,
+            &commands,
+            &mut event_receiver,
+            &mut progress_receiver,
+            &mut resized_clipboard,
+        )
+        .unwrap();
+        assert!(resized.selection.is_none());
+
+        let (mut tiny, _) = app_with_pending_copy("tiny history");
+        rendered_buffer(&mut tiny, 3, 3);
+        assert!(tiny.selection.is_none());
+        assert!(tiny.history_viewport.is_none());
+
+        let mut layout = App::default();
+        layout.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "answer".to_owned(),
+                    reasoning_summary: "reasoning".to_owned(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        queue_copy(&mut layout, "layout selection", 60, 12);
+        assert!(layout.selection.is_some());
+        assert!(
+            layout
+                .handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(layout.selection.is_none());
+    }
+
+    #[test]
+    fn edge_drag_scrolls_newer_and_stops_at_history_bounds() {
+        let mut newer = app_with_history(App::default());
+        rendered_buffer(&mut newer, 40, 7);
+        assert!(newer.update_scroll(usize::MAX).visible_changed);
+        let visible = rendered_buffer(&mut newer, 40, 7);
+        let (column, row) = cell_start(&visible, "request 1");
+        let viewport = newer.history_viewport.expect("history viewport");
+        let now = Instant::now();
+        newer.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            now,
+        );
+        newer.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                viewport.area.bottom() - 1,
+            ),
+            now,
+        );
+        let before = newer.scroll_from_bottom;
+        assert!(newer.tick(now + super::POLL_INTERVAL));
+        assert_eq!(newer.scroll_from_bottom, before - 1);
+
+        let mut older = app_with_history(App::default());
+        let visible = rendered_buffer(&mut older, 40, 7);
+        let (column, row) = cell_start(&visible, "request 8");
+        let viewport = older.history_viewport.expect("history viewport");
+        let now = Instant::now();
+        older.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            now,
+        );
+        older.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                viewport.area.top(),
+            ),
+            now,
+        );
+        for cadence in 1..=older.history_rows {
+            older.tick(now + super::POLL_INTERVAL * u32::try_from(cadence).unwrap());
+        }
+        assert_eq!(
+            older.scroll_from_bottom,
+            older.history_rows.saturating_sub(older.history_height)
+        );
+        assert!(older.drag.is_some_and(|drag| drag.edge.is_none()));
+        assert!(
+            !older
+                .tick(now + super::POLL_INTERVAL * u32::try_from(older.history_rows + 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn empty_non_primary_and_outside_clicks_do_not_copy_or_select() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "selectable text".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let buffer = rendered_buffer(&mut app, 40, 7);
+        let viewport = app.history_viewport.expect("history viewport");
+        let now = Instant::now();
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            app.handle_mouse(mouse_event(kind, 1, 2), now);
+        }
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 1, 0),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, viewport.area.y),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 1, viewport.area.y),
+            now,
+        );
+
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(!app.pending_copy);
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+        assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert!(clipboard.writes.is_empty());
+        assert_eq!(buffer, rendered_buffer(&mut app, 40, 7));
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_transcript_history() {
         let mut app = app_with_history(App::default());
         let mut input = FakeInput::new([
@@ -2181,6 +3213,7 @@ mod tests {
                 &command_sender,
                 &mut event_receiver,
                 &mut progress_receiver,
+                &mut FakeClipboard::available(),
             )
             .is_ok()
         );
@@ -2219,6 +3252,7 @@ mod tests {
             &command_sender,
             &mut event_receiver,
             &mut progress_receiver,
+            &mut FakeClipboard::available(),
         )
         .unwrap();
 
@@ -2253,6 +3287,7 @@ mod tests {
             &command_sender,
             &mut event_receiver,
             &mut progress_receiver,
+            &mut FakeClipboard::available(),
         );
 
         assert!(matches!(result, Err(super::TuiError::RuntimeClosed)));
@@ -2333,6 +3368,7 @@ mod tests {
                     &command_sender,
                     &mut event_receiver,
                     &mut progress_receiver,
+                    &mut FakeClipboard::available(),
                 )
                 .map(|_| ())
             },
@@ -3337,6 +4373,7 @@ mod tests {
                 &commands,
                 &mut event_receiver,
                 &mut progress_receiver,
+                &mut FakeClipboard::available(),
             )
             .unwrap(),
             2

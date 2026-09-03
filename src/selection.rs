@@ -30,6 +30,26 @@ impl Selection {
         Self { anchor, focus }
     }
 
+    pub(crate) fn from_inclusive_cells(
+        anchor: DocumentPosition,
+        focus: DocumentPosition,
+    ) -> Option<Self> {
+        if anchor == focus {
+            return None;
+        }
+        if anchor < focus {
+            Some(Self::new(
+                anchor,
+                DocumentPosition::new(focus.row, focus.column.saturating_add(1)),
+            ))
+        } else {
+            Some(Self::new(
+                DocumentPosition::new(anchor.row, anchor.column.saturating_add(1)),
+                focus,
+            ))
+        }
+    }
+
     pub(crate) fn project(self, viewport: Viewport) -> Option<ProjectedSelection> {
         if self.anchor == self.focus || viewport.area.is_empty() {
             return None;
@@ -444,6 +464,22 @@ mod tests {
             .wrap(Wrap { trim: false })
             .render(area, &mut buffer);
         buffer
+    }
+
+    #[test]
+    fn converts_inclusive_mouse_cells_to_half_open_ranges() {
+        let anchor = position(3, 4);
+        let focus = position(5, 6);
+
+        assert_eq!(
+            Selection::from_inclusive_cells(anchor, focus),
+            Some(Selection::new(anchor, position(5, 7)))
+        );
+        assert_eq!(
+            Selection::from_inclusive_cells(focus, anchor),
+            Some(Selection::new(position(5, 7), anchor))
+        );
+        assert_eq!(Selection::from_inclusive_cells(anchor, anchor), None);
     }
 
     #[test]

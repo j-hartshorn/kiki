@@ -142,7 +142,7 @@ All commands must pass. The live OpenAI test remains ignored without explicit cr
 
 **Tests** (`src/clipboard.rs`, adapter policy; `src/tui.rs`, input/render integration) — First fail on primary down/drag/up producing one fake clipboard write with unwrapped logical text. Cover empty and non-primary clicks, backwards selection, cross-card/off-screen drag, edge-scroll cadence/direction/bounds/release, active-run and read-only modes, selection-only content highlighting, success flash transitions and final retained highlight, generic nonfatal failure feedback, notice clearing, stale selection invalidation, viewport resize/prompt growth, mouse-wheel compatibility, tiny terminals, redraw counts, and error/quit cleanup. Real desktop clipboard access is excluded from tests.
 
-**Files** — Create: `src/clipboard.rs`. Modify: `Cargo.toml`, `Cargo.lock`, `src/main.rs`, `src/tui.rs`.
+**Files** — Create: `src/clipboard.rs`. Modify: `Cargo.toml`, `Cargo.lock`, `src/main.rs`, `src/selection.rs`, `src/tui.rs`.
 
 **Verification** — `cargo test clipboard::tests` passes; `cargo test tui::tests` passes; `cargo test selection::tests` and `cargo test transcript::tests` remain green; `cargo check --all-targets` passes.
 
