@@ -1893,7 +1893,12 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         "Startup configuration".to_owned(),
         format!("Worker: {worker_path}"),
         format!("Workspace: {workspace_root}"),
-        format!("Model: {}", snapshot.model()),
+        format!(
+            "Model: {} (context: {}, max output: {})",
+            snapshot.model_configuration().id,
+            snapshot.model_configuration().context_window_display,
+            snapshot.model_configuration().max_output_display
+        ),
         format!("Prompt: {prompt_source}"),
         format!("OpenAI API key: {api_key_presence}"),
         format!("Submission: {submission}"),
@@ -3215,7 +3220,7 @@ result
             "Startup configuration
 Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
-Model: gpt-5.6-sol
+Model: gpt-5.6-sol (context: 1.05m, max output: 128k)
 Prompt: bundled read_only_agent
 OpenAI API key: present
 Submission: available

@@ -13,9 +13,8 @@ pub use models::{
     DEFAULT_MODEL, ModelConfiguration, ModelPricing, PricingIdentity, Rates, model_by_id,
 };
 
-use self::constants::FIXED_MODEL;
-
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
+const KIKI_MODEL_ENV: &str = "KIKI_MODEL";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 1_024;
 const MAX_STARTUP_REMEDIATION_BYTES: usize = 512;
@@ -42,6 +41,8 @@ pub enum StartupProblemKind {
     WorkspaceRootUnavailable,
     WorkspaceRootNotAbsolute,
     WorkspaceConstructionFailed,
+    ModelUnknown,
+    ModelInvalidUnicode,
     PromptOverrideUnreadable,
     PromptOverrideInvalidUtf8,
     ApiKeyMissing,
@@ -55,8 +56,9 @@ impl StartupProblemKind {
             Self::WorkerConstructionFailed => 1,
             Self::WorkspaceRootUnavailable | Self::WorkspaceRootNotAbsolute => 2,
             Self::WorkspaceConstructionFailed => 3,
-            Self::PromptOverrideUnreadable | Self::PromptOverrideInvalidUtf8 => 4,
-            Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 5,
+            Self::ModelUnknown | Self::ModelInvalidUnicode => 4,
+            Self::PromptOverrideUnreadable | Self::PromptOverrideInvalidUtf8 => 5,
+            Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 6,
         }
     }
 }
@@ -162,7 +164,7 @@ impl PromptProvenance {
 pub struct StartupSnapshot {
     worker_path: Option<RedactedPath>,
     workspace_root: Option<RedactedPath>,
-    model: &'static str,
+    model: &'static ModelConfiguration,
     prompt_source: PromptProvenance,
     api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
@@ -178,6 +180,10 @@ impl StartupSnapshot {
     }
 
     pub fn model(&self) -> &'static str {
+        self.model.id
+    }
+
+    pub fn model_configuration(&self) -> &'static ModelConfiguration {
         self.model
     }
 
@@ -229,6 +235,7 @@ impl StartupConfiguration {
             workspace_root: self.construction.workspace_root.as_deref()?,
             system_prompt: self.construction.system_prompt.as_deref()?,
             api_key: self.construction.api_key.as_ref()?,
+            model: self.construction.model,
         })
     }
 
@@ -266,6 +273,7 @@ struct StartupConstruction {
     workspace_root: Option<PathBuf>,
     system_prompt: Option<String>,
     api_key: Option<ApiKey>,
+    model: &'static ModelConfiguration,
 }
 
 pub(crate) struct ReadyStartup<'a> {
@@ -273,6 +281,8 @@ pub(crate) struct ReadyStartup<'a> {
     workspace_root: &'a Path,
     system_prompt: &'a str,
     api_key: &'a ApiKey,
+    #[allow(dead_code)]
+    model: &'static ModelConfiguration,
 }
 
 impl<'a> ReadyStartup<'a> {
@@ -291,6 +301,11 @@ impl<'a> ReadyStartup<'a> {
     pub(crate) fn api_key(&self) -> &'a ApiKey {
         self.api_key
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn model(&self) -> &'static ModelConfiguration {
+        self.model
+    }
 }
 
 pub(crate) struct ApiKey(String);
@@ -303,6 +318,7 @@ impl ApiKey {
 
 struct StartupInput {
     worker_path: Option<OsString>,
+    model: Option<OsString>,
     workspace_root: io::Result<PathBuf>,
     prompt: PromptResolution,
     api_key: Option<OsString>,
@@ -350,6 +366,7 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
 pub fn load() -> StartupConfiguration {
     let input = StartupInput {
         worker_path: env::var_os(MONTY_BIN_ENV),
+        model: env::var_os(KIKI_MODEL_ENV),
         workspace_root: env::current_dir(),
         prompt: PromptResolution::from(prompt::resolve()),
         api_key: env::var_os(OPENAI_API_KEY_ENV),
@@ -360,6 +377,7 @@ pub fn load() -> StartupConfiguration {
 fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     let (api_key, api_key_presence, api_key_problem) = resolve_api_key(input.api_key);
     let exposed_api_key = api_key.as_ref().map(ApiKey::expose);
+    let (model, model_problem) = resolve_model(input.model, exposed_api_key);
     let (worker_path, worker_problem) = resolve_worker_path(input.worker_path, exposed_api_key);
     let (workspace_root, workspace_problem) =
         resolve_workspace_root(input.workspace_root, exposed_api_key);
@@ -377,6 +395,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     let mut problems = Vec::new();
     problems.extend(worker_problem);
     problems.extend(workspace_problem);
+    problems.extend(model_problem);
     problems.extend(prompt_problem);
     problems.extend(api_key_problem);
     problems.sort_by_key(|problem| problem.kind.order());
@@ -385,7 +404,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
         snapshot: StartupSnapshot {
             worker_path: worker_path_display,
             workspace_root: workspace_root_display,
-            model: FIXED_MODEL,
+            model,
             prompt_source: prompt_source_display,
             api_key_presence,
             problems,
@@ -395,7 +414,40 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
             workspace_root,
             system_prompt,
             api_key,
+            model,
         },
+    }
+}
+
+fn resolve_model(
+    model: Option<OsString>,
+    api_key: Option<&str>,
+) -> (&'static ModelConfiguration, Option<StartupProblem>) {
+    let Some(model) = model else {
+        return (DEFAULT_MODEL, None);
+    };
+    let Ok(model) = model.into_string() else {
+        return (
+            DEFAULT_MODEL,
+            Some(StartupProblem::new(
+                StartupProblemKind::ModelInvalidUnicode,
+                "KIKI_MODEL is not valid Unicode.",
+                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki.",
+                api_key,
+            )),
+        );
+    };
+    match model_by_id(&model) {
+        Some(model) => (model, None),
+        None => (
+            DEFAULT_MODEL,
+            Some(StartupProblem::new(
+                StartupProblemKind::ModelUnknown,
+                format!("KIKI_MODEL `{model}` is not a supported model."),
+                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki.",
+                api_key,
+            )),
+        ),
     }
 }
 
@@ -548,6 +600,7 @@ fn prompt_source_path(source: &PromptSource) -> &Path {
 pub(crate) fn ready_snapshot_for_test() -> StartupSnapshot {
     resolve_startup(StartupInput {
         worker_path: Some(OsString::from("/opt/kiki/bin/monty")),
+        model: None,
         workspace_root: Ok(PathBuf::from("/workspace/project")),
         prompt: PromptResolution::Resolved {
             text: "system instructions".to_owned(),
@@ -581,6 +634,10 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
+    use crate::config::{
+        DEFAULT_MODEL,
+        models::{LUNA, TERRA},
+    };
     use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
 
     use super::{
@@ -604,6 +661,7 @@ mod tests {
     fn ready_input(api_key: impl Into<OsString>) -> StartupInput {
         StartupInput {
             worker_path: Some(OsString::from(WORKER_PATH)),
+            model: None,
             workspace_root: Ok(PathBuf::from(WORKSPACE_ROOT)),
             prompt: bundled_prompt(),
             api_key: Some(api_key.into()),
@@ -654,6 +712,136 @@ mod tests {
     }
 
     #[test]
+    fn unset_model_uses_sol_and_keeps_submission_available() {
+        let configuration = resolve_startup(ready_input("key"));
+        let snapshot = configuration.snapshot();
+
+        assert_eq!(snapshot.model(), "gpt-5.6-sol");
+        assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+        assert_eq!(
+            snapshot.submission_availability(),
+            SubmissionAvailability::Available
+        );
+        assert!(std::ptr::eq(
+            configuration
+                .ready()
+                .expect("configuration should be ready")
+                .model(),
+            DEFAULT_MODEL
+        ));
+    }
+
+    #[test]
+    fn configured_terra_and_luna_models_keep_submission_available() {
+        for model in [&TERRA, &LUNA] {
+            let mut input = ready_input("key");
+            input.model = Some(OsString::from(model.id));
+
+            let configuration = resolve_startup(input);
+            let snapshot = configuration.snapshot();
+
+            assert_eq!(snapshot.model(), model.id);
+            assert!(std::ptr::eq(snapshot.model_configuration(), model));
+            assert_eq!(
+                snapshot.submission_availability(),
+                SubmissionAvailability::Available
+            );
+            assert!(std::ptr::eq(
+                configuration
+                    .ready()
+                    .expect("configuration should be ready")
+                    .model(),
+                model
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_model_disables_submission_with_a_diagnostic() {
+        for model in ["gpt-4o", "gpt-5.6-unknown"] {
+            let mut input = ready_input("key");
+            input.model = Some(OsString::from(model));
+
+            let configuration = resolve_startup(input);
+            let snapshot = configuration.snapshot();
+
+            assert_eq!(
+                snapshot
+                    .problems()
+                    .iter()
+                    .map(|problem| problem.kind())
+                    .collect::<Vec<_>>(),
+                [StartupProblemKind::ModelUnknown]
+            );
+            assert_eq!(
+                snapshot.problems()[0].diagnostic(),
+                format!("KIKI_MODEL `{model}` is not a supported model.")
+            );
+            assert_eq!(
+                snapshot.problems()[0].remediation(),
+                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
+            );
+            assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+            assert_eq!(
+                snapshot.submission_availability(),
+                SubmissionAvailability::Unavailable
+            );
+            assert!(configuration.ready().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_model_disables_submission_and_keeps_the_default() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut input = ready_input("key");
+        input.model = Some(OsString::from_vec(vec![b'g', b'p', b't', b'-', 0xff]));
+
+        let configuration = resolve_startup(input);
+        let snapshot = configuration.snapshot();
+
+        assert_eq!(
+            snapshot
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::ModelInvalidUnicode]
+        );
+        assert_eq!(
+            snapshot.problems()[0].diagnostic(),
+            "KIKI_MODEL is not valid Unicode."
+        );
+        assert_eq!(
+            snapshot.problems()[0].remediation(),
+            "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
+        );
+        assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+        assert_eq!(
+            snapshot.submission_availability(),
+            SubmissionAvailability::Unavailable
+        );
+        assert!(configuration.ready().is_none());
+    }
+
+    #[test]
+    fn model_diagnostic_redacts_an_api_key_used_as_the_model_id() {
+        let api_key = "sk-live-MODEL-SECRET";
+        let mut input = ready_input(api_key);
+        input.model = Some(OsString::from(api_key));
+
+        let configuration = resolve_startup(input);
+        let diagnostic = configuration.snapshot().problems()[0].diagnostic();
+
+        assert_eq!(
+            diagnostic,
+            "KIKI_MODEL `[redacted]` is not a supported model."
+        );
+        assert!(!diagnostic.contains(api_key), "{diagnostic}");
+    }
+
+    #[test]
     fn hostile_api_key_is_redacted_from_every_snapshot_path_and_provenance() {
         let api_key = "sk-live-PATH-SECRET";
         let worker_path = PathBuf::from(format!("/opt/{api_key}/bin/monty"));
@@ -661,6 +849,7 @@ mod tests {
         let prompt_path = PathBuf::from(format!("/prompts/{api_key}/agent.md"));
         let input = StartupInput {
             worker_path: Some(worker_path.clone().into_os_string()),
+            model: None,
             workspace_root: Ok(workspace_root.clone()),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),
@@ -882,6 +1071,7 @@ mod tests {
     fn problems_have_deterministic_field_and_construction_order() {
         let input = StartupInput {
             worker_path: Some(OsString::from("relative-worker")),
+            model: Some(OsString::from("gpt-4o")),
             workspace_root: Err(io::Error::other("workspace unavailable")),
             prompt: PromptResolution::Failed {
                 source: PromptSource::Override {
@@ -910,6 +1100,7 @@ mod tests {
                 StartupProblemKind::WorkerConstructionFailed,
                 StartupProblemKind::WorkspaceRootUnavailable,
                 StartupProblemKind::WorkspaceConstructionFailed,
+                StartupProblemKind::ModelUnknown,
                 StartupProblemKind::PromptOverrideInvalidUtf8,
                 StartupProblemKind::ApiKeyMissing,
             ]
@@ -996,6 +1187,7 @@ mod tests {
         let api_key = "sk-live-CONFIGURATION-SECRET";
         let configuration = resolve_startup(StartupInput {
             worker_path: Some(OsString::from(format!("/worker/{api_key}/monty\t\x1b"))),
+            model: None,
             workspace_root: Ok(PathBuf::from(format!("/workspace/{api_key}/project\r"))),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),
@@ -1012,7 +1204,7 @@ mod tests {
 
         assert!(rendered.contains("Worker: /worker/[redacted]/monty    \\x1B"));
         assert!(rendered.contains("Workspace: /workspace/[redacted]/project\\x0D"));
-        assert!(rendered.contains("Model: gpt-5.6-sol"));
+        assert!(rendered.contains("Model: gpt-5.6-sol (context: 1.05m, max output: 128k)"));
         assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
         assert!(rendered.contains("OpenAI API key: present"));
         assert!(rendered.contains("Submission: unavailable"));
