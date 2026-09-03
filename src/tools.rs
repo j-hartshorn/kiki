@@ -10,14 +10,16 @@ use std::sync::{Condvar, Mutex};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata};
-#[cfg(unix)]
-use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use futures::{Stream, StreamExt, stream};
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkError, SinkMatch};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+#[cfg(unix)]
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+#[cfg(unix)]
+use rustix::io::Errno;
 use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::{Notify, Semaphore};
@@ -1109,31 +1111,14 @@ fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
 
 fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, ToolError> {
     let (parent, file_name) = open_parent(workspace, path)?;
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
+    let mut file = open_content_no_follow(&parent, &file_name)?;
+    let metadata = file.metadata().map_err(ToolError::from_io)?;
     if metadata.is_dir() {
         return Err(ToolError::new(
             ToolErrorKind::IsADirectory,
             "path is a directory",
         ));
     }
-    if !metadata.is_file() {
-        return Err(ToolError::value("path is not a regular file"));
-    }
-    if metadata.len() > max_bytes as u64 {
-        return Err(ToolError::value(format!(
-            "file exceeds the {max_bytes}-byte limit"
-        )));
-    }
-
-    let mut file = open_file_no_follow(&parent, &file_name)?;
-    let metadata = file.metadata().map_err(ToolError::from_io)?;
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
@@ -1247,16 +1232,22 @@ struct SearchDirectory {
 fn root_ignore_context(
     workspace: &Dir,
     root: &Path,
+    root_directory: &Dir,
 ) -> Result<(PathBuf, Vec<IgnoreMatchers>), ToolError> {
     let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    let mut components = root.components().peekable();
     let mut root_path = PathBuf::new();
     let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
-    for component in root.components() {
+    while let Some(component) = components.next() {
         let Component::Normal(component) = component else {
             unreachable!("search roots are normalised before traversal");
         };
-        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
         root_path.push(component);
+        ignore_directory = if components.peek().is_some() {
+            open_directory_no_follow(&ignore_directory, Path::new(component))?
+        } else {
+            root_directory.try_clone().map_err(ToolError::from_io)?
+        };
         ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
     }
     Ok((root_path, ignores))
@@ -1270,7 +1261,7 @@ fn glob_directory(
 ) -> Result<Vec<ToolValue>, ToolError> {
     let (matcher, basename_only) = matcher;
     let root_directory = open_directory_root(workspace, root)?;
-    let (root_path, ignores) = root_ignore_context(workspace, root)?;
+    let (root_path, ignores) = root_ignore_context(workspace, root, &root_directory)?;
 
     let mut directories = vec![SearchDirectory {
         directory: root_directory,
@@ -1498,29 +1489,34 @@ fn grep_workspace(
     }
 
     let (parent, file_name) = open_parent(workspace, root)?;
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
+    let name = file_name
+        .to_str()
+        .expect("normalised paths originate from UTF-8 tool arguments");
+    let file_matches = matches_glob(&file_glob.0, file_glob.1, name, Path::new(name));
+    if !file_matches && is_regular_no_follow(&parent, &file_name)? {
+        return Ok(Vec::new());
     }
+
+    let file = open_content_no_follow(&parent, &file_name)?;
+    let metadata = file.metadata().map_err(ToolError::from_io)?;
     if metadata.is_dir() {
-        return grep_directory(workspace, root, &matcher, &file_glob, limits);
+        return grep_open_directory(
+            workspace,
+            root,
+            Dir::from_std_file(file.into_std()),
+            &matcher,
+            &file_glob,
+            limits,
+        );
     }
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
 
-    let name = file_name
-        .to_str()
-        .expect("normalised paths originate from UTF-8 tool arguments");
-    if !matches_glob(&file_glob.0, file_glob.1, name, Path::new(name)) {
+    if !file_matches {
         return Ok(Vec::new());
     }
-    let path = normalised_path_string(root);
-    grep_regular_file(&parent, &file_name, path, &matcher, limits, 0, 0)
+    grep_open_file(file, normalised_path_string(root), &matcher, limits, 0, 0)
         .map_err(grep_explicit_error)
         .map(grep_values)
 }
@@ -1533,7 +1529,18 @@ fn grep_directory(
     limits: ToolLimits,
 ) -> Result<Vec<ToolValue>, ToolError> {
     let root_directory = open_directory_root(workspace, root)?;
-    let (root_path, ignores) = root_ignore_context(workspace, root)?;
+    grep_open_directory(workspace, root, root_directory, matcher, file_glob, limits)
+}
+
+fn grep_open_directory(
+    workspace: &Dir,
+    root: &Path,
+    root_directory: Dir,
+    matcher: &RegexMatcher,
+    file_glob: &(GlobMatcher, bool),
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    let (root_path, ignores) = root_ignore_context(workspace, root, &root_directory)?;
 
     let mut directories = vec![SearchDirectory {
         directory: root_directory,
@@ -1611,7 +1618,25 @@ fn grep_regular_file(
     existing_items: usize,
     existing_payload_bytes: usize,
 ) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
-    let mut file = open_file_no_follow(parent, name).map_err(GrepFileFailure::Tool)?;
+    let file = open_content_no_follow(parent, name).map_err(GrepFileFailure::Tool)?;
+    grep_open_file(
+        file,
+        path,
+        matcher,
+        limits,
+        existing_items,
+        existing_payload_bytes,
+    )
+}
+
+fn grep_open_file(
+    mut file: File,
+    path: String,
+    matcher: &RegexMatcher,
+    limits: ToolLimits,
+    existing_items: usize,
+    existing_payload_bytes: usize,
+) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
     if !file
         .metadata()
         .map_err(ToolError::from_io)
@@ -1769,16 +1794,15 @@ fn directory_ignore_matcher(
 }
 
 fn read_ignore_file(directory: &Dir, name: &Path) -> Result<Option<Vec<u8>>, ToolError> {
-    let metadata = match directory.symlink_metadata(name) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ToolError::from_io(error)),
+    let mut file = match open_content_no_follow(directory, name) {
+        Ok(file) => file,
+        Err(error) if error.kind == ToolErrorKind::FileNotFound => return Ok(None),
+        Err(error) if error.kind == ToolErrorKind::Value => return Ok(None),
+        Err(error) if error.kind == ToolErrorKind::Permission && is_symlink(directory, name)? => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Ok(None);
-    }
-
-    let mut file = open_file_no_follow(directory, name)?;
     if !file.metadata().map_err(ToolError::from_io)?.is_file() {
         return Ok(None);
     }
@@ -1832,20 +1856,6 @@ fn open_directory_root(workspace: &Dir, path: &Path) -> Result<Dir, ToolError> {
     if path.as_os_str().is_empty() {
         return Ok(parent);
     }
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(ToolError::new(
-            ToolErrorKind::NotADirectory,
-            "path is not a directory",
-        ));
-    }
     open_directory_no_follow(&parent, &file_name)
 }
 
@@ -1869,44 +1879,102 @@ fn open_parent(workspace: &Dir, path: &Path) -> Result<(Dir, PathBuf), ToolError
 }
 
 #[cfg(unix)]
-fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    parent.open_with(name, &options).map_err(no_follow_io)
+fn open_content_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(|descriptor| File::from_std(std::fs::File::from(descriptor)))
+    .map_err(|error| content_open_error(parent, name, error))
 }
 
 #[cfg(not(unix))]
-fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+fn open_content_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
     parent.open(name).map_err(ToolError::from_io)
 }
 
 #[cfg(unix)]
 fn open_directory_no_follow(parent: &Dir, name: &Path) -> Result<Dir, ToolError> {
-    let metadata = parent.symlink_metadata(name).map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(|descriptor| Dir::from_std_file(std::fs::File::from(descriptor)))
+    .map_err(|error| directory_open_error(parent, name, error))
+}
 
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    parent
-        .open_with(name, &options)
-        .map(|file| Dir::from_std_file(file.into_std()))
+#[cfg(unix)]
+fn directory_open_error(parent: &Dir, name: &Path, error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    let io_error = std::io::Error::from(error);
+    if io_error.kind() != std::io::ErrorKind::PermissionDenied
+        && matches!(
+            statat(parent, name, AtFlags::SYMLINK_NOFOLLOW),
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink()
+        )
+    {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    ToolError::from_io(io_error)
+}
+
+#[cfg(unix)]
+fn content_open_error(parent: &Dir, name: &Path, error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    let io_error = std::io::Error::from(error);
+    if matches!(
+        io_error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::PermissionDenied
+    ) {
+        return ToolError::from_io(io_error);
+    }
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let file_type = FileType::from_raw_mode(stat.st_mode);
+            if file_type.is_symlink() {
+                ToolError::permission("workspace paths cannot traverse symbolic links")
+            } else if file_type.is_dir() {
+                ToolError::new(ToolErrorKind::IsADirectory, "path is a directory")
+            } else if !file_type.is_file() {
+                ToolError::value("path is not a regular file")
+            } else {
+                ToolError::from_io(io_error)
+            }
+        }
+        Err(_) => ToolError::from_io(io_error),
+    }
+}
+
+#[cfg(unix)]
+fn is_regular_no_follow(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
         .map_err(no_follow_io)
 }
 
 #[cfg(unix)]
-fn no_follow_io(error: std::io::Error) -> ToolError {
-    if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
+fn is_symlink(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink())
+        .map_err(no_follow_io)
+}
+
+#[cfg(unix)]
+fn no_follow_io(error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
         return ToolError::permission("workspace paths cannot traverse symbolic links");
     }
-    ToolError::from_io(error)
+    ToolError::from_io(error.into())
 }
 
 #[cfg(not(unix))]
@@ -1918,6 +1986,22 @@ fn open_directory_no_follow(parent: &Dir, name: &Path) -> Result<Dir, ToolError>
         ));
     }
     parent.open_dir(name).map_err(ToolError::from_io)
+}
+
+#[cfg(not(unix))]
+fn is_regular_no_follow(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    parent
+        .symlink_metadata(name)
+        .map(|metadata| metadata.is_file())
+        .map_err(ToolError::from_io)
+}
+
+#[cfg(not(unix))]
+fn is_symlink(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    parent
+        .symlink_metadata(name)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .map_err(ToolError::from_io)
 }
 
 fn read_limited(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
@@ -1941,6 +2025,8 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(unix)]
+    use cap_std::{ambient_authority, fs::Dir};
+    #[cfg(unix)]
     use std::ffi::CString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
@@ -1953,7 +2039,8 @@ mod tests {
 
     use super::{
         ACTIVE_TOOLS, ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName, ToolValue,
-        Utf8ValidatingReader, bootstrap_source, prompt_reference,
+        Utf8ValidatingReader, bootstrap_source, open_content_no_follow, open_parent,
+        prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -2144,6 +2231,142 @@ mod tests {
             ("line".to_owned(), ToolValue::Integer(line)),
             ("text".to_owned(), ToolValue::String(text.to_owned())),
         ]))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_content_open_refuses_symlinks_and_classifies_opened_descriptors() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "workspace").unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink("file", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        let mut file = open_content_no_follow(&workspace_dir, Path::new("file")).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "workspace");
+        assert!(file.metadata().unwrap().is_file());
+
+        let directory = open_content_no_follow(&workspace_dir, Path::new("directory")).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+
+        let fifo = open_content_no_follow(&workspace_dir, Path::new("fifo")).unwrap();
+        assert!(!fifo.metadata().unwrap().is_file());
+
+        for name in ["inside-link", "outside-link", "broken-link"] {
+            assert_eq!(
+                open_content_no_follow(&workspace_dir, Path::new(name))
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            open_content_no_follow(&workspace_dir, Path::new("missing"))
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::FileNotFound
+        );
+        assert_eq!(
+            open_content_no_follow(&workspace_dir, Path::new("socket"))
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Value
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_parent_open_refuses_intermediate_symlinks() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::write(workspace.path().join("inside/file"), "workspace").unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        for path in ["inside-link/file", "outside-link/outside"] {
+            assert_eq!(
+                open_parent(&workspace_dir, Path::new(path))
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::Permission
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_open_stays_anchored_after_parent_rename_and_component_swaps() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent_path = workspace.path().join("parent");
+        fs::create_dir(&parent_path).unwrap();
+        fs::write(parent_path.join("file"), "workspace").unwrap();
+        fs::write(outside.path().join("file"), "outside").unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        let (parent, file_name) = open_parent(&workspace_dir, Path::new("parent/file")).unwrap();
+        fs::rename(&parent_path, workspace.path().join("held")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent_path).unwrap();
+        let mut file = open_content_no_follow(&parent, &file_name).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "workspace");
+        fs::remove_file(&parent_path).unwrap();
+        fs::rename(workspace.path().join("held"), &parent_path).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let swapping_workspace = workspace.path().to_path_buf();
+        let swapping_outside = outside.path().to_path_buf();
+        let swapping_done = Arc::clone(&done);
+        let swaps = std::thread::spawn(move || {
+            let parent = swapping_workspace.join("parent");
+            let held = swapping_workspace.join("held");
+            for _ in 0..1_000 {
+                if fs::rename(&parent, &held).is_err() {
+                    continue;
+                }
+                std::os::unix::fs::symlink(&swapping_outside, &parent).unwrap();
+                std::thread::yield_now();
+                fs::remove_file(&parent).unwrap();
+                fs::rename(&held, &parent).unwrap();
+            }
+            swapping_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            let Ok((parent, file_name)) = open_parent(&workspace_dir, Path::new("parent/file"))
+            else {
+                continue;
+            };
+            let Ok(mut file) = open_content_no_follow(&parent, &file_name) else {
+                continue;
+            };
+            let mut contents = String::new();
+            file.read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, "workspace");
+        }
+        swaps.join().unwrap();
     }
 
     #[cfg(unix)]
@@ -2924,6 +3147,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_treats_linked_and_non_regular_ignore_files_as_absent() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("candidate.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/candidate.rs"), "").unwrap();
+        fs::write(outside.path().join("rules"), "*.rs\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("rules"),
+            workspace.path().join(".rgignore"),
+        )
+        .unwrap();
+        fs::create_dir(workspace.path().join(".ignore")).unwrap();
+        create_fifo(&workspace.path().join(".gitignore"));
+        let _socket = UnixListener::bind(workspace.path().join("nested/.rgignore")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), glob_path(&host, "*.rs", "."))
+                .await
+                .expect("ignore-file FIFOs must not block")
+                .unwrap(),
+            [
+                directory_entry("candidate.rs", "file", Some(0)),
+                directory_entry("nested/candidate.rs", "file", Some(0)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn glob_traverses_an_explicit_parent_ignored_root() {
         let workspace = TempDir::new().unwrap();
@@ -3327,6 +3583,25 @@ mod tests {
                 .await
                 .unwrap(),
             [grep_match("kept.rs", 1, "match")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_does_not_open_a_regular_file_excluded_by_file_glob() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("excluded.txt");
+        fs::write(&path, "match\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(
+            grep_path(&host, "match", "excluded.txt", Some("*.rs"))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
