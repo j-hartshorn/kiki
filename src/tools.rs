@@ -847,9 +847,9 @@ pub(crate) struct ToolHost {
     #[cfg(test)]
     test_gate: Option<ReadTestGate>,
     #[cfg(test)]
-    blocking_read_test_gate: Option<BlockingReadTestGate>,
+    blocking_read_test_gate: Option<BlockingTestGate>,
     #[cfg(test)]
-    list_dir_test_gate: Option<ListDirTestGate>,
+    list_dir_test_gate: Option<BlockingTestGate>,
     #[cfg(test)]
     batch_test_gate: Option<BatchTestGate>,
 }
@@ -903,23 +903,23 @@ impl ReadTestGate {
 
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct BlockingReadTestGate {
-    state: Arc<(Mutex<BlockingReadTestState>, Condvar)>,
+pub(crate) struct BlockingTestGate {
+    state: Arc<(Mutex<BlockingTestGateState>, Condvar)>,
 }
 
 #[cfg(test)]
-struct BlockingReadTestState {
+struct BlockingTestGateState {
     started: bool,
     allowed: bool,
     finished: bool,
 }
 
 #[cfg(test)]
-impl BlockingReadTestGate {
+impl BlockingTestGate {
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::new((
-                Mutex::new(BlockingReadTestState {
+                Mutex::new(BlockingTestGateState {
                     started: false,
                     allowed: false,
                     finished: false,
@@ -929,22 +929,22 @@ impl BlockingReadTestGate {
         }
     }
 
-    pub(crate) async fn wait_until_read_started(&self) {
+    pub(crate) async fn wait_until_started(&self) {
         self.wait_until(|state| state.started).await;
     }
 
-    pub(crate) fn resume_read(&self) {
+    pub(crate) fn resume(&self) {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("test gate mutex is not poisoned");
         state.allowed = true;
         changed.notify_all();
     }
 
-    pub(crate) async fn wait_until_read_finished(&self) {
+    pub(crate) async fn wait_until_finished(&self) {
         self.wait_until(|state| state.finished).await;
     }
 
-    fn wait_inside_read(&self) {
+    fn wait_inside(&self) {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("test gate mutex is not poisoned");
         state.started = true;
@@ -956,7 +956,7 @@ impl BlockingReadTestGate {
         }
     }
 
-    fn note_read_finished(&self) {
+    fn note_finished(&self) {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("test gate mutex is not poisoned");
         state.finished = true;
@@ -965,7 +965,7 @@ impl BlockingReadTestGate {
 
     async fn wait_until(
         &self,
-        condition: impl Fn(&BlockingReadTestState) -> bool + Send + 'static,
+        condition: impl Fn(&BlockingTestGateState) -> bool + Send + 'static,
     ) {
         let state = Arc::clone(&self.state);
         tokio::task::spawn_blocking(move || {
@@ -1174,18 +1174,6 @@ async fn take_permit(semaphore: &Arc<Semaphore>) {
         .await
         .expect("test gate semaphore remains open")
         .forget();
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct ListDirTestGate {
-    state: Arc<(Mutex<ListDirTestGateState>, Condvar)>,
-}
-
-#[cfg(test)]
-struct ListDirTestGateState {
-    started: bool,
-    allowed: bool,
 }
 
 #[cfg(test)]
@@ -1407,55 +1395,6 @@ impl WriteTestHook {
     }
 }
 
-#[cfg(test)]
-impl ListDirTestGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new((
-                Mutex::new(ListDirTestGateState {
-                    started: false,
-                    allowed: false,
-                }),
-                Condvar::new(),
-            )),
-        }
-    }
-
-    pub(crate) async fn wait_until_list_dir_started(&self) {
-        let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || {
-            let (lock, changed) = &*state;
-            let mut state = lock.lock().expect("test gate mutex is not poisoned");
-            while !state.started {
-                state = changed
-                    .wait(state)
-                    .expect("test gate mutex is not poisoned");
-            }
-        })
-        .await
-        .expect("test gate waiter completes");
-    }
-
-    pub(crate) fn resume_list_dir(&self) {
-        let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("test gate mutex is not poisoned");
-        state.allowed = true;
-        changed.notify_all();
-    }
-
-    fn wait_before_list_dir(&self) {
-        let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("test gate mutex is not poisoned");
-        state.started = true;
-        changed.notify_all();
-        while !state.allowed {
-            state = changed
-                .wait(state)
-                .expect("test gate mutex is not poisoned");
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum ToolHostError {
     #[error("workspace operation failed")]
@@ -1547,14 +1486,14 @@ impl ToolHost {
     #[cfg(test)]
     pub(crate) fn with_blocking_read_test_gate(
         mut self,
-        blocking_read_test_gate: BlockingReadTestGate,
+        blocking_read_test_gate: BlockingTestGate,
     ) -> Self {
         self.blocking_read_test_gate = Some(blocking_read_test_gate);
         self
     }
 
     #[cfg(test)]
-    pub(crate) fn with_list_dir_test_gate(mut self, list_dir_test_gate: ListDirTestGate) -> Self {
+    pub(crate) fn with_list_dir_test_gate(mut self, list_dir_test_gate: BlockingTestGate) -> Self {
         self.list_dir_test_gate = Some(list_dir_test_gate);
         self
     }
@@ -1760,12 +1699,12 @@ impl ToolHost {
         let read = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(test_gate) = &blocking_read_test_gate {
-                test_gate.wait_inside_read();
+                test_gate.wait_inside();
             }
             let read = read_file(&workspace, &path, limits.max_file_bytes);
             #[cfg(test)]
             if let Some(test_gate) = &blocking_read_test_gate {
-                test_gate.note_read_finished();
+                test_gate.note_finished();
             }
             read
         })
@@ -1789,7 +1728,7 @@ impl ToolHost {
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(test_gate) = test_gate {
-                test_gate.wait_before_list_dir();
+                test_gate.wait_inside();
             }
             list_directory(&workspace, &path, limits)
         })
@@ -3938,7 +3877,7 @@ mod tests {
     async fn blocked_list_dir_does_not_stop_a_read_future() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("file"), "contents").unwrap();
-        let gate = super::ListDirTestGate::new();
+        let gate = super::BlockingTestGate::new();
         let host = Arc::new(
             tool_host(&workspace)
                 .await
@@ -3947,7 +3886,7 @@ mod tests {
         let list_host = Arc::clone(&host);
         let mut listing = tokio::spawn(async move { list_dir(&list_host, Vec::new()).await });
 
-        gate.wait_until_list_dir_started().await;
+        gate.wait_until_started().await;
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(100), read(&host, "file"))
                 .await
@@ -3960,7 +3899,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        gate.resume_list_dir();
+        gate.resume();
         assert_eq!(listing.await.unwrap().unwrap().len(), 1);
     }
 

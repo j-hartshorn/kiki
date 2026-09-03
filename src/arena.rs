@@ -1675,7 +1675,7 @@ mod tests {
         validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{
-        BatchTestGate, BlockingReadTestGate, ReadTestGate, ToolHost, WholeFileAuthorisations,
+        BatchTestGate, BlockingTestGate, ReadTestGate, ToolHost, WholeFileAuthorisations,
         WriteTestHook,
     };
 
@@ -1744,8 +1744,8 @@ mod tests {
         (arena, gate)
     }
 
-    async fn arena_with_blocking_read_gate(workspace: &TempDir) -> (Arena, BlockingReadTestGate) {
-        let gate = BlockingReadTestGate::new();
+    async fn arena_with_blocking_read_gate(workspace: &TempDir) -> (Arena, BlockingTestGate) {
+        let gate = BlockingTestGate::new();
         let tool_host = ToolHost::new(workspace.path())
             .await
             .expect("open tool host")
@@ -4132,7 +4132,7 @@ mod tests {
         let mut execution = Box::pin(arena.execute("await read('late')", &cancellation));
 
         tokio::select! {
-            _ = gate.wait_until_read_started() => {}
+            _ = gate.wait_until_started() => {}
             result = &mut execution => panic!("execution finished before its blocking read started: {result:?}"),
         }
         cancellation.cancel();
@@ -4145,8 +4145,8 @@ mod tests {
             WholeFileAuthorisations::default()
         );
 
-        gate.resume_read();
-        gate.wait_until_read_finished().await;
+        gate.resume();
+        gate.wait_until_finished().await;
         assert_eq!(
             arena.checkpoint.authorisations,
             WholeFileAuthorisations::default()
