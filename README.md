@@ -44,7 +44,11 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - `Ctrl-T` toggles all retained reasoning. Reasoning is shown by default; hidden blocks show a placeholder.
 - `Ctrl-O` toggles all arena cards between automatic collapse and expanded display.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
-- `PageUp` / `PageDown` scroll history ten lines; `Ctrl-Home` / `Ctrl-End` jump to the oldest / newest history. The mouse wheel scrolls history three lines per event; other mouse input is ignored.
+- `PageUp` / `PageDown` scroll history ten lines; `Ctrl-Home` / `Ctrl-End` jump to the oldest / newest history. The mouse wheel scrolls history three lines per event.
+- Drag the primary mouse button over display history to select its rendered text in either direction. Resting the drag at the viewport's top or bottom edge scrolls history one row at a time; release copies a non-empty selection to the local native desktop clipboard.
+- Copied rendered logical text preserves hard line breaks, removes terminal soft wraps, card decoration, and hidden content, and separates touched cards with one blank line. It is rendered text, not source Markdown.
+- After a successful copy, the selection remains highlighted, flashes off and on twice, and the header shows `Copied`. A local clipboard failure is nonfatal: the selection remains highlighted and the header shows `Copy failed`.
+- A completed selection survives ordinary history scrolling, but a new primary-button press, display-history content change, `Ctrl-O` expansion toggle, prompt-driven viewport change, or terminal resize clears it. Clipboard copy is local-desktop only; SSH, tmux, and OSC 52 forwarding are not supported.
 
 Missing or invalid startup configuration opens a read-only configuration-only view, where prompt editing and submission are disabled. An OpenAI authentication failure or failed arena checkpoint recovery makes the runtime prompt read-only until Kiki restarts. `Ctrl-T` and `Ctrl-O` affect applicable retained transcript content only, not submission availability.
 
