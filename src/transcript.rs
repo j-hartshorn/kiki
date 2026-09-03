@@ -1,4 +1,4 @@
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -15,6 +15,9 @@ use crate::model::{AttemptAccounting, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::runtime::{
     ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord, TerminalDetails,
+};
+use crate::selection::{
+    CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
 
 #[derive(Clone, Copy)]
@@ -482,6 +485,87 @@ fn vertical_clip(
     (top < bottom).then_some(VerticalClip { top, bottom })
 }
 
+struct TextPlacement {
+    width: u16,
+    viewport: Rect,
+    top: usize,
+    text_top: usize,
+    x: u16,
+}
+
+fn selectable_text_regions(
+    text: &Text<'_>,
+    placement: TextPlacement,
+    card: CardId,
+    skip_leading_lines: usize,
+    buffer: &Buffer,
+) -> Vec<SelectableRegion> {
+    if placement.width == 0 {
+        return Vec::new();
+    }
+
+    let mut regions = Vec::new();
+    let mut line_top = placement.text_top;
+    for (index, line) in text.lines.iter().enumerate() {
+        let line_text = Text::from(line.clone());
+        let line_height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(placement.width);
+        if index >= skip_leading_lines
+            && let Some(clip) = vertical_clip(
+                line_top,
+                line_height,
+                placement.top,
+                placement.viewport.height,
+            )
+        {
+            let breaks = RowBreaks::for_rows(
+                &line_text,
+                placement.width,
+                clip.top.saturating_sub(line_top),
+                clip.bottom.saturating_sub(clip.top),
+            );
+            let y = placement.viewport.y.saturating_add(
+                u16::try_from(clip.top.saturating_sub(placement.top)).unwrap_or(u16::MAX),
+            );
+            let height = u16::try_from(clip.bottom.saturating_sub(clip.top)).unwrap_or(u16::MAX);
+            let area = Rect::new(
+                placement.viewport.x.saturating_add(placement.x),
+                y,
+                placement.width,
+                height,
+            );
+            if matches!(line.alignment.or(text.alignment), Some(Alignment::Right)) {
+                for row in area.top()..area.bottom() {
+                    if let Some(area) = rendered_content_area(buffer, area, row) {
+                        regions.push(SelectableRegion::new(area, line_top, breaks.clone(), card));
+                    }
+                }
+            } else {
+                regions.push(SelectableRegion::new(area, line_top, breaks, card));
+            }
+        }
+        line_top = line_top.saturating_add(line_height);
+    }
+    regions
+}
+
+fn rendered_content_area(buffer: &Buffer, area: Rect, y: u16) -> Option<Rect> {
+    let mut x = area.x;
+    let mut left = None;
+    let mut right = area.x;
+    while x < area.right() {
+        let cell = &buffer[(x, y)];
+        let end = x.saturating_add(cell.cell_width().max(1)).min(area.right());
+        if cell.symbol() != " " {
+            left.get_or_insert(x);
+            right = end;
+        }
+        x = end;
+    }
+    left.map(|left| Rect::new(left, y, right.saturating_sub(left), 1))
+}
+
 struct ArenaText {
     text: Text<'static>,
     style: Style,
@@ -505,6 +589,30 @@ impl ArenaText {
             width,
             height,
         }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        text_top: usize,
+        x: u16,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        selectable_text_regions(
+            &self.text,
+            TextPlacement {
+                width: self.width,
+                viewport,
+                top,
+                text_top,
+                x,
+            },
+            card,
+            0,
+            buffer,
+        )
     }
 
     fn render(&self, viewport: Rect, top: usize, text_top: usize, x: u16, buffer: &mut Buffer) {
@@ -580,6 +688,60 @@ impl ArenaSection {
         }
     }
 
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        section_top: usize,
+        x: u16,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        if self.framed {
+            let mut regions = Vec::new();
+            if let Some(clip) = vertical_clip(section_top, 1, top, viewport.height) {
+                let title_width = u16::try_from(Line::raw(&self.title).width()).unwrap_or(u16::MAX);
+                let y = viewport.y.saturating_add(
+                    u16::try_from(clip.top.saturating_sub(top)).unwrap_or(u16::MAX),
+                );
+                regions.push(SelectableRegion::new(
+                    Rect::new(
+                        viewport.x.saturating_add(x).saturating_add(1),
+                        y,
+                        title_width,
+                        1,
+                    ),
+                    section_top,
+                    RowBreaks::from_text(&Text::raw(&self.title), title_width),
+                    card,
+                ));
+            }
+            regions.extend(self.body.selectable_regions(
+                viewport,
+                top,
+                section_top.saturating_add(1),
+                x.saturating_add(1 + self.horizontal_padding),
+                card,
+                buffer,
+            ));
+            regions
+        } else {
+            let label_height = self.fallback_label.as_ref().map_or(0, |label| label.height);
+            let mut regions = self.fallback_label.as_ref().map_or_else(Vec::new, |label| {
+                label.selectable_regions(viewport, top, section_top, x, card, buffer)
+            });
+            regions.extend(self.body.selectable_regions(
+                viewport,
+                top,
+                section_top.saturating_add(label_height),
+                x,
+                card,
+                buffer,
+            ));
+            regions
+        }
+    }
+
     fn render(&self, viewport: Rect, top: usize, section_top: usize, x: u16, buffer: &mut Buffer) {
         if self.framed {
             draw_rounded_frame(
@@ -638,6 +800,24 @@ impl ArenaItem {
             Self::Text(text) => text.render(viewport, top, item_top, x, buffer),
             Self::Section(section) => section.render(viewport, top, item_top, x, buffer),
             Self::Spacer => {}
+        }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        item_top: usize,
+        x: u16,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        match self {
+            Self::Text(text) => text.selectable_regions(viewport, top, item_top, x, card, buffer),
+            Self::Section(section) => {
+                section.selectable_regions(viewport, top, item_top, x, card, buffer)
+            }
+            Self::Spacer => Vec::new(),
         }
     }
 }
@@ -744,6 +924,30 @@ impl ArenaRenderBlock {
             items,
             height: content_height.saturating_add(usize::from(bordered).saturating_mul(2)),
         }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        block_top: usize,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        let mut regions = Vec::new();
+        let mut item_top = block_top.saturating_add(usize::from(self.bordered));
+        for item in &self.items {
+            regions.extend(item.selectable_regions(
+                viewport,
+                top,
+                item_top,
+                self.content_x,
+                card,
+                buffer,
+            ));
+            item_top = item_top.saturating_add(item.height());
+        }
+        regions
     }
 
     fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
@@ -931,6 +1135,7 @@ impl RenderBlock {
             right_padding,
             top_padding: vertical_padding,
             bottom_padding: vertical_padding,
+            skip_leading_selection_lines: 0,
             height: content_height.saturating_add(usize::from(vertical_padding).saturating_mul(2)),
         })
     }
@@ -942,10 +1147,31 @@ impl RenderBlock {
         }
     }
 
+    fn skip_leading_selection_lines(mut self, count: usize) -> Self {
+        if let Self::Card(card) = &mut self {
+            card.skip_leading_selection_lines = count;
+        }
+        self
+    }
+
     fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
         match self {
             Self::Card(card) => card.render(viewport, top, block_top, buffer),
             Self::Arena(arena) => arena.render(viewport, top, block_top, buffer),
+        }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        block_top: usize,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        match self {
+            Self::Card(block) => block.selectable_regions(viewport, top, block_top, card, buffer),
+            Self::Arena(block) => block.selectable_regions(viewport, top, block_top, card, buffer),
         }
     }
 }
@@ -957,10 +1183,37 @@ struct CardRenderBlock {
     right_padding: u16,
     top_padding: u16,
     bottom_padding: u16,
+    skip_leading_selection_lines: usize,
     height: usize,
 }
 
 impl CardRenderBlock {
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        block_top: usize,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        let text_width = viewport
+            .width
+            .saturating_sub(self.left_padding.saturating_add(self.right_padding));
+        selectable_text_regions(
+            &self.text,
+            TextPlacement {
+                width: text_width,
+                viewport,
+                top,
+                text_top: block_top.saturating_add(usize::from(self.top_padding)),
+                x: self.left_padding,
+            },
+            card,
+            self.skip_leading_selection_lines,
+            buffer,
+        )
+    }
+
     fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
         let block_bottom = block_top.saturating_add(self.height);
         let Some(clip) = vertical_clip(block_top, self.height, top, viewport.height) else {
@@ -1012,6 +1265,7 @@ impl CardRenderBlock {
 
 pub(crate) struct TranscriptLayout {
     blocks: Vec<RenderBlock>,
+    width: u16,
     total_height: usize,
     footer: Option<String>,
 }
@@ -1026,18 +1280,83 @@ impl TranscriptLayout {
     }
 
     pub(crate) fn render(&self, viewport: Rect, top: usize, buffer: &mut Buffer) {
+        self.render_with_selection(viewport, top, None, buffer);
+    }
+
+    pub(crate) fn render_with_selection(
+        &self,
+        viewport: Rect,
+        top: usize,
+        selection: Option<Selection>,
+        buffer: &mut Buffer,
+    ) {
         if viewport.width == 0 || viewport.height == 0 {
             return;
         }
         buffer.set_style(viewport, page_style());
+        let selection =
+            selection.and_then(|selection| selection.project(Viewport::new(viewport, top)));
+        let mut regions = Vec::new();
         let mut block_top = 0_usize;
-        for block in &self.blocks {
+        for (index, block) in self.blocks.iter().enumerate() {
             if block_top >= top.saturating_add(usize::from(viewport.height)) {
                 break;
             }
             block.render(viewport, top, block_top, buffer);
+            if selection.is_some() {
+                regions.extend(block.selectable_regions(
+                    viewport,
+                    top,
+                    block_top,
+                    CardId::new(index),
+                    buffer,
+                ));
+            }
             block_top = block_top.saturating_add(block.height());
         }
+        if let Some(selection) = selection {
+            highlight(buffer, selection, &regions);
+        }
+    }
+
+    pub(crate) fn extract_selection(&self, selection: Selection) -> String {
+        const CHUNK_HEIGHT: usize = 64;
+
+        if self.width == 0 {
+            return String::new();
+        }
+
+        let mut extraction = Extraction::new();
+        let mut block_top = 0_usize;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let block_bottom = block_top.saturating_add(block.height());
+            let mut chunk_top = block_top;
+            while chunk_top < block_bottom {
+                let chunk_bottom = chunk_top.saturating_add(CHUNK_HEIGHT).min(block_bottom);
+                let viewport = Rect::new(
+                    0,
+                    0,
+                    self.width,
+                    u16::try_from(chunk_bottom.saturating_sub(chunk_top)).unwrap_or(u16::MAX),
+                );
+                let projected = selection.project(Viewport::new(viewport, chunk_top));
+                if let Some(projected) = projected {
+                    let mut buffer = Buffer::empty(viewport);
+                    block.render(viewport, chunk_top, block_top, &mut buffer);
+                    let regions = block.selectable_regions(
+                        viewport,
+                        chunk_top,
+                        block_top,
+                        CardId::new(index),
+                        &buffer,
+                    );
+                    extraction.append(&buffer, projected, &regions);
+                }
+                chunk_top = chunk_bottom;
+            }
+            block_top = block_bottom;
+        }
+        extraction.finish()
     }
 }
 
@@ -1310,7 +1629,8 @@ impl Transcript {
                     width,
                     0,
                     0,
-                ),
+                )
+                .skip_leading_selection_lines(1),
             };
             blocks.push(render_block);
         }
@@ -1319,6 +1639,7 @@ impl Transcript {
         });
         TranscriptLayout {
             blocks,
+            width,
             total_height,
             footer,
         }
@@ -2111,12 +2432,14 @@ mod tests {
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
         ToolCallToken, ToolName,
     };
+    use crate::config::ready_snapshot_for_test;
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::runtime::{
         ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
         TerminalDetails,
     };
+    use crate::selection::{DocumentPosition, Selection};
 
     #[test]
     fn mutation_tool_labels_are_path_free() {
@@ -2464,6 +2787,653 @@ mod tests {
             },
             progress_gap,
         }
+    }
+
+    #[test]
+    fn selection_extracts_wrapped_markdown_without_a_soft_newline() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(1, 1, "[Kiki guide](https://example.com)", Vec::new(), false),
+            false,
+        );
+
+        let layout = transcript.layout(8);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "Kiki guide (https://example.com)"
+        );
+    }
+
+    #[test]
+    fn selection_extracts_nested_arena_titles_and_bodies_without_decorations() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "    answer()", "", Vec::new()),
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "code\n    answer()\nstdout\nauthoritative stdout\nresult\n42"
+        );
+    }
+
+    #[test]
+    fn selection_omits_right_aligned_accounting_terminal_fill() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(1, 1, "answer", vec![usage(1, 1)], false),
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "answer\n\n↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
+        );
+    }
+
+    #[test]
+    fn selection_joins_a_standalone_accounting_card_with_one_blank_line() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: usage(1, 1),
+                },
+            },
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "generating\n\n↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
+        );
+    }
+
+    #[test]
+    fn selection_extracts_a_backwards_range_across_vertical_chunks() {
+        let source = (1..=66)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest { request: source },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(layout.total_height(), 0),
+                DocumentPosition::new(0, 0),
+            )),
+            "line 01
+line 02
+line 03
+line 04
+line 05
+line 06
+line 07
+line 08
+line 09
+line 10
+line 11
+line 12
+line 13
+line 14
+line 15
+line 16
+line 17
+line 18
+line 19
+line 20
+line 21
+line 22
+line 23
+line 24
+line 25
+line 26
+line 27
+line 28
+line 29
+line 30
+line 31
+line 32
+line 33
+line 34
+line 35
+line 36
+line 37
+line 38
+line 39
+line 40
+line 41
+line 42
+line 43
+line 44
+line 45
+line 46
+line 47
+line 48
+line 49
+line 50
+line 51
+line 52
+line 53
+line 54
+line 55
+line 56
+line 57
+line 58
+line 59
+line 60
+line 61
+line 62
+line 63
+line 64
+line 65
+line 66"
+        );
+    }
+
+    #[test]
+    fn selection_keeps_wide_and_combining_graphemes_whole() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(1, 1, "a你🦀e\u{301}b", Vec::new(), false),
+            false,
+        );
+
+        let layout = transcript.layout(8);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(1, 2),
+                DocumentPosition::new(1, 4),
+            )),
+            "你🦀"
+        );
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(1, 5),
+                DocumentPosition::new(1, 6),
+            )),
+            "e\u{301}"
+        );
+    }
+
+    #[test]
+    fn selection_preserves_unselected_layout_buffers_and_heights() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "padded request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(1, 1, "source()", "reasoning", Vec::new()),
+            false,
+        );
+
+        let layout = transcript.layout(24);
+        let height = u16::try_from(layout.total_height()).expect("test transcript height");
+        let area = Rect::new(0, 0, 24, height);
+        let mut rendered = Buffer::empty(area);
+        let mut unselected = Buffer::empty(area);
+        layout.render(area, 0, &mut rendered);
+        layout.render_with_selection(area, 0, None, &mut unselected);
+
+        assert_eq!(layout.total_height(), usize::from(height));
+        assert_eq!(unselected, rendered);
+    }
+
+    #[test]
+    fn selection_highlights_clipped_card_content_without_its_padding() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "padded request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let layout = transcript.layout(24);
+        let selection = Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(layout.total_height(), 0),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 1));
+
+        layout.render_with_selection(buffer.area, 1, Some(selection), &mut buffer);
+
+        assert_eq!(layout.extract_selection(selection), "padded request");
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selection_uses_visible_reasoning_and_collapsed_arena_content() {
+        let source = (1..=33)
+            .map(|line| format!("code {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, &source, "hidden reasoning", Vec::new()),
+            false,
+        );
+        assert!(transcript.toggle_reasoning());
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "reasoning hidden · Ctrl-T to show
+
+code · 1 earlier line omitted
+code 02
+code 03
+code 04
+code 05
+code 06
+code 07
+code 08
+code 09
+code 10
+code 11
+code 12
+code 13
+code 14
+code 15
+code 16
+code 17
+code 18
+code 19
+code 20
+code 21
+code 22
+code 23
+code 24
+code 25
+code 26
+code 27
+code 28
+code 29
+code 30
+code 31
+code 32
+code 33
+stdout
+authoritative stdout
+result
+42"
+        );
+    }
+
+    #[test]
+    fn selection_copies_generated_markdown_presentation() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(
+                1,
+                1,
+                "[guide](https://example.com)\n\n- first\n- second\n\n| Name | State |\n| --- | --- |\n| Kiki | ready |",
+                Vec::new(),
+                false,
+            ),
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "guide (https://example.com)
+
+- first
+- second
+
+┌──────┬───────┐
+│ Name │ State │
+├──────┼───────┤
+│ Kiki │ ready │
+└──────┴───────┘"
+        );
+    }
+
+    #[test]
+    fn selection_orders_cross_card_content_with_one_blank_line() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "first card".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(final_message(1, 1, "second card", Vec::new(), false), false);
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(layout.total_height(), 0),
+                DocumentPosition::new(0, 0),
+            )),
+            "first card\n\nsecond card"
+        );
+    }
+
+    #[test]
+    fn selection_keeps_narrow_fallback_labels_and_zero_width_empty() {
+        let mut transcript = Transcript::default();
+        transcript.apply(completed_execution(1, 1, "XYZ", "", Vec::new()), false);
+
+        let narrow = transcript.layout(8);
+        assert_eq!(
+            narrow.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(narrow.total_height(), 0),
+            )),
+            "code\nXYZ\nstdout\nauthoritative stdout\nresult\n42"
+        );
+
+        let zero = transcript.layout(0);
+        assert_eq!(
+            zero.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(zero.total_height(), 0),
+            )),
+            ""
+        );
+    }
+
+    #[test]
+    fn selection_copies_visible_startup_text() {
+        let mut transcript = Transcript::configured(ready_snapshot_for_test());
+        let layout = transcript.layout(512);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "Startup configuration
+Worker: /opt/kiki/bin/monty
+Workspace: /workspace/project
+Model: gpt-5.6-sol
+Prompt: bundled read_only_agent
+OpenAI API key: present
+Submission: available
+Problems: none
+store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."
+        );
+    }
+
+    #[test]
+    fn selection_extracts_one_very_tall_logical_line_in_chunks() {
+        let source = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmn";
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: source.to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let layout = transcript.layout(1);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(layout.total_height(), 0),
+                DocumentPosition::new(0, 0),
+            )),
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmn"
+        );
+    }
+
+    #[test]
+    fn selection_copies_visible_terminal_arena_sections_in_order() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails {
+                            evidence: Some(TerminalEvidence::Execution(Box::new(
+                                ExecutionEvidence {
+                                    source: "failure_code".to_owned(),
+                                    reasoning_summary: String::new(),
+                                    began: true,
+                                    stdout: observation("output body"),
+                                    stderr: observation("diagnostic body"),
+                                    tool_calls: vec![ToolCall {
+                                        tool: ToolName::Read,
+                                        summary: ToolCallSummary::Failed,
+                                    }],
+                                    failure: Some(ExecutionFailure::Arena {
+                                        message: "failure body".to_owned(),
+                                    }),
+                                    cancellation_warning: Some("warning body".to_owned()),
+                                },
+                            ))),
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "cancelled
+execution: started
+code
+failure_code
+tool calls
+read · failed
+stdout
+output body
+stderr
+diagnostic body
+failure
+failure body
+warning
+warning body"
+        );
+    }
+
+    #[test]
+    fn selection_copies_visible_arena_heading_and_gap() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, true);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "gap_code".to_owned(),
+                },
+            },
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "generating\ndisplay gap: some live progress was dropped\ncode\ngap_code"
+        );
+    }
+
+    #[test]
+    fn selection_copies_error_preview_and_arena_accounting() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        source: "error_code".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation("error_stderr"),
+                            outcome: ExecutionOutcome::PythonError(PythonError {
+                                text: "error_body".to_owned(),
+                                omitted_bytes: 0,
+                            }),
+                            tool_calls: Vec::new(),
+                        },
+                        attempts: vec![usage(1, 1)],
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::StdoutTruncated {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+
+        let layout = transcript.layout(80);
+
+        assert_eq!(
+            layout.extract_selection(Selection::new(
+                DocumentPosition::new(0, 0),
+                DocumentPosition::new(layout.total_height(), 0),
+            )),
+            "code
+error_code
+stderr
+error_stderr
+error
+error_body
+↑1 ↓1 R0 W0 r0 Σ2 · $0.000024
+
+running code
+stdout preview
+truncated"
+        );
+    }
+
+    #[test]
+    fn selection_highlights_framed_title_text_but_not_its_rule() {
+        let mut transcript = Transcript::default();
+        transcript.apply(completed_execution(1, 1, "source()", "", Vec::new()), false);
+        let layout = transcript.layout(80);
+        let selection = Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(layout.total_height(), 0),
+        );
+        let mut buffer = Buffer::empty(Rect::new(
+            0,
+            0,
+            80,
+            u16::try_from(layout.total_height()).expect("test transcript height"),
+        ));
+
+        layout.render_with_selection(buffer.area, 0, Some(selection), &mut buffer);
+
+        let title_row = row_containing(&buffer, "code");
+        let title_left = (0..buffer.area.width)
+            .find(|column| buffer[(*column, title_row as u16)].symbol() == "╭")
+            .expect("code frame");
+        assert!(
+            buffer[(title_left + 1, title_row as u16)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(buffer[(title_left + 5, title_row as u16)].symbol(), "─");
+        assert!(
+            !buffer[(title_left + 5, title_row as u16)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -3760,6 +4730,7 @@ mod tests {
             .collect::<Vec<_>>();
         let layout = TranscriptLayout {
             total_height: blocks.iter().map(RenderBlock::height).sum(),
+            width: 20,
             blocks,
             footer: None,
         };

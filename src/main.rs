@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod arena;
+mod clipboard;
 pub mod config;
 mod highlight;
 pub mod model;
@@ -8,6 +9,7 @@ pub mod pricing;
 pub mod prompt;
 mod prompt_editor;
 pub mod runtime;
+mod selection;
 pub mod tools;
 mod transcript;
 pub mod tui;
