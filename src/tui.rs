@@ -63,7 +63,6 @@ enum AppMode {
 #[derive(Clone, Copy)]
 struct HistoryViewport {
     area: Rect,
-    document_top: usize,
 }
 
 impl HistoryViewport {
@@ -307,10 +306,7 @@ impl App {
 
     fn begin_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
         let visible_changed = self.invalidate_selection();
-        let Some(position) = self
-            .history_viewport
-            .and_then(|viewport| viewport.position(mouse.column, mouse.row, viewport.document_top))
-        else {
+        let Some(position) = self.history_position(mouse.column, mouse.row) else {
             return Update {
                 command: None,
                 visible_changed,
@@ -335,7 +331,7 @@ impl App {
         let Some(viewport) = self.history_viewport else {
             return false;
         };
-        let Some(focus) = viewport.position(mouse.column, mouse.row, viewport.document_top) else {
+        let Some(focus) = self.history_position(mouse.column, mouse.row) else {
             if let Some(drag) = &mut self.drag {
                 drag.edge = None;
             }
@@ -395,11 +391,8 @@ impl App {
             }
             return false;
         }
-        let Some(viewport) = self.history_viewport else {
-            return false;
-        };
-        let focus = viewport
-            .position(drag.column, drag.row, self.history_document_top())
+        let focus = self
+            .history_position(drag.column, drag.row)
             .expect("drag position remains within history viewport");
         self.selection = Selection::from_inclusive_cells(drag.anchor, focus);
         if let Some(drag) = &mut self.drag {
@@ -429,6 +422,11 @@ impl App {
         self.history_rows
             .saturating_sub(self.history_height)
             .saturating_sub(self.scroll_from_bottom)
+    }
+
+    fn history_position(&self, column: u16, row: u16) -> Option<DocumentPosition> {
+        self.history_viewport?
+            .position(column, row, self.history_document_top())
     }
 
     fn selection_for_render(&self) -> Option<Selection> {
@@ -1017,11 +1015,8 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Option<St
     app.history_rows = layout.total_height();
     let last_page_start = app.history_rows.saturating_sub(app.history_height);
     app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-    let top = last_page_start.saturating_sub(app.scroll_from_bottom);
-    app.history_viewport = Some(HistoryViewport {
-        area: viewport,
-        document_top: top,
-    });
+    let top = app.history_document_top();
+    app.history_viewport = Some(HistoryViewport { area: viewport });
     if let Some(selection) = app.selection_for_render() {
         layout.render_with_selection(viewport, top, Some(selection), frame.buffer_mut());
     } else {
