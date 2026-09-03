@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -98,10 +99,32 @@ pub(crate) struct ToolCall {
     pub(crate) arguments: ToolValue,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct ToolResult {
     pub(crate) call_id: u32,
     pub(crate) result: Result<ToolValue, ToolError>,
+    effect: Option<ReadEffect>,
+}
+
+impl ToolResult {
+    pub(crate) fn apply_effect(&self, authorisations: &mut WholeFileAuthorisations) {
+        if self.result.is_ok()
+            && let Some(effect) = &self.effect
+        {
+            authorisations.authorise(effect.path.clone(), effect.fingerprint);
+        }
+    }
+}
+
+impl fmt::Debug for ToolResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolResult")
+            .field("call_id", &self.call_id)
+            .field("result", &self.result)
+            .field("effect", &self.effect)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,6 +531,12 @@ impl ToolDefinition {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentFingerprint([u8; 32]);
 
+impl fmt::Debug for ContentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentFingerprint(..)")
+    }
+}
+
 fn content_fingerprint(contents: &[u8]) -> ContentFingerprint {
     ContentFingerprint(*blake3::hash(contents).as_bytes())
 }
@@ -515,6 +544,24 @@ fn content_fingerprint(contents: &[u8]) -> ContentFingerprint {
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct WholeFileAuthorisations {
     fingerprints: BTreeMap<PathBuf, ContentFingerprint>,
+}
+
+impl fmt::Debug for WholeFileAuthorisations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WholeFileAuthorisations(..)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ReadEffect {
+    path: PathBuf,
+    fingerprint: ContentFingerprint,
+}
+
+impl fmt::Debug for ReadEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReadEffect(..)")
+    }
 }
 
 #[allow(dead_code)]
@@ -593,6 +640,20 @@ struct ToolLimits {
     max_collection_payload_bytes: usize,
 }
 
+struct ToolOutput {
+    result: ToolValue,
+    effect: Option<ReadEffect>,
+}
+
+impl ToolOutput {
+    fn without_effect(result: ToolValue) -> Self {
+        Self {
+            result,
+            effect: None,
+        }
+    }
+}
+
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
     limits: ToolLimits,
@@ -600,6 +661,8 @@ pub(crate) struct ToolHost {
     write_test_hook: Option<WriteTestHook>,
     #[cfg(test)]
     test_gate: Option<ReadTestGate>,
+    #[cfg(test)]
+    blocking_read_test_gate: Option<BlockingReadTestGate>,
     #[cfg(test)]
     list_dir_test_gate: Option<ListDirTestGate>,
     #[cfg(test)]
@@ -655,6 +718,87 @@ impl ReadTestGate {
 
 #[cfg(test)]
 #[derive(Clone)]
+pub(crate) struct BlockingReadTestGate {
+    state: Arc<(Mutex<BlockingReadTestState>, Condvar)>,
+}
+
+#[cfg(test)]
+struct BlockingReadTestState {
+    started: bool,
+    allowed: bool,
+    finished: bool,
+}
+
+#[cfg(test)]
+impl BlockingReadTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingReadTestState {
+                    started: false,
+                    allowed: false,
+                    finished: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    pub(crate) async fn wait_until_read_started(&self) {
+        self.wait_until(|state| state.started).await;
+    }
+
+    pub(crate) fn resume_read(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.allowed = true;
+        changed.notify_all();
+    }
+
+    pub(crate) async fn wait_until_read_finished(&self) {
+        self.wait_until(|state| state.finished).await;
+    }
+
+    fn wait_inside_read(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.started = true;
+        changed.notify_all();
+        while !state.allowed {
+            state = changed
+                .wait(state)
+                .expect("test gate mutex is not poisoned");
+        }
+    }
+
+    fn note_read_finished(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.finished = true;
+        changed.notify_all();
+    }
+
+    async fn wait_until(
+        &self,
+        condition: impl Fn(&BlockingReadTestState) -> bool + Send + 'static,
+    ) {
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || {
+            let (lock, changed) = &*state;
+            let mut state = lock.lock().expect("test gate mutex is not poisoned");
+            while !condition(&state) {
+                state = changed
+                    .wait(state)
+                    .expect("test gate mutex is not poisoned");
+            }
+        })
+        .await
+        .expect("test gate waiter completes");
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct BatchTestGate {
     state: Arc<Mutex<BatchTestGateState>>,
     started: Arc<Semaphore>,
@@ -667,6 +811,7 @@ struct BatchTestGateState {
     active_call_ids: BTreeSet<u32>,
     started_call_ids: Vec<u32>,
     released_call_ids: BTreeSet<u32>,
+    pending_call_ids: Vec<u32>,
     driver_settled_call_ids: Vec<u32>,
     maximum_active: usize,
     resume_futures_calls: usize,
@@ -680,6 +825,7 @@ impl BatchTestGate {
                 active_call_ids: BTreeSet::new(),
                 started_call_ids: Vec::new(),
                 released_call_ids: BTreeSet::new(),
+                pending_call_ids: Vec::new(),
                 driver_settled_call_ids: Vec::new(),
                 maximum_active: 0,
                 resume_futures_calls: 0,
@@ -705,6 +851,14 @@ impl BatchTestGate {
             .lock()
             .expect("test gate mutex is not poisoned")
             .driver_settled_call_ids
+            .clone()
+    }
+
+    pub(crate) fn pending_call_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .pending_call_ids
             .clone()
     }
 
@@ -747,6 +901,13 @@ impl BatchTestGate {
             .released_call_ids
             .insert(call_id);
         self.changed.notify_waiters();
+    }
+
+    fn note_pending_call_ids(&self, call_ids: &[u32]) {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .pending_call_ids = call_ids.to_vec();
     }
 
     fn note_driver_settled(&self, call_id: u32) {
@@ -1178,6 +1339,8 @@ impl ToolHost {
             #[cfg(test)]
             test_gate: None,
             #[cfg(test)]
+            blocking_read_test_gate: None,
+            #[cfg(test)]
             list_dir_test_gate: None,
             #[cfg(test)]
             batch_test_gate: None,
@@ -1193,6 +1356,15 @@ impl ToolHost {
     #[cfg(test)]
     pub(crate) fn with_test_gate(mut self, test_gate: ReadTestGate) -> Self {
         self.test_gate = Some(test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_blocking_read_test_gate(
+        mut self,
+        blocking_read_test_gate: BlockingReadTestGate,
+    ) -> Self {
+        self.blocking_read_test_gate = Some(blocking_read_test_gate);
         self
     }
 
@@ -1238,7 +1410,18 @@ impl ToolHost {
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
         };
-        ToolResult { call_id, result }
+        match result {
+            Ok(ToolOutput { result, effect }) => ToolResult {
+                call_id,
+                result: Ok(result),
+                effect,
+            },
+            Err(error) => ToolResult {
+                call_id,
+                result: Err(error),
+                effect: None,
+            },
+        }
     }
 
     #[allow(dead_code)]
@@ -1309,7 +1492,7 @@ impl ToolHost {
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
     }
 
-    async fn read(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let path = read_path(arguments)?;
         #[cfg(test)]
         if let Some(test_gate) = &self.test_gate {
@@ -1318,13 +1501,33 @@ impl ToolHost {
 
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
-        tokio::task::spawn_blocking(move || read_file(&workspace, &path, limits.max_file_bytes))
-            .await
-            .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
-            .map(ToolValue::String)
+        let effect_path = path.clone();
+        #[cfg(test)]
+        let blocking_read_test_gate = self.blocking_read_test_gate.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(test_gate) = &blocking_read_test_gate {
+                test_gate.wait_inside_read();
+            }
+            let read = read_file(&workspace, &path, limits.max_file_bytes);
+            #[cfg(test)]
+            if let Some(test_gate) = &blocking_read_test_gate {
+                test_gate.note_read_finished();
+            }
+            read
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
+        Ok(ToolOutput {
+            result: ToolValue::String(read.contents),
+            effect: Some(ReadEffect {
+                path: effect_path,
+                fingerprint: read.fingerprint,
+            }),
+        })
     }
 
-    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let path = list_dir_path(arguments)?;
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
@@ -1340,9 +1543,10 @@ impl ToolHost {
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
+        .map(ToolOutput::without_effect)
     }
 
-    async fn glob(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let (pattern, path) = glob_arguments(arguments)?;
         let matcher = compile_glob(&pattern)?;
         let workspace = Arc::clone(&self.workspace);
@@ -1351,9 +1555,10 @@ impl ToolHost {
             .await
             .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
             .map(ToolValue::List)
+            .map(ToolOutput::without_effect)
     }
 
-    async fn grep(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn grep(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let (pattern, path, file_glob) = grep_arguments(arguments)?;
         let matcher = compile_regex(&pattern)?;
         let file_glob = match file_glob {
@@ -1368,6 +1573,14 @@ impl ToolHost {
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
+        .map(ToolOutput::without_effect)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_batch_driver_pending_call_ids(&self, call_ids: &[u32]) {
+        if let Some(batch_test_gate) = &self.batch_test_gate {
+            batch_test_gate.note_pending_call_ids(call_ids);
+        }
     }
 
     #[cfg(test)]
@@ -1489,7 +1702,12 @@ fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
     Ok(normalised)
 }
 
-fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, ToolError> {
+struct ReadFile {
+    contents: String,
+    fingerprint: ContentFingerprint,
+}
+
+fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<ReadFile, ToolError> {
     let (parent, file_name) = open_parent(workspace, path)?;
     let mut file = open_content_no_follow(&parent, &file_name)?;
     let metadata = file.metadata().map_err(ToolError::from_io)?;
@@ -1503,8 +1721,14 @@ fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, T
         return Err(ToolError::value("path is not a regular file"));
     }
 
-    String::from_utf8(read_limited(&mut file, max_bytes)?)
-        .map_err(|_| ToolError::value("file is not valid UTF-8"))
+    let contents = read_limited(&mut file, max_bytes)?;
+    let fingerprint = content_fingerprint(&contents);
+    let contents =
+        String::from_utf8(contents).map_err(|_| ToolError::value("file is not valid UTF-8"))?;
+    Ok(ReadFile {
+        contents,
+        fingerprint,
+    })
 }
 
 fn list_directory(
@@ -2890,7 +3114,7 @@ fn publish_new_file_by_link(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     #[cfg(unix)]
@@ -2909,10 +3133,10 @@ mod tests {
     use crate::config::constants::FILE_MAX_BYTES;
 
     use super::{
-        ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName,
-        ToolValue, Utf8ValidatingReader, WholeFileAuthorisations, WholeFileEdit, WholeFileWrite,
-        WriteTestHook, bootstrap_source, content_fingerprint, normalise_path,
-        open_content_no_follow, open_parent, prompt_reference,
+        ACTIVE_TOOLS, ContentFingerprint, ReadEffect, ToolCall, ToolError, ToolErrorKind, ToolHost,
+        ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
+        WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
+        normalise_path, open_content_no_follow, open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -4758,6 +4982,112 @@ mod tests {
         assert!(authorisations.authorisation(&path) == Some(digest));
         authorisations.remove(&path);
         assert!(authorisations.authorisation(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_return_model_values_and_normalised_fingerprint_effects() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("nested/file"), "contents").unwrap();
+        let host = tool_host(&workspace).await;
+
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String("./nested//file".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(result.result, Ok(ToolValue::String("contents".to_owned())));
+        let mut authorisations = WholeFileAuthorisations::default();
+        result.apply_effect(&mut authorisations);
+        assert_eq!(
+            authorisations.authorisation(Path::new("nested/file")),
+            Some(fingerprint("contents"))
+        );
+        assert_eq!(authorisations.fingerprints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_reads_have_no_effect() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("invalid"), [0xff]).unwrap();
+        fs::write(workspace.path().join("oversized"), "12345").unwrap();
+        let host = tool_host_with_limits(&workspace, 4).await;
+        let mut authorisations = WholeFileAuthorisations::default();
+
+        for path in ["missing", "invalid", "oversized"] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 7,
+                    tool: ToolName::Read,
+                    arguments: ToolValue::List(vec![ToolValue::String(path.to_owned())]),
+                })
+                .await;
+            assert!(result.result.is_err());
+            assert!(result.effect.is_none());
+            result.apply_effect(&mut authorisations);
+        }
+
+        assert_eq!(authorisations, WholeFileAuthorisations::default());
+    }
+
+    #[tokio::test]
+    async fn read_effects_apply_in_call_order() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        let path = workspace.path().join("nested/file");
+        fs::write(&path, "first").unwrap();
+        let host = tool_host(&workspace).await;
+        let first = host.call(ToolCall {
+            call_id: 1,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String("nested/file".to_owned())]),
+        });
+        let first = first.await;
+        fs::write(&path, "second").unwrap();
+        let second = host.call(ToolCall {
+            call_id: 2,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String("./nested//file".to_owned())]),
+        });
+        let second = second.await;
+
+        let mut ordered = WholeFileAuthorisations::default();
+        first.apply_effect(&mut ordered);
+        second.apply_effect(&mut ordered);
+        let mut expected = WholeFileAuthorisations::default();
+        second.apply_effect(&mut expected);
+        let mut reversed = WholeFileAuthorisations::default();
+        second.apply_effect(&mut reversed);
+        first.apply_effect(&mut reversed);
+
+        assert_eq!(ordered, expected);
+        assert_ne!(ordered, reversed);
+    }
+
+    #[test]
+    fn authorisation_effect_and_result_debug_are_opaque() {
+        let path = PathBuf::from("distinctive/private-path");
+        let fingerprint = ContentFingerprint([42; 32]);
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), fingerprint);
+        let result = ToolResult {
+            call_id: 7,
+            result: Ok(ToolValue::String("visible".to_owned())),
+            effect: Some(ReadEffect { path, fingerprint }),
+        };
+        let marker = "[42, 42";
+
+        for debug in [
+            format!("{authorisations:?}"),
+            format!("{:?}", result.effect.as_ref().unwrap()),
+            format!("{result:?}"),
+        ] {
+            assert!(!debug.contains("distinctive/private-path"));
+            assert!(!debug.contains(marker));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
