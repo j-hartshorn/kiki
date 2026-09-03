@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
@@ -17,10 +17,10 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, TOOL_CONCURRENCY_LIMIT},
+    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolResult, ToolValue,
-        bootstrap_source,
+        WholeFileAuthorisations, bootstrap_source,
     },
 };
 
@@ -48,6 +48,7 @@ pub struct RuntimeIdentity(String);
 pub struct Checkpoint {
     identity: RuntimeIdentity,
     state: Vec<u8>,
+    authorisations: WholeFileAuthorisations,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,9 @@ pub(crate) enum ToolCallSummary {
     Pending,
     Failed,
     Count(usize),
+    Created,
+    Replaced,
+    Applied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,6 +428,7 @@ impl Arena {
         let checkpoint = Checkpoint {
             identity: runtime.clone(),
             state,
+            authorisations: WholeFileAuthorisations::default(),
         };
 
         Ok(Self {
@@ -468,6 +473,7 @@ impl Arena {
             .as_ref()
             .and_then(|limits| limits.max_memory);
         let mut interruption = InterruptedExecutionState::new();
+        let mut authorisations = self.checkpoint.authorisations.clone();
         let attempt = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(AttemptFailure::Cancelled),
@@ -477,6 +483,7 @@ impl Arena {
                 &self.tool_host,
                 code,
                 max_memory,
+                &mut authorisations,
                 progress,
                 &mut interruption,
             ) => result.map_err(AttemptFailure::Driver),
@@ -488,6 +495,7 @@ impl Arena {
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
                     state,
+                    authorisations,
                 };
                 Ok(Execution {
                     stdout: interruption.streams.stdout.finish(),
@@ -658,10 +666,19 @@ async fn execute_checkout(
     tool_host: &ToolHost,
     code: &str,
     max_memory: Option<usize>,
+    authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
 ) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
-    let result = drive(checkout, tool_host, code, progress, interruption).await;
+    let result = drive(
+        checkout,
+        tool_host,
+        code,
+        authorisations,
+        progress,
+        interruption,
+    )
+    .await;
     interruption.streams.flush_stdout(Instant::now(), progress);
     let (outcome, unsafe_memory, error_text) = match result {
         Ok(value) => (
@@ -750,6 +767,7 @@ async fn drive(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
 ) -> Result<MontyObject, DriverError> {
@@ -905,25 +923,42 @@ async fn drive(
                             ),
                         )));
                     }
-                    let mut results = BTreeMap::new();
-                    let mut calls = stream::iter(pending)
-                        .map(|call| async move {
-                            let result = tool_host
-                                .call(HostToolCall {
-                                    call_id: call.call_id,
-                                    tool: call.tool,
-                                    arguments: call.arguments,
-                                })
-                                .await;
-                            (call.token, call.call_id, result)
+                    #[cfg(test)]
+                    tool_host.note_batch_driver_pending_call_ids(&pending_call_ids);
+                    let mut pending = pending
+                        .into_iter()
+                        .map(|call| (call.call_id, call))
+                        .collect::<BTreeMap<_, _>>();
+                    let mut tokens = BTreeMap::new();
+                    let calls = pending_call_ids
+                        .iter()
+                        .map(|call_id| {
+                            let call = pending
+                                .remove(call_id)
+                                .expect("validated call ID must be admitted");
+                            assert!(
+                                tokens.insert(call.call_id, call.token).is_none(),
+                                "a pending host call must have a unique call ID"
+                            );
+                            HostToolCall {
+                                call_id: call.call_id,
+                                tool: call.tool,
+                                arguments: call.arguments,
+                            }
                         })
-                        .buffer_unordered(TOOL_CONCURRENCY_LIMIT);
-                    while let Some((token, expected_call_id, result)) = calls.next().await {
-                        assert_eq!(
-                            result.call_id, expected_call_id,
-                            "tool result must retain its call ID"
-                        );
+                        .collect::<Vec<_>>();
+                    let mutation_paths = calls
+                        .iter()
+                        .filter_map(HostToolCall::mutation_path)
+                        .collect::<BTreeSet<_>>();
+                    let mut results = BTreeMap::new();
+                    let mut calls =
+                        Box::pin(tool_host.dispatch_batch(calls, authorisations.clone()));
+                    while let Some(result) = calls.next().await {
                         let call_id = result.call_id;
+                        let token = tokens
+                            .remove(&call_id)
+                            .expect("a host result must retain an admitted call ID");
                         let summary = tool_summary(&result);
                         assert!(
                             results.insert(call_id, result).is_none(),
@@ -935,6 +970,16 @@ async fn drive(
                         progress(ArenaProgress::ToolUpdated { token, call });
                         #[cfg(test)]
                         tool_host.note_batch_driver_settled(call_id);
+                    }
+                    assert!(
+                        tokens.is_empty(),
+                        "every admitted host call must settle exactly once"
+                    );
+                    for call_id in &pending_call_ids {
+                        results
+                            .get(call_id)
+                            .expect("validated call ID must settle")
+                            .apply_batch_transition(authorisations, &mutation_paths);
                     }
                     let results = pending_call_ids
                         .into_iter()
@@ -1046,6 +1091,13 @@ fn tool_resume_value(result: ToolResult) -> ResumeValue {
 }
 
 fn tool_summary(result: &ToolResult) -> ToolCallSummary {
+    if let Some(status) = result.mutation_status() {
+        return match status {
+            crate::tools::MutationStatus::Created => ToolCallSummary::Created,
+            crate::tools::MutationStatus::Replaced => ToolCallSummary::Replaced,
+            crate::tools::MutationStatus::Applied => ToolCallSummary::Applied,
+        };
+    }
     match &result.result {
         Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
         Ok(ToolValue::List(entries)) => ToolCallSummary::Count(entries.len()),
@@ -1606,11 +1658,12 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use monty_types::PrintStream;
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -1621,7 +1674,10 @@ mod tests {
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::tools::{BatchTestGate, ReadTestGate, ToolHost};
+    use crate::tools::{
+        BatchTestGate, BlockingTestGate, ReadTestGate, ToolHost, WholeFileAuthorisations,
+        WriteTestHook,
+    };
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
         max_total_bytes: 100,
@@ -1688,6 +1744,18 @@ mod tests {
         (arena, gate)
     }
 
+    async fn arena_with_blocking_read_gate(workspace: &TempDir) -> (Arena, BlockingTestGate) {
+        let gate = BlockingTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_blocking_read_test_gate(gate.clone());
+        let arena = Arena::new(worker_path(), tool_host)
+            .await
+            .expect("create arena");
+        (arena, gate)
+    }
+
     async fn arena_with_limits(
         workspace: &TempDir,
         execution_timeout: Duration,
@@ -1735,19 +1803,29 @@ mod tests {
         format!("import asyncio\nawait asyncio.gather({calls})")
     }
 
+    fn has_authorisation(arena: &Arena, path: &str) -> bool {
+        arena
+            .checkpoint
+            .authorisations
+            .authorisation(Path::new(path))
+            .is_some()
+    }
+
     fn assert_interrupted_batch_trace(tool_calls: &[ToolCall]) {
         assert_eq!(tool_calls.len(), 18);
         assert_eq!(
-            tool_calls[0],
-            ToolCall {
-                tool: ToolName::Read,
-                summary: ToolCallSummary::Count(1),
-            }
-        );
-        assert!(
-            tool_calls[1..]
+            tool_calls
                 .iter()
-                .all(|call| matches!(call.summary, ToolCallSummary::Pending))
+                .filter(|call| matches!(call.summary, ToolCallSummary::Count(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            tool_calls
+                .iter()
+                .filter(|call| matches!(call.summary, ToolCallSummary::Pending))
+                .count(),
+            17
         );
     }
 
@@ -1973,6 +2051,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn read_authorisations_commit_and_restore_with_monty_checkpoints() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+        let initial = arena.checkpoint();
+
+        execute_without_cancellation(&mut arena, "value = 1\nawait read('file')")
+            .await
+            .unwrap();
+        let successful = arena.checkpoint();
+        let successful_authorisations = successful.authorisations.clone();
+        assert!(has_authorisation(&arena, "file"));
+
+        execute_without_cancellation(&mut arena, "value = 99")
+            .await
+            .unwrap();
+        arena.restore(initial).await.unwrap();
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
+        assert!(
+            python_error(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("NameError")
+        );
+
+        arena.restore(successful).await.unwrap();
+        assert_eq!(arena.checkpoint.authorisations, successful_authorisations);
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "1"
+        );
     }
 
     #[tokio::test]
@@ -2278,19 +2402,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exposes_only_the_four_phase_one_host_functions() {
+    async fn exposes_exactly_six_phase_two_host_functions() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("file"), "match\n").unwrap();
         let mut arena = arena(&workspace).await;
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "contents = await read('file')\nlisted = await list_dir()\nmatched = await glob('*')\nfound = await grep('match')\ntry:\n    await write('new', 'contents')\nexcept NameError:\n    write_missing = True\ntry:\n    await edit('file', 'match', 'changed')\nexcept NameError:\n    edit_missing = True\ntry:\n    await run('pwd')\nexcept NameError:\n    run_missing = True\ncontents == 'match\\n' and listed[0].path == 'file' and matched[0].path == 'file' and found[0].path == 'file' and write_missing and edit_missing and run_missing",
+            "contents = await read('file')\nlisted = await list_dir()\nmatched = await glob('*')\nfound = await grep('match')\nwrite_result = await write('new', contents)\nedit_result = await edit('file', 'match', 'changed')\ntry:\n    await run('pwd')\nexcept NameError:\n    run_missing = True\ncontents == 'match\\n' and listed[0].path == 'file' and matched[0].path == 'file' and found[0].path == 'file' and write_result is None and edit_result is None and (await read('new')) == contents and (await read('file')) == 'changed\\n' and run_missing",
         )
         .await
         .unwrap();
 
         assert_eq!(complete(&execution).unwrap().head, "True");
+    }
+
+    #[tokio::test]
+    async fn private_mutations_accept_only_exact_positional_strings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "write_result = await _kiki_write('file', 'first')\nedit_result = await _kiki_edit('file', 'first', 'second')\nwrite_result is None and edit_result is None and (await _kiki_read('file')) == 'second'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        for code in [
+            "await _kiki_write('file')",
+            "await _kiki_write('file', 1)",
+            "await _kiki_write(path='file', content='contents')",
+            "await _kiki_edit('file', 'old')",
+            "await _kiki_edit('file', 'old', 1)",
+            "await _kiki_edit(path='file', old='old', new='new')",
+        ] {
+            let execution = execute_without_cancellation(&mut arena, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("TypeError"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_mutations_return_none_update_freshness_and_record_safe_statuses() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "contents = await read('file')\nwrite_result = await write('file', 'second')\nedit_result = await edit('file', 'second', 'third')\nwrite_result is None and edit_result is None and (await read('file')) == 'third'",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(5),
+                },
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Replaced,
+                },
+                ToolCall {
+                    tool: ToolName::Edit,
+                    summary: ToolCallSummary::Applied,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(5),
+                },
+            ]
+        );
+        assert!(has_authorisation(&arena, "file"));
+    }
+
+    #[tokio::test]
+    async fn writes_create_then_replace_with_safe_statuses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "await write('new', 'first')\nawait write('./new', 'second')\nawait read('new')",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "'second'");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Created,
+                },
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Replaced,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(6),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_batch_read_cannot_authorise_a_replacement_write() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "import asyncio\ntry:\n    await asyncio.gather(read('file'), write('file', 'second'))\nexcept RuntimeError:\n    pass\ntry:\n    await write('file', 'second')\nexcept RuntimeError:\n    denied = True\ndenied",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "first"
+        );
+        assert!(!has_authorisation(&arena, "file"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_python_errors_commit_mutation_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "await write('file', 'first')\nraise ValueError('expected')",
+        )
+        .await
+        .unwrap();
+        assert!(python_error(&execution).text.contains("ValueError"));
+        assert!(has_authorisation(&arena, "file"));
+
+        execute_without_cancellation(&mut arena, "await write('file', 'second')")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_checkpoint_restores_mutation_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let initial = arena.checkpoint();
+
+        execute_without_cancellation(&mut arena, "await write('file', 'first')")
+            .await
+            .unwrap();
+        let mutation_checkpoint = arena.checkpoint();
+        assert!(has_authorisation(&arena, "file"));
+
+        arena.restore(initial).await.unwrap();
+        assert!(!has_authorisation(&arena, "file"));
+        arena.restore(mutation_checkpoint).await.unwrap();
+
+        execute_without_cancellation(&mut arena, "await write('file', 'second')")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "second"
+        );
     }
 
     #[tokio::test]
@@ -2961,15 +3252,19 @@ mod tests {
     #[tokio::test]
     async fn ordinary_python_errors_commit_preceding_mutation() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("read-before-error"), "contents").unwrap();
         let mut arena = arena(&workspace).await;
         #[cfg(unix)]
         let worker_pid = arena_worker_pid(&arena);
 
-        let error =
-            execute_without_cancellation(&mut arena, "value = 41\nraise ValueError('expected')")
-                .await
-                .unwrap();
+        let error = execute_without_cancellation(
+            &mut arena,
+            "value = 41\nawait read('read-before-error')\nraise ValueError('expected')",
+        )
+        .await
+        .unwrap();
         assert!(python_error(&error).text.contains("ValueError"));
+        assert!(has_authorisation(&arena, "read-before-error"));
 
         assert_eq!(
             complete(
@@ -3031,19 +3326,21 @@ mod tests {
     #[tokio::test]
     async fn user_raised_fatal_message_memory_error_commits_mutation_and_keeps_the_worker() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
         let mut arena = arena(&workspace).await;
         #[cfg(unix)]
         let worker_pid = arena_worker_pid(&arena);
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "value = 99\nraise MemoryError('the worker exceeded its memory limit and was terminated')",
+            "await read('file')\nvalue = 99\nraise MemoryError('the worker exceeded its memory limit and was terminated')",
         )
         .await
         .unwrap();
 
         assert!(python_error(&execution).text.contains("Traceback"));
         assert!(python_error(&execution).text.contains("MemoryError"));
+        assert!(has_authorisation(&arena, "file"));
         assert_eq!(
             complete(
                 &execute_without_cancellation(&mut arena, "value")
@@ -3255,6 +3552,8 @@ mod tests {
                 },
             ]
         );
+        assert!(!has_authorisation(&arena, "missing"));
+        assert!(has_authorisation(&arena, "present"));
     }
 
     #[tokio::test]
@@ -3321,10 +3620,74 @@ mod tests {
             [
                 (first_token, ToolCall { summary: ToolCallSummary::Pending, .. }),
                 (second_token, ToolCall { summary: ToolCallSummary::Pending, .. }),
-                (settled_second, ToolCall { summary: ToolCallSummary::Count(6), .. }),
-                (settled_first, ToolCall { summary: ToolCallSummary::Count(5), .. }),
-            ] if settled_first == first_token && settled_second == second_token
+                (settled_first, ToolCall { summary: ToolCallSummary::Count(_), .. }),
+                (settled_second, ToolCall { summary: ToolCallSummary::Count(_), .. }),
+            ] if first_token != second_token
+                && [settled_first, settled_second].contains(&first_token)
+                && [settled_first, settled_second].contains(&second_token)
         ));
+        assert!(
+            updates[2..]
+                .iter()
+                .any(|(_, call)| { matches!(call.summary, ToolCallSummary::Count(5)) })
+        );
+        assert!(
+            updates[2..]
+                .iter()
+                .any(|(_, call)| { matches!(call.summary, ToolCallSummary::Count(6)) })
+        );
+    }
+
+    #[tokio::test]
+    async fn reversed_same_path_reads_apply_effects_in_pending_call_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "first").unwrap();
+        let mut expected_arena = arena(&workspace).await;
+        execute_without_cancellation(&mut expected_arena, "await read('file')")
+            .await
+            .unwrap();
+        let first_authorisations = expected_arena.checkpoint.authorisations.clone();
+        drop(expected_arena);
+
+        let (mut actual_arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(actual_arena.execute(
+            "import asyncio\nawait asyncio.gather(read('file'), read('file'))",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut execution => panic!("execution finished before both reads started: {result:?}"),
+        }
+        let call_ids = gate.started_call_ids();
+        gate.release(call_ids[1]);
+        tokio::select! {
+            _ = gate.wait_until_driver_settled() => {}
+            result = &mut execution => panic!("execution finished before the second read settled: {result:?}"),
+        }
+        fs::write(&path, "second").unwrap();
+        let mut second_expected_arena = arena(&workspace).await;
+        execute_without_cancellation(&mut second_expected_arena, "await read('file')")
+            .await
+            .unwrap();
+        let second_authorisations = second_expected_arena.checkpoint.authorisations.clone();
+        drop(second_expected_arena);
+        let pending_call_ids = gate.pending_call_ids();
+        assert_eq!(pending_call_ids.len(), 2);
+        let expected_authorisations = match pending_call_ids.last() {
+            Some(call_id) if *call_id == call_ids[1] => first_authorisations,
+            Some(call_id) if *call_id == call_ids[0] => second_authorisations,
+            _ => panic!("pending calls must be the gated reads"),
+        };
+        gate.release(call_ids[0]);
+
+        execution.await.unwrap();
+        assert_eq!(
+            actual_arena.checkpoint.authorisations,
+            expected_authorisations
+        );
     }
 
     #[tokio::test]
@@ -3499,7 +3862,71 @@ mod tests {
         assert!(gate.active_call_ids().is_empty());
         assert_eq!(gate.maximum_active(), 16);
         assert_interrupted_batch_trace(&execution.tool_calls);
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
         assert_trusted_value(&mut arena).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_settled_mutation_authorisation_and_retains_safe_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "import asyncio\nawait asyncio.gather(write('created-on-cancel', 'first'), read('still-pending'))",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its pending read started: {result:?}"),
+        }
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its mutation settled: {result:?}"),
+        }
+        cancellation.cancel();
+
+        let error = execution.await.unwrap_err();
+        gate.resume_driver();
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(
+            execution
+                .tool_calls
+                .iter()
+                .filter(|call| matches!(call.summary, ToolCallSummary::Created))
+                .count(),
+            1
+        );
+        assert_eq!(
+            execution
+                .tool_calls
+                .iter()
+                .filter(|call| matches!(call.summary, ToolCallSummary::Pending))
+                .count(),
+            1
+        );
+        assert!(!format!("{execution:?}").contains("created-on-cancel"));
+        assert!(!format!("{execution:?}").contains("still-pending"));
+        assert!(!has_authorisation(&arena, "created-on-cancel"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("created-on-cancel")).unwrap(),
+            "first"
+        );
+
+        let later =
+            execute_without_cancellation(&mut arena, "await write('created-on-cancel', 'later')")
+                .await
+                .unwrap();
+        assert!(python_error(&later).text.contains("RuntimeError"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("created-on-cancel")).unwrap(),
+            "first"
+        );
     }
 
     #[tokio::test]
@@ -3520,7 +3947,7 @@ mod tests {
         let mut arena = Arena::with_limits(
             worker_path(),
             tool_host,
-            Duration::from_secs(1),
+            Duration::from_secs(2),
             Some(64 * 1024 * 1024),
         )
         .await
@@ -3557,7 +3984,89 @@ mod tests {
         assert!(gate.active_call_ids().is_empty());
         assert_eq!(gate.maximum_active(), 16);
         assert_interrupted_batch_trace(&execution.tool_calls);
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
         assert_trusted_value(&mut arena).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_settled_read_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let mut ready_sender = Some(ready_sender);
+        let mut progress = move |event| {
+            if matches!(event, super::ArenaProgress::StdoutDelta { ref text } if text == "ready\n")
+            {
+                ready_sender
+                    .take()
+                    .expect("ready output is emitted once")
+                    .send(())
+                    .expect("ready receiver remains open");
+            }
+        };
+        let mut execution = Box::pin(arena.execute_with_progress(
+            "await read('file')\nprint('ready')\nwhile True:\n    pass",
+            &cancellation,
+            &mut progress,
+        ));
+
+        tokio::select! {
+            _ = ready_receiver => {}
+            result = &mut execution => panic!("execution finished before its read effect settled: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Cancelled { .. }
+        ));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_discards_settled_read_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena =
+            arena_with_limits(&workspace, Duration::from_secs(1), Some(64 * 1024 * 1024)).await;
+        let cancellation = CancellationToken::new();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let mut ready_sender = Some(ready_sender);
+        let mut progress = move |event| {
+            if matches!(event, super::ArenaProgress::StdoutDelta { ref text } if text == "ready\n")
+            {
+                ready_sender
+                    .take()
+                    .expect("ready output is emitted once")
+                    .send(())
+                    .expect("ready receiver remains open");
+            }
+        };
+        let mut execution = Box::pin(arena.execute_with_progress(
+            "await read('file')\nprint('ready')\nwhile True:\n    pass",
+            &cancellation,
+            &mut progress,
+        ));
+
+        tokio::select! {
+            _ = ready_receiver => {}
+            result = &mut execution => panic!("execution finished before its read effect settled: {result:?}"),
+        }
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::TimedOut { .. }
+        ));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
     }
 
     #[tokio::test]
@@ -3611,6 +4120,87 @@ mod tests {
                 tool: ToolName::Read,
                 summary: ToolCallSummary::Pending,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn late_blocking_read_completion_cannot_authorise_after_recovery() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("late"), "contents").unwrap();
+        let (mut arena, gate) = arena_with_blocking_read_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute("await read('late')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_started() => {}
+            result = &mut execution => panic!("execution finished before its blocking read started: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Cancelled { .. }
+        ));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
+
+        gate.resume();
+        gate.wait_until_finished().await;
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_mutation_publication_after_cancellation_cannot_authorise_a_replacement() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let hook = WriteTestHook::pause_before_recheck();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_write_test_hook(hook.clone());
+        let mut arena = Arena::new(worker_path(), tool_host)
+            .await
+            .expect("create arena");
+        execute_without_cancellation(&mut arena, "await read('file')")
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute("await write('file', 'after')", &cancellation));
+
+        tokio::select! {
+            _ = hook.wait_until_paused() => {}
+            result = &mut execution => panic!("execution finished before its mutation paused: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Cancelled { .. }
+        ));
+        assert!(has_authorisation(&arena, "file"));
+
+        hook.resume();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if fs::read_to_string(workspace.path().join("file")).unwrap() == "after" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late mutation should publish");
+
+        let later = execute_without_cancellation(&mut arena, "await write('file', 'later')")
+            .await
+            .unwrap();
+        assert!(python_error(&later).text.contains("RuntimeError"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "after"
         );
     }
 
@@ -3884,6 +4474,52 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn worker_loss_discards_settled_read_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+        set_trusted_value(&mut arena).await;
+        let previous_pid = arena_worker_pid(&arena);
+        let cancellation = CancellationToken::new();
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let mut ready_sender = Some(ready_sender);
+        let mut progress = move |event| {
+            if matches!(event, super::ArenaProgress::StdoutDelta { ref text } if text == "ready\n")
+            {
+                ready_sender
+                    .take()
+                    .expect("ready output is emitted once")
+                    .send(())
+                    .expect("ready receiver remains open");
+            }
+        };
+        let mut execution = Box::pin(arena.execute_with_progress(
+            "await read('file')\nprint('ready')\nwhile True:\n    pass",
+            &cancellation,
+            &mut progress,
+        ));
+
+        tokio::select! {
+            _ = ready_receiver => {}
+            result = &mut execution => panic!("execution finished before its read effect settled: {result:?}"),
+        }
+        assert_eq!(
+            unsafe { libc::kill(previous_pid as libc::pid_t, libc::SIGKILL) },
+            0
+        );
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Infrastructure { .. }
+        ));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn worker_crashes_recover_the_trusted_checkpoint_before_returning() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -3920,6 +4556,7 @@ mod tests {
     #[tokio::test]
     async fn soft_memory_limit_recovers_the_trusted_checkpoint() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
         let mut arena =
             arena_with_limits(&workspace, Duration::from_secs(10), Some(8 * 1024 * 1024)).await;
         set_trusted_value(&mut arena).await;
@@ -3928,13 +4565,17 @@ mod tests {
 
         let error = execute_without_cancellation(
             &mut arena,
-            "value = 99\n[str(i) for i in range(131_072)]",
+            "await read('file')\nvalue = 99\n[str(i) for i in range(131_072)]",
         )
         .await
         .unwrap_err();
 
         assert!(matches!(error, ArenaError::Infrastructure { .. }));
         assert!(error.to_string().contains("MemoryError"));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
         #[cfg(unix)]
         {
             assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -3967,10 +4608,12 @@ mod tests {
 
         let mut progress = |_| {};
         let mut interruption = InterruptedExecutionState::new();
+        let mut authorisations = WholeFileAuthorisations::default();
         let result = drive(
             checkout,
             &arena.tool_host,
             "x = ' ' * (1 << 60)",
+            &mut authorisations,
             &mut progress,
             &mut interruption,
         )
@@ -3991,17 +4634,25 @@ mod tests {
     #[tokio::test]
     async fn fatal_allocator_failure_recovers_the_trusted_checkpoint() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
         let mut arena = arena_with_limits(&workspace, Duration::from_secs(1), None).await;
         set_trusted_value(&mut arena).await;
         #[cfg(unix)]
         let previous_pid = arena_worker_pid(&arena);
 
-        let error = execute_without_cancellation(&mut arena, "value = 99\nx = ' ' * (1 << 60)")
-            .await
-            .unwrap_err();
+        let error = execute_without_cancellation(
+            &mut arena,
+            "await read('file')\nvalue = 99\nx = ' ' * (1 << 60)",
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, ArenaError::Infrastructure { .. }));
         assert!(error.to_string().contains("MemoryError"));
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
         assert_trusted_value(&mut arena).await;
         #[cfg(unix)]
         assert_ne!(arena_worker_pid(&arena), previous_pid);
@@ -4050,6 +4701,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_recovery_retains_prior_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("trusted"), "contents").unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut setup = Box::pin(arena.execute("await read('trusted')", &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut setup => panic!("setup finished before its read started: {result:?}"),
+        }
+        let trusted_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("trusted read must start");
+        gate.release(trusted_call);
+        setup.await.unwrap();
+        let trusted_authorisations = arena.checkpoint.authorisations.clone();
+
+        arena.fail_next_recovery_for_test();
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute("await read('pending')", &cancellation));
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::RecoveryFailed { .. }
+        ));
+        assert_eq!(arena.checkpoint.authorisations, trusted_authorisations);
+    }
+
+    #[tokio::test]
     async fn failed_recovery_preserves_original_error_and_a_missing_checkout_self_recovers() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -4078,17 +4764,25 @@ mod tests {
     #[tokio::test]
     async fn restores_initial_successful_and_python_error_checkpoints() {
         let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("successful"), "success").unwrap();
+        fs::write(workspace.path().join("python-error"), "error").unwrap();
         let mut arena = arena(&workspace).await;
         let initial = arena.checkpoint();
 
-        execute_without_cancellation(&mut arena, "value = 1")
+        execute_without_cancellation(&mut arena, "value = 1\nawait read('successful')")
             .await
             .unwrap();
         let successful_mutation = arena.checkpoint();
+        let successful_authorisations = successful_mutation.authorisations.clone();
+        assert!(has_authorisation(&arena, "successful"));
         execute_without_cancellation(&mut arena, "value = 99")
             .await
             .unwrap();
         arena.restore(initial).await.unwrap();
+        assert_eq!(
+            arena.checkpoint.authorisations,
+            WholeFileAuthorisations::default()
+        );
         assert!(
             python_error(
                 &execute_without_cancellation(&mut arena, "value")
@@ -4100,6 +4794,7 @@ mod tests {
         );
 
         arena.restore(successful_mutation).await.unwrap();
+        assert_eq!(arena.checkpoint.authorisations, successful_authorisations);
         assert_eq!(
             complete(
                 &execute_without_cancellation(&mut arena, "value")
@@ -4111,16 +4806,21 @@ mod tests {
             "1"
         );
 
-        let error =
-            execute_without_cancellation(&mut arena, "value = 2\nraise ValueError('expected')")
-                .await
-                .unwrap();
+        let error = execute_without_cancellation(
+            &mut arena,
+            "value = 2\nawait read('python-error')\nraise ValueError('expected')",
+        )
+        .await
+        .unwrap();
         assert!(python_error(&error).text.contains("ValueError"));
         let python_error_mutation = arena.checkpoint();
+        let python_error_authorisations = python_error_mutation.authorisations.clone();
+        assert!(has_authorisation(&arena, "python-error"));
         execute_without_cancellation(&mut arena, "value = 99")
             .await
             .unwrap();
         arena.restore(python_error_mutation).await.unwrap();
+        assert_eq!(arena.checkpoint.authorisations, python_error_authorisations);
         assert_eq!(
             complete(
                 &execute_without_cancellation(&mut arena, "value")
@@ -4131,6 +4831,27 @@ mod tests {
             .head,
             "2"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_restore_retains_canonical_authorisations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("trusted"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+        execute_without_cancellation(&mut arena, "await read('trusted')")
+            .await
+            .unwrap();
+        let authorisations = arena.checkpoint.authorisations.clone();
+        let mut invalid = arena.checkpoint();
+        invalid.state = vec![0];
+        invalid.authorisations = WholeFileAuthorisations::default();
+
+        assert!(matches!(
+            arena.restore(invalid).await.unwrap_err(),
+            ArenaError::Infrastructure { .. }
+        ));
+        assert_eq!(arena.checkpoint.authorisations, authorisations);
+        assert!(has_authorisation(&arena, "trusted"));
     }
 
     #[tokio::test]

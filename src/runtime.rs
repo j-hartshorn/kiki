@@ -1036,7 +1036,35 @@ mod tests {
                     call.tool.count_label(count)
                 )
             }
+            ToolCallSummary::Created => format!("{}:created", call.tool.label()),
+            ToolCallSummary::Replaced => format!("{}:replaced", call.tool.label()),
+            ToolCallSummary::Applied => format!("{}:applied", call.tool.label()),
         }
+    }
+
+    #[test]
+    fn mutation_evidence_labels_are_path_free() {
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Write,
+                summary: ToolCallSummary::Created,
+            }),
+            "write:created"
+        );
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Write,
+                summary: ToolCallSummary::Replaced,
+            }),
+            "write:replaced"
+        );
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Edit,
+                summary: ToolCallSummary::Applied,
+            }),
+            "edit:applied"
+        );
     }
 
     fn record_label(record: &StoredRecord) -> String {

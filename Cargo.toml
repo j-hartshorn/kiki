@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 async-openai = { version = "=0.41.3", default-features = false, features = ["byot", "middleware", "responses", "rustls"] }
+blake3 = "1"
 cap-std = "4"
 futures = "0.3"
+getrandom = "0.3"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+rustix = { version = "1", features = ["fs"] }
 monty-pool = "=0.0.21"
 monty-types = "=0.0.21"
 serde = { version = "1", features = ["derive"] }

@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
-use std::io::Read;
+use std::fmt;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -10,19 +9,24 @@ use std::sync::{Condvar, Mutex};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata};
-#[cfg(unix)]
-use cap_std::fs::{OpenOptions, OpenOptionsExt};
+use futures::{Stream, StreamExt, future::BoxFuture, stream, stream::FuturesUnordered};
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkError, SinkMatch};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+#[cfg(unix)]
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use rustix::fs::{RenameFlags, fchmod, fstat, linkat, mkdirat, renameat, renameat_with, unlinkat};
+#[cfg(unix)]
+use rustix::io::Errno;
 use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::constants::{
-    COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES,
+    COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +43,8 @@ pub(crate) enum ToolValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolName {
     Read,
+    Write,
+    Edit,
     ListDir,
     Glob,
     Grep,
@@ -48,6 +54,8 @@ impl ToolName {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Read => "read",
+            Self::Write => "write",
+            Self::Edit => "edit",
             Self::ListDir => "list_dir",
             Self::Glob => "glob",
             Self::Grep => "grep",
@@ -57,6 +65,8 @@ impl ToolName {
     pub(crate) fn private_name(self) -> &'static str {
         match self {
             Self::Read => "_kiki_read",
+            Self::Write => "_kiki_write",
+            Self::Edit => "_kiki_edit",
             Self::ListDir => "_kiki_list_dir",
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
@@ -82,6 +92,9 @@ impl ToolName {
             (Self::ListDir | Self::Glob, _) => "entries",
             (Self::Grep, 1) => "match",
             (Self::Grep, _) => "matches",
+            (Self::Write | Self::Edit, _) => {
+                unreachable!("mutations have status summaries rather than counts")
+            }
         }
     }
 }
@@ -93,10 +106,70 @@ pub(crate) struct ToolCall {
     pub(crate) arguments: ToolValue,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl ToolCall {
+    pub(crate) fn mutation_path(&self) -> Option<PathBuf> {
+        match self.tool {
+            ToolName::Write => write_mutation_path(&self.arguments),
+            ToolName::Edit => edit_mutation_path(&self.arguments),
+            ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub(crate) struct ToolResult {
     pub(crate) call_id: u32,
     pub(crate) result: Result<ToolValue, ToolError>,
+    effect: Option<ToolEffect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationStatus {
+    Created,
+    Replaced,
+    Applied,
+}
+
+impl ToolResult {
+    pub(crate) fn apply_batch_transition(
+        &self,
+        authorisations: &mut WholeFileAuthorisations,
+        mutation_paths: &BTreeSet<PathBuf>,
+    ) {
+        if self.result.is_ok()
+            && let Some(effect) = &self.effect
+            && !effect.is_suppressed_read(mutation_paths)
+        {
+            effect.apply(authorisations);
+        }
+    }
+
+    fn apply_mutation_transition(&self, authorisations: &mut WholeFileAuthorisations) {
+        if self.result.is_ok()
+            && let Some(effect) = &self.effect
+            && effect.is_mutation()
+        {
+            effect.apply(authorisations);
+        }
+    }
+
+    pub(crate) fn mutation_status(&self) -> Option<MutationStatus> {
+        self.result
+            .is_ok()
+            .then(|| self.effect.as_ref().and_then(ToolEffect::mutation_status))
+            .flatten()
+    }
+}
+
+impl fmt::Debug for ToolResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolResult")
+            .field("call_id", &self.call_id)
+            .field("result", &self.result)
+            .field("effect", &self.effect)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +293,7 @@ pub(crate) struct ToolRecord {
 
 #[derive(Clone, Copy)]
 pub(crate) enum ToolResultShape {
+    None,
     String,
     RecordList(&'static ToolRecord),
 }
@@ -227,6 +301,7 @@ pub(crate) enum ToolResultShape {
 impl ToolResultShape {
     fn annotation(self) -> String {
         match self {
+            Self::None => "None".to_owned(),
             Self::String => "str".to_owned(),
             Self::RecordList(record) => format!("list[{}]", record.name),
         }
@@ -234,17 +309,18 @@ impl ToolResultShape {
 
     fn record(self) -> Option<&'static ToolRecord> {
         match self {
-            Self::String => None,
+            Self::None | Self::String => None,
             Self::RecordList(record) => Some(record),
         }
     }
 
-    fn bootstrap_return(self, private_name: &str, arguments: &str) -> String {
+    fn bootstrap_body(self, private_name: &str, arguments: &str) -> String {
         match self {
-            Self::String => format!("await {private_name}({arguments})"),
+            Self::None => format!("await {private_name}({arguments})"),
+            Self::String => format!("return await {private_name}({arguments})"),
             Self::RecordList(record) => {
                 format!(
-                    "[{}(**row) for row in await {private_name}({arguments})]",
+                    "return [{}(**row) for row in await {private_name}({arguments})]",
                     record.name
                 )
             }
@@ -265,6 +341,37 @@ const READ_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     value_type: ToolValueType::String,
     default: None,
 }];
+
+const WRITE_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "content",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+];
+
+const EDIT_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "old",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "new",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+];
 
 const DIRECTORY_ENTRY_FIELDS: &[ToolRecordField] = &[
     ToolRecordField {
@@ -349,6 +456,18 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         parameters: READ_PARAMETERS,
         result: ToolResultShape::String,
         description: "Read one complete UTF-8 workspace file.",
+    },
+    ToolDefinition {
+        name: ToolName::Write,
+        parameters: WRITE_PARAMETERS,
+        result: ToolResultShape::None,
+        description: "Create or replace one complete UTF-8 workspace file.",
+    },
+    ToolDefinition {
+        name: ToolName::Edit,
+        parameters: EDIT_PARAMETERS,
+        result: ToolResultShape::None,
+        description: "Replace one exact occurrence in a UTF-8 workspace file.",
     },
     ToolDefinition {
         name: ToolName::ListDir,
@@ -483,11 +602,11 @@ impl ToolDefinition {
 
     fn bootstrap_wrapper(self) -> String {
         format!(
-            "{}\n    \"\"\"{}\"\"\"\n    return {}",
+            "{}\n    \"\"\"{}\"\"\"\n    {}",
             self.signature(),
             self.description,
             self.result
-                .bootstrap_return(self.name.private_name(), &self.arguments()),
+                .bootstrap_body(self.name.private_name(), &self.arguments()),
         )
     }
 
@@ -500,6 +619,131 @@ impl ToolDefinition {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentFingerprint([u8; 32]);
+
+impl fmt::Debug for ContentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentFingerprint(..)")
+    }
+}
+
+fn content_fingerprint(contents: &[u8]) -> ContentFingerprint {
+    ContentFingerprint(*blake3::hash(contents).as_bytes())
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct WholeFileAuthorisations {
+    fingerprints: BTreeMap<PathBuf, ContentFingerprint>,
+}
+
+impl fmt::Debug for WholeFileAuthorisations {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WholeFileAuthorisations(..)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ToolEffect {
+    Read {
+        path: PathBuf,
+        fingerprint: ContentFingerprint,
+    },
+    Write {
+        path: PathBuf,
+        outcome: WholeFileWriteOutcome,
+        fingerprint: ContentFingerprint,
+    },
+    Edit {
+        path: PathBuf,
+        pre_fingerprint: ContentFingerprint,
+        post_fingerprint: ContentFingerprint,
+    },
+}
+
+impl ToolEffect {
+    fn apply(&self, authorisations: &mut WholeFileAuthorisations) {
+        match self {
+            Self::Read { path, fingerprint }
+            | Self::Write {
+                path, fingerprint, ..
+            } => {
+                authorisations.authorise(path.clone(), *fingerprint);
+            }
+            Self::Edit {
+                path,
+                pre_fingerprint,
+                post_fingerprint,
+            } => {
+                if authorisations.authorisation(path) == Some(*pre_fingerprint) {
+                    authorisations.authorise(path.clone(), *post_fingerprint);
+                } else {
+                    authorisations.remove(path);
+                }
+            }
+        }
+    }
+
+    fn is_mutation(&self) -> bool {
+        matches!(self, Self::Write { .. } | Self::Edit { .. })
+    }
+
+    fn is_suppressed_read(&self, mutation_paths: &BTreeSet<PathBuf>) -> bool {
+        matches!(self, Self::Read { path, .. } if mutation_paths.contains(path))
+    }
+
+    fn mutation_status(&self) -> Option<MutationStatus> {
+        match self {
+            Self::Write {
+                outcome: WholeFileWriteOutcome::Created,
+                ..
+            } => Some(MutationStatus::Created),
+            Self::Write {
+                outcome: WholeFileWriteOutcome::Replaced,
+                ..
+            } => Some(MutationStatus::Replaced),
+            Self::Edit { .. } => Some(MutationStatus::Applied),
+            Self::Read { .. } => None,
+        }
+    }
+}
+
+impl fmt::Debug for ToolEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolEffect(..)")
+    }
+}
+
+impl WholeFileAuthorisations {
+    pub(crate) fn authorisation(&self, path: &Path) -> Option<ContentFingerprint> {
+        self.fingerprints.get(path).copied()
+    }
+
+    pub(crate) fn authorise(&mut self, path: PathBuf, fingerprint: ContentFingerprint) {
+        self.fingerprints.insert(path, fingerprint);
+    }
+
+    pub(crate) fn remove(&mut self, path: &Path) {
+        self.fingerprints.remove(path);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WholeFileWriteOutcome {
+    Created,
+    Replaced,
+}
+
+struct WholeFileWrite {
+    outcome: WholeFileWriteOutcome,
+    fingerprint: ContentFingerprint,
+}
+
+struct WholeFileEdit {
+    pre_fingerprint: ContentFingerprint,
+    post_fingerprint: ContentFingerprint,
+}
+
 #[derive(Clone, Copy)]
 struct ToolLimits {
     max_file_bytes: usize,
@@ -507,13 +751,105 @@ struct ToolLimits {
     max_collection_payload_bytes: usize,
 }
 
+struct ToolOutput {
+    result: ToolValue,
+    effect: Option<ToolEffect>,
+}
+
+impl ToolOutput {
+    fn without_effect(result: ToolValue) -> Self {
+        Self {
+            result,
+            effect: None,
+        }
+    }
+}
+
+struct ScheduledCall {
+    result: ToolResult,
+    mutation_path: Option<PathBuf>,
+}
+
+struct BatchDispatch<'a> {
+    host: &'a ToolHost,
+    queued: VecDeque<ToolCall>,
+    active: FuturesUnordered<BoxFuture<'a, ScheduledCall>>,
+    active_mutation_paths: BTreeSet<PathBuf>,
+    authorisations: WholeFileAuthorisations,
+}
+
+impl<'a> BatchDispatch<'a> {
+    fn new(
+        host: &'a ToolHost,
+        calls: Vec<ToolCall>,
+        authorisations: WholeFileAuthorisations,
+    ) -> Self {
+        Self {
+            host,
+            queued: calls.into(),
+            active: FuturesUnordered::new(),
+            active_mutation_paths: BTreeSet::new(),
+            authorisations,
+        }
+    }
+
+    async fn next(mut self) -> Option<(ToolResult, Self)> {
+        self.admit_calls();
+        let ScheduledCall {
+            result,
+            mutation_path,
+        } = self.active.next().await?;
+        if let Some(path) = mutation_path {
+            self.active_mutation_paths.remove(&path);
+            result.apply_mutation_transition(&mut self.authorisations);
+        }
+        Some((result, self))
+    }
+
+    fn admit_calls(&mut self) {
+        while self.active.len() < TOOL_CONCURRENCY_LIMIT {
+            let Some(index) = self.queued.iter().position(|call| {
+                call.mutation_path()
+                    .is_none_or(|path| !self.active_mutation_paths.contains(&path))
+            }) else {
+                return;
+            };
+            let call = self
+                .queued
+                .remove(index)
+                .expect("queued batch call index must remain valid");
+            let mutation_path = call.mutation_path();
+            let authorisation = mutation_path
+                .as_ref()
+                .and_then(|path| self.authorisations.authorisation(path));
+            if let Some(path) = &mutation_path {
+                assert!(
+                    self.active_mutation_paths.insert(path.clone()),
+                    "active same-path mutations must be serialised"
+                );
+            }
+            let host = self.host;
+            self.active.push(Box::pin(async move {
+                ScheduledCall {
+                    result: host.call_with_authorisation(call, authorisation).await,
+                    mutation_path,
+                }
+            }));
+        }
+    }
+}
+
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
     limits: ToolLimits,
     #[cfg(test)]
+    write_test_hook: Option<WriteTestHook>,
+    #[cfg(test)]
     test_gate: Option<ReadTestGate>,
     #[cfg(test)]
-    list_dir_test_gate: Option<ListDirTestGate>,
+    blocking_read_test_gate: Option<BlockingTestGate>,
+    #[cfg(test)]
+    list_dir_test_gate: Option<BlockingTestGate>,
     #[cfg(test)]
     batch_test_gate: Option<BatchTestGate>,
 }
@@ -567,6 +903,87 @@ impl ReadTestGate {
 
 #[cfg(test)]
 #[derive(Clone)]
+pub(crate) struct BlockingTestGate {
+    state: Arc<(Mutex<BlockingTestGateState>, Condvar)>,
+}
+
+#[cfg(test)]
+struct BlockingTestGateState {
+    started: bool,
+    allowed: bool,
+    finished: bool,
+}
+
+#[cfg(test)]
+impl BlockingTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingTestGateState {
+                    started: false,
+                    allowed: false,
+                    finished: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    pub(crate) async fn wait_until_started(&self) {
+        self.wait_until(|state| state.started).await;
+    }
+
+    pub(crate) fn resume(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.allowed = true;
+        changed.notify_all();
+    }
+
+    pub(crate) async fn wait_until_finished(&self) {
+        self.wait_until(|state| state.finished).await;
+    }
+
+    fn wait_inside(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.started = true;
+        changed.notify_all();
+        while !state.allowed {
+            state = changed
+                .wait(state)
+                .expect("test gate mutex is not poisoned");
+        }
+    }
+
+    fn note_finished(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("test gate mutex is not poisoned");
+        state.finished = true;
+        changed.notify_all();
+    }
+
+    async fn wait_until(
+        &self,
+        condition: impl Fn(&BlockingTestGateState) -> bool + Send + 'static,
+    ) {
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || {
+            let (lock, changed) = &*state;
+            let mut state = lock.lock().expect("test gate mutex is not poisoned");
+            while !condition(&state) {
+                state = changed
+                    .wait(state)
+                    .expect("test gate mutex is not poisoned");
+            }
+        })
+        .await
+        .expect("test gate waiter completes");
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct BatchTestGate {
     state: Arc<Mutex<BatchTestGateState>>,
     started: Arc<Semaphore>,
@@ -579,6 +996,7 @@ struct BatchTestGateState {
     active_call_ids: BTreeSet<u32>,
     started_call_ids: Vec<u32>,
     released_call_ids: BTreeSet<u32>,
+    pending_call_ids: Vec<u32>,
     driver_settled_call_ids: Vec<u32>,
     maximum_active: usize,
     resume_futures_calls: usize,
@@ -592,6 +1010,7 @@ impl BatchTestGate {
                 active_call_ids: BTreeSet::new(),
                 started_call_ids: Vec::new(),
                 released_call_ids: BTreeSet::new(),
+                pending_call_ids: Vec::new(),
                 driver_settled_call_ids: Vec::new(),
                 maximum_active: 0,
                 resume_futures_calls: 0,
@@ -617,6 +1036,14 @@ impl BatchTestGate {
             .lock()
             .expect("test gate mutex is not poisoned")
             .driver_settled_call_ids
+            .clone()
+    }
+
+    pub(crate) fn pending_call_ids(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .pending_call_ids
             .clone()
     }
 
@@ -659,6 +1086,13 @@ impl BatchTestGate {
             .released_call_ids
             .insert(call_id);
         self.changed.notify_waiters();
+    }
+
+    fn note_pending_call_ids(&self, call_ids: &[u32]) {
+        self.state
+            .lock()
+            .expect("test gate mutex is not poisoned")
+            .pending_call_ids = call_ids.to_vec();
     }
 
     fn note_driver_settled(&self, call_id: u32) {
@@ -743,62 +1177,220 @@ async fn take_permit(semaphore: &Arc<Semaphore>) {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WritePause {
+    InitialRead,
+    BeforePublish,
+    BeforeRecheck,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct ListDirTestGate {
-    state: Arc<(Mutex<ListDirTestGateState>, Condvar)>,
+pub(crate) struct WriteTestHook {
+    state: Arc<(Mutex<WriteTestState>, Condvar)>,
 }
 
 #[cfg(test)]
-struct ListDirTestGateState {
-    started: bool,
-    allowed: bool,
+struct WriteTestState {
+    temporary_suffixes: VecDeque<[u8; 16]>,
+    fail_entropy: bool,
+    fail_write: bool,
+    fail_publish: bool,
+    force_hard_link_fallback: bool,
+    pause: Option<WritePause>,
+    paused: bool,
+    resumed: bool,
 }
 
 #[cfg(test)]
-impl ListDirTestGate {
-    pub(crate) fn new() -> Self {
+impl WriteTestHook {
+    fn new() -> Self {
         Self {
             state: Arc::new((
-                Mutex::new(ListDirTestGateState {
-                    started: false,
-                    allowed: false,
+                Mutex::new(WriteTestState {
+                    temporary_suffixes: VecDeque::new(),
+                    fail_entropy: false,
+                    fail_write: false,
+                    fail_publish: false,
+                    force_hard_link_fallback: false,
+                    pause: None,
+                    paused: false,
+                    resumed: false,
                 }),
                 Condvar::new(),
             )),
         }
     }
 
-    pub(crate) async fn wait_until_list_dir_started(&self) {
+    fn with_temp_suffixes(suffixes: impl IntoIterator<Item = [u8; 16]>) -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .temporary_suffixes = suffixes.into_iter().collect();
+        hook
+    }
+
+    fn fail_entropy() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_entropy = true;
+        hook
+    }
+
+    fn fail_write() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_write = true;
+        hook
+    }
+
+    fn fail_publish() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_publish = true;
+        hook
+    }
+
+    fn force_hard_link_fallback() -> Self {
+        let hook = Self::new();
+        hook.set_hard_link_fallback();
+        hook
+    }
+
+    fn set_fail_write(&self) {
+        self.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_write = true;
+    }
+
+    fn set_hard_link_fallback(&self) {
+        self.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .force_hard_link_fallback = true;
+    }
+
+    fn pause_before_initial_read() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .pause = Some(WritePause::InitialRead);
+        hook
+    }
+
+    fn pause_before_publish() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .pause = Some(WritePause::BeforePublish);
+        hook
+    }
+
+    pub(crate) fn pause_before_recheck() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .pause = Some(WritePause::BeforeRecheck);
+        hook
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
         let state = Arc::clone(&self.state);
         tokio::task::spawn_blocking(move || {
             let (lock, changed) = &*state;
-            let mut state = lock.lock().expect("test gate mutex is not poisoned");
-            while !state.started {
+            let mut state = lock.lock().expect("test hook mutex is not poisoned");
+            while !state.paused {
                 state = changed
                     .wait(state)
-                    .expect("test gate mutex is not poisoned");
+                    .expect("test hook mutex is not poisoned");
             }
         })
         .await
-        .expect("test gate waiter completes");
+        .expect("test hook waiter completes");
     }
 
-    pub(crate) fn resume_list_dir(&self) {
+    pub(crate) fn resume(&self) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("test gate mutex is not poisoned");
-        state.allowed = true;
+        let mut state = lock.lock().expect("test hook mutex is not poisoned");
+        state.resumed = true;
         changed.notify_all();
     }
 
-    fn wait_before_list_dir(&self) {
+    fn temporary_name(suffix: [u8; 16]) -> PathBuf {
+        temporary_name(suffix)
+    }
+
+    fn next_temporary_suffix(&self) -> Result<Option<[u8; 16]>, ToolError> {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned");
+        if state.fail_entropy {
+            return Err(ToolError::new(
+                ToolErrorKind::Os,
+                "temporary file creation failed",
+            ));
+        }
+        Ok(state.temporary_suffixes.pop_front())
+    }
+
+    fn fail_writing(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_write
+    }
+
+    fn fail_publishing(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .fail_publish
+    }
+
+    fn use_hard_link_fallback(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .force_hard_link_fallback
+    }
+
+    fn pause(&self, pause: WritePause) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("test gate mutex is not poisoned");
-        state.started = true;
+        let mut state = lock.lock().expect("test hook mutex is not poisoned");
+        if state.pause != Some(pause) {
+            return;
+        }
+        state.paused = true;
         changed.notify_all();
-        while !state.allowed {
+        while !state.resumed {
             state = changed
                 .wait(state)
-                .expect("test gate mutex is not poisoned");
+                .expect("test hook mutex is not poisoned");
         }
     }
 }
@@ -867,12 +1459,22 @@ impl ToolHost {
             workspace,
             limits,
             #[cfg(test)]
+            write_test_hook: None,
+            #[cfg(test)]
             test_gate: None,
+            #[cfg(test)]
+            blocking_read_test_gate: None,
             #[cfg(test)]
             list_dir_test_gate: None,
             #[cfg(test)]
             batch_test_gate: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_write_test_hook(mut self, write_test_hook: WriteTestHook) -> Self {
+        self.write_test_hook = Some(write_test_hook);
+        self
     }
 
     #[cfg(test)]
@@ -882,7 +1484,16 @@ impl ToolHost {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_list_dir_test_gate(mut self, list_dir_test_gate: ListDirTestGate) -> Self {
+    pub(crate) fn with_blocking_read_test_gate(
+        mut self,
+        blocking_read_test_gate: BlockingTestGate,
+    ) -> Self {
+        self.blocking_read_test_gate = Some(blocking_read_test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_list_dir_test_gate(mut self, list_dir_test_gate: BlockingTestGate) -> Self {
         self.list_dir_test_gate = Some(list_dir_test_gate);
         self
     }
@@ -893,7 +1504,27 @@ impl ToolHost {
         self
     }
 
-    pub(crate) async fn call(&self, call: ToolCall) -> ToolResult {
+    pub(crate) fn dispatch_batch(
+        &self,
+        calls: Vec<ToolCall>,
+        authorisations: WholeFileAuthorisations,
+    ) -> impl Stream<Item = ToolResult> + '_ {
+        stream::unfold(
+            BatchDispatch::new(self, calls, authorisations),
+            |dispatch| async move { dispatch.next().await },
+        )
+    }
+
+    #[cfg(test)]
+    async fn call(&self, call: ToolCall) -> ToolResult {
+        self.call_with_authorisation(call, None).await
+    }
+
+    async fn call_with_authorisation(
+        &self,
+        call: ToolCall,
+        authorisation: Option<ContentFingerprint>,
+    ) -> ToolResult {
         let ToolCall {
             call_id,
             tool,
@@ -910,14 +1541,150 @@ impl ToolHost {
         }
         let result = match tool {
             ToolName::Read => self.read(arguments).await,
+            ToolName::Write => self.write(arguments, authorisation).await,
+            ToolName::Edit => self.edit(arguments).await,
             ToolName::ListDir => self.list_dir(arguments).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
         };
-        ToolResult { call_id, result }
+        match result {
+            Ok(ToolOutput { result, effect }) => ToolResult {
+                call_id,
+                result: Ok(result),
+                effect,
+            },
+            Err(error) => ToolResult {
+                call_id,
+                result: Err(error),
+                effect: None,
+            },
+        }
     }
 
-    async fn read(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    #[cfg(test)]
+    async fn write_file(
+        &self,
+        path: &str,
+        content: String,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<WholeFileWrite, ToolError> {
+        self.write_file_at(normalise_path(path)?, content, authorisation)
+            .await
+    }
+
+    async fn write_file_at(
+        &self,
+        path: PathBuf,
+        content: String,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<WholeFileWrite, ToolError> {
+        if content.len() > self.limits.max_file_bytes {
+            return Err(ToolError::value(format!(
+                "file exceeds the {}-byte limit",
+                self.limits.max_file_bytes
+            )));
+        }
+        let workspace = Arc::clone(&self.workspace);
+        let max_file_bytes = self.limits.max_file_bytes;
+        #[cfg(test)]
+        let write_test_hook = self.write_test_hook.clone();
+        tokio::task::spawn_blocking(move || {
+            write_whole_file(
+                &workspace,
+                &path,
+                &content,
+                authorisation,
+                max_file_bytes,
+                #[cfg(test)]
+                write_test_hook.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+    }
+
+    #[cfg(test)]
+    async fn edit_file(
+        &self,
+        path: &str,
+        old: String,
+        new: String,
+    ) -> Result<WholeFileEdit, ToolError> {
+        self.edit_file_at(normalise_path(path)?, old, new).await
+    }
+
+    async fn edit_file_at(
+        &self,
+        path: PathBuf,
+        old: String,
+        new: String,
+    ) -> Result<WholeFileEdit, ToolError> {
+        if old.is_empty() {
+            return Err(ToolError::value("edit target cannot be empty"));
+        }
+        if old == new {
+            return Err(ToolError::value(
+                "edit replacement must differ from its target",
+            ));
+        }
+        let workspace = Arc::clone(&self.workspace);
+        let max_file_bytes = self.limits.max_file_bytes;
+        #[cfg(test)]
+        let write_test_hook = self.write_test_hook.clone();
+        tokio::task::spawn_blocking(move || {
+            edit_whole_file(
+                &workspace,
+                &path,
+                &old,
+                &new,
+                max_file_bytes,
+                #[cfg(test)]
+                write_test_hook.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+    }
+
+    async fn write(
+        &self,
+        arguments: ToolValue,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<ToolOutput, ToolError> {
+        let (path, content) = write_arguments(arguments)?;
+        let effect_path = path.clone();
+        let WholeFileWrite {
+            outcome,
+            fingerprint,
+        } = self.write_file_at(path, content, authorisation).await?;
+        Ok(ToolOutput {
+            result: ToolValue::None,
+            effect: Some(ToolEffect::Write {
+                path: effect_path,
+                outcome,
+                fingerprint,
+            }),
+        })
+    }
+
+    async fn edit(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+        let (path, old, new) = edit_arguments(arguments)?;
+        let effect_path = path.clone();
+        let WholeFileEdit {
+            pre_fingerprint,
+            post_fingerprint,
+        } = self.edit_file_at(path, old, new).await?;
+        Ok(ToolOutput {
+            result: ToolValue::None,
+            effect: Some(ToolEffect::Edit {
+                path: effect_path,
+                pre_fingerprint,
+                post_fingerprint,
+            }),
+        })
+    }
+
+    async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let path = read_path(arguments)?;
         #[cfg(test)]
         if let Some(test_gate) = &self.test_gate {
@@ -926,13 +1693,33 @@ impl ToolHost {
 
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
-        tokio::task::spawn_blocking(move || read_file(&workspace, &path, limits.max_file_bytes))
-            .await
-            .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
-            .map(ToolValue::String)
+        let effect_path = path.clone();
+        #[cfg(test)]
+        let blocking_read_test_gate = self.blocking_read_test_gate.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(test_gate) = &blocking_read_test_gate {
+                test_gate.wait_inside();
+            }
+            let read = read_file(&workspace, &path, limits.max_file_bytes);
+            #[cfg(test)]
+            if let Some(test_gate) = &blocking_read_test_gate {
+                test_gate.note_finished();
+            }
+            read
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
+        Ok(ToolOutput {
+            result: ToolValue::String(read.contents),
+            effect: Some(ToolEffect::Read {
+                path: effect_path,
+                fingerprint: read.fingerprint,
+            }),
+        })
     }
 
-    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let path = list_dir_path(arguments)?;
         let workspace = Arc::clone(&self.workspace);
         let limits = self.limits;
@@ -941,16 +1728,17 @@ impl ToolHost {
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(test_gate) = test_gate {
-                test_gate.wait_before_list_dir();
+                test_gate.wait_inside();
             }
             list_directory(&workspace, &path, limits)
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
+        .map(ToolOutput::without_effect)
     }
 
-    async fn glob(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let (pattern, path) = glob_arguments(arguments)?;
         let matcher = compile_glob(&pattern)?;
         let workspace = Arc::clone(&self.workspace);
@@ -959,9 +1747,10 @@ impl ToolHost {
             .await
             .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
             .map(ToolValue::List)
+            .map(ToolOutput::without_effect)
     }
 
-    async fn grep(&self, arguments: ToolValue) -> Result<ToolValue, ToolError> {
+    async fn grep(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
         let (pattern, path, file_glob) = grep_arguments(arguments)?;
         let matcher = compile_regex(&pattern)?;
         let file_glob = match file_glob {
@@ -976,6 +1765,14 @@ impl ToolHost {
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
+        .map(ToolOutput::without_effect)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_batch_driver_pending_call_ids(&self, call_ids: &[u32]) {
+        if let Some(batch_test_gate) = &self.batch_test_gate {
+            batch_test_gate.note_pending_call_ids(call_ids);
+        }
     }
 
     #[cfg(test)]
@@ -997,6 +1794,67 @@ impl ToolHost {
         if let Some(test_gate) = &self.test_gate {
             test_gate.wait_after_read_settled().await;
         }
+    }
+}
+
+fn write_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    let [ToolValue::String(path), ToolValue::String(_)] = arguments.as_slice() else {
+        return None;
+    };
+    normalise_path(path).ok()
+}
+
+fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    let [
+        ToolValue::String(path),
+        ToolValue::String(_),
+        ToolValue::String(_),
+    ] = arguments.as_slice()
+    else {
+        return None;
+    };
+    normalise_path(path).ok()
+}
+
+fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "write() expects two positional string arguments",
+        ));
+    };
+    match <[ToolValue; 2]>::try_from(arguments) {
+        Ok([ToolValue::String(path), ToolValue::String(content)]) => {
+            Ok((normalise_path(&path)?, content))
+        }
+        _ => Err(ToolError::type_error(
+            "write() expects two positional string arguments",
+        )),
+    }
+}
+
+fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "edit() expects three positional string arguments",
+        ));
+    };
+    match <[ToolValue; 3]>::try_from(arguments) {
+        Ok(
+            [
+                ToolValue::String(path),
+                ToolValue::String(old),
+                ToolValue::String(new),
+            ],
+        ) => Ok((normalise_path(&path)?, old, new)),
+        _ => Err(ToolError::type_error(
+            "edit() expects three positional string arguments",
+        )),
     }
 }
 
@@ -1097,16 +1955,15 @@ fn normalise_path(path: &str) -> Result<PathBuf, ToolError> {
     Ok(normalised)
 }
 
-fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, ToolError> {
+struct ReadFile {
+    contents: String,
+    fingerprint: ContentFingerprint,
+}
+
+fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<ReadFile, ToolError> {
     let (parent, file_name) = open_parent(workspace, path)?;
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
+    let mut file = open_content_no_follow(&parent, &file_name)?;
+    let metadata = file.metadata().map_err(ToolError::from_io)?;
     if metadata.is_dir() {
         return Err(ToolError::new(
             ToolErrorKind::IsADirectory,
@@ -1116,20 +1973,15 @@ fn read_file(workspace: &Dir, path: &Path, max_bytes: usize) -> Result<String, T
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
-    if metadata.len() > max_bytes as u64 {
-        return Err(ToolError::value(format!(
-            "file exceeds the {max_bytes}-byte limit"
-        )));
-    }
 
-    let mut file = open_file_no_follow(&parent, &file_name)?;
-    let metadata = file.metadata().map_err(ToolError::from_io)?;
-    if !metadata.is_file() {
-        return Err(ToolError::value("path is not a regular file"));
-    }
-
-    String::from_utf8(read_limited(&mut file, max_bytes)?)
-        .map_err(|_| ToolError::value("file is not valid UTF-8"))
+    let contents = read_limited(&mut file, max_bytes)?;
+    let fingerprint = content_fingerprint(&contents);
+    let contents =
+        String::from_utf8(contents).map_err(|_| ToolError::value("file is not valid UTF-8"))?;
+    Ok(ReadFile {
+        contents,
+        fingerprint,
+    })
 }
 
 fn list_directory(
@@ -1150,21 +2002,7 @@ fn list_directory(
         let metadata = directory
             .symlink_metadata(&file_name)
             .map_err(ToolError::from_io)?;
-        let (kind, size_bytes) = if metadata.file_type().is_symlink() {
-            ("symlink", None)
-        } else if metadata.is_file() {
-            (
-                "file",
-                Some(
-                    i64::try_from(metadata.len())
-                        .map_err(|_| ToolError::new(ToolErrorKind::Os, "file size is too large"))?,
-                ),
-            )
-        } else if metadata.is_dir() {
-            ("directory", None)
-        } else {
-            ("other", None)
-        };
+        let (kind, size_bytes) = entry_kind(&metadata)?;
         let path = if base_path.is_empty() {
             name.to_owned()
         } else {
@@ -1191,14 +2029,7 @@ fn list_directory(
                     limits.max_collection_payload_bytes
                 )));
             }
-            Ok(ToolValue::Dictionary(BTreeMap::from([
-                ("path".to_owned(), ToolValue::String(path)),
-                ("kind".to_owned(), ToolValue::String(kind.to_owned())),
-                (
-                    "size_bytes".to_owned(),
-                    size_bytes.map_or(ToolValue::None, ToolValue::Integer),
-                ),
-            ])))
+            Ok(directory_entry_value(path, kind, size_bytes))
         })
         .collect()
 }
@@ -1237,16 +2068,22 @@ struct SearchDirectory {
 fn root_ignore_context(
     workspace: &Dir,
     root: &Path,
+    root_directory: &Dir,
 ) -> Result<(PathBuf, Vec<IgnoreMatchers>), ToolError> {
     let mut ignore_directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    let mut components = root.components().peekable();
     let mut root_path = PathBuf::new();
     let mut ignores = vec![directory_ignore_matchers(&ignore_directory, &root_path)?];
-    for component in root.components() {
+    while let Some(component) = components.next() {
         let Component::Normal(component) = component else {
             unreachable!("search roots are normalised before traversal");
         };
-        ignore_directory = open_directory_no_follow(&ignore_directory, Path::new(component))?;
         root_path.push(component);
+        ignore_directory = if components.peek().is_some() {
+            open_directory_no_follow(&ignore_directory, Path::new(component))?
+        } else {
+            root_directory.try_clone().map_err(ToolError::from_io)?
+        };
         ignores.push(directory_ignore_matchers(&ignore_directory, &root_path)?);
     }
     Ok((root_path, ignores))
@@ -1260,7 +2097,7 @@ fn glob_directory(
 ) -> Result<Vec<ToolValue>, ToolError> {
     let (matcher, basename_only) = matcher;
     let root_directory = open_directory_root(workspace, root)?;
-    let (root_path, ignores) = root_ignore_context(workspace, root)?;
+    let (root_path, ignores) = root_ignore_context(workspace, root, &root_directory)?;
 
     let mut directories = vec![SearchDirectory {
         directory: root_directory,
@@ -1488,29 +2325,34 @@ fn grep_workspace(
     }
 
     let (parent, file_name) = open_parent(workspace, root)?;
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
+    let name = file_name
+        .to_str()
+        .expect("normalised paths originate from UTF-8 tool arguments");
+    let file_matches = matches_glob(&file_glob.0, file_glob.1, name, Path::new(name));
+    if !file_matches && is_regular_no_follow(&parent, &file_name)? {
+        return Ok(Vec::new());
     }
+
+    let file = open_content_no_follow(&parent, &file_name)?;
+    let metadata = file.metadata().map_err(ToolError::from_io)?;
     if metadata.is_dir() {
-        return grep_directory(workspace, root, &matcher, &file_glob, limits);
+        return grep_open_directory(
+            workspace,
+            root,
+            Dir::from_std_file(file.into_std()),
+            &matcher,
+            &file_glob,
+            limits,
+        );
     }
     if !metadata.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
 
-    let name = file_name
-        .to_str()
-        .expect("normalised paths originate from UTF-8 tool arguments");
-    if !matches_glob(&file_glob.0, file_glob.1, name, Path::new(name)) {
+    if !file_matches {
         return Ok(Vec::new());
     }
-    let path = normalised_path_string(root);
-    grep_regular_file(&parent, &file_name, path, &matcher, limits, 0, 0)
+    grep_open_file(file, normalised_path_string(root), &matcher, limits, 0, 0)
         .map_err(grep_explicit_error)
         .map(grep_values)
 }
@@ -1523,7 +2365,18 @@ fn grep_directory(
     limits: ToolLimits,
 ) -> Result<Vec<ToolValue>, ToolError> {
     let root_directory = open_directory_root(workspace, root)?;
-    let (root_path, ignores) = root_ignore_context(workspace, root)?;
+    grep_open_directory(workspace, root, root_directory, matcher, file_glob, limits)
+}
+
+fn grep_open_directory(
+    workspace: &Dir,
+    root: &Path,
+    root_directory: Dir,
+    matcher: &RegexMatcher,
+    file_glob: &(GlobMatcher, bool),
+    limits: ToolLimits,
+) -> Result<Vec<ToolValue>, ToolError> {
+    let (root_path, ignores) = root_ignore_context(workspace, root, &root_directory)?;
 
     let mut directories = vec![SearchDirectory {
         directory: root_directory,
@@ -1601,7 +2454,25 @@ fn grep_regular_file(
     existing_items: usize,
     existing_payload_bytes: usize,
 ) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
-    let mut file = open_file_no_follow(parent, name).map_err(GrepFileFailure::Tool)?;
+    let file = open_content_no_follow(parent, name).map_err(GrepFileFailure::Tool)?;
+    grep_open_file(
+        file,
+        path,
+        matcher,
+        limits,
+        existing_items,
+        existing_payload_bytes,
+    )
+}
+
+fn grep_open_file(
+    mut file: File,
+    path: String,
+    matcher: &RegexMatcher,
+    limits: ToolLimits,
+    existing_items: usize,
+    existing_payload_bytes: usize,
+) -> Result<Vec<GrepMatchValue>, GrepFileFailure> {
     if !file
         .metadata()
         .map_err(ToolError::from_io)
@@ -1759,16 +2630,15 @@ fn directory_ignore_matcher(
 }
 
 fn read_ignore_file(directory: &Dir, name: &Path) -> Result<Option<Vec<u8>>, ToolError> {
-    let metadata = match directory.symlink_metadata(name) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ToolError::from_io(error)),
+    let mut file = match open_content_no_follow(directory, name) {
+        Ok(file) => file,
+        Err(error) if error.kind == ToolErrorKind::FileNotFound => return Ok(None),
+        Err(error) if error.kind == ToolErrorKind::Value => return Ok(None),
+        Err(error) if error.kind == ToolErrorKind::Permission && is_symlink(directory, name)? => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Ok(None);
-    }
-
-    let mut file = open_file_no_follow(directory, name)?;
     if !file.metadata().map_err(ToolError::from_io)?.is_file() {
         return Ok(None);
     }
@@ -1822,20 +2692,6 @@ fn open_directory_root(workspace: &Dir, path: &Path) -> Result<Dir, ToolError> {
     if path.as_os_str().is_empty() {
         return Ok(parent);
     }
-    let metadata = parent
-        .symlink_metadata(&file_name)
-        .map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(ToolError::new(
-            ToolErrorKind::NotADirectory,
-            "path is not a directory",
-        ));
-    }
     open_directory_no_follow(&parent, &file_name)
 }
 
@@ -1859,44 +2715,102 @@ fn open_parent(workspace: &Dir, path: &Path) -> Result<(Dir, PathBuf), ToolError
 }
 
 #[cfg(unix)]
-fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    parent.open_with(name, &options).map_err(no_follow_io)
+fn open_content_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(|descriptor| File::from_std(std::fs::File::from(descriptor)))
+    .map_err(|error| content_open_error(parent, name, error))
 }
 
 #[cfg(not(unix))]
-fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
+fn open_content_no_follow(parent: &Dir, name: &Path) -> Result<File, ToolError> {
     parent.open(name).map_err(ToolError::from_io)
 }
 
 #[cfg(unix)]
 fn open_directory_no_follow(parent: &Dir, name: &Path) -> Result<Dir, ToolError> {
-    let metadata = parent.symlink_metadata(name).map_err(ToolError::from_io)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ToolError::permission(
-            "workspace paths cannot traverse symbolic links",
-        ));
-    }
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(|descriptor| Dir::from_std_file(std::fs::File::from(descriptor)))
+    .map_err(|error| directory_open_error(parent, name, error))
+}
 
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    parent
-        .open_with(name, &options)
-        .map(|file| Dir::from_std_file(file.into_std()))
+#[cfg(unix)]
+fn directory_open_error(parent: &Dir, name: &Path, error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    let io_error = std::io::Error::from(error);
+    if io_error.kind() != std::io::ErrorKind::PermissionDenied
+        && matches!(
+            statat(parent, name, AtFlags::SYMLINK_NOFOLLOW),
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink()
+        )
+    {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    ToolError::from_io(io_error)
+}
+
+#[cfg(unix)]
+fn content_open_error(parent: &Dir, name: &Path, error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
+        return ToolError::permission("workspace paths cannot traverse symbolic links");
+    }
+    let io_error = std::io::Error::from(error);
+    if matches!(
+        io_error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::PermissionDenied
+    ) {
+        return ToolError::from_io(io_error);
+    }
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let file_type = FileType::from_raw_mode(stat.st_mode);
+            if file_type.is_symlink() {
+                ToolError::permission("workspace paths cannot traverse symbolic links")
+            } else if file_type.is_dir() {
+                ToolError::new(ToolErrorKind::IsADirectory, "path is a directory")
+            } else if !file_type.is_file() {
+                ToolError::value("path is not a regular file")
+            } else {
+                ToolError::from_io(io_error)
+            }
+        }
+        Err(_) => ToolError::from_io(io_error),
+    }
+}
+
+#[cfg(unix)]
+fn is_regular_no_follow(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
         .map_err(no_follow_io)
 }
 
 #[cfg(unix)]
-fn no_follow_io(error: std::io::Error) -> ToolError {
-    if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) {
+fn is_symlink(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink())
+        .map_err(no_follow_io)
+}
+
+#[cfg(unix)]
+fn no_follow_io(error: Errno) -> ToolError {
+    if matches!(error, Errno::LOOP | Errno::MLINK) {
         return ToolError::permission("workspace paths cannot traverse symbolic links");
     }
-    ToolError::from_io(error)
+    ToolError::from_io(error.into())
 }
 
 #[cfg(not(unix))]
@@ -1908,6 +2822,22 @@ fn open_directory_no_follow(parent: &Dir, name: &Path) -> Result<Dir, ToolError>
         ));
     }
     parent.open_dir(name).map_err(ToolError::from_io)
+}
+
+#[cfg(not(unix))]
+fn is_regular_no_follow(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    parent
+        .symlink_metadata(name)
+        .map(|metadata| metadata.is_file())
+        .map_err(ToolError::from_io)
+}
+
+#[cfg(not(unix))]
+fn is_symlink(parent: &Dir, name: &Path) -> Result<bool, ToolError> {
+    parent
+        .symlink_metadata(name)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .map_err(ToolError::from_io)
 }
 
 fn read_limited(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
@@ -1923,26 +2853,521 @@ fn read_limited(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, ToolError>
     Ok(contents)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const TEMPORARY_NAME_ATTEMPTS: usize = 16;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum WriteTarget {
+    Missing,
+    Regular,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct CurrentRegularFile {
+    contents: Vec<u8>,
+    fingerprint: ContentFingerprint,
+    mode: Mode,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct UnpublishedTemporary<'a> {
+    parent: &'a Dir,
+    name: PathBuf,
+    published: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> UnpublishedTemporary<'a> {
+    fn new(parent: &'a Dir, name: PathBuf) -> Self {
+        Self {
+            parent,
+            name,
+            published: false,
+        }
+    }
+
+    fn publish(&mut self) {
+        self.published = true;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for UnpublishedTemporary<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = unlinkat(self.parent, &self.name, AtFlags::empty());
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_whole_file(
+    workspace: &Dir,
+    path: &Path,
+    content: &str,
+    authorisation: Option<ContentFingerprint>,
+    max_file_bytes: usize,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileWrite, ToolError> {
+    let (parent, name) = open_parent_creating(workspace, path)?;
+    match write_target(&parent, &name)? {
+        WriteTarget::Missing => {
+            let (temporary, file) = create_temporary_file(
+                &parent,
+                #[cfg(test)]
+                test_hook,
+            )?;
+            let mut temporary_file = UnpublishedTemporary::new(&parent, temporary);
+            write_temporary_file(
+                file,
+                content,
+                None,
+                #[cfg(test)]
+                test_hook,
+            )?;
+            #[cfg(test)]
+            if let Some(test_hook) = test_hook {
+                test_hook.pause(WritePause::BeforePublish);
+                if test_hook.fail_publishing() {
+                    return Err(ToolError::new(
+                        ToolErrorKind::Os,
+                        "temporary file publication failed",
+                    ));
+                }
+            }
+            publish_new_file(
+                &parent,
+                &temporary_file.name,
+                &name,
+                #[cfg(test)]
+                test_hook,
+            )?;
+            temporary_file.publish();
+            Ok(WholeFileWrite {
+                outcome: WholeFileWriteOutcome::Created,
+                fingerprint: content_fingerprint(content.as_bytes()),
+            })
+        }
+        WriteTarget::Regular => {
+            let Some(authorisation) = authorisation else {
+                return Err(ToolError::runtime(
+                    "file contents are not authorised for replacement",
+                ));
+            };
+            #[cfg(test)]
+            if let Some(test_hook) = test_hook {
+                test_hook.pause(WritePause::InitialRead);
+            }
+            let initial = current_regular_file(&parent, &name, max_file_bytes)
+                .map_err(|_| ToolError::runtime("file changed during replacement"))?;
+            if initial.fingerprint != authorisation {
+                return Err(ToolError::runtime("file changed during replacement"));
+            }
+            replace_existing_file(
+                &parent,
+                &name,
+                content,
+                initial.fingerprint,
+                initial.mode,
+                max_file_bytes,
+                #[cfg(test)]
+                test_hook,
+            )?;
+            Ok(WholeFileWrite {
+                outcome: WholeFileWriteOutcome::Replaced,
+                fingerprint: content_fingerprint(content.as_bytes()),
+            })
+        }
+        WriteTarget::Directory => Err(ToolError::new(
+            ToolErrorKind::IsADirectory,
+            "path is a directory",
+        )),
+        WriteTarget::Symlink => Err(ToolError::permission(
+            "workspace paths cannot traverse symbolic links",
+        )),
+        WriteTarget::Other => Err(ToolError::value("path is not a regular file")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn write_whole_file(
+    _workspace: &Dir,
+    _path: &Path,
+    _content: &str,
+    _authorisation: Option<ContentFingerprint>,
+    _max_file_bytes: usize,
+    #[cfg(test)] _test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileWrite, ToolError> {
+    Err(ToolError::new(
+        ToolErrorKind::Os,
+        "workspace mutation is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn edit_whole_file(
+    workspace: &Dir,
+    path: &Path,
+    old: &str,
+    new: &str,
+    max_file_bytes: usize,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileEdit, ToolError> {
+    let (parent, name) = open_parent(workspace, path)?;
+    let CurrentRegularFile {
+        contents,
+        fingerprint: pre_fingerprint,
+        mode,
+    } = current_regular_file(&parent, &name, max_file_bytes)?;
+    let contents =
+        String::from_utf8(contents).map_err(|_| ToolError::value("file is not valid UTF-8"))?;
+    let Some(start) = contents.find(old) else {
+        return Err(ToolError::value("edit target does not occur exactly once"));
+    };
+    let next_search_start = start
+        + old
+            .chars()
+            .next()
+            .expect("edit target is non-empty")
+            .len_utf8();
+    if contents[next_search_start..].find(old).is_some() {
+        return Err(ToolError::value("edit target does not occur exactly once"));
+    }
+    let replacement_length = contents
+        .len()
+        .checked_sub(old.len())
+        .and_then(|length| length.checked_add(new.len()))
+        .ok_or_else(|| ToolError::value("edited file exceeds the byte limit"))?;
+    if replacement_length > max_file_bytes {
+        return Err(ToolError::value(format!(
+            "file exceeds the {max_file_bytes}-byte limit"
+        )));
+    }
+    let mut replacement = String::with_capacity(replacement_length);
+    replacement.push_str(&contents[..start]);
+    replacement.push_str(new);
+    replacement.push_str(&contents[start + old.len()..]);
+    let post_fingerprint = content_fingerprint(replacement.as_bytes());
+    replace_existing_file(
+        &parent,
+        &name,
+        &replacement,
+        pre_fingerprint,
+        mode,
+        max_file_bytes,
+        #[cfg(test)]
+        test_hook,
+    )?;
+    Ok(WholeFileEdit {
+        pre_fingerprint,
+        post_fingerprint,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn edit_whole_file(
+    _workspace: &Dir,
+    _path: &Path,
+    _old: &str,
+    _new: &str,
+    _max_file_bytes: usize,
+    #[cfg(test)] _test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileEdit, ToolError> {
+    Err(ToolError::new(
+        ToolErrorKind::Os,
+        "workspace mutation is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_parent_creating(workspace: &Dir, path: &Path) -> Result<(Dir, PathBuf), ToolError> {
+    let mut components = path.components().peekable();
+    let mut directory = workspace.try_clone().map_err(ToolError::from_io)?;
+    if components.peek().is_none() {
+        return Ok((directory, PathBuf::from(".")));
+    }
+    while let Some(component) = components.next() {
+        let Component::Normal(component) = component else {
+            unreachable!("paths are normalised before component traversal");
+        };
+        let component = PathBuf::from(component);
+        if components.peek().is_none() {
+            return Ok((directory, component));
+        }
+        directory = match open_directory_no_follow(&directory, &component) {
+            Ok(directory) => directory,
+            Err(error) if error.kind == ToolErrorKind::FileNotFound => {
+                match mkdirat(&directory, &component, Mode::from_raw_mode(0o777)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(no_follow_io(error)),
+                }
+                open_directory_no_follow(&directory, &component)?
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    unreachable!("normalised paths contain at least one component")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_target(parent: &Dir, name: &Path) -> Result<WriteTarget, ToolError> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let file_type = FileType::from_raw_mode(stat.st_mode);
+            if file_type.is_file() {
+                Ok(WriteTarget::Regular)
+            } else if file_type.is_dir() {
+                Ok(WriteTarget::Directory)
+            } else if file_type.is_symlink() {
+                Ok(WriteTarget::Symlink)
+            } else {
+                Ok(WriteTarget::Other)
+            }
+        }
+        Err(Errno::NOENT) => Ok(WriteTarget::Missing),
+        Err(error) => Err(no_follow_io(error)),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn current_regular_file(
+    parent: &Dir,
+    name: &Path,
+    max_file_bytes: usize,
+) -> Result<CurrentRegularFile, ToolError> {
+    let mut file = open_content_no_follow(parent, name)?;
+    let stat = fstat(&file).map_err(|error| ToolError::from_io(error.into()))?;
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_dir() {
+        return Err(ToolError::new(
+            ToolErrorKind::IsADirectory,
+            "path is a directory",
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(ToolError::value("path is not a regular file"));
+    }
+    let contents = read_limited(&mut file, max_file_bytes)?;
+    Ok(CurrentRegularFile {
+        fingerprint: content_fingerprint(&contents),
+        contents,
+        mode: Mode::from_raw_mode(stat.st_mode),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn replace_existing_file(
+    parent: &Dir,
+    name: &Path,
+    content: &str,
+    initial_fingerprint: ContentFingerprint,
+    replacement_mode: Mode,
+    max_file_bytes: usize,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<(), ToolError> {
+    let (temporary, file) = create_temporary_file(
+        parent,
+        #[cfg(test)]
+        test_hook,
+    )?;
+    let mut temporary_file = UnpublishedTemporary::new(parent, temporary);
+    write_temporary_file(
+        file,
+        content,
+        Some(replacement_mode),
+        #[cfg(test)]
+        test_hook,
+    )?;
+    #[cfg(test)]
+    if let Some(test_hook) = test_hook {
+        test_hook.pause(WritePause::BeforeRecheck);
+    }
+    let latest = current_regular_file(parent, name, max_file_bytes)
+        .map_err(|_| ToolError::runtime("file changed during replacement"))?;
+    if latest.fingerprint != initial_fingerprint {
+        return Err(ToolError::runtime("file changed during replacement"));
+    }
+    #[cfg(test)]
+    if test_hook.is_some_and(WriteTestHook::fail_publishing) {
+        return Err(ToolError::new(
+            ToolErrorKind::Os,
+            "temporary file publication failed",
+        ));
+    }
+    renameat(parent, &temporary_file.name, parent, name).map_err(replacement_rename_error)?;
+    temporary_file.publish();
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_temporary_file(
+    parent: &Dir,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<(PathBuf, File), ToolError> {
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+        let suffix = temporary_suffix(
+            #[cfg(test)]
+            test_hook,
+        )?;
+        let name = temporary_name(suffix);
+        match openat(
+            parent,
+            &name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        ) {
+            Ok(descriptor) => return Ok((name, File::from_std(std::fs::File::from(descriptor)))),
+            Err(Errno::EXIST) => continue,
+            Err(error) => return Err(ToolError::from_io(error.into())),
+        }
+    }
+    Err(ToolError::runtime(
+        "temporary file creation did not succeed",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn temporary_suffix(#[cfg(test)] test_hook: Option<&WriteTestHook>) -> Result<[u8; 16], ToolError> {
+    #[cfg(test)]
+    if let Some(test_hook) = test_hook
+        && let Some(suffix) = test_hook.next_temporary_suffix()?
+    {
+        return Ok(suffix);
+    }
+    let mut suffix = [0; 16];
+    getrandom::fill(&mut suffix)
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "temporary file creation failed"))?;
+    Ok(suffix)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn temporary_name(suffix: [u8; 16]) -> PathBuf {
+    let suffix = suffix
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    PathBuf::from(format!(".kiki-write-{suffix}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_temporary_file(
+    mut file: File,
+    content: &str,
+    replacement_mode: Option<Mode>,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<(), ToolError> {
+    #[cfg(test)]
+    if test_hook.is_some_and(WriteTestHook::fail_writing) {
+        return Err(ToolError::new(
+            ToolErrorKind::Os,
+            "temporary file write failed",
+        ));
+    }
+    file.write_all(content.as_bytes())
+        .map_err(ToolError::from_io)?;
+    file.flush().map_err(ToolError::from_io)?;
+    if let Some(mode) = replacement_mode {
+        fchmod(&file, mode).map_err(|error| ToolError::from_io(error.into()))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_new_file(
+    parent: &Dir,
+    temporary_name: &Path,
+    name: &Path,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<(), ToolError> {
+    #[cfg(test)]
+    if test_hook.is_some_and(WriteTestHook::use_hard_link_fallback) {
+        return publish_new_file_by_link(parent, temporary_name, name);
+    }
+    match renameat_with(parent, temporary_name, parent, name, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(error) if no_replace_is_unsupported(error) => {
+            publish_new_file_by_link(parent, temporary_name, name)
+        }
+        Err(error) => Err(no_replace_rename_error(error)),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn replacement_rename_error(error: Errno) -> ToolError {
+    if matches!(
+        error,
+        Errno::NOENT | Errno::ISDIR | Errno::NOTDIR | Errno::NOTEMPTY | Errno::EXIST
+    ) {
+        ToolError::runtime("file changed during replacement")
+    } else {
+        ToolError::from_io(error.into())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_rename_error(error: Errno) -> ToolError {
+    if matches!(
+        error,
+        Errno::NOENT | Errno::ISDIR | Errno::NOTDIR | Errno::NOTEMPTY | Errno::EXIST
+    ) {
+        ToolError::runtime("file changed during publication")
+    } else {
+        ToolError::from_io(error.into())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_is_unsupported(error: Errno) -> bool {
+    matches!(error, Errno::NOSYS | Errno::INVAL | Errno::NOTSUP)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_new_file_by_link(
+    parent: &Dir,
+    temporary_name: &Path,
+    name: &Path,
+) -> Result<(), ToolError> {
+    match linkat(parent, temporary_name, parent, name, AtFlags::empty()) {
+        Ok(()) => match unlinkat(parent, temporary_name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(error) => Err(ToolError::from_io(error.into())),
+        },
+        Err(Errno::NOENT) => Err(ToolError::runtime("file changed during publication")),
+        Err(Errno::EXIST) => Err(ToolError::runtime("file appeared before publication")),
+        Err(error) => Err(ToolError::from_io(error.into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    #[cfg(unix)]
+    use cap_std::{ambient_authority, fs::Dir};
     #[cfg(unix)]
     use std::ffi::CString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     use std::time::Duration;
 
+    use futures::StreamExt;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use rustix::io::Errno;
     use tempfile::TempDir;
 
     use crate::config::constants::FILE_MAX_BYTES;
 
     use super::{
-        ACTIVE_TOOLS, ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName, ToolValue,
-        Utf8ValidatingReader, bootstrap_source, prompt_reference,
+        ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolEffect, ToolError, ToolErrorKind, ToolHost,
+        ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
+        WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
+        normalise_path, open_content_no_follow, open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -2136,6 +3561,142 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn direct_content_open_refuses_symlinks_and_classifies_opened_descriptors() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "workspace").unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink("file", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        let mut file = open_content_no_follow(&workspace_dir, Path::new("file")).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "workspace");
+        assert!(file.metadata().unwrap().is_file());
+
+        let directory = open_content_no_follow(&workspace_dir, Path::new("directory")).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+
+        let fifo = open_content_no_follow(&workspace_dir, Path::new("fifo")).unwrap();
+        assert!(!fifo.metadata().unwrap().is_file());
+
+        for name in ["inside-link", "outside-link", "broken-link"] {
+            assert_eq!(
+                open_content_no_follow(&workspace_dir, Path::new(name))
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            open_content_no_follow(&workspace_dir, Path::new("missing"))
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::FileNotFound
+        );
+        assert_eq!(
+            open_content_no_follow(&workspace_dir, Path::new("socket"))
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Value
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_parent_open_refuses_intermediate_symlinks() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("inside")).unwrap();
+        fs::write(workspace.path().join("inside/file"), "workspace").unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        std::os::unix::fs::symlink("inside", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-link")).unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        for path in ["inside-link/file", "outside-link/outside"] {
+            assert_eq!(
+                open_parent(&workspace_dir, Path::new(path))
+                    .unwrap_err()
+                    .kind,
+                ToolErrorKind::Permission
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_open_stays_anchored_after_parent_rename_and_component_swaps() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let parent_path = workspace.path().join("parent");
+        fs::create_dir(&parent_path).unwrap();
+        fs::write(parent_path.join("file"), "workspace").unwrap();
+        fs::write(outside.path().join("file"), "outside").unwrap();
+        let workspace_dir = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
+
+        let (parent, file_name) = open_parent(&workspace_dir, Path::new("parent/file")).unwrap();
+        fs::rename(&parent_path, workspace.path().join("held")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent_path).unwrap();
+        let mut file = open_content_no_follow(&parent, &file_name).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "workspace");
+        fs::remove_file(&parent_path).unwrap();
+        fs::rename(workspace.path().join("held"), &parent_path).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let swapping_workspace = workspace.path().to_path_buf();
+        let swapping_outside = outside.path().to_path_buf();
+        let swapping_done = Arc::clone(&done);
+        let swaps = std::thread::spawn(move || {
+            let parent = swapping_workspace.join("parent");
+            let held = swapping_workspace.join("held");
+            for _ in 0..1_000 {
+                if fs::rename(&parent, &held).is_err() {
+                    continue;
+                }
+                std::os::unix::fs::symlink(&swapping_outside, &parent).unwrap();
+                std::thread::yield_now();
+                fs::remove_file(&parent).unwrap();
+                fs::rename(&held, &parent).unwrap();
+            }
+            swapping_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            let Ok((parent, file_name)) = open_parent(&workspace_dir, Path::new("parent/file"))
+            else {
+                continue;
+            };
+            let Ok(mut file) = open_content_no_follow(&parent, &file_name) else {
+                continue;
+            };
+            let mut contents = String::new();
+            file.read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, "workspace");
+        }
+        swaps.join().unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_dir_maps_direct_root_kinds_to_distinct_errors() {
         use std::os::unix::net::UnixListener;
@@ -2316,7 +3877,7 @@ mod tests {
     async fn blocked_list_dir_does_not_stop_a_read_future() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("file"), "contents").unwrap();
-        let gate = super::ListDirTestGate::new();
+        let gate = super::BlockingTestGate::new();
         let host = Arc::new(
             tool_host(&workspace)
                 .await
@@ -2325,7 +3886,7 @@ mod tests {
         let list_host = Arc::clone(&host);
         let mut listing = tokio::spawn(async move { list_dir(&list_host, Vec::new()).await });
 
-        gate.wait_until_list_dir_started().await;
+        gate.wait_until_started().await;
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(100), read(&host, "file"))
                 .await
@@ -2338,51 +3899,373 @@ mod tests {
                 .await
                 .is_err()
         );
-        gate.resume_list_dir();
+        gate.resume();
         assert_eq!(listing.await.unwrap().unwrap().len(), 1);
     }
 
+    fn batch_read(call_id: u32, path: impl Into<String>) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String(path.into())]),
+        }
+    }
+
+    fn batch_write(call_id: u32, path: impl Into<String>, content: impl Into<String>) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Write,
+            arguments: ToolValue::List(vec![
+                ToolValue::String(path.into()),
+                ToolValue::String(content.into()),
+            ]),
+        }
+    }
+
+    fn batch_edit(
+        call_id: u32,
+        path: impl Into<String>,
+        old: impl Into<String>,
+        new: impl Into<String>,
+    ) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Edit,
+            arguments: ToolValue::List(vec![
+                ToolValue::String(path.into()),
+                ToolValue::String(old.into()),
+                ToolValue::String(new.into()),
+            ]),
+        }
+    }
+
     #[tokio::test]
-    async fn batch_test_gate_tracks_independent_host_calls_per_host() {
+    async fn dispatch_batch_serialises_lexical_aliases_and_advances_freshness() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(
+            normalise_path("file").unwrap(),
+            content_fingerprint(b"first"),
+        );
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![
+                batch_write(1, "./file", "second"),
+                batch_edit(2, "file", "second", "third"),
+            ],
+            authorisations,
+        ));
+
+        let mut first = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut first => panic!("batch finished before the first mutation started: {result:?}"),
+        }
+        assert_eq!(gate.started_call_ids(), vec![1]);
+        gate.release(1);
+        assert_eq!(first.await.unwrap().result, Ok(ToolValue::None));
+        let mut second = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut second => panic!("batch finished before the second mutation started: {result:?}"),
+        }
+        assert_eq!(gate.started_call_ids(), vec![1, 2]);
+        gate.release(2);
+        assert_eq!(second.await.unwrap().result, Ok(ToolValue::None));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "third"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_same_path_mutations_leave_slots_for_independent_calls() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 3..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                std::iter::once(batch_write(1, "shared", "first"))
+                    .chain(std::iter::once(batch_write(2, "./shared", "second")))
+                    .chain((3..=17).map(|call_id| batch_read(call_id, format!("file-{call_id}"))))
+                    .collect(),
+                WholeFileAuthorisations::default(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before its active calls started: {result:?}"),
+        }
+        let started = gate.started_call_ids().into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(started.len(), 16);
+        assert!(started.contains(&1));
+        assert!(!started.contains(&2));
+        assert!((3..=17).all(|call_id| started.contains(&call_id)));
+        assert_eq!(gate.active_call_ids().len(), 16);
+        assert_eq!(gate.maximum_active(), 16);
+
+        drop(calls);
+        assert!(gate.active_call_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_same_path_mutations_settle_without_losing_later_freshness() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let host = tool_host(&workspace).await;
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(
+            normalise_path("file").unwrap(),
+            content_fingerprint(b"first"),
+        );
+
+        let results = host
+            .dispatch_batch(
+                vec![
+                    batch_write(1, "file", "second"),
+                    batch_edit(2, "./file", "missing", "third"),
+                    batch_write(3, "file", "fourth"),
+                ],
+                authorisations,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].result.is_ok());
+        assert!(matches!(
+            results[1].result,
+            Err(ref error) if error.kind == ToolErrorKind::Value
+        ));
+        assert!(results[2].result.is_ok());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "fourth"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_starts_different_path_mutations_together() {
+        let workspace = TempDir::new().unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![
+                batch_write(1, "first", "one"),
+                batch_write(2, "second", "two"),
+            ],
+            WholeFileAuthorisations::default(),
+        ));
+
+        let mut results = Box::pin(calls.as_mut().collect::<Vec<_>>());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut results => panic!("batch finished before both mutations started: {result:?}"),
+        }
+        assert_eq!(gate.active_call_ids().len(), 2);
+        gate.release(1);
+        gate.release(2);
+        assert!(
+            results
+                .await
+                .into_iter()
+                .all(|result| result.result == Ok(ToolValue::None))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_yields_completion_order_with_correlated_call_ids() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("first"), "first").unwrap();
         fs::write(workspace.path().join("second"), "second").unwrap();
         let gate = super::BatchTestGate::new();
-        let host = Arc::new(
-            tool_host(&workspace)
-                .await
-                .with_batch_test_gate(gate.clone()),
-        );
-        let first_host = Arc::clone(&host);
-        let first = tokio::spawn(async move {
-            first_host
-                .call(ToolCall {
-                    call_id: 1,
-                    tool: ToolName::Read,
-                    arguments: ToolValue::List(vec![ToolValue::String("first".to_owned())]),
-                })
-                .await
-        });
-        let second_host = Arc::clone(&host);
-        let second = tokio::spawn(async move {
-            second_host
-                .call(ToolCall {
-                    call_id: 2,
-                    tool: ToolName::Read,
-                    arguments: ToolValue::List(vec![ToolValue::String("second".to_owned())]),
-                })
-                .await
-        });
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![batch_read(1, "first"), batch_read(2, "second")],
+            WholeFileAuthorisations::default(),
+        ));
 
-        gate.wait_until_calls_started(2).await;
-        assert_eq!(gate.active_call_ids(), [1, 2]);
-        assert_eq!(gate.maximum_active(), 2);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = calls.next() => panic!("batch finished before both calls started: {result:?}"),
+        }
+        gate.release(2);
+        let second = calls.next().await.unwrap();
+        assert_eq!(second.call_id, 2);
+        assert_eq!(second.result, Ok(ToolValue::String("second".to_owned())));
+        gate.release(1);
+        let first = calls.next().await.unwrap();
+        assert_eq!(first.call_id, 1);
+        assert_eq!(first.result, Ok(ToolValue::String("first".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_limits_active_calls_and_admits_queued_calls() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 1..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                (1..=17)
+                    .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
+                    .collect(),
+                WholeFileAuthorisations::default(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before 16 calls started: {result:?}"),
+        }
+        assert_eq!(gate.active_call_ids().len(), 16);
+        assert_eq!(gate.maximum_active(), 16);
+
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("a batch call must have started");
+        gate.release(released_call);
+        assert_eq!(calls.next().await.unwrap().call_id, released_call);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = calls.next() => panic!("batch finished before the queued call started: {result:?}"),
+        }
+        assert_eq!(gate.maximum_active(), 16);
+
+        for call_id in gate.active_call_ids() {
+            gate.release(call_id);
+        }
+        let mut call_ids = calls.map(|result| result.call_id).collect::<Vec<_>>().await;
+        call_ids.push(released_call);
+        call_ids.sort_unstable();
+        assert_eq!(call_ids, (1..=17).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_settles_queued_siblings_after_an_ordinary_failure() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 2..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                std::iter::once(batch_read(1, "missing"))
+                    .chain((2..=17).map(|call_id| batch_read(call_id, format!("file-{call_id}"))))
+                    .collect(),
+                WholeFileAuthorisations::default(),
+            ),
+        );
+        let mut results = Box::pin(calls.as_mut().collect::<Vec<_>>());
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut results => panic!("batch finished before 16 calls started: {result:?}"),
+        }
         for call_id in gate.started_call_ids() {
             gate.release(call_id);
         }
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut results => panic!("batch finished before the queued sibling started: {result:?}"),
+        }
+        let queued_call = *gate
+            .started_call_ids()
+            .last()
+            .expect("queued sibling must have started");
+        gate.release(queued_call);
 
-        assert!(first.await.unwrap().result.is_ok());
-        assert!(second.await.unwrap().result.is_ok());
+        let results = results.await;
+        assert_eq!(results.len(), 17);
+        assert!(matches!(
+            results.iter().find(|result| result.call_id == 1),
+            Some(result) if result.result.is_err()
+        ));
+        assert!(
+            results
+                .iter()
+                .filter(|result| result.call_id != 1)
+                .all(|result| result.result.is_ok())
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partly_consumed_batch_drops_active_calls_and_leaves_calls_queued() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 1..=18 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                (1..=18)
+                    .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
+                    .collect(),
+                WholeFileAuthorisations::default(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before 16 calls started: {result:?}"),
+        }
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("a batch call must have started");
+        gate.release(released_call);
+        assert_eq!(calls.next().await.unwrap().call_id, released_call);
+        let mut next_result = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut next_result => panic!("batch finished before another call started: {result:?}"),
+        }
+        drop(next_result);
+        drop(calls);
+
+        assert!(gate.active_call_ids().is_empty());
+        assert_eq!(gate.started_call_ids(), (1..=17).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -2774,6 +4657,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_treats_linked_and_non_regular_ignore_files_as_absent() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("candidate.rs"), "").unwrap();
+        fs::write(workspace.path().join("nested/candidate.rs"), "").unwrap();
+        fs::write(outside.path().join("rules"), "*.rs\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("rules"),
+            workspace.path().join(".rgignore"),
+        )
+        .unwrap();
+        fs::create_dir(workspace.path().join(".ignore")).unwrap();
+        create_fifo(&workspace.path().join(".gitignore"));
+        let _socket = UnixListener::bind(workspace.path().join("nested/.rgignore")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), glob_path(&host, "*.rs", "."))
+                .await
+                .expect("ignore-file FIFOs must not block")
+                .unwrap(),
+            [
+                directory_entry("candidate.rs", "file", Some(0)),
+                directory_entry("nested/candidate.rs", "file", Some(0)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn glob_traverses_an_explicit_parent_ignored_root() {
         let workspace = TempDir::new().unwrap();
@@ -2920,13 +4836,13 @@ mod tests {
     }
 
     #[test]
-    fn grep_is_the_fourth_active_tool_with_match_evidence_labels() {
+    fn active_tools_are_in_the_phase_two_canonical_order() {
         assert_eq!(
             ACTIVE_TOOLS
                 .iter()
                 .map(|definition| definition.name.name())
                 .collect::<Vec<_>>(),
-            ["read", "list_dir", "glob", "grep"]
+            ["read", "write", "edit", "list_dir", "glob", "grep"]
         );
         assert_eq!(ToolName::Grep.count_label(1), "match");
         assert_eq!(ToolName::Grep.count_label(2), "matches");
@@ -3182,6 +5098,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn grep_does_not_open_a_regular_file_excluded_by_file_glob() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("excluded.txt");
+        fs::write(&path, "match\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert!(
+            grep_path(&host, "match", "excluded.txt", Some("*.rs"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn grep_skips_traversed_non_regular_binary_invalid_and_symlink_entries() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -3385,6 +5320,1128 @@ mod tests {
         );
     }
 
+    async fn write(
+        host: &ToolHost,
+        path: &str,
+        content: &str,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<WholeFileWrite, ToolErrorKind> {
+        host.write_file(path, content.to_owned(), authorisation)
+            .await
+            .map_err(|error| error.kind)
+    }
+
+    async fn write_error(
+        host: &ToolHost,
+        path: &str,
+        content: &str,
+        authorisation: Option<ContentFingerprint>,
+    ) -> ToolErrorKind {
+        match write(host, path, content, authorisation).await {
+            Ok(_) => panic!("write succeeded unexpectedly"),
+            Err(error) => error,
+        }
+    }
+
+    async fn edit(
+        host: &ToolHost,
+        path: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<WholeFileEdit, ToolErrorKind> {
+        host.edit_file(path, old.to_owned(), new.to_owned())
+            .await
+            .map_err(|error| error.kind)
+    }
+
+    async fn edit_error(host: &ToolHost, path: &str, old: &str, new: &str) -> ToolErrorKind {
+        match edit(host, path, old, new).await {
+            Ok(_) => panic!("edit succeeded unexpectedly"),
+            Err(error) => error,
+        }
+    }
+
+    fn fingerprint(contents: impl AsRef<[u8]>) -> ContentFingerprint {
+        content_fingerprint(contents.as_ref())
+    }
+
+    fn temporary_entries(directory: &Path) -> Vec<std::path::PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .starts_with(b".kiki-write-")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn content_fingerprints_are_canonical_blake3_digests() {
+        let expected = ContentFingerprint(*blake3::hash(b"kiki").as_bytes());
+        assert_eq!(std::mem::size_of::<ContentFingerprint>(), 32);
+        assert!(fingerprint("kiki") == expected);
+        assert!(fingerprint("kiki") != fingerprint("Kiki"));
+    }
+
+    #[test]
+    fn whole_file_authorisations_are_keyed_by_normalised_paths() {
+        let mut authorisations = WholeFileAuthorisations::default();
+        let path = normalise_path("nested//./file").unwrap();
+        let digest = fingerprint("contents");
+
+        authorisations.authorise(path.clone(), digest);
+        assert!(authorisations.authorisation(&path) == Some(digest));
+        authorisations.remove(&path);
+        assert!(authorisations.authorisation(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_return_model_values_and_normalised_fingerprint_effects() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("nested/file"), "contents").unwrap();
+        let host = tool_host(&workspace).await;
+
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String("./nested//file".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(result.result, Ok(ToolValue::String("contents".to_owned())));
+        let mut authorisations = WholeFileAuthorisations::default();
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        assert_eq!(
+            authorisations.authorisation(Path::new("nested/file")),
+            Some(fingerprint("contents"))
+        );
+        assert_eq!(authorisations.fingerprints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_reads_have_no_effect() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("invalid"), [0xff]).unwrap();
+        fs::write(workspace.path().join("oversized"), "12345").unwrap();
+        let host = tool_host_with_limits(&workspace, 4).await;
+        let mut authorisations = WholeFileAuthorisations::default();
+
+        for path in ["missing", "invalid", "oversized"] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 7,
+                    tool: ToolName::Read,
+                    arguments: ToolValue::List(vec![ToolValue::String(path.to_owned())]),
+                })
+                .await;
+            assert!(result.result.is_err());
+            assert!(result.effect.is_none());
+            result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        }
+
+        assert_eq!(authorisations, WholeFileAuthorisations::default());
+    }
+
+    #[test]
+    fn mutation_effects_update_or_invalidate_authorisations_in_pending_order() {
+        let path = normalise_path("file").unwrap();
+        let first = fingerprint("first");
+        let second = fingerprint("second");
+        let third = fingerprint("third");
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), first);
+        let edit = ToolResult {
+            call_id: 1,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Edit {
+                path: path.clone(),
+                pre_fingerprint: first,
+                post_fingerprint: second,
+            }),
+        };
+        edit.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), Some(second));
+        assert_eq!(edit.mutation_status(), Some(super::MutationStatus::Applied));
+
+        let write = ToolResult {
+            call_id: 2,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Write {
+                path: path.clone(),
+                outcome: super::WholeFileWriteOutcome::Replaced,
+                fingerprint: third,
+            }),
+        };
+        write.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), Some(third));
+        assert_eq!(
+            write.mutation_status(),
+            Some(super::MutationStatus::Replaced)
+        );
+
+        edit.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), None);
+    }
+
+    #[test]
+    fn same_batch_read_suppression_is_independent_of_settlement_order() {
+        let path = normalise_path("file").unwrap();
+        let read = ToolResult {
+            call_id: 1,
+            result: Ok(ToolValue::String("observed".to_owned())),
+            effect: Some(ToolEffect::Read {
+                path: path.clone(),
+                fingerprint: fingerprint("observed"),
+            }),
+        };
+        let mutation = ToolResult {
+            call_id: 2,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Write {
+                path: path.clone(),
+                outcome: super::WholeFileWriteOutcome::Replaced,
+                fingerprint: fingerprint("written"),
+            }),
+        };
+        let mutation_paths =
+            BTreeSet::from([batch_write(2, "./file", "written").mutation_path().unwrap()]);
+
+        for settled in [[&read, &mutation], [&mutation, &read]] {
+            let mut authorisations = WholeFileAuthorisations::default();
+            for result in settled {
+                result.apply_batch_transition(&mut authorisations, &mutation_paths);
+            }
+            assert_eq!(
+                authorisations.authorisation(&path),
+                Some(fingerprint("written"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_effects_apply_in_call_order() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        let path = workspace.path().join("nested/file");
+        fs::write(&path, "first").unwrap();
+        let host = tool_host(&workspace).await;
+        let first = host.call(ToolCall {
+            call_id: 1,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String("nested/file".to_owned())]),
+        });
+        let first = first.await;
+        fs::write(&path, "second").unwrap();
+        let second = host.call(ToolCall {
+            call_id: 2,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String("./nested//file".to_owned())]),
+        });
+        let second = second.await;
+
+        let mut ordered = WholeFileAuthorisations::default();
+        first.apply_batch_transition(&mut ordered, &BTreeSet::new());
+        second.apply_batch_transition(&mut ordered, &BTreeSet::new());
+        let mut expected = WholeFileAuthorisations::default();
+        second.apply_batch_transition(&mut expected, &BTreeSet::new());
+        let mut reversed = WholeFileAuthorisations::default();
+        second.apply_batch_transition(&mut reversed, &BTreeSet::new());
+        first.apply_batch_transition(&mut reversed, &BTreeSet::new());
+
+        assert_eq!(ordered, expected);
+        assert_ne!(ordered, reversed);
+    }
+
+    #[test]
+    fn authorisation_effect_and_result_debug_are_opaque() {
+        let path = PathBuf::from("distinctive/private-path");
+        let fingerprint = ContentFingerprint([42; 32]);
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), fingerprint);
+        let result = ToolResult {
+            call_id: 7,
+            result: Ok(ToolValue::String("visible".to_owned())),
+            effect: Some(ToolEffect::Read { path, fingerprint }),
+        };
+        let marker = "[42, 42";
+
+        for debug in [
+            format!("{authorisations:?}"),
+            format!("{:?}", result.effect.as_ref().unwrap()),
+            format!("{result:?}"),
+        ] {
+            assert!(!debug.contains("distinctive/private-path"));
+            assert!(!debug.contains(marker));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unsupported_no_replace_errors_choose_hard_link_fallback() {
+        assert!(
+            [Errno::NOSYS, Errno::INVAL, Errno::NOTSUP]
+                .into_iter()
+                .all(super::no_replace_is_unsupported)
+        );
+        assert!(
+            ![Errno::PERM, Errno::ACCESS, Errno::IO]
+                .into_iter()
+                .any(super::no_replace_is_unsupported)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn publication_rename_errors_map_freshness_conflicts_to_runtime() {
+        for errno in [
+            Errno::NOENT,
+            Errno::ISDIR,
+            Errno::NOTDIR,
+            Errno::NOTEMPTY,
+            Errno::EXIST,
+        ] {
+            let error = super::replacement_rename_error(errno);
+            assert_eq!(error.kind, ToolErrorKind::Runtime);
+            assert_eq!(error.to_string(), "file changed during replacement");
+        }
+        for errno in [
+            Errno::NOENT,
+            Errno::ISDIR,
+            Errno::NOTDIR,
+            Errno::NOTEMPTY,
+            Errno::EXIST,
+        ] {
+            let error = super::no_replace_rename_error(errno);
+            assert_eq!(error.kind, ToolErrorKind::Runtime);
+            assert_eq!(error.to_string(), "file changed during publication");
+        }
+        for classify in [
+            super::replacement_rename_error as fn(Errno) -> ToolError,
+            super::no_replace_rename_error,
+        ] {
+            for errno in [Errno::PERM, Errno::ACCESS] {
+                assert_eq!(classify(errno).kind, ToolErrorKind::Permission);
+            }
+            assert_eq!(classify(Errno::IO).kind, ToolErrorKind::Os);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_creates_root_and_nested_files_with_normalised_paths() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        let root = write(&host, "./root", "root", None).await.unwrap();
+        let nested = write(&host, "nested//./file", "nested", None)
+            .await
+            .unwrap();
+
+        assert!(root.outcome == super::WholeFileWriteOutcome::Created);
+        assert!(nested.outcome == super::WholeFileWriteOutcome::Created);
+        assert!(root.fingerprint == fingerprint("root"));
+        assert!(nested.fingerprint == fingerprint("nested"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("root")).unwrap(),
+            "root"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("nested/file")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_validates_paths_and_content_before_creating_parents() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host_with_limits(&workspace, 4).await;
+
+        for path in ["/outside", "../outside", "nested/../outside"] {
+            assert_eq!(
+                write_error(&host, path, "text", None).await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            write_error(&host, "missing/too-large", "12345", None).await,
+            ToolErrorKind::Value
+        );
+        assert!(!workspace.path().join("missing").exists());
+        assert!(
+            write(&host, "at-limit", "1234", None)
+                .await
+                .unwrap()
+                .outcome
+                == super::WholeFileWriteOutcome::Created
+        );
+    }
+
+    #[tokio::test]
+    async fn write_requires_current_authorisation_to_replace_regular_files() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            write_error(&host, "file", "after", None).await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            write_error(&host, "file", "after", Some(fingerprint("stale"))).await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before"
+        );
+
+        let outcome = write(&host, "file", "after", Some(fingerprint("before")))
+            .await
+            .unwrap();
+        assert!(outcome.outcome == super::WholeFileWriteOutcome::Replaced);
+        assert!(outcome.fingerprint == fingerprint("after"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_same_length_external_changes_and_binary_files_without_authorisation() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        fs::write(workspace.path().join("binary"), [0xff]).unwrap();
+        let host = tool_host(&workspace).await;
+
+        fs::write(workspace.path().join("file"), "other!").unwrap();
+        assert_eq!(
+            write_error(&host, "file", "after", Some(fingerprint("before"))).await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            write_error(&host, "binary", "after", None).await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "other!"
+        );
+        assert_eq!(fs::read(workspace.path().join("binary")).unwrap(), [0xff]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_classifies_terminal_and_intermediate_path_kinds_without_following_symlinks() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("regular"), "before").unwrap();
+        fs::write(outside.path().join("outside"), "outside").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("regular", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        std::os::unix::fs::symlink("directory", workspace.path().join("inside-parent")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-parent"))
+            .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-parent")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            write_error(&host, "directory", "x", None).await,
+            ToolErrorKind::IsADirectory
+        );
+        assert_eq!(
+            write_error(&host, "fifo", "x", None).await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            write_error(&host, "socket", "x", None).await,
+            ToolErrorKind::Value
+        );
+        for path in [
+            "inside-link",
+            "outside-link",
+            "broken-link",
+            "inside-parent/file",
+            "outside-parent/file",
+            "broken-parent/file",
+        ] {
+            assert_eq!(
+                write_error(&host, path, "x", None).await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            write_error(&host, "regular/child", "x", None).await,
+            ToolErrorKind::NotADirectory
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("outside")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_preserves_replacement_mode_and_uses_ordinary_new_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let replacement = workspace.path().join("replacement");
+        let reference = workspace.path().join("reference");
+        fs::write(&replacement, "before").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(&reference, "reference").unwrap();
+        let host = tool_host(&workspace).await;
+
+        write(&host, "replacement", "after", Some(fingerprint("before")))
+            .await
+            .unwrap();
+        write(&host, "new", "new", None).await.unwrap();
+
+        assert_eq!(
+            fs::metadata(replacement).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(workspace.path().join("new"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            fs::metadata(reference).unwrap().permissions().mode() & 0o777
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rechecks_before_replacement_and_never_clobbers_a_new_target() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("replace"), "before").unwrap();
+        let recheck_hook = WriteTestHook::pause_before_recheck();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(recheck_hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let replace = tokio::spawn(async move {
+            write(
+                &writing_host,
+                "replace",
+                "after",
+                Some(fingerprint("before")),
+            )
+            .await
+        });
+        recheck_hook.wait_until_paused().await;
+        fs::write(workspace.path().join("replace"), "other!").unwrap();
+        recheck_hook.resume();
+        assert!(matches!(
+            replace.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("replace")).unwrap(),
+            "other!"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let publish_hook = WriteTestHook::pause_before_publish();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(publish_hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let create =
+            tokio::spawn(async move { write(&writing_host, "new", "created", None).await });
+        publish_hook.wait_until_paused().await;
+        fs::write(workspace.path().join("new"), "appeared").unwrap();
+        publish_hook.resume();
+        assert!(matches!(create.await.unwrap(), Err(ToolErrorKind::Runtime)));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("new")).unwrap(),
+            "appeared"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let fallback_hook = WriteTestHook::pause_before_publish();
+        fallback_hook.set_hard_link_fallback();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(fallback_hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let create =
+            tokio::spawn(
+                async move { write(&writing_host, "fallback-new", "created", None).await },
+            );
+        fallback_hook.wait_until_paused().await;
+        fs::write(workspace.path().join("fallback-new"), "appeared").unwrap();
+        fallback_hook.resume();
+        assert!(matches!(create.await.unwrap(), Err(ToolErrorKind::Runtime)));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("fallback-new")).unwrap(),
+            "appeared"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_publishes_only_complete_old_or_new_file_contents() {
+        use std::sync::{Barrier, Mutex};
+
+        let workspace = TempDir::new().unwrap();
+        let old = "old".repeat(256 * 1024);
+        let new = "new".repeat(256 * 1024);
+        fs::write(workspace.path().join("file"), &old).unwrap();
+        let hook = WriteTestHook::pause_before_recheck();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let expected = fingerprint(&old);
+        let new_for_write = new.clone();
+        let write_task = tokio::spawn(async move {
+            write(&writing_host, "file", &new_for_write, Some(expected)).await
+        });
+        hook.wait_until_paused().await;
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let reader_observations = Arc::clone(&observations);
+        let old_observed = Arc::new(Barrier::new(2));
+        let new_observed = Arc::new(Barrier::new(2));
+        let reader_old_observed = Arc::clone(&old_observed);
+        let reader_new_observed = Arc::clone(&new_observed);
+        let path = workspace.path().join("file");
+        let new_for_reader = new.clone();
+        let reader = std::thread::spawn(move || {
+            let observation = fs::read_to_string(&path).unwrap();
+            reader_observations.lock().unwrap().push(observation);
+            reader_old_observed.wait();
+
+            loop {
+                let observation = fs::read_to_string(&path).unwrap();
+                let published = observation == new_for_reader;
+                reader_observations.lock().unwrap().push(observation);
+                if published {
+                    reader_new_observed.wait();
+                    return;
+                }
+            }
+        });
+        old_observed.wait();
+        hook.resume();
+        write_task.await.unwrap().unwrap();
+        new_observed.wait();
+        reader.join().unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert!(observations.iter().any(|value| value == &old));
+        assert!(observations.iter().any(|value| value == &new));
+        assert!(
+            observations
+                .iter()
+                .all(|value| value == &old || value == &new)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_retries_temp_collisions_and_cleans_unpublished_temps_after_failures() {
+        let workspace = TempDir::new().unwrap();
+        let first = [1; 16];
+        let second = [2; 16];
+        fs::write(
+            workspace.path().join(WriteTestHook::temporary_name(first)),
+            "collision",
+        )
+        .unwrap();
+        let collision_hook = WriteTestHook::with_temp_suffixes([first, second]);
+        collision_hook.set_fail_write();
+        let host = tool_host(&workspace)
+            .await
+            .with_write_test_hook(collision_hook);
+        assert_eq!(
+            write_error(&host, "file", "contents", None).await,
+            ToolErrorKind::Os
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(WriteTestHook::temporary_name(first)))
+                .unwrap(),
+            "collision"
+        );
+        assert_eq!(
+            temporary_entries(workspace.path()),
+            [workspace.path().join(WriteTestHook::temporary_name(first))]
+        );
+
+        for failure in [
+            WriteTestHook::fail_entropy as fn() -> WriteTestHook,
+            WriteTestHook::fail_write,
+            WriteTestHook::fail_publish,
+        ] {
+            let workspace = TempDir::new().unwrap();
+            fs::write(workspace.path().join("file"), "before").unwrap();
+            let host = tool_host(&workspace).await.with_write_test_hook(failure());
+            assert_eq!(
+                write_error(&host, "file", "contents", Some(fingerprint("before"))).await,
+                ToolErrorKind::Os
+            );
+            assert_eq!(
+                fs::read_to_string(workspace.path().join("file")).unwrap(),
+                "before"
+            );
+            assert!(temporary_entries(workspace.path()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_keeps_created_parents_after_later_failure_and_uses_no_clobber_fallback() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace)
+            .await
+            .with_write_test_hook(WriteTestHook::fail_write());
+        assert_eq!(
+            write_error(&host, "created/then-fail", "contents", None).await,
+            ToolErrorKind::Os
+        );
+        assert!(workspace.path().join("created").is_dir());
+        assert!(!workspace.path().join("created/then-fail").exists());
+
+        let fallback_hook = WriteTestHook::force_hard_link_fallback();
+        let host = tool_host(&workspace)
+            .await
+            .with_write_test_hook(fallback_hook);
+        assert!(
+            write(&host, "fallback", "contents", None)
+                .await
+                .unwrap()
+                .outcome
+                == super::WholeFileWriteOutcome::Created
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("fallback")).unwrap(),
+            "contents"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_one_exact_match_and_returns_content_fingerprints() {
+        let workspace = TempDir::new().unwrap();
+        let before = "before needle after";
+        fs::write(workspace.path().join("file"), before).unwrap();
+        let host = tool_host(&workspace).await;
+
+        let outcome = edit(&host, "./file", "needle", "replacement")
+            .await
+            .unwrap();
+
+        assert!(outcome.pre_fingerprint == fingerprint(before));
+        assert!(outcome.post_fingerprint == fingerprint("before replacement after"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before replacement after"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_empty_identical_zero_multiple_and_overlapping_matches_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "aaa").unwrap();
+        let host = tool_host(&workspace).await;
+
+        for (old, new) in [
+            ("", "x"),
+            ("aaa", "aaa"),
+            ("missing", "x"),
+            ("a", "x"),
+            ("aa", "x"),
+        ] {
+            assert_eq!(
+                edit_error(&host, "file", old, new).await,
+                ToolErrorKind::Value
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "aaa");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_counts_ascii_and_multibyte_matches_at_character_boundaries() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("ascii"), "one needle two").unwrap();
+        fs::write(workspace.path().join("multibyte"), "one é needle € two").unwrap();
+        fs::write(workspace.path().join("multibyte-overlap"), "ééé").unwrap();
+        fs::write(workspace.path().join("scalar"), "€").unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "ascii", "needle", "replacement").await.unwrap();
+        edit(&host, "multibyte", "é needle €", "£").await.unwrap();
+        assert_eq!(
+            edit_error(&host, "multibyte-overlap", "éé", "£").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            edit_error(&host, "scalar", "©", "replacement").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("ascii")).unwrap(),
+            "one replacement two"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("multibyte")).unwrap(),
+            "one £ two"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("multibyte-overlap")).unwrap(),
+            "ééé"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("scalar")).unwrap(),
+            "€"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_enforces_pre_and_post_edit_byte_limits_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let at_limit = workspace.path().join("at-limit");
+        let over_limit = workspace.path().join("over-limit");
+        let multibyte_at_limit = workspace.path().join("multibyte-at-limit");
+        let multibyte_growth = workspace.path().join("multibyte-growth");
+        fs::write(&at_limit, "1234").unwrap();
+        fs::write(&over_limit, "12345").unwrap();
+        fs::write(&multibyte_at_limit, "éab").unwrap();
+        fs::write(&multibyte_growth, "éab").unwrap();
+        let host = tool_host_with_limits(&workspace, 4).await;
+
+        edit(&host, "at-limit", "4", "x").await.unwrap();
+        assert_eq!(fs::read_to_string(&at_limit).unwrap(), "123x");
+        assert_eq!(
+            edit_error(&host, "at-limit", "x", "56").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&at_limit).unwrap(), "123x");
+        edit(&host, "multibyte-at-limit", "ab", "é").await.unwrap();
+        assert_eq!(fs::read_to_string(&multibyte_at_limit).unwrap(), "éé");
+        assert_eq!(
+            edit_error(&host, "multibyte-growth", "ab", "€").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&multibyte_growth).unwrap(), "éab");
+        assert_eq!(
+            edit_error(&host, "over-limit", "5", "x").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&over_limit).unwrap(), "12345");
+    }
+
+    #[tokio::test]
+    async fn edit_normalises_paths_and_rejects_escapes_before_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("nested/file");
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(&path, "before").unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "./nested//file", "before", "after")
+            .await
+            .unwrap();
+        for path in ["/outside", "../outside", "nested/../file"] {
+            assert_eq!(
+                edit_error(&host, path, "after", "changed").await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("nested/file")).unwrap(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_invalid_utf8_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, [0xff]).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            edit_error(&host, "file", "x", "y").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read(&path).unwrap(), [0xff]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_classifies_terminal_and_intermediate_path_kinds_without_following_symlinks() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("regular"), "old").unwrap();
+        fs::write(outside.path().join("outside"), "old").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("regular", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        std::os::unix::fs::symlink("directory", workspace.path().join("inside-parent")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-parent"))
+            .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-parent")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            edit_error(&host, "missing", "old", "new").await,
+            ToolErrorKind::FileNotFound
+        );
+        assert_eq!(
+            edit_error(&host, "directory", "old", "new").await,
+            ToolErrorKind::IsADirectory
+        );
+        for path in ["fifo", "socket"] {
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    edit_error(&host, path, "old", "new")
+                )
+                .await
+                .expect("editing an other entry must not block"),
+                ToolErrorKind::Value
+            );
+        }
+        for path in [
+            "inside-link",
+            "outside-link",
+            "broken-link",
+            "inside-parent/file",
+            "outside-parent/file",
+            "broken-parent/file",
+        ] {
+            assert_eq!(
+                edit_error(&host, path, "old", "new").await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            edit_error(&host, "regular/child", "old", "new").await,
+            ToolErrorKind::NotADirectory
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("outside")).unwrap(),
+            "old"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rechecks_content_disappearance_and_kind_changes_before_publication() {
+        let workspace = TempDir::new().unwrap();
+
+        let content_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("content"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(content_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "content", "before", "after").await });
+        content_hook.wait_until_paused().await;
+        fs::write(workspace.path().join("content"), "external").unwrap();
+        content_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("content")).unwrap(),
+            "external"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let missing_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("missing"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(missing_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "missing", "before", "after").await });
+        missing_hook.wait_until_paused().await;
+        fs::remove_file(workspace.path().join("missing")).unwrap();
+        missing_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert!(!workspace.path().join("missing").exists());
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let kind_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("kind"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(kind_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "kind", "before", "after").await });
+        kind_hook.wait_until_paused().await;
+        fs::remove_file(workspace.path().join("kind")).unwrap();
+        fs::create_dir(workspace.path().join("kind")).unwrap();
+        kind_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert!(workspace.path().join("kind").is_dir());
+        assert!(temporary_entries(workspace.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_publishes_only_complete_old_or_new_file_contents() {
+        use std::sync::{Barrier, Mutex};
+
+        let workspace = TempDir::new().unwrap();
+        let old = "old".repeat(256 * 1024);
+        let new = "new".repeat(256 * 1024);
+        fs::write(workspace.path().join("file"), &old).unwrap();
+        let hook = WriteTestHook::pause_before_recheck();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let old_for_edit = old.clone();
+        let new_for_edit = new.clone();
+        let edit_task =
+            tokio::spawn(
+                async move { edit(&editing_host, "file", &old_for_edit, &new_for_edit).await },
+            );
+        hook.wait_until_paused().await;
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let reader_observations = Arc::clone(&observations);
+        let old_observed = Arc::new(Barrier::new(2));
+        let new_observed = Arc::new(Barrier::new(2));
+        let reader_old_observed = Arc::clone(&old_observed);
+        let reader_new_observed = Arc::clone(&new_observed);
+        let path = workspace.path().join("file");
+        let new_for_reader = new.clone();
+        let reader = std::thread::spawn(move || {
+            let observation = fs::read_to_string(&path).unwrap();
+            reader_observations.lock().unwrap().push(observation);
+            reader_old_observed.wait();
+
+            loop {
+                let observation = fs::read_to_string(&path).unwrap();
+                let published = observation == new_for_reader;
+                reader_observations.lock().unwrap().push(observation);
+                if published {
+                    reader_new_observed.wait();
+                    return;
+                }
+            }
+        });
+        old_observed.wait();
+        hook.resume();
+        edit_task.await.unwrap().unwrap();
+        new_observed.wait();
+        reader.join().unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert!(observations.iter().any(|value| value == &old));
+        assert!(observations.iter().any(|value| value == &new));
+        assert!(
+            observations
+                .iter()
+                .all(|value| value == &old || value == &new)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_preserves_exact_existing_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "file", "before", "after").await.unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_uses_the_mode_from_its_opened_initial_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let hook = WriteTestHook::pause_before_initial_read();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let write_task = tokio::spawn(async move {
+            write(&writing_host, "file", "after", Some(fingerprint("before"))).await
+        });
+        hook.wait_until_paused().await;
+        let replacement = workspace.path().join("replacement");
+        fs::write(&replacement, "before").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        hook.resume();
+
+        write_task.await.unwrap().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
     #[test]
     fn generated_sources_share_active_tool_definitions() {
         assert_eq!(
@@ -3404,6 +6461,12 @@ mod tests {
                 "async def read(path: str) -> str:\n",
                 "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
                 "    return await _kiki_read(path)\n\n",
+                "async def write(path: str, content: str) -> None:\n",
+                "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
+                "    await _kiki_write(path, content)\n\n",
+                "async def edit(path: str, old: str, new: str) -> None:\n",
+                "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
+                "    await _kiki_edit(path, old, new)\n\n",
                 "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
                 "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
                 "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
@@ -3418,6 +6481,8 @@ mod tests {
         let reference = prompt_reference();
         for signature in [
             "async def read(path: str) -> str:",
+            "async def write(path: str, content: str) -> None:",
+            "async def edit(path: str, old: str, new: str) -> None:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
@@ -3428,8 +6493,6 @@ mod tests {
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
-        for unavailable in ["write(", "edit(", "run("] {
-            assert!(!reference.contains(unavailable));
-        }
+        assert!(!reference.contains("run("));
     }
 }

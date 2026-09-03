@@ -109,6 +109,8 @@ mod tests {
     fn assert_generated_tool_reference(reference: &str) {
         for signature in [
             "async def read(path: str) -> str:",
+            "async def write(path: str, content: str) -> None:",
+            "async def edit(path: str, old: str, new: str) -> None:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
@@ -129,9 +131,7 @@ mod tests {
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
         }
-        for unavailable in ["write(", "edit(", "run("] {
-            assert!(!reference.contains(unavailable));
-        }
+        assert!(!reference.contains("run("));
     }
 
     #[test]

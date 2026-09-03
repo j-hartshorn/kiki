@@ -351,6 +351,9 @@ fn tool_call_label(call: ToolCall) -> String {
         ToolCallSummary::Count(count) => {
             format!("{count} {}", call.tool.count_label(count))
         }
+        ToolCallSummary::Created => "created".to_owned(),
+        ToolCallSummary::Replaced => "replaced".to_owned(),
+        ToolCallSummary::Applied => "applied".to_owned(),
     };
     format!("{} · {summary}", call.tool.label())
 }
@@ -2101,6 +2104,7 @@ mod tests {
         ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, IN_PROGRESS_ARENA, MUTED,
         NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER,
         assistant_text, markdown, normalise_terminal_text, own_styled_text, page_style,
+        tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -2113,6 +2117,31 @@ mod tests {
         ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
         TerminalDetails,
     };
+
+    #[test]
+    fn mutation_tool_labels_are_path_free() {
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Write,
+                summary: ToolCallSummary::Created,
+            }),
+            "write · created"
+        );
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Write,
+                summary: ToolCallSummary::Replaced,
+            }),
+            "write · replaced"
+        );
+        assert_eq!(
+            tool_call_label(ToolCall {
+                tool: ToolName::Edit,
+                summary: ToolCallSummary::Applied,
+            }),
+            "edit · applied"
+        );
+    }
 
     #[test]
     fn markdown_compatibility() {
