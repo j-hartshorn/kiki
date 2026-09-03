@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
@@ -22,7 +22,7 @@ use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProg
 use crate::selection::{DocumentPosition, Selection};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
-use crate::transcript::{Transcript, muted_page_style, normalise_terminal_text, page_style};
+use crate::transcript::{Transcript, TranscriptLayout, normalise_terminal_text, page_style};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
@@ -951,7 +951,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         1,
     );
     if area.height == 2 {
-        render_rule(frame, bottom_rule, None);
+        render_rule(frame, bottom_rule);
         app.history_unavailable();
         return;
     }
@@ -959,9 +959,8 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_rule(
             frame,
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-            None,
         );
-        render_rule(frame, bottom_rule, None);
+        render_rule(frame, bottom_rule);
         app.history_unavailable();
         return;
     }
@@ -989,21 +988,20 @@ fn render(frame: &mut Frame, app: &mut App) {
             .saturating_sub(1)
             .saturating_sub(prompt_box_height),
     );
-    let footer = render_history(frame, app, history);
-    render_rule(frame, Rect::new(area.x, prompt_top, area.width, 1), None);
+    let layout = render_history(frame, app, history);
+    render_rule(frame, Rect::new(area.x, prompt_top, area.width, 1));
     render_prompt(frame, &prompt, content, !app.is_submission_disabled());
-    render_rule(frame, bottom_rule, footer.as_deref());
+    frame.render_widget(
+        Paragraph::new(layout.footer_rule(bottom_rule.width)),
+        bottom_rule,
+    );
 }
 
-fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Option<String> {
+fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> TranscriptLayout {
     let layout = app.transcript.layout(viewport.width);
-    let footer = layout
-        .footer()
-        .map(normalise_terminal_text)
-        .filter(|footer| !footer.is_empty());
     if viewport.is_empty() {
         app.history_unavailable();
-        return footer;
+        return layout;
     }
     if app
         .history_viewport
@@ -1034,7 +1032,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Option<St
             app.pending_copy_text = Some(text);
         }
     }
-    footer
+    layout
 }
 
 fn prompt_content_capacity(height: u16) -> usize {
@@ -1093,65 +1091,11 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
     }
 }
 
-fn render_rule(frame: &mut Frame, area: Rect, footer: Option<&str>) {
-    frame.render_widget(Paragraph::new(footer_rule(footer, area.width)), area);
-}
-
-fn footer_rule(footer: Option<&str>, width: u16) -> Line<'static> {
-    let Some(footer) = footer else {
-        return Line::raw("─".repeat(usize::from(width)));
-    };
-    match width {
-        0 => Line::raw(""),
-        1 => Line::styled(truncate_footer(footer, 1), muted_page_style()),
-        2 => Line::from(vec![
-            Span::styled(truncate_footer(footer, 1), muted_page_style()),
-            Span::raw("─"),
-        ]),
-        3 => Line::from(vec![
-            Span::raw("─"),
-            Span::styled(truncate_footer(footer, 1), muted_page_style()),
-            Span::raw("─"),
-        ]),
-        4 => Line::from(vec![
-            Span::raw("─"),
-            Span::styled(truncate_footer(footer, 1), muted_page_style()),
-            Span::raw(" ─"),
-        ]),
-        _ => {
-            let footer = truncate_footer(footer, width - 4);
-            let footer_width = Line::raw(&footer).width();
-            let leading_rules = usize::from(width).saturating_sub(footer_width.saturating_add(3));
-            Line::from(vec![
-                Span::raw("─".repeat(leading_rules)),
-                Span::raw(" "),
-                Span::styled(footer, muted_page_style()),
-                Span::raw(" ─"),
-            ])
-        }
-    }
-}
-
-fn truncate_footer(footer: &str, width: u16) -> String {
-    if Line::raw(footer).width() <= usize::from(width) {
-        return footer.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    let suffix_width = usize::from(width - 1);
-    let mut suffix = String::new();
-    for character in footer.chars().rev() {
-        let character_width = Line::raw(character.to_string()).width();
-        if character_width.saturating_add(Line::raw(&suffix).width()) > suffix_width {
-            break;
-        }
-        suffix.insert(0, character);
-    }
-    format!("…{suffix}")
+fn render_rule(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::raw("─".repeat(usize::from(area.width)))),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -1170,6 +1114,7 @@ mod tests {
         MouseEventKind,
     };
     use ratatui::layout::Position;
+    use ratatui::style::Color;
 
     use super::App;
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
@@ -3607,7 +3552,7 @@ mod tests {
         assert_eq!(with_rows[9], "─".repeat(80));
         assert!(with_rows[10].starts_with("> ask"));
         assert!(with_rows[11].starts_with('─'));
-        assert!(with_rows[11].ends_with("↑1 ↓1 R0 W0 r0 Σ2 $0.000024 ─"));
+        assert!(with_rows[11].ends_with("↑1 ↓1 R0 W0 r0 Σ2 C0%/272k H0% $0.000024 ─"));
         assert_eq!(app.history_height, 8);
     }
 
@@ -3782,7 +3727,7 @@ mod tests {
         let four = rendered(&mut app, 80, 4);
         let rows = four.lines().collect::<Vec<_>>();
         assert!(rows[2].starts_with("> ask"));
-        assert!(rows[3].ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"));
+        assert!(rows[3].ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─"));
         assert_eq!(app.history_height, 0);
 
         let larger = rendered(&mut app, 80, 6);
@@ -3793,10 +3738,9 @@ mod tests {
                 .is_some_and(|row| row.starts_with("> ask"))
         );
         assert!(
-            larger
-                .lines()
-                .nth(5)
-                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"))
+            larger.lines().nth(5).is_some_and(
+                |row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─")
+            )
         );
         assert_eq!(app.history_height, 2);
         assert!(app.history_rows > 0);
@@ -3835,36 +3779,42 @@ mod tests {
     }
 
     #[test]
-    fn footer_truncates_to_one_display_row_with_an_ellipsis() {
+    fn footer_renders_styled_metrics_and_truncates_to_one_display_row() {
         let mut app = App::default();
         app.handle_event(completed_record(
             1,
             1,
             "accounting()",
             vec![detailed_usage(
-                Some(100),
-                Some(20),
-                Some(10),
-                Some(5),
-                Some(5),
-                Some(120),
+                Some(217_600),
+                Some(0),
+                Some(163_200),
+                Some(0),
+                Some(0),
+                Some(217_600),
             )],
         ));
 
+        let full = rendered_buffer(&mut app, 80, 4);
+        let column = (0..full.area.width)
+            .find(|column| {
+                full[(*column, 3)].symbol() == "8"
+                    && full[(*column + 1, 3)].symbol() == "0"
+                    && full[(*column + 2, 3)].symbol() == "%"
+            })
+            .expect("context percentage");
+        assert_eq!(full[(column, 3)].fg, Color::Yellow);
+        let full = rendered(&mut app, 80, 4);
+        assert!(
+            full.lines()
+                .nth(3)
+                .is_some_and(|row| row.ends_with("C80%/272k H75% $0.28288 ─"))
+        );
+
         let one = rendered(&mut app, 1, 4);
         assert_eq!(one.lines().nth(3), Some("…"));
-        let narrow = rendered(&mut app, 12, 4);
-        let footer = narrow.lines().nth(3).expect("footer row");
-        assert!(footer.starts_with('─'));
-        assert!(footer.ends_with('─'));
-        assert!(footer.contains('…'));
-        let cjk_suffix = super::truncate_footer("prefix 日本 $9", 6);
-        assert_eq!(cjk_suffix, "…本 $9");
-        assert_eq!(super::Line::raw(cjk_suffix).width(), 6);
-        assert_eq!(super::truncate_footer("text", 0), "");
-        assert_eq!(super::truncate_footer("text", 1), "…");
-        assert_eq!(super::footer_rule(Some("footer"), 0).width(), 0);
-        assert_eq!(super::footer_rule(Some("footer"), 1).width(), 1);
+        let narrow = rendered(&mut app, 29, 4);
+        assert_eq!(narrow.lines().nth(3), Some("─ … C80%/272k H75% $0.28288 ─"));
     }
 
     #[test]
@@ -3898,10 +3848,9 @@ mod tests {
             },
         });
         assert!(
-            rendered(&mut app, 80, 5)
-                .lines()
-                .last()
-                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 $0.000769 ─"))
+            rendered(&mut app, 80, 5).lines().last().is_some_and(
+                |row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─")
+            )
         );
 
         app.handle_event(completed_record(1, 1, "first()", vec![first]));
@@ -3936,10 +3885,9 @@ mod tests {
         ));
 
         assert!(
-            rendered(&mut app, 80, 8)
-                .lines()
-                .last()
-                .is_some_and(|row| row.ends_with("↑107 ↓30 R10 W5 r5 Σ137 $0.000769 ─"))
+            rendered(&mut app, 80, 8).lines().last().is_some_and(
+                |row| row.ends_with("↑107 ↓30 R10 W5 r5 Σ137 C0%/272k H0% $0.000769 ─")
+            )
         );
     }
 
@@ -4077,7 +4025,9 @@ mod tests {
                 accounting: usage(0, 100),
             },
         });
-        assert!(rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 r0 Σ200 $0.0024"));
+        assert!(
+            rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 r0 Σ200 C0%/272k $0.0024")
+        );
     }
 
     #[test]

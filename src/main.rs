@@ -28,7 +28,11 @@ use crate::runtime::{
 use crate::tools::ToolHost;
 
 fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
-    OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
+    OpenAiModel::new(
+        ready.system_prompt(),
+        ready.api_key().expose(),
+        ready.model(),
+    )
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

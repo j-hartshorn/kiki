@@ -1,59 +1,9 @@
 use crate::{
-    config::constants::FIXED_MODEL,
+    config::model_by_id,
     model::{AttemptAccounting, ModelUsage},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PricingIdentity {
-    pub model: &'static str,
-    pub service_tier: &'static str,
-    pub version: &'static str,
-    pub source: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rates {
-    uncached_input_nanos: u64,
-    cached_input_nanos: u64,
-    cache_write_nanos: u64,
-    output_nanos: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelPricing {
-    identity: PricingIdentity,
-    long_context_threshold: u64,
-    short_context: Rates,
-    long_context: Rates,
-}
-
-impl ModelPricing {
-    pub fn identity(&self) -> PricingIdentity {
-        self.identity
-    }
-}
-
-pub const GPT_5_6_SOL_DEFAULT_2026_08_27: ModelPricing = ModelPricing {
-    identity: PricingIdentity {
-        model: FIXED_MODEL,
-        service_tier: "default",
-        version: "2026-08-27",
-        source: "https://developers.openai.com/api/docs/pricing",
-    },
-    long_context_threshold: 272_000,
-    short_context: Rates {
-        uncached_input_nanos: 4_000,
-        cached_input_nanos: 400,
-        cache_write_nanos: 5_000,
-        output_nanos: 20_000,
-    },
-    long_context: Rates {
-        uncached_input_nanos: 8_000,
-        cached_input_nanos: 800,
-        cache_write_nanos: 10_000,
-        output_nanos: 30_000,
-    },
-};
+pub use crate::config::PricingIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsdNanos(u128);
@@ -116,6 +66,11 @@ pub enum PricingError {
 }
 
 pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> {
+    let model = model_by_id(&usage.model).ok_or(PricingError::ModelMismatch)?;
+    if usage.service_tier.as_deref() != Some(model.pricing.identity.service_tier) {
+        return Err(PricingError::ServiceTierMismatch);
+    }
+
     let input = usage
         .input_tokens
         .ok_or(PricingError::MissingCategory(UsageCategory::Input))?;
@@ -139,14 +94,6 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
         .total_tokens
         .ok_or(PricingError::MissingCategory(UsageCategory::Total))?;
 
-    let pricing = GPT_5_6_SOL_DEFAULT_2026_08_27;
-    if usage.model != pricing.identity.model {
-        return Err(PricingError::ModelMismatch);
-    }
-    if usage.service_tier.as_deref() != Some(pricing.identity.service_tier) {
-        return Err(PricingError::ServiceTierMismatch);
-    }
-
     let categorised_input = cached
         .checked_add(cache_write)
         .ok_or(PricingError::ArithmeticOverflow)?;
@@ -166,10 +113,10 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
     let uncached = input
         .checked_sub(categorised_input)
         .ok_or(PricingError::ArithmeticOverflow)?;
-    let rates = if input <= pricing.long_context_threshold {
-        pricing.short_context
+    let rates = if input <= model.pricing.long_context_threshold {
+        model.pricing.short_context
     } else {
-        pricing.long_context
+        model.pricing.long_context
     };
     let amount = [
         (uncached, rates.uncached_input_nanos),
@@ -189,7 +136,7 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
 
     Ok(CostEstimate {
         amount: UsdNanos(amount),
-        pricing: pricing.identity,
+        pricing: model.pricing.identity,
     })
 }
 
@@ -197,9 +144,9 @@ pub fn estimate_run_cost<'a>(
     attempts: impl IntoIterator<Item = &'a AttemptAccounting>,
 ) -> RunCostEstimate {
     let mut known_amount = 0_u128;
-    let mut has_known = false;
     let mut is_lower_bound = false;
     let mut has_unpriceable = false;
+    let mut run_pricing: Option<PricingIdentity> = None;
 
     for attempt in attempts {
         let usage = match attempt {
@@ -217,36 +164,62 @@ pub fn estimate_run_cost<'a>(
             has_unpriceable = true;
             continue;
         };
+        if let Some(existing) = run_pricing {
+            if existing != estimate.pricing {
+                return RunCostEstimate::Unavailable;
+            }
+        } else {
+            run_pricing = Some(estimate.pricing);
+        }
         let Some(total) = known_amount.checked_add(estimate.amount.0) else {
             has_unpriceable = true;
             continue;
         };
         known_amount = total;
-        has_known = true;
     }
 
+    let Some(pricing) = run_pricing else {
+        return RunCostEstimate::Unavailable;
+    };
     let estimate = CostEstimate {
         amount: UsdNanos(known_amount),
-        pricing: GPT_5_6_SOL_DEFAULT_2026_08_27.identity,
+        pricing,
     };
-    match (has_known, has_unpriceable || is_lower_bound) {
-        (true, true) => RunCostEstimate::LowerBound(estimate),
-        (true, false) => RunCostEstimate::Complete(estimate),
-        (false, _) => RunCostEstimate::Unavailable,
+    if has_unpriceable || is_lower_bound {
+        RunCostEstimate::LowerBound(estimate)
+    } else {
+        RunCostEstimate::Complete(estimate)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CostEstimate, GPT_5_6_SOL_DEFAULT_2026_08_27, PricingError, RunCostEstimate, UsageCategory,
-        estimate_run_cost, estimate_usage,
+        CostEstimate, PricingError, RunCostEstimate, UsageCategory, estimate_run_cost,
+        estimate_usage,
     };
-    use crate::model::{AttemptAccounting, ModelUsage};
+    use crate::{
+        config::{
+            DEFAULT_MODEL,
+            models::{LUNA, SOL, TERRA},
+        },
+        model::{AttemptAccounting, ModelUsage},
+    };
 
     fn usage(input: u64, cached: u64, cache_write: u64, output: u64, reasoning: u64) -> ModelUsage {
+        usage_for("gpt-5.6-sol", input, cached, cache_write, output, reasoning)
+    }
+
+    fn usage_for(
+        model: &str,
+        input: u64,
+        cached: u64,
+        cache_write: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> ModelUsage {
         ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: model.to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: Some(input),
             cached_input_tokens: Some(cached),
@@ -263,9 +236,9 @@ mod tests {
 
     #[test]
     fn pricing_constant_has_versioned_official_identity() {
-        let identity = GPT_5_6_SOL_DEFAULT_2026_08_27.identity();
+        let identity = SOL.pricing.identity;
 
-        assert_eq!(identity.model, crate::config::constants::FIXED_MODEL);
+        assert_eq!(identity.model, DEFAULT_MODEL.id);
         assert_eq!(identity.service_tier, "default");
         assert_eq!(identity.version, "2026-08-27");
         assert_eq!(
@@ -279,10 +252,7 @@ mod tests {
         let estimate = estimate_usage(&usage(200_000, 40_000, 60_000, 100_000, 50_000)).unwrap();
 
         assert_eq!(amount(estimate), 2_716_000_000);
-        assert_eq!(
-            estimate.pricing(),
-            GPT_5_6_SOL_DEFAULT_2026_08_27.identity()
-        );
+        assert_eq!(estimate.pricing(), SOL.pricing.identity);
     }
 
     #[test]
@@ -292,6 +262,33 @@ mod tests {
 
         assert_eq!(amount(threshold), 2_828_000_000);
         assert_eq!(amount(above), 4_656_008_000);
+    }
+
+    #[test]
+    fn prices_terra_and_luna_at_published_short_context_rates() {
+        for (model, expected_amount, pricing) in [
+            (TERRA.id, 16_700, TERRA.pricing.identity),
+            (LUNA.id, 1_670, LUNA.pricing.identity),
+        ] {
+            let estimate = estimate_usage(&usage_for(model, 3, 1, 1, 1, 0)).unwrap();
+
+            assert_eq!(amount(estimate), expected_amount);
+            assert_eq!(estimate.pricing(), pricing);
+        }
+    }
+
+    #[test]
+    fn prices_terra_and_luna_at_published_long_context_rates() {
+        for (model, expected_amount, pricing) in [
+            (TERRA.id, 734_422_000, TERRA.pricing.identity),
+            (LUNA.id, 73_442_200, LUNA.pricing.identity),
+        ] {
+            let estimate =
+                estimate_usage(&usage_for(model, 272_001, 136_000, 136_000, 1, 0)).unwrap();
+
+            assert_eq!(amount(estimate), expected_amount);
+            assert_eq!(estimate.pricing(), pricing);
+        }
     }
 
     #[test]
@@ -400,9 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_model_and_non_default_or_missing_returned_tier() {
+    fn rejects_unknown_model_and_non_default_or_missing_returned_tier() {
         let mut wrong_model = usage(10, 0, 0, 0, 0);
-        wrong_model.model = "gpt-5.6-terra".to_owned();
+        wrong_model.model = "gpt-5.6-unknown".to_owned();
         assert_eq!(
             estimate_usage(&wrong_model),
             Err(PricingError::ModelMismatch)
@@ -432,13 +429,36 @@ mod tests {
         match estimate_run_cost(&attempts) {
             RunCostEstimate::Complete(estimate) => {
                 assert_eq!(amount(estimate), 20_800_000_000);
-                assert_eq!(
-                    estimate.pricing(),
-                    GPT_5_6_SOL_DEFAULT_2026_08_27.identity()
-                );
+                assert_eq!(estimate.pricing(), SOL.pricing.identity);
             }
             estimate => panic!("expected complete estimate, got {estimate:?}"),
         }
+    }
+
+    #[test]
+    fn run_cost_aggregates_multiple_attempts_for_the_same_model() {
+        let attempts = [
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+        ];
+
+        match estimate_run_cost(&attempts) {
+            RunCostEstimate::Complete(estimate) => {
+                assert_eq!(amount(estimate), 33_400);
+                assert_eq!(estimate.pricing(), TERRA.pricing.identity);
+            }
+            estimate => panic!("expected complete estimate, got {estimate:?}"),
+        }
+    }
+
+    #[test]
+    fn run_cost_is_unavailable_when_attempts_mix_different_models() {
+        let attempts = [
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+            AttemptAccounting::KnownUsage(usage_for(LUNA.id, 3, 1, 1, 1, 0)),
+        ];
+
+        assert_eq!(estimate_run_cost(&attempts), RunCostEstimate::Unavailable);
     }
 
     #[test]

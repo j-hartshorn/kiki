@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
 use crate::{
-    config::constants::{ACCEPTED_MODEL_CONTENT_LIMIT, FIXED_MODEL},
+    config::{ModelConfiguration, constants::ACCEPTED_MODEL_CONTENT_LIMIT},
     model::{
         AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
@@ -39,16 +39,25 @@ fn openai_config(api_key: impl Into<String>, api_base: impl Into<String>) -> Ope
 pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
-    model: &'static str,
+    model: &'static ModelConfiguration,
     api_key: String,
 }
 
 impl OpenAiModel {
-    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
+    pub(crate) fn new(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        model: &'static ModelConfiguration,
+    ) -> Self {
+        Self::build(prompt.into(), api_key.into(), model, OPENAI_API_BASE)
     }
 
-    fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
+    fn build(
+        prompt: String,
+        api_key: String,
+        model: &'static ModelConfiguration,
+        endpoint: &str,
+    ) -> Self {
         let service = ServiceBuilder::new()
             .layer(OpenAIRetryLayer::new(2))
             .service(ReqwestService::default());
@@ -56,7 +65,7 @@ impl OpenAiModel {
             prompt,
             client: Client::with_config(openai_config(api_key.clone(), endpoint))
                 .with_http_service(service),
-            model: FIXED_MODEL,
+            model,
             api_key,
         }
     }
@@ -67,7 +76,12 @@ impl OpenAiModel {
         api_key: impl Into<String>,
         endpoint: &str,
     ) -> Self {
-        Self::build(prompt.into(), api_key.into(), endpoint)
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            crate::config::DEFAULT_MODEL,
+            endpoint,
+        )
     }
 
     fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
@@ -121,12 +135,12 @@ impl OpenAiModel {
         }
 
         Ok(json!({
-            "model": self.model,
+            "model": self.model.id,
             "instructions": self.prompt,
             "input": input,
             "stream": true,
             "store": false,
-            "service_tier": "default",
+            "service_tier": self.model.service_tier,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": {
@@ -565,7 +579,7 @@ impl OpenAiModel {
             return AttemptAccounting::UsageUnavailable;
         };
         AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
-            model: self.model.to_owned(),
+            model: self.model.id.to_owned(),
             service_tier: response
                 .service_tier
                 .as_deref()
@@ -1588,7 +1602,7 @@ mod tests {
     use tokio::time::{Instant, sleep, sleep_until, timeout};
 
     use super::{WireEvent, WireStatus, WireStream, openai_config};
-    use crate::model::ModelHistory;
+    use crate::{config::models::CATALOGUE, model::ModelHistory};
 
     fn history() -> ModelHistory {
         let mut history = ModelHistory::new();
@@ -1621,16 +1635,20 @@ mod tests {
     );
 
     #[test]
-    fn standard_constructor_uses_only_the_fixed_openai_configuration() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+    fn constructs_and_serializes_each_configured_openai_model() {
+        for configuration in CATALOGUE {
+            let model = super::OpenAiModel::new("system prompt", "test-api-key", configuration);
+            let request = model.request(&history()).unwrap();
 
-        assert_eq!(model.prompt, "system prompt");
-        assert_eq!(model.model, crate::config::constants::FIXED_MODEL);
-        assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
-        assert_eq!(
-            model.client.config().url("/responses"),
-            format!("{OPENAI_API_BASE}/responses")
-        );
+            assert_eq!(model.prompt, "system prompt");
+            assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
+            assert_eq!(
+                model.client.config().url("/responses"),
+                format!("{OPENAI_API_BASE}/responses")
+            );
+            assert_eq!(request["model"], json!(configuration.id));
+            assert_eq!(request["service_tier"], json!(configuration.service_tier));
+        }
     }
 
     #[derive(Clone)]
@@ -5034,7 +5052,11 @@ mod tests {
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
-                super::OpenAiModel::new(ready.system_prompt(), ready.api_key().expose()),
+                super::OpenAiModel::new(
+                    ready.system_prompt(),
+                    ready.api_key().expose(),
+                    ready.model(),
+                ),
             )
         };
         let tool_host = crate::tools::ToolHost::new(workspace_root)
