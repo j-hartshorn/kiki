@@ -12,6 +12,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata};
 #[cfg(unix)]
 use cap_std::fs::{OpenOptions, OpenOptionsExt};
+use futures::{Stream, StreamExt, stream};
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -22,7 +23,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::constants::{
-    COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES,
+    COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -893,7 +894,16 @@ impl ToolHost {
         self
     }
 
-    pub(crate) async fn call(&self, call: ToolCall) -> ToolResult {
+    pub(crate) fn dispatch_batch(
+        &self,
+        calls: Vec<ToolCall>,
+    ) -> impl Stream<Item = ToolResult> + '_ {
+        stream::iter(calls)
+            .map(|call| self.call(call))
+            .buffer_unordered(TOOL_CONCURRENCY_LIMIT)
+    }
+
+    async fn call(&self, call: ToolCall) -> ToolResult {
         let ToolCall {
             call_id,
             tool,
@@ -1936,6 +1946,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::time::Duration;
 
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     use crate::config::constants::FILE_MAX_BYTES;
@@ -2342,47 +2353,186 @@ mod tests {
         assert_eq!(listing.await.unwrap().unwrap().len(), 1);
     }
 
+    fn batch_read(call_id: u32, path: impl Into<String>) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Read,
+            arguments: ToolValue::List(vec![ToolValue::String(path.into())]),
+        }
+    }
+
     #[tokio::test]
-    async fn batch_test_gate_tracks_independent_host_calls_per_host() {
+    async fn dispatch_batch_yields_completion_order_with_correlated_call_ids() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("first"), "first").unwrap();
         fs::write(workspace.path().join("second"), "second").unwrap();
         let gate = super::BatchTestGate::new();
-        let host = Arc::new(
-            tool_host(&workspace)
-                .await
-                .with_batch_test_gate(gate.clone()),
-        );
-        let first_host = Arc::clone(&host);
-        let first = tokio::spawn(async move {
-            first_host
-                .call(ToolCall {
-                    call_id: 1,
-                    tool: ToolName::Read,
-                    arguments: ToolValue::List(vec![ToolValue::String("first".to_owned())]),
-                })
-                .await
-        });
-        let second_host = Arc::clone(&host);
-        let second = tokio::spawn(async move {
-            second_host
-                .call(ToolCall {
-                    call_id: 2,
-                    tool: ToolName::Read,
-                    arguments: ToolValue::List(vec![ToolValue::String("second".to_owned())]),
-                })
-                .await
-        });
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls =
+            Box::pin(host.dispatch_batch(vec![batch_read(1, "first"), batch_read(2, "second")]));
 
-        gate.wait_until_calls_started(2).await;
-        assert_eq!(gate.active_call_ids(), [1, 2]);
-        assert_eq!(gate.maximum_active(), 2);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = calls.next() => panic!("batch finished before both calls started: {result:?}"),
+        }
+        gate.release(2);
+        let second = calls.next().await.unwrap();
+        assert_eq!(second.call_id, 2);
+        assert_eq!(second.result, Ok(ToolValue::String("second".to_owned())));
+        gate.release(1);
+        let first = calls.next().await.unwrap();
+        assert_eq!(first.call_id, 1);
+        assert_eq!(first.result, Ok(ToolValue::String("first".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_limits_active_calls_and_admits_queued_calls() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 1..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                (1..=17)
+                    .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
+                    .collect(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before 16 calls started: {result:?}"),
+        }
+        assert_eq!(gate.active_call_ids().len(), 16);
+        assert_eq!(gate.maximum_active(), 16);
+
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("a batch call must have started");
+        gate.release(released_call);
+        assert_eq!(calls.next().await.unwrap().call_id, released_call);
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = calls.next() => panic!("batch finished before the queued call started: {result:?}"),
+        }
+        assert_eq!(gate.maximum_active(), 16);
+
+        for call_id in gate.active_call_ids() {
+            gate.release(call_id);
+        }
+        let mut call_ids = calls.map(|result| result.call_id).collect::<Vec<_>>().await;
+        call_ids.push(released_call);
+        call_ids.sort_unstable();
+        assert_eq!(call_ids, (1..=17).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_settles_queued_siblings_after_an_ordinary_failure() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 2..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                std::iter::once(batch_read(1, "missing"))
+                    .chain((2..=17).map(|call_id| batch_read(call_id, format!("file-{call_id}"))))
+                    .collect(),
+            ),
+        );
+        let mut results = Box::pin(calls.as_mut().collect::<Vec<_>>());
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut results => panic!("batch finished before 16 calls started: {result:?}"),
+        }
         for call_id in gate.started_call_ids() {
             gate.release(call_id);
         }
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut results => panic!("batch finished before the queued sibling started: {result:?}"),
+        }
+        let queued_call = *gate
+            .started_call_ids()
+            .last()
+            .expect("queued sibling must have started");
+        gate.release(queued_call);
 
-        assert!(first.await.unwrap().result.is_ok());
-        assert!(second.await.unwrap().result.is_ok());
+        let results = results.await;
+        assert_eq!(results.len(), 17);
+        assert!(matches!(
+            results.iter().find(|result| result.call_id == 1),
+            Some(result) if result.result.is_err()
+        ));
+        assert!(
+            results
+                .iter()
+                .filter(|result| result.call_id != 1)
+                .all(|result| result.result.is_ok())
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partly_consumed_batch_drops_active_calls_and_leaves_calls_queued() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 1..=18 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                (1..=18)
+                    .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
+                    .collect(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before 16 calls started: {result:?}"),
+        }
+        let released_call = *gate
+            .started_call_ids()
+            .first()
+            .expect("a batch call must have started");
+        gate.release(released_call);
+        assert_eq!(calls.next().await.unwrap().call_id, released_call);
+        let mut next_result = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut next_result => panic!("batch finished before another call started: {result:?}"),
+        }
+        drop(next_result);
+        drop(calls);
+
+        assert!(gate.active_call_ids().is_empty());
+        assert_eq!(gate.started_call_ids(), (1..=17).collect::<Vec<_>>());
     }
 
     #[tokio::test]

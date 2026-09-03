@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
@@ -17,7 +17,7 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, TOOL_CONCURRENCY_LIMIT},
+    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolResult, ToolValue,
         bootstrap_source,
@@ -905,25 +905,28 @@ async fn drive(
                             ),
                         )));
                     }
-                    let mut results = BTreeMap::new();
-                    let mut calls = stream::iter(pending)
-                        .map(|call| async move {
-                            let result = tool_host
-                                .call(HostToolCall {
-                                    call_id: call.call_id,
-                                    tool: call.tool,
-                                    arguments: call.arguments,
-                                })
-                                .await;
-                            (call.token, call.call_id, result)
+                    let mut tokens = BTreeMap::new();
+                    let calls = pending
+                        .into_iter()
+                        .map(|call| {
+                            assert!(
+                                tokens.insert(call.call_id, call.token).is_none(),
+                                "a pending host call must have a unique call ID"
+                            );
+                            HostToolCall {
+                                call_id: call.call_id,
+                                tool: call.tool,
+                                arguments: call.arguments,
+                            }
                         })
-                        .buffer_unordered(TOOL_CONCURRENCY_LIMIT);
-                    while let Some((token, expected_call_id, result)) = calls.next().await {
-                        assert_eq!(
-                            result.call_id, expected_call_id,
-                            "tool result must retain its call ID"
-                        );
+                        .collect();
+                    let mut results = BTreeMap::new();
+                    let mut calls = tool_host.dispatch_batch(calls);
+                    while let Some(result) = calls.next().await {
                         let call_id = result.call_id;
+                        let token = tokens
+                            .remove(&call_id)
+                            .expect("a host result must retain an admitted call ID");
                         let summary = tool_summary(&result);
                         assert!(
                             results.insert(call_id, result).is_none(),
@@ -936,6 +939,10 @@ async fn drive(
                         #[cfg(test)]
                         tool_host.note_batch_driver_settled(call_id);
                     }
+                    assert!(
+                        tokens.is_empty(),
+                        "every admitted host call must settle exactly once"
+                    );
                     let results = pending_call_ids
                         .into_iter()
                         .map(|call_id| {
