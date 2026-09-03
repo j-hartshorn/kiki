@@ -2,3 +2,5 @@
 /.env
 /worktrees/*
 !/worktrees/README.md
+
+TODO.md
