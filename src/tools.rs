@@ -1,3 +1,5 @@
+mod command;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;

@@ -8,4 +8,5 @@ pub(crate) const ARENA_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const COLLECTION_MAX_ITEMS: usize = 10_000;
 pub(crate) const COLLECTION_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const COMMAND_STREAM_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const TOOL_CONCURRENCY_LIMIT: usize = 16;
