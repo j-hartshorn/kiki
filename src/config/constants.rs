@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-pub(crate) const FIXED_MODEL: &str = crate::config::models::DEFAULT_MODEL.id;
 pub(crate) const ACCEPTED_MODEL_CONTENT_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const PROVIDER_CODE_LIMIT: usize = 256;
 pub(crate) const PROVIDER_MESSAGE_LIMIT: usize = 4 * 1024;

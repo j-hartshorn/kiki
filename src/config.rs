@@ -281,7 +281,6 @@ pub(crate) struct ReadyStartup<'a> {
     workspace_root: &'a Path,
     system_prompt: &'a str,
     api_key: &'a ApiKey,
-    #[allow(dead_code)]
     model: &'static ModelConfiguration,
 }
 
@@ -302,7 +301,6 @@ impl<'a> ReadyStartup<'a> {
         self.api_key
     }
 
-    #[allow(dead_code)]
     pub(crate) fn model(&self) -> &'static ModelConfiguration {
         self.model
     }
@@ -684,7 +682,7 @@ mod tests {
 
         assert_eq!(snapshot.worker_path().unwrap().as_str(), WORKER_PATH);
         assert_eq!(snapshot.workspace_root().unwrap().as_str(), WORKSPACE_ROOT);
-        assert_eq!(snapshot.model(), crate::config::constants::FIXED_MODEL);
+        assert_eq!(snapshot.model(), DEFAULT_MODEL.id);
         assert_eq!(
             snapshot.prompt_source(),
             &PromptProvenance::Bundled {

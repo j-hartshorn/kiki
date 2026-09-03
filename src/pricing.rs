@@ -200,7 +200,10 @@ mod tests {
         estimate_run_cost, estimate_usage,
     };
     use crate::{
-        config::models::{LUNA, TERRA},
+        config::{
+            DEFAULT_MODEL,
+            models::{LUNA, TERRA},
+        },
         model::{AttemptAccounting, ModelUsage},
     };
 
@@ -236,7 +239,7 @@ mod tests {
     fn pricing_constant_has_versioned_official_identity() {
         let identity = GPT_5_6_SOL_DEFAULT_2026_08_27.identity();
 
-        assert_eq!(identity.model, crate::config::constants::FIXED_MODEL);
+        assert_eq!(identity.model, DEFAULT_MODEL.id);
         assert_eq!(identity.service_tier, "default");
         assert_eq!(identity.version, "2026-08-27");
         assert_eq!(
