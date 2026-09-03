@@ -146,7 +146,7 @@ pub fn estimate_run_cost<'a>(
     let mut known_amount = 0_u128;
     let mut is_lower_bound = false;
     let mut has_unpriceable = false;
-    let mut latest_pricing = None;
+    let mut run_pricing: Option<PricingIdentity> = None;
 
     for attempt in attempts {
         let usage = match attempt {
@@ -164,15 +164,21 @@ pub fn estimate_run_cost<'a>(
             has_unpriceable = true;
             continue;
         };
+        if let Some(existing) = run_pricing {
+            if existing != estimate.pricing {
+                return RunCostEstimate::Unavailable;
+            }
+        } else {
+            run_pricing = Some(estimate.pricing);
+        }
         let Some(total) = known_amount.checked_add(estimate.amount.0) else {
             has_unpriceable = true;
             continue;
         };
         known_amount = total;
-        latest_pricing = Some(estimate.pricing);
     }
 
-    let Some(pricing) = latest_pricing else {
+    let Some(pricing) = run_pricing else {
         return RunCostEstimate::Unavailable;
     };
     let estimate = CostEstimate {
@@ -430,19 +436,29 @@ mod tests {
     }
 
     #[test]
-    fn run_cost_aggregates_terra_and_luna_attempts() {
+    fn run_cost_aggregates_multiple_attempts_for_the_same_model() {
+        let attempts = [
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+        ];
+
+        match estimate_run_cost(&attempts) {
+            RunCostEstimate::Complete(estimate) => {
+                assert_eq!(amount(estimate), 33_400);
+                assert_eq!(estimate.pricing(), TERRA.pricing.identity);
+            }
+            estimate => panic!("expected complete estimate, got {estimate:?}"),
+        }
+    }
+
+    #[test]
+    fn run_cost_is_unavailable_when_attempts_mix_different_models() {
         let attempts = [
             AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
             AttemptAccounting::KnownUsage(usage_for(LUNA.id, 3, 1, 1, 1, 0)),
         ];
 
-        match estimate_run_cost(&attempts) {
-            RunCostEstimate::Complete(estimate) => {
-                assert_eq!(amount(estimate), 18_370);
-                assert_eq!(estimate.pricing(), LUNA.pricing.identity);
-            }
-            estimate => panic!("expected complete estimate, got {estimate:?}"),
-        }
+        assert_eq!(estimate_run_cost(&attempts), RunCostEstimate::Unavailable);
     }
 
     #[test]
