@@ -130,7 +130,10 @@ enum RowBreak {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RowBreaks(Vec<RowBreak>);
+pub(crate) struct RowBreaks {
+    start: usize,
+    breaks: Vec<RowBreak>,
+}
 
 impl RowBreaks {
     pub(crate) fn from_text(text: &Text<'_>, width: u16) -> Self {
@@ -144,15 +147,47 @@ impl RowBreaks {
             }
             let start = breaks.len();
             breaks.push(RowBreak::Hard);
-            breaks.extend(soft_breaks(line, width));
+            visit_soft_breaks(line, width, |break_before| breaks.push(break_before));
             breaks.truncate(start.saturating_add(height));
             breaks.resize(start.saturating_add(height), RowBreak::Soft);
         }
-        Self(breaks)
+        Self { start: 0, breaks }
+    }
+
+    pub(crate) fn for_rows(text: &Text<'_>, width: u16, start: usize, height: usize) -> Self {
+        let end = start.saturating_add(height);
+        let mut breaks = vec![RowBreak::Soft; height];
+        let mut line_top = 0_usize;
+        for line in &text.lines {
+            let line_height = Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            let line_bottom = line_top.saturating_add(line_height);
+            if line_top < end && start < line_bottom {
+                if start <= line_top && line_top < end {
+                    breaks[line_top.saturating_sub(start)] = RowBreak::Hard;
+                }
+                let mut row = 1_usize;
+                visit_soft_breaks(line, width, |break_before| {
+                    if row < line_height {
+                        let row_in_text = line_top.saturating_add(row);
+                        if start <= row_in_text && row_in_text < end {
+                            breaks[row_in_text.saturating_sub(start)] = break_before;
+                        }
+                    }
+                    row = row.saturating_add(1);
+                });
+            }
+            line_top = line_bottom;
+        }
+        Self { start, breaks }
     }
 
     fn before(&self, row: usize) -> RowBreak {
-        self.0.get(row).copied().unwrap_or(RowBreak::Hard)
+        row.checked_sub(self.start)
+            .and_then(|row| self.breaks.get(row))
+            .copied()
+            .unwrap_or(RowBreak::Hard)
     }
 }
 
@@ -208,57 +243,82 @@ pub(crate) fn highlight(
     }
 }
 
+pub(crate) struct Extraction {
+    text: String,
+    previous: Option<(CardId, usize)>,
+}
+
+impl Extraction {
+    pub(crate) fn new() -> Self {
+        Self {
+            text: String::new(),
+            previous: None,
+        }
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        buffer: &Buffer,
+        selection: ProjectedSelection,
+        regions: &[SelectableRegion],
+    ) {
+        let mut regions = regions.iter().collect::<Vec<_>>();
+        regions.sort_by_key(|region| (region.document_top, region.area.y, region.area.x));
+
+        for region in regions {
+            let area = region
+                .area
+                .intersection(buffer.area)
+                .intersection(selection.viewport.area);
+            for y in area.top()..area.bottom() {
+                let row = selection.document_row(y);
+                let Some(columns) = selection.columns_on(row, region.area.x..region.area.right())
+                else {
+                    continue;
+                };
+                let row_text = extract_row(buffer, area, y, columns);
+                let break_before = region
+                    .breaks
+                    .before(row.saturating_sub(region.document_top));
+                let blank_line = row_text.is_empty()
+                    && break_before == RowBreak::Hard
+                    && row_is_blank(buffer, area, y);
+                if row_text.is_empty() && !blank_line {
+                    continue;
+                }
+                if let Some((card, previous_row)) = self.previous {
+                    if card != region.card {
+                        self.text.push_str("\n\n");
+                    } else if previous_row != row {
+                        match break_before {
+                            RowBreak::Hard => self.text.push('\n'),
+                            RowBreak::Soft => {}
+                            RowBreak::SoftWord => self.text.push(' '),
+                        }
+                    }
+                }
+                self.text.push_str(&row_text);
+                self.previous = Some((region.card, row));
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> String {
+        self.text
+    }
+}
+
 pub(crate) fn extract(
     buffer: &Buffer,
     selection: ProjectedSelection,
     regions: &[SelectableRegion],
 ) -> String {
-    let mut regions = regions.iter().collect::<Vec<_>>();
-    regions.sort_by_key(|region| (region.document_top, region.area.y, region.area.x));
-
-    let mut text = String::new();
-    let mut previous = None;
-    for region in regions {
-        let area = region
-            .area
-            .intersection(buffer.area)
-            .intersection(selection.viewport.area);
-        for y in area.top()..area.bottom() {
-            let row = selection.document_row(y);
-            let Some(columns) = selection.columns_on(row, region.area.x..region.area.right())
-            else {
-                continue;
-            };
-            let row_text = extract_row(buffer, area, y, columns);
-            let break_before = region
-                .breaks
-                .before(row.saturating_sub(region.document_top));
-            let blank_line = row_text.is_empty()
-                && break_before == RowBreak::Hard
-                && row_is_blank(buffer, area, y);
-            if row_text.is_empty() && !blank_line {
-                continue;
-            }
-            if let Some((card, previous_row)) = previous {
-                if card != region.card {
-                    text.push_str("\n\n");
-                } else if previous_row != row {
-                    match break_before {
-                        RowBreak::Hard => text.push('\n'),
-                        RowBreak::Soft => {}
-                        RowBreak::SoftWord => text.push(' '),
-                    }
-                }
-            }
-            text.push_str(&row_text);
-            previous = Some((region.card, row));
-        }
-    }
-    text
+    let mut extraction = Extraction::new();
+    extraction.append(buffer, selection, regions);
+    extraction.finish()
 }
 
-fn soft_breaks(line: &ratatui::text::Line<'_>, width: u16) -> Vec<RowBreak> {
-    let mut breaks = Vec::new();
+fn visit_soft_breaks(line: &ratatui::text::Line<'_>, width: u16, mut visit: impl FnMut(RowBreak)) {
     let mut line_width = 0_u16;
     let mut word_width = 0_u16;
     let mut whitespace_width = 0_u16;
@@ -295,7 +355,7 @@ fn soft_breaks(line: &ratatui::text::Line<'_>, width: u16) -> Vec<RowBreak> {
                 .saturating_add(word_width)
                 >= width;
         if line_full || pending_word_overflow {
-            breaks.push(if is_whitespace || !pending_whitespace.is_empty() {
+            visit(if is_whitespace || !pending_whitespace.is_empty() {
                 RowBreak::SoftWord
             } else {
                 RowBreak::Soft
@@ -324,7 +384,6 @@ fn soft_breaks(line: &ratatui::text::Line<'_>, width: u16) -> Vec<RowBreak> {
         }
         non_whitespace_previous = !is_whitespace;
     }
-    breaks
 }
 
 fn extract_row(buffer: &Buffer, area: Rect, y: u16, columns: Range<u16>) -> String {
@@ -370,8 +429,8 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        CardId, DocumentPosition, RowBreaks, SelectableRegion, Selection, Viewport, extract,
-        highlight,
+        CardId, DocumentPosition, Extraction, RowBreaks, SelectableRegion, Selection, Viewport,
+        extract, highlight,
     };
 
     fn position(row: usize, column: u16) -> DocumentPosition {
@@ -439,6 +498,52 @@ mod tests {
         let buffer = rendered(&text, area);
 
         assert_eq!(extract(&buffer, selection, &[region]), "helloworld\nagain");
+    }
+
+    #[test]
+    fn restores_a_word_break_across_bounded_chunks() {
+        let area = Rect::new(0, 0, 5, 1);
+        let text = Text::raw("hello world");
+        let selection = Selection::new(position(0, 0), position(2, 0));
+        let mut extraction = Extraction::new();
+        let mut first = Buffer::empty(area);
+        Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .render(area, &mut first);
+        let first_region = SelectableRegion::new(
+            area,
+            0,
+            RowBreaks::for_rows(&text, area.width, 0, 1),
+            CardId::new(0),
+        );
+        extraction.append(
+            &first,
+            selection
+                .project(Viewport::new(area, 0))
+                .expect("first chunk is visible"),
+            &[first_region],
+        );
+
+        let mut second = Buffer::empty(area);
+        Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((1, 0))
+            .render(area, &mut second);
+        let second_region = SelectableRegion::new(
+            area,
+            0,
+            RowBreaks::for_rows(&text, area.width, 1, 1),
+            CardId::new(0),
+        );
+        extraction.append(
+            &second,
+            selection
+                .project(Viewport::new(area, 1))
+                .expect("second chunk is visible"),
+            &[second_region],
+        );
+
+        assert_eq!(extraction.finish(), "hello world");
     }
 
     #[test]

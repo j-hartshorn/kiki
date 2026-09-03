@@ -132,7 +132,7 @@ All commands must pass. The live OpenAI test remains ignored without explicit cr
 
 **Tests** (`src/transcript.rs`, display-projection behaviour) — First fail on a narrow wrapped Markdown card whose copied text has no soft newline. Cover hard newlines, generated Markdown presentation such as links/lists/tables, card padding, nested arena frames and labels, collapsed and hidden content, cross-card ordering and separators, backwards and off-screen ranges, clipping, tiny widths, long chunked extraction, and wide/combining graphemes. Assert existing rendered buffers and heights remain unchanged when no selection is present.
 
-**Files** — Modify: `src/transcript.rs`.
+**Files** — Modify: `src/selection.rs`, `src/transcript.rs`.
 
 **Verification** — `cargo test transcript::tests` passes; `cargo test selection::tests` remains green; `cargo check --all-targets` passes.
 
