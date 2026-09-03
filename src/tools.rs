@@ -739,46 +739,9 @@ struct WholeFileWrite {
     fingerprint: ContentFingerprint,
 }
 
-#[allow(dead_code)]
-impl WholeFileWrite {
-    fn created(&self) -> bool {
-        matches!(self.outcome, WholeFileWriteOutcome::Created)
-    }
-
-    fn replaced(&self) -> bool {
-        matches!(self.outcome, WholeFileWriteOutcome::Replaced)
-    }
-
-    fn fingerprint(&self) -> ContentFingerprint {
-        self.fingerprint
-    }
-}
-
-#[allow(dead_code)]
-enum WholeFileEditOutcome {
-    Applied,
-}
-
-#[allow(dead_code)]
 struct WholeFileEdit {
-    outcome: WholeFileEditOutcome,
     pre_fingerprint: ContentFingerprint,
     post_fingerprint: ContentFingerprint,
-}
-
-#[allow(dead_code)]
-impl WholeFileEdit {
-    fn applied(&self) -> bool {
-        matches!(self.outcome, WholeFileEditOutcome::Applied)
-    }
-
-    fn pre_fingerprint(&self) -> ContentFingerprint {
-        self.pre_fingerprint
-    }
-
-    fn post_fingerprint(&self) -> ContentFingerprint {
-        self.post_fingerprint
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1771,7 +1734,6 @@ impl ToolHost {
         let WholeFileEdit {
             pre_fingerprint,
             post_fingerprint,
-            ..
         } = self.edit_file_at(path, old, new).await?;
         Ok(ToolOutput {
             result: ToolValue::None,
@@ -1927,17 +1889,14 @@ fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError>
             "write() expects two positional string arguments",
         ));
     };
-    let Ok([path, content]) = <[ToolValue; 2]>::try_from(arguments) else {
-        return Err(ToolError::type_error(
+    match <[ToolValue; 2]>::try_from(arguments) {
+        Ok([ToolValue::String(path), ToolValue::String(content)]) => {
+            Ok((normalise_path(&path)?, content))
+        }
+        _ => Err(ToolError::type_error(
             "write() expects two positional string arguments",
-        ));
-    };
-    let (ToolValue::String(path), ToolValue::String(content)) = (path, content) else {
-        return Err(ToolError::type_error(
-            "write() expects two positional string arguments",
-        ));
-    };
-    Ok((normalise_path(&path)?, content))
+        )),
+    }
 }
 
 fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), ToolError> {
@@ -1946,19 +1905,18 @@ fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), Too
             "edit() expects three positional string arguments",
         ));
     };
-    let Ok([path, old, new]) = <[ToolValue; 3]>::try_from(arguments) else {
-        return Err(ToolError::type_error(
+    match <[ToolValue; 3]>::try_from(arguments) {
+        Ok(
+            [
+                ToolValue::String(path),
+                ToolValue::String(old),
+                ToolValue::String(new),
+            ],
+        ) => Ok((normalise_path(&path)?, old, new)),
+        _ => Err(ToolError::type_error(
             "edit() expects three positional string arguments",
-        ));
-    };
-    let (ToolValue::String(path), ToolValue::String(old), ToolValue::String(new)) =
-        (path, old, new)
-    else {
-        return Err(ToolError::type_error(
-            "edit() expects three positional string arguments",
-        ));
-    };
-    Ok((normalise_path(&path)?, old, new))
+        )),
+    }
 }
 
 fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
@@ -2105,21 +2063,7 @@ fn list_directory(
         let metadata = directory
             .symlink_metadata(&file_name)
             .map_err(ToolError::from_io)?;
-        let (kind, size_bytes) = if metadata.file_type().is_symlink() {
-            ("symlink", None)
-        } else if metadata.is_file() {
-            (
-                "file",
-                Some(
-                    i64::try_from(metadata.len())
-                        .map_err(|_| ToolError::new(ToolErrorKind::Os, "file size is too large"))?,
-                ),
-            )
-        } else if metadata.is_dir() {
-            ("directory", None)
-        } else {
-            ("other", None)
-        };
+        let (kind, size_bytes) = entry_kind(&metadata)?;
         let path = if base_path.is_empty() {
             name.to_owned()
         } else {
@@ -2146,14 +2090,7 @@ fn list_directory(
                     limits.max_collection_payload_bytes
                 )));
             }
-            Ok(ToolValue::Dictionary(BTreeMap::from([
-                ("path".to_owned(), ToolValue::String(path)),
-                ("kind".to_owned(), ToolValue::String(kind.to_owned())),
-                (
-                    "size_bytes".to_owned(),
-                    size_bytes.map_or(ToolValue::None, ToolValue::Integer),
-                ),
-            ])))
+            Ok(directory_entry_value(path, kind, size_bytes))
         })
         .collect()
 }
@@ -3186,7 +3123,6 @@ fn edit_whole_file(
         test_hook,
     )?;
     Ok(WholeFileEdit {
-        outcome: WholeFileEditOutcome::Applied,
         pre_fingerprint,
         post_fingerprint,
     })
@@ -5766,10 +5702,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(root.created());
-        assert!(nested.created());
-        assert!(root.fingerprint() == fingerprint("root"));
-        assert!(nested.fingerprint() == fingerprint("nested"));
+        assert!(root.outcome == super::WholeFileWriteOutcome::Created);
+        assert!(nested.outcome == super::WholeFileWriteOutcome::Created);
+        assert!(root.fingerprint == fingerprint("root"));
+        assert!(nested.fingerprint == fingerprint("nested"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("root")).unwrap(),
             "root"
@@ -5800,7 +5736,8 @@ mod tests {
             write(&host, "at-limit", "1234", None)
                 .await
                 .unwrap()
-                .created()
+                .outcome
+                == super::WholeFileWriteOutcome::Created
         );
     }
 
@@ -5826,8 +5763,8 @@ mod tests {
         let outcome = write(&host, "file", "after", Some(fingerprint("before")))
             .await
             .unwrap();
-        assert!(outcome.replaced());
-        assert!(outcome.fingerprint() == fingerprint("after"));
+        assert!(outcome.outcome == super::WholeFileWriteOutcome::Replaced);
+        assert!(outcome.fingerprint == fingerprint("after"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("file")).unwrap(),
             "after"
@@ -6155,7 +6092,8 @@ mod tests {
             write(&host, "fallback", "contents", None)
                 .await
                 .unwrap()
-                .created()
+                .outcome
+                == super::WholeFileWriteOutcome::Created
         );
         assert_eq!(
             fs::read_to_string(workspace.path().join("fallback")).unwrap(),
@@ -6175,9 +6113,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.applied());
-        assert!(outcome.pre_fingerprint() == fingerprint(before));
-        assert!(outcome.post_fingerprint() == fingerprint("before replacement after"));
+        assert!(outcome.pre_fingerprint == fingerprint(before));
+        assert!(outcome.post_fingerprint == fingerprint("before replacement after"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("file")).unwrap(),
             "before replacement after"
