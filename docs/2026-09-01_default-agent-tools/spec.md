@@ -129,11 +129,11 @@ Run one non-login `/bin/sh -c` command with Kiki’s inherited environment, null
 
 Commands retain Kiki’s ordinary host filesystem, environment, and network permissions. Do not advertise an escape hatch to the model. The tool description and shared prompt guidance require project-local reads and effects, while this limitation remains explicit in user-facing documentation.
 
-Each command starts in a new Unix process group. Kiki owns that group and terminates remaining members after shell exit, Arena timeout, or user cancellation. If the shell exits while a background descendant still holds an output pipe, terminate the group before waiting for pipe EOF. Cancellation always wins over command completion or output-overflow reporting: it produces the Arena cancellation outcome, not a later tool exception. Background services are unsupported. A descendant that deliberately creates a separate session can escape this best-effort group cleanup.
+Each command starts in a new Unix process group. Kiki owns that group and terminates it immediately with `SIGKILL` after shell exit, command-output overflow, Arena timeout, or user cancellation. If the shell exits while a background descendant still holds an output pipe, terminate the group before waiting for pipe EOF. Cancellation always wins over command completion or output-overflow reporting: it produces the Arena cancellation outcome, not a later tool exception. Background services are unsupported. A descendant that deliberately creates a separate session can escape this best-effort group cleanup.
 
 There is no separate command timeout. The five-minute whole-Arena wall deadline bounds Python and tools together.
 
-Decode stdout and stderr lossily as UTF-8, replacing invalid sequences with `U+FFFD`, while counting original bytes. Limit each stream independently to 8 MiB. If either exceeds its bound, continue draining until the command settles and then raise `RuntimeError`. The diagnostic names overflowing streams, configured limits, omitted bytes, final status when available, possible completed effects, and filtering or redirection remediation. No result is assigned, so every successful `CommandResult` contains complete output.
+Decode stdout and stderr lossily as UTF-8, replacing invalid sequences with `U+FFFD`, while counting original bytes. Limit each stream independently to 8 MiB. If either exceeds its bound, terminate the owned process group immediately, drain its pipes through cleanup and reaping, then raise `RuntimeError`. The diagnostic names overflowing streams, configured limits, omitted bytes, final status when available, possible completed effects, and filtering or redirection remediation. No result is assigned, so every successful `CommandResult` contains complete output.
 
 Earlier Python state and completed host effects remain committed after this ordinary runtime error. In `asyncio.gather()`, sibling host calls may also have completed even though gather raises and assigns no sibling results.
 
@@ -201,8 +201,9 @@ This implementation supports macOS and Linux. Windows shell and Job Object suppo
 - Keep only per-call result bounds; accept that a large gather can hit the Arena memory limit.
 - Use ordinary Python exceptions; reject a Kiki-specific error hierarchy and result-union boilerplate.
 - Use one-shot non-login `/bin/sh` with inherited environment and owned process groups; defer interactive, background, sandboxed, and Windows execution.
+- Terminate the owned process group immediately with `SIGKILL`; reject graceful-shutdown timing and escalation state for unsupported background work.
 - Let the five-minute whole-Arena deadline be the sole command timeout; reject both a second `run` timeout and active-Python deadline accounting.
-- Raise after an oversized command completes; accept loss of its result so incomplete output cannot be consumed as complete.
+- Terminate an oversized command and raise after cleanup; accept incomplete command effects so incomplete output cannot be consumed as complete.
 - Restore freshness state with a rolled-back Arena even though external effects remain; accept conservative rereads after uncertain execution.
 - Retain ordered path-free tool summaries; reject argument retention and aggregate-only evidence.
 - Keep policy in compile-time `src/config/constants.rs`; defer external configuration and bootstrap schema versioning.
@@ -216,7 +217,7 @@ This implementation supports macOS and Linux. Windows shell and Job Object suppo
 - Exercise final and intermediate symlinks whose targets are both inside and outside the workspace. Prove direct filesystem search can report a symlink entry without descending, can report `other` entries such as a Unix FIFO with `size_bytes=None`, and follows the complete path-kind exception matrix. Use Unix non-UTF-8 names to prove collections fail without lossy aliases. Test `run` separately as outside this direct-filesystem guarantee.
 - Cover every freshness transition: read, new write, authorised replacement, stale replacement, authorised edit, grep-based edit, same-batch read/write, mutation batches with reads completing in either order, read-only batches in reversed completion order, external change, ordinary Python error, and checkpoint recovery after completed or late mutation.
 - Execute generated bootstrap source in Monty and snapshot its prompt representation. At the provider-request boundary, prove bundled and overridden prompts advertise exactly the active phase’s runtime tools once and contain no legacy read contract.
-- Cover command success, non-zero and signal status, null-stdin EOF, independent stdout/stderr, lossy decoding, exact output boundaries, overflow after side effects, shell exit with a pipe-holding background child, process-group cleanup, and cancellation precedence.
+- Cover command success, non-zero and signal status, null-stdin EOF, independent stdout/stderr, lossy decoding, exact output boundaries, overflow-triggered process-group termination after earlier side effects, shell exit with a pipe-holding background child, process-group cleanup, and cancellation precedence.
 - Preserve existing checkpoint, model-feedback, progress-loss, transcript, collapse, memory-recovery, and credential-free all-target test coverage in every phase.
 
 ## Risks and unknowns
