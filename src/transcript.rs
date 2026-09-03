@@ -9,7 +9,10 @@ use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, Term
 use crate::arena::{
     Execution, ExecutionOutcome, Observation, ToolCall, ToolCallSummary, ToolCallToken,
 };
-use crate::config::{ApiKeyPresence, PromptProvenance, StartupSnapshot, SubmissionAvailability};
+use crate::config::{
+    ApiKeyPresence, DEFAULT_MODEL, PromptProvenance, StartupSnapshot, SubmissionAvailability,
+    model_by_id,
+};
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
@@ -1263,11 +1266,114 @@ impl CardRenderBlock {
     }
 }
 
+struct FooterField {
+    spans: Vec<Span<'static>>,
+}
+
+impl FooterField {
+    fn muted(text: String) -> Self {
+        Self {
+            spans: vec![Span::styled(text, muted_page_style())],
+        }
+    }
+
+    fn text(&self) -> String {
+        self.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+}
+
+struct Footer {
+    #[allow(dead_code)]
+    fields: Vec<FooterField>,
+    text: String,
+}
+
+impl Footer {
+    fn new(fields: Vec<FooterField>) -> Option<Self> {
+        (!fields.is_empty()).then(|| Self {
+            text: fields
+                .iter()
+                .map(FooterField::text)
+                .collect::<Vec<_>>()
+                .join(" "),
+            fields,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn spans(&self) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (index, field) in self.fields.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" ", muted_page_style()));
+            }
+            spans.extend(field.spans.clone());
+        }
+        spans
+    }
+
+    #[allow(dead_code)]
+    fn width(&self) -> usize {
+        self.fields.iter().map(FooterField::width).sum::<usize>()
+            + self.fields.len().saturating_sub(1)
+    }
+
+    #[allow(dead_code)]
+    fn truncated_spans(&self, width: u16) -> Vec<Span<'static>> {
+        if self.width() <= usize::from(width) {
+            return self.spans();
+        }
+        if width == 0 {
+            return Vec::new();
+        }
+        if width == 1 {
+            return vec![Span::styled("…", muted_page_style())];
+        }
+
+        let mut first = self.fields.len();
+        let mut used = 0_usize;
+        let available = usize::from(width.saturating_sub(2));
+        while first > 0 {
+            let field = &self.fields[first - 1];
+            let separator = usize::from(first < self.fields.len());
+            let field_width = field.width().saturating_add(separator);
+            if used.saturating_add(field_width) > available {
+                break;
+            }
+            first -= 1;
+            used = used.saturating_add(field_width);
+        }
+        if first == self.fields.len() {
+            return vec![Span::styled("…", muted_page_style())];
+        }
+
+        let mut spans = vec![
+            Span::styled("…", muted_page_style()),
+            Span::styled(" ", muted_page_style()),
+        ];
+        for (index, field) in self.fields[first..].iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" ", muted_page_style()));
+            }
+            spans.extend(field.spans.clone());
+        }
+        spans
+    }
+}
+
 pub(crate) struct TranscriptLayout {
     blocks: Vec<RenderBlock>,
     width: u16,
     total_height: usize,
-    footer: Option<String>,
+    footer: Option<Footer>,
 }
 
 impl TranscriptLayout {
@@ -1276,7 +1382,39 @@ impl TranscriptLayout {
     }
 
     pub(crate) fn footer(&self) -> Option<&str> {
-        self.footer.as_deref()
+        self.footer.as_ref().map(|footer| footer.text.as_str())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn footer_rule(&self, width: u16) -> Line<'static> {
+        let Some(footer) = &self.footer else {
+            return Line::raw("─".repeat(usize::from(width)));
+        };
+        match width {
+            0 => Line::raw(""),
+            1 => Line::from(footer.truncated_spans(1)),
+            2 => Line::from(vec![Span::styled("…", muted_page_style()), Span::raw("─")]),
+            3 => Line::from(vec![
+                Span::raw("─"),
+                Span::styled("…", muted_page_style()),
+                Span::raw("─"),
+            ]),
+            4 => Line::from(vec![
+                Span::raw("─"),
+                Span::styled("…", muted_page_style()),
+                Span::raw(" ─"),
+            ]),
+            _ => {
+                let mut footer = footer.truncated_spans(width - 4);
+                let footer_width = footer.iter().map(Span::width).sum::<usize>();
+                let leading_rules =
+                    usize::from(width).saturating_sub(footer_width.saturating_add(3));
+                let mut spans = vec![Span::raw("─".repeat(leading_rules)), Span::raw(" ")];
+                spans.append(&mut footer);
+                spans.push(Span::raw(" ─"));
+                Line::from(spans)
+            }
+        }
     }
 
     pub(crate) fn render(&self, viewport: Rect, top: usize, buffer: &mut Buffer) {
@@ -1362,7 +1500,7 @@ impl TranscriptLayout {
 
 struct DisplayProjection {
     blocks: Vec<TranscriptBlock>,
-    footer: Option<String>,
+    footer: Option<Footer>,
 }
 
 pub(crate) struct Transcript {
@@ -2283,16 +2421,88 @@ impl SessionAccounting {
     }
 }
 
-fn session_footer(attempts: &[&AttemptAccounting]) -> Option<String> {
+struct ContextMetric {
+    percent: u128,
+    denominator: &'static str,
+}
+
+struct LatestAttemptMetrics {
+    context: Option<ContextMetric>,
+    cache_hit: Option<String>,
+}
+
+fn latest_settled_attempt_metrics(attempts: &[&AttemptAccounting]) -> Option<LatestAttemptMetrics> {
+    let attempt = attempts.iter().next_back()?;
+    let usage = match attempt {
+        AttemptAccounting::KnownUsage(usage)
+        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => usage,
+        AttemptAccounting::UsageUnavailable => return None,
+    };
+    let model = model_by_id(&usage.model).unwrap_or(DEFAULT_MODEL);
+    let context = usage.total_tokens.map(|total| {
+        let (capacity, denominator) = if total <= model.pricing.long_context_threshold {
+            (
+                model.pricing.long_context_threshold,
+                model.pricing.long_context_threshold_display,
+            )
+        } else {
+            (model.context_window_tokens, model.context_window_display)
+        };
+        ContextMetric {
+            percent: (u128::from(total) * 100 + u128::from(capacity) / 2) / u128::from(capacity),
+            denominator,
+        }
+    });
+    let cache_hit = match (usage.input_tokens, usage.cached_input_tokens) {
+        (Some(input), Some(cached)) if input > 0 && cached <= input => {
+            let tenths = (u128::from(cached) * 1_000 + u128::from(input) / 2) / u128::from(input);
+            Some(if tenths % 10 == 0 {
+                format!("H{}%", tenths / 10)
+            } else {
+                format!("H{}.{}%", tenths / 10, tenths % 10)
+            })
+        }
+        _ => None,
+    };
+    Some(LatestAttemptMetrics { context, cache_hit })
+}
+
+fn session_footer(attempts: &[&AttemptAccounting]) -> Option<Footer> {
     let mut accounting = SessionAccounting::default();
     for attempt in attempts {
         accounting.add(attempt);
     }
-    let mut fields = accounting_fields(&accounting);
-    if let Some(cost) = estimated_cost(attempts.iter().copied()) {
-        fields.push(cost);
+    let mut fields = accounting_fields(&accounting)
+        .into_iter()
+        .map(FooterField::muted)
+        .collect::<Vec<_>>();
+    if let Some(metrics) = latest_settled_attempt_metrics(attempts) {
+        if let Some(context) = metrics.context {
+            fields.push(FooterField {
+                spans: vec![
+                    Span::styled("C", muted_page_style()),
+                    Span::styled(
+                        format!("{}%", context.percent),
+                        if context.percent >= 90 {
+                            Style::new().fg(Color::Red)
+                        } else if context.percent >= 80 {
+                            Style::new().fg(Color::Yellow)
+                        } else {
+                            muted_page_style()
+                        },
+                    ),
+                    Span::styled(format!("/{}", context.denominator), muted_page_style()),
+                ],
+            });
+        }
+        if let Some(cache_hit) = metrics.cache_hit {
+            fields.push(FooterField::muted(cache_hit));
+        }
     }
-    (!fields.is_empty()).then(|| fields.join(" "))
+    if let Some(cost) = estimated_cost(attempts.iter().copied()) {
+        fields.push(FooterField::muted(cost));
+    }
+    Footer::new(fields)
 }
 
 fn add_total(total: &mut Option<u128>, value: Option<u64>) {
@@ -2429,8 +2639,8 @@ mod tests {
     use super::{
         ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, IN_PROGRESS_ARENA, MUTED,
         NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER,
-        assistant_text, markdown, normalise_terminal_text, own_styled_text, page_style,
-        tool_call_label,
+        assistant_text, markdown, muted_page_style, normalise_terminal_text, own_styled_text,
+        page_style, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -3690,6 +3900,279 @@ truncated"
     }
 
     #[test]
+    fn footer_reports_short_context_occupancy_and_cache_hit_rate() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "metrics()",
+                "",
+                vec![detailed_usage(
+                    Some(217_600),
+                    Some(0),
+                    Some(163_200),
+                    Some(0),
+                    Some(0),
+                    Some(217_600),
+                )],
+            ),
+            false,
+        );
+
+        assert_eq!(
+            transcript.layout(80).footer(),
+            Some("↑217600 ↓0 R163200 W0 r0 Σ217600 C80%/272k H75% $0.28288")
+        );
+    }
+
+    #[test]
+    fn footer_context_metric_switches_capacity_and_alert_styles() {
+        for (total, context, percentage, denominator, style) in [
+            (
+                216_240,
+                "C80%/272k",
+                "80%",
+                "/272k",
+                Style::new().fg(Color::Yellow),
+            ),
+            (
+                243_440,
+                "C90%/272k",
+                "90%",
+                "/272k",
+                Style::new().fg(Color::Red),
+            ),
+            (
+                272_000,
+                "C100%/272k",
+                "100%",
+                "/272k",
+                Style::new().fg(Color::Red),
+            ),
+            (272_001, "C26%/1.05m", "26%", "/1.05m", muted_page_style()),
+        ] {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                completed_execution(
+                    1,
+                    1,
+                    "metrics()",
+                    "",
+                    vec![detailed_usage(
+                        Some(total),
+                        Some(0),
+                        None,
+                        None,
+                        None,
+                        Some(total),
+                    )],
+                ),
+                false,
+            );
+
+            let footer = transcript.layout(128).footer_rule(128);
+            assert!(footer.to_string().contains(context), "{footer}");
+            assert_eq!(
+                footer
+                    .spans
+                    .iter()
+                    .find(|span| span.content == "C")
+                    .expect("context prefix span")
+                    .style,
+                muted_page_style()
+            );
+            assert_eq!(
+                footer
+                    .spans
+                    .iter()
+                    .find(|span| span.content == percentage)
+                    .expect("context percentage span")
+                    .style,
+                style
+            );
+            assert_eq!(
+                footer
+                    .spans
+                    .iter()
+                    .find(|span| span.content == denominator)
+                    .expect("context denominator span")
+                    .style,
+                muted_page_style()
+            );
+        }
+    }
+
+    #[test]
+    fn footer_formats_cache_hit_rates_and_omits_invalid_values() {
+        for (input, cached, expected) in [(4, 3, "H75%"), (4, 4, "H100%"), (1_000, 873, "H87.3%")] {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                completed_execution(
+                    1,
+                    1,
+                    "metrics()",
+                    "",
+                    vec![detailed_usage(
+                        Some(input),
+                        Some(0),
+                        Some(cached),
+                        Some(0),
+                        Some(0),
+                        Some(input),
+                    )],
+                ),
+                false,
+            );
+
+            let layout = transcript.layout(80);
+            assert!(layout.footer().expect("footer").contains(expected));
+            assert_eq!(
+                layout
+                    .footer_rule(80)
+                    .spans
+                    .iter()
+                    .find(|span| span.content == expected)
+                    .expect("cache-hit span")
+                    .style,
+                muted_page_style()
+            );
+        }
+
+        for usage in [
+            detailed_usage(Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)),
+            detailed_usage(Some(1), Some(0), None, Some(0), Some(0), Some(1)),
+            detailed_usage(Some(1), Some(0), Some(2), Some(0), Some(0), Some(1)),
+        ] {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                completed_execution(1, 1, "metrics()", "", vec![usage]),
+                false,
+            );
+
+            assert!(
+                !transcript
+                    .layout(80)
+                    .footer()
+                    .expect("footer")
+                    .contains(" H")
+            );
+        }
+    }
+
+    #[test]
+    fn footer_uses_the_latest_settled_attempt_during_streaming() {
+        let first = detailed_usage(
+            Some(100_000),
+            Some(0),
+            Some(25_000),
+            Some(0),
+            Some(0),
+            Some(100_000),
+        );
+        let latest = detailed_usage(
+            Some(216_240),
+            Some(0),
+            Some(162_180),
+            Some(0),
+            Some(0),
+            Some(216_240),
+        );
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "metrics()", "", vec![first, latest]),
+            false,
+        );
+
+        let settled_footer = transcript.layout(128).footer().expect("footer").to_owned();
+        assert!(settled_footer.contains("C80%/272k H75%"));
+        assert!(!settled_footer.contains("C37%/272k H25%"));
+
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+        transcript.apply(
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+        assert_eq!(
+            transcript.layout(128).footer(),
+            Some(settled_footer.as_str())
+        );
+
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: AttemptAccounting::UsageUnavailable,
+                },
+            },
+            false,
+        );
+        let unavailable_layout = transcript.layout(128);
+        let unavailable_footer = unavailable_layout.footer().expect("footer");
+        assert!(!unavailable_footer.contains(" C"));
+        assert!(!unavailable_footer.contains(" H"));
+    }
+
+    #[test]
+    fn footer_rule_fills_the_terminal_and_truncates_to_latest_metrics() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "metrics()",
+                "",
+                vec![detailed_usage(
+                    Some(217_600),
+                    Some(0),
+                    Some(163_200),
+                    Some(0),
+                    Some(0),
+                    Some(217_600),
+                )],
+            ),
+            false,
+        );
+
+        let full = transcript.layout(128).footer_rule(128);
+        assert_eq!(full.width(), 128);
+        assert!(full.to_string().starts_with('─'), "{full}");
+        assert!(full.to_string().ends_with(" ─"), "{full}");
+        assert_eq!(
+            full.spans
+                .iter()
+                .find(|span| span.content == "80%")
+                .expect("context percentage span")
+                .style,
+            Style::new().fg(Color::Yellow)
+        );
+
+        let narrow = transcript.layout(29).footer_rule(29);
+        assert_eq!(narrow.width(), 29);
+        assert_eq!(narrow.to_string(), "─ … C80%/272k H75% $0.28288 ─");
+        assert_eq!(
+            narrow
+                .spans
+                .iter()
+                .find(|span| span.content == "80%")
+                .expect("context percentage span")
+                .style,
+            Style::new().fg(Color::Yellow)
+        );
+
+        for width in 0..=12 {
+            let rule = Transcript::default().layout(width).footer_rule(width);
+            assert_eq!(rule.width(), usize::from(width));
+            assert_eq!(rule.to_string(), "─".repeat(usize::from(width)));
+        }
+    }
+
+    #[test]
     fn accounting_compacts_attempt_fields_and_omits_unavailable_values() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -3790,7 +4273,7 @@ truncated"
             panic!("zero accounting arena")
         };
         assert_eq!(zeroes_arena.accounting.as_deref(), Some("↑0 R0 r0 Σ0"));
-        assert_eq!(zeroes.layout(1).footer(), Some("↑0 R0 r0 Σ0"));
+        assert_eq!(zeroes.layout(1).footer(), Some("↑0 R0 r0 Σ0 C0%/272k"));
 
         let mut complete = Transcript::default();
         complete.apply(
