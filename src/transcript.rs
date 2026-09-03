@@ -1277,38 +1277,20 @@ impl FooterField {
         }
     }
 
-    fn text(&self) -> String {
-        self.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    #[allow(dead_code)]
     fn width(&self) -> usize {
         self.spans.iter().map(Span::width).sum()
     }
 }
 
 struct Footer {
-    #[allow(dead_code)]
     fields: Vec<FooterField>,
-    text: String,
 }
 
 impl Footer {
     fn new(fields: Vec<FooterField>) -> Option<Self> {
-        (!fields.is_empty()).then(|| Self {
-            text: fields
-                .iter()
-                .map(FooterField::text)
-                .collect::<Vec<_>>()
-                .join(" "),
-            fields,
-        })
+        (!fields.is_empty()).then_some(Self { fields })
     }
 
-    #[allow(dead_code)]
     fn spans(&self) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         for (index, field) in self.fields.iter().enumerate() {
@@ -1320,13 +1302,11 @@ impl Footer {
         spans
     }
 
-    #[allow(dead_code)]
     fn width(&self) -> usize {
         self.fields.iter().map(FooterField::width).sum::<usize>()
             + self.fields.len().saturating_sub(1)
     }
 
-    #[allow(dead_code)]
     fn truncated_spans(&self, width: u16) -> Vec<Span<'static>> {
         if self.width() <= usize::from(width) {
             return self.spans();
@@ -1381,11 +1361,6 @@ impl TranscriptLayout {
         self.total_height
     }
 
-    pub(crate) fn footer(&self) -> Option<&str> {
-        self.footer.as_ref().map(|footer| footer.text.as_str())
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn footer_rule(&self, width: u16) -> Line<'static> {
         let Some(footer) = &self.footer else {
             return Line::raw("─".repeat(usize::from(width)));
@@ -2805,6 +2780,16 @@ mod tests {
         buffer
     }
 
+    fn footer_text(layout: &TranscriptLayout) -> Option<String> {
+        layout.footer.as_ref().map(|footer| {
+            footer
+                .spans()
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+    }
+
     fn card(block: &RenderBlock) -> Option<&CardRenderBlock> {
         let RenderBlock::Card(card) = block else {
             return None;
@@ -3921,7 +3906,7 @@ truncated"
         );
 
         assert_eq!(
-            transcript.layout(80).footer(),
+            footer_text(&transcript.layout(80)).as_deref(),
             Some("↑217600 ↓0 R163200 W0 r0 Σ217600 C80%/272k H75% $0.28288")
         );
     }
@@ -4026,7 +4011,7 @@ truncated"
             );
 
             let layout = transcript.layout(80);
-            assert!(layout.footer().expect("footer").contains(expected));
+            assert!(footer_text(&layout).expect("footer").contains(expected));
             assert_eq!(
                 layout
                     .footer_rule(80)
@@ -4051,9 +4036,7 @@ truncated"
             );
 
             assert!(
-                !transcript
-                    .layout(80)
-                    .footer()
+                !footer_text(&transcript.layout(80))
                     .expect("footer")
                     .contains(" H")
             );
@@ -4084,7 +4067,7 @@ truncated"
             false,
         );
 
-        let settled_footer = transcript.layout(128).footer().expect("footer").to_owned();
+        let settled_footer = footer_text(&transcript.layout(128)).expect("footer");
         assert!(settled_footer.contains("C80%/272k H75%"));
         assert!(!settled_footer.contains("C37%/272k H25%"));
 
@@ -4097,7 +4080,7 @@ truncated"
             false,
         );
         assert_eq!(
-            transcript.layout(128).footer(),
+            footer_text(&transcript.layout(128)).as_deref(),
             Some(settled_footer.as_str())
         );
 
@@ -4113,7 +4096,7 @@ truncated"
             false,
         );
         let unavailable_layout = transcript.layout(128);
-        let unavailable_footer = unavailable_layout.footer().expect("footer");
+        let unavailable_footer = footer_text(&unavailable_layout).expect("footer");
         assert!(!unavailable_footer.contains(" C"));
         assert!(!unavailable_footer.contains(" H"));
     }
@@ -4169,6 +4152,9 @@ truncated"
             let rule = Transcript::default().layout(width).footer_rule(width);
             assert_eq!(rule.width(), usize::from(width));
             assert_eq!(rule.to_string(), "─".repeat(usize::from(width)));
+
+            let populated_rule = transcript.layout(width).footer_rule(width);
+            assert_eq!(populated_rule.width(), usize::from(width));
         }
     }
 
@@ -4204,7 +4190,7 @@ truncated"
         );
 
         assert_eq!(
-            transcript.layout(1).footer(),
+            footer_text(&transcript.layout(1)).as_deref(),
             Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
         );
 
@@ -4224,7 +4210,7 @@ truncated"
             panic!("unavailable accounting arena")
         };
         assert_eq!(unavailable_arena.accounting, None);
-        assert_eq!(unavailable.layout(1).footer(), None);
+        assert_eq!(footer_text(&unavailable.layout(1)), None);
 
         let AttemptAccounting::KnownUsage(mut partial_usage) =
             detailed_usage(Some(7), None, None, None, None, None)
@@ -4248,7 +4234,7 @@ truncated"
             panic!("unpriceable accounting arena")
         };
         assert_eq!(unpriceable_arena.accounting.as_deref(), Some("↑7"));
-        assert_eq!(unpriceable.layout(1).footer(), Some("↑7"));
+        assert_eq!(footer_text(&unpriceable.layout(1)).as_deref(), Some("↑7"));
 
         let mut zeroes = Transcript::default();
         zeroes.apply(
@@ -4273,7 +4259,10 @@ truncated"
             panic!("zero accounting arena")
         };
         assert_eq!(zeroes_arena.accounting.as_deref(), Some("↑0 R0 r0 Σ0"));
-        assert_eq!(zeroes.layout(1).footer(), Some("↑0 R0 r0 Σ0 C0%/272k"));
+        assert_eq!(
+            footer_text(&zeroes.layout(1)).as_deref(),
+            Some("↑0 R0 r0 Σ0 C0%/272k")
+        );
 
         let mut complete = Transcript::default();
         complete.apply(

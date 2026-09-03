@@ -1,6 +1,6 @@
 # Kiki
 
-Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint with the fixed `gpt-5.6-sol/default` model. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, and `grep`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
+Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `gpt-5.6-sol` (the default flagship model), `gpt-5.6-terra` (the intelligence/cost balance), or `gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, and `grep`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
 
 ## Setup
 
@@ -10,12 +10,13 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.21 --locked --root /tmp/kiki-monty-0.0.21
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override. Export the variables:
+Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, or `KIKI_MODEL` to one of `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`; when unset, it uses `gpt-5.6-sol`. Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
 export MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty
 export KIKI_SYSTEM_PROMPT=/absolute/path/to/read_only_agent.md
+export KIKI_MODEL=gpt-5.6-terra
 ```
 
 Launch Kiki from the workspace the agent may inspect and modify:
@@ -30,7 +31,7 @@ Alternatively, put the variables in the ignored root `.env` file and launch with
 
 `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
 
-Credentials and opaque provider replay data stay hidden from Kiki records and display. Returned token usage has a versioned local estimate for `gpt-5.6-sol/default`; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable.
+Credentials and opaque provider replay data stay hidden from Kiki records and display. Returned token usage has a versioned `2026-08-27` local direct-API Standard estimate for the reported `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` model. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable.
 
 ## Controls and availability
 
@@ -60,7 +61,7 @@ User requests appear in neutral cards without a `you:` label. RunId and ModelSte
 
 Automatic collapse applies only when source exceeds 32 logical lines or combined execution-content lines exceeds 16 logical lines. It keeps the latest 32 source lines and latest 16 combined execution-content lines. Each affected code or execution section owns its skipped-line count in its top border as `<label> · N earlier line(s) omitted`; a non-empty execution section wholly consumed by the shared output budget remains as a closed titled box. Section labels and borders, live activity, failure or cancellation diagnostics, display-gap, and accounting do not consume those budgets. `tool calls` has its own automatic preview: it shows the latest 16 rows, preceded by `[N earlier tool calls omitted]` when needed. The tool-call trace is deliberately unbounded per execution; this display collapse is its only bound. `Ctrl-O` expands every retained source, tool-call, and execution row together or restores automatic collapse; it cannot recover source or execution content outside their existing retention bounds. Tree-sitter highlights exact partial and settled Python source. If highlighting fails, Kiki shows the exact source as plain text.
 
-The configured prompt is a grapheme-aware editor with a visible terminal cursor. It is bottom anchored between full-width top and always-present bottom rules, wraps at display-cell boundaries while preserving explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then follows its tail or keeps a moved caret visible. The session footer sits right-aligned inside the prompt's bottom rule, in this order when reported: `↑` reported input, `↓` reported output, `R` cached input, `W` cache-write input, `r` reasoning output, `Σ` provider-reported total, `$` local estimated cost. It never adds or moves a row; on narrow terminals it truncates its left side with `…` to preserve the rightmost totals and cost. `r` is an informational subset of output, not an additional total; `Σ` is not recomputed locally. Missing values are omitted. The footer is absent without metrics and in the configuration-only view. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
+The configured prompt is a grapheme-aware editor with a visible terminal cursor. It is bottom anchored between full-width top and always-present bottom rules, wraps at display-cell boundaries while preserving explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then follows its tail or keeps a moved caret visible. The session footer sits right-aligned inside the prompt's bottom rule, in this order when reported: `↑` reported input, `↓` reported output, `R` cached input, `W` cache-write input, `r` reasoning output, `Σ` provider-reported total, `C` latest settled-request context occupancy, `H` latest settled-request prompt-cache hit percentage, and `$` local estimated cost. `C` displays as `C<percent>/<capacity>` against `272k` while the latest total is at or below the 272,000-token long-context pricing threshold, then switches to the full `1.05m` context capacity above it. Its percentage is yellow from 80% through 89% and red from 90% against the active denominator. `H` is cached input as a percentage of input, with one decimal place only when needed. It never adds or moves a row; on narrow terminals it truncates its left side with `…`, preferring the rightmost `C`, `H`, and `$` fields. `r` is an informational subset of output, not an additional total; `Σ` is not recomputed locally. Missing values are omitted. The footer is absent without metrics and in the configuration-only view. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
 
 ## Manual interactive transcript demonstration
 
@@ -78,7 +79,7 @@ Submit this prompt:
 Use the Python arena in separate steps. First read `README.md` into persistent Python state named `readme` and print its character count. In a later Python step, use that retained `readme` value to count its `## ` headings and print the count. Then return a GFM response with a heading, task list, link to `README.md`, and fenced code block.
 ```
 
-Check streamed GFM and reasoning, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, unlabelled user cards, activity without internal identifiers, a closed rounded lifecycle frame with closed labelled source and execution sections, unboxed accounting, and the neutral borderless assistant block. On a terminal with enhanced modified-key reporting, verify `Shift-Enter` adds a prompt newline; verify the bottom-anchored wrapping prompt, `Ctrl-T`, `Ctrl-O`, scrolling, and the right-aligned footer embedded in its bottom rule, including left-side ellipsis truncation that preserves the cost.
+Check streamed GFM and reasoning, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, unlabelled user cards, activity without internal identifiers, a closed rounded lifecycle frame with closed labelled source and execution sections, unboxed accounting, and the neutral borderless assistant block. On a terminal with enhanced modified-key reporting, verify `Shift-Enter` adds a prompt newline; verify the bottom-anchored wrapping prompt, `Ctrl-T`, `Ctrl-O`, scrolling, and the right-aligned footer embedded in its bottom rule, including left-side ellipsis truncation that prefers the rightmost `C`, `H`, and `$` fields.
 
 ## Deterministic verification
 
