@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use crate::prompt::{self, PromptError, PromptSource, ResolvedPrompt};
 
 pub(crate) mod constants;
+pub mod models;
+
+pub use models::{
+    DEFAULT_MODEL, ModelConfiguration, ModelPricing, PricingIdentity, Rates, model_by_id,
+};
 
 use self::constants::FIXED_MODEL;
 
