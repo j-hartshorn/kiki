@@ -559,6 +559,33 @@ impl WholeFileWrite {
     }
 }
 
+#[allow(dead_code)]
+enum WholeFileEditOutcome {
+    Applied,
+}
+
+#[allow(dead_code)]
+struct WholeFileEdit {
+    outcome: WholeFileEditOutcome,
+    pre_fingerprint: ContentFingerprint,
+    post_fingerprint: ContentFingerprint,
+}
+
+#[allow(dead_code)]
+impl WholeFileEdit {
+    fn applied(&self) -> bool {
+        matches!(self.outcome, WholeFileEditOutcome::Applied)
+    }
+
+    fn pre_fingerprint(&self) -> ContentFingerprint {
+        self.pre_fingerprint
+    }
+
+    fn post_fingerprint(&self) -> ContentFingerprint {
+        self.post_fingerprint
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ToolLimits {
     max_file_bytes: usize,
@@ -818,6 +845,7 @@ struct ListDirTestGateState {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WritePause {
+    InitialRead,
     BeforePublish,
     BeforeRecheck,
 }
@@ -920,6 +948,16 @@ impl WriteTestHook {
             .lock()
             .expect("test hook mutex is not poisoned")
             .force_hard_link_fallback = true;
+    }
+
+    fn pause_before_initial_read() -> Self {
+        let hook = Self::new();
+        hook.state
+            .0
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .pause = Some(WritePause::InitialRead);
+        hook
     }
 
     fn pause_before_publish() -> Self {
@@ -1227,6 +1265,41 @@ impl ToolHost {
                 &path,
                 &content,
                 authorisation,
+                max_file_bytes,
+                #[cfg(test)]
+                write_test_hook.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+    }
+
+    #[allow(dead_code)]
+    async fn edit_file(
+        &self,
+        path: &str,
+        old: String,
+        new: String,
+    ) -> Result<WholeFileEdit, ToolError> {
+        let path = normalise_path(path)?;
+        if old.is_empty() {
+            return Err(ToolError::value("edit target cannot be empty"));
+        }
+        if old == new {
+            return Err(ToolError::value(
+                "edit replacement must differ from its target",
+            ));
+        }
+        let workspace = Arc::clone(&self.workspace);
+        let max_file_bytes = self.limits.max_file_bytes;
+        #[cfg(test)]
+        let write_test_hook = self.write_test_hook.clone();
+        tokio::task::spawn_blocking(move || {
+            edit_whole_file(
+                &workspace,
+                &path,
+                &old,
+                &new,
                 max_file_bytes,
                 #[cfg(test)]
                 write_test_hook.as_ref(),
@@ -2330,10 +2403,17 @@ const TEMPORARY_NAME_ATTEMPTS: usize = 16;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 enum WriteTarget {
     Missing,
-    Regular(Mode),
+    Regular,
     Directory,
     Symlink,
     Other,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct CurrentRegularFile {
+    contents: Vec<u8>,
+    fingerprint: ContentFingerprint,
+    mode: Mode,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2415,49 +2495,31 @@ fn write_whole_file(
                 fingerprint: content_fingerprint(content.as_bytes()),
             })
         }
-        WriteTarget::Regular(mode) => {
+        WriteTarget::Regular => {
             let Some(authorisation) = authorisation else {
                 return Err(ToolError::runtime(
                     "file contents are not authorised for replacement",
                 ));
             };
-            let initial = current_fingerprint(&parent, &name, max_file_bytes)
-                .map_err(|_| ToolError::runtime("file changed during replacement"))?;
-            if initial != authorisation {
-                return Err(ToolError::runtime("file changed during replacement"));
-            }
-            let (temporary, file) = create_temporary_file(
-                &parent,
-                #[cfg(test)]
-                test_hook,
-            )?;
-            let mut temporary_file = UnpublishedTemporary::new(&parent, temporary);
-            write_temporary_file(
-                file,
-                content,
-                Some(mode),
-                #[cfg(test)]
-                test_hook,
-            )?;
             #[cfg(test)]
             if let Some(test_hook) = test_hook {
-                test_hook.pause(WritePause::BeforeRecheck);
+                test_hook.pause(WritePause::InitialRead);
             }
-            let latest = current_fingerprint(&parent, &name, max_file_bytes)
+            let initial = current_regular_file(&parent, &name, max_file_bytes)
                 .map_err(|_| ToolError::runtime("file changed during replacement"))?;
-            if latest != initial {
+            if initial.fingerprint != authorisation {
                 return Err(ToolError::runtime("file changed during replacement"));
             }
-            #[cfg(test)]
-            if test_hook.is_some_and(WriteTestHook::fail_publishing) {
-                return Err(ToolError::new(
-                    ToolErrorKind::Os,
-                    "temporary file publication failed",
-                ));
-            }
-            renameat(&parent, &temporary_file.name, &parent, &name)
-                .map_err(replacement_rename_error)?;
-            temporary_file.publish();
+            replace_existing_file(
+                &parent,
+                &name,
+                content,
+                initial.fingerprint,
+                initial.mode,
+                max_file_bytes,
+                #[cfg(test)]
+                test_hook,
+            )?;
             Ok(WholeFileWrite {
                 outcome: WholeFileWriteOutcome::Replaced,
                 fingerprint: content_fingerprint(content.as_bytes()),
@@ -2483,6 +2545,82 @@ fn write_whole_file(
     _max_file_bytes: usize,
     #[cfg(test)] _test_hook: Option<&WriteTestHook>,
 ) -> Result<WholeFileWrite, ToolError> {
+    Err(ToolError::new(
+        ToolErrorKind::Os,
+        "workspace mutation is unsupported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn edit_whole_file(
+    workspace: &Dir,
+    path: &Path,
+    old: &str,
+    new: &str,
+    max_file_bytes: usize,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileEdit, ToolError> {
+    let (parent, name) = open_parent(workspace, path)?;
+    let CurrentRegularFile {
+        contents,
+        fingerprint: pre_fingerprint,
+        mode,
+    } = current_regular_file(&parent, &name, max_file_bytes)?;
+    let contents =
+        String::from_utf8(contents).map_err(|_| ToolError::value("file is not valid UTF-8"))?;
+    let Some(start) = contents.find(old) else {
+        return Err(ToolError::value("edit target does not occur exactly once"));
+    };
+    let next_search_start = start
+        + old
+            .chars()
+            .next()
+            .expect("edit target is non-empty")
+            .len_utf8();
+    if contents[next_search_start..].find(old).is_some() {
+        return Err(ToolError::value("edit target does not occur exactly once"));
+    }
+    let replacement_length = contents
+        .len()
+        .checked_sub(old.len())
+        .and_then(|length| length.checked_add(new.len()))
+        .ok_or_else(|| ToolError::value("edited file exceeds the byte limit"))?;
+    if replacement_length > max_file_bytes {
+        return Err(ToolError::value(format!(
+            "file exceeds the {max_file_bytes}-byte limit"
+        )));
+    }
+    let mut replacement = String::with_capacity(replacement_length);
+    replacement.push_str(&contents[..start]);
+    replacement.push_str(new);
+    replacement.push_str(&contents[start + old.len()..]);
+    let post_fingerprint = content_fingerprint(replacement.as_bytes());
+    replace_existing_file(
+        &parent,
+        &name,
+        &replacement,
+        pre_fingerprint,
+        mode,
+        max_file_bytes,
+        #[cfg(test)]
+        test_hook,
+    )?;
+    Ok(WholeFileEdit {
+        outcome: WholeFileEditOutcome::Applied,
+        pre_fingerprint,
+        post_fingerprint,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn edit_whole_file(
+    _workspace: &Dir,
+    _path: &Path,
+    _old: &str,
+    _new: &str,
+    _max_file_bytes: usize,
+    #[cfg(test)] _test_hook: Option<&WriteTestHook>,
+) -> Result<WholeFileEdit, ToolError> {
     Err(ToolError::new(
         ToolErrorKind::Os,
         "workspace mutation is unsupported on this platform",
@@ -2525,7 +2663,7 @@ fn write_target(parent: &Dir, name: &Path) -> Result<WriteTarget, ToolError> {
         Ok(stat) => {
             let file_type = FileType::from_raw_mode(stat.st_mode);
             if file_type.is_file() {
-                Ok(WriteTarget::Regular(Mode::from_raw_mode(stat.st_mode)))
+                Ok(WriteTarget::Regular)
             } else if file_type.is_dir() {
                 Ok(WriteTarget::Directory)
             } else if file_type.is_symlink() {
@@ -2540,17 +2678,73 @@ fn write_target(parent: &Dir, name: &Path) -> Result<WriteTarget, ToolError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn current_fingerprint(
+fn current_regular_file(
     parent: &Dir,
     name: &Path,
     max_file_bytes: usize,
-) -> Result<ContentFingerprint, ToolError> {
+) -> Result<CurrentRegularFile, ToolError> {
     let mut file = open_content_no_follow(parent, name)?;
     let stat = fstat(&file).map_err(|error| ToolError::from_io(error.into()))?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_dir() {
+        return Err(ToolError::new(
+            ToolErrorKind::IsADirectory,
+            "path is a directory",
+        ));
+    }
+    if !file_type.is_file() {
         return Err(ToolError::value("path is not a regular file"));
     }
-    read_limited(&mut file, max_file_bytes).map(|contents| content_fingerprint(&contents))
+    let contents = read_limited(&mut file, max_file_bytes)?;
+    Ok(CurrentRegularFile {
+        fingerprint: content_fingerprint(&contents),
+        contents,
+        mode: Mode::from_raw_mode(stat.st_mode),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn replace_existing_file(
+    parent: &Dir,
+    name: &Path,
+    content: &str,
+    initial_fingerprint: ContentFingerprint,
+    replacement_mode: Mode,
+    max_file_bytes: usize,
+    #[cfg(test)] test_hook: Option<&WriteTestHook>,
+) -> Result<(), ToolError> {
+    let (temporary, file) = create_temporary_file(
+        parent,
+        #[cfg(test)]
+        test_hook,
+    )?;
+    let mut temporary_file = UnpublishedTemporary::new(parent, temporary);
+    write_temporary_file(
+        file,
+        content,
+        Some(replacement_mode),
+        #[cfg(test)]
+        test_hook,
+    )?;
+    #[cfg(test)]
+    if let Some(test_hook) = test_hook {
+        test_hook.pause(WritePause::BeforeRecheck);
+    }
+    let latest = current_regular_file(parent, name, max_file_bytes)
+        .map_err(|_| ToolError::runtime("file changed during replacement"))?;
+    if latest.fingerprint != initial_fingerprint {
+        return Err(ToolError::runtime("file changed during replacement"));
+    }
+    #[cfg(test)]
+    if test_hook.is_some_and(WriteTestHook::fail_publishing) {
+        return Err(ToolError::new(
+            ToolErrorKind::Os,
+            "temporary file publication failed",
+        ));
+    }
+    renameat(parent, &temporary_file.name, parent, name).map_err(replacement_rename_error)?;
+    temporary_file.publish();
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2716,9 +2910,9 @@ mod tests {
 
     use super::{
         ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolError, ToolErrorKind, ToolHost, ToolName,
-        ToolValue, Utf8ValidatingReader, WholeFileAuthorisations, WholeFileWrite, WriteTestHook,
-        bootstrap_source, content_fingerprint, normalise_path, open_content_no_follow, open_parent,
-        prompt_reference,
+        ToolValue, Utf8ValidatingReader, WholeFileAuthorisations, WholeFileEdit, WholeFileWrite,
+        WriteTestHook, bootstrap_source, content_fingerprint, normalise_path,
+        open_content_no_follow, open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -4511,6 +4705,24 @@ mod tests {
         }
     }
 
+    async fn edit(
+        host: &ToolHost,
+        path: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<WholeFileEdit, ToolErrorKind> {
+        host.edit_file(path, old.to_owned(), new.to_owned())
+            .await
+            .map_err(|error| error.kind)
+    }
+
+    async fn edit_error(host: &ToolHost, path: &str, old: &str, new: &str) -> ToolErrorKind {
+        match edit(host, path, old, new).await {
+            Ok(_) => panic!("edit succeeded unexpectedly"),
+            Err(error) => error,
+        }
+    }
+
     fn fingerprint(contents: impl AsRef<[u8]>) -> ContentFingerprint {
         content_fingerprint(contents.as_ref())
     }
@@ -5005,6 +5217,408 @@ mod tests {
             "contents"
         );
         assert!(temporary_entries(workspace.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_one_exact_match_and_returns_content_fingerprints() {
+        let workspace = TempDir::new().unwrap();
+        let before = "before needle after";
+        fs::write(workspace.path().join("file"), before).unwrap();
+        let host = tool_host(&workspace).await;
+
+        let outcome = edit(&host, "./file", "needle", "replacement")
+            .await
+            .unwrap();
+
+        assert!(outcome.applied());
+        assert!(outcome.pre_fingerprint() == fingerprint(before));
+        assert!(outcome.post_fingerprint() == fingerprint("before replacement after"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before replacement after"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_empty_identical_zero_multiple_and_overlapping_matches_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "aaa").unwrap();
+        let host = tool_host(&workspace).await;
+
+        for (old, new) in [
+            ("", "x"),
+            ("aaa", "aaa"),
+            ("missing", "x"),
+            ("a", "x"),
+            ("aa", "x"),
+        ] {
+            assert_eq!(
+                edit_error(&host, "file", old, new).await,
+                ToolErrorKind::Value
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "aaa");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_counts_ascii_and_multibyte_matches_at_character_boundaries() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("ascii"), "one needle two").unwrap();
+        fs::write(workspace.path().join("multibyte"), "one é needle € two").unwrap();
+        fs::write(workspace.path().join("multibyte-overlap"), "ééé").unwrap();
+        fs::write(workspace.path().join("scalar"), "€").unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "ascii", "needle", "replacement").await.unwrap();
+        edit(&host, "multibyte", "é needle €", "£").await.unwrap();
+        assert_eq!(
+            edit_error(&host, "multibyte-overlap", "éé", "£").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            edit_error(&host, "scalar", "©", "replacement").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("ascii")).unwrap(),
+            "one replacement two"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("multibyte")).unwrap(),
+            "one £ two"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("multibyte-overlap")).unwrap(),
+            "ééé"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("scalar")).unwrap(),
+            "€"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_enforces_pre_and_post_edit_byte_limits_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let at_limit = workspace.path().join("at-limit");
+        let over_limit = workspace.path().join("over-limit");
+        let multibyte_at_limit = workspace.path().join("multibyte-at-limit");
+        let multibyte_growth = workspace.path().join("multibyte-growth");
+        fs::write(&at_limit, "1234").unwrap();
+        fs::write(&over_limit, "12345").unwrap();
+        fs::write(&multibyte_at_limit, "éab").unwrap();
+        fs::write(&multibyte_growth, "éab").unwrap();
+        let host = tool_host_with_limits(&workspace, 4).await;
+
+        edit(&host, "at-limit", "4", "x").await.unwrap();
+        assert_eq!(fs::read_to_string(&at_limit).unwrap(), "123x");
+        assert_eq!(
+            edit_error(&host, "at-limit", "x", "56").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&at_limit).unwrap(), "123x");
+        edit(&host, "multibyte-at-limit", "ab", "é").await.unwrap();
+        assert_eq!(fs::read_to_string(&multibyte_at_limit).unwrap(), "éé");
+        assert_eq!(
+            edit_error(&host, "multibyte-growth", "ab", "€").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&multibyte_growth).unwrap(), "éab");
+        assert_eq!(
+            edit_error(&host, "over-limit", "5", "x").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read_to_string(&over_limit).unwrap(), "12345");
+    }
+
+    #[tokio::test]
+    async fn edit_normalises_paths_and_rejects_escapes_before_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("nested/file");
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(&path, "before").unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "./nested//file", "before", "after")
+            .await
+            .unwrap();
+        for path in ["/outside", "../outside", "nested/../file"] {
+            assert_eq!(
+                edit_error(&host, path, "after", "changed").await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("nested/file")).unwrap(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_invalid_utf8_without_mutation() {
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, [0xff]).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            edit_error(&host, "file", "x", "y").await,
+            ToolErrorKind::Value
+        );
+        assert_eq!(fs::read(&path).unwrap(), [0xff]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_classifies_terminal_and_intermediate_path_kinds_without_following_symlinks() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("regular"), "old").unwrap();
+        fs::write(outside.path().join("outside"), "old").unwrap();
+        create_fifo(&workspace.path().join("fifo"));
+        let _socket = UnixListener::bind(workspace.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("regular", workspace.path().join("inside-link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside"),
+            workspace.path().join("outside-link"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-link")).unwrap();
+        std::os::unix::fs::symlink("directory", workspace.path().join("inside-parent")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside-parent"))
+            .unwrap();
+        std::os::unix::fs::symlink("missing", workspace.path().join("broken-parent")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        assert_eq!(
+            edit_error(&host, "missing", "old", "new").await,
+            ToolErrorKind::FileNotFound
+        );
+        assert_eq!(
+            edit_error(&host, "directory", "old", "new").await,
+            ToolErrorKind::IsADirectory
+        );
+        for path in ["fifo", "socket"] {
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    edit_error(&host, path, "old", "new")
+                )
+                .await
+                .expect("editing an other entry must not block"),
+                ToolErrorKind::Value
+            );
+        }
+        for path in [
+            "inside-link",
+            "outside-link",
+            "broken-link",
+            "inside-parent/file",
+            "outside-parent/file",
+            "broken-parent/file",
+        ] {
+            assert_eq!(
+                edit_error(&host, path, "old", "new").await,
+                ToolErrorKind::Permission
+            );
+        }
+        assert_eq!(
+            edit_error(&host, "regular/child", "old", "new").await,
+            ToolErrorKind::NotADirectory
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("outside")).unwrap(),
+            "old"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rechecks_content_disappearance_and_kind_changes_before_publication() {
+        let workspace = TempDir::new().unwrap();
+
+        let content_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("content"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(content_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "content", "before", "after").await });
+        content_hook.wait_until_paused().await;
+        fs::write(workspace.path().join("content"), "external").unwrap();
+        content_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("content")).unwrap(),
+            "external"
+        );
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let missing_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("missing"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(missing_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "missing", "before", "after").await });
+        missing_hook.wait_until_paused().await;
+        fs::remove_file(workspace.path().join("missing")).unwrap();
+        missing_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert!(!workspace.path().join("missing").exists());
+        assert!(temporary_entries(workspace.path()).is_empty());
+
+        let kind_hook = WriteTestHook::pause_before_recheck();
+        fs::write(workspace.path().join("kind"), "before").unwrap();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(kind_hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let edit_task =
+            tokio::spawn(async move { edit(&editing_host, "kind", "before", "after").await });
+        kind_hook.wait_until_paused().await;
+        fs::remove_file(workspace.path().join("kind")).unwrap();
+        fs::create_dir(workspace.path().join("kind")).unwrap();
+        kind_hook.resume();
+        assert!(matches!(
+            edit_task.await.unwrap(),
+            Err(ToolErrorKind::Runtime)
+        ));
+        assert!(workspace.path().join("kind").is_dir());
+        assert!(temporary_entries(workspace.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_publishes_only_complete_old_or_new_file_contents() {
+        use std::sync::{Barrier, Mutex};
+
+        let workspace = TempDir::new().unwrap();
+        let old = "old".repeat(256 * 1024);
+        let new = "new".repeat(256 * 1024);
+        fs::write(workspace.path().join("file"), &old).unwrap();
+        let hook = WriteTestHook::pause_before_recheck();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(hook.clone()),
+        );
+        let editing_host = Arc::clone(&host);
+        let old_for_edit = old.clone();
+        let new_for_edit = new.clone();
+        let edit_task =
+            tokio::spawn(
+                async move { edit(&editing_host, "file", &old_for_edit, &new_for_edit).await },
+            );
+        hook.wait_until_paused().await;
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let reader_observations = Arc::clone(&observations);
+        let old_observed = Arc::new(Barrier::new(2));
+        let new_observed = Arc::new(Barrier::new(2));
+        let reader_old_observed = Arc::clone(&old_observed);
+        let reader_new_observed = Arc::clone(&new_observed);
+        let path = workspace.path().join("file");
+        let new_for_reader = new.clone();
+        let reader = std::thread::spawn(move || {
+            let observation = fs::read_to_string(&path).unwrap();
+            reader_observations.lock().unwrap().push(observation);
+            reader_old_observed.wait();
+
+            loop {
+                let observation = fs::read_to_string(&path).unwrap();
+                let published = observation == new_for_reader;
+                reader_observations.lock().unwrap().push(observation);
+                if published {
+                    reader_new_observed.wait();
+                    return;
+                }
+            }
+        });
+        old_observed.wait();
+        hook.resume();
+        edit_task.await.unwrap().unwrap();
+        new_observed.wait();
+        reader.join().unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert!(observations.iter().any(|value| value == &old));
+        assert!(observations.iter().any(|value| value == &new));
+        assert!(
+            observations
+                .iter()
+                .all(|value| value == &old || value == &new)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_preserves_exact_existing_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let host = tool_host(&workspace).await;
+
+        edit(&host, "file", "before", "after").await.unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_uses_the_mode_from_its_opened_initial_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let path = workspace.path().join("file");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let hook = WriteTestHook::pause_before_initial_read();
+        let host = Arc::new(
+            tool_host(&workspace)
+                .await
+                .with_write_test_hook(hook.clone()),
+        );
+        let writing_host = Arc::clone(&host);
+        let write_task = tokio::spawn(async move {
+            write(&writing_host, "file", "after", Some(fingerprint("before"))).await
+        });
+        hook.wait_until_paused().await;
+        let replacement = workspace.path().join("replacement");
+        fs::write(&replacement, "before").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        hook.resume();
+
+        write_task.await.unwrap().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
     }
 
     #[test]
