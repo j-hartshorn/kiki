@@ -14,5 +14,8 @@ format:
 run:
     cargo run
 
+test:
+    cargo test --all-targets
+
 live-test:
     cargo test openai::tests::live_sol -- --exact --ignored --test-threads=1
