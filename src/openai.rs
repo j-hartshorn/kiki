@@ -3997,7 +3997,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sends_the_generated_phase_one_reference_with_only_execute_python() {
+        async fn sends_the_generated_phase_two_reference_with_only_execute_python() {
             let output = vec![function_call(
                 "fc_1",
                 "call_1",
@@ -4028,6 +4028,8 @@ mod tests {
             assert_eq!(instructions, prompt);
             for signature in [
                 "async def read(path: str) -> str:",
+                "async def write(path: str, content: str) -> None:",
+                "async def edit(path: str, old: str, new: str) -> None:",
                 "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
                 "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
                 "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
@@ -4035,8 +4037,6 @@ mod tests {
                 assert_eq!(instructions.matches(signature).count(), 1);
             }
             assert!(instructions.contains("asyncio.gather"));
-            assert!(!instructions.contains("write("));
-            assert!(!instructions.contains("edit("));
             assert!(!instructions.contains("run("));
             assert_eq!(
                 request["tools"],

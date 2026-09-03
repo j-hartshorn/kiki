@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
@@ -11,7 +9,7 @@ use std::sync::{Condvar, Mutex};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata};
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, future::BoxFuture, stream, stream::FuturesUnordered};
 use globset::{GlobBuilder, GlobMatcher};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -45,6 +43,8 @@ pub(crate) enum ToolValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolName {
     Read,
+    Write,
+    Edit,
     ListDir,
     Glob,
     Grep,
@@ -54,6 +54,8 @@ impl ToolName {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Read => "read",
+            Self::Write => "write",
+            Self::Edit => "edit",
             Self::ListDir => "list_dir",
             Self::Glob => "glob",
             Self::Grep => "grep",
@@ -63,6 +65,8 @@ impl ToolName {
     pub(crate) fn private_name(self) -> &'static str {
         match self {
             Self::Read => "_kiki_read",
+            Self::Write => "_kiki_write",
+            Self::Edit => "_kiki_edit",
             Self::ListDir => "_kiki_list_dir",
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
@@ -88,6 +92,9 @@ impl ToolName {
             (Self::ListDir | Self::Glob, _) => "entries",
             (Self::Grep, 1) => "match",
             (Self::Grep, _) => "matches",
+            (Self::Write | Self::Edit, _) => {
+                unreachable!("mutations have status summaries rather than counts")
+            }
         }
     }
 }
@@ -99,20 +106,58 @@ pub(crate) struct ToolCall {
     pub(crate) arguments: ToolValue,
 }
 
+impl ToolCall {
+    pub(crate) fn mutation_path(&self) -> Option<PathBuf> {
+        match self.tool {
+            ToolName::Write => write_mutation_path(&self.arguments),
+            ToolName::Edit => edit_mutation_path(&self.arguments),
+            ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => None,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct ToolResult {
     pub(crate) call_id: u32,
     pub(crate) result: Result<ToolValue, ToolError>,
-    effect: Option<ReadEffect>,
+    effect: Option<ToolEffect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationStatus {
+    Created,
+    Replaced,
+    Applied,
 }
 
 impl ToolResult {
-    pub(crate) fn apply_effect(&self, authorisations: &mut WholeFileAuthorisations) {
+    pub(crate) fn apply_batch_transition(
+        &self,
+        authorisations: &mut WholeFileAuthorisations,
+        mutation_paths: &BTreeSet<PathBuf>,
+    ) {
         if self.result.is_ok()
             && let Some(effect) = &self.effect
+            && !effect.is_suppressed_read(mutation_paths)
         {
-            authorisations.authorise(effect.path.clone(), effect.fingerprint);
+            effect.apply(authorisations);
         }
+    }
+
+    fn apply_mutation_transition(&self, authorisations: &mut WholeFileAuthorisations) {
+        if self.result.is_ok()
+            && let Some(effect) = &self.effect
+            && effect.is_mutation()
+        {
+            effect.apply(authorisations);
+        }
+    }
+
+    pub(crate) fn mutation_status(&self) -> Option<MutationStatus> {
+        self.result
+            .is_ok()
+            .then(|| self.effect.as_ref().and_then(ToolEffect::mutation_status))
+            .flatten()
     }
 }
 
@@ -248,6 +293,7 @@ pub(crate) struct ToolRecord {
 
 #[derive(Clone, Copy)]
 pub(crate) enum ToolResultShape {
+    None,
     String,
     RecordList(&'static ToolRecord),
 }
@@ -255,6 +301,7 @@ pub(crate) enum ToolResultShape {
 impl ToolResultShape {
     fn annotation(self) -> String {
         match self {
+            Self::None => "None".to_owned(),
             Self::String => "str".to_owned(),
             Self::RecordList(record) => format!("list[{}]", record.name),
         }
@@ -262,17 +309,18 @@ impl ToolResultShape {
 
     fn record(self) -> Option<&'static ToolRecord> {
         match self {
-            Self::String => None,
+            Self::None | Self::String => None,
             Self::RecordList(record) => Some(record),
         }
     }
 
-    fn bootstrap_return(self, private_name: &str, arguments: &str) -> String {
+    fn bootstrap_body(self, private_name: &str, arguments: &str) -> String {
         match self {
-            Self::String => format!("await {private_name}({arguments})"),
+            Self::None => format!("await {private_name}({arguments})"),
+            Self::String => format!("return await {private_name}({arguments})"),
             Self::RecordList(record) => {
                 format!(
-                    "[{}(**row) for row in await {private_name}({arguments})]",
+                    "return [{}(**row) for row in await {private_name}({arguments})]",
                     record.name
                 )
             }
@@ -293,6 +341,37 @@ const READ_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     value_type: ToolValueType::String,
     default: None,
 }];
+
+const WRITE_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "content",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+];
+
+const EDIT_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "path",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "old",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "new",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+];
 
 const DIRECTORY_ENTRY_FIELDS: &[ToolRecordField] = &[
     ToolRecordField {
@@ -377,6 +456,18 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         parameters: READ_PARAMETERS,
         result: ToolResultShape::String,
         description: "Read one complete UTF-8 workspace file.",
+    },
+    ToolDefinition {
+        name: ToolName::Write,
+        parameters: WRITE_PARAMETERS,
+        result: ToolResultShape::None,
+        description: "Create or replace one complete UTF-8 workspace file.",
+    },
+    ToolDefinition {
+        name: ToolName::Edit,
+        parameters: EDIT_PARAMETERS,
+        result: ToolResultShape::None,
+        description: "Replace one exact occurrence in a UTF-8 workspace file.",
     },
     ToolDefinition {
         name: ToolName::ListDir,
@@ -511,11 +602,11 @@ impl ToolDefinition {
 
     fn bootstrap_wrapper(self) -> String {
         format!(
-            "{}\n    \"\"\"{}\"\"\"\n    return {}",
+            "{}\n    \"\"\"{}\"\"\"\n    {}",
             self.signature(),
             self.description,
             self.result
-                .bootstrap_return(self.name.private_name(), &self.arguments()),
+                .bootstrap_body(self.name.private_name(), &self.arguments()),
         )
     }
 
@@ -553,18 +644,76 @@ impl fmt::Debug for WholeFileAuthorisations {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ReadEffect {
-    path: PathBuf,
-    fingerprint: ContentFingerprint,
+enum ToolEffect {
+    Read {
+        path: PathBuf,
+        fingerprint: ContentFingerprint,
+    },
+    Write {
+        path: PathBuf,
+        outcome: WholeFileWriteOutcome,
+        fingerprint: ContentFingerprint,
+    },
+    Edit {
+        path: PathBuf,
+        pre_fingerprint: ContentFingerprint,
+        post_fingerprint: ContentFingerprint,
+    },
 }
 
-impl fmt::Debug for ReadEffect {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ReadEffect(..)")
+impl ToolEffect {
+    fn apply(&self, authorisations: &mut WholeFileAuthorisations) {
+        match self {
+            Self::Read { path, fingerprint }
+            | Self::Write {
+                path, fingerprint, ..
+            } => {
+                authorisations.authorise(path.clone(), *fingerprint);
+            }
+            Self::Edit {
+                path,
+                pre_fingerprint,
+                post_fingerprint,
+            } => {
+                if authorisations.authorisation(path) == Some(*pre_fingerprint) {
+                    authorisations.authorise(path.clone(), *post_fingerprint);
+                } else {
+                    authorisations.remove(path);
+                }
+            }
+        }
+    }
+
+    fn is_mutation(&self) -> bool {
+        matches!(self, Self::Write { .. } | Self::Edit { .. })
+    }
+
+    fn is_suppressed_read(&self, mutation_paths: &BTreeSet<PathBuf>) -> bool {
+        matches!(self, Self::Read { path, .. } if mutation_paths.contains(path))
+    }
+
+    fn mutation_status(&self) -> Option<MutationStatus> {
+        match self {
+            Self::Write {
+                outcome: WholeFileWriteOutcome::Created,
+                ..
+            } => Some(MutationStatus::Created),
+            Self::Write {
+                outcome: WholeFileWriteOutcome::Replaced,
+                ..
+            } => Some(MutationStatus::Replaced),
+            Self::Edit { .. } => Some(MutationStatus::Applied),
+            Self::Read { .. } => None,
+        }
     }
 }
 
-#[allow(dead_code)]
+impl fmt::Debug for ToolEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolEffect(..)")
+    }
+}
+
 impl WholeFileAuthorisations {
     pub(crate) fn authorisation(&self, path: &Path) -> Option<ContentFingerprint> {
         self.fingerprints.get(path).copied()
@@ -579,13 +728,12 @@ impl WholeFileAuthorisations {
     }
 }
 
-#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum WholeFileWriteOutcome {
     Created,
     Replaced,
 }
 
-#[allow(dead_code)]
 struct WholeFileWrite {
     outcome: WholeFileWriteOutcome,
     fingerprint: ContentFingerprint,
@@ -642,7 +790,7 @@ struct ToolLimits {
 
 struct ToolOutput {
     result: ToolValue,
-    effect: Option<ReadEffect>,
+    effect: Option<ToolEffect>,
 }
 
 impl ToolOutput {
@@ -650,6 +798,80 @@ impl ToolOutput {
         Self {
             result,
             effect: None,
+        }
+    }
+}
+
+struct ScheduledCall {
+    result: ToolResult,
+    mutation_path: Option<PathBuf>,
+}
+
+struct BatchDispatch<'a> {
+    host: &'a ToolHost,
+    queued: VecDeque<ToolCall>,
+    active: FuturesUnordered<BoxFuture<'a, ScheduledCall>>,
+    active_mutation_paths: BTreeSet<PathBuf>,
+    authorisations: WholeFileAuthorisations,
+}
+
+impl<'a> BatchDispatch<'a> {
+    fn new(
+        host: &'a ToolHost,
+        calls: Vec<ToolCall>,
+        authorisations: WholeFileAuthorisations,
+    ) -> Self {
+        Self {
+            host,
+            queued: calls.into(),
+            active: FuturesUnordered::new(),
+            active_mutation_paths: BTreeSet::new(),
+            authorisations,
+        }
+    }
+
+    async fn next(mut self) -> Option<(ToolResult, Self)> {
+        self.admit_calls();
+        let ScheduledCall {
+            result,
+            mutation_path,
+        } = self.active.next().await?;
+        if let Some(path) = mutation_path {
+            self.active_mutation_paths.remove(&path);
+            result.apply_mutation_transition(&mut self.authorisations);
+        }
+        Some((result, self))
+    }
+
+    fn admit_calls(&mut self) {
+        while self.active.len() < TOOL_CONCURRENCY_LIMIT {
+            let Some(index) = self.queued.iter().position(|call| {
+                call.mutation_path()
+                    .is_none_or(|path| !self.active_mutation_paths.contains(&path))
+            }) else {
+                return;
+            };
+            let call = self
+                .queued
+                .remove(index)
+                .expect("queued batch call index must remain valid");
+            let mutation_path = call.mutation_path();
+            let authorisation = mutation_path
+                .as_ref()
+                .and_then(|path| self.authorisations.authorisation(path));
+            if let Some(path) = &mutation_path {
+                assert!(
+                    self.active_mutation_paths.insert(path.clone()),
+                    "active same-path mutations must be serialised"
+                );
+            }
+            let host = self.host;
+            self.active.push(Box::pin(async move {
+                ScheduledCall {
+                    result: host.call_with_authorisation(call, authorisation).await,
+                    mutation_path,
+                }
+            }));
         }
     }
 }
@@ -1013,7 +1235,7 @@ enum WritePause {
 
 #[cfg(test)]
 #[derive(Clone)]
-struct WriteTestHook {
+pub(crate) struct WriteTestHook {
     state: Arc<(Mutex<WriteTestState>, Condvar)>,
 }
 
@@ -1131,7 +1353,7 @@ impl WriteTestHook {
         hook
     }
 
-    fn pause_before_recheck() -> Self {
+    pub(crate) fn pause_before_recheck() -> Self {
         let hook = Self::new();
         hook.state
             .0
@@ -1141,7 +1363,7 @@ impl WriteTestHook {
         hook
     }
 
-    async fn wait_until_paused(&self) {
+    pub(crate) async fn wait_until_paused(&self) {
         let state = Arc::clone(&self.state);
         tokio::task::spawn_blocking(move || {
             let (lock, changed) = &*state;
@@ -1156,7 +1378,7 @@ impl WriteTestHook {
         .expect("test hook waiter completes");
     }
 
-    fn resume(&self) {
+    pub(crate) fn resume(&self) {
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("test hook mutex is not poisoned");
         state.resumed = true;
@@ -1348,7 +1570,7 @@ impl ToolHost {
     }
 
     #[cfg(test)]
-    fn with_write_test_hook(mut self, write_test_hook: WriteTestHook) -> Self {
+    pub(crate) fn with_write_test_hook(mut self, write_test_hook: WriteTestHook) -> Self {
         self.write_test_hook = Some(write_test_hook);
         self
     }
@@ -1383,13 +1605,24 @@ impl ToolHost {
     pub(crate) fn dispatch_batch(
         &self,
         calls: Vec<ToolCall>,
+        authorisations: WholeFileAuthorisations,
     ) -> impl Stream<Item = ToolResult> + '_ {
-        stream::iter(calls)
-            .map(|call| self.call(call))
-            .buffer_unordered(TOOL_CONCURRENCY_LIMIT)
+        stream::unfold(
+            BatchDispatch::new(self, calls, authorisations),
+            |dispatch| async move { dispatch.next().await },
+        )
     }
 
+    #[cfg(test)]
     async fn call(&self, call: ToolCall) -> ToolResult {
+        self.call_with_authorisation(call, None).await
+    }
+
+    async fn call_with_authorisation(
+        &self,
+        call: ToolCall,
+        authorisation: Option<ContentFingerprint>,
+    ) -> ToolResult {
         let ToolCall {
             call_id,
             tool,
@@ -1406,6 +1639,8 @@ impl ToolHost {
         }
         let result = match tool {
             ToolName::Read => self.read(arguments).await,
+            ToolName::Write => self.write(arguments, authorisation).await,
+            ToolName::Edit => self.edit(arguments).await,
             ToolName::ListDir => self.list_dir(arguments).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
@@ -1424,14 +1659,23 @@ impl ToolHost {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     async fn write_file(
         &self,
         path: &str,
         content: String,
         authorisation: Option<ContentFingerprint>,
     ) -> Result<WholeFileWrite, ToolError> {
-        let path = normalise_path(path)?;
+        self.write_file_at(normalise_path(path)?, content, authorisation)
+            .await
+    }
+
+    async fn write_file_at(
+        &self,
+        path: PathBuf,
+        content: String,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<WholeFileWrite, ToolError> {
         if content.len() > self.limits.max_file_bytes {
             return Err(ToolError::value(format!(
                 "file exceeds the {}-byte limit",
@@ -1457,14 +1701,22 @@ impl ToolHost {
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     async fn edit_file(
         &self,
         path: &str,
         old: String,
         new: String,
     ) -> Result<WholeFileEdit, ToolError> {
-        let path = normalise_path(path)?;
+        self.edit_file_at(normalise_path(path)?, old, new).await
+    }
+
+    async fn edit_file_at(
+        &self,
+        path: PathBuf,
+        old: String,
+        new: String,
+    ) -> Result<WholeFileEdit, ToolError> {
         if old.is_empty() {
             return Err(ToolError::value("edit target cannot be empty"));
         }
@@ -1490,6 +1742,45 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
+    }
+
+    async fn write(
+        &self,
+        arguments: ToolValue,
+        authorisation: Option<ContentFingerprint>,
+    ) -> Result<ToolOutput, ToolError> {
+        let (path, content) = write_arguments(arguments)?;
+        let effect_path = path.clone();
+        let WholeFileWrite {
+            outcome,
+            fingerprint,
+        } = self.write_file_at(path, content, authorisation).await?;
+        Ok(ToolOutput {
+            result: ToolValue::None,
+            effect: Some(ToolEffect::Write {
+                path: effect_path,
+                outcome,
+                fingerprint,
+            }),
+        })
+    }
+
+    async fn edit(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+        let (path, old, new) = edit_arguments(arguments)?;
+        let effect_path = path.clone();
+        let WholeFileEdit {
+            pre_fingerprint,
+            post_fingerprint,
+            ..
+        } = self.edit_file_at(path, old, new).await?;
+        Ok(ToolOutput {
+            result: ToolValue::None,
+            effect: Some(ToolEffect::Edit {
+                path: effect_path,
+                pre_fingerprint,
+                post_fingerprint,
+            }),
+        })
     }
 
     async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
@@ -1520,7 +1811,7 @@ impl ToolHost {
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
         Ok(ToolOutput {
             result: ToolValue::String(read.contents),
-            effect: Some(ReadEffect {
+            effect: Some(ToolEffect::Read {
                 path: effect_path,
                 fingerprint: read.fingerprint,
             }),
@@ -1603,6 +1894,71 @@ impl ToolHost {
             test_gate.wait_after_read_settled().await;
         }
     }
+}
+
+fn write_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    let [ToolValue::String(path), ToolValue::String(_)] = arguments.as_slice() else {
+        return None;
+    };
+    normalise_path(path).ok()
+}
+
+fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    let [
+        ToolValue::String(path),
+        ToolValue::String(_),
+        ToolValue::String(_),
+    ] = arguments.as_slice()
+    else {
+        return None;
+    };
+    normalise_path(path).ok()
+}
+
+fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "write() expects two positional string arguments",
+        ));
+    };
+    let Ok([path, content]) = <[ToolValue; 2]>::try_from(arguments) else {
+        return Err(ToolError::type_error(
+            "write() expects two positional string arguments",
+        ));
+    };
+    let (ToolValue::String(path), ToolValue::String(content)) = (path, content) else {
+        return Err(ToolError::type_error(
+            "write() expects two positional string arguments",
+        ));
+    };
+    Ok((normalise_path(&path)?, content))
+}
+
+fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "edit() expects three positional string arguments",
+        ));
+    };
+    let Ok([path, old, new]) = <[ToolValue; 3]>::try_from(arguments) else {
+        return Err(ToolError::type_error(
+            "edit() expects three positional string arguments",
+        ));
+    };
+    let (ToolValue::String(path), ToolValue::String(old), ToolValue::String(new)) =
+        (path, old, new)
+    else {
+        return Err(ToolError::type_error(
+            "edit() expects three positional string arguments",
+        ));
+    };
+    Ok((normalise_path(&path)?, old, new))
 }
 
 fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
@@ -3112,7 +3468,7 @@ fn publish_new_file_by_link(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -3133,7 +3489,7 @@ mod tests {
     use crate::config::constants::FILE_MAX_BYTES;
 
     use super::{
-        ACTIVE_TOOLS, ContentFingerprint, ReadEffect, ToolCall, ToolError, ToolErrorKind, ToolHost,
+        ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolEffect, ToolError, ToolErrorKind, ToolHost,
         ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
         WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
         normalise_path, open_content_no_follow, open_parent, prompt_reference,
@@ -3680,6 +4036,184 @@ mod tests {
         }
     }
 
+    fn batch_write(call_id: u32, path: impl Into<String>, content: impl Into<String>) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Write,
+            arguments: ToolValue::List(vec![
+                ToolValue::String(path.into()),
+                ToolValue::String(content.into()),
+            ]),
+        }
+    }
+
+    fn batch_edit(
+        call_id: u32,
+        path: impl Into<String>,
+        old: impl Into<String>,
+        new: impl Into<String>,
+    ) -> ToolCall {
+        ToolCall {
+            call_id,
+            tool: ToolName::Edit,
+            arguments: ToolValue::List(vec![
+                ToolValue::String(path.into()),
+                ToolValue::String(old.into()),
+                ToolValue::String(new.into()),
+            ]),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_serialises_lexical_aliases_and_advances_freshness() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(
+            normalise_path("file").unwrap(),
+            content_fingerprint(b"first"),
+        );
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![
+                batch_write(1, "./file", "second"),
+                batch_edit(2, "file", "second", "third"),
+            ],
+            authorisations,
+        ));
+
+        let mut first = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut first => panic!("batch finished before the first mutation started: {result:?}"),
+        }
+        assert_eq!(gate.started_call_ids(), vec![1]);
+        gate.release(1);
+        assert_eq!(first.await.unwrap().result, Ok(ToolValue::None));
+        let mut second = Box::pin(calls.next());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(1) => {}
+            result = &mut second => panic!("batch finished before the second mutation started: {result:?}"),
+        }
+        assert_eq!(gate.started_call_ids(), vec![1, 2]);
+        gate.release(2);
+        assert_eq!(second.await.unwrap().result, Ok(ToolValue::None));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "third"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_same_path_mutations_leave_slots_for_independent_calls() {
+        let workspace = TempDir::new().unwrap();
+        for call_id in 3..=17 {
+            fs::write(
+                workspace.path().join(format!("file-{call_id}")),
+                call_id.to_string(),
+            )
+            .unwrap();
+        }
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(
+            host.dispatch_batch(
+                std::iter::once(batch_write(1, "shared", "first"))
+                    .chain(std::iter::once(batch_write(2, "./shared", "second")))
+                    .chain((3..=17).map(|call_id| batch_read(call_id, format!("file-{call_id}"))))
+                    .collect(),
+                WholeFileAuthorisations::default(),
+            ),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = calls.next() => panic!("batch finished before its active calls started: {result:?}"),
+        }
+        let started = gate.started_call_ids().into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(started.len(), 16);
+        assert!(started.contains(&1));
+        assert!(!started.contains(&2));
+        assert!((3..=17).all(|call_id| started.contains(&call_id)));
+        assert_eq!(gate.active_call_ids().len(), 16);
+        assert_eq!(gate.maximum_active(), 16);
+
+        drop(calls);
+        assert!(gate.active_call_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_same_path_mutations_settle_without_losing_later_freshness() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "first").unwrap();
+        let host = tool_host(&workspace).await;
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(
+            normalise_path("file").unwrap(),
+            content_fingerprint(b"first"),
+        );
+
+        let results = host
+            .dispatch_batch(
+                vec![
+                    batch_write(1, "file", "second"),
+                    batch_edit(2, "./file", "missing", "third"),
+                    batch_write(3, "file", "fourth"),
+                ],
+                authorisations,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].result.is_ok());
+        assert!(matches!(
+            results[1].result,
+            Err(ref error) if error.kind == ToolErrorKind::Value
+        ));
+        assert!(results[2].result.is_ok());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "fourth"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_starts_different_path_mutations_together() {
+        let workspace = TempDir::new().unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![
+                batch_write(1, "first", "one"),
+                batch_write(2, "second", "two"),
+            ],
+            WholeFileAuthorisations::default(),
+        ));
+
+        let mut results = Box::pin(calls.as_mut().collect::<Vec<_>>());
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut results => panic!("batch finished before both mutations started: {result:?}"),
+        }
+        assert_eq!(gate.active_call_ids().len(), 2);
+        gate.release(1);
+        gate.release(2);
+        assert!(
+            results
+                .await
+                .into_iter()
+                .all(|result| result.result == Ok(ToolValue::None))
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_batch_yields_completion_order_with_correlated_call_ids() {
         let workspace = TempDir::new().unwrap();
@@ -3689,8 +4223,10 @@ mod tests {
         let host = tool_host(&workspace)
             .await
             .with_batch_test_gate(gate.clone());
-        let mut calls =
-            Box::pin(host.dispatch_batch(vec![batch_read(1, "first"), batch_read(2, "second")]));
+        let mut calls = Box::pin(host.dispatch_batch(
+            vec![batch_read(1, "first"), batch_read(2, "second")],
+            WholeFileAuthorisations::default(),
+        ));
 
         tokio::select! {
             _ = gate.wait_until_calls_started(2) => {}
@@ -3725,6 +4261,7 @@ mod tests {
                 (1..=17)
                     .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
                     .collect(),
+                WholeFileAuthorisations::default(),
             ),
         );
 
@@ -3775,6 +4312,7 @@ mod tests {
                 std::iter::once(batch_read(1, "missing"))
                     .chain((2..=17).map(|call_id| batch_read(call_id, format!("file-{call_id}"))))
                     .collect(),
+                WholeFileAuthorisations::default(),
             ),
         );
         let mut results = Box::pin(calls.as_mut().collect::<Vec<_>>());
@@ -3829,6 +4367,7 @@ mod tests {
                 (1..=18)
                     .map(|call_id| batch_read(call_id, format!("file-{call_id}")))
                     .collect(),
+                WholeFileAuthorisations::default(),
             ),
         );
 
@@ -4422,13 +4961,13 @@ mod tests {
     }
 
     #[test]
-    fn grep_is_the_fourth_active_tool_with_match_evidence_labels() {
+    fn active_tools_are_in_the_phase_two_canonical_order() {
         assert_eq!(
             ACTIVE_TOOLS
                 .iter()
                 .map(|definition| definition.name.name())
                 .collect::<Vec<_>>(),
-            ["read", "list_dir", "glob", "grep"]
+            ["read", "write", "edit", "list_dir", "glob", "grep"]
         );
         assert_eq!(ToolName::Grep.count_label(1), "match");
         assert_eq!(ToolName::Grep.count_label(2), "matches");
@@ -5001,7 +5540,7 @@ mod tests {
 
         assert_eq!(result.result, Ok(ToolValue::String("contents".to_owned())));
         let mut authorisations = WholeFileAuthorisations::default();
-        result.apply_effect(&mut authorisations);
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
         assert_eq!(
             authorisations.authorisation(Path::new("nested/file")),
             Some(fingerprint("contents"))
@@ -5027,10 +5566,86 @@ mod tests {
                 .await;
             assert!(result.result.is_err());
             assert!(result.effect.is_none());
-            result.apply_effect(&mut authorisations);
+            result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
         }
 
         assert_eq!(authorisations, WholeFileAuthorisations::default());
+    }
+
+    #[test]
+    fn mutation_effects_update_or_invalidate_authorisations_in_pending_order() {
+        let path = normalise_path("file").unwrap();
+        let first = fingerprint("first");
+        let second = fingerprint("second");
+        let third = fingerprint("third");
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), first);
+        let edit = ToolResult {
+            call_id: 1,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Edit {
+                path: path.clone(),
+                pre_fingerprint: first,
+                post_fingerprint: second,
+            }),
+        };
+        edit.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), Some(second));
+        assert_eq!(edit.mutation_status(), Some(super::MutationStatus::Applied));
+
+        let write = ToolResult {
+            call_id: 2,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Write {
+                path: path.clone(),
+                outcome: super::WholeFileWriteOutcome::Replaced,
+                fingerprint: third,
+            }),
+        };
+        write.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), Some(third));
+        assert_eq!(
+            write.mutation_status(),
+            Some(super::MutationStatus::Replaced)
+        );
+
+        edit.apply_batch_transition(&mut authorisations, &BTreeSet::from([path.clone()]));
+        assert_eq!(authorisations.authorisation(&path), None);
+    }
+
+    #[test]
+    fn same_batch_read_suppression_is_independent_of_settlement_order() {
+        let path = normalise_path("file").unwrap();
+        let read = ToolResult {
+            call_id: 1,
+            result: Ok(ToolValue::String("observed".to_owned())),
+            effect: Some(ToolEffect::Read {
+                path: path.clone(),
+                fingerprint: fingerprint("observed"),
+            }),
+        };
+        let mutation = ToolResult {
+            call_id: 2,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Write {
+                path: path.clone(),
+                outcome: super::WholeFileWriteOutcome::Replaced,
+                fingerprint: fingerprint("written"),
+            }),
+        };
+        let mutation_paths =
+            BTreeSet::from([batch_write(2, "./file", "written").mutation_path().unwrap()]);
+
+        for settled in [[&read, &mutation], [&mutation, &read]] {
+            let mut authorisations = WholeFileAuthorisations::default();
+            for result in settled {
+                result.apply_batch_transition(&mut authorisations, &mutation_paths);
+            }
+            assert_eq!(
+                authorisations.authorisation(&path),
+                Some(fingerprint("written"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -5055,13 +5670,13 @@ mod tests {
         let second = second.await;
 
         let mut ordered = WholeFileAuthorisations::default();
-        first.apply_effect(&mut ordered);
-        second.apply_effect(&mut ordered);
+        first.apply_batch_transition(&mut ordered, &BTreeSet::new());
+        second.apply_batch_transition(&mut ordered, &BTreeSet::new());
         let mut expected = WholeFileAuthorisations::default();
-        second.apply_effect(&mut expected);
+        second.apply_batch_transition(&mut expected, &BTreeSet::new());
         let mut reversed = WholeFileAuthorisations::default();
-        second.apply_effect(&mut reversed);
-        first.apply_effect(&mut reversed);
+        second.apply_batch_transition(&mut reversed, &BTreeSet::new());
+        first.apply_batch_transition(&mut reversed, &BTreeSet::new());
 
         assert_eq!(ordered, expected);
         assert_ne!(ordered, reversed);
@@ -5076,7 +5691,7 @@ mod tests {
         let result = ToolResult {
             call_id: 7,
             result: Ok(ToolValue::String("visible".to_owned())),
-            effect: Some(ReadEffect { path, fingerprint }),
+            effect: Some(ToolEffect::Read { path, fingerprint }),
         };
         let marker = "[42, 42";
 
@@ -5970,6 +6585,12 @@ mod tests {
                 "async def read(path: str) -> str:\n",
                 "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
                 "    return await _kiki_read(path)\n\n",
+                "async def write(path: str, content: str) -> None:\n",
+                "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
+                "    await _kiki_write(path, content)\n\n",
+                "async def edit(path: str, old: str, new: str) -> None:\n",
+                "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
+                "    await _kiki_edit(path, old, new)\n\n",
                 "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
                 "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
                 "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
@@ -5984,6 +6605,8 @@ mod tests {
         let reference = prompt_reference();
         for signature in [
             "async def read(path: str) -> str:",
+            "async def write(path: str, content: str) -> None:",
+            "async def edit(path: str, old: str, new: str) -> None:",
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
@@ -5994,8 +6617,6 @@ mod tests {
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
-        for unavailable in ["write(", "edit(", "run("] {
-            assert!(!reference.contains(unavailable));
-        }
+        assert!(!reference.contains("run("));
     }
 }
