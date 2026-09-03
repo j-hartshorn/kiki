@@ -1265,7 +1265,6 @@ impl CardRenderBlock {
 
 pub(crate) struct TranscriptLayout {
     blocks: Vec<RenderBlock>,
-    #[cfg_attr(not(test), allow(dead_code))]
     width: u16,
     total_height: usize,
     footer: Option<String>,
@@ -1320,7 +1319,6 @@ impl TranscriptLayout {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn extract_selection(&self, selection: Selection) -> String {
         const CHUNK_HEIGHT: usize = 64;
 

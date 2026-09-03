@@ -9,7 +9,6 @@ pub mod pricing;
 pub mod prompt;
 mod prompt_editor;
 pub mod runtime;
-#[cfg_attr(not(test), allow(dead_code))]
 mod selection;
 pub mod tools;
 mod transcript;

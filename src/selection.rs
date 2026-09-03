@@ -328,6 +328,7 @@ impl Extraction {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract(
     buffer: &Buffer,
     selection: ProjectedSelection,
