@@ -14,7 +14,7 @@ use crate::config::{
     model_by_id,
 };
 use crate::highlight::PythonHighlighter;
-use crate::model::{AttemptAccounting, ModelProgress};
+use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::runtime::{
     ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord, TerminalDetails,
@@ -1282,6 +1282,17 @@ impl FooterField {
     }
 }
 
+fn join_fields(fields: &[FooterField]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ", muted_page_style()));
+        }
+        spans.extend(field.spans.clone());
+    }
+    spans
+}
+
 struct Footer {
     fields: Vec<FooterField>,
 }
@@ -1292,14 +1303,7 @@ impl Footer {
     }
 
     fn spans(&self) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        for (index, field) in self.fields.iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled(" ", muted_page_style()));
-            }
-            spans.extend(field.spans.clone());
-        }
-        spans
+        join_fields(&self.fields)
     }
 
     fn width(&self) -> usize {
@@ -1339,12 +1343,7 @@ impl Footer {
             Span::styled("…", muted_page_style()),
             Span::styled(" ", muted_page_style()),
         ];
-        for (index, field) in self.fields[first..].iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled(" ", muted_page_style()));
-            }
-            spans.extend(field.spans.clone());
-        }
+        spans.extend(join_fields(&self.fields[first..]));
         spans
     }
 }
@@ -2008,9 +2007,9 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         format!("Workspace: {workspace_root}"),
         format!(
             "Model: {} (context: {}, max output: {})",
-            snapshot.model_configuration().id,
-            snapshot.model_configuration().context_window_display,
-            snapshot.model_configuration().max_output_display
+            snapshot.model().id,
+            snapshot.model().context_window_display,
+            snapshot.model().max_output_display
         ),
         format!("Prompt: {prompt_source}"),
         format!("OpenAI API key: {api_key_presence}"),
@@ -2396,50 +2395,46 @@ impl SessionAccounting {
     }
 }
 
-struct ContextMetric {
-    percent: u128,
-    denominator: &'static str,
-}
-
-struct LatestAttemptMetrics {
-    context: Option<ContextMetric>,
-    cache_hit: Option<String>,
-}
-
-fn latest_settled_attempt_metrics(attempts: &[&AttemptAccounting]) -> Option<LatestAttemptMetrics> {
-    let attempt = attempts.iter().next_back()?;
-    let usage = match attempt {
-        AttemptAccounting::KnownUsage(usage)
-        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => usage,
-        AttemptAccounting::UsageUnavailable => return None,
-    };
+fn latest_context_field(usage: &ModelUsage) -> Option<FooterField> {
+    let total = usage.total_tokens?;
     let model = model_by_id(&usage.model).unwrap_or(DEFAULT_MODEL);
-    let context = usage.total_tokens.map(|total| {
-        let (capacity, denominator) = if total <= model.pricing.long_context_threshold {
-            (
-                model.pricing.long_context_threshold,
-                model.pricing.long_context_threshold_display,
-            )
-        } else {
-            (model.context_window_tokens, model.context_window_display)
-        };
-        ContextMetric {
-            percent: (u128::from(total) * 100 + u128::from(capacity) / 2) / u128::from(capacity),
-            denominator,
-        }
-    });
-    let cache_hit = match (usage.input_tokens, usage.cached_input_tokens) {
+    let (capacity, denominator) = if total <= model.pricing.long_context_threshold {
+        (
+            model.pricing.long_context_threshold,
+            model.pricing.long_context_threshold_display,
+        )
+    } else {
+        (model.context_window_tokens, model.context_window_display)
+    };
+    let percent = (u128::from(total) * 100 + u128::from(capacity) / 2) / u128::from(capacity);
+    let style = if percent >= 90 {
+        Style::new().fg(Color::Red)
+    } else if percent >= 80 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        muted_page_style()
+    };
+    Some(FooterField {
+        spans: vec![
+            Span::styled("C", muted_page_style()),
+            Span::styled(format!("{percent}%"), style),
+            Span::styled(format!("/{denominator}"), muted_page_style()),
+        ],
+    })
+}
+
+fn latest_cache_hit_field(usage: &ModelUsage) -> Option<FooterField> {
+    match (usage.input_tokens, usage.cached_input_tokens) {
         (Some(input), Some(cached)) if input > 0 && cached <= input => {
             let tenths = (u128::from(cached) * 1_000 + u128::from(input) / 2) / u128::from(input);
-            Some(if tenths % 10 == 0 {
+            Some(FooterField::muted(if tenths % 10 == 0 {
                 format!("H{}%", tenths / 10)
             } else {
                 format!("H{}.{}%", tenths / 10, tenths % 10)
-            })
+            }))
         }
         _ => None,
-    };
-    Some(LatestAttemptMetrics { context, cache_hit })
+    }
 }
 
 fn session_footer(attempts: &[&AttemptAccounting]) -> Option<Footer> {
@@ -2451,27 +2446,16 @@ fn session_footer(attempts: &[&AttemptAccounting]) -> Option<Footer> {
         .into_iter()
         .map(FooterField::muted)
         .collect::<Vec<_>>();
-    if let Some(metrics) = latest_settled_attempt_metrics(attempts) {
-        if let Some(context) = metrics.context {
-            fields.push(FooterField {
-                spans: vec![
-                    Span::styled("C", muted_page_style()),
-                    Span::styled(
-                        format!("{}%", context.percent),
-                        if context.percent >= 90 {
-                            Style::new().fg(Color::Red)
-                        } else if context.percent >= 80 {
-                            Style::new().fg(Color::Yellow)
-                        } else {
-                            muted_page_style()
-                        },
-                    ),
-                    Span::styled(format!("/{}", context.denominator), muted_page_style()),
-                ],
-            });
+    if let Some(
+        AttemptAccounting::KnownUsage(usage)
+        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
+    ) = attempts.iter().next_back()
+    {
+        if let Some(context) = latest_context_field(usage) {
+            fields.push(context);
         }
-        if let Some(cache_hit) = metrics.cache_hit {
-            fields.push(FooterField::muted(cache_hit));
+        if let Some(cache_hit) = latest_cache_hit_field(usage) {
+            fields.push(cache_hit);
         }
     }
     if let Some(cost) = estimated_cost(attempts.iter().copied()) {

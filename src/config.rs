@@ -179,11 +179,7 @@ impl StartupSnapshot {
         self.workspace_root.as_ref()
     }
 
-    pub fn model(&self) -> &'static str {
-        self.model.id
-    }
-
-    pub fn model_configuration(&self) -> &'static ModelConfiguration {
+    pub fn model(&self) -> &'static ModelConfiguration {
         self.model
     }
 
@@ -682,7 +678,7 @@ mod tests {
 
         assert_eq!(snapshot.worker_path().unwrap().as_str(), WORKER_PATH);
         assert_eq!(snapshot.workspace_root().unwrap().as_str(), WORKSPACE_ROOT);
-        assert_eq!(snapshot.model(), DEFAULT_MODEL.id);
+        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
             snapshot.prompt_source(),
             &PromptProvenance::Bundled {
@@ -714,8 +710,8 @@ mod tests {
         let configuration = resolve_startup(ready_input("key"));
         let snapshot = configuration.snapshot();
 
-        assert_eq!(snapshot.model(), "gpt-5.6-sol");
-        assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+        assert_eq!(snapshot.model().id, "gpt-5.6-sol");
+        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Available
@@ -738,8 +734,8 @@ mod tests {
             let configuration = resolve_startup(input);
             let snapshot = configuration.snapshot();
 
-            assert_eq!(snapshot.model(), model.id);
-            assert!(std::ptr::eq(snapshot.model_configuration(), model));
+            assert_eq!(snapshot.model().id, model.id);
+            assert!(std::ptr::eq(snapshot.model(), model));
             assert_eq!(
                 snapshot.submission_availability(),
                 SubmissionAvailability::Available
@@ -779,7 +775,7 @@ mod tests {
                 snapshot.problems()[0].remediation(),
                 "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
             );
-            assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+            assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
                 snapshot.submission_availability(),
                 SubmissionAvailability::Unavailable
@@ -815,7 +811,7 @@ mod tests {
             snapshot.problems()[0].remediation(),
             "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
         );
-        assert!(std::ptr::eq(snapshot.model_configuration(), DEFAULT_MODEL));
+        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
             snapshot.submission_availability(),
             SubmissionAvailability::Unavailable

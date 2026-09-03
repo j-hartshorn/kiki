@@ -1,17 +1,9 @@
 use crate::{
-    config::{DEFAULT_MODEL, model_by_id},
+    config::model_by_id,
     model::{AttemptAccounting, ModelUsage},
 };
 
-pub use crate::config::{ModelPricing, PricingIdentity};
-
-impl ModelPricing {
-    pub fn identity(&self) -> PricingIdentity {
-        self.identity
-    }
-}
-
-pub const GPT_5_6_SOL_DEFAULT_2026_08_27: ModelPricing = crate::config::models::SOL.pricing;
+pub use crate::config::PricingIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsdNanos(u128);
@@ -152,10 +144,9 @@ pub fn estimate_run_cost<'a>(
     attempts: impl IntoIterator<Item = &'a AttemptAccounting>,
 ) -> RunCostEstimate {
     let mut known_amount = 0_u128;
-    let mut has_known = false;
     let mut is_lower_bound = false;
     let mut has_unpriceable = false;
-    let mut pricing: PricingIdentity = DEFAULT_MODEL.pricing.identity;
+    let mut latest_pricing = None;
 
     for attempt in attempts {
         let usage = match attempt {
@@ -178,31 +169,33 @@ pub fn estimate_run_cost<'a>(
             continue;
         };
         known_amount = total;
-        pricing = estimate.pricing;
-        has_known = true;
+        latest_pricing = Some(estimate.pricing);
     }
 
+    let Some(pricing) = latest_pricing else {
+        return RunCostEstimate::Unavailable;
+    };
     let estimate = CostEstimate {
         amount: UsdNanos(known_amount),
         pricing,
     };
-    match (has_known, has_unpriceable || is_lower_bound) {
-        (true, true) => RunCostEstimate::LowerBound(estimate),
-        (true, false) => RunCostEstimate::Complete(estimate),
-        (false, _) => RunCostEstimate::Unavailable,
+    if has_unpriceable || is_lower_bound {
+        RunCostEstimate::LowerBound(estimate)
+    } else {
+        RunCostEstimate::Complete(estimate)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CostEstimate, GPT_5_6_SOL_DEFAULT_2026_08_27, PricingError, RunCostEstimate, UsageCategory,
-        estimate_run_cost, estimate_usage,
+        CostEstimate, PricingError, RunCostEstimate, UsageCategory, estimate_run_cost,
+        estimate_usage,
     };
     use crate::{
         config::{
             DEFAULT_MODEL,
-            models::{LUNA, TERRA},
+            models::{LUNA, SOL, TERRA},
         },
         model::{AttemptAccounting, ModelUsage},
     };
@@ -237,7 +230,7 @@ mod tests {
 
     #[test]
     fn pricing_constant_has_versioned_official_identity() {
-        let identity = GPT_5_6_SOL_DEFAULT_2026_08_27.identity();
+        let identity = SOL.pricing.identity;
 
         assert_eq!(identity.model, DEFAULT_MODEL.id);
         assert_eq!(identity.service_tier, "default");
@@ -253,10 +246,7 @@ mod tests {
         let estimate = estimate_usage(&usage(200_000, 40_000, 60_000, 100_000, 50_000)).unwrap();
 
         assert_eq!(amount(estimate), 2_716_000_000);
-        assert_eq!(
-            estimate.pricing(),
-            GPT_5_6_SOL_DEFAULT_2026_08_27.identity()
-        );
+        assert_eq!(estimate.pricing(), SOL.pricing.identity);
     }
 
     #[test]
@@ -433,10 +423,7 @@ mod tests {
         match estimate_run_cost(&attempts) {
             RunCostEstimate::Complete(estimate) => {
                 assert_eq!(amount(estimate), 20_800_000_000);
-                assert_eq!(
-                    estimate.pricing(),
-                    GPT_5_6_SOL_DEFAULT_2026_08_27.identity()
-                );
+                assert_eq!(estimate.pricing(), SOL.pricing.identity);
             }
             estimate => panic!("expected complete estimate, got {estimate:?}"),
         }
