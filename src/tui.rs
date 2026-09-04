@@ -1350,6 +1350,289 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responsiveness_p95_uses_the_48th_sorted_sample() {
+        let mut samples: Vec<_> = (1..=50).rev().map(Duration::from_nanos).collect();
+
+        assert_eq!(responsiveness_p95(&mut samples), Duration::from_nanos(48));
+    }
+
+    #[test]
+    fn responsiveness_p95_of_four_samples_is_the_maximum() {
+        let mut samples = [3, 1, 4, 2].map(Duration::from_nanos).to_vec();
+
+        assert_eq!(responsiveness_p95(&mut samples), Duration::from_nanos(4));
+    }
+
+    #[test]
+    fn responsiveness_tolerance_is_inclusive() {
+        for tolerance in [Duration::from_nanos(16_700_000), Duration::from_millis(50)] {
+            assert!(within_responsiveness_tolerance(tolerance, tolerance));
+            assert!(!within_responsiveness_tolerance(
+                tolerance + Duration::from_nanos(1),
+                tolerance
+            ));
+        }
+    }
+
+    fn responsiveness_p95(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[(samples.len() * 95).div_ceil(100) - 1]
+    }
+
+    fn within_responsiveness_tolerance(observed: Duration, tolerance: Duration) -> bool {
+        observed <= tolerance
+    }
+
+    struct ResponsivenessFrame {
+        key: KeyEvent,
+        delta: RuntimeEvent,
+    }
+
+    fn responsiveness_frame(code: KeyCode, sequence: u16) -> ResponsivenessFrame {
+        ResponsivenessFrame {
+            key: key(code),
+            delta: responsiveness_delta(sequence),
+        }
+    }
+
+    fn responsiveness_delta(sequence: u16) -> RuntimeEvent {
+        let text = format!("live tick {sequence:04}: 1234567890\n");
+        assert_eq!(text.len(), 27);
+        RuntimeEvent::ModelProgress {
+            run_id: RunId(129),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk { text },
+        }
+    }
+
+    fn responsiveness_assistant_message() -> String {
+        const LINE: &str = "- stable **markdown** [link](https://example.test) `inline`\n";
+        let mut message = String::new();
+        while message.len() + LINE.len() <= 8_192 {
+            message.push_str(LINE);
+        }
+        message.push_str(&"x".repeat(8_192 - message.len()));
+        assert!(message.is_ascii());
+        assert_eq!(message.len(), 8_192);
+        message
+    }
+
+    fn responsiveness_settled_events() -> Vec<RuntimeEvent> {
+        let assistant_message = responsiveness_assistant_message();
+        let mut events = Vec::with_capacity(128 * 5);
+        for run_id in 1..=128 {
+            let source = (0..40)
+                .map(|line| format!("value_{run_id:03}_{line:02} = {line:02}\n"))
+                .collect::<String>();
+            assert_eq!(source.lines().count(), 40);
+            events.extend([
+                RuntimeEvent::RunStarted {
+                    run_id: RunId(run_id),
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(run_id),
+                        record: Record::UserRequest {
+                            request: format!("benchmark request {run_id:03}"),
+                        },
+                    },
+                    progress_gap: false,
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(run_id),
+                        record: Record::CompletedExecution {
+                            step_id: ModelStepId(1),
+                            source,
+                            reasoning_summary: format!("settled reasoning {run_id:03}"),
+                            execution: Execution {
+                                stdout: observation("authoritative stdout\n"),
+                                stderr: observation(""),
+                                outcome: ExecutionOutcome::Complete {
+                                    result: Some(observation("42")),
+                                },
+                                tool_calls: Vec::new(),
+                            },
+                            attempts: Vec::new(),
+                        },
+                    },
+                    progress_gap: false,
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(run_id),
+                        record: Record::FinalMessage {
+                            step_id: ModelStepId(2),
+                            text: assistant_message.clone(),
+                            reasoning_summary: String::new(),
+                            terminal: TerminalDetails::empty(),
+                        },
+                    },
+                    progress_gap: false,
+                },
+                RuntimeEvent::RunSettled {
+                    run_id: RunId(run_id),
+                },
+            ]);
+        }
+        events
+    }
+
+    #[test]
+    #[ignore = "run with --release --ignored to measure TUI responsiveness"]
+    fn responsiveness_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "responsiveness benchmark requires a release build"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let mut clipboard = FakeClipboard::available();
+        let settled_events = responsiveness_settled_events();
+        let live_setup = [
+            RuntimeEvent::RunStarted { run_id: RunId(129) },
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(129),
+                step_id: ModelStepId(1),
+            },
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(129),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "# live assistant\n\n".to_owned(),
+                },
+            },
+        ];
+        let warmups = [
+            responsiveness_frame(KeyCode::Char('w'), 1),
+            responsiveness_frame(KeyCode::PageUp, 2),
+            responsiveness_frame(KeyCode::Char('w'), 3),
+            responsiveness_frame(KeyCode::PageDown, 4),
+            responsiveness_frame(KeyCode::Char('w'), 5),
+            responsiveness_frame(KeyCode::PageUp, 6),
+            responsiveness_frame(KeyCode::Char('w'), 7),
+            responsiveness_frame(KeyCode::PageDown, 8),
+        ];
+        let key_frames = (0_u16..50)
+            .map(|index| {
+                responsiveness_frame(
+                    KeyCode::Char(char::from(b'a' + u8::try_from(index % 26).unwrap())),
+                    9 + index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let scroll_frames = (0_u16..50)
+            .map(|index| {
+                responsiveness_frame(
+                    if index % 2 == 0 {
+                        KeyCode::PageUp
+                    } else {
+                        KeyCode::PageDown
+                    },
+                    59 + index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let clear_draft = modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let raw_paste = "\t12345\r\n".repeat(6_553) + "abcdef";
+        let normalised_paste =
+            super::normalise_terminal_text(&super::normalise_paste_line_endings(&raw_paste));
+        let paste_delta = responsiveness_delta(109);
+        let key_scroll_tolerance = Duration::from_nanos(16_700_000);
+        let paste_tolerance = Duration::from_millis(50);
+
+        let assistant_messages = settled_events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            record: Record::FinalMessage { text, .. },
+                            ..
+                        },
+                    ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_messages.len(), 128);
+        for message in &assistant_messages {
+            assert!(message.is_ascii());
+            assert_eq!(message.len(), 8_192);
+        }
+        assert_eq!(
+            assistant_messages
+                .iter()
+                .map(|message| message.len())
+                .sum::<usize>(),
+            1_048_576
+        );
+        assert_eq!(normalised_paste.len(), 65_536);
+
+        for event in settled_events {
+            app.handle_event(event);
+        }
+        for event in live_setup {
+            app.handle_event(event);
+        }
+        super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+
+        for ResponsivenessFrame { key, delta } in warmups {
+            app.handle_key(key);
+            app.handle_event(delta);
+            super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+        }
+        assert_eq!(app.scroll_from_bottom, 0);
+
+        let mut key_samples = Vec::with_capacity(50);
+        for ResponsivenessFrame { key, delta } in key_frames {
+            let started = Instant::now();
+            app.handle_key(key);
+            app.handle_event(delta);
+            super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+            key_samples.push(started.elapsed());
+        }
+
+        assert_eq!(app.scroll_from_bottom, 0);
+        let mut scroll_samples = Vec::with_capacity(50);
+        for ResponsivenessFrame { key, delta } in scroll_frames {
+            let started = Instant::now();
+            app.handle_key(key);
+            app.handle_event(delta);
+            super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+            scroll_samples.push(started.elapsed());
+        }
+
+        assert!(app.handle_key(clear_draft).visible_changed);
+        assert!(app.prompt.is_empty());
+        let paste_started = Instant::now();
+        app.handle_paste(&raw_paste);
+        app.handle_event(paste_delta);
+        super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
+        let paste_sample = paste_started.elapsed();
+
+        let key_p95 = responsiveness_p95(&mut key_samples);
+        let scroll_p95 = responsiveness_p95(&mut scroll_samples);
+        println!(
+            "responsiveness benchmark: target 8.3ms; tolerance 16.7ms; paste tolerance 50ms; key p95 {key_p95:?}; scroll p95 {scroll_p95:?}; paste {paste_sample:?}"
+        );
+        assert_eq!(app.prompt.text().len(), 65_536);
+        assert!(within_responsiveness_tolerance(
+            key_p95,
+            key_scroll_tolerance
+        ));
+        assert!(within_responsiveness_tolerance(
+            scroll_p95,
+            key_scroll_tolerance
+        ));
+        assert!(within_responsiveness_tolerance(
+            paste_sample,
+            paste_tolerance
+        ));
+    }
+
     fn app_with_history(mut app: App) -> App {
         for run_id in 1..=8 {
             app.handle_event(RuntimeEvent::RecordAppended {
