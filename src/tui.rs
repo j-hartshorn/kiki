@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
@@ -217,6 +217,21 @@ impl App {
         let mut update = self.handle_key_inner(key);
         update.visible_changed |= notice_cleared;
         update
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Update {
+        let notice_cleared = self.clear_notice();
+        let visible_changed = if self.is_submission_disabled() {
+            false
+        } else {
+            let text = normalise_terminal_text(&normalise_paste_line_endings(text));
+            self.prompt.insert_paste(&text)
+        };
+        Update {
+            command: None,
+            visible_changed: visible_changed || notice_cleared,
+            quit: false,
+        }
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> Update {
@@ -618,6 +633,22 @@ impl App {
     }
 }
 
+fn normalise_paste_line_endings(text: &str) -> String {
+    let mut normalised = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalised.push('\n');
+        } else {
+            normalised.push(character);
+        }
+    }
+    normalised
+}
+
 struct RestoreGuard<F: FnOnce()> {
     restore: Option<F>,
 }
@@ -651,24 +682,26 @@ pub(crate) fn run(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
-            with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
-                with_keyboard_enhancement(
-                    enable_keyboard_enhancement,
-                    disable_keyboard_enhancement,
-                    |enhanced_keyboard| {
-                        app.enhanced_keyboard = enhanced_keyboard;
-                        run_loop(
-                            terminal,
-                            &mut app,
-                            &mut input,
-                            &commands,
-                            &mut events,
-                            &mut progress,
-                            &mut clipboard,
-                        )
-                        .map(|_| ())
-                    },
-                )
+            with_bracketed_paste(enable_bracketed_paste, disable_bracketed_paste, || {
+                with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
+                    with_keyboard_enhancement(
+                        enable_keyboard_enhancement,
+                        disable_keyboard_enhancement,
+                        |enhanced_keyboard| {
+                            app.enhanced_keyboard = enhanced_keyboard;
+                            run_loop(
+                                terminal,
+                                &mut app,
+                                &mut input,
+                                &commands,
+                                &mut events,
+                                &mut progress,
+                                &mut clipboard,
+                            )
+                            .map(|_| ())
+                        },
+                    )
+                })
             })
         },
     )
@@ -697,6 +730,29 @@ fn with_terminal<B: Backend>(
     let _guard = RestoreGuard::new(restore);
     let mut terminal = initialize()?;
     run(&mut terminal)
+}
+
+fn enable_bracketed_paste() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    ratatui::crossterm::execute!(stdout, EnableBracketedPaste)
+}
+
+fn disable_bracketed_paste() {
+    let mut stdout = io::stdout();
+    let _ = ratatui::crossterm::execute!(stdout, DisableBracketedPaste);
+}
+
+fn with_bracketed_paste<T>(
+    enable: impl FnOnce() -> io::Result<()>,
+    disable: impl FnOnce(),
+    run: impl FnOnce() -> Result<T, TuiError>,
+) -> Result<T, TuiError> {
+    if let Err(error) = enable() {
+        disable();
+        return Err(TuiError::Terminal(error.to_string()));
+    }
+    let _guard = RestoreGuard::new(disable);
+    run()
 }
 
 fn enable_mouse_capture() -> io::Result<()> {
@@ -791,7 +847,7 @@ fn run_configuration_loop<B: Backend>(
                     app.invalidate_selection();
                     dirty = true;
                 }
-                Event::Paste(_) => dirty |= app.clear_notice(),
+                Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
                 _ => {}
             }
         }
@@ -839,7 +895,7 @@ fn run_loop<B: Backend>(
                     app.invalidate_selection();
                     dirty = true;
                 }
-                Event::Paste(_) => dirty |= app.clear_notice(),
+                Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
                 _ => {}
             }
         }
@@ -1124,7 +1180,7 @@ mod tests {
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
-    use crate::prompt_editor::{PromptEdit, PromptEditor};
+    use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
         ModelStepId, Record, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
         StoredRecord, TerminalDetails,
@@ -1544,19 +1600,19 @@ mod tests {
             enhanced_keyboard: true,
             ..App::default()
         };
-        set_prompt(&mut bounded, &"a".repeat(16 * 1024 - 1));
+        set_prompt(&mut bounded, &"a".repeat(MAX_PROMPT_BYTES - 1));
         assert!(
             bounded
                 .handle_key(shifted_key(KeyCode::Enter))
                 .visible_changed
         );
-        assert_eq!(bounded.prompt.text().len(), 16 * 1024);
+        assert_eq!(bounded.prompt.text().len(), MAX_PROMPT_BYTES);
         let limit_reached = bounded.handle_key(shifted_key(KeyCode::Enter));
         assert!(limit_reached.command.is_none());
         assert!(!limit_reached.visible_changed);
         assert!(!bounded.handle_key(key(KeyCode::Char('x'))).visible_changed);
         assert!(bounded.handle_key(key(KeyCode::Backspace)).visible_changed);
-        assert_eq!(bounded.prompt.text(), "a".repeat(16 * 1024 - 1));
+        assert_eq!(bounded.prompt.text(), "a".repeat(MAX_PROMPT_BYTES - 1));
 
         let before_release = active.prompt.text().to_owned();
         let release =
@@ -1567,16 +1623,114 @@ mod tests {
 
     #[test]
     fn prompt_enforces_its_byte_limit_and_backspaces_unicode() {
-        let mut app = app_with_prompt(&"a".repeat(16 * 1024 - '🦀'.len_utf8()));
+        let mut app = app_with_prompt(&"a".repeat(MAX_PROMPT_BYTES - '🦀'.len_utf8()));
 
         assert!(app.handle_key(key(KeyCode::Char('🦀'))).visible_changed);
-        assert_eq!(app.prompt.text().len(), 16 * 1024);
+        assert_eq!(app.prompt.text().len(), MAX_PROMPT_BYTES);
         assert!(!app.handle_key(key(KeyCode::Char('x'))).visible_changed);
-        assert_eq!(app.prompt.text().len(), 16 * 1024);
+        assert_eq!(app.prompt.text().len(), MAX_PROMPT_BYTES);
 
         assert!(app.handle_key(key(KeyCode::Backspace)).visible_changed);
         assert!(!app.prompt.text().ends_with('🦀'));
         assert!(app.prompt.text().is_char_boundary(app.prompt.text().len()));
+    }
+
+    #[test]
+    fn paste_normalises_before_splicing_and_accounting_for_capacity() {
+        let mut app = app_with_prompt("α\nγ");
+        assert!(app.handle_key(key(KeyCode::Left)).visible_changed);
+
+        let update = app.handle_paste("β\r\n\t\x1b\rδ\u{009d}");
+
+        assert!(update.command.is_none());
+        assert!(!update.quit);
+        assert!(update.visible_changed);
+        assert_eq!(app.prompt.text(), "α\nβ\n    \\x1B\nδ\\x9Dγ");
+
+        let mut bounded = app_with_prompt(&"a".repeat(MAX_PROMPT_BYTES - 3));
+        let update = bounded.handle_paste("\t");
+        assert!(update.command.is_none());
+        assert!(update.visible_changed);
+        assert_eq!(
+            bounded.prompt.text(),
+            format!("{}   ", "a".repeat(MAX_PROMPT_BYTES - 3))
+        );
+    }
+
+    #[test]
+    fn paste_edits_idle_and_active_drafts_without_commands() {
+        let mut idle = App::default();
+        let idle_update = idle.handle_paste("idle draft");
+        assert!(idle_update.visible_changed);
+        assert!(idle_update.command.is_none());
+        assert!(!idle_update.quit);
+        assert_eq!(idle.prompt.text(), "idle draft");
+
+        let mut active = App::default();
+        assert!(active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) }));
+        let active_update = active.handle_paste("active draft");
+        assert!(active_update.visible_changed);
+        assert!(active_update.command.is_none());
+        assert!(!active_update.quit);
+        assert_eq!(active.prompt.text(), "active draft");
+    }
+
+    #[test]
+    fn empty_or_uninsertable_paste_is_a_visible_noop_without_notice() {
+        let mut empty = app_with_prompt("keep");
+        let empty_update = empty.handle_paste("");
+        assert!(empty_update.command.is_none());
+        assert!(!empty_update.visible_changed);
+        assert_eq!(empty.prompt.text(), "keep");
+
+        let mut full = app_with_prompt(&"a".repeat(MAX_PROMPT_BYTES));
+        let full_update = full.handle_paste("x");
+        assert!(full_update.command.is_none());
+        assert!(!full_update.visible_changed);
+        assert_eq!(full.prompt.text().len(), MAX_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn paste_is_read_only_in_configuration_and_disabled_views() {
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut configuration, "locked");
+        let configuration_update = configuration.handle_paste("discarded");
+        assert!(configuration_update.command.is_none());
+        assert!(!configuration_update.visible_changed);
+        assert_eq!(configuration.prompt.text(), "locked");
+
+        let mut disabled = App::default();
+        set_prompt(&mut disabled, "locked");
+        disabled.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::OpenAiAuthentication,
+        });
+        let disabled_update = disabled.handle_paste("discarded");
+        assert!(disabled_update.command.is_none());
+        assert!(!disabled_update.visible_changed);
+        assert_eq!(disabled.prompt.text(), "locked");
+    }
+
+    #[test]
+    fn paste_redraws_once_only_when_it_changes_visible_state() {
+        let mut inserted = App::default();
+        let mut inserted_input = FakeInput::new([
+            Some(Event::Paste("bulk draft".to_owned())),
+            Some(quit_event()),
+            Some(quit_event()),
+        ]);
+        assert_eq!(run_transcript_loop(&mut inserted, &mut inserted_input), 3);
+
+        let mut noop = App::default();
+        let mut noop_input =
+            FakeInput::new([Some(Event::Paste(String::new())), Some(quit_event())]);
+        assert_eq!(run_transcript_loop(&mut noop, &mut noop_input), 1);
+
+        let mut notice = App::default();
+        notice.notice = Some(super::Notice::Copied);
+        let mut notice_input =
+            FakeInput::new([Some(Event::Paste(String::new())), Some(quit_event())]);
+        assert_eq!(run_transcript_loop(&mut notice, &mut notice_input), 2);
+        assert!(notice.notice().is_none());
     }
 
     #[test]
@@ -2238,6 +2392,273 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_lifecycle_orders_configured_modes_and_skips_configuration() {
+        let calls = RefCell::new(Vec::new());
+        {
+            let _terminal_restore =
+                super::RestoreGuard::new(|| calls.borrow_mut().push("terminal restore"));
+            super::with_bracketed_paste(
+                || {
+                    calls.borrow_mut().push("paste enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("paste disable"),
+                || {
+                    super::with_mouse_capture(
+                        || {
+                            calls.borrow_mut().push("mouse enable");
+                            Ok(())
+                        },
+                        || calls.borrow_mut().push("mouse disable"),
+                        || {
+                            super::with_keyboard_enhancement(
+                                || {
+                                    calls.borrow_mut().push("keyboard enable");
+                                    Ok(true)
+                                },
+                                || calls.borrow_mut().push("keyboard disable"),
+                                |enabled| {
+                                    assert!(enabled);
+                                    calls.borrow_mut().push("run");
+                                    Ok::<(), super::TuiError>(())
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "paste enable",
+                "mouse enable",
+                "keyboard enable",
+                "run",
+                "keyboard disable",
+                "mouse disable",
+                "paste disable",
+                "terminal restore",
+            ]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        let loop_error = {
+            let _terminal_restore =
+                super::RestoreGuard::new(|| calls.borrow_mut().push("terminal restore"));
+            super::with_bracketed_paste(
+                || {
+                    calls.borrow_mut().push("paste enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("paste disable"),
+                || {
+                    super::with_mouse_capture(
+                        || {
+                            calls.borrow_mut().push("mouse enable");
+                            Ok(())
+                        },
+                        || calls.borrow_mut().push("mouse disable"),
+                        || {
+                            super::with_keyboard_enhancement(
+                                || {
+                                    calls.borrow_mut().push("keyboard enable");
+                                    Ok(true)
+                                },
+                                || calls.borrow_mut().push("keyboard disable"),
+                                |_| {
+                                    calls.borrow_mut().push("run");
+                                    Err::<(), _>(super::TuiError::Terminal(
+                                        "loop failed".to_owned(),
+                                    ))
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        };
+        assert!(loop_error.is_err());
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "paste enable",
+                "mouse enable",
+                "keyboard enable",
+                "run",
+                "keyboard disable",
+                "mouse disable",
+                "paste disable",
+                "terminal restore",
+            ]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _terminal_restore =
+                super::RestoreGuard::new(|| calls.borrow_mut().push("terminal restore"));
+            let _ = super::with_bracketed_paste(
+                || {
+                    calls.borrow_mut().push("paste enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("paste disable"),
+                || {
+                    super::with_mouse_capture(
+                        || {
+                            calls.borrow_mut().push("mouse enable");
+                            Ok(())
+                        },
+                        || calls.borrow_mut().push("mouse disable"),
+                        || {
+                            super::with_keyboard_enhancement(
+                                || {
+                                    calls.borrow_mut().push("keyboard enable");
+                                    Ok(true)
+                                },
+                                || calls.borrow_mut().push("keyboard disable"),
+                                |_| -> Result<(), super::TuiError> {
+                                    calls.borrow_mut().push("run");
+                                    panic!("loop panic")
+                                },
+                            )
+                        },
+                    )
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "paste enable",
+                "mouse enable",
+                "keyboard enable",
+                "run",
+                "keyboard disable",
+                "mouse disable",
+                "paste disable",
+                "terminal restore",
+            ]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        let paste_error = {
+            let _terminal_restore =
+                super::RestoreGuard::new(|| calls.borrow_mut().push("terminal restore"));
+            super::with_bracketed_paste(
+                || {
+                    calls.borrow_mut().push("paste enable");
+                    Err(io::Error::other("paste failed"))
+                },
+                || calls.borrow_mut().push("paste disable"),
+                || {
+                    calls.borrow_mut().push("run");
+                    Ok(())
+                },
+            )
+        };
+        assert!(
+            matches!(paste_error, Err(super::TuiError::Terminal(message)) if message == "paste failed")
+        );
+        assert_eq!(
+            calls.into_inner(),
+            ["paste enable", "paste disable", "terminal restore"]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        let mouse_error = {
+            let _terminal_restore =
+                super::RestoreGuard::new(|| calls.borrow_mut().push("terminal restore"));
+            super::with_bracketed_paste(
+                || {
+                    calls.borrow_mut().push("paste enable");
+                    Ok(())
+                },
+                || calls.borrow_mut().push("paste disable"),
+                || {
+                    super::with_mouse_capture(
+                        || {
+                            calls.borrow_mut().push("mouse enable");
+                            Err(io::Error::other("mouse failed"))
+                        },
+                        || calls.borrow_mut().push("mouse disable"),
+                        || {
+                            calls.borrow_mut().push("run");
+                            Ok(())
+                        },
+                    )
+                },
+            )
+        };
+        assert!(
+            matches!(mouse_error, Err(super::TuiError::Terminal(message)) if message == "mouse failed")
+        );
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "paste enable",
+                "mouse enable",
+                "mouse disable",
+                "paste disable",
+                "terminal restore",
+            ]
+        );
+
+        let calls = RefCell::new(Vec::new());
+        let initialisation_error = super::with_terminal::<TestBackend>(
+            || {
+                calls.borrow_mut().push("initialise");
+                Err(super::TuiError::Terminal(
+                    "initialisation failed".to_owned(),
+                ))
+            },
+            || calls.borrow_mut().push("terminal restore"),
+            |_| {
+                calls.borrow_mut().push("paste enable");
+                Ok(())
+            },
+        );
+        assert!(initialisation_error.is_err());
+        assert_eq!(calls.into_inner(), ["initialise", "terminal restore"]);
+
+        let calls = RefCell::new(Vec::new());
+        super::with_terminal(
+            || {
+                calls.borrow_mut().push("initialise");
+                Terminal::new(TestBackend::new(10, 3))
+                    .map_err(|error| super::TuiError::Terminal(error.to_string()))
+            },
+            || calls.borrow_mut().push("terminal restore"),
+            |_| {
+                super::with_mouse_capture(
+                    || {
+                        calls.borrow_mut().push("mouse enable");
+                        Ok(())
+                    },
+                    || calls.borrow_mut().push("mouse disable"),
+                    || {
+                        calls.borrow_mut().push("run");
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "initialise",
+                "mouse enable",
+                "run",
+                "mouse disable",
+                "terminal restore",
+            ]
+        );
+    }
+
+    #[test]
     fn active_run_accepts_cancel_but_not_submit() {
         let mut app = App::default();
         assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(7) }));
@@ -2831,35 +3252,21 @@ mod tests {
     }
 
     #[test]
-    fn paste_clears_copy_feedback_without_affecting_prompt_or_selection() {
+    fn paste_clears_copy_feedback_without_affecting_selection() {
         let mut configured = App::default();
         set_prompt(&mut configured, "keep");
         let now = queue_copy(&mut configured, "copied selection", 40, 7);
         let mut copied_clipboard = FakeClipboard::available();
         assert!(configured.finish_pending_copy(&mut copied_clipboard, now));
         let copied_selection = configured.selection;
-        let mut configured_input = FakeInput::new([Some(Event::Paste("ignored".to_owned()))]);
-        let mut configured_terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
-        let (commands, _command_receiver) = tokio::sync::mpsc::channel(1);
-        let (event_sender, mut events) = tokio::sync::mpsc::unbounded_channel();
-        let (_progress_sender, mut progress) = tokio::sync::mpsc::channel(1);
-        drop(event_sender);
 
-        assert!(matches!(
-            super::run_loop(
-                &mut configured_terminal,
-                &mut configured,
-                &mut configured_input,
-                &commands,
-                &mut events,
-                &mut progress,
-                &mut copied_clipboard,
-            ),
-            Err(super::TuiError::RuntimeClosed)
-        ));
+        let update = configured.handle_paste(" pasted");
+
+        assert!(update.visible_changed);
+        assert!(update.command.is_none());
         assert!(configured.notice().is_none());
         assert_eq!(configured.selection, copied_selection);
-        assert_eq!(configured.prompt.text(), "keep");
+        assert_eq!(configured.prompt.text(), "keep pasted");
 
         let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
         set_prompt(&mut configuration, "keep");
