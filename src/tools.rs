@@ -2,6 +2,7 @@ mod command;
 
 #[cfg(test)]
 pub(crate) use command::CommandTestGate;
+pub(crate) use command::ToolOutputChunk;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -28,6 +29,7 @@ use rustix::fs::{RenameFlags, fchmod, fstat, linkat, mkdirat, renameat, renameat
 #[cfg(unix)]
 use rustix::io::Errno;
 use thiserror::Error;
+use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::{Notify, Semaphore};
 
@@ -848,6 +850,7 @@ struct BatchDispatch<'a> {
     active: FuturesUnordered<BoxFuture<'a, ScheduledCall>>,
     active_mutation_paths: BTreeSet<PathBuf>,
     authorisations: WholeFileAuthorisations,
+    output: Option<mpsc::Sender<ToolOutputChunk>>,
 }
 
 impl<'a> BatchDispatch<'a> {
@@ -855,6 +858,7 @@ impl<'a> BatchDispatch<'a> {
         host: &'a ToolHost,
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
+        output: Option<mpsc::Sender<ToolOutputChunk>>,
     ) -> Self {
         Self {
             host,
@@ -862,6 +866,7 @@ impl<'a> BatchDispatch<'a> {
             active: FuturesUnordered::new(),
             active_mutation_paths: BTreeSet::new(),
             authorisations,
+            output,
         }
     }
 
@@ -901,9 +906,12 @@ impl<'a> BatchDispatch<'a> {
                 );
             }
             let host = self.host;
+            let output = self.output.clone();
             self.active.push(Box::pin(async move {
                 ScheduledCall {
-                    result: host.call_with_authorisation(call, authorisation).await,
+                    result: host
+                        .call_with_authorisation_and_output(call, authorisation, output)
+                        .await,
                     mutation_path,
                 }
             }));
@@ -1589,13 +1597,26 @@ impl ToolHost {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch_batch(
         &self,
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
     ) -> impl Stream<Item = ToolResult> + '_ {
         stream::unfold(
-            BatchDispatch::new(self, calls, authorisations),
+            BatchDispatch::new(self, calls, authorisations, None),
+            |dispatch| async move { dispatch.next().await },
+        )
+    }
+
+    pub(crate) fn dispatch_batch_with_output(
+        &self,
+        calls: Vec<ToolCall>,
+        authorisations: WholeFileAuthorisations,
+        output: mpsc::Sender<ToolOutputChunk>,
+    ) -> impl Stream<Item = ToolResult> + '_ {
+        stream::unfold(
+            BatchDispatch::new(self, calls, authorisations, Some(output)),
             |dispatch| async move { dispatch.next().await },
         )
     }
@@ -1605,10 +1626,21 @@ impl ToolHost {
         self.call_with_authorisation(call, None).await
     }
 
+    #[cfg(test)]
     async fn call_with_authorisation(
         &self,
         call: ToolCall,
         authorisation: Option<ContentFingerprint>,
+    ) -> ToolResult {
+        self.call_with_authorisation_and_output(call, authorisation, None)
+            .await
+    }
+
+    async fn call_with_authorisation_and_output(
+        &self,
+        call: ToolCall,
+        authorisation: Option<ContentFingerprint>,
+        output: Option<mpsc::Sender<ToolOutputChunk>>,
     ) -> ToolResult {
         let ToolCall {
             call_id,
@@ -1631,7 +1663,7 @@ impl ToolHost {
             ToolName::ListDir => self.list_dir(arguments).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
-            ToolName::Run => self.run(arguments).await,
+            ToolName::Run => self.run(call_id, arguments, output).await,
         };
         match result {
             Ok(ToolOutput { result, effect }) => ToolResult {
@@ -1854,7 +1886,12 @@ impl ToolHost {
         .map(ToolOutput::without_effect)
     }
 
-    async fn run(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+    async fn run(
+        &self,
+        call_id: u32,
+        arguments: ToolValue,
+        output: Option<mpsc::Sender<ToolOutputChunk>>,
+    ) -> Result<ToolOutput, ToolError> {
         let (command, cwd) = run_arguments(arguments)?;
         let workspace = Arc::clone(&self.workspace);
         let cwd = tokio::task::spawn_blocking(move || {
@@ -1864,12 +1901,17 @@ impl ToolHost {
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
         #[cfg(test)]
-        let result =
-            command::execute_command_with_test_gate(&command, cwd, self.command_test_gate.clone())
-                .await
-                .map_err(map_command_error)?;
+        let result = command::execute_command_with_test_gate(
+            &command,
+            cwd,
+            self.command_test_gate.clone(),
+            call_id,
+            output,
+        )
+        .await
+        .map_err(map_command_error)?;
         #[cfg(not(test))]
-        let result = command::execute_command(&command, cwd)
+        let result = command::execute_command_streaming(&command, cwd, call_id, output)
             .await
             .map_err(map_command_error)?;
         Ok(ToolOutput::without_effect(command_result_value(result)))

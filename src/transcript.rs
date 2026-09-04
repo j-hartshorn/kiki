@@ -7,7 +7,8 @@ use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
 
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{
-    Execution, ExecutionOutcome, Observation, ToolCall, ToolCallSummary, ToolCallToken,
+    Execution, ExecutionOutcome, Observation, RunPreview, ToolCall, ToolCallSummary, ToolCallToken,
+    ToolName,
 };
 use crate::config::{
     ApiKeyPresence, DEFAULT_MODEL, PromptProvenance, StartupSnapshot, SubmissionAvailability,
@@ -94,6 +95,7 @@ struct LiveStep {
     stdout_truncated: bool,
     tool_calls: Vec<ToolCall>,
     tool_call_tokens: Vec<ToolCallToken>,
+    run_previews: Vec<Option<RunPreview>>,
     progress_gap: bool,
     activity: String,
 }
@@ -112,9 +114,24 @@ impl LiveStep {
             stdout_truncated: false,
             tool_calls: Vec::new(),
             tool_call_tokens: Vec::new(),
+            run_previews: Vec::new(),
             progress_gap,
             activity: "generating".to_owned(),
         }
+    }
+
+    fn insert_tool_call(
+        &mut self,
+        token: ToolCallToken,
+        call: ToolCall,
+        preview: Option<RunPreview>,
+    ) {
+        let index = self
+            .tool_call_tokens
+            .partition_point(|existing| *existing <= token);
+        self.tool_calls.insert(index, call);
+        self.tool_call_tokens.insert(index, token);
+        self.run_previews.insert(index, preview);
     }
 }
 
@@ -152,6 +169,7 @@ struct ArenaBlock {
     status: Option<String>,
     source: Option<String>,
     tool_calls: Vec<ToolCall>,
+    run_previews: Vec<Option<RunPreview>>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
     accounting: Option<String>,
@@ -204,6 +222,7 @@ struct NormalisedArenaBlock {
     status: Option<String>,
     source: Option<String>,
     tool_calls: Vec<ToolCall>,
+    run_previews: Vec<Option<RunPreview>>,
     content: Vec<ArenaContent>,
     progress_gap: bool,
     accounting: Option<String>,
@@ -232,6 +251,16 @@ impl TranscriptBlock {
                 status: arena.status.map(|status| normalise_terminal_text(&status)),
                 source: arena.source.map(|source| normalise_terminal_text(&source)),
                 tool_calls: arena.tool_calls,
+                run_previews: arena
+                    .run_previews
+                    .into_iter()
+                    .map(|preview| {
+                        preview.map(|preview| RunPreview {
+                            command: normalise_terminal_text(&preview.command),
+                            stdout: normalise_terminal_text(&preview.stdout),
+                        })
+                    })
+                    .collect(),
                 content: arena
                     .content
                     .into_iter()
@@ -324,6 +353,7 @@ fn code_preview(source: &str, expanded: bool) -> (String, Option<usize>) {
 
 fn tool_call_text(
     tool_calls: &[ToolCall],
+    run_previews: &[Option<RunPreview>],
     expanded: bool,
     background: Color,
 ) -> Option<Text<'static>> {
@@ -338,11 +368,27 @@ fn tool_call_text(
             dim_card_style(background),
         ));
     }
-    lines.extend(
-        tool_calls[omitted.unwrap_or_default()..]
-            .iter()
-            .map(|call| Line::styled(tool_call_label(*call), card_style(background))),
-    );
+    for (index, call) in tool_calls
+        .iter()
+        .enumerate()
+        .skip(omitted.unwrap_or_default())
+    {
+        lines.push(Line::styled(tool_call_label(*call), card_style(background)));
+        if let Some(preview) = run_previews.get(index).and_then(Option::as_ref) {
+            lines.push(Line::styled(
+                format!("╭─ $ {}", preview.command),
+                dim_card_style(background),
+            ));
+            if !preview.stdout.is_empty() {
+                lines.extend(
+                    logical_lines(&preview.stdout)
+                        .into_iter()
+                        .map(|line| Line::styled(format!("│ {line}"), card_style(background))),
+                );
+            }
+            lines.push(Line::styled("╰─", dim_card_style(background)));
+        }
+    }
     Some(Text {
         alignment: None,
         style: card_style(background),
@@ -886,7 +932,9 @@ impl ArenaRenderBlock {
             )));
         }
 
-        if let Some(tool_calls) = tool_call_text(&arena.tool_calls, expanded, background) {
+        if let Some(tool_calls) =
+            tool_call_text(&arena.tool_calls, &arena.run_previews, expanded, background)
+        {
             items.push(ArenaItem::Section(ArenaSection::new(
                 "tool calls",
                 tool_calls,
@@ -1091,7 +1139,8 @@ impl NormalisedArenaBlock {
         if let Some(source) = &self.source {
             lines.push(format!("code:\n{source}"));
         }
-        if let Some(tool_calls) = tool_call_text(&self.tool_calls, false, PAGE) {
+        if let Some(tool_calls) = tool_call_text(&self.tool_calls, &self.run_previews, false, PAGE)
+        {
             lines.push(format!("tool calls:\n{tool_calls}"));
         }
         if self.source.is_some() && !self.content.is_empty() {
@@ -1543,55 +1592,85 @@ impl Transcript {
         &self.status
     }
 
+    fn has_settled_run(&self, run_id: RunId, step_id: ModelStepId) -> bool {
+        self.live_step.as_ref().is_some_and(|live| {
+            live.run_id == run_id
+                && live.step_id == step_id
+                && live.tool_calls.iter().any(|call| {
+                    call.tool == ToolName::Run && !matches!(call.summary, ToolCallSummary::Pending)
+                })
+        })
+    }
+
     pub(crate) fn apply(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
         match event {
             RuntimeEvent::RunStarted { run_id } => self.start_run(run_id, gap_before),
-            RuntimeEvent::ModelStepStarted { run_id, step_id } => self.update_live_step(
-                run_id,
-                step_id,
-                gap_before,
-                Some("generating".to_owned()),
-                |_| {},
-            ),
+            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+                if self.has_settled_run(run_id, step_id) {
+                    false
+                } else {
+                    self.update_live_step(
+                        run_id,
+                        step_id,
+                        gap_before,
+                        Some("generating".to_owned()),
+                        |_| {},
+                    )
+                }
+            }
             RuntimeEvent::ModelProgress {
                 run_id,
                 step_id,
                 progress,
-            } => self.update_live_step(
-                run_id,
-                step_id,
-                gap_before,
-                Some("generating".to_owned()),
-                |live| match progress {
-                    ModelProgress::AttemptStarted { .. } => {
-                        live.phase = LivePhase::Generating;
-                        live.reasoning.clear();
-                        live.assistant_text.clear();
-                        live.decoded_python.clear();
-                        live.activity = "generating".to_owned();
-                    }
-                    ModelProgress::ReasoningSummaryChunk { text } => live.reasoning.push_str(&text),
-                    ModelProgress::AssistantTextChunk { text } => {
-                        live.assistant_text.push_str(&text)
-                    }
-                    ModelProgress::DecodedPythonChunk { code } => {
-                        live.decoded_python.push_str(&code)
-                    }
-                    ModelProgress::AttemptSettled { accounting, .. } => {
-                        live.settled_attempts.push(accounting)
-                    }
-                },
-            ),
-            RuntimeEvent::ExecutionStarted { run_id, step_id } => self.update_live_step(
-                run_id,
-                step_id,
-                gap_before,
-                Some("running code".to_owned()),
-                |live| {
-                    live.phase = LivePhase::Executing;
-                    live.activity = "running code".to_owned();
-                },
-            ),
+            } => {
+                if self.has_settled_run(run_id, step_id) {
+                    false
+                } else {
+                    self.update_live_step(
+                        run_id,
+                        step_id,
+                        gap_before,
+                        Some("generating".to_owned()),
+                        |live| match progress {
+                            ModelProgress::AttemptStarted { .. } => {
+                                live.phase = LivePhase::Generating;
+                                live.reasoning.clear();
+                                live.assistant_text.clear();
+                                live.decoded_python.clear();
+                                live.activity = "generating".to_owned();
+                            }
+                            ModelProgress::ReasoningSummaryChunk { text } => {
+                                live.reasoning.push_str(&text)
+                            }
+                            ModelProgress::AssistantTextChunk { text } => {
+                                live.assistant_text.push_str(&text)
+                            }
+                            ModelProgress::DecodedPythonChunk { code } => {
+                                live.decoded_python.push_str(&code)
+                            }
+                            ModelProgress::AttemptSettled { accounting, .. } => {
+                                live.settled_attempts.push(accounting)
+                            }
+                        },
+                    )
+                }
+            }
+            RuntimeEvent::ExecutionStarted { run_id, step_id } => {
+                if self.has_settled_run(run_id, step_id) {
+                    false
+                } else {
+                    self.update_live_step(
+                        run_id,
+                        step_id,
+                        gap_before,
+                        Some("running code".to_owned()),
+                        |live| {
+                            live.phase = LivePhase::Executing;
+                            live.activity = "running code".to_owned();
+                        },
+                    )
+                }
+            }
             RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
@@ -1599,26 +1678,78 @@ impl Transcript {
                 call,
             } => {
                 let activity = tool_call_label(call);
-                self.update_live_step(
-                    run_id,
-                    step_id,
-                    gap_before,
-                    Some(activity.clone()),
-                    |live| {
-                        live.phase = LivePhase::Executing;
-                        live.activity = activity;
-                        if matches!(call.summary, ToolCallSummary::Pending) {
-                            live.tool_calls.push(call);
-                            live.tool_call_tokens.push(token);
-                        } else if let Some(index) = live
+                let mut accepted = false;
+                let mut changed =
+                    self.update_live_step(run_id, step_id, gap_before, None, |live| {
+                        let index = live
                             .tool_call_tokens
                             .iter()
-                            .position(|pending| *pending == token)
-                        {
-                            live.tool_calls[index] = call;
+                            .position(|existing| *existing == token);
+                        if index.is_some_and(|index| {
+                            !matches!(live.tool_calls[index].summary, ToolCallSummary::Pending)
+                                && matches!(call.summary, ToolCallSummary::Pending)
+                        }) {
+                            return;
                         }
-                    },
-                )
+                        accepted = true;
+                        live.phase = LivePhase::Executing;
+                        live.activity = activity.clone();
+                        if let Some(index) = index {
+                            live.tool_calls[index] = call;
+                            if !matches!(call.summary, ToolCallSummary::Pending) {
+                                live.run_previews[index] = None;
+                            }
+                        } else {
+                            live.insert_tool_call(token, call, None);
+                        }
+                    });
+                if accepted {
+                    changed |= self.set_status(activity);
+                }
+                changed
+            }
+            RuntimeEvent::RunPreviewUpdated {
+                run_id,
+                step_id,
+                token,
+                preview,
+            } => {
+                let activity = tool_call_label(ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                });
+                let mut accepted = false;
+                let mut changed =
+                    self.update_live_step(run_id, step_id, gap_before, None, |live| {
+                        let index = live
+                            .tool_call_tokens
+                            .iter()
+                            .position(|existing| *existing == token);
+                        if index.is_some_and(|index| {
+                            !matches!(live.tool_calls[index].summary, ToolCallSummary::Pending)
+                        }) {
+                            return;
+                        }
+                        accepted = true;
+                        live.phase = LivePhase::Executing;
+                        live.activity = activity.clone();
+                        if let Some(index) = index {
+                            live.run_previews[index] = Some(preview);
+                        } else {
+                            live.insert_tool_call(
+                                token,
+                                ToolCall {
+                                    tool: ToolName::Run,
+                                    summary: ToolCallSummary::Pending,
+                                },
+                                Some(preview),
+                            );
+                        }
+                    });
+                if accepted {
+                    changed |= self.set_status(activity);
+                }
+                changed
             }
             RuntimeEvent::StdoutDelta {
                 run_id,
@@ -2074,6 +2205,7 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
                 status: None,
                 source: Some(source.clone()),
                 tool_calls: execution.tool_calls.clone(),
+                run_previews: Vec::new(),
                 content: execution_content(execution),
                 progress_gap: displayed.progress_gap,
                 accounting: step_accounting(attempts),
@@ -2141,6 +2273,7 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
             status: (live.activity != live.phase.label()).then(|| live.activity.clone()),
             source: (!live.decoded_python.is_empty()).then(|| live.decoded_python.clone()),
             tool_calls: live.tool_calls.clone(),
+            run_previews: live.run_previews.clone(),
             content,
             progress_gap: live.progress_gap,
             accounting,
@@ -2186,6 +2319,7 @@ fn terminal_blocks(
                 status: None,
                 source: Some(evidence.decoded_python.clone()),
                 tool_calls: Vec::new(),
+                run_previews: Vec::new(),
                 content: Vec::new(),
                 progress_gap,
                 accounting: None,
@@ -2285,6 +2419,7 @@ fn terminal_evidence_blocks(
                     status: None,
                     source: Some(decoded_python.clone()),
                     tool_calls: Vec::new(),
+                    run_previews: Vec::new(),
                     content: Vec::new(),
                     progress_gap: false,
                     accounting: None,
@@ -2365,6 +2500,7 @@ fn execution_evidence_block(
         )),
         source: Some(evidence.source.clone()),
         tool_calls: evidence.tool_calls.clone(),
+        run_previews: Vec::new(),
         content,
         progress_gap,
         accounting,
@@ -2605,8 +2741,8 @@ mod tests {
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
-        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
-        ToolCallToken, ToolName,
+        Execution, ExecutionOutcome, Observation, PythonError, RunPreview, ToolCall,
+        ToolCallSummary, ToolCallToken, ToolName,
     };
     use crate::config::ready_snapshot_for_test;
     use crate::highlight::PythonHighlighter;
@@ -2967,6 +3103,69 @@ mod tests {
             },
             progress_gap: false,
         }
+    }
+
+    fn start_live_run(transcript: &mut Transcript) {
+        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+        ));
+    }
+
+    fn apply_run_tool_update(
+        transcript: &mut Transcript,
+        token: ToolCallToken,
+        summary: ToolCallSummary,
+    ) -> bool {
+        transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                call: ToolCall {
+                    tool: ToolName::Run,
+                    summary,
+                },
+            },
+            false,
+        )
+    }
+
+    fn apply_run_preview(
+        transcript: &mut Transcript,
+        token: ToolCallToken,
+        command: &str,
+        stdout: &str,
+    ) -> bool {
+        transcript.apply(
+            RuntimeEvent::RunPreviewUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                preview: RunPreview {
+                    command: command.to_owned(),
+                    stdout: stdout.to_owned(),
+                },
+            },
+            false,
+        )
+    }
+
+    fn assert_live_run_rows(
+        transcript: &Transcript,
+        tool_calls: &[ToolCall],
+        run_previews: &[Option<RunPreview>],
+    ) {
+        let live = transcript
+            .live_step
+            .as_ref()
+            .expect("run updates create a live step");
+        assert_eq!(live.tool_calls, tool_calls);
+        assert_eq!(live.run_previews, run_previews);
     }
 
     fn final_message(
@@ -5876,6 +6075,535 @@ truncated"
         ] {
             assert!(!rendered.contains(omitted), "{rendered}");
         }
+    }
+
+    #[test]
+    fn cards_box_each_active_run_command_and_its_stdout_tail() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+        );
+        let token = ToolCallToken::for_test(0);
+        transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                call: ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+            },
+            false,
+        );
+        let stdout = (3..=10)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        transcript.apply(
+            RuntimeEvent::RunPreviewUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                preview: RunPreview {
+                    command: "printf 'ten lines'".to_owned(),
+                    stdout,
+                },
+            },
+            false,
+        );
+
+        let buffer = rendered_buffer(&mut transcript, 80);
+        closed_section(&buffer, "tool calls");
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("run · pending"), "{rendered}");
+        assert!(rendered.contains("╭─ $ printf 'ten lines'"), "{rendered}");
+        assert!(rendered.contains("│ line 3"), "{rendered}");
+        assert!(rendered.contains("│ line 10"), "{rendered}");
+        assert!(rendered.contains("╰─"), "{rendered}");
+        assert!(!rendered.contains("│ line 1 "), "{rendered}");
+        assert!(!rendered.contains("│ line 2 "), "{rendered}");
+
+        transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                call: ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::RunPreviewUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                preview: RunPreview {
+                    command: "stale command".to_owned(),
+                    stdout: "stale output".to_owned(),
+                },
+            },
+            true,
+        );
+        transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token,
+                call: ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+            },
+            false,
+        );
+
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(!rendered.contains("printf 'ten lines'"), "{rendered}");
+        assert!(!rendered.contains("line 10"), "{rendered}");
+        assert!(!rendered.contains("stale command"), "{rendered}");
+        assert!(!rendered.contains("stale output"), "{rendered}");
+        assert_eq!(transcript.status(), "run · exit 0");
+    }
+
+    #[test]
+    fn live_run_events_upsert_delayed_and_duplicate_updates() {
+        let mut transcript = Transcript::default();
+        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        let token = ToolCallToken::for_test(0);
+
+        assert!(apply_run_preview(
+            &mut transcript,
+            token,
+            "first",
+            "first output"
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }],
+            &[Some(RunPreview {
+                command: "first".to_owned(),
+                stdout: "first output".to_owned(),
+            })],
+        );
+        assert!(rendered_text(&transcript).contains("first output"));
+
+        assert!(apply_run_preview(
+            &mut transcript,
+            token,
+            "latest",
+            "latest output"
+        ));
+        assert!(!apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Pending
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }],
+            &[Some(RunPreview {
+                command: "latest".to_owned(),
+                stdout: "latest output".to_owned(),
+            })],
+        );
+
+        assert!(!apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Pending
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }],
+            &[Some(RunPreview {
+                command: "latest".to_owned(),
+                stdout: "latest output".to_owned(),
+            })],
+        );
+
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Exit(0)
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Exit(0),
+            }],
+            &[None],
+        );
+        let status = transcript.status().to_owned();
+
+        assert!(!apply_run_preview(
+            &mut transcript,
+            token,
+            "stale",
+            "stale output"
+        ));
+        assert!(!apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Pending
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Exit(0),
+            }],
+            &[None],
+        );
+        assert_eq!(transcript.status(), status);
+    }
+
+    #[test]
+    fn live_tool_rows_upsert_by_token_in_admission_order() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let first = ToolCallToken::for_test(0);
+        let second = ToolCallToken::for_test(1);
+
+        assert!(transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token: second,
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(1),
+                },
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token: first,
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+            },
+            false,
+        ));
+
+        assert_live_run_rows(
+            &transcript,
+            &[
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(1),
+                },
+            ],
+            &[None, None],
+        );
+    }
+
+    #[test]
+    fn live_terminal_run_updates_create_and_upsert_rows() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let token = ToolCallToken::for_test(0);
+
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Exit(7)
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Exit(7),
+            }],
+            &[None],
+        );
+        assert_eq!(transcript.status(), "run · exit 7");
+
+        assert!(!apply_run_preview(
+            &mut transcript,
+            token,
+            "stale command",
+            "stale output"
+        ));
+        assert!(!apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Exit(7)
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Exit(7),
+            }],
+            &[None],
+        );
+    }
+
+    #[test]
+    fn reliable_run_settlement_rejects_delayed_step_lifecycle_progress() {
+        let mut transcript = Transcript::default();
+        let token = ToolCallToken::for_test(0);
+
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            token,
+            ToolCallSummary::Exit(0)
+        ));
+        assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        assert!(!transcript.apply(
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "stale()".to_owned(),
+                },
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            false,
+        ));
+        assert_eq!(transcript.status(), "run · exit 0");
+        let rendered = rendered_text(&transcript);
+        assert!(rendered.contains("run · exit 0"));
+        assert!(!rendered.contains("stale()"));
+    }
+
+    #[test]
+    fn mixed_tool_rows_keep_admission_order_when_run_settles_first() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let read = ToolCallToken::for_test(0);
+        let run = ToolCallToken::for_test(1);
+
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            run,
+            ToolCallSummary::Exit(0)
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                token: read,
+                call: ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+            },
+            false,
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Pending,
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            ],
+            &[None, None],
+        );
+    }
+
+    #[test]
+    fn concurrent_run_rows_keep_admission_order_when_later_call_settles_first() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let first = ToolCallToken::for_test(0);
+        let second = ToolCallToken::for_test(1);
+
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            second,
+            ToolCallSummary::Exit(0)
+        ));
+        assert!(apply_run_preview(
+            &mut transcript,
+            first,
+            "first",
+            "first output"
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            ],
+            &[
+                Some(RunPreview {
+                    command: "first".to_owned(),
+                    stdout: "first output".to_owned(),
+                }),
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn concurrent_live_run_previews_settle_independently() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let first = ToolCallToken::for_test(0);
+        let second = ToolCallToken::for_test(1);
+
+        assert!(apply_run_preview(
+            &mut transcript,
+            first,
+            "first",
+            "first output"
+        ));
+        assert!(apply_run_preview(
+            &mut transcript,
+            second,
+            "second",
+            "second output"
+        ));
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            first,
+            ToolCallSummary::Exit(0)
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+            ],
+            &[
+                None,
+                Some(RunPreview {
+                    command: "second".to_owned(),
+                    stdout: "second output".to_owned(),
+                }),
+            ],
+        );
+
+        assert!(apply_run_preview(
+            &mut transcript,
+            second,
+            "second latest",
+            "second latest output"
+        ));
+        assert!(apply_run_tool_update(
+            &mut transcript,
+            second,
+            ToolCallSummary::Exit(1)
+        ));
+        assert_live_run_rows(
+            &transcript,
+            &[
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(1),
+                },
+            ],
+            &[None, None],
+        );
+    }
+
+    #[test]
+    fn live_run_previews_end_at_the_retained_evidence_boundary() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        let token = ToolCallToken::for_test(0);
+
+        assert!(apply_run_preview(
+            &mut transcript,
+            token,
+            "live command",
+            "live output"
+        ));
+        assert!(rendered_text(&transcript).contains("live command"));
+        assert!(transcript.apply(
+            completed_execution_with_tool_calls(
+                1,
+                1,
+                "authoritative()",
+                "authoritative output",
+                vec![ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                }],
+            ),
+            false,
+        ));
+
+        let retained = rendered_text(&transcript);
+        assert!(retained.contains("run · exit 0"));
+        assert!(!retained.contains("live command"));
+        assert!(!retained.contains("live output"));
+        assert!(transcript.live_step.is_none());
+        assert!(transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false));
+        assert!(transcript.is_idle());
+
+        assert!(!apply_run_preview(
+            &mut transcript,
+            token,
+            "stale command",
+            "stale output"
+        ));
+        assert_eq!(rendered_text(&transcript), retained);
     }
 
     #[test]

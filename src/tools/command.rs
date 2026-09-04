@@ -3,19 +3,21 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 #[cfg(test)]
 use tokio::sync::{Mutex, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::constants::COMMAND_STREAM_MAX_BYTES;
+
+const STDOUT_PROGRESS_CHUNK_BYTES: usize = 256 * 1024;
+const STDOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CommandResult {
@@ -32,6 +34,12 @@ pub(super) enum CommandError {
     Internal,
     #[error("{0}")]
     Overflow(String),
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolOutputChunk {
+    pub(crate) call_id: u32,
+    pub(crate) stdout: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -323,17 +331,34 @@ fn overflow_message(
     )
 }
 
+#[cfg(test)]
 pub(super) async fn execute_command(
     command: &str,
     cwd: OwnedFd,
 ) -> Result<CommandResult, CommandError> {
+    execute_command_streaming(command, cwd, 0, None).await
+}
+
+pub(super) async fn execute_command_streaming(
+    command: &str,
+    cwd: OwnedFd,
+    call_id: u32,
+    stdout_sender: Option<mpsc::Sender<ToolOutputChunk>>,
+) -> Result<CommandResult, CommandError> {
     #[cfg(test)]
     {
-        execute_command_with_test_gate(command, cwd, None).await
+        execute_command_with_test_gate(command, cwd, None, call_id, stdout_sender).await
     }
     #[cfg(not(test))]
     {
-        execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES).await
+        execute_command_bounded_streaming(
+            command,
+            cwd,
+            COMMAND_STREAM_MAX_BYTES,
+            call_id,
+            stdout_sender,
+        )
+        .await
     }
 }
 
@@ -342,14 +367,36 @@ pub(super) async fn execute_command_with_test_gate(
     command: &str,
     cwd: OwnedFd,
     gate: Option<Arc<CommandTestGate>>,
+    call_id: u32,
+    stdout_sender: Option<mpsc::Sender<ToolOutputChunk>>,
 ) -> Result<CommandResult, CommandError> {
-    execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES, gate).await
+    execute_command_bounded_streaming(
+        command,
+        cwd,
+        COMMAND_STREAM_MAX_BYTES,
+        call_id,
+        stdout_sender,
+        gate,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn execute_command_bounded(
     command: &str,
     cwd: OwnedFd,
     limit: usize,
+    gate: Option<Arc<CommandTestGate>>,
+) -> Result<CommandResult, CommandError> {
+    execute_command_bounded_streaming(command, cwd, limit, 0, None, gate).await
+}
+
+async fn execute_command_bounded_streaming(
+    command: &str,
+    cwd: OwnedFd,
+    limit: usize,
+    call_id: u32,
+    stdout_sender: Option<mpsc::Sender<ToolOutputChunk>>,
     #[cfg(test)] gate: Option<Arc<CommandTestGate>>,
 ) -> Result<CommandResult, CommandError> {
     let mut cmd = Command::new("/bin/sh");
@@ -425,6 +472,8 @@ async fn execute_command_bounded(
             stdout,
             stderr,
             limit,
+            call_id,
+            stdout_sender,
             cancel_rx,
             result_tx,
             #[cfg(test)]
@@ -445,6 +494,8 @@ struct Supervisor {
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
     limit: usize,
+    call_id: u32,
+    stdout_sender: Option<mpsc::Sender<ToolOutputChunk>>,
     cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<Result<CommandResult, CommandError>>,
     #[cfg(test)]
@@ -459,6 +510,8 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
         mut stdout,
         mut stderr,
         limit,
+        call_id,
+        stdout_sender,
         mut cancel_rx,
         result_tx,
         #[cfg(test)]
@@ -476,6 +529,9 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
     let mut stderr_bytes = 0usize;
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
+    let mut stdout_progress = Vec::new();
+    let mut stdout_progress_started = false;
+    let mut stdout_progress_at = Instant::now();
     let mut child_waited = false;
     let mut child_status = None;
     let mut pipe_error = false;
@@ -501,11 +557,25 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
                 cancelled = true;
                 guard.kill();
             }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                stdout_progress_at + STDOUT_PROGRESS_INTERVAL,
+            )), if !cancelled && stdout_progress_started && !stdout_progress.is_empty() => {
+                publish_stdout(call_id, &stdout_sender, &mut stdout_progress).await;
+                stdout_progress_at = Instant::now();
+            }
             res = stdout.read(&mut chunk_out), if !stdout_done && !reads_held => {
                 match res {
                     Ok(0) => stdout_done = true,
                     Ok(n) => {
                         stdout_bytes += n;
+                        stdout_progress.extend_from_slice(&chunk_out[..n]);
+                        if !stdout_progress_started
+                            || stdout_progress.len() >= STDOUT_PROGRESS_CHUNK_BYTES
+                        {
+                            publish_stdout(call_id, &stdout_sender, &mut stdout_progress).await;
+                            stdout_progress_started = true;
+                            stdout_progress_at = Instant::now();
+                        }
                         if stdout_bytes > limit {
                             stdout_overflow = true;
                             guard.kill();
@@ -562,6 +632,9 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
         gate.notify_cleaned_up(guard.pgid);
     }
 
+    if !cancelled {
+        publish_stdout(call_id, &stdout_sender, &mut stdout_progress).await;
+    }
     if cancelled || cancellation_requested(&mut cancel_rx) {
         return;
     }
@@ -627,9 +700,30 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
     }));
 }
 
+async fn publish_stdout(
+    call_id: u32,
+    stdout_sender: &Option<mpsc::Sender<ToolOutputChunk>>,
+    stdout: &mut Vec<u8>,
+) {
+    if stdout.is_empty() {
+        return;
+    }
+    if let Some(stdout_sender) = stdout_sender {
+        let _ = stdout_sender
+            .send(ToolOutputChunk {
+                call_id,
+                stdout: std::mem::take(stdout),
+            })
+            .await;
+    } else {
+        stdout.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolOutputChunk;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::time::Duration;
@@ -675,6 +769,89 @@ mod tests {
         assert_eq!(output.stdout, "hello stdout");
         assert_eq!(output.stderr, "hello stderr");
         assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn streams_stdout_before_the_command_completes() {
+        let (_dir, cwd) = test_cwd();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ToolOutputChunk>(1);
+        let mut command = tokio::spawn(execute_command_streaming(
+            "printf first; sleep 0.1; printf second; sleep 1; printf third",
+            cwd,
+            42,
+            Some(sender),
+        ));
+
+        let first = tokio::select! {
+            stdout = receiver.recv() => stdout.expect("stdout channel should remain open"),
+            result = &mut command => panic!("command completed before streaming stdout: {result:?}"),
+        };
+        assert_eq!(first.call_id, 42);
+        assert_eq!(first.stdout, b"first");
+        let second = tokio::select! {
+            stdout = receiver.recv() => stdout.expect("stdout channel should remain open"),
+            result = &mut command => panic!("command completed before streaming later stdout: {result:?}"),
+        };
+        assert_eq!(second.call_id, 42);
+        assert_eq!(second.stdout, b"second");
+
+        let result = command.await.unwrap().unwrap();
+        assert_eq!(result.stdout, "firstsecondthird");
+    }
+
+    #[tokio::test]
+    async fn flushes_quiet_stdout_before_command_completes() {
+        let (dir, cwd) = test_cwd();
+        let burst_file = dir.path().join("burst");
+        let finish_file = dir.path().join("finish");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ToolOutputChunk>(1);
+        let shell_command = format!(
+            "printf first; while [ ! -e '{}' ]; do sleep 0.01; done; printf second; while [ ! -e '{}' ]; do sleep 0.01; done",
+            burst_file.display(),
+            finish_file.display(),
+        );
+        let command = tokio::spawn(async move {
+            execute_command_streaming(&shell_command, cwd, 73, Some(sender)).await
+        });
+
+        let first = receiver
+            .recv()
+            .await
+            .expect("stdout channel should remain open");
+        assert_eq!(first.call_id, 73);
+        assert_eq!(first.stdout, b"first");
+        fs::write(&burst_file, "").unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await;
+        let command_completed = command.is_finished();
+        fs::write(&finish_file, "").unwrap();
+        let result = command.await.unwrap().unwrap();
+
+        let second = second
+            .expect("quiet stdout should flush within the progress interval")
+            .expect("stdout channel should remain open");
+        assert_eq!(second.call_id, 73);
+        assert_eq!(second.stdout, b"second");
+        assert!(
+            !command_completed,
+            "command completed before quiet stdout flushed"
+        );
+        assert_eq!(result.stdout, "firstsecond");
+    }
+
+    #[tokio::test]
+    async fn ignores_a_closed_stdout_receiver() {
+        let (_dir, cwd) = test_cwd();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<ToolOutputChunk>(1);
+        drop(receiver);
+
+        let result = execute_command_streaming("printf stdout", cwd, 99, Some(sender))
+            .await
+            .unwrap();
+
+        assert_eq!(result.stdout, "stdout");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.exit_code, Some(0));
     }
 
     #[tokio::test]

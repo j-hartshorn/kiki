@@ -4882,6 +4882,9 @@ mod tests {
                 | RuntimeEvent::ToolUpdated {
                     run_id, step_id, ..
                 }
+                | RuntimeEvent::RunPreviewUpdated {
+                    run_id, step_id, ..
+                }
                 | RuntimeEvent::StdoutDelta {
                     run_id, step_id, ..
                 }
@@ -4964,6 +4967,7 @@ mod tests {
                 }
                 RuntimeEvent::ExecutionStarted { .. }
                 | RuntimeEvent::ToolUpdated { .. }
+                | RuntimeEvent::RunPreviewUpdated { .. }
                 | RuntimeEvent::StdoutDelta { .. }
                 | RuntimeEvent::StdoutTruncated { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}

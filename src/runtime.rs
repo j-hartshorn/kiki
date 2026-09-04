@@ -3,7 +3,7 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEvidence};
-use crate::arena::{Execution, ToolCall, ToolCallToken};
+use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +101,12 @@ pub(crate) enum RuntimeEvent {
         token: ToolCallToken,
         call: ToolCall,
     },
+    RunPreviewUpdated {
+        run_id: RunId,
+        step_id: ModelStepId,
+        token: ToolCallToken,
+        preview: RunPreview,
+    },
     StdoutDelta {
         run_id: RunId,
         step_id: ModelStepId,
@@ -197,6 +203,11 @@ struct ActiveRun<M: Model> {
 
 #[allow(clippy::large_enum_variant)]
 enum WorkerMessage<M: Model> {
+    ToolSettled {
+        step_ordinal: u64,
+        token: ToolCallToken,
+        call: ToolCall,
+    },
     ExecutionCompleted {
         step_ordinal: u64,
         source: String,
@@ -228,6 +239,9 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
     match progress {
         AgentProgress::ModelProgress(progress) => model_progress_payload_bytes(progress),
         AgentProgress::ToolUpdated { .. } => 0,
+        AgentProgress::RunPreviewUpdated { preview, .. } => {
+            preview.command.len() + preview.stdout.len()
+        }
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
         AgentProgress::ModelStepStarted
@@ -240,6 +254,9 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
     match event {
         RuntimeEvent::ModelProgress { progress, .. } => model_progress_payload_bytes(progress),
         RuntimeEvent::ToolUpdated { .. } => 0,
+        RuntimeEvent::RunPreviewUpdated { preview, .. } => {
+            preview.command.len() + preview.stdout.len()
+        }
         RuntimeEvent::StdoutDelta { text, .. } => text.len(),
         RuntimeEvent::StdoutTruncated { .. } => 0,
         RuntimeEvent::RunStarted { .. }
@@ -443,6 +460,16 @@ impl<M: Model> RuntimeController<M> {
                             0,
                         );
                     }
+                    AgentProgress::ToolUpdated { token, call }
+                        if call.tool == ToolName::Run
+                            && !matches!(call.summary, ToolCallSummary::Pending) =>
+                    {
+                        let _ = completion_sender.send(WorkerMessage::ToolSettled {
+                            step_ordinal,
+                            token,
+                            call,
+                        });
+                    }
                     AgentProgress::ExecutionCompleted {
                         source,
                         reasoning_summary,
@@ -508,6 +535,24 @@ impl<M: Model> RuntimeController<M> {
         progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
         match message {
+            WorkerMessage::ToolSettled {
+                step_ordinal,
+                token,
+                call,
+            } => {
+                let Some(step_id) = self.step_id_for(step_ordinal) else {
+                    return;
+                };
+                self.emit(
+                    events,
+                    RuntimeEvent::ToolUpdated {
+                        run_id: self.active_run_id(),
+                        step_id,
+                        token,
+                        call,
+                    },
+                );
+            }
             WorkerMessage::ExecutionCompleted {
                 step_ordinal,
                 source,
@@ -693,6 +738,14 @@ impl<M: Model> RuntimeController<M> {
                 token,
                 call,
             },
+            AgentProgress::RunPreviewUpdated { token, preview } => {
+                RuntimeEvent::RunPreviewUpdated {
+                    run_id,
+                    step_id,
+                    token,
+                    preview,
+                }
+            }
             AgentProgress::StdoutDelta { text } => RuntimeEvent::StdoutDelta {
                 run_id,
                 step_id,
@@ -1011,6 +1064,7 @@ mod tests {
                 step_id.0,
                 tool_call_label(*call)
             ),
+            RuntimeEvent::RunPreviewUpdated { .. } => "run-preview-updated".to_owned(),
             RuntimeEvent::StdoutDelta { .. } => "stdout-delta".to_owned(),
             RuntimeEvent::StdoutTruncated { .. } => "stdout-truncated".to_owned(),
             RuntimeEvent::RecordAppended { record, .. } => record_label(record),
@@ -1830,6 +1884,58 @@ mod tests {
             events.last(),
             Some(RuntimeEvent::RunSettled { run_id: RunId(1) })
         ));
+    }
+
+    #[tokio::test]
+    async fn progress_forwards_active_run_previews_with_run_and_step_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (commands, mut events, mut progress, controller) = start_controller(
+            controller(
+                &workspace,
+                vec![
+                    ModelAction::Code {
+                        source: "await run(\"printf 'preview stdout'\")".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ],
+            )
+            .await,
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let progress = drain_progress(&mut progress);
+        shutdown_controller(commands, controller).await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                call: ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ..
+            }
+        )));
+        assert!(progress.iter().any(|envelope| matches!(
+            &envelope.item,
+            RuntimeEvent::RunPreviewUpdated {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                preview,
+                ..
+            } if preview.command == "printf 'preview stdout'"
+                && preview.stdout == "preview stdout"
+        )));
     }
 
     #[tokio::test]
