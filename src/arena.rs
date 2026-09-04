@@ -114,6 +114,8 @@ pub(crate) enum ArenaProgress {
 pub(crate) enum ToolCallSummary {
     Pending,
     Failed,
+    Exit(i64),
+    Signal,
     Count(usize),
     Created,
     Replaced,
@@ -937,7 +939,9 @@ async fn drive(
                                 .remove(call_id)
                                 .expect("validated call ID must be admitted");
                             assert!(
-                                tokens.insert(call.call_id, call.token).is_none(),
+                                tokens
+                                    .insert(call.call_id, (call.tool, call.token))
+                                    .is_none(),
                                 "a pending host call must have a unique call ID"
                             );
                             HostToolCall {
@@ -956,10 +960,10 @@ async fn drive(
                         Box::pin(tool_host.dispatch_batch(calls, authorisations.clone()));
                     while let Some(result) = calls.next().await {
                         let call_id = result.call_id;
-                        let token = tokens
+                        let (tool, token) = tokens
                             .remove(&call_id)
                             .expect("a host result must retain an admitted call ID");
-                        let summary = tool_summary(&result);
+                        let summary = tool_summary(tool, &result);
                         assert!(
                             results.insert(call_id, result).is_none(),
                             "a host tool call must settle once"
@@ -1090,7 +1094,7 @@ fn tool_resume_value(result: ToolResult) -> ResumeValue {
     }
 }
 
-fn tool_summary(result: &ToolResult) -> ToolCallSummary {
+fn tool_summary(tool: ToolName, result: &ToolResult) -> ToolCallSummary {
     if let Some(status) = result.mutation_status() {
         return match status {
             crate::tools::MutationStatus::Created => ToolCallSummary::Created,
@@ -1098,11 +1102,24 @@ fn tool_summary(result: &ToolResult) -> ToolCallSummary {
             crate::tools::MutationStatus::Applied => ToolCallSummary::Applied,
         };
     }
-    match &result.result {
-        Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
-        Ok(ToolValue::List(entries)) => ToolCallSummary::Count(entries.len()),
-        Ok(_) => ToolCallSummary::Count(0),
-        Err(_) => ToolCallSummary::Failed,
+    match tool {
+        ToolName::Run => match &result.result {
+            Ok(ToolValue::Dictionary(fields)) => match fields.get("exit_code") {
+                Some(ToolValue::Integer(exit_code)) => ToolCallSummary::Exit(*exit_code),
+                Some(ToolValue::None) => ToolCallSummary::Signal,
+                _ => ToolCallSummary::Failed,
+            },
+            Ok(_) | Err(_) => ToolCallSummary::Failed,
+        },
+        ToolName::Write | ToolName::Edit => ToolCallSummary::Failed,
+        ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => {
+            match &result.result {
+                Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
+                Ok(ToolValue::List(entries)) => ToolCallSummary::Count(entries.len()),
+                Ok(_) => ToolCallSummary::Count(0),
+                Err(_) => ToolCallSummary::Failed,
+            }
+        }
     }
 }
 
@@ -1659,6 +1676,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use monty_types::PrintStream;
@@ -1672,11 +1690,11 @@ mod tests {
         Observation, ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY,
         RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName, ToolTraceState,
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
-        validate_worker, validate_worker_with_timeout,
+        tool_summary, validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{
-        BatchTestGate, BlockingTestGate, ReadTestGate, ToolHost, WholeFileAuthorisations,
-        WriteTestHook,
+        BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolHost, ToolResult,
+        ToolValue, WholeFileAuthorisations, WriteTestHook,
     };
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
@@ -1741,6 +1759,26 @@ mod tests {
         let arena = Arena::new(worker_path(), tool_host)
             .await
             .expect("create arena");
+        (arena, gate)
+    }
+
+    async fn arena_with_command_gate(
+        workspace: &TempDir,
+        execution_timeout: Duration,
+    ) -> (Arena, Arc<CommandTestGate>) {
+        let gate = CommandTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_command_test_gate(gate.clone());
+        let arena = Arena::with_limits(
+            worker_path(),
+            tool_host,
+            execution_timeout,
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .expect("create arena");
         (arena, gate)
     }
 
@@ -1835,6 +1873,48 @@ mod tests {
         accumulator.finish()
     }
 
+    fn assert_failed_without_count_label_panic(tool: ToolName, result: &ToolResult) {
+        let summary = std::panic::catch_unwind(|| {
+            let summary = tool_summary(tool, result);
+            if let ToolCallSummary::Count(count) = summary {
+                tool.count_label(count);
+            }
+            summary
+        })
+        .expect("unexpected successful shape must not reach count_label");
+        assert_eq!(summary, ToolCallSummary::Failed);
+    }
+
+    #[test]
+    fn tool_summary_rejects_malformed_run_results_without_count_labels() {
+        let result = ToolResult::without_effect(ToolValue::None);
+
+        for value in [
+            ToolValue::None,
+            ToolValue::String("unexpected".to_owned()),
+            ToolValue::List(vec![]),
+            ToolValue::Dictionary(Default::default()),
+            ToolValue::Dictionary(
+                [("exit_code".to_owned(), ToolValue::String("0".to_owned()))].into(),
+            ),
+        ] {
+            let mut result = result.clone();
+            result.result = Ok(value);
+            assert_failed_without_count_label_panic(ToolName::Run, &result);
+        }
+    }
+
+    #[test]
+    fn tool_summary_rejects_mutation_successes_without_statuses() {
+        let result = ToolResult::without_effect(ToolValue::None);
+
+        for tool in [ToolName::Write, ToolName::Edit] {
+            let mut result = result.clone();
+            result.result = Ok(ToolValue::None);
+            assert_failed_without_count_label_panic(tool, &result);
+        }
+    }
+
     #[test]
     fn tool_trace_preserves_admission_order_with_safe_summaries() {
         let fixture_path = "secrets/fixture-path";
@@ -1876,6 +1956,312 @@ mod tests {
         let retained = format!("{trace:?}");
         assert!(!retained.contains(fixture_path));
         assert!(!retained.contains(fixture_error));
+    }
+
+    #[tokio::test]
+    async fn run_call_trace_records_its_numeric_exit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "result = await run('exit 7')\nresult.exit_code == 7 and result.stdout == '' and result.stderr == ''",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Exit(7),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_returns_command_results_for_zero_nonzero_signal_and_stdin_eof() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "zero = await run(\"printf stdout; printf stderr >&2\")\nnonzero = await run(\"printf nonzero; printf failure >&2; exit 9\")\nsignalled = await run('kill -9 $$')\nstdin = await run('cat')\ntype(zero).__name__ == 'CommandResult' and zero.exit_code == 0 and zero.stdout == 'stdout' and zero.stderr == 'stderr' and nonzero.exit_code == 9 and nonzero.stdout == 'nonzero' and nonzero.stderr == 'failure' and signalled.exit_code is None and stdin.exit_code == 0 and stdin.stdout == '' and stdin.stderr == ''",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(9),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Signal,
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_maps_malformed_calls_and_cwd_failures_to_builtin_exceptions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("real/sub")).unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        std::os::unix::fs::symlink("real", workspace.path().join("link")).unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for (call, expected) in [
+            ("await run()", "TypeError"),
+            ("await run(1)", "TypeError"),
+            ("await run('printf ignored', None)", "TypeError"),
+            ("await run('printf ignored', '.', '.')", "TypeError"),
+            ("await run('printf ignored', '/tmp')", "PermissionError"),
+            ("await run('printf ignored', 'real/..')", "PermissionError"),
+            (
+                "await run('printf ignored', 'missing')",
+                "FileNotFoundError",
+            ),
+            ("await run('printf ignored', 'file')", "NotADirectoryError"),
+            ("await run('printf ignored', 'link')", "PermissionError"),
+            ("await run('printf ignored', 'link/sub')", "PermissionError"),
+        ] {
+            let execution = execute_without_cancellation(
+                &mut arena,
+                &format!(
+                    "result = 'allowed'\ntry:\n    {call}\nexcept Exception as error:\n    result = type(error).__name__\nresult"
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(complete(&execution).unwrap().head, format!("'{expected}'"));
+        }
+    }
+
+    #[tokio::test]
+    async fn command_output_overflow_keeps_pre_and_post_catch_python_state_and_side_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "before = 41\nresult = 'unassigned'\ntry:\n    result = await run(\"printf side-effect > effect; dd if=/dev/zero bs=8388609 count=1 2>/dev/null\")\nexcept RuntimeError as error:\n    error_name = type(error).__name__\n    after = before + 1\nerror_name == 'RuntimeError' and result == 'unassigned' and before == 41 and after == 42",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Failed,
+            }]
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("effect")).unwrap(),
+            "side-effect"
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "before + after")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "83"
+        );
+    }
+
+    #[tokio::test]
+    async fn gathered_commands_admit_concurrently_and_associate_reversed_settlement_by_call_id() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "import asyncio\nresults = await asyncio.gather(run(\"printf first\"), run(\"printf second\"))\nresults[0].stdout == 'first' and results[1].stdout == 'second'",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut execution => panic!("execution finished before both commands started: {result:?}"),
+        }
+        let call_ids = gate.started_call_ids();
+        assert_eq!(call_ids.len(), 2);
+        assert_eq!(gate.active_call_ids().len(), 2);
+        gate.release(call_ids[1]);
+        tokio::select! {
+            _ = gate.wait_until_driver_settled() => {}
+            result = &mut execution => panic!("execution finished before the reversed command settled: {result:?}"),
+        }
+        assert_eq!(gate.driver_settled_call_ids(), [call_ids[1]]);
+        gate.release(call_ids[0]);
+        tokio::select! {
+            _ = gate.wait_until_driver_settled() => {}
+            result = &mut execution => panic!("execution finished before the first command settled: {result:?}"),
+        }
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            ]
+        );
+        assert_eq!(gate.resume_futures_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn gathered_commands_settle_a_successful_sibling_after_an_ordinary_command_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "import asyncio\nawait asyncio.gather(run('printf ignored', 'missing'), run(\"printf sibling > sibling\"))",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut execution => panic!("execution finished before both commands started: {result:?}"),
+        }
+        for call_id in gate.started_call_ids() {
+            gate.release(call_id);
+        }
+
+        let execution = execution.await.unwrap();
+        assert!(python_error(&execution).text.contains("FileNotFoundError"));
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Failed,
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("sibling")).unwrap(),
+            "sibling"
+        );
+        assert_eq!(gate.resume_futures_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_evidence_stays_ordered_path_free_and_updates_pending_rows_in_place() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_batch_gate(&workspace).await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+        let execution = {
+            let mut capture = |event| progress.push(event);
+            let mut execution = Box::pin(arena.execute_with_progress(
+                "import asyncio\nawait asyncio.gather(run(\"COMMAND_SENTINEL; printf OUTPUT_SENTINEL; printf ERROR_SENTINEL >&2\"), run('kill -9 $$'), run('printf ignored', 'CWD_SENTINEL'))",
+                &cancellation,
+                &mut capture,
+            ));
+
+            tokio::select! {
+                _ = gate.wait_until_calls_started(3) => {}
+                result = &mut execution => panic!("execution finished before all commands started: {result:?}"),
+            }
+            for call_id in gate.started_call_ids() {
+                gate.release(call_id);
+            }
+            execution.await.unwrap()
+        };
+
+        assert!(python_error(&execution).text.contains("FileNotFoundError"));
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Signal,
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Failed,
+                },
+            ]
+        );
+        let updates = progress
+            .into_iter()
+            .filter_map(|event| match event {
+                super::ArenaProgress::ToolUpdated { token, call } => Some((token, call)),
+                super::ArenaProgress::StdoutDelta { .. }
+                | super::ArenaProgress::StdoutTruncated => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 6);
+        assert!(updates[..3].iter().all(
+            |(_, call)| call.tool == ToolName::Run && call.summary == ToolCallSummary::Pending
+        ));
+        for (token, _) in &updates[..3] {
+            assert_eq!(
+                updates[3..]
+                    .iter()
+                    .filter(|(settled, _)| settled == token)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            updates[3..]
+                .iter()
+                .any(|(_, call)| call.summary == ToolCallSummary::Exit(0))
+        );
+        assert!(
+            updates[3..]
+                .iter()
+                .any(|(_, call)| call.summary == ToolCallSummary::Signal)
+        );
+        assert!(
+            updates[3..]
+                .iter()
+                .any(|(_, call)| call.summary == ToolCallSummary::Failed)
+        );
+        let retained = format!("{:?}{updates:?}", execution.tool_calls);
+        for sentinel in [
+            "COMMAND_SENTINEL",
+            "CWD_SENTINEL",
+            "OUTPUT_SENTINEL",
+            "ERROR_SENTINEL",
+        ] {
+            assert!(!retained.contains(sentinel), "retained {sentinel}");
+        }
     }
 
     #[tokio::test]
@@ -2402,14 +2788,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exposes_exactly_six_phase_two_host_functions() {
+    async fn exposes_exactly_seven_host_functions() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("file"), "match\n").unwrap();
         let mut arena = arena(&workspace).await;
 
         let execution = execute_without_cancellation(
             &mut arena,
-            "contents = await read('file')\nlisted = await list_dir()\nmatched = await glob('*')\nfound = await grep('match')\nwrite_result = await write('new', contents)\nedit_result = await edit('file', 'match', 'changed')\ntry:\n    await run('pwd')\nexcept NameError:\n    run_missing = True\ncontents == 'match\\n' and listed[0].path == 'file' and matched[0].path == 'file' and found[0].path == 'file' and write_result is None and edit_result is None and (await read('new')) == contents and (await read('file')) == 'changed\\n' and run_missing",
+            "contents = await read('file')\nlisted = await list_dir()\nmatched = await glob('*')\nfound = await grep('match')\nwrite_result = await write('new', contents)\nedit_result = await edit('file', 'match', 'changed')\ncommand_result = await run(\"printf 'command output'\")\ncontents == 'match\\n' and listed[0].path == 'file' and matched[0].path == 'file' and found[0].path == 'file' and write_result is None and edit_result is None and command_result.exit_code == 0 and command_result.stdout == 'command output' and command_result.stderr == '' and (await read('new')) == contents and (await read('file')) == 'changed\\n'",
         )
         .await
         .unwrap();
@@ -3816,6 +4202,182 @@ mod tests {
                     summary: ToolCallSummary::Count(1),
                 }
         }));
+    }
+
+    #[cfg(unix)]
+    async fn assert_group_absent(pgid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(-pgid, 0) } == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ESRCH)
+                    );
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for command group cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_cleans_a_running_command_process_group() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("await run('tail -f /dev/null')", &cancellation));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0);
+        cancellation.cancel();
+
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Cancelled { .. }
+        ));
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        assert_group_absent(pgid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_cleans_a_command_and_restores_the_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("trusted"), "contents").unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(1)).await;
+        set_trusted_value(&mut arena).await;
+        execute_without_cancellation(&mut arena, "await read('trusted')")
+            .await
+            .unwrap();
+        let trusted_checkpoint = arena.checkpoint();
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("value = 99\nawait run('tail -f /dev/null')", &cancellation));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0);
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::TimedOut { execution } = error else {
+            panic!("expected interrupted timeout");
+        };
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        assert_group_absent(pgid).await;
+        assert_eq!(arena.checkpoint(), trusted_checkpoint);
+        assert!(has_authorisation(&arena, "trusted"));
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interruption_preserves_completed_command_effects_and_freezes_safe_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("CWD_SENTINEL")).unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        set_trusted_value(&mut arena).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "await run('printf effect > SIDE_EFFECT_SENTINEL')\nvalue = 99\nawait run('tail -f /dev/null # COMMAND_SENTINEL', 'CWD_SENTINEL')",
+            &cancellation,
+        ));
+
+        let first_pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its first command started: {result:?}"),
+        };
+        gate.wait_until_kill_sent(first_pgid).await;
+        gate.wait_until_cleaned_up(first_pgid).await;
+        let second_pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its second command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-second_pgid, 0) }, 0);
+        cancellation.cancel();
+
+        let error = execution.await.unwrap_err();
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        gate.wait_until_kill_sent(second_pgid).await;
+        gate.wait_until_cleaned_up(second_pgid).await;
+        assert_group_absent(second_pgid).await;
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+            ]
+        );
+        let retained = format!("{execution:?}");
+        for sentinel in ["COMMAND_SENTINEL", "CWD_SENTINEL", "SIDE_EFFECT_SENTINEL"] {
+            assert!(!retained.contains(sentinel), "retained {sentinel}");
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("SIDE_EFFECT_SENTINEL")).unwrap(),
+            "effect"
+        );
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_wins_before_a_held_overflow_error_is_published() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        gate.hold_error_publication();
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "await run('dd if=/dev/zero bs=8388609 count=1 2>/dev/null')",
+            &cancellation,
+        ));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+        gate.release_error_publication();
+        gate.wait_until_supervisor_exited().await;
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("cancellation must win over command overflow");
+        };
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
+        assert!(!gate.error_published());
     }
 
     #[tokio::test]
