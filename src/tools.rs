@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub(crate) enum ToolName {
     ListDir,
     Glob,
     Grep,
+    Run,
 }
 
 impl ToolName {
@@ -61,6 +63,7 @@ impl ToolName {
             Self::ListDir => "list_dir",
             Self::Glob => "glob",
             Self::Grep => "grep",
+            Self::Run => "run",
         }
     }
 
@@ -72,6 +75,7 @@ impl ToolName {
             Self::ListDir => "_kiki_list_dir",
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
+            Self::Run => "_kiki_run",
         }
     }
 
@@ -97,6 +101,9 @@ impl ToolName {
             (Self::Write | Self::Edit, _) => {
                 unreachable!("mutations have status summaries rather than counts")
             }
+            (Self::Run, _) => {
+                unreachable!("commands have exit or signal summaries rather than counts")
+            }
         }
     }
 }
@@ -113,7 +120,11 @@ impl ToolCall {
         match self.tool {
             ToolName::Write => write_mutation_path(&self.arguments),
             ToolName::Edit => edit_mutation_path(&self.arguments),
-            ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => None,
+            ToolName::Read
+            | ToolName::ListDir
+            | ToolName::Glob
+            | ToolName::Grep
+            | ToolName::Run => None,
         }
     }
 }
@@ -1548,6 +1559,7 @@ impl ToolHost {
             ToolName::ListDir => self.list_dir(arguments).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
+            ToolName::Run => self.run(arguments).await,
         };
         match result {
             Ok(ToolOutput { result, effect }) => ToolResult {
@@ -1770,6 +1782,21 @@ impl ToolHost {
         .map(ToolOutput::without_effect)
     }
 
+    async fn run(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+        let (command, cwd) = run_arguments(arguments)?;
+        let workspace = Arc::clone(&self.workspace);
+        let cwd = tokio::task::spawn_blocking(move || {
+            open_directory_root(&workspace, &cwd)
+                .map(|directory| OwnedFd::from(directory.into_std_file()))
+        })
+        .await
+        .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
+        let result = command::execute_command(&command, cwd)
+            .await
+            .map_err(map_command_error)?;
+        Ok(ToolOutput::without_effect(command_result_value(result)))
+    }
+
     #[cfg(test)]
     pub(crate) fn note_batch_driver_pending_call_ids(&self, call_ids: &[u32]) {
         if let Some(batch_test_gate) = &self.batch_test_gate {
@@ -1857,6 +1884,45 @@ fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), Too
         _ => Err(ToolError::type_error(
             "edit() expects three positional string arguments",
         )),
+    }
+}
+
+fn run_arguments(arguments: ToolValue) -> Result<(String, PathBuf), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "run() expects one or two positional string arguments: string command, optional string cwd",
+        ));
+    };
+    match arguments.as_slice() {
+        [ToolValue::String(command)] => Ok((command.clone(), PathBuf::new())),
+        [ToolValue::String(command), ToolValue::String(cwd)] => {
+            Ok((command.clone(), normalise_path(cwd)?))
+        }
+        _ => Err(ToolError::type_error(
+            "run() expects one or two positional string arguments: string command, optional string cwd",
+        )),
+    }
+}
+
+fn command_result_value(result: command::CommandResult) -> ToolValue {
+    ToolValue::Dictionary(BTreeMap::from([
+        (
+            "exit_code".to_owned(),
+            result
+                .exit_code
+                .map_or(ToolValue::None, |code| ToolValue::Integer(i64::from(code))),
+        ),
+        ("stdout".to_owned(), ToolValue::String(result.stdout)),
+        ("stderr".to_owned(), ToolValue::String(result.stderr)),
+    ]))
+}
+
+fn map_command_error(error: command::CommandError) -> ToolError {
+    match error {
+        command::CommandError::Overflow(message) => ToolError::runtime(message),
+        command::CommandError::Launch | command::CommandError::Internal => {
+            ToolError::new(ToolErrorKind::Os, "command execution failed")
+        }
     }
 }
 
@@ -3543,6 +3609,29 @@ mod tests {
         grep_path(host, pattern, path, file_glob).await.unwrap_err()
     }
 
+    async fn run_call(host: &ToolHost, arguments: Vec<ToolValue>) -> Result<ToolValue, ToolError> {
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Run,
+                arguments: ToolValue::List(arguments),
+            })
+            .await;
+        assert_eq!(result.call_id, 7);
+        result.result
+    }
+
+    async fn run_tool(
+        host: &ToolHost,
+        arguments: Vec<ToolValue>,
+    ) -> Result<ToolValue, ToolErrorKind> {
+        run_call(host, arguments).await.map_err(|error| error.kind)
+    }
+
+    async fn run_error(host: &ToolHost, arguments: Vec<ToolValue>) -> ToolErrorKind {
+        run_tool(host, arguments).await.unwrap_err()
+    }
+
     fn directory_entry(path: &str, kind: &str, size_bytes: Option<i64>) -> ToolValue {
         ToolValue::Dictionary(BTreeMap::from([
             ("path".to_owned(), ToolValue::String(path.to_owned())),
@@ -3938,6 +4027,18 @@ mod tests {
                 ToolValue::String(old.into()),
                 ToolValue::String(new.into()),
             ]),
+        }
+    }
+
+    fn batch_run(call_id: u32, command: impl Into<String>, cwd: Option<&str>) -> ToolCall {
+        let mut arguments = vec![ToolValue::String(command.into())];
+        if let Some(cwd) = cwd {
+            arguments.push(ToolValue::String(cwd.to_owned()));
+        }
+        ToolCall {
+            call_id,
+            tool: ToolName::Run,
+            arguments: ToolValue::List(arguments),
         }
     }
 
@@ -6496,5 +6597,412 @@ mod tests {
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("    ..."));
         assert!(!reference.contains("run("));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_missing_extra_and_non_string_arguments() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        let expected_message = "run() expects one or two positional string arguments: string command, optional string cwd";
+
+        let non_list_result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Run,
+                arguments: ToolValue::None,
+            })
+            .await;
+        let err = non_list_result.result.unwrap_err();
+        assert_eq!(err.kind, ToolErrorKind::Type);
+        assert_eq!(err.to_string(), expected_message);
+
+        for args in [
+            vec![],
+            vec![
+                ToolValue::String("echo".to_owned()),
+                ToolValue::String(".".to_owned()),
+                ToolValue::String("extra".to_owned()),
+            ],
+            vec![ToolValue::Integer(1)],
+            vec![ToolValue::String("echo".to_owned()), ToolValue::None],
+            vec![ToolValue::String("echo".to_owned()), ToolValue::Integer(1)],
+        ] {
+            let err = run_call(&host, args).await.unwrap_err();
+            assert_eq!(err.kind, ToolErrorKind::Type);
+            assert_eq!(err.to_string(), expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_resolves_default_root_nested_and_lexically_aliased_cwd() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("nested/dir")).unwrap();
+        fs::write(workspace.path().join("root.txt"), "root").unwrap();
+        fs::write(workspace.path().join("nested/dir/nested.txt"), "nested").unwrap();
+        let host = tool_host(&workspace).await;
+
+        let res = run_tool(&host, vec![ToolValue::String("cat root.txt".to_owned())])
+            .await
+            .unwrap();
+        let ToolValue::Dictionary(dict) = res else {
+            panic!()
+        };
+        assert_eq!(dict.get("exit_code"), Some(&ToolValue::Integer(0)));
+        assert_eq!(
+            dict.get("stdout"),
+            Some(&ToolValue::String("root".to_owned()))
+        );
+
+        for root_cwd in [".", ""] {
+            let res = run_tool(
+                &host,
+                vec![
+                    ToolValue::String("cat root.txt".to_owned()),
+                    ToolValue::String(root_cwd.to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+            let ToolValue::Dictionary(dict) = res else {
+                panic!()
+            };
+            assert_eq!(dict.get("exit_code"), Some(&ToolValue::Integer(0)));
+            assert_eq!(
+                dict.get("stdout"),
+                Some(&ToolValue::String("root".to_owned()))
+            );
+        }
+
+        let res = run_tool(
+            &host,
+            vec![
+                ToolValue::String("cat nested.txt".to_owned()),
+                ToolValue::String("nested/dir".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+        let ToolValue::Dictionary(dict) = res else {
+            panic!()
+        };
+        assert_eq!(dict.get("exit_code"), Some(&ToolValue::Integer(0)));
+        assert_eq!(
+            dict.get("stdout"),
+            Some(&ToolValue::String("nested".to_owned()))
+        );
+
+        let res = run_tool(
+            &host,
+            vec![
+                ToolValue::String("cat nested.txt".to_owned()),
+                ToolValue::String("./nested//./dir//.".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+        let ToolValue::Dictionary(dict) = res else {
+            panic!()
+        };
+        assert_eq!(dict.get("exit_code"), Some(&ToolValue::Integer(0)));
+        assert_eq!(
+            dict.get("stdout"),
+            Some(&ToolValue::String("nested".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_denies_absolute_and_parent_cwd() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        for bad_cwd in ["/tmp", "/", "..", "nested/..", "../nested"] {
+            let err = run_error(
+                &host,
+                vec![
+                    ToolValue::String("echo hi".to_owned()),
+                    ToolValue::String(bad_cwd.to_owned()),
+                ],
+            )
+            .await;
+            assert_eq!(err, ToolErrorKind::Permission);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_classifies_missing_non_directory_and_symlinked_cwd() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("real_dir/sub")).unwrap();
+        fs::create_dir(outside.path().join("outside-sub")).unwrap();
+        fs::write(workspace.path().join("file.txt"), "hello").unwrap();
+        std::os::unix::fs::symlink("real_dir", workspace.path().join("link_dir")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("outside_link")).unwrap();
+        let host = tool_host(&workspace).await;
+
+        let err = run_error(
+            &host,
+            vec![
+                ToolValue::String("echo hi".to_owned()),
+                ToolValue::String("missing_dir".to_owned()),
+            ],
+        )
+        .await;
+        assert_eq!(err, ToolErrorKind::FileNotFound);
+
+        let err = run_error(
+            &host,
+            vec![
+                ToolValue::String("echo hi".to_owned()),
+                ToolValue::String("file.txt".to_owned()),
+            ],
+        )
+        .await;
+        assert_eq!(err, ToolErrorKind::NotADirectory);
+
+        for symlink in ["link_dir", "outside_link"] {
+            let err = run_error(
+                &host,
+                vec![
+                    ToolValue::String("echo hi".to_owned()),
+                    ToolValue::String(symlink.to_owned()),
+                ],
+            )
+            .await;
+            assert_eq!(err, ToolErrorKind::Permission);
+        }
+
+        for cwd in ["link_dir/sub", "outside_link/outside-sub"] {
+            let err = run_error(
+                &host,
+                vec![
+                    ToolValue::String("echo hi".to_owned()),
+                    ToolValue::String(cwd.to_owned()),
+                ],
+            )
+            .await;
+            assert_eq!(err, ToolErrorKind::Permission);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_returns_exact_result_dictionaries() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        let res0 = run_tool(&host, vec![ToolValue::String("exit 0".to_owned())])
+            .await
+            .unwrap();
+        assert_eq!(
+            res0,
+            ToolValue::Dictionary(BTreeMap::from([
+                ("exit_code".to_owned(), ToolValue::Integer(0)),
+                ("stdout".to_owned(), ToolValue::String("".to_owned())),
+                ("stderr".to_owned(), ToolValue::String("".to_owned())),
+            ]))
+        );
+
+        let res42 = run_tool(
+            &host,
+            vec![ToolValue::String(
+                "printf 'stdout text'; printf 'stderr text' >&2; exit 42".to_owned(),
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res42,
+            ToolValue::Dictionary(BTreeMap::from([
+                ("exit_code".to_owned(), ToolValue::Integer(42)),
+                (
+                    "stdout".to_owned(),
+                    ToolValue::String("stdout text".to_owned())
+                ),
+                (
+                    "stderr".to_owned(),
+                    ToolValue::String("stderr text".to_owned())
+                ),
+            ]))
+        );
+
+        let res_sig = run_tool(&host, vec![ToolValue::String("kill -9 $$".to_owned())])
+            .await
+            .unwrap();
+        assert_eq!(
+            res_sig,
+            ToolValue::Dictionary(BTreeMap::from([
+                ("exit_code".to_owned(), ToolValue::None),
+                ("stdout".to_owned(), ToolValue::String("".to_owned())),
+                ("stderr".to_owned(), ToolValue::String("".to_owned())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn run_maps_command_errors_to_safe_tool_errors() {
+        use super::command::CommandError;
+
+        let overflow = super::map_command_error(CommandError::Overflow(
+            "safe overflow diagnostic".to_owned(),
+        ));
+        assert_eq!(overflow.kind, ToolErrorKind::Runtime);
+        assert_eq!(overflow.to_string(), "safe overflow diagnostic");
+
+        for command_error in [CommandError::Launch, CommandError::Internal] {
+            let error = super::map_command_error(command_error);
+            assert_eq!(error.kind, ToolErrorKind::Os);
+            assert_eq!(error.to_string(), "command execution failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_maps_real_overflow_to_runtime_error() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+
+        let overflow = run_call(
+            &host,
+            vec![ToolValue::String(
+                "dd if=/dev/zero bs=8388609 count=1 2>/dev/null".to_owned(),
+            )],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(overflow.kind, ToolErrorKind::Runtime);
+        assert!(
+            overflow
+                .to_string()
+                .contains("stdout exceeded the 8388608-byte limit by 1 bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_side_effects_leave_authorisations_unchanged() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file.txt"), "hello").unwrap();
+        let host = tool_host(&workspace).await;
+
+        let path = normalise_path("file.txt").unwrap();
+        let digest = content_fingerprint(b"hello");
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), digest);
+
+        let result = host
+            .call(batch_run(1, "printf changed > file.txt", None))
+            .await;
+        assert!(result.result.is_ok());
+        assert!(result.effect.is_none());
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file.txt")).unwrap(),
+            "changed"
+        );
+        assert_eq!(authorisations.authorisation(&path), Some(digest));
+
+        let stale_write = host
+            .call_with_authorisation(
+                batch_write(2, "file.txt", "replacement"),
+                authorisations.authorisation(&path),
+            )
+            .await;
+        assert!(matches!(
+            stale_write.result,
+            Err(ref error) if error.kind == ToolErrorKind::Runtime
+        ));
+
+        let result = host
+            .call(batch_run(3, "echo fail", Some("missing_dir")))
+            .await;
+        assert!(result.result.is_err());
+        assert!(result.effect.is_none());
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        assert_eq!(authorisations.authorisation(&path), Some(digest));
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_admits_independent_commands_concurrently() {
+        let workspace = TempDir::new().unwrap();
+        let gate = super::BatchTestGate::new();
+        let host = tool_host(&workspace)
+            .await
+            .with_batch_test_gate(gate.clone());
+        let mut results = Box::pin(
+            host.dispatch_batch(
+                vec![
+                    batch_run(1, "echo first", None),
+                    batch_run(2, "echo second", None),
+                ],
+                WholeFileAuthorisations::default(),
+            )
+            .collect::<Vec<_>>(),
+        );
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(2) => {}
+            result = &mut results => panic!("batch finished before both commands started: {result:?}"),
+        }
+        let started = gate.started_call_ids().into_iter().collect::<BTreeSet<_>>();
+        assert!(started.contains(&1));
+        assert!(started.contains(&2));
+        assert_eq!(gate.active_call_ids().len(), 2);
+
+        gate.release(1);
+        gate.release(2);
+
+        let results = results.await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].result.is_ok());
+        assert!(results[1].result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_settles_successful_sibling_after_ordinary_command_error() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+        let results = host
+            .dispatch_batch(
+                vec![
+                    batch_run(1, "echo fail", Some("missing_dir")),
+                    batch_run(2, "printf sibling", None),
+                ],
+                WholeFileAuthorisations::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(results.len(), 2);
+        let first = results.iter().find(|r| r.call_id == 1).unwrap();
+        let second = results.iter().find(|r| r.call_id == 2).unwrap();
+
+        assert_eq!(
+            first.result.as_ref().unwrap_err().kind,
+            ToolErrorKind::FileNotFound
+        );
+        let ToolValue::Dictionary(dict) = second.result.as_ref().unwrap() else {
+            panic!()
+        };
+        assert_eq!(dict.get("exit_code"), Some(&ToolValue::Integer(0)));
+        assert_eq!(
+            dict.get("stdout"),
+            Some(&ToolValue::String("sibling".to_owned()))
+        );
+    }
+
+    #[test]
+    fn tool_name_run_properties() {
+        assert_eq!(ToolName::Run.name(), "run");
+        assert_eq!(ToolName::Run.private_name(), "_kiki_run");
+        assert_eq!(ToolName::Run.label(), "run");
+        assert_eq!(ToolName::from_private_name("_kiki_run"), None);
+
+        let call = ToolCall {
+            call_id: 1,
+            tool: ToolName::Run,
+            arguments: ToolValue::None,
+        };
+        assert_eq!(call.mutation_path(), None);
+
+        let count_label_panic = std::panic::catch_unwind(|| ToolName::Run.count_label(1));
+        assert!(count_label_panic.is_err());
     }
 }
