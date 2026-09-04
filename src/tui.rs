@@ -413,7 +413,7 @@ impl App {
         if flash.transitions == 4 {
             self.flash = None;
         } else {
-            flash.next_tick = now + Duration::from_millis(100);
+            flash.next_tick = now + Duration::from_millis(50);
         }
         true
     }
@@ -444,7 +444,7 @@ impl App {
         if clipboard.write_text(&text).is_ok() {
             self.notice = Some(Notice::Copied);
             self.flash = Some(Flash {
-                next_tick: now + Duration::from_millis(100),
+                next_tick: now + Duration::from_millis(50),
                 transitions: 0,
                 highlighted: true,
             });
@@ -2663,7 +2663,7 @@ mod tests {
         assert_eq!(clipboard.writes, ["flash selection"]);
         assert_eq!(app.notice(), Some("Copied"));
         assert!(app.selection_for_render().is_some());
-        for (elapsed, highlighted) in [(100, false), (200, true), (300, false), (400, true)] {
+        for (elapsed, highlighted) in [(50, false), (100, true), (150, false), (200, true)] {
             assert!(app.tick(now + Duration::from_millis(elapsed)));
             assert_eq!(app.selection_for_render().is_some(), highlighted);
         }
