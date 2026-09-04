@@ -184,12 +184,6 @@ mod tests {
             format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference())
         );
         assert_generated_tool_reference(resolved.text());
-        assert_generated_tool_reference(
-            resolved
-                .text()
-                .strip_prefix(format!("{BUNDLED_PROMPT}\n\n").as_str())
-                .expect("bundled prompt is preserved verbatim before the managed reference"),
-        );
         assert!(
             resolved
                 .text()
@@ -223,12 +217,6 @@ mod tests {
             format!("{OVERRIDE}\n\n{}", prompt_reference())
         );
         assert_generated_tool_reference(resolved.text());
-        assert_generated_tool_reference(
-            resolved
-                .text()
-                .strip_prefix(format!("{OVERRIDE}\n\n").as_str())
-                .expect("override is preserved verbatim before the managed reference"),
-        );
         assert_eq!(
             resolved.source(),
             &PromptSource::Override {

@@ -1679,7 +1679,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use futures::StreamExt;
     use monty_types::PrintStream;
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -1694,8 +1693,8 @@ mod tests {
         tool_summary, validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{
-        BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolCall as HostToolCall,
-        ToolHost, ToolResult, ToolValue, WholeFileAuthorisations, WriteTestHook,
+        BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolHost, ToolResult,
+        ToolValue, WholeFileAuthorisations, WriteTestHook,
     };
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
@@ -1874,23 +1873,6 @@ mod tests {
         accumulator.finish()
     }
 
-    async fn successful_statusless_tool_result() -> ToolResult {
-        let workspace = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(workspace.path())
-            .await
-            .expect("open tool host");
-
-        let mut results = Box::pin(host.dispatch_batch(
-            vec![HostToolCall {
-                call_id: 1,
-                tool: ToolName::ListDir,
-                arguments: ToolValue::List(vec![]),
-            }],
-            WholeFileAuthorisations::default(),
-        ));
-        results.next().await.expect("successful tool result")
-    }
-
     fn assert_failed_without_count_label_panic(tool: ToolName, result: &ToolResult) {
         let summary = std::panic::catch_unwind(|| {
             let summary = tool_summary(tool, result);
@@ -1903,9 +1885,9 @@ mod tests {
         assert_eq!(summary, ToolCallSummary::Failed);
     }
 
-    #[tokio::test]
-    async fn tool_summary_rejects_malformed_run_results_without_count_labels() {
-        let result = successful_statusless_tool_result().await;
+    #[test]
+    fn tool_summary_rejects_malformed_run_results_without_count_labels() {
+        let result = ToolResult::without_effect(ToolValue::None);
 
         for value in [
             ToolValue::None,
@@ -1922,9 +1904,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn tool_summary_rejects_mutation_successes_without_statuses() {
-        let result = successful_statusless_tool_result().await;
+    #[test]
+    fn tool_summary_rejects_mutation_successes_without_statuses() {
+        let result = ToolResult::without_effect(ToolValue::None);
 
         for tool in [ToolName::Write, ToolName::Edit] {
             let mut result = result.clone();

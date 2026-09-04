@@ -301,6 +301,28 @@ fn cancellation_requested(cancel_rx: &mut oneshot::Receiver<()>) -> bool {
     !matches!(cancel_rx.try_recv(), Err(TryRecvError::Empty))
 }
 
+fn overflow_message(
+    stdout_overflow: bool,
+    stderr_overflow: bool,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    limit: usize,
+    status_desc: &str,
+) -> String {
+    let (stream, omitted) = match (stdout_overflow, stderr_overflow) {
+        (true, true) => (
+            "stdout and stderr",
+            stdout_bytes.saturating_sub(limit) + stderr_bytes.saturating_sub(limit),
+        ),
+        (true, false) => ("stdout", stdout_bytes.saturating_sub(limit)),
+        (false, true) => ("stderr", stderr_bytes.saturating_sub(limit)),
+        (false, false) => unreachable!("overflow diagnostics require an overflowed stream"),
+    };
+    format!(
+        "command {stream} exceeded the {limit}-byte limit by {omitted} bytes ({status_desc}); the command ran and may have produced side effects; rerun with filtering or redirection"
+    )
+}
+
 pub(super) async fn execute_command(
     command: &str,
     cwd: OwnedFd,
@@ -324,26 +346,7 @@ pub(super) async fn execute_command_with_test_gate(
     execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES, gate).await
 }
 
-#[cfg(test)]
-pub(super) async fn execute_command_bounded(
-    command: &str,
-    cwd: OwnedFd,
-    limit: usize,
-    gate: Option<Arc<CommandTestGate>>,
-) -> Result<CommandResult, CommandError> {
-    execute_command_supervisor(command, cwd, limit, gate).await
-}
-
-#[cfg(not(test))]
 async fn execute_command_bounded(
-    command: &str,
-    cwd: OwnedFd,
-    limit: usize,
-) -> Result<CommandResult, CommandError> {
-    execute_command_supervisor(command, cwd, limit).await
-}
-
-async fn execute_command_supervisor(
     command: &str,
     cwd: OwnedFd,
     limit: usize,
@@ -430,22 +433,9 @@ async fn execute_command_supervisor(
         .await;
     });
 
-    struct CancelOnDrop {
-        cancel_tx: Option<oneshot::Sender<()>>,
-    }
-    impl Drop for CancelOnDrop {
-        fn drop(&mut self) {
-            let _ = self.cancel_tx.take();
-        }
-    }
-
-    let mut cancel_guard = CancelOnDrop {
-        cancel_tx: Some(cancel_tx),
-    };
-
-    let result = result_rx.await.map_err(|_| CommandError::Internal)?;
-    cancel_guard.cancel_tx = None;
-    result
+    let result = result_rx.await;
+    drop(cancel_tx);
+    result.map_err(|_| CommandError::Internal)?
 }
 
 struct Supervisor {
@@ -602,33 +592,22 @@ async fn run_supervisor_loop(supervisor: Supervisor) {
             None => "status unavailable".to_string(),
         };
 
-        let msg = if stdout_overflow && stderr_overflow {
-            let omitted_out = stdout_bytes.saturating_sub(limit);
-            let omitted_err = stderr_bytes.saturating_sub(limit);
-            let total_omitted = omitted_out + omitted_err;
-            format!(
-                "command stdout and stderr exceeded the {limit}-byte limit by {total_omitted} bytes ({status_desc}); the command ran and may have produced side effects; rerun with filtering or redirection"
-            )
-        } else if stdout_overflow {
-            let omitted = stdout_bytes.saturating_sub(limit);
-            format!(
-                "command stdout exceeded the {limit}-byte limit by {omitted} bytes ({status_desc}); the command ran and may have produced side effects; rerun with filtering or redirection"
-            )
-        } else {
-            let omitted = stderr_bytes.saturating_sub(limit);
-            format!(
-                "command stderr exceeded the {limit}-byte limit by {omitted} bytes ({status_desc}); the command ran and may have produced side effects; rerun with filtering or redirection"
-            )
-        };
+        let msg = overflow_message(
+            stdout_overflow,
+            stderr_overflow,
+            stdout_bytes,
+            stderr_bytes,
+            limit,
+            &status_desc,
+        );
 
-        #[cfg(test)]
         let published = result_tx.send(Err(CommandError::Overflow(msg))).is_ok();
-        #[cfg(not(test))]
-        let _ = result_tx.send(Err(CommandError::Overflow(msg)));
         #[cfg(test)]
         if published && let Some(gate) = &gate {
             gate.notify_error_published();
         }
+        #[cfg(not(test))]
+        let _ = published;
         return;
     }
 

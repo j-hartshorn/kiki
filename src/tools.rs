@@ -147,6 +147,15 @@ pub(crate) enum MutationStatus {
 }
 
 impl ToolResult {
+    #[cfg(test)]
+    pub(crate) fn without_effect(result: ToolValue) -> Self {
+        Self {
+            call_id: 0,
+            result: Ok(result),
+            effect: None,
+        }
+    }
+
     pub(crate) fn apply_batch_transition(
         &self,
         authorisations: &mut WholeFileAuthorisations,
