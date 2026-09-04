@@ -4015,7 +4015,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sends_the_generated_phase_two_reference_with_only_execute_python() {
+        async fn sends_the_generated_tool_reference_with_only_execute_python() {
             let output = vec![function_call(
                 "fc_1",
                 "call_1",
@@ -4051,11 +4051,13 @@ mod tests {
                 "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
                 "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
                 "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+                "async def run(command: str, cwd: str = \".\") -> CommandResult:",
             ] {
                 assert_eq!(instructions.matches(signature).count(), 1);
             }
+            assert_eq!(instructions.matches("class CommandResult:").count(), 1);
             assert!(instructions.contains("asyncio.gather"));
-            assert!(!instructions.contains("run("));
+            assert!(instructions.contains("Run project-local, one-shot commands."));
             assert_eq!(
                 request["tools"],
                 json!([{

@@ -114,24 +114,26 @@ mod tests {
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+            "async def run(command: str, cwd: str = \".\") -> CommandResult:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
+        assert_eq!(reference.matches("class CommandResult:").count(), 1);
         for guidance in [
             "Every host call must be awaited.",
             "independent calls expected to succeed",
             "Keep dependent calls sequential.",
             "Avoid unbounded fan-out.",
             "A gather failure can follow completed host calls",
+            "Run project-local, one-shot commands.",
             "Keep model-visible output focused.",
             "five-minute deadline",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
         }
-        assert!(!reference.contains("run("));
     }
 
     #[test]
@@ -162,7 +164,6 @@ mod tests {
             "edit(path)",
             "glob(",
             "grep(",
-            "run(",
             "subagent",
         ] {
             assert!(
@@ -182,6 +183,7 @@ mod tests {
             resolved.text(),
             format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference())
         );
+        assert_generated_tool_reference(resolved.text());
         assert_generated_tool_reference(
             resolved
                 .text()
@@ -206,8 +208,7 @@ mod tests {
     fn an_override_takes_exact_precedence_and_reports_only_its_path() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("nested")).unwrap();
-        const OVERRIDE: &str =
-            "private override text: async def read(path: str) -> str: is mentioned independently";
+        const OVERRIDE: &str = "private override text";
         fs::write(directory.path().join("override.md"), OVERRIDE).unwrap();
         let override_path = directory
             .path()
@@ -221,13 +222,7 @@ mod tests {
             resolved.text(),
             format!("{OVERRIDE}\n\n{}", prompt_reference())
         );
-        assert_eq!(
-            resolved
-                .text()
-                .matches("async def read(path: str) -> str:")
-                .count(),
-            2
-        );
+        assert_generated_tool_reference(resolved.text());
         assert_generated_tool_reference(
             resolved
                 .text()

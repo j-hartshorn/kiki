@@ -308,6 +308,7 @@ pub(crate) struct ToolRecord {
 pub(crate) enum ToolResultShape {
     None,
     String,
+    Record(&'static ToolRecord),
     RecordList(&'static ToolRecord),
 }
 
@@ -316,6 +317,7 @@ impl ToolResultShape {
         match self {
             Self::None => "None".to_owned(),
             Self::String => "str".to_owned(),
+            Self::Record(record) => record.name.to_owned(),
             Self::RecordList(record) => format!("list[{}]", record.name),
         }
     }
@@ -323,7 +325,7 @@ impl ToolResultShape {
     fn record(self) -> Option<&'static ToolRecord> {
         match self {
             Self::None | Self::String => None,
-            Self::RecordList(record) => Some(record),
+            Self::Record(record) | Self::RecordList(record) => Some(record),
         }
     }
 
@@ -331,6 +333,12 @@ impl ToolResultShape {
         match self {
             Self::None => format!("await {private_name}({arguments})"),
             Self::String => format!("return await {private_name}({arguments})"),
+            Self::Record(record) => {
+                format!(
+                    "return {}(**await {private_name}({arguments}))",
+                    record.name
+                )
+            }
             Self::RecordList(record) => {
                 format!(
                     "return [{}(**row) for row in await {private_name}({arguments})]",
@@ -426,6 +434,26 @@ const GREP_MATCH: ToolRecord = ToolRecord {
     fields: GREP_MATCH_FIELDS,
 };
 
+const COMMAND_RESULT_FIELDS: &[ToolRecordField] = &[
+    ToolRecordField {
+        name: "exit_code",
+        value_type: ToolValueType::OptionalInteger,
+    },
+    ToolRecordField {
+        name: "stdout",
+        value_type: ToolValueType::String,
+    },
+    ToolRecordField {
+        name: "stderr",
+        value_type: ToolValueType::String,
+    },
+];
+
+const COMMAND_RESULT: ToolRecord = ToolRecord {
+    name: "CommandResult",
+    fields: COMMAND_RESULT_FIELDS,
+};
+
 const LIST_DIR_PARAMETERS: &[ToolParameter] = &[ToolParameter {
     name: "path",
     value_type: ToolValueType::String,
@@ -460,6 +488,19 @@ const GREP_PARAMETERS: &[ToolParameter] = &[
         name: "file_glob",
         value_type: ToolValueType::OptionalString,
         default: Some(ToolDefault::None),
+    },
+];
+
+const RUN_PARAMETERS: &[ToolParameter] = &[
+    ToolParameter {
+        name: "command",
+        value_type: ToolValueType::String,
+        default: None,
+    },
+    ToolParameter {
+        name: "cwd",
+        value_type: ToolValueType::String,
+        default: Some(ToolDefault::String(".")),
     },
 ];
 
@@ -499,6 +540,12 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         parameters: GREP_PARAMETERS,
         result: ToolResultShape::RecordList(&GREP_MATCH),
         description: "Search workspace file contents with a regular expression.",
+    },
+    ToolDefinition {
+        name: ToolName::Run,
+        parameters: RUN_PARAMETERS,
+        result: ToolResultShape::Record(&COMMAND_RESULT),
+        description: "Run one project-local shell command.",
     },
 ];
 
@@ -549,7 +596,7 @@ pub(crate) fn prompt_reference() -> String {
     .collect::<Vec<_>>()
     .join("\n\n");
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables. Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables. Run project-local, one-shot commands. Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
@@ -4939,13 +4986,13 @@ mod tests {
     }
 
     #[test]
-    fn active_tools_are_in_the_phase_two_canonical_order() {
+    fn active_tools_are_in_the_canonical_order() {
         assert_eq!(
             ACTIVE_TOOLS
                 .iter()
                 .map(|definition| definition.name.name())
                 .collect::<Vec<_>>(),
-            ["read", "write", "edit", "list_dir", "glob", "grep"]
+            ["read", "write", "edit", "list_dir", "glob", "grep", "run"]
         );
         assert_eq!(ToolName::Grep.count_label(1), "match");
         assert_eq!(ToolName::Grep.count_label(2), "matches");
@@ -6548,6 +6595,21 @@ mod tests {
     #[test]
     fn generated_sources_share_active_tool_definitions() {
         assert_eq!(
+            ACTIVE_TOOLS
+                .iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            [
+                ToolName::Read,
+                ToolName::Write,
+                ToolName::Edit,
+                ToolName::ListDir,
+                ToolName::Glob,
+                ToolName::Grep,
+                ToolName::Run,
+            ]
+        );
+        assert_eq!(
             bootstrap_source(),
             concat!(
                 "from dataclasses import dataclass\n\n",
@@ -6561,6 +6623,11 @@ mod tests {
                 "    path: str\n",
                 "    line: int\n",
                 "    text: str\n\n",
+                "@dataclass\n",
+                "class CommandResult:\n",
+                "    exit_code: int | None\n",
+                "    stdout: str\n",
+                "    stderr: str\n\n",
                 "async def read(path: str) -> str:\n",
                 "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
                 "    return await _kiki_read(path)\n\n",
@@ -6578,7 +6645,10 @@ mod tests {
                 "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
                 "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
                 "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
-                "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]"
+                "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
+                "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
+                "    \"\"\"Run one project-local shell command.\"\"\"\n",
+                "    return CommandResult(**await _kiki_run(command, cwd))"
             )
         );
         let reference = prompt_reference();
@@ -6589,14 +6659,16 @@ mod tests {
             "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+            "async def run(command: str, cwd: str = \".\") -> CommandResult:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
+        assert_eq!(reference.matches("class CommandResult:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
+        assert!(reference.contains("Run project-local, one-shot commands."));
         assert!(reference.contains("    ..."));
-        assert!(!reference.contains("run("));
     }
 
     #[tokio::test]
@@ -6993,7 +7065,10 @@ mod tests {
         assert_eq!(ToolName::Run.name(), "run");
         assert_eq!(ToolName::Run.private_name(), "_kiki_run");
         assert_eq!(ToolName::Run.label(), "run");
-        assert_eq!(ToolName::from_private_name("_kiki_run"), None);
+        assert_eq!(
+            ToolName::from_private_name("_kiki_run"),
+            Some(ToolName::Run)
+        );
 
         let call = ToolCall {
             call_id: 1,

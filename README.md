@@ -1,6 +1,6 @@
 # Kiki
 
-Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `gpt-5.6-sol` (the default flagship model), `gpt-5.6-terra` (the intelligence/cost balance), or `gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, and `grep`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
+Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `gpt-5.6-sol` (the default flagship model), `gpt-5.6-terra` (the intelligence/cost balance), or `gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
 
 ## Setup
 
@@ -26,6 +26,14 @@ cargo run
 ```
 
 Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
+
+## Commands
+
+`run(command, cwd=".")` starts one non-login `/bin/sh -c` command with null standard input and Kiki's inherited environment; interactive input is unavailable. `cwd` is workspace-relative, rejects absolute and parent paths, and is opened component by component without following symlinks before the validated directory descriptor is applied immediately before the command starts. There is no command-specific timeout: the five-minute whole-Arena deadline is the only limit.
+
+A normal or non-zero exit returns `CommandResult(exit_code, stdout, stderr)`; signal termination returns `exit_code=None`. stdout and stderr are captured independently, limited to 8 MiB each by their original byte counts, then lossily decoded as UTF-8. An overflowing stream kills the command's owned process group, drains both pipes, returns no partial result, and raises `RuntimeError` after any completed effects remain. Kiki also kills that group after shell exit; background services are unsupported.
+
+`run` has ordinary host filesystem, environment, and network authority. It is not a sandbox or approval boundary: a command can access host resources available to the Kiki process.
 
 ## Privacy and costs
 

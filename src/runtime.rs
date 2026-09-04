@@ -1029,6 +1029,8 @@ mod tests {
         match call.summary {
             ToolCallSummary::Pending => format!("{}:pending", call.tool.label()),
             ToolCallSummary::Failed => format!("{}:failed", call.tool.label()),
+            ToolCallSummary::Exit(code) => format!("{}:exit {code}", call.tool.label()),
+            ToolCallSummary::Signal => format!("{}:signal", call.tool.label()),
             ToolCallSummary::Count(count) => {
                 format!(
                     "{}:{count} {}",
@@ -1065,6 +1067,24 @@ mod tests {
             }),
             "edit:applied"
         );
+    }
+
+    #[test]
+    fn command_evidence_labels_are_path_free() {
+        for (summary, expected) in [
+            (ToolCallSummary::Pending, "run:pending"),
+            (ToolCallSummary::Exit(7), "run:exit 7"),
+            (ToolCallSummary::Signal, "run:signal"),
+            (ToolCallSummary::Failed, "run:failed"),
+        ] {
+            assert_eq!(
+                tool_call_label(ToolCall {
+                    tool: ToolName::Run,
+                    summary,
+                }),
+                expected
+            );
+        }
     }
 
     fn record_label(record: &StoredRecord) -> String {

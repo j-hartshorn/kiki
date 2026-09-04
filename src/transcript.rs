@@ -354,6 +354,8 @@ fn tool_call_label(call: ToolCall) -> String {
     let summary = match call.summary {
         ToolCallSummary::Pending => "pending".to_owned(),
         ToolCallSummary::Failed => "failed".to_owned(),
+        ToolCallSummary::Exit(code) => format!("exit {code}"),
+        ToolCallSummary::Signal => "signal".to_owned(),
         ToolCallSummary::Count(count) => {
             format!("{count} {}", call.tool.count_label(count))
         }
@@ -2638,6 +2640,24 @@ mod tests {
             }),
             "edit · applied"
         );
+    }
+
+    #[test]
+    fn command_tool_labels_are_path_free() {
+        for (summary, expected) in [
+            (ToolCallSummary::Pending, "run · pending"),
+            (ToolCallSummary::Exit(7), "run · exit 7"),
+            (ToolCallSummary::Signal, "run · signal"),
+            (ToolCallSummary::Failed, "run · failed"),
+        ] {
+            assert_eq!(
+                tool_call_label(ToolCall {
+                    tool: ToolName::Run,
+                    summary,
+                }),
+                expected
+            );
+        }
     }
 
     #[test]
