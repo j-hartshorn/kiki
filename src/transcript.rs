@@ -55,6 +55,7 @@ enum RunState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DisplayedRecord {
     record: StoredRecord,
+    run_previews: Vec<Option<RunPreview>>,
     progress_gap: bool,
 }
 
@@ -1696,9 +1697,6 @@ impl Transcript {
                         live.activity = activity.clone();
                         if let Some(index) = index {
                             live.tool_calls[index] = call;
-                            if !matches!(call.summary, ToolCallSummary::Pending) {
-                                live.run_previews[index] = None;
-                            }
                         } else {
                             live.insert_tool_call(token, call, None);
                         }
@@ -2037,6 +2035,14 @@ impl Transcript {
             self.latest_run_id
                 .map_or(record.run_id, |latest| latest.max(record.run_id)),
         );
+        let run_previews = match (&record.record, &self.live_step) {
+            (Record::CompletedExecution { step_id, .. }, Some(live))
+                if live.run_id == record.run_id && live.step_id == *step_id =>
+            {
+                live.run_previews.clone()
+            }
+            _ => Vec::new(),
+        };
         match &record.record {
             Record::CompletedExecution { step_id, .. } => {
                 self.completed_steps.push((record.run_id, *step_id));
@@ -2057,6 +2063,7 @@ impl Transcript {
         }
         self.records.push(DisplayedRecord {
             record,
+            run_previews,
             progress_gap,
         });
         true
@@ -2205,7 +2212,7 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
                 status: None,
                 source: Some(source.clone()),
                 tool_calls: execution.tool_calls.clone(),
-                run_previews: Vec::new(),
+                run_previews: displayed.run_previews.clone(),
                 content: execution_content(execution),
                 progress_gap: displayed.progress_gap,
                 accounting: step_accounting(attempts),
@@ -6170,8 +6177,8 @@ truncated"
         );
 
         let rendered = rendered_layout_text(&mut transcript);
-        assert!(!rendered.contains("printf 'ten lines'"), "{rendered}");
-        assert!(!rendered.contains("line 10"), "{rendered}");
+        assert!(rendered.contains("printf 'ten lines'"), "{rendered}");
+        assert!(rendered.contains("line 10"), "{rendered}");
         assert!(!rendered.contains("stale command"), "{rendered}");
         assert!(!rendered.contains("stale output"), "{rendered}");
         assert_eq!(transcript.status(), "run · exit 0");
@@ -6253,7 +6260,10 @@ truncated"
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
             }],
-            &[None],
+            &[Some(RunPreview {
+                command: "latest".to_owned(),
+                stdout: "latest output".to_owned(),
+            })],
         );
         let status = transcript.status().to_owned();
 
@@ -6274,7 +6284,10 @@ truncated"
                 tool: ToolName::Run,
                 summary: ToolCallSummary::Exit(0),
             }],
-            &[None],
+            &[Some(RunPreview {
+                command: "latest".to_owned(),
+                stdout: "latest output".to_owned(),
+            })],
         );
         assert_eq!(transcript.status(), status);
     }
@@ -6527,7 +6540,10 @@ truncated"
                 },
             ],
             &[
-                None,
+                Some(RunPreview {
+                    command: "first".to_owned(),
+                    stdout: "first output".to_owned(),
+                }),
                 Some(RunPreview {
                     command: "second".to_owned(),
                     stdout: "second output".to_owned(),
@@ -6558,12 +6574,21 @@ truncated"
                     summary: ToolCallSummary::Exit(1),
                 },
             ],
-            &[None, None],
+            &[
+                Some(RunPreview {
+                    command: "first".to_owned(),
+                    stdout: "first output".to_owned(),
+                }),
+                Some(RunPreview {
+                    command: "second latest".to_owned(),
+                    stdout: "second latest output".to_owned(),
+                }),
+            ],
         );
     }
 
     #[test]
-    fn live_run_previews_end_at_the_retained_evidence_boundary() {
+    fn completed_execution_keeps_run_preview_tails() {
         let mut transcript = Transcript::default();
         start_live_run(&mut transcript);
         let token = ToolCallToken::for_test(0);
@@ -6591,8 +6616,8 @@ truncated"
 
         let retained = rendered_text(&transcript);
         assert!(retained.contains("run · exit 0"));
-        assert!(!retained.contains("live command"));
-        assert!(!retained.contains("live output"));
+        assert!(retained.contains("live command"));
+        assert!(retained.contains("live output"));
         assert!(transcript.live_step.is_none());
         assert!(transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false));
         assert!(transcript.is_idle());
