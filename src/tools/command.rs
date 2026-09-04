@@ -13,7 +13,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 #[cfg(test)]
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use crate::config::constants::COMMAND_STREAM_MAX_BYTES;
 
@@ -36,13 +36,13 @@ pub(super) enum CommandError {
 
 #[cfg(test)]
 #[derive(Debug)]
-pub(super) struct CommandTestGate {
+pub(crate) struct CommandTestGate {
     started_tx: watch::Sender<Option<libc::pid_t>>,
-    started_rx: watch::Receiver<Option<libc::pid_t>>,
-    kill_sent_tx: watch::Sender<bool>,
-    kill_sent_rx: watch::Receiver<bool>,
-    cleaned_up_tx: watch::Sender<bool>,
-    cleaned_up_rx: watch::Receiver<bool>,
+    started_rx: Mutex<watch::Receiver<Option<libc::pid_t>>>,
+    kill_sent_tx: watch::Sender<Option<libc::pid_t>>,
+    kill_sent_rx: watch::Receiver<Option<libc::pid_t>>,
+    cleaned_up_tx: watch::Sender<Option<libc::pid_t>>,
+    cleaned_up_rx: watch::Receiver<Option<libc::pid_t>>,
     supervisor_exited_tx: watch::Sender<bool>,
     supervisor_exited_rx: watch::Receiver<bool>,
     error_published_tx: watch::Sender<bool>,
@@ -55,17 +55,17 @@ pub(super) struct CommandTestGate {
 
 #[cfg(test)]
 impl CommandTestGate {
-    pub(super) fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (started_tx, started_rx) = watch::channel(None);
-        let (kill_sent_tx, kill_sent_rx) = watch::channel(false);
-        let (cleaned_up_tx, cleaned_up_rx) = watch::channel(false);
+        let (kill_sent_tx, kill_sent_rx) = watch::channel(None);
+        let (cleaned_up_tx, cleaned_up_rx) = watch::channel(None);
         let (supervisor_exited_tx, supervisor_exited_rx) = watch::channel(false);
         let (error_published_tx, error_published_rx) = watch::channel(false);
         let (error_hold_tx, error_hold_rx) = watch::channel(false);
         let (read_hold_tx, read_hold_rx) = watch::channel(false);
         Arc::new(Self {
             started_tx,
-            started_rx,
+            started_rx: Mutex::new(started_rx),
             kill_sent_tx,
             kill_sent_rx,
             cleaned_up_tx,
@@ -81,23 +81,26 @@ impl CommandTestGate {
         })
     }
 
-    pub(super) async fn wait_until_started(&self) {
-        let mut rx = self.started_rx.clone();
+    pub(crate) async fn wait_until_started(&self) -> libc::pid_t {
+        let mut rx = self.started_rx.lock().await;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while rx.borrow().is_none() {
+            loop {
                 rx.changed()
                     .await
                     .expect("test gate started sender dropped");
+                if let Some(pgid) = *rx.borrow() {
+                    return pgid;
+                }
             }
         })
         .await
-        .expect("timed out waiting for command start");
+        .expect("timed out waiting for command start")
     }
 
-    pub(super) async fn wait_until_kill_sent(&self) {
+    pub(crate) async fn wait_until_kill_sent(&self, pgid: libc::pid_t) {
         let mut rx = self.kill_sent_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !*rx.borrow() {
+            while *rx.borrow() != Some(pgid) {
                 rx.changed().await.expect("test gate kill sender dropped");
             }
         })
@@ -105,10 +108,10 @@ impl CommandTestGate {
         .expect("timed out waiting for group kill");
     }
 
-    pub(super) async fn wait_until_cleaned_up(&self) {
+    pub(crate) async fn wait_until_cleaned_up(&self, pgid: libc::pid_t) {
         let mut rx = self.cleaned_up_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !*rx.borrow() {
+            while *rx.borrow() != Some(pgid) {
                 rx.changed()
                     .await
                     .expect("test gate cleanup sender dropped");
@@ -118,7 +121,7 @@ impl CommandTestGate {
         .expect("timed out waiting for command cleanup");
     }
 
-    pub(super) async fn wait_until_supervisor_exited(&self) {
+    pub(crate) async fn wait_until_supervisor_exited(&self) {
         let mut rx = self.supervisor_exited_rx.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !*rx.borrow() {
@@ -144,19 +147,15 @@ impl CommandTestGate {
         .expect("timed out waiting for command error publication");
     }
 
-    pub(super) fn error_published(&self) -> bool {
+    pub(crate) fn error_published(&self) -> bool {
         *self.error_published_rx.borrow()
     }
 
-    pub(super) fn last_pgid(&self) -> Option<libc::pid_t> {
-        *self.started_rx.borrow()
-    }
-
-    pub(super) fn hold_error_publication(&self) {
+    pub(crate) fn hold_error_publication(&self) {
         let _ = self.error_hold_tx.send(true);
     }
 
-    pub(super) fn release_error_publication(&self) {
+    pub(crate) fn release_error_publication(&self) {
         let _ = self.error_hold_tx.send(false);
     }
 
@@ -172,12 +171,12 @@ impl CommandTestGate {
         let _ = self.started_tx.send(Some(pgid));
     }
 
-    fn notify_kill_sent(&self) {
-        let _ = self.kill_sent_tx.send(true);
+    fn notify_kill_sent(&self, pgid: libc::pid_t) {
+        let _ = self.kill_sent_tx.send(Some(pgid));
     }
 
-    fn notify_cleaned_up(&self) {
-        let _ = self.cleaned_up_tx.send(true);
+    fn notify_cleaned_up(&self, pgid: libc::pid_t) {
+        let _ = self.cleaned_up_tx.send(Some(pgid));
     }
 
     fn notify_supervisor_exited(&self) {
@@ -254,7 +253,7 @@ impl GroupKillGuard {
             }
             #[cfg(test)]
             if let Some(gate) = &self.gate {
-                gate.notify_kill_sent();
+                gate.notify_kill_sent(self.pgid);
             }
         }
     }
@@ -308,12 +307,21 @@ pub(super) async fn execute_command(
 ) -> Result<CommandResult, CommandError> {
     #[cfg(test)]
     {
-        execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES, None).await
+        execute_command_with_test_gate(command, cwd, None).await
     }
     #[cfg(not(test))]
     {
         execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES).await
     }
+}
+
+#[cfg(test)]
+pub(super) async fn execute_command_with_test_gate(
+    command: &str,
+    cwd: OwnedFd,
+    gate: Option<Arc<CommandTestGate>>,
+) -> Result<CommandResult, CommandError> {
+    execute_command_bounded(command, cwd, COMMAND_STREAM_MAX_BYTES, gate).await
 }
 
 #[cfg(test)]
@@ -407,7 +415,7 @@ async fn execute_command_supervisor(
     let gate_task = gate.clone();
 
     tokio::spawn(async move {
-        run_supervisor_loop(
+        run_supervisor_loop(Supervisor {
             guard,
             child,
             sigchld,
@@ -417,8 +425,8 @@ async fn execute_command_supervisor(
             cancel_rx,
             result_tx,
             #[cfg(test)]
-            gate_task,
-        )
+            gate: gate_task,
+        })
         .await;
     });
 
@@ -440,17 +448,32 @@ async fn execute_command_supervisor(
     result
 }
 
-async fn run_supervisor_loop(
-    mut guard: GroupKillGuard,
-    mut child: tokio::process::Child,
+struct Supervisor {
+    guard: GroupKillGuard,
+    child: tokio::process::Child,
     sigchld: Signal,
-    mut stdout: tokio::process::ChildStdout,
-    mut stderr: tokio::process::ChildStderr,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
     limit: usize,
-    mut cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<Result<CommandResult, CommandError>>,
-    #[cfg(test)] gate: Option<Arc<CommandTestGate>>,
-) {
+    #[cfg(test)]
+    gate: Option<Arc<CommandTestGate>>,
+}
+
+async fn run_supervisor_loop(supervisor: Supervisor) {
+    let Supervisor {
+        mut guard,
+        mut child,
+        sigchld,
+        mut stdout,
+        mut stderr,
+        limit,
+        mut cancel_rx,
+        result_tx,
+        #[cfg(test)]
+        gate,
+    } = supervisor;
     #[cfg(test)]
     let _supervisor_exit_guard = SupervisorExitGuard { gate: gate.clone() };
 
@@ -546,7 +569,7 @@ async fn run_supervisor_loop(
 
     #[cfg(test)]
     if let Some(gate) = &gate {
-        gate.notify_cleaned_up();
+        gate.notify_cleaned_up(guard.pgid);
     }
 
     if cancelled || cancellation_requested(&mut cancel_rx) {
@@ -807,8 +830,8 @@ mod tests {
             execute_command_bounded("printf '%01024d' 0", cwd, 10, Some(gate_clone)).await
         });
 
-        gate.wait_until_started().await;
-        gate.wait_until_kill_sent().await;
+        let pgid = gate.wait_until_started().await;
+        gate.wait_until_kill_sent(pgid).await;
         gate.release_read();
 
         let err = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -965,15 +988,82 @@ mod tests {
             .await
         });
 
-        gate.wait_until_started().await;
-        let pgid = gate.last_pgid().unwrap();
+        let pgid = gate.wait_until_started().await;
         assert!(pgid > 0);
         assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0);
 
         handle.abort();
-        gate.wait_until_cleaned_up().await;
+        gate.wait_until_cleaned_up(pgid).await;
         assert_group_absent(pgid).await;
         assert_process_absent(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_waits_do_not_reuse_prior_command_notifications() {
+        let (_dir, first_cwd) = test_cwd();
+        let gate = CommandTestGate::new();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            execute_command_bounded(
+                "tail -f /dev/null",
+                first_cwd,
+                COMMAND_STREAM_MAX_BYTES,
+                Some(first_gate),
+            )
+            .await
+        });
+
+        let first_pgid = gate.wait_until_started().await;
+        first.abort();
+        gate.wait_until_kill_sent(first_pgid).await;
+        gate.wait_until_cleaned_up(first_pgid).await;
+        let cancellation = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("timed out cancelling first command")
+            .unwrap_err();
+        assert!(cancellation.is_cancelled());
+
+        let (_dir, second_cwd) = test_cwd();
+        let second_gate = gate.clone();
+        let second = tokio::spawn(async move {
+            execute_command_bounded(
+                "tail -f /dev/null",
+                second_cwd,
+                COMMAND_STREAM_MAX_BYTES,
+                Some(second_gate),
+            )
+            .await
+        });
+
+        let second_pgid = gate.wait_until_started().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                gate.wait_until_kill_sent(second_pgid)
+            )
+            .await
+            .is_err(),
+            "first command's kill satisfied the second wait"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                gate.wait_until_cleaned_up(second_pgid)
+            )
+            .await
+            .is_err(),
+            "first command's cleanup satisfied the second wait"
+        );
+
+        second.abort();
+        gate.wait_until_kill_sent(second_pgid).await;
+        gate.wait_until_cleaned_up(second_pgid).await;
+        let cancellation = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("timed out cancelling second command")
+            .unwrap_err();
+        assert!(cancellation.is_cancelled());
+        assert_group_absent(second_pgid).await;
     }
 
     #[tokio::test]
@@ -1000,7 +1090,7 @@ mod tests {
         };
         drop(unpolled_future);
 
-        gate.wait_until_kill_sent().await;
+        gate.wait_until_kill_sent(pgid).await;
         tokio::time::timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || child.wait()),
@@ -1041,9 +1131,9 @@ mod tests {
             .await
         });
 
-        gate.wait_until_started().await;
-        gate.wait_until_kill_sent().await;
-        gate.wait_until_cleaned_up().await;
+        let pgid = gate.wait_until_started().await;
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
 
         gate.release_error_publication();
         let res = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -1071,8 +1161,8 @@ mod tests {
             .await
         });
 
-        gate.wait_until_started().await;
-        gate.wait_until_cleaned_up().await;
+        let pgid = gate.wait_until_started().await;
+        gate.wait_until_cleaned_up(pgid).await;
 
         handle.abort();
         let cancellation = tokio::time::timeout(Duration::from_secs(5), handle)

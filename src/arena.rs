@@ -1676,6 +1676,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use futures::StreamExt;
@@ -1693,8 +1694,8 @@ mod tests {
         tool_summary, validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{
-        BatchTestGate, BlockingTestGate, ReadTestGate, ToolCall as HostToolCall, ToolHost,
-        ToolResult, ToolValue, WholeFileAuthorisations, WriteTestHook,
+        BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolCall as HostToolCall,
+        ToolHost, ToolResult, ToolValue, WholeFileAuthorisations, WriteTestHook,
     };
 
     const TEST_LIMITS: ObservationLimits = ObservationLimits {
@@ -1759,6 +1760,26 @@ mod tests {
         let arena = Arena::new(worker_path(), tool_host)
             .await
             .expect("create arena");
+        (arena, gate)
+    }
+
+    async fn arena_with_command_gate(
+        workspace: &TempDir,
+        execution_timeout: Duration,
+    ) -> (Arena, Arc<CommandTestGate>) {
+        let gate = CommandTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_command_test_gate(gate.clone());
+        let arena = Arena::with_limits(
+            worker_path(),
+            tool_host,
+            execution_timeout,
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .expect("create arena");
         (arena, gate)
     }
 
@@ -4199,6 +4220,182 @@ mod tests {
                     summary: ToolCallSummary::Count(1),
                 }
         }));
+    }
+
+    #[cfg(unix)]
+    async fn assert_group_absent(pgid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(-pgid, 0) } == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ESRCH)
+                    );
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for command group cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_cleans_a_running_command_process_group() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("await run('tail -f /dev/null')", &cancellation));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0);
+        cancellation.cancel();
+
+        assert!(matches!(
+            execution.await.unwrap_err(),
+            ArenaError::Cancelled { .. }
+        ));
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        assert_group_absent(pgid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_cleans_a_command_and_restores_the_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("trusted"), "contents").unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(1)).await;
+        set_trusted_value(&mut arena).await;
+        execute_without_cancellation(&mut arena, "await read('trusted')")
+            .await
+            .unwrap();
+        let trusted_checkpoint = arena.checkpoint();
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("value = 99\nawait run('tail -f /dev/null')", &cancellation));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0);
+        let error = execution.await.unwrap_err();
+
+        let ArenaError::TimedOut { execution } = error else {
+            panic!("expected interrupted timeout");
+        };
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        assert_group_absent(pgid).await;
+        assert_eq!(arena.checkpoint(), trusted_checkpoint);
+        assert!(has_authorisation(&arena, "trusted"));
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interruption_preserves_completed_command_effects_and_freezes_safe_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("CWD_SENTINEL")).unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        set_trusted_value(&mut arena).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "await run('printf effect > SIDE_EFFECT_SENTINEL')\nvalue = 99\nawait run('tail -f /dev/null # COMMAND_SENTINEL', 'CWD_SENTINEL')",
+            &cancellation,
+        ));
+
+        let first_pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its first command started: {result:?}"),
+        };
+        gate.wait_until_kill_sent(first_pgid).await;
+        gate.wait_until_cleaned_up(first_pgid).await;
+        let second_pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its second command started: {result:?}"),
+        };
+        assert_eq!(unsafe { libc::kill(-second_pgid, 0) }, 0);
+        cancellation.cancel();
+
+        let error = execution.await.unwrap_err();
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("expected interrupted cancellation");
+        };
+        gate.wait_until_kill_sent(second_pgid).await;
+        gate.wait_until_cleaned_up(second_pgid).await;
+        assert_group_absent(second_pgid).await;
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(0),
+                },
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Pending,
+                },
+            ]
+        );
+        let retained = format!("{execution:?}");
+        for sentinel in ["COMMAND_SENTINEL", "CWD_SENTINEL", "SIDE_EFFECT_SENTINEL"] {
+            assert!(!retained.contains(sentinel), "retained {sentinel}");
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("SIDE_EFFECT_SENTINEL")).unwrap(),
+            "effect"
+        );
+        assert_trusted_value(&mut arena).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_wins_before_a_held_overflow_error_is_published() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut arena, gate) = arena_with_command_gate(&workspace, Duration::from_secs(5)).await;
+        gate.hold_error_publication();
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "await run('dd if=/dev/zero bs=8388609 count=1 2>/dev/null')",
+            &cancellation,
+        ));
+
+        let pgid = tokio::select! {
+            pgid = gate.wait_until_started() => pgid,
+            result = &mut execution => panic!("execution finished before its command started: {result:?}"),
+        };
+        gate.wait_until_kill_sent(pgid).await;
+        gate.wait_until_cleaned_up(pgid).await;
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+        gate.release_error_publication();
+        gate.wait_until_supervisor_exited().await;
+
+        let ArenaError::Cancelled { execution } = error else {
+            panic!("cancellation must win over command overflow");
+        };
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::Run,
+                summary: ToolCallSummary::Pending,
+            }]
+        );
+        assert!(!gate.error_published());
     }
 
     #[tokio::test]

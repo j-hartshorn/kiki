@@ -1,5 +1,8 @@
 mod command;
 
+#[cfg(test)]
+pub(crate) use command::CommandTestGate;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
@@ -912,6 +915,8 @@ pub(crate) struct ToolHost {
     list_dir_test_gate: Option<BlockingTestGate>,
     #[cfg(test)]
     batch_test_gate: Option<BatchTestGate>,
+    #[cfg(test)]
+    command_test_gate: Option<Arc<CommandTestGate>>,
 }
 
 #[cfg(test)]
@@ -1528,6 +1533,8 @@ impl ToolHost {
             list_dir_test_gate: None,
             #[cfg(test)]
             batch_test_gate: None,
+            #[cfg(test)]
+            command_test_gate: None,
         })
     }
 
@@ -1561,6 +1568,15 @@ impl ToolHost {
     #[cfg(test)]
     pub(crate) fn with_batch_test_gate(mut self, batch_test_gate: BatchTestGate) -> Self {
         self.batch_test_gate = Some(batch_test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_command_test_gate(
+        mut self,
+        command_test_gate: Arc<CommandTestGate>,
+    ) -> Self {
+        self.command_test_gate = Some(command_test_gate);
         self
     }
 
@@ -1838,6 +1854,12 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
+        #[cfg(test)]
+        let result =
+            command::execute_command_with_test_gate(&command, cwd, self.command_test_gate.clone())
+                .await
+                .map_err(map_command_error)?;
+        #[cfg(not(test))]
         let result = command::execute_command(&command, cwd)
             .await
             .map_err(map_command_error)?;
