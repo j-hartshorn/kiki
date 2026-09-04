@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    Observation, PythonError, ToolCall, ToolCallToken,
+    Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
 use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
 use crate::model::{
@@ -73,6 +73,10 @@ pub(crate) enum AgentProgress {
     ToolUpdated {
         token: ToolCallToken,
         call: ToolCall,
+    },
+    RunPreviewUpdated {
+        token: ToolCallToken,
+        preview: RunPreview,
     },
     StdoutDelta {
         text: String,
@@ -559,6 +563,9 @@ impl<M: Model> Agent<M> {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ToolUpdated { token, call } => {
                                 progress(AgentProgress::ToolUpdated { token, call });
+                            }
+                            ArenaProgress::RunPreviewUpdated { token, preview } => {
+                                progress(AgentProgress::RunPreviewUpdated { token, preview });
                             }
                             ArenaProgress::StdoutDelta { text } => {
                                 progress(AgentProgress::StdoutDelta { text });

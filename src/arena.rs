@@ -13,14 +13,15 @@ use thiserror::Error;
 use tokio::process::Command;
 #[cfg(test)]
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
     tools::{
-        ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolResult, ToolValue,
-        WholeFileAuthorisations, bootstrap_source,
+        ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
+        ToolValue, WholeFileAuthorisations, bootstrap_source,
     },
 };
 
@@ -32,6 +33,10 @@ const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
+const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
+const RUN_STDOUT_PREVIEW_BYTES: usize = 3 * 1024;
+const RUN_STDOUT_PREVIEW_LINES: usize = 8;
+const RUN_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
     max_total_bytes: 256 * 1024,
     max_total_lines: 1_000,
@@ -104,10 +109,84 @@ pub(crate) enum ArenaProgress {
         token: ToolCallToken,
         call: ToolCall,
     },
+    RunPreviewUpdated {
+        token: ToolCallToken,
+        preview: RunPreview,
+    },
     StdoutDelta {
         text: String,
     },
     StdoutTruncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunPreview {
+    pub(crate) command: String,
+    pub(crate) stdout: String,
+}
+
+struct RunPreviewState {
+    command: String,
+    stdout: Vec<u8>,
+}
+
+impl RunPreviewState {
+    fn new(command: &str) -> Self {
+        let first_line = command
+            .split(['\r', '\n'])
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let truncated =
+            first_line.len() < command.len() || first_line.len() > RUN_COMMAND_PREVIEW_BYTES;
+        let mut command = first_line.to_owned();
+        if command.len() > RUN_COMMAND_PREVIEW_BYTES {
+            command.truncate(utf8_prefix_len(&command, RUN_COMMAND_PREVIEW_BYTES));
+        }
+        if truncated {
+            command.push('…');
+        }
+        Self {
+            command,
+            stdout: Vec::new(),
+        }
+    }
+
+    fn push_stdout(&mut self, stdout: &[u8]) {
+        self.stdout.extend_from_slice(stdout);
+        let logical_lines = self.stdout.iter().filter(|byte| **byte == b'\n').count()
+            + usize::from(!self.stdout.ends_with(b"\n"));
+        let excess_lines = logical_lines.saturating_sub(RUN_STDOUT_PREVIEW_LINES);
+        if excess_lines > 0 {
+            let mut seen = 0;
+            if let Some(end) = self.stdout.iter().position(|byte| {
+                if *byte == b'\n' {
+                    seen += 1;
+                }
+                seen == excess_lines
+            }) {
+                self.stdout.drain(..=end);
+            }
+        }
+        if self.stdout.len() > RUN_STDOUT_PREVIEW_BYTES {
+            let start = self.stdout.len() - RUN_STDOUT_PREVIEW_BYTES;
+            self.stdout.drain(..start);
+        }
+    }
+
+    fn snapshot(&self) -> RunPreview {
+        let mut stdout = String::from_utf8_lossy(&self.stdout).into_owned();
+        if stdout.len() > RUN_STDOUT_PREVIEW_BYTES {
+            let mut start = stdout.len() - RUN_STDOUT_PREVIEW_BYTES;
+            while !stdout.is_char_boundary(start) {
+                start += 1;
+            }
+            stdout.drain(..start);
+        }
+        RunPreview {
+            command: self.command.clone(),
+            stdout,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +207,7 @@ pub(crate) struct ToolCall {
     pub(crate) summary: ToolCallSummary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ToolCallToken(usize);
 
 #[cfg(test)]
@@ -763,6 +842,7 @@ struct PendingToolCall {
     tool: ToolName,
     arguments: ToolValue,
     token: ToolCallToken,
+    run_preview: Option<RunPreviewState>,
 }
 
 async fn drive(
@@ -869,11 +949,20 @@ async fn drive(
                             token,
                             call: tools.call(token),
                         });
+                        let run_preview =
+                            run_command_argument(tool, &arguments).map(RunPreviewState::new);
+                        if let Some(run_preview) = &run_preview {
+                            progress(ArenaProgress::RunPreviewUpdated {
+                                token,
+                                preview: run_preview.snapshot(),
+                            });
+                        }
                         pending_calls.push(PendingToolCall {
                             call_id,
                             tool,
                             arguments,
                             token,
+                            run_preview,
                         });
                         match with_print!(on_print => checkout
                             .resume(ResumeValue::Future, &mut on_print)
@@ -932,6 +1021,7 @@ async fn drive(
                         .map(|call| (call.call_id, call))
                         .collect::<BTreeMap<_, _>>();
                     let mut tokens = BTreeMap::new();
+                    let mut run_previews = BTreeMap::new();
                     let calls = pending_call_ids
                         .iter()
                         .map(|call_id| {
@@ -944,6 +1034,14 @@ async fn drive(
                                     .is_none(),
                                 "a pending host call must have a unique call ID"
                             );
+                            if let Some(run_preview) = call.run_preview {
+                                assert!(
+                                    run_previews
+                                        .insert(call.call_id, (call.token, run_preview))
+                                        .is_none(),
+                                    "a pending run call must have a unique call ID"
+                                );
+                            }
                             HostToolCall {
                                 call_id: call.call_id,
                                 tool: call.tool,
@@ -956,9 +1054,26 @@ async fn drive(
                         .filter_map(HostToolCall::mutation_path)
                         .collect::<BTreeSet<_>>();
                     let mut results = BTreeMap::new();
-                    let mut calls =
-                        Box::pin(tool_host.dispatch_batch(calls, authorisations.clone()));
-                    while let Some(result) = calls.next().await {
+                    let (output_sender, mut output_receiver) =
+                        mpsc::channel(RUN_OUTPUT_CHANNEL_CAPACITY);
+                    let mut calls = Box::pin(tool_host.dispatch_batch_with_output(
+                        calls,
+                        authorisations.clone(),
+                        output_sender,
+                    ));
+                    while !tokens.is_empty() {
+                        let result = tokio::select! {
+                            result = calls.next() => result.expect("every admitted host call must settle"),
+                            output = output_receiver.recv(), if !run_previews.is_empty() => {
+                                if let Some(output) = output {
+                                    update_run_preview(output, &mut run_previews, progress);
+                                }
+                                continue;
+                            }
+                        };
+                        while let Ok(output) = output_receiver.try_recv() {
+                            update_run_preview(output, &mut run_previews, progress);
+                        }
                         let call_id = result.call_id;
                         let (tool, token) = tokens
                             .remove(&call_id)
@@ -969,6 +1084,7 @@ async fn drive(
                             "a host tool call must settle once"
                         );
                         let call = tools.settle(token, summary);
+                        run_previews.remove(&call_id);
                         #[cfg(test)]
                         tool_host.wait_after_read_settled().await;
                         progress(ArenaProgress::ToolUpdated { token, call });
@@ -1010,6 +1126,36 @@ async fn drive(
             };
         }
     }
+}
+
+fn run_command_argument(tool: ToolName, arguments: &ToolValue) -> Option<&str> {
+    if tool != ToolName::Run {
+        return None;
+    }
+    let ToolValue::List(arguments) = arguments else {
+        return None;
+    };
+    match arguments.as_slice() {
+        [ToolValue::String(command)] | [ToolValue::String(command), ToolValue::String(_)] => {
+            Some(command)
+        }
+        _ => None,
+    }
+}
+
+fn update_run_preview(
+    output: ToolOutputChunk,
+    run_previews: &mut BTreeMap<u32, (ToolCallToken, RunPreviewState)>,
+    progress: &mut (impl FnMut(ArenaProgress) + Send),
+) {
+    let Some((token, preview)) = run_previews.get_mut(&output.call_id) else {
+        return;
+    };
+    preview.push_stdout(&output.stdout);
+    progress(ArenaProgress::RunPreviewUpdated {
+        token: *token,
+        preview: preview.snapshot(),
+    });
 }
 
 fn matches_pending_batch(calls: &[PendingToolCall], pending_call_ids: &[u32]) -> bool {
@@ -2184,7 +2330,7 @@ mod tests {
         let execution = {
             let mut capture = |event| progress.push(event);
             let mut execution = Box::pin(arena.execute_with_progress(
-                "import asyncio\nawait asyncio.gather(run(\"COMMAND_SENTINEL; printf OUTPUT_SENTINEL; printf ERROR_SENTINEL >&2\"), run('kill -9 $$'), run('printf ignored', 'CWD_SENTINEL'))",
+                "import asyncio\nawait asyncio.gather(run(\"COMMAND_SENTINEL; printf OUTPUT_SENTINEL; printf ERROR_SENTINEL >&2\"), run('printf SECOND_OUTPUT_SENTINEL; kill -9 $$'), run('printf ignored', 'CWD_SENTINEL'))",
                 &cancellation,
                 &mut capture,
             ));
@@ -2218,10 +2364,11 @@ mod tests {
             ]
         );
         let updates = progress
-            .into_iter()
+            .iter()
             .filter_map(|event| match event {
-                super::ArenaProgress::ToolUpdated { token, call } => Some((token, call)),
-                super::ArenaProgress::StdoutDelta { .. }
+                super::ArenaProgress::ToolUpdated { token, call } => Some((*token, *call)),
+                super::ArenaProgress::RunPreviewUpdated { .. }
+                | super::ArenaProgress::StdoutDelta { .. }
                 | super::ArenaProgress::StdoutTruncated => None,
             })
             .collect::<Vec<_>>();
@@ -2253,11 +2400,33 @@ mod tests {
                 .iter()
                 .any(|(_, call)| call.summary == ToolCallSummary::Failed)
         );
+        let successful_token = updates[0].0;
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            super::ArenaProgress::RunPreviewUpdated {
+                token,
+                preview: super::RunPreview { command, stdout },
+            } if *token == successful_token
+                && command.contains("COMMAND_SENTINEL")
+                && stdout.contains("OUTPUT_SENTINEL")
+                && !stdout.contains("ERROR_SENTINEL")
+        )));
+        let signalled_token = updates[1].0;
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            super::ArenaProgress::RunPreviewUpdated {
+                token,
+                preview: super::RunPreview { command, stdout },
+            } if *token == signalled_token
+                && command.contains("SECOND_OUTPUT_SENTINEL")
+                && stdout.contains("SECOND_OUTPUT_SENTINEL")
+        )));
         let retained = format!("{:?}{updates:?}", execution.tool_calls);
         for sentinel in [
             "COMMAND_SENTINEL",
             "CWD_SENTINEL",
             "OUTPUT_SENTINEL",
+            "SECOND_OUTPUT_SENTINEL",
             "ERROR_SENTINEL",
         ] {
             assert!(!retained.contains(sentinel), "retained {sentinel}");
@@ -3178,6 +3347,55 @@ mod tests {
     }
 
     #[test]
+    fn run_preview_keeps_the_command_prefix_and_last_eight_stdout_lines() {
+        let mut preview = super::RunPreviewState::new(&format!("{}🦀tail", "x".repeat(200)));
+        preview.push_stdout(
+            &(1..=10)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>()
+                .into_bytes(),
+        );
+
+        let preview = preview.snapshot();
+        assert!(preview.command.ends_with('…'));
+        assert!(preview.command.len() <= super::RUN_COMMAND_PREVIEW_BYTES + '…'.len_utf8());
+        assert_eq!(
+            preview.stdout,
+            (3..=10)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>()
+        );
+
+        let mut invalid = super::RunPreviewState::new("invalid output");
+        invalid.push_stdout(&vec![0xff; super::RUN_STDOUT_PREVIEW_BYTES]);
+        let invalid = invalid.snapshot();
+        assert!(invalid.stdout.len() <= super::RUN_STDOUT_PREVIEW_BYTES);
+        assert!(
+            invalid.command.len() + invalid.stdout.len()
+                <= super::RUN_COMMAND_PREVIEW_BYTES + super::RUN_STDOUT_PREVIEW_BYTES
+        );
+    }
+
+    #[test]
+    fn run_preview_keeps_invalid_continuation_bytes_at_the_raw_tail_boundary() {
+        let mut preview = super::RunPreviewState::new("invalid output");
+        preview.push_stdout(&vec![0x80; super::RUN_STDOUT_PREVIEW_BYTES + 1]);
+
+        let preview = preview.snapshot();
+        assert_eq!(
+            preview.stdout,
+            "\u{fffd}".repeat(super::RUN_STDOUT_PREVIEW_BYTES / '\u{fffd}'.len_utf8())
+        );
+    }
+
+    #[test]
+    fn run_preview_skips_leading_blank_command_lines() {
+        let preview = super::RunPreviewState::new("\r\n\nprintf first\nprintf second").snapshot();
+
+        assert_eq!(preview.command, "printf first…");
+    }
+
+    #[test]
     fn stdout_progress_flushes_utf8_safe_chunks_when_pending_output_reaches_four_kib() {
         let now = Instant::now();
         let mut streams = StreamAccumulators::new(OBSERVATION_LIMITS);
@@ -3208,8 +3426,9 @@ mod tests {
         );
         assert!(progress.iter().all(|event| match event {
             super::ArenaProgress::StdoutDelta { text } => text.len() <= 4 * 1024,
-            super::ArenaProgress::StdoutTruncated | super::ArenaProgress::ToolUpdated { .. } =>
-                true,
+            super::ArenaProgress::StdoutTruncated
+            | super::ArenaProgress::ToolUpdated { .. }
+            | super::ArenaProgress::RunPreviewUpdated { .. } => true,
         }));
         assert!(matches!(
             progress.get(1),
@@ -3997,7 +4216,8 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 super::ArenaProgress::ToolUpdated { token, call } => Some((token, call)),
-                super::ArenaProgress::StdoutDelta { .. }
+                super::ArenaProgress::RunPreviewUpdated { .. }
+                | super::ArenaProgress::StdoutDelta { .. }
                 | super::ArenaProgress::StdoutTruncated => None,
             })
             .collect::<Vec<_>>();
