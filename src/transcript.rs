@@ -298,7 +298,7 @@ impl TranscriptBlock {
     }
 }
 
-const PAGE: Color = Color::Rgb(24, 24, 30);
+const PAGE: Color = Color::Reset;
 const TEXT: Color = Color::Rgb(212, 212, 212);
 const MUTED: Color = Color::Rgb(128, 128, 128);
 const DIM: Color = Color::Rgb(102, 102, 102);
@@ -2759,6 +2759,11 @@ mod tests {
         TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
+
+    #[test]
+    fn page_uses_terminal_background() {
+        assert_eq!(page_style().bg, Some(Color::Reset));
+    }
 
     #[test]
     fn mutation_tool_labels_are_path_free() {
