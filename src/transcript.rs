@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -37,7 +39,14 @@ impl StyleSheet for MarkdownStyleSheet {
     }
 }
 
-fn markdown(source: &str) -> Text<'_> {
+fn markdown<'a>(
+    source: &'a str,
+    #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
+) -> Text<'a> {
+    #[cfg(test)]
+    if let Some(construction_counts) = construction_counts {
+        construction_counts.markdown += 1;
+    }
     let options = Options::new(MarkdownStyleSheet).image_fallback(ImageFallback::AltText);
     from_str_with_options(source, &options)
 }
@@ -490,8 +499,19 @@ fn accounting_line(text: String, style: Style) -> Line<'static> {
     Line::styled(text, style).alignment(Alignment::Right)
 }
 
-fn assistant_text(markdown_source: &str, accounting: Option<String>) -> Text<'static> {
-    let mut text = own_styled_text(markdown(markdown_source), page_style());
+fn assistant_text(
+    markdown_source: &str,
+    accounting: Option<String>,
+    #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
+) -> Text<'static> {
+    let mut text = own_styled_text(
+        markdown(
+            markdown_source,
+            #[cfg(test)]
+            construction_counts,
+        ),
+        page_style(),
+    );
     if let Some(accounting) = accounting {
         if !markdown_source.is_empty() {
             text.lines.push(Line::raw(""));
@@ -888,6 +908,7 @@ impl ArenaRenderBlock {
         expanded: bool,
         highlighter: &mut PythonHighlighter,
         width: u16,
+        #[cfg(test)] construction_counts: Option<&mut ConstructionCounts>,
     ) -> Self {
         let background = match arena.state {
             ArenaState::InProgress => IN_PROGRESS_ARENA,
@@ -923,6 +944,10 @@ impl ArenaRenderBlock {
 
         if let Some(source) = arena.source.filter(|source| !source.is_empty()) {
             let (preview, omitted) = code_preview(&source, expanded);
+            #[cfg(test)]
+            if let Some(construction_counts) = construction_counts {
+                construction_counts.highlighting += 1;
+            }
             let code = own_styled_text(highlighter.highlight(&preview), style);
             let title = omission_title("code", omitted);
             items.push(ArenaItem::Section(ArenaSection::new(
@@ -1104,11 +1129,11 @@ fn draw_rounded_frame(
 impl NormalisedBlock {
     fn paragraph(&self) -> Paragraph<'_> {
         let text = match self {
-            Self::Reasoning { markdown: source } => markdown(source),
+            Self::Reasoning { markdown: source } => markdown(source, None),
             Self::Assistant {
                 markdown: source,
                 accounting,
-            } => assistant_text(source, accounting.clone()),
+            } => assistant_text(source, accounting.clone(), None),
             _ => Text::raw(self.plain_text()),
         };
         Paragraph::new(text).wrap(Wrap { trim: false })
@@ -1400,8 +1425,106 @@ impl Footer {
     }
 }
 
+struct SettledBlock {
+    source: NormalisedBlock,
+    raster: Option<Arc<SettledRaster>>,
+}
+
+impl SettledBlock {
+    fn new(source: NormalisedBlock) -> Self {
+        Self {
+            source,
+            raster: None,
+        }
+    }
+
+    fn invalidates_for_reasoning(&self) -> bool {
+        matches!(self.source, NormalisedBlock::Reasoning { .. })
+    }
+
+    fn invalidates_for_arena(&self) -> bool {
+        matches!(self.source, NormalisedBlock::Arena(..))
+    }
+}
+
+struct SettledRaster {
+    buffer: Buffer,
+    height: usize,
+    regions: Vec<SelectableRegion>,
+}
+
+impl SettledRaster {
+    fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
+        assert_eq!(
+            viewport.width, self.buffer.area.width,
+            "cached raster width must match viewport width"
+        );
+        let Some(clip) = vertical_clip(block_top, self.height, top, viewport.height) else {
+            return;
+        };
+        for row in clip.top..clip.bottom {
+            let source_y = u16::try_from(row.saturating_sub(block_top)).unwrap_or(u16::MAX);
+            let target_y = viewport
+                .y
+                .saturating_add(u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX));
+            for x in 0..viewport.width {
+                buffer[(viewport.x.saturating_add(x), target_y)] =
+                    self.buffer[(x, source_y)].clone();
+            }
+        }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        block_top: usize,
+        card: CardId,
+    ) -> Vec<SelectableRegion> {
+        self.regions
+            .iter()
+            .filter_map(|region| region.rebase(viewport, top, block_top, card))
+            .collect()
+    }
+}
+
+enum LayoutBlock {
+    Cached(Arc<SettledRaster>),
+    Fresh(RenderBlock),
+}
+
+impl LayoutBlock {
+    fn height(&self) -> usize {
+        match self {
+            Self::Cached(raster) => raster.height,
+            Self::Fresh(block) => block.height(),
+        }
+    }
+
+    fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
+        match self {
+            Self::Cached(raster) => raster.render(viewport, top, block_top, buffer),
+            Self::Fresh(block) => block.render(viewport, top, block_top, buffer),
+        }
+    }
+
+    fn selectable_regions(
+        &self,
+        viewport: Rect,
+        top: usize,
+        block_top: usize,
+        card: CardId,
+        buffer: &Buffer,
+    ) -> Vec<SelectableRegion> {
+        match self {
+            Self::Cached(raster) => raster.selectable_regions(viewport, top, block_top, card),
+            Self::Fresh(block) => block.selectable_regions(viewport, top, block_top, card, buffer),
+        }
+    }
+}
+
 pub(crate) struct TranscriptLayout {
-    blocks: Vec<RenderBlock>,
+    blocks: Vec<LayoutBlock>,
     width: u16,
     total_height: usize,
     footer: Option<Footer>,
@@ -1524,9 +1647,20 @@ impl TranscriptLayout {
     }
 }
 
+#[cfg(test)]
 struct DisplayProjection {
     blocks: Vec<TranscriptBlock>,
-    footer: Option<Footer>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConstructionCounts {
+    normalisations: usize,
+    rasterisations: usize,
+    markdown: usize,
+    highlighting: usize,
+    render_block_builds: usize,
+    selection_region_builds: usize,
 }
 
 pub(crate) struct Transcript {
@@ -1539,10 +1673,13 @@ pub(crate) struct Transcript {
     pending_run_gap: bool,
     status: String,
     records: Vec<DisplayedRecord>,
+    settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
     show_reasoning: bool,
     expand_arenas: bool,
     highlighter: PythonHighlighter,
+    #[cfg(test)]
+    construction_counts: ConstructionCounts,
 }
 
 impl Default for Transcript {
@@ -1557,20 +1694,26 @@ impl Default for Transcript {
             pending_run_gap: false,
             status: "idle".to_owned(),
             records: Vec::new(),
+            settled_blocks: Vec::new(),
             live_step: None,
             show_reasoning: true,
             expand_arenas: false,
             highlighter: PythonHighlighter::new(),
+            #[cfg(test)]
+            construction_counts: ConstructionCounts::default(),
         }
     }
 }
 
 impl Transcript {
     pub(crate) fn configured(startup: StartupSnapshot) -> Self {
-        Self {
+        let mut transcript = Self {
             startup: Some(startup),
             ..Self::default()
-        }
+        };
+        let block = startup_block(transcript.startup.as_ref().expect("startup was set"));
+        transcript.append_settled_blocks([block]);
+        transcript
     }
 
     pub(crate) fn begin_submission(&mut self) -> bool {
@@ -1788,94 +1931,123 @@ impl Transcript {
 
     pub(crate) fn toggle_reasoning(&mut self) -> bool {
         self.show_reasoning = !self.show_reasoning;
-        self.blocks()
+        let visible = self
+            .settled_blocks
             .iter()
-            .any(|block| matches!(block, TranscriptBlock::Reasoning { .. }))
+            .any(SettledBlock::invalidates_for_reasoning)
+            || self
+                .live_step
+                .as_ref()
+                .is_some_and(|live| !live.reasoning.is_empty());
+        if visible {
+            for block in &mut self.settled_blocks {
+                if block.invalidates_for_reasoning() {
+                    block.raster = None;
+                }
+            }
+        }
+        visible
     }
 
     pub(crate) fn toggle_arena_expansion(&mut self) -> bool {
         self.expand_arenas = !self.expand_arenas;
-        self.blocks()
+        let visible = self
+            .settled_blocks
             .iter()
-            .any(|block| matches!(block, TranscriptBlock::Arena(..)))
+            .any(SettledBlock::invalidates_for_arena)
+            || self.live_step.as_ref().is_some_and(|live| {
+                live.phase == LivePhase::Executing
+                    || !live.decoded_python.is_empty()
+                    || !live.stdout.is_empty()
+                    || live.stdout_truncated
+            });
+        if visible {
+            for block in &mut self.settled_blocks {
+                if block.invalidates_for_arena() {
+                    block.raster = None;
+                }
+            }
+        }
+        visible
     }
 
     pub(crate) fn layout(&mut self, width: u16) -> TranscriptLayout {
-        let DisplayProjection {
-            blocks: projected_blocks,
-            footer,
-        } = self.projection();
-        let mut blocks = Vec::new();
-        for block in projected_blocks.into_iter().map(TranscriptBlock::normalise) {
-            let render_block = match block {
-                NormalisedBlock::Startup { lines } | NormalisedBlock::Metadata { lines } => {
-                    RenderBlock::card(
-                        own_styled_text(Text::raw(lines.join("\n")), page_style()),
-                        page_style(),
-                        width,
-                        0,
-                        0,
-                    )
+        self.layout_with_cache(width, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_fresh(&mut self, width: u16) -> TranscriptLayout {
+        self.layout_with_cache(width, false)
+    }
+
+    fn layout_with_cache(&mut self, width: u16, use_cache: bool) -> TranscriptLayout {
+        let show_reasoning = self.show_reasoning;
+        let expand_arenas = self.expand_arenas;
+        let footer = self.footer();
+        let live_sources = self
+            .live_step
+            .as_ref()
+            .map(live_blocks)
+            .unwrap_or_default()
+            .into_iter()
+            .map(TranscriptBlock::normalise)
+            .collect::<Vec<_>>();
+        let highlighter = &mut self.highlighter;
+        #[cfg(test)]
+        let mut construction_counts = use_cache.then_some(&mut self.construction_counts);
+        let mut blocks = Vec::with_capacity(self.settled_blocks.len() + live_sources.len());
+        for settled in &mut self.settled_blocks {
+            if use_cache
+                && let Some(raster) = settled
+                    .raster
+                    .as_ref()
+                    .filter(|raster| raster.buffer.area.width == width)
+            {
+                blocks.push(LayoutBlock::Cached(Arc::clone(raster)));
+                continue;
+            }
+            if use_cache {
+                settled.raster = None;
+            }
+            let render_block = build_render_block(
+                &settled.source,
+                show_reasoning,
+                expand_arenas,
+                width,
+                highlighter,
+                #[cfg(test)]
+                construction_counts.as_deref_mut(),
+            );
+            let block = if use_cache {
+                match rasterise(
+                    render_block,
+                    width,
+                    #[cfg(test)]
+                    construction_counts
+                        .as_deref_mut()
+                        .expect("cached layout records construction"),
+                ) {
+                    Ok(raster) => {
+                        settled.raster = Some(Arc::clone(&raster));
+                        LayoutBlock::Cached(raster)
+                    }
+                    Err(render_block) => LayoutBlock::Fresh(render_block),
                 }
-                NormalisedBlock::User { request } => {
-                    let style = card_style(USER);
-                    RenderBlock::card(
-                        own_styled_text(Text::raw(request), style),
-                        style,
-                        width,
-                        1,
-                        1,
-                    )
-                }
-                NormalisedBlock::Reasoning { markdown: source } => {
-                    let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
-                    let text = if self.show_reasoning {
-                        own_styled_text(markdown(&source), style)
-                    } else {
-                        own_styled_text(
-                            Text::raw("reasoning hidden · Ctrl-T to show"),
-                            dim_card_style(REASONING).add_modifier(Modifier::ITALIC),
-                        )
-                    };
-                    RenderBlock::card(text, style, width, 2, 1)
-                }
-                NormalisedBlock::Arena(arena) => RenderBlock::Arena(ArenaRenderBlock::new(
-                    arena,
-                    self.expand_arenas,
-                    &mut self.highlighter,
-                    width,
-                )),
-                NormalisedBlock::Assistant {
-                    markdown: source,
-                    accounting,
-                } => RenderBlock::card(
-                    assistant_text(&source, accounting),
-                    page_style(),
-                    width,
-                    0,
-                    1,
-                ),
-                NormalisedBlock::Status { text } => RenderBlock::card(
-                    own_styled_text(Text::raw(text), page_style()),
-                    page_style(),
-                    width,
-                    0,
-                    0,
-                ),
-                NormalisedBlock::Accounting { text } => RenderBlock::card(
-                    Text {
-                        alignment: None,
-                        style: page_style(),
-                        lines: vec![Line::raw(""), accounting_line(text, muted_page_style())],
-                    },
-                    page_style(),
-                    width,
-                    0,
-                    0,
-                )
-                .skip_leading_selection_lines(1),
+            } else {
+                LayoutBlock::Fresh(render_block)
             };
-            blocks.push(render_block);
+            blocks.push(block);
+        }
+        for source in &live_sources {
+            blocks.push(LayoutBlock::Fresh(build_render_block(
+                source,
+                show_reasoning,
+                expand_arenas,
+                width,
+                highlighter,
+                #[cfg(test)]
+                None,
+            )));
         }
         let total_height = blocks.iter().fold(0_usize, |height, block| {
             height.saturating_add(block.height())
@@ -1888,10 +2060,17 @@ impl Transcript {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn construction_counts(&self) -> ConstructionCounts {
+        self.construction_counts
+    }
+
+    #[cfg(test)]
     fn blocks(&self) -> Vec<TranscriptBlock> {
         self.projection().blocks
     }
 
+    #[cfg(test)]
     fn projection(&self) -> DisplayProjection {
         let mut blocks = self
             .startup
@@ -1899,18 +2078,34 @@ impl Transcript {
             .map(startup_block)
             .into_iter()
             .collect::<Vec<_>>();
-        let mut attempts = Vec::new();
         for displayed in &self.records {
             blocks.extend(record_blocks(displayed));
-            append_record_attempts(&displayed.record.record, &mut attempts);
         }
         if let Some(live) = &self.live_step {
             blocks.extend(live_blocks(live));
+        }
+        DisplayProjection { blocks }
+    }
+
+    fn footer(&self) -> Option<Footer> {
+        let mut attempts = Vec::new();
+        for displayed in &self.records {
+            append_record_attempts(&displayed.record.record, &mut attempts);
+        }
+        if let Some(live) = &self.live_step {
             attempts.extend(&live.settled_attempts);
         }
-        DisplayProjection {
-            blocks,
-            footer: session_footer(&attempts),
+        session_footer(&attempts)
+    }
+
+    fn append_settled_blocks(&mut self, blocks: impl IntoIterator<Item = TranscriptBlock>) {
+        for block in blocks {
+            #[cfg(test)]
+            {
+                self.construction_counts.normalisations += 1;
+            }
+            self.settled_blocks
+                .push(SettledBlock::new(block.normalise()));
         }
     }
 
@@ -2061,11 +2256,14 @@ impl Transcript {
             }
             Record::UserRequest { .. } => {}
         }
-        self.records.push(DisplayedRecord {
+        let displayed = DisplayedRecord {
             record,
             run_previews,
             progress_gap,
-        });
+        };
+        let blocks = record_blocks(&displayed);
+        self.records.push(displayed);
+        self.append_settled_blocks(blocks);
         true
     }
 
@@ -2120,6 +2318,130 @@ impl Transcript {
             true
         }
     }
+}
+
+fn build_render_block(
+    source: &NormalisedBlock,
+    show_reasoning: bool,
+    expand_arenas: bool,
+    width: u16,
+    highlighter: &mut PythonHighlighter,
+    #[cfg(test)] mut construction_counts: Option<&mut ConstructionCounts>,
+) -> RenderBlock {
+    #[cfg(test)]
+    if let Some(construction_counts) = construction_counts.as_deref_mut() {
+        construction_counts.render_block_builds += 1;
+    }
+
+    match source {
+        NormalisedBlock::Startup { lines } | NormalisedBlock::Metadata { lines } => {
+            RenderBlock::card(
+                own_styled_text(Text::raw(lines.join("\n")), page_style()),
+                page_style(),
+                width,
+                0,
+                0,
+            )
+        }
+        NormalisedBlock::User { request } => {
+            let style = card_style(USER);
+            RenderBlock::card(
+                own_styled_text(Text::raw(request.as_str()), style),
+                style,
+                width,
+                1,
+                1,
+            )
+        }
+        NormalisedBlock::Reasoning { markdown: source } => {
+            let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
+            let text = if show_reasoning {
+                own_styled_text(
+                    markdown(
+                        source,
+                        #[cfg(test)]
+                        construction_counts,
+                    ),
+                    style,
+                )
+            } else {
+                own_styled_text(
+                    Text::raw("reasoning hidden · Ctrl-T to show"),
+                    dim_card_style(REASONING).add_modifier(Modifier::ITALIC),
+                )
+            };
+            RenderBlock::card(text, style, width, 2, 1)
+        }
+        NormalisedBlock::Arena(arena) => RenderBlock::Arena(ArenaRenderBlock::new(
+            arena.clone(),
+            expand_arenas,
+            highlighter,
+            width,
+            #[cfg(test)]
+            construction_counts,
+        )),
+        NormalisedBlock::Assistant {
+            markdown: source,
+            accounting,
+        } => RenderBlock::card(
+            assistant_text(
+                source,
+                accounting.clone(),
+                #[cfg(test)]
+                construction_counts,
+            ),
+            page_style(),
+            width,
+            0,
+            1,
+        ),
+        NormalisedBlock::Status { text } => RenderBlock::card(
+            own_styled_text(Text::raw(text.as_str()), page_style()),
+            page_style(),
+            width,
+            0,
+            0,
+        ),
+        NormalisedBlock::Accounting { text } => RenderBlock::card(
+            Text {
+                alignment: None,
+                style: page_style(),
+                lines: vec![
+                    Line::raw(""),
+                    accounting_line(text.clone(), muted_page_style()),
+                ],
+            },
+            page_style(),
+            width,
+            0,
+            0,
+        )
+        .skip_leading_selection_lines(1),
+    }
+}
+
+fn rasterise(
+    block: RenderBlock,
+    width: u16,
+    #[cfg(test)] construction_counts: &mut ConstructionCounts,
+) -> Result<Arc<SettledRaster>, RenderBlock> {
+    let Ok(height) = u16::try_from(block.height()) else {
+        return Err(block);
+    };
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    block.render(area, 0, 0, &mut buffer);
+    #[cfg(test)]
+    {
+        construction_counts.rasterisations += 1;
+        construction_counts.selection_region_builds += 1;
+    }
+    let regions = block.selectable_regions(area, 0, 0, CardId::new(0), &buffer);
+    Ok(Arc::new(SettledRaster {
+        buffer,
+        height: usize::from(height),
+        regions,
+    }))
 }
 
 fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
@@ -2741,10 +3063,10 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, IN_PROGRESS_ARENA, MUTED,
-        NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER,
-        assistant_text, markdown, muted_page_style, normalise_terminal_text, own_styled_text,
-        page_style, tool_call_label,
+        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, IN_PROGRESS_ARENA,
+        LayoutBlock, MUTED, NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock,
+        TranscriptLayout, USER, assistant_text, markdown, muted_page_style,
+        normalise_terminal_text, own_styled_text, page_style, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -2810,25 +3132,25 @@ mod tests {
 
     #[test]
     fn markdown_compatibility() {
-        let heading = markdown("# Heading");
+        let heading = markdown("# Heading", None);
         assert_eq!(heading.to_string(), "# Heading");
         assert_eq!(heading.lines[0].style, Style::new().bold());
 
-        let table = markdown("| Name | State |\n| --- | --- |\n| Kiki | ready |").to_string();
+        let table = markdown("| Name | State |\n| --- | --- |\n| Kiki | ready |", None).to_string();
         assert!(table.contains("┌"));
         assert!(table.contains("Name"));
         assert!(table.contains("ready"));
 
-        let tasks = markdown("- [ ] pending\n- [x] complete").to_string();
+        let tasks = markdown("- [ ] pending\n- [x] complete", None).to_string();
         assert!(tasks.contains("- [ ] pending"));
         assert!(tasks.contains("- [x] complete"));
 
         assert_eq!(
-            markdown("[guide](https://example.com)").to_string(),
+            markdown("[guide](https://example.com)", None).to_string(),
             "guide (https://example.com)"
         );
-        assert_eq!(markdown("> quoted").to_string(), "> quoted");
-        let strikethrough = markdown("~~obsolete~~");
+        assert_eq!(markdown("> quoted", None).to_string(), "> quoted");
+        let strikethrough = markdown("~~obsolete~~", None);
         assert_eq!(strikethrough.to_string(), "obsolete");
         assert!(
             strikethrough.lines[0].spans[0]
@@ -2837,20 +3159,20 @@ mod tests {
                 .contains(Modifier::CROSSED_OUT)
         );
 
-        let fenced = markdown("```rust\nlet value = 1;\n```");
+        let fenced = markdown("```rust\nlet value = 1;\n```", None);
         assert_eq!(fenced.to_string(), "```rust\nlet value = 1;\n```");
         assert_eq!(fenced.lines[1].style, Style::new().white().on_black());
 
-        let html = markdown("inline <em>HTML</em>\n\n<div>\nblock HTML\n</div>").to_string();
+        let html = markdown("inline <em>HTML</em>\n\n<div>\nblock HTML\n</div>", None).to_string();
         for literal in ["<em>", "</em>", "<div>", "block HTML", "</div>"] {
             assert!(html.contains(literal));
         }
 
-        let images = markdown("![diagram](diagram.png)\n\n![](empty.png)").to_string();
+        let images = markdown("![diagram](diagram.png)\n\n![](empty.png)", None).to_string();
         assert!(images.contains("[img] diagram"));
         assert!(images.contains("[img] empty.png"));
 
-        let styled_link = markdown("[guide](https://example.com)");
+        let styled_link = markdown("[guide](https://example.com)", None);
         let link = styled_link.lines[0]
             .spans
             .iter()
@@ -2860,27 +3182,27 @@ mod tests {
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
 
         assert_eq!(
-            markdown("unfinished **emphasis").to_string(),
+            markdown("unfinished **emphasis", None).to_string(),
             "unfinished **emphasis"
         );
         assert!(
-            markdown("```rust\nlet value = 1;")
+            markdown("```rust\nlet value = 1;", None)
                 .to_string()
                 .contains("let value = 1;")
         );
-        assert!(!markdown("| header |\n| --- |").lines.is_empty());
+        assert!(!markdown("| header |\n| --- |", None).lines.is_empty());
 
         let source = "# Café 日本 🦀\n\n- [x] **résumé**\n\n[link](https://example.com/🦀)\n\n```text\nolé 世界\n```";
-        let complete = markdown(source).to_string();
+        let complete = markdown(source, None).to_string();
         let mut final_prefix = None;
         for end in 0..=source.len() {
             if source.is_char_boundary(end) {
-                final_prefix = Some(markdown(&source[..end]).to_string());
+                final_prefix = Some(markdown(&source[..end], None).to_string());
             }
         }
         assert_eq!(final_prefix, Some(complete));
 
-        let paragraph = Paragraph::new(markdown("café 日本 🦀 wraps across terminal rows"))
+        let paragraph = Paragraph::new(markdown("café 日本 🦀 wraps across terminal rows", None))
             .wrap(Wrap { trim: false });
         let width = 8;
         let measured_rows = paragraph.line_count(width);
@@ -2900,11 +3222,13 @@ mod tests {
             .into_iter()
             .map(TranscriptBlock::normalise)
             .map(|block| match &block {
-                NormalisedBlock::Reasoning { markdown: source } => markdown(source).to_string(),
+                NormalisedBlock::Reasoning { markdown: source } => {
+                    markdown(source, None).to_string()
+                }
                 NormalisedBlock::Assistant {
                     markdown: source,
                     accounting,
-                } => assistant_text(source, accounting.clone()).to_string(),
+                } => assistant_text(source, accounting.clone(), None).to_string(),
                 block => block.plain_text(),
             })
             .collect::<Vec<_>>()
@@ -2942,14 +3266,58 @@ mod tests {
         })
     }
 
-    fn card(block: &RenderBlock) -> Option<&CardRenderBlock> {
-        let RenderBlock::Card(card) = block else {
+    fn layout_buffer(
+        layout: &TranscriptLayout,
+        viewport: Rect,
+        top: usize,
+        selection: Option<Selection>,
+    ) -> Buffer {
+        let mut buffer = Buffer::empty(viewport);
+        if let Some(selection) = selection {
+            layout.render_with_selection(viewport, top, Some(selection), &mut buffer);
+        } else {
+            layout.render(viewport, top, &mut buffer);
+        }
+        buffer
+    }
+
+    fn assert_cached_layout_matches_fresh(transcript: &mut Transcript, width: u16) {
+        let cached = transcript.layout(width);
+        let fresh = transcript.layout_fresh(width);
+        assert_eq!(cached.total_height(), fresh.total_height());
+        assert_eq!(footer_text(&cached), footer_text(&fresh));
+        assert_eq!(cached.footer_rule(width), fresh.footer_rule(width));
+
+        let selection = Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(cached.total_height(), 0),
+        );
+        let height = u16::try_from(cached.total_height()).expect("test transcript height");
+        for (top, viewport_height) in [(0, height), (1, height.min(6))] {
+            let viewport = Rect::new(3, 2, width, viewport_height);
+            assert_eq!(
+                layout_buffer(&cached, viewport, top, None),
+                layout_buffer(&fresh, viewport, top, None)
+            );
+            assert_eq!(
+                layout_buffer(&cached, viewport, top, Some(selection)),
+                layout_buffer(&fresh, viewport, top, Some(selection))
+            );
+        }
+        assert_eq!(
+            cached.extract_selection(selection),
+            fresh.extract_selection(selection)
+        );
+    }
+
+    fn card(block: &LayoutBlock) -> Option<&CardRenderBlock> {
+        let LayoutBlock::Fresh(RenderBlock::Card(card)) = block else {
             return None;
         };
         Some(card)
     }
 
-    fn card_with_text<'a>(blocks: &'a [RenderBlock], text: &str) -> &'a CardRenderBlock {
+    fn card_with_text<'a>(blocks: &'a [LayoutBlock], text: &str) -> &'a CardRenderBlock {
         blocks
             .iter()
             .filter_map(card)
@@ -3202,6 +3570,362 @@ mod tests {
             },
             progress_gap,
         }
+    }
+
+    fn cached_transcript() -> Transcript {
+        let source = (1..=34)
+            .map(|line| format!("print('line {line:02}: 日本 🦀 e\u{301}')"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "cached request: Café 日本 🦀 e\u{301}".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                &source,
+                "## Cached reasoning 日本 🦀 e\u{301}\n\n- [x] **Markdown**\n\n[guide](https://example.com/🦀)",
+                Vec::new(),
+            ),
+            false,
+        );
+        transcript.apply(
+            final_message(
+                1,
+                2,
+                "# Cached answer\n\n| Word | State |\n| --- | --- |\n| Café 日本 🦀 e\u{301} | **ready** |",
+                vec![usage(1, 1)],
+                false,
+            ),
+            false,
+        );
+        transcript
+    }
+
+    #[test]
+    fn settled_layout_reuses_all_construction_work_at_an_unchanged_width() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "def cached():\n    return 42", "# Cached", Vec::new()),
+            false,
+        );
+
+        transcript.layout(40);
+        let first = transcript.construction_counts();
+        assert!(first.rasterisations > 0);
+        assert!(first.markdown > 0);
+        assert!(first.highlighting > 0);
+        assert!(first.render_block_builds > 0);
+        assert!(first.selection_region_builds > 0);
+
+        transcript.layout(40);
+
+        assert_eq!(transcript.construction_counts(), first);
+    }
+
+    #[test]
+    fn cached_layout_matches_fresh_across_rendering_states() {
+        let mut transcript = cached_transcript();
+        for width in [1, 2, 3, 4, 80] {
+            assert_cached_layout_matches_fresh(&mut transcript, width);
+        }
+
+        assert!(transcript.toggle_reasoning());
+        assert_cached_layout_matches_fresh(&mut transcript, 80);
+        assert!(transcript.toggle_arena_expansion());
+        assert_cached_layout_matches_fresh(&mut transcript, 80);
+        assert!(transcript.toggle_reasoning());
+        assert_cached_layout_matches_fresh(&mut transcript, 80);
+
+        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::ReasoningSummaryChunk {
+                    text: "## Live reasoning 日本 🦀 e\u{301}".to_owned(),
+                },
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "**Live Markdown** 日本 🦀 e\u{301}".to_owned(),
+                },
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: usage(2, 3),
+                },
+            },
+            false,
+        ));
+        assert_cached_layout_matches_fresh(&mut transcript, 80);
+
+        assert!(transcript.apply(
+            final_message(
+                2,
+                1,
+                "## Settled Markdown 日本 🦀 e\u{301}",
+                vec![usage(2, 3)],
+                false,
+            ),
+            false,
+        ));
+        assert_cached_layout_matches_fresh(&mut transcript, 80);
+    }
+
+    #[test]
+    #[should_panic(expected = "cached raster width must match viewport width")]
+    fn cached_raster_rejects_a_different_viewport_width() {
+        let mut transcript = cached_transcript();
+        let layout = transcript.layout(24);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 25, 1));
+
+        layout.render(buffer.area, 0, &mut buffer);
+    }
+
+    #[test]
+    fn settled_cache_appends_and_invalidates_only_affected_rasters() {
+        let mut transcript = cached_transcript();
+        transcript.layout(24);
+        let initial = transcript.construction_counts();
+        assert_eq!(initial.normalisations, 4);
+        assert_eq!(initial.rasterisations, 4);
+        assert_eq!(initial.markdown, 2);
+
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "new request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript.layout(24);
+        let appended = transcript.construction_counts();
+        assert_eq!(appended.normalisations, initial.normalisations + 1);
+        assert_eq!(appended.rasterisations, initial.rasterisations + 1);
+        assert_eq!(appended.markdown, initial.markdown);
+        assert_eq!(appended.highlighting, initial.highlighting);
+        assert_eq!(
+            appended.render_block_builds,
+            initial.render_block_builds + 1
+        );
+        assert_eq!(
+            appended.selection_region_builds,
+            initial.selection_region_builds + 1
+        );
+
+        assert!(transcript.toggle_reasoning());
+        transcript.layout(24);
+        let reasoning = transcript.construction_counts();
+        assert_eq!(reasoning.rasterisations, appended.rasterisations + 1);
+        assert_eq!(reasoning.markdown, appended.markdown);
+        assert_eq!(reasoning.highlighting, appended.highlighting);
+
+        assert!(transcript.toggle_arena_expansion());
+        transcript.layout(24);
+        let arena = transcript.construction_counts();
+        assert_eq!(arena.rasterisations, reasoning.rasterisations + 1);
+        assert_eq!(arena.markdown, reasoning.markdown);
+        assert_eq!(arena.highlighting, reasoning.highlighting + 1);
+
+        transcript.layout(48);
+        let width = transcript.construction_counts();
+        let block_count = transcript.settled_blocks.len();
+        assert_eq!(width.rasterisations, arena.rasterisations + block_count);
+        assert_eq!(width.markdown, arena.markdown + 1);
+        assert_eq!(width.highlighting, arena.highlighting + 1);
+        assert_eq!(
+            width.render_block_builds,
+            arena.render_block_builds + block_count
+        );
+        assert_eq!(
+            width.selection_region_builds,
+            arena.selection_region_builds + block_count
+        );
+        assert!(transcript.toggle_reasoning());
+        transcript.layout(48);
+        let shown_reasoning = transcript.construction_counts();
+        assert_eq!(shown_reasoning.markdown, width.markdown + 1);
+        assert!(transcript.settled_blocks.iter().all(|block| {
+            block
+                .raster
+                .as_ref()
+                .is_some_and(|raster| raster.buffer.area.width == 48)
+        }));
+
+        for width in [17, 48, 17, 48] {
+            transcript.layout(width);
+            assert!(transcript.settled_blocks.iter().all(|block| {
+                block
+                    .raster
+                    .as_ref()
+                    .is_some_and(|raster| raster.buffer.area.width == width)
+            }));
+        }
+    }
+
+    #[test]
+    fn live_progress_and_settlement_preserve_settled_rasters_and_footer() {
+        let mut transcript = cached_transcript();
+        let initial_layout = transcript.layout(24);
+        let initial_footer = footer_text(&initial_layout);
+        let initial_counts = transcript.construction_counts();
+
+        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: usage(3, 2),
+                },
+            },
+            false,
+        ));
+        let live_layout = transcript.layout(24);
+        assert_eq!(transcript.construction_counts(), initial_counts);
+        assert_ne!(footer_text(&live_layout), initial_footer);
+        assert!(
+            footer_text(&live_layout)
+                .expect("live footer")
+                .contains("↑4 ↓3 R0 W0 r0 Σ7")
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "live assistant".to_owned(),
+                },
+            },
+            false,
+        ));
+        transcript.layout(24);
+        assert_eq!(transcript.construction_counts(), initial_counts);
+
+        assert!(transcript.apply(
+            completed_execution(2, 1, "settled()", "", vec![usage(3, 2)]),
+            false,
+        ));
+        assert!(transcript.live_step.is_none());
+        let settled_layout = transcript.layout(24);
+        let settled_counts = transcript.construction_counts();
+        assert_eq!(
+            settled_counts.rasterisations,
+            initial_counts.rasterisations + 1
+        );
+        assert_eq!(settled_counts.highlighting, initial_counts.highlighting + 1);
+        assert_eq!(footer_text(&settled_layout), footer_text(&live_layout));
+        let area = Rect::new(
+            0,
+            0,
+            24,
+            u16::try_from(settled_layout.total_height()).expect("test transcript height"),
+        );
+        let text = layout_buffer(&settled_layout, area, 0, None)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("settled()"));
+        assert!(!text.contains("live assistant"));
+
+        assert!(!transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(2),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "stale".to_owned(),
+                },
+            },
+            false,
+        ));
+        transcript.layout(24);
+        assert_eq!(transcript.construction_counts(), settled_counts);
+    }
+
+    #[test]
+    fn over_u16_settled_blocks_keep_the_uncached_renderer() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "x".repeat(usize::from(u16::MAX) + 1),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let cached = transcript.layout(1);
+        let first = transcript.construction_counts();
+        let fresh = transcript.layout_fresh(1);
+        assert_eq!(transcript.construction_counts(), first);
+        assert!(cached.total_height() > usize::from(u16::MAX));
+        assert_eq!(first.rasterisations, 0);
+        assert_eq!(first.selection_region_builds, 0);
+        assert!(transcript.settled_blocks[0].raster.is_none());
+        let viewport = Rect::new(0, 0, 1, 1);
+        assert_eq!(
+            layout_buffer(&cached, viewport, 1, None),
+            layout_buffer(&fresh, viewport, 1, None)
+        );
+
+        transcript.layout(1);
+        let rebuilt = transcript.construction_counts();
+        assert_eq!(rebuilt.rasterisations, 0);
+        assert_eq!(rebuilt.selection_region_builds, 0);
+        assert_eq!(rebuilt.render_block_builds, first.render_block_builds + 1);
+    }
+
+    #[test]
+    fn fresh_layout_bypass_retains_settled_rasters() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "def cached():\n    return 42", "# Cached", Vec::new()),
+            false,
+        );
+
+        transcript.layout(40);
+        let first = transcript.construction_counts();
+        transcript.layout_fresh(40);
+        assert_eq!(transcript.construction_counts(), first);
+
+        transcript.layout(40);
+
+        assert_eq!(transcript.construction_counts(), first);
     }
 
     #[test]
@@ -4712,7 +5436,7 @@ truncated"
             false,
         );
 
-        let layout = transcript.layout(80);
+        let layout = transcript.layout_fresh(80);
         let assistant = card_with_text(&layout.blocks, "Settled heading");
         assert!(
             assistant.text.lines[0]
@@ -4824,7 +5548,7 @@ truncated"
             completed_execution(1, 1, "print('settled')", "# Settled reasoning", Vec::new()),
             false,
         );
-        let settled_layout = transcript.layout(80);
+        let settled_layout = transcript.layout_fresh(80);
         let settled_reasoning = card_with_text(&settled_layout.blocks, "Settled reasoning");
         assert!(
             settled_reasoning.text.lines[0]
@@ -5423,7 +6147,7 @@ truncated"
         let layout = TranscriptLayout {
             total_height: blocks.iter().map(RenderBlock::height).sum(),
             width: 20,
-            blocks,
+            blocks: blocks.into_iter().map(LayoutBlock::Fresh).collect(),
             footer: None,
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
@@ -7322,7 +8046,7 @@ truncated"
         );
 
         for width in 1..=4 {
-            let layout = transcript.layout(width);
+            let layout = transcript.layout_fresh(width);
             assert!(
                 layout
                     .blocks
@@ -7550,7 +8274,7 @@ truncated"
             TranscriptBlock::User { request },
             TranscriptBlock::Metadata { .. },
         ] if request == "request"));
-        let layout = transcript.layout(40);
+        let layout = transcript.layout_fresh(40);
         let user = card_with_text(&layout.blocks, "request");
         assert_eq!(user.height, 3);
     }
@@ -7579,7 +8303,7 @@ truncated"
             false,
         );
 
-        let layout = transcript.layout(64);
+        let layout = transcript.layout_fresh(64);
         let reasoning = card_with_text(&layout.blocks, "reasoning");
         assert_eq!((reasoning.left_padding, reasoning.right_padding), (2, 2));
         assert_eq!((reasoning.top_padding, reasoning.bottom_padding), (1, 1));

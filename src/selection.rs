@@ -228,6 +228,32 @@ impl SelectableRegion {
             card,
         }
     }
+
+    pub(crate) fn rebase(
+        &self,
+        viewport: Rect,
+        scroll_top: usize,
+        block_top: usize,
+        card: CardId,
+    ) -> Option<Self> {
+        let region_top = block_top.saturating_add(usize::from(self.area.y));
+        let region_bottom = region_top.saturating_add(usize::from(self.area.height));
+        let top = region_top.max(scroll_top);
+        let bottom = region_bottom.min(scroll_top.saturating_add(usize::from(viewport.height)));
+        (top < bottom).then(|| Self {
+            area: Rect::new(
+                viewport.x.saturating_add(self.area.x),
+                viewport.y.saturating_add(
+                    u16::try_from(top.saturating_sub(scroll_top)).unwrap_or(u16::MAX),
+                ),
+                self.area.width,
+                u16::try_from(bottom.saturating_sub(top)).unwrap_or(u16::MAX),
+            ),
+            document_top: block_top.saturating_add(self.document_top),
+            breaks: self.breaks.clone(),
+            card,
+        })
+    }
 }
 
 pub(crate) fn highlight(

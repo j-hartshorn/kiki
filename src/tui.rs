@@ -1365,6 +1365,32 @@ mod tests {
         app
     }
 
+    #[test]
+    fn history_render_reuses_settled_rasters_across_prompt_scroll_and_live_updates() {
+        let mut app = app_with_history(App::default());
+        rendered_buffer(&mut app, 40, 8);
+        let initial = app.transcript.construction_counts();
+
+        type_prompt(&mut app, "x");
+        rendered_buffer(&mut app, 40, 8);
+        assert_eq!(app.transcript.construction_counts(), initial);
+
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        rendered_buffer(&mut app, 40, 8);
+        assert_eq!(app.transcript.construction_counts(), initial);
+
+        assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(9) }));
+        assert!(app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(9),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "live update".to_owned(),
+            },
+        }));
+        rendered_buffer(&mut app, 40, 8);
+        assert_eq!(app.transcript.construction_counts(), initial);
+    }
+
     fn mouse(kind: MouseEventKind) -> Event {
         mouse_at(kind, 0, 0)
     }
