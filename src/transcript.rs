@@ -1914,6 +1914,7 @@ impl Transcript {
                 progress_gap,
             } => self.append_record(record, progress_gap),
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
+            RuntimeEvent::SettingsAccepted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.disabled_reason.is_none()
                     && (self.run_state == RunState::Submitting
@@ -3085,6 +3086,14 @@ mod tests {
     #[test]
     fn page_uses_terminal_background() {
         assert_eq!(page_style().bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn settings_acknowledgements_do_not_change_display_history() {
+        let mut transcript = Transcript::default();
+
+        assert!(!transcript.apply(RuntimeEvent::SettingsAccepted { revision: 1 }, false));
+        assert!(transcript.blocks().is_empty());
     }
 
     #[test]

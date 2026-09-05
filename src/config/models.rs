@@ -36,6 +36,28 @@ pub struct ModelConfiguration {
     pub pricing: ModelPricing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSelection {
+    model: &'static ModelConfiguration,
+    thinking: &'static str,
+}
+
+impl ModelSelection {
+    pub fn new(model: &'static ModelConfiguration, thinking: &'static str) -> Option<Self> {
+        model
+            .supports_thinking(thinking)
+            .then_some(Self { model, thinking })
+    }
+
+    pub fn model(self) -> &'static ModelConfiguration {
+        self.model
+    }
+
+    pub fn thinking(self) -> &'static str {
+        self.thinking
+    }
+}
+
 pub static OPENAI_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
 pub static SOL: ModelConfiguration = ModelConfiguration {
@@ -155,7 +177,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        CATALOGUE, DEFAULT_MODEL, LUNA, OPENAI_THINKING_LEVELS, Rates, SOL, TERRA, model_by_id,
+        CATALOGUE, DEFAULT_MODEL, LUNA, ModelSelection, OPENAI_THINKING_LEVELS, Rates, SOL, TERRA,
+        model_by_id,
     };
 
     #[test]
@@ -263,6 +286,15 @@ mod tests {
             assert_eq!(model.pricing.short_context, short_context);
             assert_eq!(model.pricing.long_context, long_context);
         }
+    }
+
+    #[test]
+    fn selection_keeps_a_model_and_its_supported_thinking_together() {
+        let selection = ModelSelection::new(&TERRA, "high").expect("supported selection");
+
+        assert!(std::ptr::eq(selection.model(), &TERRA));
+        assert_eq!(selection.thinking(), "high");
+        assert_eq!(ModelSelection::new(&TERRA, "unsupported"), None);
     }
 
     #[test]

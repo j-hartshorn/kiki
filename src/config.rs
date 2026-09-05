@@ -11,7 +11,8 @@ pub mod models;
 pub(crate) mod settings;
 
 pub use models::{
-    DEFAULT_MODEL, ModelConfiguration, ModelPricing, PricingIdentity, Rates, model_by_id,
+    DEFAULT_MODEL, ModelConfiguration, ModelPricing, ModelSelection, PricingIdentity, Rates,
+    model_by_id,
 };
 
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
