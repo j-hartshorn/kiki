@@ -1449,17 +1449,20 @@ impl SettledBlock {
 
 struct SettledRaster {
     buffer: Buffer,
-    height: usize,
     regions: Vec<SelectableRegion>,
 }
 
 impl SettledRaster {
+    fn height(&self) -> usize {
+        usize::from(self.buffer.area.height)
+    }
+
     fn render(&self, viewport: Rect, top: usize, block_top: usize, buffer: &mut Buffer) {
         assert_eq!(
             viewport.width, self.buffer.area.width,
             "cached raster width must match viewport width"
         );
-        let Some(clip) = vertical_clip(block_top, self.height, top, viewport.height) else {
+        let Some(clip) = vertical_clip(block_top, self.height(), top, viewport.height) else {
             return;
         };
         for row in clip.top..clip.bottom {
@@ -1496,7 +1499,7 @@ enum LayoutBlock {
 impl LayoutBlock {
     fn height(&self) -> usize {
         match self {
-            Self::Cached(raster) => raster.height,
+            Self::Cached(raster) => raster.height(),
             Self::Fresh(block) => block.height(),
         }
     }
@@ -2437,11 +2440,7 @@ fn rasterise(
         construction_counts.selection_region_builds += 1;
     }
     let regions = block.selectable_regions(area, 0, 0, CardId::new(0), &buffer);
-    Ok(Arc::new(SettledRaster {
-        buffer,
-        height: usize::from(height),
-        regions,
-    }))
+    Ok(Arc::new(SettledRaster { buffer, regions }))
 }
 
 fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
