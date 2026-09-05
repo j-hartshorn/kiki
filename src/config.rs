@@ -426,7 +426,7 @@ fn resolve_model(
             Some(StartupProblem::new(
                 StartupProblemKind::ModelInvalidUnicode,
                 "KIKI_MODEL is not valid Unicode.",
-                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki.",
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.",
                 api_key,
             )),
         );
@@ -438,7 +438,7 @@ fn resolve_model(
             Some(StartupProblem::new(
                 StartupProblemKind::ModelUnknown,
                 format!("KIKI_MODEL `{model}` is not a supported model."),
-                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki.",
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.",
                 api_key,
             )),
         ),
@@ -630,7 +630,7 @@ mod tests {
 
     use crate::config::{
         DEFAULT_MODEL,
-        models::{LUNA, TERRA},
+        models::{LUNA, SOL, TERRA},
     };
     use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
 
@@ -710,7 +710,7 @@ mod tests {
         let configuration = resolve_startup(ready_input("key"));
         let snapshot = configuration.snapshot();
 
-        assert_eq!(snapshot.model().id, "gpt-5.6-sol");
+        assert_eq!(snapshot.model().id, "openai/gpt-5.6-sol");
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
             snapshot.submission_availability(),
@@ -726,8 +726,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_terra_and_luna_models_keep_submission_available() {
-        for model in [&TERRA, &LUNA] {
+    fn configured_qualified_model_ids_keep_submission_available() {
+        for model in [&SOL, &TERRA, &LUNA] {
             let mut input = ready_input("key");
             input.model = Some(OsString::from(model.id));
 
@@ -751,8 +751,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_model_disables_submission_with_a_diagnostic() {
-        for model in ["gpt-4o", "gpt-5.6-unknown"] {
+    fn unqualified_and_unknown_models_disable_submission_with_a_diagnostic() {
+        for model in ["gpt-4o", "gpt-5.6-sol", "gpt-5.6-unknown"] {
             let mut input = ready_input("key");
             input.model = Some(OsString::from(model));
 
@@ -773,7 +773,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
             );
             assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
@@ -809,7 +809,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
         );
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
@@ -1198,7 +1198,7 @@ mod tests {
 
         assert!(rendered.contains("Worker: /worker/[redacted]/monty    \\x1B"));
         assert!(rendered.contains("Workspace: /workspace/[redacted]/project\\x0D"));
-        assert!(rendered.contains("Model: gpt-5.6-sol (context: 1.05m, max output: 128k)"));
+        assert!(rendered.contains("Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)"));
         assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
         assert!(rendered.contains("OpenAI API key: present"));
         assert!(rendered.contains("Submission: unavailable"));

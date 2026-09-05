@@ -4046,7 +4046,7 @@ mod tests {
 
     fn usage(input: u64, output: u64) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: Some(input),
             cached_input_tokens: Some(0),
@@ -4066,7 +4066,7 @@ mod tests {
         total: Option<u64>,
     ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: input,
             cached_input_tokens: cache_read,
@@ -4689,7 +4689,7 @@ mod tests {
                         None,
                         vec![AttemptAccounting::KnownUsageWithUntrackedRetries(
                             ModelUsage {
-                                model: "gpt-5.6-sol".to_owned(),
+                                model: "openai/gpt-5.6-sol".to_owned(),
                                 service_tier: Some("default".to_owned()),
                                 input_tokens: Some(0),
                                 cached_input_tokens: Some(0),

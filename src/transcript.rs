@@ -2976,7 +2976,7 @@ fn step_accounting(attempts: &[AttemptAccounting]) -> Option<String> {
 fn estimated_cost<'a>(attempts: impl IntoIterator<Item = &'a AttemptAccounting>) -> Option<String> {
     match estimate_run_cost(attempts) {
         RunCostEstimate::Complete(estimate) | RunCostEstimate::LowerBound(estimate) => {
-            Some(format_usd(estimate.amount().as_nanos()))
+            Some(format_usd(estimate.as_nanos()))
         }
         RunCostEstimate::Unavailable => None,
     }
@@ -3395,7 +3395,7 @@ mod tests {
 
     fn usage(input: u64, output: u64) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: Some(input),
             cached_input_tokens: Some(0),
@@ -3415,7 +3415,7 @@ mod tests {
         total: Option<u64>,
     ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: input,
             cached_input_tokens: cache_read,
@@ -4353,7 +4353,7 @@ result
             "Startup configuration
 Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
-Model: gpt-5.6-sol (context: 1.05m, max output: 128k)
+Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
 Prompt: bundled read_only_agent
 OpenAI API key: present
 Submission: available

@@ -23,6 +23,7 @@ use crate::{
 };
 
 const OPENAI_PROVIDER: &str = "openai";
+const OPENAI_MODEL_QUALIFIER: &str = "openai/";
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -40,6 +41,7 @@ pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
     model: &'static ModelConfiguration,
+    thinking: &'static str,
     api_key: String,
 }
 
@@ -48,14 +50,22 @@ impl OpenAiModel {
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         model: &'static ModelConfiguration,
+        thinking: &'static str,
     ) -> Self {
-        Self::build(prompt.into(), api_key.into(), model, OPENAI_API_BASE)
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            model,
+            thinking,
+            OPENAI_API_BASE,
+        )
     }
 
     fn build(
         prompt: String,
         api_key: String,
         model: &'static ModelConfiguration,
+        thinking: &'static str,
         endpoint: &str,
     ) -> Self {
         let service = ServiceBuilder::new()
@@ -66,6 +76,7 @@ impl OpenAiModel {
             client: Client::with_config(openai_config(api_key.clone(), endpoint))
                 .with_http_service(service),
             model,
+            thinking,
             api_key,
         }
     }
@@ -80,11 +91,31 @@ impl OpenAiModel {
             prompt.into(),
             api_key.into(),
             crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
             endpoint,
         )
     }
 
+    #[cfg(test)]
+    fn with_selection_and_endpoint(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        model: &'static ModelConfiguration,
+        thinking: &'static str,
+        endpoint: &str,
+    ) -> Self {
+        Self::build(prompt.into(), api_key.into(), model, thinking, endpoint)
+    }
+
     fn request(&self, history: &ModelHistory) -> Result<Value, ModelError> {
+        if !self.model.supports_thinking(self.thinking) {
+            return Err(ModelError::InvalidSelection("unsupported thinking effort"));
+        }
+        let wire_model = self
+            .model
+            .id
+            .strip_prefix(OPENAI_MODEL_QUALIFIER)
+            .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))?;
         let mut input = Vec::new();
 
         for entry in history.entries() {
@@ -135,7 +166,7 @@ impl OpenAiModel {
         }
 
         Ok(json!({
-            "model": self.model.id,
+            "model": wire_model,
             "instructions": self.prompt,
             "input": input,
             "stream": true,
@@ -144,7 +175,7 @@ impl OpenAiModel {
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": {
-                "effort": "medium",
+                "effort": self.thinking,
                 "summary": "auto",
                 "context": "all_turns"
             },
@@ -1600,9 +1631,13 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep, sleep_until, timeout};
+    use tokio_util::sync::CancellationToken;
 
     use super::{WireEvent, WireStatus, WireStream, openai_config};
-    use crate::{config::models::CATALOGUE, model::ModelHistory};
+    use crate::{
+        config::models::{CATALOGUE, SOL},
+        model::{AttemptAccounting, Model, ModelError, ModelHistory},
+    };
 
     fn history() -> ModelHistory {
         let mut history = ModelHistory::new();
@@ -1635,20 +1670,114 @@ mod tests {
     );
 
     #[test]
+    fn constructs_qualified_sol_request_with_high_effort() {
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            &crate::config::models::SOL,
+            "high",
+        );
+        let request = model.request(&history()).unwrap();
+
+        assert_eq!(request["model"], json!("gpt-5.6-sol"));
+        assert_eq!(request["reasoning"]["effort"], json!("high"));
+    }
+
+    #[test]
     fn constructs_and_serializes_each_configured_openai_model() {
         for configuration in CATALOGUE {
-            let model = super::OpenAiModel::new("system prompt", "test-api-key", configuration);
-            let request = model.request(&history()).unwrap();
+            for &thinking in configuration.thinking_levels {
+                let model = super::OpenAiModel::new(
+                    "system prompt",
+                    "test-api-key",
+                    configuration,
+                    thinking,
+                );
+                let request = model.request(&history()).unwrap();
 
-            assert_eq!(model.prompt, "system prompt");
-            assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
-            assert_eq!(
-                model.client.config().url("/responses"),
-                format!("{OPENAI_API_BASE}/responses")
-            );
-            assert_eq!(request["model"], json!(configuration.id));
-            assert_eq!(request["service_tier"], json!(configuration.service_tier));
+                assert_eq!(model.prompt, "system prompt");
+                assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
+                assert_eq!(
+                    model.client.config().url("/responses"),
+                    format!("{OPENAI_API_BASE}/responses")
+                );
+                assert_eq!(
+                    request["model"],
+                    json!(configuration.id.strip_prefix("openai/").unwrap())
+                );
+                assert_eq!(request["service_tier"], json!(configuration.service_tier));
+                assert_eq!(request["reasoning"]["effort"], json!(thinking));
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_thinking_before_networking() {
+        let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
+        let mut model = super::OpenAiModel::with_selection_and_endpoint(
+            "system prompt",
+            "fixture-key",
+            &SOL,
+            "minimal",
+            &fixture.endpoint,
+        );
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+
+        let failure = model
+            .step(&history(), &cancellation, &mut progress)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error(),
+            &ModelError::InvalidSelection("unsupported thinking effort")
+        );
+        assert_eq!(fixture.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retries_preserve_selected_thinking_and_qualified_usage_identity() {
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::Sse(""),
+            FixtureReply::Sse(COMPLETED_STREAM),
+        ])
+        .await;
+        let mut model = super::OpenAiModel::with_selection_and_endpoint(
+            "system prompt",
+            "fixture-key",
+            &SOL,
+            "high",
+            &fixture.endpoint,
+        );
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+
+        let step = model
+            .step(&history(), &cancellation, &mut progress)
+            .await
+            .unwrap();
+
+        assert_eq!(fixture.request_count(), 2);
+        for request in fixture.requests.lock().unwrap().iter() {
+            assert_eq!(request.body["model"], json!("gpt-5.6-sol"));
+            assert_eq!(request.body["reasoning"]["effort"], json!("high"));
+        }
+        let [
+            AttemptAccounting::UsageUnavailable,
+            AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
+        ] = step.attempts.as_slice()
+        else {
+            panic!("expected one restarted attempt followed by known usage");
+        };
+        assert_eq!(usage.model, SOL.id);
+        assert_eq!(
+            crate::pricing::estimate_usage(&usage)
+                .unwrap()
+                .pricing()
+                .model,
+            SOL.id
+        );
     }
 
     #[derive(Clone)]
@@ -2840,7 +2969,7 @@ mod tests {
 
         fn expected_accounting() -> AttemptAccounting {
             AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
-                model: "gpt-5.6-sol".to_owned(),
+                model: "openai/gpt-5.6-sol".to_owned(),
                 service_tier: Some("default".to_owned()),
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
@@ -3781,7 +3910,7 @@ mod tests {
 
         fn expected_accounting() -> AttemptAccounting {
             AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
-                model: "gpt-5.6-sol".to_owned(),
+                model: "openai/gpt-5.6-sol".to_owned(),
                 service_tier: Some("default".to_owned()),
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
@@ -5062,6 +5191,7 @@ mod tests {
                     ready.system_prompt(),
                     ready.api_key().expose(),
                     ready.model(),
+                    ready.model().default_thinking,
                 ),
             )
         };
