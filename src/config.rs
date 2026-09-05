@@ -658,12 +658,20 @@ fn prompt_source_path(source: &PromptSource) -> &Path {
 
 #[cfg(test)]
 pub(crate) fn ready_snapshot_for_test() -> StartupSnapshot {
+    ready_snapshot_with_settings_for_test(None, Path::new("/workspace/project"))
+}
+
+#[cfg(test)]
+pub(crate) fn ready_snapshot_with_settings_for_test(
+    home: Option<&Path>,
+    workspace_root: &Path,
+) -> StartupSnapshot {
     resolve_startup(StartupInput {
         worker_path: Some(OsString::from("/opt/kiki/bin/monty")),
         model: None,
         thinking: None,
-        home: None,
-        workspace_root: Ok(PathBuf::from("/workspace/project")),
+        home: home.map(|path| path.as_os_str().to_os_string()),
+        workspace_root: Ok(workspace_root.to_path_buf()),
         prompt: PromptResolution::Resolved {
             text: "system instructions".to_owned(),
             source: PromptSource::Bundled {
