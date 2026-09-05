@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod picker;
@@ -10,7 +11,9 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use ratatui::crossterm::terminal::SetTitle;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
@@ -27,7 +30,9 @@ use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProg
 use crate::selection::{DocumentPosition, Selection};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
-use crate::transcript::{Transcript, TranscriptLayout, normalise_terminal_text, page_style};
+use crate::transcript::{
+    FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
+};
 use picker::{Picker, PickerAction, PickerItem};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -153,6 +158,9 @@ struct App {
     notice: Option<Notice>,
     flash: Option<Flash>,
     settings: Option<SettingsContext>,
+    workspace_root: Option<String>,
+    home: Option<PathBuf>,
+    session_name: Option<String>,
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
@@ -182,6 +190,9 @@ impl Default for App {
             notice: None,
             flash: None,
             settings: None,
+            workspace_root: None,
+            home: None,
+            session_name: None,
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
@@ -214,9 +225,20 @@ impl App {
         let settings_selection = ModelSelection::new(startup.model(), startup.thinking())
             .expect("startup thinking must be supported by its model");
         let settings = startup.settings().clone();
+        let workspace_root = startup
+            .workspace_root()
+            .map(|path| normalise_single_line(path.as_str()));
+        let home = settings
+            .user_path()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         Self {
             transcript: Transcript::configured(startup),
             settings: Some(settings),
+            workspace_root,
+            home,
+            session_name: None,
             settings_selection,
             session_thinking: BTreeMap::from([(
                 settings_selection.model().id,
@@ -404,6 +426,7 @@ impl App {
                     }
                 }
             }
+            SlashCommand::Name(argument) => self.name_session(argument),
             SlashCommand::Thinking(argument) => {
                 let model = self.settings_selection.model();
                 if argument.is_empty() {
@@ -645,6 +668,63 @@ impl App {
 
     fn set_notice(&mut self, notice: String) {
         self.notice = Some(Notice::Status(notice));
+    }
+
+    fn name_session(&mut self, argument: &str) -> Update {
+        let name = normalise_single_line(argument);
+        if name.is_empty() {
+            self.set_notice(self.session_name.as_ref().map_or_else(
+                || "Usage: /name <name>".to_owned(),
+                |name| format!("Session name: {name}"),
+            ));
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
+        }
+        if Line::raw(&name).width() > 80 {
+            self.set_notice("Session name must be at most 80 display cells.".to_owned());
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
+        }
+        self.session_name = Some(name);
+        Update {
+            commands: Vec::new(),
+            visible_changed: true,
+            quit: false,
+        }
+    }
+
+    fn title(&self) -> String {
+        match &self.session_name {
+            Some(name) => format!("✷ - {name}"),
+            None => format!(
+                "✷ - {}",
+                self.cwd_basename().unwrap_or_else(|| "kiki".to_owned())
+            ),
+        }
+    }
+
+    fn cwd_basename(&self) -> Option<String> {
+        self.workspace_root.as_deref().and_then(|workspace_root| {
+            Path::new(workspace_root)
+                .file_name()
+                .map(|basename| normalise_single_line(&basename.to_string_lossy()))
+                .filter(|basename| !basename.is_empty())
+        })
+    }
+
+    fn footer_context(&self) -> Option<FooterContext> {
+        self.settings.as_ref().map(|_| FooterContext {
+            workspace_root: self.workspace_root.clone(),
+            home: self.home.clone(),
+            name: self.session_name.clone(),
+            selection: self.settings_selection,
+        })
     }
 
     fn begin_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
@@ -1003,6 +1083,7 @@ impl App {
 
 enum SlashCommand<'a> {
     Model(&'a str),
+    Name(&'a str),
     Thinking(&'a str),
 }
 
@@ -1012,6 +1093,9 @@ fn slash_command(draft: &str) -> Option<SlashCommand<'_>> {
     }
     if let Some(rest) = draft.strip_prefix("/model") {
         return slash_argument(rest).map(SlashCommand::Model);
+    }
+    if let Some(rest) = draft.strip_prefix("/name") {
+        return slash_argument(rest).map(SlashCommand::Name);
     }
     draft
         .strip_prefix("/thinking")
@@ -1036,6 +1120,10 @@ fn is_shift_tab(key: KeyEvent) -> bool {
         KeyCode::Tab => key.modifiers == KeyModifiers::SHIFT,
         _ => false,
     }
+}
+
+fn normalise_single_line(text: &str) -> String {
+    normalise_terminal_text(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn normalise_paste_line_endings(text: &str) -> String {
@@ -1074,6 +1162,38 @@ impl<F: FnOnce()> Drop for RestoreGuard<F> {
     }
 }
 
+trait TitlePublisher {
+    fn publish(&mut self, title: &str) -> io::Result<()>;
+}
+
+struct TerminalTitlePublisher;
+
+impl TitlePublisher for TerminalTitlePublisher {
+    fn publish(&mut self, title: &str) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        ratatui::crossterm::execute!(stdout, SetTitle(title))
+    }
+}
+
+#[cfg(test)]
+struct NoopTitlePublisher;
+
+#[cfg(test)]
+impl TitlePublisher for NoopTitlePublisher {
+    fn publish(&mut self, _title: &str) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
+    if publisher.publish(&app.title()).is_err() {
+        app.set_notice("Could not change terminal title.".to_owned());
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn run(
     startup: StartupSnapshot,
     commands: mpsc::Sender<RuntimeCommand>,
@@ -1083,6 +1203,7 @@ pub(crate) fn run(
     let mut app = App::configured(startup);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
+    let mut titles = TerminalTitlePublisher;
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
@@ -1094,7 +1215,7 @@ pub(crate) fn run(
                         disable_keyboard_enhancement,
                         |enhanced_keyboard| {
                             app.enhanced_keyboard = enhanced_keyboard;
-                            run_loop(
+                            run_loop_with_titles(
                                 terminal,
                                 &mut app,
                                 &mut input,
@@ -1102,6 +1223,7 @@ pub(crate) fn run(
                                 &mut events,
                                 &mut progress,
                                 &mut clipboard,
+                                &mut titles,
                             )
                             .map(|_| ())
                         },
@@ -1116,11 +1238,13 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
     let mut app = App::configuration(startup);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
+    let mut titles = TerminalTitlePublisher;
     with_terminal(
         || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
         ratatui::restore,
         |terminal| {
             with_mouse_capture(enable_mouse_capture, disable_mouse_capture, || {
+                publish_title(&mut app, &mut titles);
                 run_configuration_loop(terminal, &mut app, &mut input, &mut clipboard).map(|_| ())
             })
         },
@@ -1273,6 +1397,7 @@ fn dispatch_commands(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -1282,7 +1407,31 @@ fn run_loop<B: Backend>(
     progress: &mut RuntimeProgressReceiver,
     clipboard: &mut impl ClipboardPort,
 ) -> Result<usize, TuiError> {
+    run_loop_with_titles(
+        terminal,
+        app,
+        input,
+        commands,
+        events,
+        progress,
+        clipboard,
+        &mut NoopTitlePublisher,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_with_titles<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    input: &mut impl EventSource,
+    commands: &mpsc::Sender<RuntimeCommand>,
+    events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    progress: &mut RuntimeProgressReceiver,
+    clipboard: &mut impl ClipboardPort,
+    titles: &mut impl TitlePublisher,
+) -> Result<usize, TuiError> {
     let mut dirty = true;
+    publish_title(app, titles);
     let mut redraws = 0;
     let mut progress_open = true;
 
@@ -1296,8 +1445,12 @@ fn run_loop<B: Backend>(
         if input.poll(POLL_INTERVAL).map_err(TuiError::Input)? {
             match input.read().map_err(TuiError::Input)? {
                 Event::Key(key) => {
+                    let previous_title = app.title();
                     let update = app.handle_key_at(key, Instant::now());
                     dirty |= update.visible_changed;
+                    if previous_title != app.title() {
+                        dirty |= publish_title(app, titles);
+                    }
                     dispatch_commands(commands, &update)?;
                     quit = update.quit;
                 }
@@ -1372,7 +1525,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     } else if app.transcript.is_disabled() {
         let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C quit",
+            "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T thinking | Ctrl-O expand | Ctrl-C quit",
             app.transcript.status()
         )
     } else {
@@ -1383,7 +1536,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         };
         let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {}{notice} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T reasoning | Ctrl-O expand | Ctrl-C clear/quit",
+            "Status: {}{notice} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
             app.transcript.status()
         )
     };
@@ -1422,7 +1575,11 @@ fn render(frame: &mut Frame, app: &mut App) {
         1,
     );
     if area.height == 2 {
-        render_rule(frame, bottom_rule);
+        render_rule(
+            frame,
+            bottom_rule,
+            thinking_rule_style(app.settings_selection),
+        );
         app.history_unavailable();
         return;
     }
@@ -1430,8 +1587,13 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_rule(
             frame,
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            thinking_rule_style(app.settings_selection),
         );
-        render_rule(frame, bottom_rule);
+        render_rule(
+            frame,
+            bottom_rule,
+            thinking_rule_style(app.settings_selection),
+        );
         app.history_unavailable();
         return;
     }
@@ -1460,7 +1622,12 @@ fn render(frame: &mut Frame, app: &mut App) {
             .saturating_sub(prompt_box_height),
     );
     let layout = render_history(frame, app, history);
-    render_rule(frame, Rect::new(area.x, prompt_top, area.width, 1));
+    let rule_style = thinking_rule_style(app.settings_selection);
+    render_rule(
+        frame,
+        Rect::new(area.x, prompt_top, area.width, 1),
+        rule_style,
+    );
     render_prompt(
         frame,
         &prompt,
@@ -1468,7 +1635,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         !app.is_submission_disabled() && app.picker.is_none(),
     );
     frame.render_widget(
-        Paragraph::new(layout.footer_rule(bottom_rule.width)),
+        Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
         bottom_rule,
     );
     if let Some(picker) = &mut app.picker {
@@ -1477,7 +1644,10 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> TranscriptLayout {
-    let layout = app.transcript.layout(viewport.width);
+    let layout = match app.footer_context() {
+        Some(context) => app.transcript.layout_with_footer(viewport.width, context),
+        None => app.transcript.layout(viewport.width),
+    };
     if viewport.is_empty() {
         app.history_unavailable();
         return layout;
@@ -1570,9 +1740,67 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
     }
 }
 
-fn render_rule(frame: &mut Frame, area: Rect) {
+const THINKING_RULE_COLOURS: [Color; 6] = [
+    Color::Rgb(102, 102, 102),
+    Color::Rgb(63, 94, 158),
+    Color::Rgb(91, 77, 169),
+    Color::Rgb(139, 63, 192),
+    Color::Rgb(190, 45, 209),
+    Color::Rgb(255, 0, 255),
+];
+
+fn thinking_rule_style(selection: ModelSelection) -> Style {
+    Style::new().fg(thinking_rule_colour(
+        selection.model().thinking_levels,
+        selection.thinking(),
+    ))
+}
+
+fn thinking_rule_colour(levels: &[&str], selected: &str) -> Color {
+    let index = levels
+        .iter()
+        .position(|level| *level == selected)
+        .expect("selection thinking must be supported by its model");
+    let denominator = levels.len().saturating_sub(1);
+    if denominator == 0 {
+        return THINKING_RULE_COLOURS[0];
+    }
+    let position = index * (THINKING_RULE_COLOURS.len() - 1);
+    let lower = position / denominator;
+    let remainder = position % denominator;
+    let upper = (lower + usize::from(remainder > 0)).min(THINKING_RULE_COLOURS.len() - 1);
+    interpolate_colour(
+        THINKING_RULE_COLOURS[lower],
+        THINKING_RULE_COLOURS[upper],
+        remainder,
+        denominator,
+    )
+}
+
+fn interpolate_colour(start: Color, end: Color, remainder: usize, denominator: usize) -> Color {
+    let (Color::Rgb(red, green, blue), Color::Rgb(end_red, end_green, end_blue)) = (start, end)
+    else {
+        unreachable!("thinking palette contains only RGB colours")
+    };
+    let blend = |start, end| {
+        u8::try_from(
+            (usize::from(start) * (denominator - remainder)
+                + usize::from(end) * remainder
+                + denominator / 2)
+                / denominator,
+        )
+        .expect("interpolated colour is an RGB channel")
+    };
+    Color::Rgb(
+        blend(red, end_red),
+        blend(green, end_green),
+        blend(blue, end_blue),
+    )
+}
+
+fn render_rule(frame: &mut Frame, area: Rect, style: Style) {
     frame.render_widget(
-        Paragraph::new(Line::raw("─".repeat(usize::from(area.width)))),
+        Paragraph::new(Line::raw("─".repeat(usize::from(area.width)))).style(style),
         area,
     );
 }
@@ -1596,7 +1824,7 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::Color;
 
-    use super::App;
+    use super::{App, TitlePublisher};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -2220,6 +2448,38 @@ mod tests {
         now
     }
 
+    struct RecordingTitles {
+        titles: Vec<String>,
+        fail: bool,
+    }
+
+    impl RecordingTitles {
+        fn available() -> Self {
+            Self {
+                titles: Vec::new(),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                titles: Vec::new(),
+                fail: true,
+            }
+        }
+    }
+
+    impl TitlePublisher for RecordingTitles {
+        fn publish(&mut self, title: &str) -> io::Result<()> {
+            self.titles.push(title.to_owned());
+            if self.fail {
+                Err(io::Error::other("title unavailable"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     struct ErrorInput;
 
     impl super::EventSource for ErrorInput {
@@ -2230,6 +2490,208 @@ mod tests {
         fn read(&mut self) -> io::Result<ratatui::crossterm::event::Event> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn title_publisher_runs_at_startup_and_on_name_changes_only() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("worktrees/interactive/settings/kiki");
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        let mut input = FakeInput::new([
+            Some(Event::Paste("/name Refactor auth".to_owned())),
+            Some(Event::Key(key(KeyCode::Enter))),
+            Some(quit_event()),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
+        let (commands, _command_receiver) = mpsc::channel(8);
+        let (_event_sender, mut events) = mpsc::unbounded_channel();
+        let (_progress_sender, mut progress) = mpsc::channel(8);
+        let mut clipboard = FakeClipboard::available();
+        let mut titles = RecordingTitles::available();
+
+        super::run_loop_with_titles(
+            &mut terminal,
+            &mut app,
+            &mut input,
+            &commands,
+            &mut events,
+            &mut progress,
+            &mut clipboard,
+            &mut titles,
+        )
+        .expect("loop");
+
+        assert_eq!(titles.titles, ["✷ - kiki", "✷ - Refactor auth"]);
+    }
+
+    #[test]
+    fn title_failure_is_nonfatal_and_terminal_cleanup_still_runs() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("kiki");
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        let mut input = FakeInput::new([Some(quit_event())]);
+        let (commands, _command_receiver) = mpsc::channel(8);
+        let (_event_sender, mut events) = mpsc::unbounded_channel();
+        let (_progress_sender, mut progress) = mpsc::channel(8);
+        let mut clipboard = FakeClipboard::available();
+        let mut titles = RecordingTitles::failing();
+        let restored = Cell::new(false);
+
+        let result = super::with_terminal(
+            || {
+                Terminal::new(TestBackend::new(80, 8))
+                    .map_err(|error| super::TuiError::Terminal(error.to_string()))
+            },
+            || restored.set(true),
+            |terminal| {
+                super::run_loop_with_titles(
+                    terminal,
+                    &mut app,
+                    &mut input,
+                    &commands,
+                    &mut events,
+                    &mut progress,
+                    &mut clipboard,
+                    &mut titles,
+                )
+                .map(|_| ())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(restored.get());
+        assert_eq!(titles.titles, ["✷ - kiki"]);
+    }
+
+    #[test]
+    fn session_name_uses_exact_title_and_front_truncated_footer_identity() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("worktrees/interactive/settings/kiki");
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+
+        assert_eq!(app.title(), "✷ - kiki");
+
+        assert!(app.handle_paste("/name  Refactor\t auth").visible_changed);
+        let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
+
+        assert!(update.commands.is_empty());
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.title(), "✷ - Refactor auth");
+        assert!(rendered(&mut app, 80, 4).contains("~/…/kiki (Refactor auth)"));
+    }
+
+    #[test]
+    fn session_name_is_ephemeral_and_title_failure_is_visible() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("kiki");
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        let update = app.name_session("  Refactor\t auth  ");
+        assert!(update.commands.is_empty());
+        assert_eq!(app.title(), "✷ - Refactor auth");
+
+        let mut titles = RecordingTitles::failing();
+        assert!(super::publish_title(&mut app, &mut titles));
+        assert_eq!(app.title(), "✷ - Refactor auth");
+        assert_eq!(app.notice(), Some("Could not change terminal title."));
+        assert_eq!(titles.titles, ["✷ - Refactor auth"]);
+        assert!(rendered(&mut app, 80, 4).contains("~/kiki (Refactor auth)"));
+
+        assert!(app.transcript.begin_submission());
+        assert!(app.handle_paste("/name Active name").visible_changed);
+        let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
+        assert!(update.commands.is_empty());
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.title(), "✷ - Active name");
+    }
+
+    #[test]
+    fn session_name_validates_empty_and_display_width() {
+        let mut app = App::default();
+        assert!(app.handle_paste("/name").visible_changed);
+        let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
+        assert!(update.commands.is_empty());
+        assert_eq!(app.notice(), Some("Usage: /name <name>"));
+
+        let update = app.name_session(" \t ");
+        assert!(update.commands.is_empty());
+        assert_eq!(app.notice(), Some("Usage: /name <name>"));
+
+        let accepted = "a".repeat(80);
+        assert!(app.name_session(&accepted).visible_changed);
+        assert_eq!(app.title(), format!("✷ - {accepted}"));
+        let rejected = "b".repeat(81);
+        assert!(app.name_session(&rejected).visible_changed);
+        assert_eq!(app.title(), format!("✷ - {accepted}"));
+        assert_eq!(
+            app.notice(),
+            Some("Session name must be at most 80 display cells.")
+        );
+
+        let wide = "界".repeat(40);
+        assert!(app.name_session(&wide).visible_changed);
+        assert_eq!(app.title(), format!("✷ - {wide}"));
+        assert!(app.name_session(&"界".repeat(41)).visible_changed);
+        assert_eq!(app.title(), format!("✷ - {wide}"));
+    }
+
+    #[test]
+    fn titles_sanitise_cwd_and_fall_back_when_unavailable() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("kiki\nsettings");
+        let app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        assert_eq!(app.title(), "✷ - kiki settings");
+        assert_eq!(App::default().title(), "✷ - kiki");
+        let configured = App::configuration(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        assert_eq!(configured.title(), "✷ - kiki settings");
+    }
+
+    #[test]
+    fn prompt_rules_follow_active_and_preview_thinking_colours() {
+        for (thinking, colour) in ["none", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .zip(super::THINKING_RULE_COLOURS)
+        {
+            assert_eq!(
+                super::thinking_rule_colour(
+                    &["none", "low", "medium", "high", "xhigh", "max"],
+                    thinking,
+                ),
+                colour,
+            );
+        }
+        assert_eq!(
+            super::thinking_rule_colour(&["none", "medium", "max"], "medium"),
+            super::interpolate_colour(
+                super::THINKING_RULE_COLOURS[2],
+                super::THINKING_RULE_COLOURS[3],
+                1,
+                2,
+            )
+        );
+
+        let mut app = App::default();
+        let now = Instant::now();
+        assert!(app.cycle_thinking_preview(now).visible_changed);
+        let buffer = rendered_buffer(&mut app, 80, 8);
+        assert_eq!(buffer[(0, 7)].fg, super::THINKING_RULE_COLOURS[3]);
     }
 
     #[test]
@@ -2304,11 +2766,11 @@ mod tests {
         let now = Instant::now();
         let mut app = App::default();
 
-        let update = enter_at(&mut app, "/name future task", now);
+        let update = enter_at(&mut app, "/future task", now);
         assert_eq!(
             update.commands,
             [RuntimeCommand::Submit {
-                request: "/name future task".to_owned()
+                request: "/future task".to_owned()
             }]
         );
 
@@ -2753,13 +3215,13 @@ mod tests {
         let now = Instant::now();
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
-        set_prompt(&mut app, "/name later");
+        set_prompt(&mut app, "/future later");
 
         let update = app.handle_key_at(key(KeyCode::Enter), now);
 
         assert!(update.commands.is_empty());
         assert!(update.visible_changed);
-        assert_eq!(app.prompt.text(), "/name later");
+        assert_eq!(app.prompt.text(), "/future later");
     }
 
     #[test]
@@ -3387,6 +3849,17 @@ mod tests {
         assert!(header.contains("Ctrl-C clear/quit"));
         assert!(!header.contains("Up/Down scroll"));
         assert!(!header.contains("Shift-Enter newline"));
+    }
+
+    #[test]
+    fn header_uses_thinking_terminology() {
+        let mut app = App::default();
+
+        let header = rendered(&mut app, 200, 4);
+
+        assert!(header.contains("Ctrl-T thinking"));
+        assert!(!header.contains("reasoning"));
+        assert!(!include_str!("../README.md").contains("reasoning"));
     }
 
     #[test]
@@ -5243,7 +5716,7 @@ mod tests {
         assert_eq!(with_rows[9], "─".repeat(80));
         assert!(with_rows[10].starts_with("> ask"));
         assert!(with_rows[11].starts_with('─'));
-        assert!(with_rows[11].ends_with("↑1 ↓1 R0 W0 r0 Σ2 C0%/272k H0% $0.000024 ─"));
+        assert!(with_rows[11].ends_with("↑1 ↓1 R0 W0 CH0.0% $0.00002400 0.0%/272k ─"));
         assert_eq!(app.history_height, 8);
     }
 
@@ -5418,7 +5891,7 @@ mod tests {
         let four = rendered(&mut app, 80, 4);
         let rows = four.lines().collect::<Vec<_>>();
         assert!(rows[2].starts_with("> ask"));
-        assert!(rows[3].ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─"));
+        assert!(rows[3].ends_with("↑100 ↓20 R10 W5 CH10.0% $0.0007690 0.0%/272k ─"));
         assert_eq!(app.history_height, 0);
 
         let larger = rendered(&mut app, 80, 6);
@@ -5429,16 +5902,52 @@ mod tests {
                 .is_some_and(|row| row.starts_with("> ask"))
         );
         assert!(
-            larger.lines().nth(5).is_some_and(
-                |row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─")
-            )
+            larger
+                .lines()
+                .nth(5)
+                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 CH10.0% $0.0007690 0.0%/272k ─"))
         );
         assert_eq!(app.history_height, 2);
         assert!(app.history_rows > 0);
     }
 
     #[test]
-    fn footer_is_absent_without_metrics_or_in_configuration_only_mode() {
+    fn configured_session_delegates_complete_footer_context() {
+        let home = tempdir().expect("home");
+        let workspace = home.path().join("worktrees/interactive/settings/kiki");
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            &workspace,
+        ));
+        assert!(app.name_session("Refactor auth").visible_changed);
+        app.handle_event(completed_record(
+            1,
+            1,
+            "metrics()",
+            vec![detailed_usage(
+                Some(217_600),
+                Some(0),
+                Some(163_200),
+                Some(0),
+                Some(0),
+                Some(217_600),
+            )],
+        ));
+
+        let footer = rendered(&mut app, 200, 20);
+        assert!(
+            footer.contains("~/worktrees/interactive/settings/kiki (Refactor auth)"),
+            "{footer}"
+        );
+        assert!(
+            footer.contains("↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k"),
+            "{footer}"
+        );
+        assert!(footer.contains("gpt-5.6-sol • thinking medium"), "{footer}");
+    }
+
+    #[test]
+    fn footer_is_absent_without_metrics_for_unconfigured_and_configuration_only_sessions() {
         let mut without_metrics = app_with_prompt("ask");
         without_metrics.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -5491,7 +6000,9 @@ mod tests {
             .find(|column| {
                 full[(*column, 3)].symbol() == "8"
                     && full[(*column + 1, 3)].symbol() == "0"
-                    && full[(*column + 2, 3)].symbol() == "%"
+                    && full[(*column + 2, 3)].symbol() == "."
+                    && full[(*column + 3, 3)].symbol() == "0"
+                    && full[(*column + 4, 3)].symbol() == "%"
             })
             .expect("context percentage");
         assert_eq!(full[(column, 3)].fg, Color::Yellow);
@@ -5499,13 +6010,13 @@ mod tests {
         assert!(
             full.lines()
                 .nth(3)
-                .is_some_and(|row| row.ends_with("C80%/272k H75% $0.28288 ─"))
+                .is_some_and(|row| row.ends_with("CH75.0% $0.2829 80.0%/272k ─"))
         );
 
         let one = rendered(&mut app, 1, 4);
         assert_eq!(one.lines().nth(3), Some("…"));
         let narrow = rendered(&mut app, 29, 4);
-        assert_eq!(narrow.lines().nth(3), Some("─ … C80%/272k H75% $0.28288 ─"));
+        assert_eq!(narrow.lines().nth(3), Some("─ ───────$0.2829 80.0%/272k ─"));
     }
 
     #[test]
@@ -5539,9 +6050,10 @@ mod tests {
             },
         });
         assert!(
-            rendered(&mut app, 80, 5).lines().last().is_some_and(
-                |row| row.ends_with("↑100 ↓20 R10 W5 r5 Σ120 C0%/272k H10% $0.000769 ─")
-            )
+            rendered(&mut app, 80, 5)
+                .lines()
+                .last()
+                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 CH10.0% $0.0007690 0.0%/272k ─"))
         );
 
         app.handle_event(completed_record(1, 1, "first()", vec![first]));
@@ -5576,9 +6088,10 @@ mod tests {
         ));
 
         assert!(
-            rendered(&mut app, 80, 8).lines().last().is_some_and(
-                |row| row.ends_with("↑107 ↓30 R10 W5 r5 Σ137 C0%/272k H0% $0.000769 ─")
-            )
+            rendered(&mut app, 80, 8)
+                .lines()
+                .last()
+                .is_some_and(|row| row.ends_with("↑107 ↓30 R10 W5 CH0.0% $0.0007690 0.0%/272k ─"))
         );
     }
 
@@ -5701,7 +6214,7 @@ mod tests {
         let history = rendered(&mut app, 120, 40);
         assert!(history.contains("↑100 ↓0 R0 W0 r0 Σ100 · $0.0004"));
         assert!(history.contains("↑0 ↓100 R0 W0 r20 Σ100 · $0.002"));
-        assert!(history.contains("↑100 ↓100 R0 W0 r20 Σ200 $0.0024"));
+        assert!(history.contains("↑100 ↓100 R0 W0 $0.002400"));
         assert!(!history.contains("Run estimated cost"));
         assert!(!history.contains("Unavailable $0"));
 
@@ -5716,9 +6229,7 @@ mod tests {
                 accounting: usage(0, 100),
             },
         });
-        assert!(
-            rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 r0 Σ200 C0%/272k $0.0024")
-        );
+        assert!(rendered(&mut active, 120, 40).contains("↑100 ↓100 R0 W0 $0.002400 0.0%/272k"));
     }
 
     #[test]
@@ -5828,7 +6339,7 @@ mod tests {
         assert!(hidden.commands.is_empty());
         assert!(hidden.visible_changed);
         let screen = rendered(&mut app, 60, 80);
-        assert!(screen.contains("reasoning hidden · Ctrl-T to show"));
+        assert!(screen.contains("thinking hidden · Ctrl-T to show"));
         assert!(!screen.contains("visible reasoning"));
 
         for code in ['o', 'O'] {
@@ -5875,7 +6386,7 @@ mod tests {
                 .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .visible_changed
         );
-        assert!(rendered(&mut disabled, 60, 8).contains("reasoning hidden · Ctrl-T to show"));
+        assert!(rendered(&mut disabled, 60, 8).contains("thinking hidden · Ctrl-T to show"));
 
         let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
         let update =
@@ -5909,7 +6420,7 @@ mod tests {
         });
         let screen = rendered(&mut configuration, 80, 80);
         assert!(screen.contains("code 33"));
-        assert!(screen.contains("reasoning hidden · Ctrl-T to show"));
+        assert!(screen.contains("thinking hidden · Ctrl-T to show"));
     }
 
     #[test]
