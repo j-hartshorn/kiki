@@ -1772,7 +1772,7 @@ mod tests {
         };
         assert_eq!(usage.model, SOL.id);
         assert_eq!(
-            crate::pricing::estimate_usage(&usage)
+            crate::pricing::estimate_usage(usage)
                 .unwrap()
                 .pricing()
                 .model,
@@ -5191,7 +5191,7 @@ mod tests {
                     ready.system_prompt(),
                     ready.api_key().expose(),
                     ready.model(),
-                    ready.model().default_thinking,
+                    ready.thinking(),
                 ),
             )
         };

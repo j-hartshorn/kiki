@@ -32,7 +32,7 @@ fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
         ready.system_prompt(),
         ready.api_key().expose(),
         ready.model(),
-        ready.model().default_thinking,
+        ready.thinking(),
     )
 }
 

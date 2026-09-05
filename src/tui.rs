@@ -2426,7 +2426,7 @@ mod tests {
 
     #[test]
     fn configuration_controls_are_read_only_and_ctrl_c_needs_no_command() {
-        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        let mut app = App::configuration(crate::config::ready_snapshot_for_test());
         set_prompt(&mut app, "locked");
         let prompt = app.prompt.text().to_owned();
         let screen = rendered(&mut app, 120, 15);
@@ -2461,7 +2461,7 @@ mod tests {
 
     #[test]
     fn configuration_loop_redraws_scrolls_and_handles_tiny_terminals() {
-        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        let mut app = App::configuration(crate::config::ready_snapshot_for_test());
         let backend = TestBackend::new(40, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut input = FakeInput::new([
@@ -2515,7 +2515,7 @@ mod tests {
         assert!(restored_after_initialisation.get());
 
         let restored_after_error = Cell::new(false);
-        let mut app = App::configuration(crate::config::load().snapshot().clone());
+        let mut app = App::configuration(crate::config::ready_snapshot_for_test());
         let mut input = ErrorInput;
         let input_result = super::with_terminal(
             || {
@@ -3813,7 +3813,7 @@ mod tests {
     #[test]
     fn configuration_mouse_wheel_scrolls_transcript_history() {
         let mut app =
-            app_with_history(App::configuration(crate::config::load().snapshot().clone()));
+            app_with_history(App::configuration(crate::config::ready_snapshot_for_test()));
         let mut input = FakeInput::new([
             Some(mouse(MouseEventKind::Down(MouseButton::Left))),
             Some(mouse(MouseEventKind::ScrollUp)),
@@ -3829,7 +3829,7 @@ mod tests {
     #[test]
     fn configuration_mouse_wheel_scrolls_towards_newest_history() {
         let mut app =
-            app_with_history(App::configuration(crate::config::load().snapshot().clone()));
+            app_with_history(App::configuration(crate::config::ready_snapshot_for_test()));
         rendered(&mut app, 40, 7);
         assert!(app.update_scroll(3).visible_changed);
         let mut input =
@@ -4894,7 +4894,7 @@ mod tests {
         );
         assert!(rendered(&mut disabled, 60, 8).contains("reasoning hidden · Ctrl-T to show"));
 
-        let mut configuration = App::configuration(crate::config::load().snapshot().clone());
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
         let update =
             configuration.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(update.command.is_none());

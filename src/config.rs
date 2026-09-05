@@ -8,6 +8,7 @@ use crate::prompt::{self, PromptError, PromptSource, ResolvedPrompt};
 
 pub(crate) mod constants;
 pub mod models;
+pub(crate) mod settings;
 
 pub use models::{
     DEFAULT_MODEL, ModelConfiguration, ModelPricing, PricingIdentity, Rates, model_by_id,
@@ -15,6 +16,7 @@ pub use models::{
 
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
 const KIKI_MODEL_ENV: &str = "KIKI_MODEL";
+const KIKI_THINKING_ENV: &str = "KIKI_THINKING";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 1_024;
 const MAX_STARTUP_REMEDIATION_BYTES: usize = 512;
@@ -41,8 +43,20 @@ pub enum StartupProblemKind {
     WorkspaceRootUnavailable,
     WorkspaceRootNotAbsolute,
     WorkspaceConstructionFailed,
+    UserSettingsUnreadable,
+    UserSettingsInvalidUtf8,
+    UserSettingsMalformed,
+    UserSettingsInvalid,
+    ProjectSettingsUnreadable,
+    ProjectSettingsInvalidUtf8,
+    ProjectSettingsMalformed,
+    ProjectSettingsInvalid,
     ModelUnknown,
     ModelInvalidUnicode,
+    ThinkingInvalidUnicode,
+    ThinkingEmpty,
+    ThinkingUnknown,
+    ThinkingUnsupported,
     PromptOverrideUnreadable,
     PromptOverrideInvalidUtf8,
     ApiKeyMissing,
@@ -56,9 +70,21 @@ impl StartupProblemKind {
             Self::WorkerConstructionFailed => 1,
             Self::WorkspaceRootUnavailable | Self::WorkspaceRootNotAbsolute => 2,
             Self::WorkspaceConstructionFailed => 3,
-            Self::ModelUnknown | Self::ModelInvalidUnicode => 4,
-            Self::PromptOverrideUnreadable | Self::PromptOverrideInvalidUtf8 => 5,
-            Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 6,
+            Self::UserSettingsUnreadable
+            | Self::UserSettingsInvalidUtf8
+            | Self::UserSettingsMalformed
+            | Self::UserSettingsInvalid => 4,
+            Self::ProjectSettingsUnreadable
+            | Self::ProjectSettingsInvalidUtf8
+            | Self::ProjectSettingsMalformed
+            | Self::ProjectSettingsInvalid => 5,
+            Self::ModelUnknown | Self::ModelInvalidUnicode => 6,
+            Self::ThinkingInvalidUnicode
+            | Self::ThinkingEmpty
+            | Self::ThinkingUnknown
+            | Self::ThinkingUnsupported => 7,
+            Self::PromptOverrideUnreadable | Self::PromptOverrideInvalidUtf8 => 8,
+            Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 9,
         }
     }
 }
@@ -165,6 +191,8 @@ pub struct StartupSnapshot {
     worker_path: Option<RedactedPath>,
     workspace_root: Option<RedactedPath>,
     model: &'static ModelConfiguration,
+    thinking: &'static str,
+    settings: settings::SettingsContext,
     prompt_source: PromptProvenance,
     api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
@@ -181,6 +209,15 @@ impl StartupSnapshot {
 
     pub fn model(&self) -> &'static ModelConfiguration {
         self.model
+    }
+
+    pub fn thinking(&self) -> &'static str {
+        self.thinking
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn settings(&self) -> &settings::SettingsContext {
+        &self.settings
     }
 
     pub fn prompt_source(&self) -> &PromptProvenance {
@@ -232,6 +269,8 @@ impl StartupConfiguration {
             system_prompt: self.construction.system_prompt.as_deref()?,
             api_key: self.construction.api_key.as_ref()?,
             model: self.construction.model,
+            thinking: self.snapshot.thinking,
+            settings: &self.snapshot.settings,
         })
     }
 
@@ -278,6 +317,9 @@ pub(crate) struct ReadyStartup<'a> {
     system_prompt: &'a str,
     api_key: &'a ApiKey,
     model: &'static ModelConfiguration,
+    thinking: &'static str,
+    #[allow(dead_code)]
+    settings: &'a settings::SettingsContext,
 }
 
 impl<'a> ReadyStartup<'a> {
@@ -300,6 +342,15 @@ impl<'a> ReadyStartup<'a> {
     pub(crate) fn model(&self) -> &'static ModelConfiguration {
         self.model
     }
+
+    pub(crate) fn thinking(&self) -> &'static str {
+        self.thinking
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn settings(&self) -> &'a settings::SettingsContext {
+        self.settings
+    }
 }
 
 pub(crate) struct ApiKey(String);
@@ -313,6 +364,8 @@ impl ApiKey {
 struct StartupInput {
     worker_path: Option<OsString>,
     model: Option<OsString>,
+    thinking: Option<OsString>,
+    home: Option<OsString>,
     workspace_root: io::Result<PathBuf>,
     prompt: PromptResolution,
     api_key: Option<OsString>,
@@ -361,6 +414,8 @@ pub fn load() -> StartupConfiguration {
     let input = StartupInput {
         worker_path: env::var_os(MONTY_BIN_ENV),
         model: env::var_os(KIKI_MODEL_ENV),
+        thinking: env::var_os(KIKI_THINKING_ENV),
+        home: env::var_os("HOME"),
         workspace_root: env::current_dir(),
         prompt: PromptResolution::from(prompt::resolve()),
         api_key: env::var_os(OPENAI_API_KEY_ENV),
@@ -369,14 +424,34 @@ pub fn load() -> StartupConfiguration {
 }
 
 fn resolve_startup(input: StartupInput) -> StartupConfiguration {
-    let (api_key, api_key_presence, api_key_problem) = resolve_api_key(input.api_key);
+    let StartupInput {
+        worker_path,
+        model,
+        thinking,
+        home,
+        workspace_root,
+        prompt,
+        api_key: api_key_input,
+    } = input;
+    let (api_key, api_key_presence, api_key_problem) = resolve_api_key(api_key_input);
     let exposed_api_key = api_key.as_ref().map(ApiKey::expose);
-    let (model, model_problem) = resolve_model(input.model, exposed_api_key);
-    let (worker_path, worker_problem) = resolve_worker_path(input.worker_path, exposed_api_key);
+    let settings = settings::resolve(settings::Input {
+        home,
+        workspace_root: workspace_root.as_ref().ok().cloned(),
+        model,
+        thinking,
+    });
+    let model = settings.model();
+    let thinking = settings.thinking();
+    let settings_context = settings.context().clone();
+    let settings_problems = settings
+        .problems()
+        .iter()
+        .map(|problem| startup_settings_problem(problem, exposed_api_key));
+    let (worker_path, worker_problem) = resolve_worker_path(worker_path, exposed_api_key);
     let (workspace_root, workspace_problem) =
-        resolve_workspace_root(input.workspace_root, exposed_api_key);
-    let (prompt_source, system_prompt, prompt_problem) =
-        resolve_prompt(input.prompt, exposed_api_key);
+        resolve_workspace_root(workspace_root, exposed_api_key);
+    let (prompt_source, system_prompt, prompt_problem) = resolve_prompt(prompt, exposed_api_key);
 
     let worker_path_display = worker_path
         .as_deref()
@@ -389,7 +464,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     let mut problems = Vec::new();
     problems.extend(worker_problem);
     problems.extend(workspace_problem);
-    problems.extend(model_problem);
+    problems.extend(settings_problems);
     problems.extend(prompt_problem);
     problems.extend(api_key_problem);
     problems.sort_by_key(|problem| problem.kind.order());
@@ -399,6 +474,8 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
             worker_path: worker_path_display,
             workspace_root: workspace_root_display,
             model,
+            thinking,
+            settings: settings_context,
             prompt_source: prompt_source_display,
             api_key_presence,
             problems,
@@ -413,36 +490,24 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     }
 }
 
-fn resolve_model(
-    model: Option<OsString>,
-    api_key: Option<&str>,
-) -> (&'static ModelConfiguration, Option<StartupProblem>) {
-    let Some(model) = model else {
-        return (DEFAULT_MODEL, None);
+fn startup_settings_problem(problem: &settings::Problem, api_key: Option<&str>) -> StartupProblem {
+    let kind = match problem.kind() {
+        settings::ProblemKind::UserUnreadable => StartupProblemKind::UserSettingsUnreadable,
+        settings::ProblemKind::UserInvalidUtf8 => StartupProblemKind::UserSettingsInvalidUtf8,
+        settings::ProblemKind::UserMalformed => StartupProblemKind::UserSettingsMalformed,
+        settings::ProblemKind::UserInvalid => StartupProblemKind::UserSettingsInvalid,
+        settings::ProblemKind::ProjectUnreadable => StartupProblemKind::ProjectSettingsUnreadable,
+        settings::ProblemKind::ProjectInvalidUtf8 => StartupProblemKind::ProjectSettingsInvalidUtf8,
+        settings::ProblemKind::ProjectMalformed => StartupProblemKind::ProjectSettingsMalformed,
+        settings::ProblemKind::ProjectInvalid => StartupProblemKind::ProjectSettingsInvalid,
+        settings::ProblemKind::ModelInvalidUnicode => StartupProblemKind::ModelInvalidUnicode,
+        settings::ProblemKind::ModelUnknown => StartupProblemKind::ModelUnknown,
+        settings::ProblemKind::ThinkingInvalidUnicode => StartupProblemKind::ThinkingInvalidUnicode,
+        settings::ProblemKind::ThinkingEmpty => StartupProblemKind::ThinkingEmpty,
+        settings::ProblemKind::ThinkingUnknown => StartupProblemKind::ThinkingUnknown,
+        settings::ProblemKind::ThinkingUnsupported => StartupProblemKind::ThinkingUnsupported,
     };
-    let Ok(model) = model.into_string() else {
-        return (
-            DEFAULT_MODEL,
-            Some(StartupProblem::new(
-                StartupProblemKind::ModelInvalidUnicode,
-                "KIKI_MODEL is not valid Unicode.",
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.",
-                api_key,
-            )),
-        );
-    };
-    match model_by_id(&model) {
-        Some(model) => (model, None),
-        None => (
-            DEFAULT_MODEL,
-            Some(StartupProblem::new(
-                StartupProblemKind::ModelUnknown,
-                format!("KIKI_MODEL `{model}` is not a supported model."),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.",
-                api_key,
-            )),
-        ),
-    }
+    StartupProblem::new(kind, problem.diagnostic(), problem.remediation(), api_key)
 }
 
 fn resolve_api_key(
@@ -595,6 +660,8 @@ pub(crate) fn ready_snapshot_for_test() -> StartupSnapshot {
     resolve_startup(StartupInput {
         worker_path: Some(OsString::from("/opt/kiki/bin/monty")),
         model: None,
+        thinking: None,
+        home: None,
         workspace_root: Ok(PathBuf::from("/workspace/project")),
         prompt: PromptResolution::Resolved {
             text: "system instructions".to_owned(),
@@ -625,6 +692,7 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fs;
     use std::io;
     use std::path::PathBuf;
 
@@ -633,6 +701,7 @@ mod tests {
         models::{LUNA, SOL, TERRA},
     };
     use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
+    use tempfile::tempdir;
 
     use super::{
         ApiKeyPresence, MAX_STARTUP_DIAGNOSTIC_BYTES, MAX_STARTUP_PATH_BYTES,
@@ -656,10 +725,28 @@ mod tests {
         StartupInput {
             worker_path: Some(OsString::from(WORKER_PATH)),
             model: None,
+            thinking: None,
+            home: None,
             workspace_root: Ok(PathBuf::from(WORKSPACE_ROOT)),
             prompt: bundled_prompt(),
             api_key: Some(api_key.into()),
         }
+    }
+
+    fn ready_input_with_settings(
+        home: &std::path::Path,
+        workspace_root: &std::path::Path,
+    ) -> StartupInput {
+        let mut input = ready_input("key");
+        input.home = Some(home.as_os_str().to_os_string());
+        input.workspace_root = Ok(workspace_root.to_path_buf());
+        input
+    }
+
+    fn write_settings(root: &std::path::Path, content: &str) {
+        let path = root.join(".kiki/config.toml");
+        fs::create_dir_all(path.parent().expect("settings parent")).expect("settings directory");
+        fs::write(path, content).expect("settings file");
     }
 
     fn problem_kinds(input: StartupInput) -> Vec<StartupProblemKind> {
@@ -751,6 +838,104 @@ mod tests {
     }
 
     #[test]
+    fn hierarchical_settings_flow_into_snapshot_and_ready_startup() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "model = \"openai/gpt-5.6-sol\"\n\n[thinking]\n\"openai/gpt-5.6-sol\" = \"low\"\n",
+        );
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\n\n[thinking]\n\"openai/gpt-5.6-terra\" = \"high\"\n",
+        );
+        let mut input = ready_input_with_settings(home.path(), project.path());
+        input.model = Some(OsString::from(LUNA.id));
+        input.thinking = Some(OsString::from("max"));
+
+        let configuration = resolve_startup(input);
+        let snapshot = configuration.snapshot();
+
+        let user_settings_path = home.path().join(".kiki/config.toml");
+        let project_settings_path = project.path().join(".kiki/config.toml");
+        assert_eq!(snapshot.model().id, LUNA.id);
+        assert_eq!(snapshot.thinking(), "max");
+        assert_eq!(
+            snapshot.settings().user_path(),
+            Some(user_settings_path.as_path())
+        );
+        assert_eq!(
+            snapshot.settings().project_path(),
+            Some(project_settings_path.as_path())
+        );
+        assert_eq!(snapshot.settings().thinking_for(&SOL), Some("low"));
+        assert_eq!(snapshot.settings().thinking_for(&TERRA), Some("high"));
+        let ready = configuration.ready().expect("ready configuration");
+        assert_eq!(ready.thinking(), "max");
+        assert_eq!(ready.settings().thinking_for(&TERRA), Some("high"));
+    }
+
+    #[test]
+    fn invalid_file_settings_disable_submission_with_source_specific_diagnostics() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(home.path(), "model = [\n");
+        write_settings(
+            project.path(),
+            "[thinking]\n\"openai/gpt-5.6-sol\" = \"untrusted-value\"\n",
+        );
+
+        let configuration = resolve_startup(ready_input_with_settings(home.path(), project.path()));
+        let snapshot = configuration.snapshot();
+
+        assert_eq!(
+            snapshot
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [
+                StartupProblemKind::UserSettingsMalformed,
+                StartupProblemKind::ProjectSettingsInvalid,
+            ]
+        );
+        assert_eq!(
+            snapshot.submission_availability(),
+            SubmissionAvailability::Unavailable
+        );
+        assert!(configuration.ready().is_none());
+    }
+
+    #[test]
+    fn settings_diagnostics_and_snapshot_debug_redact_untrusted_content_and_paths() {
+        let temporary = tempdir().expect("temporary directory");
+        let secret = "sk-settings-SECRET";
+        let home = temporary.path().join(secret);
+        fs::create_dir_all(&home).expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(&home, &format!("\"{secret}\" = \"{secret}\"\n"));
+
+        let configuration = resolve_startup(ready_input_with_settings(&home, project.path()));
+        let snapshot = configuration.snapshot();
+        let rendered = crate::tui::format_startup_configuration(snapshot);
+
+        assert_eq!(
+            snapshot
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::UserSettingsInvalid]
+        );
+        assert!(rendered.contains(
+            "Problem: user settings file `~/.kiki/config.toml` contains an unknown field"
+        ));
+        assert!(rendered.contains("Remediation: Remove the unknown field"));
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(!format!("{snapshot:?}").contains(secret));
+    }
+
+    #[test]
     fn unqualified_and_unknown_models_disable_submission_with_a_diagnostic() {
         for model in ["gpt-4o", "gpt-5.6-sol", "gpt-5.6-unknown"] {
             let mut input = ready_input("key");
@@ -769,7 +954,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].diagnostic(),
-                format!("KIKI_MODEL `{model}` is not a supported model.")
+                "KIKI_MODEL is not a supported qualified model id."
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
@@ -820,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn model_diagnostic_redacts_an_api_key_used_as_the_model_id() {
+    fn model_diagnostic_does_not_echo_an_api_key_used_as_the_model_id() {
         let api_key = "sk-live-MODEL-SECRET";
         let mut input = ready_input(api_key);
         input.model = Some(OsString::from(api_key));
@@ -830,7 +1015,7 @@ mod tests {
 
         assert_eq!(
             diagnostic,
-            "KIKI_MODEL `[redacted]` is not a supported model."
+            "KIKI_MODEL is not a supported qualified model id."
         );
         assert!(!diagnostic.contains(api_key), "{diagnostic}");
     }
@@ -844,6 +1029,8 @@ mod tests {
         let input = StartupInput {
             worker_path: Some(worker_path.clone().into_os_string()),
             model: None,
+            thinking: None,
+            home: None,
             workspace_root: Ok(workspace_root.clone()),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),
@@ -1066,6 +1253,8 @@ mod tests {
         let input = StartupInput {
             worker_path: Some(OsString::from("relative-worker")),
             model: Some(OsString::from("gpt-4o")),
+            thinking: None,
+            home: None,
             workspace_root: Err(io::Error::other("workspace unavailable")),
             prompt: PromptResolution::Failed {
                 source: PromptSource::Override {
@@ -1182,6 +1371,8 @@ mod tests {
         let configuration = resolve_startup(StartupInput {
             worker_path: Some(OsString::from(format!("/worker/{api_key}/monty\t\x1b"))),
             model: None,
+            thinking: None,
+            home: None,
             workspace_root: Ok(PathBuf::from(format!("/workspace/{api_key}/project\r"))),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),

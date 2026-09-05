@@ -2472,6 +2472,7 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             snapshot.model().context_window_display,
             snapshot.model().max_output_display
         ),
+        format!("Thinking: {}", snapshot.thinking()),
         format!("Prompt: {prompt_source}"),
         format!("OpenAI API key: {api_key_presence}"),
         format!("Submission: {submission}"),
@@ -4354,6 +4355,7 @@ result
 Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
 Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
+Thinking: medium
 Prompt: bundled read_only_agent
 OpenAI API key: present
 Submission: available
