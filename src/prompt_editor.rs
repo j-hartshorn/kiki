@@ -1,7 +1,7 @@
 use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
-const MAX_PROMPT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptEdit {
@@ -116,6 +116,22 @@ impl PromptEditor {
                     .then_some((row - self.viewport_top, column))
             }),
         }
+    }
+
+    pub(crate) fn insert_paste(&mut self, text: &str) -> bool {
+        let mut end = text
+            .len()
+            .min(MAX_PROMPT_BYTES.saturating_sub(self.text.len()));
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            return false;
+        }
+        self.text.insert_str(self.caret, &text[..end]);
+        self.caret += end;
+        self.preferred_column = None;
+        true
     }
 
     fn insert(&mut self, character: char) -> bool {
@@ -387,9 +403,7 @@ fn byte_at_column(text: &str, row: &VisualRow, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptEdit, PromptEditor};
-
-    const MAX_PROMPT_BYTES: usize = 16 * 1024;
+    use super::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
 
     fn from_text(text: &str) -> PromptEditor {
         let mut editor = PromptEditor::default();
@@ -447,6 +461,30 @@ mod tests {
             editor.text(),
             format!("{}🦀a", "a".repeat(MAX_PROMPT_BYTES - '🦀'.len_utf8() - 1))
         );
+    }
+
+    #[test]
+    fn bulk_paste_splices_a_fitting_utf8_prefix_at_the_caret() {
+        let mut interior = from_text("α\nγ");
+        assert!(interior.apply(PromptEdit::Left, 80));
+        assert!(interior.insert_paste("β\n"));
+        assert!(interior.apply(PromptEdit::Insert('δ'), 80));
+        assert_eq!(interior.text(), "α\nβ\nδγ");
+
+        let mut exact = PromptEditor::default();
+        assert!(exact.insert_paste(&"x".repeat(MAX_PROMPT_BYTES)));
+        assert_eq!(exact.text().len(), MAX_PROMPT_BYTES);
+
+        let mut truncated = from_text(&"a".repeat(MAX_PROMPT_BYTES - 3));
+        assert!(truncated.insert_paste("é🦀z"));
+        assert_eq!(
+            truncated.text(),
+            format!("{}é", "a".repeat(MAX_PROMPT_BYTES - 3))
+        );
+
+        let mut no_room = from_text(&"a".repeat(MAX_PROMPT_BYTES - 1));
+        assert!(!no_room.insert_paste("é"));
+        assert!(!PromptEditor::default().insert_paste(""));
     }
 
     #[test]
