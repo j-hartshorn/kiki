@@ -1367,11 +1367,12 @@ mod tests {
     #[test]
     fn responsiveness_tolerance_is_inclusive() {
         for tolerance in [Duration::from_nanos(16_700_000), Duration::from_millis(50)] {
-            assert!(within_responsiveness_tolerance(tolerance, tolerance));
-            assert!(!within_responsiveness_tolerance(
-                tolerance + Duration::from_nanos(1),
-                tolerance
-            ));
+            for (observed, expected) in [
+                (tolerance, true),
+                (tolerance + Duration::from_nanos(1), false),
+            ] {
+                assert_eq!(observed <= tolerance, expected);
+            }
         }
     }
 
@@ -1380,8 +1381,9 @@ mod tests {
         samples[(samples.len() * 95).div_ceil(100) - 1]
     }
 
-    fn within_responsiveness_tolerance(observed: Duration, tolerance: Duration) -> bool {
-        observed <= tolerance
+    fn require_release_benchmark() {
+        #[cfg(debug_assertions)]
+        panic!("responsiveness benchmark requires a release build");
     }
 
     struct ResponsivenessFrame {
@@ -1482,10 +1484,7 @@ mod tests {
     #[test]
     #[ignore = "run with --release --ignored to measure TUI responsiveness"]
     fn responsiveness_benchmark() {
-        assert!(
-            !cfg!(debug_assertions),
-            "responsiveness benchmark requires a release build"
-        );
+        require_release_benchmark();
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
@@ -1619,18 +1618,9 @@ mod tests {
             "responsiveness benchmark: target 8.3ms; tolerance 16.7ms; paste tolerance 50ms; key p95 {key_p95:?}; scroll p95 {scroll_p95:?}; paste {paste_sample:?}"
         );
         assert_eq!(app.prompt.text().len(), 65_536);
-        assert!(within_responsiveness_tolerance(
-            key_p95,
-            key_scroll_tolerance
-        ));
-        assert!(within_responsiveness_tolerance(
-            scroll_p95,
-            key_scroll_tolerance
-        ));
-        assert!(within_responsiveness_tolerance(
-            paste_sample,
-            paste_tolerance
-        ));
+        assert!(key_p95 <= key_scroll_tolerance);
+        assert!(scroll_p95 <= key_scroll_tolerance);
+        assert!(paste_sample <= paste_tolerance);
     }
 
     fn app_with_history(mut app: App) -> App {
@@ -2034,8 +2024,10 @@ mod tests {
             FakeInput::new([Some(Event::Paste(String::new())), Some(quit_event())]);
         assert_eq!(run_transcript_loop(&mut noop, &mut noop_input), 1);
 
-        let mut notice = App::default();
-        notice.notice = Some(super::Notice::Copied);
+        let mut notice = App {
+            notice: Some(super::Notice::Copied),
+            ..App::default()
+        };
         let mut notice_input =
             FakeInput::new([Some(Event::Paste(String::new())), Some(quit_event())]);
         assert_eq!(run_transcript_loop(&mut notice, &mut notice_input), 2);
