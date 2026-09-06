@@ -17,22 +17,22 @@ pub mod tui;
 use std::error::Error;
 
 use tokio::runtime::Builder;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::agent::Agent;
 use crate::arena::Arena;
+use crate::config::ModelSelection;
 use crate::openai::OpenAiModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
 use crate::tools::ToolHost;
 
-fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
-    OpenAiModel::new(
-        ready.system_prompt(),
-        ready.api_key().expose(),
-        ready.model(),
-    )
+fn production_model(
+    ready: &config::ReadyStartup<'_>,
+    settings: watch::Receiver<ModelSelection>,
+) -> OpenAiModel {
+    OpenAiModel::with_settings(ready.system_prompt(), ready.api_key().expose(), settings)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -42,7 +42,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
-    let model = production_model(&ready);
+    let selection = ModelSelection::new(ready.model(), ready.thinking())
+        .expect("ready startup selection must be valid");
+    let (settings, model_settings) = watch::channel(selection);
+    let model = production_model(&ready, model_settings);
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let tool_host = match runtime.block_on(ToolHost::new(workspace_root)) {
@@ -60,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let startup = configuration.snapshot().clone();
-    let controller = RuntimeController::new(Agent::new(arena, model));
+    let controller = RuntimeController::new(Agent::new(arena, model), settings);
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =
@@ -84,11 +87,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::production_model;
-    use crate::config::ReadyStartup;
+    use tokio::sync::watch;
+
+    use crate::config::{ModelSelection, ReadyStartup};
     use crate::openai::OpenAiModel;
 
     #[test]
     fn production_model_composition_is_openai() {
-        let _: for<'a> fn(&ReadyStartup<'a>) -> OpenAiModel = production_model;
+        let _: for<'a> fn(&ReadyStartup<'a>, watch::Receiver<ModelSelection>) -> OpenAiModel =
+            production_model;
     }
 }

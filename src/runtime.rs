@@ -1,9 +1,12 @@
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEvidence};
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
+#[cfg(test)]
+use crate::config::DEFAULT_MODEL;
+use crate::config::ModelSelection;
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -14,7 +17,13 @@ pub(crate) struct ModelStepId(pub(crate) u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeCommand {
-    Submit { request: String },
+    Submit {
+        request: String,
+    },
+    ApplySettings {
+        selection: ModelSelection,
+        revision: u64,
+    },
     Cancel,
     Shutdown,
 }
@@ -123,6 +132,9 @@ pub(crate) enum RuntimeEvent {
     RunSettled {
         run_id: RunId,
     },
+    SettingsAccepted {
+        revision: u64,
+    },
     SubmissionRejectedBusy {
         active_run_id: RunId,
     },
@@ -188,6 +200,7 @@ pub(crate) struct RuntimeController<M: Model> {
     records: Vec<StoredRecord>,
     next_run_id: u64,
     next_model_step_id: u64,
+    settings: watch::Sender<ModelSelection>,
     active: Option<ActiveRun<M>>,
 }
 
@@ -264,6 +277,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::ExecutionStarted { .. }
         | RuntimeEvent::RecordAppended { .. }
         | RuntimeEvent::RunSettled { .. }
+        | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
@@ -293,15 +307,30 @@ fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting
 }
 
 impl<M: Model> RuntimeController<M> {
-    pub(crate) fn new(agent: Agent<M>) -> Self {
+    pub(crate) fn new(agent: Agent<M>, settings: watch::Sender<ModelSelection>) -> Self {
         Self {
             agent: Some(agent),
             disabled_reason: None,
             records: Vec::new(),
             next_run_id: 1,
             next_model_step_id: 1,
+            settings,
             active: None,
         }
+    }
+
+    #[cfg(test)]
+    fn for_test(agent: Agent<M>) -> Self {
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("default model selection must be valid");
+        let (settings, _) = watch::channel(selection);
+        Self::new(agent, settings)
+    }
+
+    #[cfg(test)]
+    fn with_settings(mut self, settings: watch::Sender<ModelSelection>) -> Self {
+        self.settings = settings;
+        self
     }
 
     pub(crate) async fn run(
@@ -406,6 +435,13 @@ impl<M: Model> RuntimeController<M> {
                 } else {
                     self.start_run(request, events, progress);
                 }
+            }
+            RuntimeCommand::ApplySettings {
+                selection,
+                revision,
+            } => {
+                self.settings.send_replace(selection);
+                self.emit(events, RuntimeEvent::SettingsAccepted { revision });
             }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
             RuntimeCommand::Shutdown => {
@@ -883,12 +919,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{Notify, mpsc, watch};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -904,10 +940,14 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, RecoveryTestGate, ToolCall,
         ToolCallSummary, ToolName,
     };
+    use crate::config::{
+        ModelSelection,
+        models::{LUNA, SOL, TERRA},
+    };
     use crate::model::{
-        AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId, ModelError,
-        ModelFailure, ModelHistory, ModelProgress, ModelStep, ProviderFailure, ProviderReplay,
-        ScriptedAction as ModelAction, ScriptedModel,
+        AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId,
+        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
+        ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::tools::{ReadTestGate, ToolHost};
     use tokio_util::sync::CancellationToken;
@@ -932,7 +972,7 @@ mod tests {
         )
         .await
         .expect("create arena");
-        RuntimeController::new(Agent::new(arena, model))
+        RuntimeController::for_test(Agent::new(arena, model))
     }
 
     async fn controller(
@@ -1069,6 +1109,7 @@ mod tests {
             RuntimeEvent::StdoutTruncated { .. } => "stdout-truncated".to_owned(),
             RuntimeEvent::RecordAppended { record, .. } => record_label(record),
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
+            RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
@@ -1205,6 +1246,511 @@ mod tests {
             step_id: ModelStepId(1),
             progress: ModelProgress::AssistantTextChunk { text },
         }
+    }
+
+    struct GatedSelectionModel {
+        selection: watch::Receiver<ModelSelection>,
+        first_snapshotted: Arc<Notify>,
+        allow_first_step: Arc<Notify>,
+        observed: Arc<Mutex<Vec<ModelSelection>>>,
+        step: u8,
+    }
+
+    impl Model for GatedSelectionModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let selection = *self.selection.borrow_and_update();
+                self.observed.lock().unwrap().push(selection);
+                let action = match self.step {
+                    0 => {
+                        self.first_snapshotted.notify_one();
+                        self.allow_first_step.notified().await;
+                        CompletedModelAction::Code {
+                            source: "value = 1".to_owned(),
+                            call_id: ModelCallId::new("first"),
+                        }
+                    }
+                    1 => CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn active_settings_update_applies_to_the_next_model_step_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let first_snapshotted = Arc::new(Notify::new());
+        let allow_first_step = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            GatedSelectionModel {
+                selection: selection_receiver,
+                first_snapshotted: first_snapshotted.clone(),
+                allow_first_step: allow_first_step.clone(),
+                observed: observed.clone(),
+                step: 0,
+            },
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        first_snapshotted.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+
+        allow_first_step.notify_one();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(*observed.lock().unwrap(), [selection_a, selection_b]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SettingsAccepted { .. }))
+        );
+        assert_eq!(records.len(), 3);
+    }
+
+    struct SelectionMessageModel {
+        selection: watch::Receiver<ModelSelection>,
+        observed: Arc<Mutex<Vec<ModelSelection>>>,
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+    }
+
+    impl Model for SelectionMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(*self.selection.borrow_and_update());
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct SnapshotAfterGateModel {
+        selection: watch::Receiver<ModelSelection>,
+        before_snapshot: Arc<Notify>,
+        allow_snapshot: Arc<Notify>,
+        observed: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl Model for SnapshotAfterGateModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.before_snapshot.notify_one();
+                self.allow_snapshot.notified().await;
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(*self.selection.borrow_and_update());
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct CancelThenMessageSelectionModel {
+        selection: watch::Receiver<ModelSelection>,
+        first_snapshotted: Arc<Notify>,
+        observed: Arc<Mutex<Vec<ModelSelection>>>,
+        step: u8,
+    }
+
+    impl Model for CancelThenMessageSelectionModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(*self.selection.borrow_and_update());
+                if self.step == 0 {
+                    self.step = 1;
+                    self.first_snapshotted.notify_one();
+                    cancellation.cancelled().await;
+                    return Err(ModelError::Cancelled.into());
+                }
+                self.step += 1;
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "later done".to_owned(),
+                    },
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_acknowledgements_are_ordered_and_idle_updates_keep_only_the_latest_pair() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            SelectionMessageModel {
+                selection: selection_receiver,
+                observed: observed.clone(),
+                contexts: contexts.clone(),
+            },
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        for (selection, revision) in [(selection_b, 7), (selection_c, 8)] {
+            commands
+                .send(RuntimeCommand::ApplySettings {
+                    selection,
+                    revision,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 7 }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 8 }
+        );
+        assert!(events.try_recv().is_err());
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let settled = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(*observed.lock().unwrap(), [selection_c]);
+        assert_eq!(
+            *contexts.lock().unwrap(),
+            [vec![ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]]
+        );
+        assert!(
+            settled
+                .iter()
+                .all(|event| !matches!(event, RuntimeEvent::SettingsAccepted { .. }))
+        );
+        assert!(matches!(
+            records.as_slice(),
+            [
+                StoredRecord {
+                    record: Record::UserRequest { request },
+                    ..
+                },
+                StoredRecord {
+                    record: Record::FinalMessage { text, .. },
+                    ..
+                },
+            ] if request == "inspect" && text == "done"
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_settings_updates_keep_only_the_latest_complete_pair() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let first_snapshotted = Arc::new(Notify::new());
+        let allow_first_step = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            GatedSelectionModel {
+                selection: selection_receiver,
+                first_snapshotted: first_snapshotted.clone(),
+                allow_first_step: allow_first_step.clone(),
+                observed: observed.clone(),
+                step: 0,
+            },
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        first_snapshotted.notified().await;
+        for (selection, revision) in [(selection_b, 1), (selection_c, 2)] {
+            commands
+                .send(RuntimeCommand::ApplySettings {
+                    selection,
+                    revision,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended { .. }
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 2 }
+        );
+        allow_first_step.notify_one();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.as_slice(), [selection_a, selection_c]);
+        assert!(std::ptr::eq(observed[1].model(), &LUNA));
+        assert_eq!(observed[1].thinking(), "max");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_command_before_the_step_snapshot_applies_to_that_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let before_snapshot = Arc::new(Notify::new());
+        let allow_snapshot = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            SnapshotAfterGateModel {
+                selection: selection_receiver,
+                before_snapshot: before_snapshot.clone(),
+                allow_snapshot: allow_snapshot.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        before_snapshot.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended { .. }
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        allow_snapshot.notify_one();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+
+        assert_eq!(*observed.lock().unwrap(), [selection_b]);
+    }
+
+    #[tokio::test]
+    async fn active_settings_survive_cancellation_and_drive_a_later_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let first_snapshotted = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            CancelThenMessageSelectionModel {
+                selection: selection_receiver,
+                first_snapshotted: first_snapshotted.clone(),
+                observed: observed.clone(),
+                step: 0,
+            },
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        first_snapshotted.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended { .. }
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        let cancelled = events_until_settled(&mut events).await;
+        assert!(matches!(
+            cancelled.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::CancelledRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "later".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(*observed.lock().unwrap(), [selection_a, selection_b]);
+        assert!(matches!(
+            records.as_slice(),
+            [
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest { .. },
+                },
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun { .. },
+                },
+                StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest { .. },
+                },
+                StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::FinalMessage { text, .. },
+                },
+            ] if text == "later done"
+        ));
     }
 
     struct ProgressModel {
@@ -1951,7 +2497,7 @@ mod tests {
         )
         .await
         .expect("create arena");
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             ScriptedModel::new(vec![ModelAction::Code {
                 source: "print('before cancellation')\nawait read('blocked')".to_owned(),
@@ -2868,7 +3414,7 @@ mod tests {
         )
         .await
         .expect("create arena");
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             SummaryCodeModel {
                 source: "contents = await read('Cargo.toml')".to_owned(),
@@ -3706,7 +4252,7 @@ mod tests {
         .expect("create arena");
         arena.fail_next_recovery_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             RecoveryFailureModel {
                 calls: calls.clone(),
@@ -3797,7 +4343,7 @@ mod tests {
         .expect("create arena");
         arena.fail_next_recovery_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             RecoveryFailureModel {
                 calls: calls.clone(),
@@ -3865,7 +4411,7 @@ mod tests {
         .expect("create arena");
         arena.fail_next_recovery_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             RecoveryFailureModel {
                 calls: calls.clone(),
@@ -3937,7 +4483,7 @@ mod tests {
         .with_recovery_test_gate(recovery_gate.clone());
         arena.fail_next_recovery_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
-        let controller = RuntimeController::new(Agent::new(
+        let controller = RuntimeController::for_test(Agent::new(
             arena,
             RecoveryFailureModel {
                 calls: calls.clone(),

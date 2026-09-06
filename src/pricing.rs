@@ -32,8 +32,8 @@ impl CostEstimate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunCostEstimate {
-    Complete(CostEstimate),
-    LowerBound(CostEstimate),
+    Complete(UsdNanos),
+    LowerBound(UsdNanos),
     Unavailable,
 }
 
@@ -144,9 +144,9 @@ pub fn estimate_run_cost<'a>(
     attempts: impl IntoIterator<Item = &'a AttemptAccounting>,
 ) -> RunCostEstimate {
     let mut known_amount = 0_u128;
+    let mut has_priced_usage = false;
     let mut is_lower_bound = false;
     let mut has_unpriceable = false;
-    let mut run_pricing: Option<PricingIdentity> = None;
 
     for attempt in attempts {
         let usage = match attempt {
@@ -164,27 +164,18 @@ pub fn estimate_run_cost<'a>(
             has_unpriceable = true;
             continue;
         };
-        if let Some(existing) = run_pricing {
-            if existing != estimate.pricing {
-                return RunCostEstimate::Unavailable;
-            }
-        } else {
-            run_pricing = Some(estimate.pricing);
-        }
         let Some(total) = known_amount.checked_add(estimate.amount.0) else {
             has_unpriceable = true;
             continue;
         };
         known_amount = total;
+        has_priced_usage = true;
     }
 
-    let Some(pricing) = run_pricing else {
+    if !has_priced_usage {
         return RunCostEstimate::Unavailable;
-    };
-    let estimate = CostEstimate {
-        amount: UsdNanos(known_amount),
-        pricing,
-    };
+    }
+    let estimate = UsdNanos(known_amount);
     if has_unpriceable || is_lower_bound {
         RunCostEstimate::LowerBound(estimate)
     } else {
@@ -195,7 +186,7 @@ pub fn estimate_run_cost<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CostEstimate, PricingError, RunCostEstimate, UsageCategory, estimate_run_cost,
+        CostEstimate, PricingError, RunCostEstimate, UsageCategory, UsdNanos, estimate_run_cost,
         estimate_usage,
     };
     use crate::{
@@ -207,7 +198,14 @@ mod tests {
     };
 
     fn usage(input: u64, cached: u64, cache_write: u64, output: u64, reasoning: u64) -> ModelUsage {
-        usage_for("gpt-5.6-sol", input, cached, cache_write, output, reasoning)
+        usage_for(
+            "openai/gpt-5.6-sol",
+            input,
+            cached,
+            cache_write,
+            output,
+            reasoning,
+        )
     }
 
     fn usage_for(
@@ -232,6 +230,10 @@ mod tests {
 
     fn amount(estimate: CostEstimate) -> u128 {
         estimate.amount().as_nanos()
+    }
+
+    fn run_amount(estimate: UsdNanos) -> u128 {
+        estimate.as_nanos()
     }
 
     #[test]
@@ -265,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn prices_terra_and_luna_at_published_short_context_rates() {
+    fn prices_qualified_terra_and_luna_usage_at_published_short_context_rates() {
         for (model, expected_amount, pricing) in [
             (TERRA.id, 16_700, TERRA.pricing.identity),
             (LUNA.id, 1_670, LUNA.pricing.identity),
@@ -274,6 +276,7 @@ mod tests {
 
             assert_eq!(amount(estimate), expected_amount);
             assert_eq!(estimate.pricing(), pricing);
+            assert_eq!(estimate.pricing().model, model);
         }
     }
 
@@ -428,8 +431,7 @@ mod tests {
 
         match estimate_run_cost(&attempts) {
             RunCostEstimate::Complete(estimate) => {
-                assert_eq!(amount(estimate), 20_800_000_000);
-                assert_eq!(estimate.pricing(), SOL.pricing.identity);
+                assert_eq!(run_amount(estimate), 20_800_000_000);
             }
             estimate => panic!("expected complete estimate, got {estimate:?}"),
         }
@@ -444,21 +446,37 @@ mod tests {
 
         match estimate_run_cost(&attempts) {
             RunCostEstimate::Complete(estimate) => {
-                assert_eq!(amount(estimate), 33_400);
-                assert_eq!(estimate.pricing(), TERRA.pricing.identity);
+                assert_eq!(run_amount(estimate), 33_400);
             }
             estimate => panic!("expected complete estimate, got {estimate:?}"),
         }
     }
 
     #[test]
-    fn run_cost_is_unavailable_when_attempts_mix_different_models() {
+    fn run_cost_sums_qualified_attempts_from_different_models() {
         let attempts = [
             AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
             AttemptAccounting::KnownUsage(usage_for(LUNA.id, 3, 1, 1, 1, 0)),
         ];
 
-        assert_eq!(estimate_run_cost(&attempts), RunCostEstimate::Unavailable);
+        match estimate_run_cost(&attempts) {
+            RunCostEstimate::Complete(estimate) => assert_eq!(run_amount(estimate), 18_370),
+            estimate => panic!("expected complete estimate, got {estimate:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_model_run_cost_preserves_lower_bound_semantics() {
+        let attempts = [
+            AttemptAccounting::KnownUsage(usage_for(TERRA.id, 3, 1, 1, 1, 0)),
+            AttemptAccounting::KnownUsageWithUntrackedRetries(usage_for(LUNA.id, 3, 1, 1, 1, 0)),
+            AttemptAccounting::UsageUnavailable,
+        ];
+
+        match estimate_run_cost(&attempts) {
+            RunCostEstimate::LowerBound(estimate) => assert_eq!(run_amount(estimate), 18_370),
+            estimate => panic!("expected lower-bound estimate, got {estimate:?}"),
+        }
     }
 
     #[test]
@@ -494,7 +512,9 @@ mod tests {
                 .into_iter()
                 .flatten(),
         ) {
-            RunCostEstimate::LowerBound(estimate) => assert_eq!(amount(estimate), 20_800_000_000),
+            RunCostEstimate::LowerBound(estimate) => {
+                assert_eq!(run_amount(estimate), 20_800_000_000)
+            }
             estimate => panic!("expected lower bound, got {estimate:?}"),
         }
     }
@@ -511,7 +531,7 @@ mod tests {
         ] {
             match estimate_run_cost(&attempts) {
                 RunCostEstimate::LowerBound(estimate) => {
-                    assert_eq!(amount(estimate), 800_000_000);
+                    assert_eq!(run_amount(estimate), 800_000_000);
                 }
                 estimate => panic!("expected lower bound, got {estimate:?}"),
             }

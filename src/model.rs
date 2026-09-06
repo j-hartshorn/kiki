@@ -344,6 +344,8 @@ pub enum ModelError {
     Exhausted,
     #[error("model provider failed: {0}")]
     Provider(Box<ProviderFailure>),
+    #[error("model selection is invalid: {0}")]
+    InvalidSelection(&'static str),
     #[error("model request history is invalid: {0}")]
     InvalidHistory(&'static str),
     #[error("model response violated the action protocol: {0}")]

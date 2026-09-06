@@ -26,6 +26,8 @@ pub struct ModelPricing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelConfiguration {
     pub id: &'static str,
+    pub thinking_levels: &'static [&'static str],
+    pub default_thinking: &'static str,
     pub service_tier: &'static str,
     pub context_window_tokens: u64,
     pub context_window_display: &'static str,
@@ -34,8 +36,34 @@ pub struct ModelConfiguration {
     pub pricing: ModelPricing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSelection {
+    model: &'static ModelConfiguration,
+    thinking: &'static str,
+}
+
+impl ModelSelection {
+    pub fn new(model: &'static ModelConfiguration, thinking: &'static str) -> Option<Self> {
+        model
+            .supports_thinking(thinking)
+            .then_some(Self { model, thinking })
+    }
+
+    pub fn model(self) -> &'static ModelConfiguration {
+        self.model
+    }
+
+    pub fn thinking(self) -> &'static str {
+        self.thinking
+    }
+}
+
+pub static OPENAI_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
 pub static SOL: ModelConfiguration = ModelConfiguration {
-    id: "gpt-5.6-sol",
+    id: "openai/gpt-5.6-sol",
+    thinking_levels: OPENAI_THINKING_LEVELS,
+    default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
     context_window_display: "1.05m",
@@ -43,7 +71,7 @@ pub static SOL: ModelConfiguration = ModelConfiguration {
     max_output_display: "128k",
     pricing: ModelPricing {
         identity: PricingIdentity {
-            model: "gpt-5.6-sol",
+            model: "openai/gpt-5.6-sol",
             service_tier: "default",
             version: "2026-08-27",
             source: "https://developers.openai.com/api/docs/pricing",
@@ -66,7 +94,9 @@ pub static SOL: ModelConfiguration = ModelConfiguration {
 };
 
 pub static TERRA: ModelConfiguration = ModelConfiguration {
-    id: "gpt-5.6-terra",
+    id: "openai/gpt-5.6-terra",
+    thinking_levels: OPENAI_THINKING_LEVELS,
+    default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
     context_window_display: "1.05m",
@@ -74,7 +104,7 @@ pub static TERRA: ModelConfiguration = ModelConfiguration {
     max_output_display: "128k",
     pricing: ModelPricing {
         identity: PricingIdentity {
-            model: "gpt-5.6-terra",
+            model: "openai/gpt-5.6-terra",
             service_tier: "default",
             version: "2026-08-27",
             source: "https://developers.openai.com/api/docs/pricing",
@@ -97,7 +127,9 @@ pub static TERRA: ModelConfiguration = ModelConfiguration {
 };
 
 pub static LUNA: ModelConfiguration = ModelConfiguration {
-    id: "gpt-5.6-luna",
+    id: "openai/gpt-5.6-luna",
+    thinking_levels: OPENAI_THINKING_LEVELS,
+    default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
     context_window_display: "1.05m",
@@ -105,7 +137,7 @@ pub static LUNA: ModelConfiguration = ModelConfiguration {
     max_output_display: "128k",
     pricing: ModelPricing {
         identity: PricingIdentity {
-            model: "gpt-5.6-luna",
+            model: "openai/gpt-5.6-luna",
             service_tier: "default",
             version: "2026-08-27",
             source: "https://developers.openai.com/api/docs/pricing",
@@ -130,6 +162,12 @@ pub static LUNA: ModelConfiguration = ModelConfiguration {
 pub static CATALOGUE: [&ModelConfiguration; 3] = [&SOL, &TERRA, &LUNA];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
+impl ModelConfiguration {
+    pub fn supports_thinking(&self, thinking: &str) -> bool {
+        self.thinking_levels.contains(&thinking)
+    }
+}
+
 pub fn model_by_id(id: &str) -> Option<&'static ModelConfiguration> {
     CATALOGUE.iter().copied().find(|model| model.id == id)
 }
@@ -138,14 +176,21 @@ pub fn model_by_id(id: &str) -> Option<&'static ModelConfiguration> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{CATALOGUE, DEFAULT_MODEL, LUNA, Rates, SOL, TERRA, model_by_id};
+    use super::{
+        CATALOGUE, DEFAULT_MODEL, LUNA, ModelSelection, OPENAI_THINKING_LEVELS, Rates, SOL, TERRA,
+        model_by_id,
+    };
 
     #[test]
     fn catalogue_contains_each_supported_model_once_and_defaults_to_sol() {
         assert_eq!(CATALOGUE.len(), 3);
         assert_eq!(
             CATALOGUE.map(|model| model.id),
-            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            [
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-terra",
+                "openai/gpt-5.6-luna"
+            ]
         );
         assert_eq!(
             CATALOGUE
@@ -162,6 +207,13 @@ mod tests {
     fn every_model_has_published_context_and_pricing_thresholds() {
         for model in CATALOGUE {
             assert_eq!(model.service_tier, "default");
+            assert_eq!(
+                model.thinking_levels,
+                &["none", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
+            assert_eq!(model.default_thinking, "medium");
+            assert!(model.thinking_levels.contains(&model.default_thinking));
             assert_eq!(model.context_window_tokens, 1_050_000);
             assert_eq!(model.context_window_display, "1.05m");
             assert_eq!(model.max_output_tokens, 128_000);
@@ -237,13 +289,30 @@ mod tests {
     }
 
     #[test]
+    fn selection_keeps_a_model_and_its_supported_thinking_together() {
+        let selection = ModelSelection::new(&TERRA, "high").expect("supported selection");
+
+        assert!(std::ptr::eq(selection.model(), &TERRA));
+        assert_eq!(selection.thinking(), "high");
+        assert_eq!(ModelSelection::new(&TERRA, "unsupported"), None);
+    }
+
+    #[test]
     fn lookup_requires_an_exact_supported_model_id() {
         for model in [&SOL, &TERRA, &LUNA] {
             let found = model_by_id(model.id).expect("supported model should be found");
             assert!(std::ptr::eq(found, model));
         }
 
-        for id in ["gpt-5.6", "GPT-5.6-SOL", "gpt-5.6-sol ", "unknown"] {
+        for id in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "openai/GPT-5.6-SOL",
+            "openai/gpt-5.6-sol ",
+            "unknown",
+        ] {
             assert_eq!(model_by_id(id), None);
         }
     }

@@ -1,4 +1,7 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Alignment, Rect};
@@ -12,9 +15,10 @@ use crate::arena::{
     Execution, ExecutionOutcome, Observation, RunPreview, ToolCall, ToolCallSummary, ToolCallToken,
     ToolName,
 };
+use crate::config::models::CATALOGUE;
 use crate::config::{
-    ApiKeyPresence, DEFAULT_MODEL, PromptProvenance, StartupSnapshot, SubmissionAvailability,
-    model_by_id,
+    ApiKeyPresence, DEFAULT_MODEL, ModelSelection, PromptProvenance, StartupSnapshot,
+    SubmissionAvailability, model_by_id,
 };
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
@@ -1343,14 +1347,15 @@ impl CardRenderBlock {
     }
 }
 
+#[derive(Clone)]
 struct FooterField {
     spans: Vec<Span<'static>>,
 }
 
 impl FooterField {
-    fn muted(text: String) -> Self {
+    fn muted(text: impl Into<String>) -> Self {
         Self {
-            spans: vec![Span::styled(text, muted_page_style())],
+            spans: vec![Span::styled(text.into(), muted_page_style())],
         }
     }
 
@@ -1359,69 +1364,350 @@ impl FooterField {
     }
 }
 
-fn join_fields(fields: &[FooterField]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" ", muted_page_style()));
+#[derive(Clone)]
+struct FooterIdentity {
+    cwd: Option<String>,
+    name: Option<String>,
+}
+
+impl FooterIdentity {
+    fn full(&self) -> String {
+        match (&self.cwd, &self.name) {
+            (Some(cwd), Some(name)) => format!("{cwd} ({name})"),
+            (Some(cwd), None) => cwd.clone(),
+            (None, Some(name)) => format!("({name})"),
+            (None, None) => String::new(),
         }
-        spans.extend(field.spans.clone());
     }
-    spans
+
+    fn preferred(&self) -> String {
+        match (&self.cwd, &self.name) {
+            (Some(cwd), Some(name)) => format!("{} ({name})", preferred_cwd(cwd)),
+            (Some(cwd), None) => preferred_cwd(cwd),
+            (None, Some(name)) => format!("({name})"),
+            (None, None) => String::new(),
+        }
+    }
+
+    fn truncated(&self, width: usize) -> Option<FooterField> {
+        let full = self.full();
+        if Line::raw(&full).width() <= width {
+            return Some(FooterField::muted(full));
+        }
+        let text = match (&self.cwd, &self.name) {
+            (Some(cwd), Some(name)) => {
+                let name = format!("({name})");
+                let cwd_width = width.saturating_sub(Line::raw(&name).width().saturating_add(1));
+                let cwd = truncate_cwd(cwd, cwd_width);
+                if cwd.is_empty() {
+                    truncate_end(&name, width)
+                } else {
+                    format!("{cwd} {name}")
+                }
+            }
+            (Some(cwd), None) => truncate_cwd(cwd, width),
+            (None, Some(name)) => truncate_end(&format!("({name})"), width),
+            (None, None) => String::new(),
+        };
+        (!text.is_empty()).then(|| FooterField::muted(text))
+    }
+}
+
+#[derive(Clone)]
+struct ModelFooter {
+    id: String,
+    thinking: String,
+}
+
+impl ModelFooter {
+    fn full(&self) -> String {
+        format!(
+            "{} • thinking {}",
+            display_model_id(&self.id),
+            self.thinking
+        )
+    }
+
+    fn truncated(&self, width: usize) -> Option<FooterField> {
+        let model = display_model_id(&self.id);
+        let thinking = format!("thinking {}", self.thinking);
+        let separator = " • ";
+        let full = self.full();
+        let text = if Line::raw(&full).width() <= width {
+            full
+        } else if width >= 1 + Line::raw(separator).width() + Line::raw(&thinking).width() {
+            format!(
+                "{}{}{}",
+                truncate_front(
+                    model,
+                    width - Line::raw(separator).width() - Line::raw(&thinking).width()
+                ),
+                separator,
+                thinking
+            )
+        } else {
+            truncate_end(&thinking, width)
+        };
+        (!text.is_empty()).then(|| FooterField::muted(text))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FooterContext {
+    pub(crate) workspace_root: Option<String>,
+    pub(crate) home: Option<PathBuf>,
+    pub(crate) name: Option<String>,
+    pub(crate) selection: ModelSelection,
 }
 
 struct Footer {
-    fields: Vec<FooterField>,
+    identity: Option<FooterIdentity>,
+    statistics: Vec<FooterField>,
+    model: Option<ModelFooter>,
+}
+
+struct FooterLayout {
+    identity: Option<FooterField>,
+    right: Vec<FooterField>,
+    statistics_len: usize,
+}
+
+impl FooterLayout {
+    fn right_spans(&self) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (index, field) in self.right.iter().enumerate() {
+            if index > 0 {
+                let separator = if index == self.statistics_len && self.statistics_len > 0 {
+                    "  "
+                } else {
+                    " "
+                };
+                spans.push(Span::styled(separator, muted_page_style()));
+            }
+            spans.extend(field.spans.clone());
+        }
+        spans
+    }
+
+    #[cfg(test)]
+    fn spans(&self) -> Vec<Span<'static>> {
+        let mut spans = self
+            .identity
+            .as_ref()
+            .map(|field| field.spans.clone())
+            .unwrap_or_default();
+        if self.identity.is_some() && !self.right.is_empty() {
+            spans.push(Span::styled(" ", muted_page_style()));
+        }
+        spans.extend(self.right_spans());
+        spans
+    }
+
+    fn rule_spans(&self, width: usize) -> Vec<Span<'static>> {
+        let right = self.right_spans();
+        let right_width = right.iter().map(Span::width).sum::<usize>();
+        let identity_width = self.identity.as_ref().map_or(0, FooterField::width);
+        let mut spans = self
+            .identity
+            .as_ref()
+            .map(|field| field.spans.clone())
+            .unwrap_or_default();
+        spans.push(Span::raw("─".repeat(
+            width.saturating_sub(identity_width.saturating_add(right_width)),
+        )));
+        spans.extend(right);
+        spans
+    }
 }
 
 impl Footer {
-    fn new(fields: Vec<FooterField>) -> Option<Self> {
-        (!fields.is_empty()).then_some(Self { fields })
+    fn new(
+        identity: Option<FooterIdentity>,
+        statistics: Vec<FooterField>,
+        model: Option<ModelFooter>,
+    ) -> Option<Self> {
+        (identity.is_some() || !statistics.is_empty() || model.is_some()).then_some(Self {
+            identity,
+            statistics,
+            model,
+        })
     }
 
+    #[cfg(test)]
     fn spans(&self) -> Vec<Span<'static>> {
-        join_fields(&self.fields)
+        self.layout(usize::MAX).spans()
     }
 
-    fn width(&self) -> usize {
-        self.fields.iter().map(FooterField::width).sum::<usize>()
-            + self.fields.len().saturating_sub(1)
-    }
-
-    fn truncated_spans(&self, width: u16) -> Vec<Span<'static>> {
-        if self.width() <= usize::from(width) {
-            return self.spans();
-        }
-        if width == 0 {
-            return Vec::new();
-        }
-        if width == 1 {
-            return vec![Span::styled("…", muted_page_style())];
-        }
-
-        let mut first = self.fields.len();
-        let mut used = 0_usize;
-        let available = usize::from(width.saturating_sub(2));
-        while first > 0 {
-            let field = &self.fields[first - 1];
-            let separator = usize::from(first < self.fields.len());
-            let field_width = field.width().saturating_add(separator);
-            if used.saturating_add(field_width) > available {
-                break;
+    fn layout(&self, width: usize) -> FooterLayout {
+        let mut statistics = self.statistics.clone();
+        let mut model = self
+            .model
+            .as_ref()
+            .and_then(|model| model.truncated(usize::MAX));
+        let full_identity = self.identity.as_ref().and_then(|identity| {
+            let text = identity.full();
+            (!text.is_empty()).then(|| FooterField::muted(text))
+        });
+        let preferred_identity = self.identity.as_ref().and_then(|identity| {
+            let text = identity.preferred();
+            (!text.is_empty()).then(|| FooterField::muted(text))
+        });
+        let identity = if footer_fits(width, full_identity.as_ref(), &statistics, model.as_ref()) {
+            full_identity
+        } else {
+            while !statistics.is_empty()
+                && !footer_fits(
+                    width,
+                    preferred_identity.as_ref(),
+                    &statistics,
+                    model.as_ref(),
+                )
+            {
+                statistics.remove(0);
             }
-            first -= 1;
-            used = used.saturating_add(field_width);
+            if footer_fits(
+                width,
+                preferred_identity.as_ref(),
+                &statistics,
+                model.as_ref(),
+            ) {
+                preferred_identity
+            } else {
+                let right_width = right_width(&statistics, model.as_ref());
+                if right_width > width {
+                    model = self.model.as_ref().and_then(|model| model.truncated(width));
+                    None
+                } else {
+                    self.identity.as_ref().and_then(|identity| {
+                        identity.truncated(
+                            width
+                                .saturating_sub(right_width)
+                                .saturating_sub(usize::from(right_width > 0)),
+                        )
+                    })
+                }
+            }
+        };
+        let statistics_len = statistics.len();
+        let mut right = statistics;
+        if let Some(model) = model {
+            right.push(model);
         }
-        if first == self.fields.len() {
-            return vec![Span::styled("…", muted_page_style())];
+        FooterLayout {
+            identity,
+            right,
+            statistics_len,
         }
+    }
+}
 
-        let mut spans = vec![
-            Span::styled("…", muted_page_style()),
-            Span::styled(" ", muted_page_style()),
-        ];
-        spans.extend(join_fields(&self.fields[first..]));
-        spans
+fn footer_fits(
+    width: usize,
+    identity: Option<&FooterField>,
+    statistics: &[FooterField],
+    model: Option<&FooterField>,
+) -> bool {
+    let right_width = right_width(statistics, model);
+    identity.map_or(right_width, |identity| {
+        identity
+            .width()
+            .saturating_add(right_width)
+            .saturating_add(usize::from(right_width > 0))
+    }) <= width
+}
+
+fn right_width(statistics: &[FooterField], model: Option<&FooterField>) -> usize {
+    let statistics_width = statistics.iter().map(FooterField::width).sum::<usize>()
+        + statistics.len().saturating_sub(1);
+    match model {
+        Some(model) if statistics_width > 0 => statistics_width + 2 + model.width(),
+        Some(model) => model.width(),
+        None => statistics_width,
+    }
+}
+
+fn display_model_id(id: &str) -> &str {
+    let mut providers = CATALOGUE
+        .iter()
+        .filter_map(|model| model.id.split_once('/').map(|(provider, _)| provider));
+    match providers.next() {
+        Some(provider) if providers.all(|candidate| candidate == provider) => {
+            id.split_once('/').map_or(id, |(_, model)| model)
+        }
+        _ => id,
+    }
+}
+
+fn truncate_front(text: &str, width: usize) -> String {
+    if Line::raw(text).width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut suffix = Vec::new();
+    let mut used = 1_usize;
+    for grapheme in text.graphemes(true).rev() {
+        let grapheme_width = Line::raw(grapheme).width();
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        suffix.push(grapheme);
+        used += grapheme_width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.concat())
+}
+
+fn truncate_end(text: &str, width: usize) -> String {
+    if Line::raw(text).width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut prefix = String::new();
+    let mut used = 1_usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = Line::raw(grapheme).width();
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        prefix.push_str(grapheme);
+        used += grapheme_width;
+    }
+    format!("{prefix}…")
+}
+
+fn preferred_cwd(cwd: &str) -> String {
+    let basename = cwd.rsplit('/').next().unwrap_or(cwd);
+    let shortened = if cwd.starts_with("~/") {
+        format!("~/…/{basename}")
+    } else {
+        format!("…/{basename}")
+    };
+    if Line::raw(&shortened).width() < Line::raw(cwd).width() {
+        shortened
+    } else {
+        cwd.to_owned()
+    }
+}
+
+fn truncate_cwd(cwd: &str, width: usize) -> String {
+    if Line::raw(cwd).width() <= width {
+        return cwd.to_owned();
+    }
+    let shortened = preferred_cwd(cwd);
+    if Line::raw(&shortened).width() <= width {
+        shortened
+    } else {
+        truncate_front(cwd, width)
     }
 }
 
@@ -1544,8 +1830,8 @@ impl TranscriptLayout {
         };
         match width {
             0 => Line::raw(""),
-            1 => Line::from(footer.truncated_spans(1)),
-            2 => Line::from(vec![Span::styled("…", muted_page_style()), Span::raw("─")]),
+            1 => Line::from(Span::styled("…", muted_page_style())),
+            2 => Line::from(vec![Span::raw("─"), Span::styled("…", muted_page_style())]),
             3 => Line::from(vec![
                 Span::raw("─"),
                 Span::styled("…", muted_page_style()),
@@ -1557,12 +1843,9 @@ impl TranscriptLayout {
                 Span::raw(" ─"),
             ]),
             _ => {
-                let mut footer = footer.truncated_spans(width - 4);
-                let footer_width = footer.iter().map(Span::width).sum::<usize>();
-                let leading_rules =
-                    usize::from(width).saturating_sub(footer_width.saturating_add(3));
-                let mut spans = vec![Span::raw("─".repeat(leading_rules)), Span::raw(" ")];
-                spans.append(&mut footer);
+                let layout = footer.layout(usize::from(width - 4));
+                let mut spans = vec![Span::raw("─ ")];
+                spans.extend(layout.rule_spans(usize::from(width - 4)));
                 spans.push(Span::raw(" ─"));
                 Line::from(spans)
             }
@@ -1914,6 +2197,7 @@ impl Transcript {
                 progress_gap,
             } => self.append_record(record, progress_gap),
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
+            RuntimeEvent::SettingsAccepted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.disabled_reason.is_none()
                     && (self.run_state == RunState::Submitting
@@ -1975,18 +2259,31 @@ impl Transcript {
     }
 
     pub(crate) fn layout(&mut self, width: u16) -> TranscriptLayout {
-        self.layout_with_cache(width, true)
+        self.layout_with_cache(width, true, None)
+    }
+
+    pub(crate) fn layout_with_footer(
+        &mut self,
+        width: u16,
+        context: FooterContext,
+    ) -> TranscriptLayout {
+        self.layout_with_cache(width, true, Some(context))
     }
 
     #[cfg(test)]
     pub(crate) fn layout_fresh(&mut self, width: u16) -> TranscriptLayout {
-        self.layout_with_cache(width, false)
+        self.layout_with_cache(width, false, None)
     }
 
-    fn layout_with_cache(&mut self, width: u16, use_cache: bool) -> TranscriptLayout {
+    fn layout_with_cache(
+        &mut self,
+        width: u16,
+        use_cache: bool,
+        footer_context: Option<FooterContext>,
+    ) -> TranscriptLayout {
         let show_reasoning = self.show_reasoning;
         let expand_arenas = self.expand_arenas;
-        let footer = self.footer();
+        let footer = self.footer(footer_context);
         let live_sources = self
             .live_step
             .as_ref()
@@ -2090,7 +2387,7 @@ impl Transcript {
         DisplayProjection { blocks }
     }
 
-    fn footer(&self) -> Option<Footer> {
+    fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
         let mut attempts = Vec::new();
         for displayed in &self.records {
             append_record_attempts(&displayed.record.record, &mut attempts);
@@ -2098,7 +2395,7 @@ impl Transcript {
         if let Some(live) = &self.live_step {
             attempts.extend(&live.settled_attempts);
         }
-        session_footer(&attempts)
+        session_footer(&attempts, context)
     }
 
     fn append_settled_blocks(&mut self, blocks: impl IntoIterator<Item = TranscriptBlock>) {
@@ -2369,7 +2666,7 @@ fn build_render_block(
                 )
             } else {
                 own_styled_text(
-                    Text::raw("reasoning hidden · Ctrl-T to show"),
+                    Text::raw("thinking hidden · Ctrl-T to show"),
                     dim_card_style(REASONING).add_modifier(Modifier::ITALIC),
                 )
             };
@@ -2472,6 +2769,7 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             snapshot.model().context_window_display,
             snapshot.model().max_output_display
         ),
+        format!("Thinking: {}", snapshot.thinking()),
         format!("Prompt: {prompt_source}"),
         format!("OpenAI API key: {api_key_presence}"),
         format!("Submission: {submission}"),
@@ -2872,18 +3170,17 @@ fn latest_context_field(usage: &ModelUsage) -> Option<FooterField> {
     } else {
         (model.context_window_tokens, model.context_window_display)
     };
-    let percent = (u128::from(total) * 100 + u128::from(capacity) / 2) / u128::from(capacity);
-    let style = if percent >= 90 {
+    let tenths = (u128::from(total) * 1_000 + u128::from(capacity) / 2) / u128::from(capacity);
+    let style = if tenths >= 900 {
         Style::new().fg(Color::Red)
-    } else if percent >= 80 {
+    } else if tenths >= 800 {
         Style::new().fg(Color::Yellow)
     } else {
         muted_page_style()
     };
     Some(FooterField {
         spans: vec![
-            Span::styled("C", muted_page_style()),
-            Span::styled(format!("{percent}%"), style),
+            Span::styled(format!("{}.{}%", tenths / 10, tenths % 10), style),
             Span::styled(format!("/{denominator}"), muted_page_style()),
         ],
     })
@@ -2893,22 +3190,25 @@ fn latest_cache_hit_field(usage: &ModelUsage) -> Option<FooterField> {
     match (usage.input_tokens, usage.cached_input_tokens) {
         (Some(input), Some(cached)) if input > 0 && cached <= input => {
             let tenths = (u128::from(cached) * 1_000 + u128::from(input) / 2) / u128::from(input);
-            Some(FooterField::muted(if tenths % 10 == 0 {
-                format!("H{}%", tenths / 10)
-            } else {
-                format!("H{}.{}%", tenths / 10, tenths % 10)
-            }))
+            Some(FooterField::muted(format!(
+                "CH{}.{}%",
+                tenths / 10,
+                tenths % 10
+            )))
         }
         _ => None,
     }
 }
 
-fn session_footer(attempts: &[&AttemptAccounting]) -> Option<Footer> {
+fn session_footer(
+    attempts: &[&AttemptAccounting],
+    context: Option<FooterContext>,
+) -> Option<Footer> {
     let mut accounting = SessionAccounting::default();
     for attempt in attempts {
         accounting.add(attempt);
     }
-    let mut fields = accounting_fields(&accounting)
+    let mut statistics = footer_accounting_fields(&accounting)
         .into_iter()
         .map(FooterField::muted)
         .collect::<Vec<_>>();
@@ -2916,18 +3216,162 @@ fn session_footer(attempts: &[&AttemptAccounting]) -> Option<Footer> {
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
     ) = attempts.iter().next_back()
+        && let Some(cache_hit) = latest_cache_hit_field(usage)
     {
-        if let Some(context) = latest_context_field(usage) {
-            fields.push(context);
-        }
-        if let Some(cache_hit) = latest_cache_hit_field(usage) {
-            fields.push(cache_hit);
-        }
+        statistics.push(cache_hit);
     }
-    if let Some(cost) = estimated_cost(attempts.iter().copied()) {
-        fields.push(FooterField::muted(cost));
+    if let Some(cost) = footer_estimated_cost(attempts.iter().copied()) {
+        statistics.push(FooterField::muted(cost));
     }
-    Footer::new(fields)
+    if let Some(
+        AttemptAccounting::KnownUsage(usage)
+        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
+    ) = attempts.iter().next_back()
+        && let Some(context) = latest_context_field(usage)
+    {
+        statistics.push(context);
+    }
+    let model = context.as_ref().map(|context| ModelFooter {
+        id: context.selection.model().id.to_owned(),
+        thinking: context.selection.thinking().to_owned(),
+    });
+    let identity = context.and_then(footer_identity);
+    Footer::new(identity, statistics, model)
+}
+
+fn footer_identity(context: FooterContext) -> Option<FooterIdentity> {
+    let cwd = context.workspace_root.map(|workspace_root| {
+        context
+            .home
+            .as_deref()
+            .and_then(|home| {
+                Path::new(&workspace_root)
+                    .strip_prefix(home)
+                    .ok()
+                    .map(|relative| {
+                        if relative.as_os_str().is_empty() {
+                            "~".to_owned()
+                        } else {
+                            format!("~/{}", relative.display())
+                        }
+                    })
+            })
+            .unwrap_or(workspace_root)
+    });
+    (cwd.is_some() || context.name.is_some()).then_some(FooterIdentity {
+        cwd,
+        name: context.name,
+    })
+}
+
+fn footer_accounting_fields(accounting: &SessionAccounting) -> Vec<String> {
+    [
+        ("↑", accounting.input),
+        ("↓", accounting.output),
+        ("R", accounting.cache_read),
+        ("W", accounting.cache_write),
+    ]
+    .into_iter()
+    .filter_map(|(label, total)| total.map(|total| format!("{label}{}", format_token_count(total))))
+    .collect()
+}
+
+fn format_token_count(value: u128) -> String {
+    const K: u128 = 1_000;
+    const M: u128 = 1_000_000;
+    if value < K {
+        return value.to_string();
+    }
+    if value >= M {
+        return format_token_count_with_suffix(value, M, "m");
+    }
+    let formatted = format_token_count_with_suffix(value, K, "k");
+    if formatted.starts_with("1000k") {
+        format_token_count_with_suffix(value, M, "m")
+    } else {
+        formatted
+    }
+}
+
+fn format_token_count_with_suffix(value: u128, base: u128, suffix: &str) -> String {
+    let whole = value / base;
+    let precision = if whole < 10 {
+        2
+    } else if whole < 100 {
+        1
+    } else {
+        0
+    };
+    let factor = 10_u128.pow(precision);
+    let scaled = whole
+        .saturating_mul(factor)
+        .saturating_add(((value % base).saturating_mul(factor) + base / 2) / base);
+    let integer = scaled / factor;
+    let fraction = scaled % factor;
+    if precision == 0 || fraction == 0 {
+        format!("{integer}{suffix}")
+    } else {
+        let fraction = format!("{fraction:0width$}", width = precision as usize)
+            .trim_end_matches('0')
+            .to_owned();
+        format!("{integer}.{fraction}{suffix}")
+    }
+}
+
+fn footer_estimated_cost<'a>(
+    attempts: impl IntoIterator<Item = &'a AttemptAccounting>,
+) -> Option<String> {
+    match estimate_run_cost(attempts) {
+        RunCostEstimate::Complete(estimate) | RunCostEstimate::LowerBound(estimate) => {
+            Some(format_footer_usd(estimate.as_nanos()))
+        }
+        RunCostEstimate::Unavailable => None,
+    }
+}
+
+fn format_footer_usd(nanodollars: u128) -> String {
+    const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
+    let mut decimals = footer_cost_decimals(nanodollars);
+    let mut rounded = round_nanodollars(nanodollars, decimals);
+    let rounded_decimals = footer_cost_decimals(rounded);
+    if rounded_decimals != decimals {
+        decimals = rounded_decimals;
+        rounded = round_nanodollars(nanodollars, decimals);
+    }
+    let dollars = rounded / NANODOLLARS_PER_DOLLAR;
+    let divisor = 10_u128.pow(9 - decimals);
+    let fractional = (rounded % NANODOLLARS_PER_DOLLAR) / divisor;
+    format!("${dollars}.{fractional:0width$}", width = decimals as usize)
+}
+
+fn footer_cost_decimals(nanodollars: u128) -> u32 {
+    const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
+    let dollars = nanodollars / NANODOLLARS_PER_DOLLAR;
+    if dollars > 0 {
+        return 2.max(4_u32.saturating_sub(decimal_digits(dollars)));
+    }
+    if nanodollars == 0 {
+        return 2;
+    }
+    2.max((13_u32.saturating_sub(decimal_digits(nanodollars))).min(9))
+}
+
+fn decimal_digits(mut value: u128) -> u32 {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn round_nanodollars(nanodollars: u128, decimals: u32) -> u128 {
+    let unit = 10_u128.pow(9 - decimals);
+    let quotient = nanodollars / unit;
+    let remainder = nanodollars % unit;
+    quotient
+        .saturating_add(u128::from(remainder >= unit.div_ceil(2)))
+        .saturating_mul(unit)
 }
 
 fn add_total(total: &mut Option<u128>, value: Option<u64>) {
@@ -2976,7 +3420,7 @@ fn step_accounting(attempts: &[AttemptAccounting]) -> Option<String> {
 fn estimated_cost<'a>(attempts: impl IntoIterator<Item = &'a AttemptAccounting>) -> Option<String> {
     match estimate_run_cost(attempts) {
         RunCostEstimate::Complete(estimate) | RunCostEstimate::LowerBound(estimate) => {
-            Some(format_usd(estimate.amount().as_nanos()))
+            Some(format_usd(estimate.as_nanos()))
         }
         RunCostEstimate::Unavailable => None,
     }
@@ -3062,17 +3506,19 @@ mod tests {
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, IN_PROGRESS_ARENA,
-        LayoutBlock, MUTED, NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock,
-        TranscriptLayout, USER, assistant_text, markdown, muted_page_style,
-        normalise_terminal_text, own_styled_text, page_style, tool_call_label,
+        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, FooterContext,
+        FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter, NormalisedBlock,
+        RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
+        format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
+        own_styled_text, page_style, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, RunPreview, ToolCall,
         ToolCallSummary, ToolCallToken, ToolName,
     };
-    use crate::config::ready_snapshot_for_test;
+    use crate::config::models::{SOL, TERRA};
+    use crate::config::{ModelSelection, ready_snapshot_for_test};
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::runtime::{
@@ -3084,6 +3530,14 @@ mod tests {
     #[test]
     fn page_uses_terminal_background() {
         assert_eq!(page_style().bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn settings_acknowledgements_do_not_change_display_history() {
+        let mut transcript = Transcript::default();
+
+        assert!(!transcript.apply(RuntimeEvent::SettingsAccepted { revision: 1 }, false));
+        assert!(transcript.blocks().is_empty());
     }
 
     #[test]
@@ -3395,7 +3849,7 @@ mod tests {
 
     fn usage(input: u64, output: u64) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: Some(input),
             cached_input_tokens: Some(0),
@@ -3415,7 +3869,7 @@ mod tests {
         total: Option<u64>,
     ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "gpt-5.6-sol".to_owned(),
+            model: "openai/gpt-5.6-sol".to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: input,
             cached_input_tokens: cache_read,
@@ -3815,7 +4269,7 @@ mod tests {
         assert!(
             footer_text(&live_layout)
                 .expect("live footer")
-                .contains("↑4 ↓3 R0 W0 r0 Σ7")
+                .contains("↑4 ↓3 R0 W0")
         );
 
         assert!(transcript.apply(
@@ -4212,7 +4666,7 @@ line 66"
                 DocumentPosition::new(0, 0),
                 DocumentPosition::new(layout.total_height(), 0),
             )),
-            "reasoning hidden · Ctrl-T to show
+            "thinking hidden · Ctrl-T to show
 
 code · 1 earlier line omitted
 code 02
@@ -4353,7 +4807,8 @@ result
             "Startup configuration
 Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
-Model: gpt-5.6-sol (context: 1.05m, max output: 128k)
+Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
+Thinking: medium
 Prompt: bundled read_only_agent
 OpenAI API key: present
 Submission: available
@@ -4823,6 +5278,203 @@ truncated"
     }
 
     #[test]
+    fn footer_compacts_counts_and_costs_with_required_precision() {
+        for (value, expected) in [
+            (999, "999"),
+            (1_000, "1k"),
+            (1_050, "1.05k"),
+            (11_500, "11.5k"),
+            (999_499, "999k"),
+            (999_500, "1m"),
+            (1_230_000, "1.23m"),
+        ] {
+            assert_eq!(format_token_count(value), expected);
+        }
+        for (nanodollars, expected) in [
+            (794_000_000, "$0.7940"),
+            (12_350_000, "$0.01235"),
+            (12_350_000_000, "$12.35"),
+            (123_450_000_000, "$123.45"),
+            (1_234_500_000_000, "$1234.50"),
+        ] {
+            assert_eq!(format_footer_usd(nanodollars), expected);
+        }
+    }
+
+    #[test]
+    fn footer_adds_identity_and_preserves_model_thinking_under_pressure() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "metrics()",
+                "",
+                vec![detailed_usage(
+                    Some(217_600),
+                    Some(0),
+                    Some(163_200),
+                    Some(0),
+                    Some(0),
+                    Some(217_600),
+                )],
+            ),
+            false,
+        );
+        let context = FooterContext {
+            workspace_root: Some("/home/kiki/worktrees/interactive/settings/kiki".to_owned()),
+            home: Some("/home/kiki".into()),
+            name: Some("Refactor auth".to_owned()),
+            selection: ModelSelection::new(&SOL, "high").expect("supported thinking"),
+        };
+
+        let layout = transcript.layout_with_footer(128, context.clone());
+        assert_eq!(
+            footer_text(&layout).as_deref(),
+            Some(
+                "~/worktrees/interactive/settings/kiki (Refactor auth) ↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k  gpt-5.6-sol • thinking high"
+            )
+        );
+
+        let rule = transcript
+            .layout_with_footer(64, context.clone())
+            .footer_rule(64);
+        assert_eq!(rule.width(), 64);
+        for metric in [
+            "↑218k",
+            "↓0",
+            "R163k",
+            "W0",
+            "CH75.0%",
+            "$0.2829",
+            "80.0%/272k",
+        ] {
+            assert!(!rule.to_string().contains(metric), "{rule}");
+        }
+        assert!(
+            rule.to_string().contains("~/…/kiki (Refactor auth)"),
+            "{rule}"
+        );
+        assert!(
+            rule.to_string().contains("gpt-5.6-sol • thinking high"),
+            "{rule}"
+        );
+
+        let rule = transcript
+            .layout_with_footer(52, context.clone())
+            .footer_rule(52);
+        assert!(!rule.to_string().contains("$0.2829"), "{rule}");
+        assert!(rule.to_string().contains("Refactor auth"), "{rule}");
+        assert!(
+            rule.to_string().contains("gpt-5.6-sol • thinking high"),
+            "{rule}"
+        );
+
+        let model_only = transcript
+            .layout_with_footer(31, context.clone())
+            .footer_rule(31);
+        assert_eq!(model_only.to_string(), "─ gpt-5.6-sol • thinking high ─");
+        for width in 0..=30 {
+            let rule = transcript
+                .layout_with_footer(width, context.clone())
+                .footer_rule(width);
+            assert_eq!(rule.width(), usize::from(width), "{rule}");
+        }
+
+        let model = Transcript::default()
+            .layout_with_footer(80, context)
+            .footer_rule(80);
+        assert!(
+            model.to_string().contains("~/…/kiki (Refactor auth)"),
+            "{model}"
+        );
+    }
+
+    #[test]
+    fn footer_keeps_shortened_identity_before_dropping_metrics() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(
+                1,
+                1,
+                "metrics()",
+                "",
+                vec![detailed_usage(
+                    Some(217_600),
+                    Some(0),
+                    Some(163_200),
+                    Some(0),
+                    Some(0),
+                    Some(217_600),
+                )],
+            ),
+            false,
+        );
+        let context = FooterContext {
+            workspace_root: Some("/home/kiki/worktrees/interactive/settings/kiki".to_owned()),
+            home: Some("/home/kiki".into()),
+            name: Some("Refactor auth".to_owned()),
+            selection: ModelSelection::new(&SOL, "high").expect("supported thinking"),
+        };
+
+        let footer = transcript
+            .layout_with_footer(79, context)
+            .footer_rule(79)
+            .to_string();
+
+        assert_eq!(
+            footer,
+            "─ ~/…/kiki (Refactor auth)────$0.2829 80.0%/272k  gpt-5.6-sol • thinking high ─"
+        );
+    }
+
+    #[test]
+    fn footer_clips_thinking_without_model_truncation_artefacts() {
+        for (width, expected) in [(2, "t…"), (3, "th…")] {
+            let field = ModelFooter {
+                id: SOL.id.to_owned(),
+                thinking: "medium".to_owned(),
+            }
+            .truncated(width)
+            .expect("model footer");
+
+            assert_eq!(field.spans[0].content, expected);
+        }
+    }
+
+    #[test]
+    fn footer_name_only_fallback_has_no_leading_space() {
+        let field = FooterIdentity {
+            cwd: Some("/home/kiki/worktrees/interactive/settings/kiki".to_owned()),
+            name: Some("Refactor auth".to_owned()),
+        }
+        .truncated(3)
+        .expect("identity footer");
+
+        assert_eq!(field.spans[0].content, "(R…");
+    }
+
+    #[test]
+    fn footer_sums_mixed_model_costs_without_per_step_regression() {
+        let mut terra = usage(100, 0);
+        let AttemptAccounting::KnownUsage(model_usage) = &mut terra else {
+            unreachable!("usage helper produces known usage")
+        };
+        model_usage.model = TERRA.id.to_owned();
+
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "mixed()", "", vec![usage(100, 0), terra]),
+            false,
+        );
+
+        let footer = footer_text(&transcript.layout(80)).expect("footer");
+        assert!(footer.contains("$0.0006000"), "{footer}");
+        let history = rendered_text(&transcript);
+        assert!(history.contains("2 attempts · ↑200 ↓0 R0 W0 r0 Σ200 · $0.0006"));
+    }
+
+    #[test]
     fn footer_reports_short_context_occupancy_and_cache_hit_rate() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -4845,7 +5497,7 @@ truncated"
 
         assert_eq!(
             footer_text(&transcript.layout(80)).as_deref(),
-            Some("↑217600 ↓0 R163200 W0 r0 Σ217600 C80%/272k H75% $0.28288")
+            Some("↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k")
         );
     }
 
@@ -4853,27 +5505,33 @@ truncated"
     fn footer_context_metric_switches_capacity_and_alert_styles() {
         for (total, context, percentage, denominator, style) in [
             (
-                216_240,
-                "C80%/272k",
-                "80%",
+                217_600,
+                "80.0%/272k",
+                "80.0%",
                 "/272k",
                 Style::new().fg(Color::Yellow),
             ),
             (
-                243_440,
-                "C90%/272k",
-                "90%",
+                244_800,
+                "90.0%/272k",
+                "90.0%",
                 "/272k",
                 Style::new().fg(Color::Red),
             ),
             (
                 272_000,
-                "C100%/272k",
-                "100%",
+                "100.0%/272k",
+                "100.0%",
                 "/272k",
                 Style::new().fg(Color::Red),
             ),
-            (272_001, "C26%/1.05m", "26%", "/1.05m", muted_page_style()),
+            (
+                272_001,
+                "25.9%/1.05m",
+                "25.9%",
+                "/1.05m",
+                muted_page_style(),
+            ),
         ] {
             let mut transcript = Transcript::default();
             transcript.apply(
@@ -4900,15 +5558,6 @@ truncated"
                 footer
                     .spans
                     .iter()
-                    .find(|span| span.content == "C")
-                    .expect("context prefix span")
-                    .style,
-                muted_page_style()
-            );
-            assert_eq!(
-                footer
-                    .spans
-                    .iter()
                     .find(|span| span.content == percentage)
                     .expect("context percentage span")
                     .style,
@@ -4928,7 +5577,11 @@ truncated"
 
     #[test]
     fn footer_formats_cache_hit_rates_and_omits_invalid_values() {
-        for (input, cached, expected) in [(4, 3, "H75%"), (4, 4, "H100%"), (1_000, 873, "H87.3%")] {
+        for (input, cached, expected) in [
+            (4, 3, "CH75.0%"),
+            (4, 4, "CH100.0%"),
+            (1_000, 873, "CH87.3%"),
+        ] {
             let mut transcript = Transcript::default();
             transcript.apply(
                 completed_execution(
@@ -4976,7 +5629,7 @@ truncated"
             assert!(
                 !footer_text(&transcript.layout(80))
                     .expect("footer")
-                    .contains(" H")
+                    .contains("CH")
             );
         }
     }
@@ -4992,12 +5645,12 @@ truncated"
             Some(100_000),
         );
         let latest = detailed_usage(
-            Some(216_240),
+            Some(217_600),
             Some(0),
-            Some(162_180),
+            Some(163_200),
             Some(0),
             Some(0),
-            Some(216_240),
+            Some(217_600),
         );
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -5006,8 +5659,9 @@ truncated"
         );
 
         let settled_footer = footer_text(&transcript.layout(128)).expect("footer");
-        assert!(settled_footer.contains("C80%/272k H75%"));
-        assert!(!settled_footer.contains("C37%/272k H25%"));
+        assert!(settled_footer.contains("CH75.0%"));
+        assert!(settled_footer.contains("80.0%/272k"));
+        assert!(!settled_footer.contains("CH25.0%"));
 
         transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
         transcript.apply(
@@ -5035,8 +5689,8 @@ truncated"
         );
         let unavailable_layout = transcript.layout(128);
         let unavailable_footer = footer_text(&unavailable_layout).expect("footer");
-        assert!(!unavailable_footer.contains(" C"));
-        assert!(!unavailable_footer.contains(" H"));
+        assert!(!unavailable_footer.contains("%/"));
+        assert!(!unavailable_footer.contains("CH"));
     }
 
     #[test]
@@ -5067,7 +5721,7 @@ truncated"
         assert_eq!(
             full.spans
                 .iter()
-                .find(|span| span.content == "80%")
+                .find(|span| span.content == "80.0%")
                 .expect("context percentage span")
                 .style,
             Style::new().fg(Color::Yellow)
@@ -5075,12 +5729,12 @@ truncated"
 
         let narrow = transcript.layout(29).footer_rule(29);
         assert_eq!(narrow.width(), 29);
-        assert_eq!(narrow.to_string(), "─ … C80%/272k H75% $0.28288 ─");
+        assert_eq!(narrow.to_string(), "─ ───────$0.2829 80.0%/272k ─");
         assert_eq!(
             narrow
                 .spans
                 .iter()
-                .find(|span| span.content == "80%")
+                .find(|span| span.content == "80.0%")
                 .expect("context percentage span")
                 .style,
             Style::new().fg(Color::Yellow)
@@ -5129,7 +5783,7 @@ truncated"
 
         assert_eq!(
             footer_text(&transcript.layout(1)).as_deref(),
-            Some("↑100 ↓20 R10 W5 r5 Σ120 $0.000769")
+            Some("↑100 ↓20 R10 W5 $0.0007690")
         );
 
         let mut unavailable = Transcript::default();
@@ -5199,7 +5853,7 @@ truncated"
         assert_eq!(zeroes_arena.accounting.as_deref(), Some("↑0 R0 r0 Σ0"));
         assert_eq!(
             footer_text(&zeroes.layout(1)).as_deref(),
-            Some("↑0 R0 r0 Σ0 C0%/272k")
+            Some("↑0 R0 0.0%/272k")
         );
 
         let mut complete = Transcript::default();
@@ -8010,7 +8664,7 @@ truncated"
         assert!(transcript.toggle_reasoning());
         let hidden = rendered_layout_text(&mut transcript);
         assert_eq!(
-            hidden.matches("reasoning hidden · Ctrl-T to show").count(),
+            hidden.matches("thinking hidden · Ctrl-T to show").count(),
             1
         );
         assert!(!hidden.contains("reasoning\n"));
@@ -8018,7 +8672,7 @@ truncated"
         let expanded = rendered_layout_text(&mut transcript);
         assert!(expanded.contains("code 33"));
         let request = expanded.find("request").unwrap();
-        let placeholder = expanded.find("reasoning hidden").unwrap();
+        let placeholder = expanded.find("thinking hidden").unwrap();
         let arena = expanded.find("╭code").unwrap();
         let answer = expanded.find("answer").unwrap();
         assert!(request < placeholder && placeholder < arena && arena < answer);
