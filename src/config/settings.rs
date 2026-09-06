@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
-use super::{DEFAULT_MODEL, ModelConfiguration, model_by_id};
+use super::{DEFAULT_MODEL, ModelConfiguration, StartupProblemKind, model_by_id};
 
 const MAX_DOCUMENT_PROBLEMS: usize = 3;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
@@ -76,16 +76,17 @@ impl fmt::Debug for SettingsContext {
     }
 }
 
-#[allow(dead_code)]
 impl SettingsContext {
     pub(crate) fn user_path(&self) -> Option<&Path> {
         self.user_path.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn project_path(&self) -> Option<&Path> {
         self.project_path.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn model_origin(&self) -> SettingsOrigin {
         self.model_origin
     }
@@ -165,14 +166,12 @@ struct PersistedThinking {
     origin: SettingsOrigin,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
     Saved,
     SavedButMasked { by: SettingsOrigin },
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SaveError {
     UserSettingsUnavailable,
@@ -213,32 +212,14 @@ impl fmt::Display for SaveError {
 
 impl std::error::Error for SaveError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProblemKind {
-    UserUnreadable,
-    UserInvalidUtf8,
-    UserMalformed,
-    UserInvalid,
-    ProjectUnreadable,
-    ProjectInvalidUtf8,
-    ProjectMalformed,
-    ProjectInvalid,
-    ModelInvalidUnicode,
-    ModelUnknown,
-    ThinkingInvalidUnicode,
-    ThinkingEmpty,
-    ThinkingUnknown,
-    ThinkingUnsupported,
-}
-
 pub(crate) struct Problem {
-    kind: ProblemKind,
+    kind: StartupProblemKind,
     diagnostic: String,
     remediation: &'static str,
 }
 
 impl Problem {
-    pub(crate) fn kind(&self) -> ProblemKind {
+    pub(crate) fn kind(&self) -> StartupProblemKind {
         self.kind
     }
 
@@ -274,11 +255,6 @@ impl Resolution {
     pub(crate) fn problems(&self) -> &[Problem] {
         &self.problems
     }
-
-    #[cfg(test)]
-    fn thinking_for(&self, model: &'static ModelConfiguration) -> Option<&'static str> {
-        self.context.thinking_for(model)
-    }
 }
 
 pub(crate) fn resolve(input: Input) -> Resolution {
@@ -313,7 +289,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         Some(model_input) => match model_input.into_string() {
             Err(_) => {
                 problems.push(environment_problem(
-                    ProblemKind::ModelInvalidUnicode,
+                    StartupProblemKind::ModelInvalidUnicode,
                     "KIKI_MODEL is not valid Unicode.",
                     ENVIRONMENT_MODEL_REMEDIATION,
                 ));
@@ -327,7 +303,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                 }
                 None => {
                     problems.push(environment_problem(
-                        ProblemKind::ModelUnknown,
+                        StartupProblemKind::ModelUnknown,
                         "KIKI_MODEL is not a supported qualified model id.",
                         ENVIRONMENT_MODEL_REMEDIATION,
                     ));
@@ -344,12 +320,12 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     if model_is_valid && let Some(thinking_input) = input.thinking {
         match thinking_input.into_string() {
             Err(_) => problems.push(thinking_problem(
-                ProblemKind::ThinkingInvalidUnicode,
+                StartupProblemKind::ThinkingInvalidUnicode,
                 model,
                 "KIKI_THINKING is not valid Unicode",
             )),
             Ok(thinking_input) if thinking_input.is_empty() => problems.push(thinking_problem(
-                ProblemKind::ThinkingEmpty,
+                StartupProblemKind::ThinkingEmpty,
                 model,
                 "KIKI_THINKING is empty",
             )),
@@ -358,13 +334,13 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                     selected_thinking = level;
                     environment_thinking_model = Some(model.id);
                 }
-                Err(ProblemKind::ThinkingUnsupported) => problems.push(thinking_problem(
-                    ProblemKind::ThinkingUnsupported,
+                Err(StartupProblemKind::ThinkingUnsupported) => problems.push(thinking_problem(
+                    StartupProblemKind::ThinkingUnsupported,
                     model,
                     "KIKI_THINKING is not supported",
                 )),
-                Err(ProblemKind::ThinkingUnknown) => problems.push(thinking_problem(
-                    ProblemKind::ThinkingUnknown,
+                Err(StartupProblemKind::ThinkingUnknown) => problems.push(thinking_problem(
+                    StartupProblemKind::ThinkingUnknown,
                     model,
                     "KIKI_THINKING is not a known thinking level",
                 )),
@@ -548,7 +524,7 @@ fn validate_thinking_table(
 fn environment_thinking_level(
     model: &ModelConfiguration,
     level: &str,
-) -> Result<&'static str, ProblemKind> {
+) -> Result<&'static str, StartupProblemKind> {
     model
         .thinking_levels
         .iter()
@@ -556,9 +532,9 @@ fn environment_thinking_level(
         .find(|candidate| *candidate == level)
         .ok_or_else(|| {
             if known_thinking_level(level) {
-                ProblemKind::ThinkingUnsupported
+                StartupProblemKind::ThinkingUnsupported
             } else {
-                ProblemKind::ThinkingUnknown
+                StartupProblemKind::ThinkingUnknown
             }
         })
 }
@@ -600,14 +576,20 @@ enum FileProblem {
 
 fn file_problem(layer: FileLayer, problem: FileProblem, detail: &str) -> Problem {
     let kind = match (layer, problem) {
-        (FileLayer::User, FileProblem::Unreadable) => ProblemKind::UserUnreadable,
-        (FileLayer::User, FileProblem::InvalidUtf8) => ProblemKind::UserInvalidUtf8,
-        (FileLayer::User, FileProblem::Malformed) => ProblemKind::UserMalformed,
-        (FileLayer::User, FileProblem::Invalid) => ProblemKind::UserInvalid,
-        (FileLayer::Project, FileProblem::Unreadable) => ProblemKind::ProjectUnreadable,
-        (FileLayer::Project, FileProblem::InvalidUtf8) => ProblemKind::ProjectInvalidUtf8,
-        (FileLayer::Project, FileProblem::Malformed) => ProblemKind::ProjectMalformed,
-        (FileLayer::Project, FileProblem::Invalid) => ProblemKind::ProjectInvalid,
+        (FileLayer::User, FileProblem::Unreadable) => StartupProblemKind::UserSettingsUnreadable,
+        (FileLayer::User, FileProblem::InvalidUtf8) => StartupProblemKind::UserSettingsInvalidUtf8,
+        (FileLayer::User, FileProblem::Malformed) => StartupProblemKind::UserSettingsMalformed,
+        (FileLayer::User, FileProblem::Invalid) => StartupProblemKind::UserSettingsInvalid,
+        (FileLayer::Project, FileProblem::Unreadable) => {
+            StartupProblemKind::ProjectSettingsUnreadable
+        }
+        (FileLayer::Project, FileProblem::InvalidUtf8) => {
+            StartupProblemKind::ProjectSettingsInvalidUtf8
+        }
+        (FileLayer::Project, FileProblem::Malformed) => {
+            StartupProblemKind::ProjectSettingsMalformed
+        }
+        (FileLayer::Project, FileProblem::Invalid) => StartupProblemKind::ProjectSettingsInvalid,
     };
     Problem {
         kind,
@@ -617,7 +599,7 @@ fn file_problem(layer: FileLayer, problem: FileProblem, detail: &str) -> Problem
 }
 
 fn environment_problem(
-    kind: ProblemKind,
+    kind: StartupProblemKind,
     diagnostic: &'static str,
     remediation: &'static str,
 ) -> Problem {
@@ -629,7 +611,7 @@ fn environment_problem(
 }
 
 fn thinking_problem(
-    kind: ProblemKind,
+    kind: StartupProblemKind,
     model: &'static ModelConfiguration,
     prefix: &str,
 ) -> Problem {
@@ -663,8 +645,8 @@ impl DocumentProblems {
         if self.problems.len() < MAX_DOCUMENT_PROBLEMS {
             self.problems.push(Problem {
                 kind: match self.layer {
-                    FileLayer::User => ProblemKind::UserInvalid,
-                    FileLayer::Project => ProblemKind::ProjectInvalid,
+                    FileLayer::User => StartupProblemKind::UserSettingsInvalid,
+                    FileLayer::Project => StartupProblemKind::ProjectSettingsInvalid,
                 },
                 diagnostic: format!("{} {}.", self.layer.label(), detail.into()),
                 remediation,
@@ -690,7 +672,6 @@ impl DocumentProblems {
     }
 }
 
-#[allow(dead_code)]
 fn replace_string(item: &mut Item, text: &str) {
     let Some(existing) = item.as_value_mut() else {
         *item = value(text);
@@ -702,7 +683,6 @@ fn replace_string(item: &mut Item, text: &str) {
     *existing = replacement;
 }
 
-#[allow(dead_code)]
 fn update_user_document(
     user_path: Option<&Path>,
     update: impl FnOnce(&mut DocumentMut) -> Result<(), SaveError>,
@@ -721,7 +701,6 @@ fn update_user_document(
     write_document(user_path, &document.to_string())
 }
 
-#[allow(dead_code)]
 fn write_document(path: &Path, content: &str) -> Result<(), SaveError> {
     let parent = path.parent().ok_or(SaveError::UserSettingsUnavailable)?;
     fs::create_dir_all(parent).map_err(SaveError::Io)?;
@@ -774,7 +753,7 @@ mod tests {
         });
 
         assert_eq!(resolution.model().id, TERRA.id);
-        assert_eq!(resolution.thinking_for(&LUNA), Some("high"));
+        assert_eq!(resolution.context().thinking_for(&LUNA), Some("high"));
         assert!(resolution.problems().is_empty());
         assert_eq!(resolution.thinking(), TERRA.default_thinking);
         assert_eq!(resolution.context().thinking_for(&SOL), None);
@@ -836,8 +815,8 @@ mod tests {
         let resolution = resolve(input(Some(home.path()), Some(project.path())));
 
         assert_eq!(resolution.thinking(), "max");
-        assert_eq!(resolution.thinking_for(&SOL), Some("max"));
-        assert_eq!(resolution.thinking_for(&LUNA), Some("high"));
+        assert_eq!(resolution.context().thinking_for(&SOL), Some("max"));
+        assert_eq!(resolution.context().thinking_for(&LUNA), Some("high"));
     }
 
     #[test]
@@ -882,7 +861,7 @@ mod tests {
                 .iter()
                 .map(|problem| problem.kind())
                 .collect::<Vec<_>>(),
-            [super::ProblemKind::ModelUnknown]
+            [crate::config::StartupProblemKind::ModelUnknown]
         );
     }
 
@@ -890,10 +869,13 @@ mod tests {
     fn thinking_environment_problems_name_the_variable_model_and_levels() {
         let project = tempdir().expect("project directory");
         for (value, kind) in [
-            (OsString::from(""), super::ProblemKind::ThinkingEmpty),
+            (
+                OsString::from(""),
+                crate::config::StartupProblemKind::ThinkingEmpty,
+            ),
             (
                 OsString::from("not-a-level"),
-                super::ProblemKind::ThinkingUnknown,
+                crate::config::StartupProblemKind::ThinkingUnknown,
             ),
         ] {
             let mut input = input(None, Some(project.path()));
@@ -923,7 +905,7 @@ mod tests {
 
         assert_eq!(
             super::environment_thinking_level(&limited, "high"),
-            Err(super::ProblemKind::ThinkingUnsupported)
+            Err(crate::config::StartupProblemKind::ThinkingUnsupported)
         );
     }
 
@@ -948,7 +930,7 @@ mod tests {
         assert_eq!(resolution.model().id, TERRA.id);
         assert_eq!(
             resolution.problems()[0].kind(),
-            super::ProblemKind::ThinkingInvalidUnicode
+            crate::config::StartupProblemKind::ThinkingInvalidUnicode
         );
         assert!(resolution.problems()[0].diagnostic().contains(TERRA.id));
     }
@@ -981,9 +963,9 @@ mod tests {
                 .map(|problem| problem.kind())
                 .collect::<Vec<_>>(),
             [
-                super::ProblemKind::UserInvalid,
-                super::ProblemKind::ProjectInvalid,
-                super::ProblemKind::ProjectInvalid,
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                crate::config::StartupProblemKind::ProjectSettingsInvalid,
+                crate::config::StartupProblemKind::ProjectSettingsInvalid,
             ]
         );
         assert!(
@@ -1014,10 +996,10 @@ mod tests {
             let resolution = resolve(input(Some(home.path()), Some(project.path())));
 
             assert_eq!(resolution.model().id, SOL.id, "{content}");
-            assert_eq!(resolution.thinking_for(&SOL), None, "{content}");
+            assert_eq!(resolution.context().thinking_for(&SOL), None, "{content}");
             assert_eq!(
                 resolution.problems()[0].kind(),
-                super::ProblemKind::UserInvalid,
+                crate::config::StartupProblemKind::UserSettingsInvalid,
                 "{content}"
             );
         }
@@ -1040,8 +1022,8 @@ mod tests {
                 .map(|problem| problem.kind())
                 .collect::<Vec<_>>(),
             [
-                super::ProblemKind::UserMalformed,
-                super::ProblemKind::ProjectUnreadable,
+                crate::config::StartupProblemKind::UserSettingsMalformed,
+                crate::config::StartupProblemKind::ProjectSettingsUnreadable,
             ]
         );
         assert!(
@@ -1061,7 +1043,7 @@ mod tests {
         let resolution = resolve(input(None, Some(project.path())));
         assert_eq!(
             resolution.problems()[0].kind(),
-            super::ProblemKind::ProjectInvalidUtf8
+            crate::config::StartupProblemKind::ProjectSettingsInvalidUtf8
         );
     }
 
@@ -1128,7 +1110,7 @@ mod tests {
 
         let resolution = resolve(input(Some(home.path()), Some(project.path())));
         assert_eq!(resolution.model().id, TERRA.id);
-        assert_eq!(resolution.thinking_for(&SOL), Some("low"));
+        assert_eq!(resolution.context().thinking_for(&SOL), Some("low"));
         assert!(resolution.problems().is_empty());
     }
 

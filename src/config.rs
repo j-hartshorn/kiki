@@ -216,7 +216,6 @@ impl StartupSnapshot {
         self.thinking
     }
 
-    #[allow(dead_code)]
     pub(crate) fn settings(&self) -> &settings::SettingsContext {
         &self.settings
     }
@@ -271,7 +270,6 @@ impl StartupConfiguration {
             api_key: self.construction.api_key.as_ref()?,
             model: self.construction.model,
             thinking: self.snapshot.thinking,
-            settings: &self.snapshot.settings,
         })
     }
 
@@ -319,8 +317,6 @@ pub(crate) struct ReadyStartup<'a> {
     api_key: &'a ApiKey,
     model: &'static ModelConfiguration,
     thinking: &'static str,
-    #[allow(dead_code)]
-    settings: &'a settings::SettingsContext,
 }
 
 impl<'a> ReadyStartup<'a> {
@@ -346,11 +342,6 @@ impl<'a> ReadyStartup<'a> {
 
     pub(crate) fn thinking(&self) -> &'static str {
         self.thinking
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn settings(&self) -> &'a settings::SettingsContext {
-        self.settings
     }
 }
 
@@ -492,23 +483,12 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
 }
 
 fn startup_settings_problem(problem: &settings::Problem, api_key: Option<&str>) -> StartupProblem {
-    let kind = match problem.kind() {
-        settings::ProblemKind::UserUnreadable => StartupProblemKind::UserSettingsUnreadable,
-        settings::ProblemKind::UserInvalidUtf8 => StartupProblemKind::UserSettingsInvalidUtf8,
-        settings::ProblemKind::UserMalformed => StartupProblemKind::UserSettingsMalformed,
-        settings::ProblemKind::UserInvalid => StartupProblemKind::UserSettingsInvalid,
-        settings::ProblemKind::ProjectUnreadable => StartupProblemKind::ProjectSettingsUnreadable,
-        settings::ProblemKind::ProjectInvalidUtf8 => StartupProblemKind::ProjectSettingsInvalidUtf8,
-        settings::ProblemKind::ProjectMalformed => StartupProblemKind::ProjectSettingsMalformed,
-        settings::ProblemKind::ProjectInvalid => StartupProblemKind::ProjectSettingsInvalid,
-        settings::ProblemKind::ModelInvalidUnicode => StartupProblemKind::ModelInvalidUnicode,
-        settings::ProblemKind::ModelUnknown => StartupProblemKind::ModelUnknown,
-        settings::ProblemKind::ThinkingInvalidUnicode => StartupProblemKind::ThinkingInvalidUnicode,
-        settings::ProblemKind::ThinkingEmpty => StartupProblemKind::ThinkingEmpty,
-        settings::ProblemKind::ThinkingUnknown => StartupProblemKind::ThinkingUnknown,
-        settings::ProblemKind::ThinkingUnsupported => StartupProblemKind::ThinkingUnsupported,
-    };
-    StartupProblem::new(kind, problem.diagnostic(), problem.remediation(), api_key)
+    StartupProblem::new(
+        problem.kind(),
+        problem.diagnostic(),
+        problem.remediation(),
+        api_key,
+    )
 }
 
 fn resolve_api_key(
@@ -881,7 +861,6 @@ mod tests {
         assert_eq!(snapshot.settings().thinking_for(&TERRA), Some("high"));
         let ready = configuration.ready().expect("ready configuration");
         assert_eq!(ready.thinking(), "max");
-        assert_eq!(ready.settings().thinking_for(&TERRA), Some("high"));
     }
 
     #[test]

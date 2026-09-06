@@ -20,7 +20,6 @@ pub(crate) enum RuntimeCommand {
     Submit {
         request: String,
     },
-    #[allow(dead_code)]
     ApplySettings {
         selection: ModelSelection,
         revision: u64,

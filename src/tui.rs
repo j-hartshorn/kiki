@@ -23,7 +23,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::CATALOGUE;
-use crate::config::settings::SettingsContext;
+use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout};
 use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
@@ -502,9 +502,12 @@ impl App {
                 self.picker = None;
                 let mut update = self.apply_picker_value(value);
                 match value {
-                    PickerValue::Model(model) => self.save_model(model),
+                    PickerValue::Model(model) => {
+                        self.save_user_default(|settings| settings.save_model(model))
+                    }
                     PickerValue::Thinking(thinking) => {
-                        self.save_thinking(self.settings_selection.model(), thinking)
+                        let model = self.settings_selection.model();
+                        self.save_user_default(|settings| settings.save_thinking(model, thinking));
                     }
                 }
                 update.visible_changed = true;
@@ -634,32 +637,15 @@ impl App {
         }
     }
 
-    fn save_model(&mut self, model: &'static ModelConfiguration) {
+    fn save_user_default(
+        &mut self,
+        save: impl FnOnce(&SettingsContext) -> Result<SaveOutcome, SaveError>,
+    ) {
         let result = self
             .settings
             .as_ref()
             .ok_or_else(|| "user settings are unavailable".to_owned())
-            .and_then(|settings| {
-                settings
-                    .save_model(model)
-                    .map_err(|error| error.to_string())
-            });
-        self.set_notice(match result {
-            Ok(outcome) => outcome.to_string(),
-            Err(error) => format!("Could not save user default: {error}."),
-        });
-    }
-
-    fn save_thinking(&mut self, model: &'static ModelConfiguration, thinking: &'static str) {
-        let result = self
-            .settings
-            .as_ref()
-            .ok_or_else(|| "user settings are unavailable".to_owned())
-            .and_then(|settings| {
-                settings
-                    .save_thinking(model, thinking)
-                    .map_err(|error| error.to_string())
-            });
+            .and_then(|settings| save(settings).map_err(|error| error.to_string()));
         self.set_notice(match result {
             Ok(outcome) => outcome.to_string(),
             Err(error) => format!("Could not save user default: {error}."),

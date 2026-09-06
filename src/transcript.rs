@@ -1627,15 +1627,14 @@ fn right_width(statistics: &[FooterField], model: Option<&FooterField>) -> usize
 }
 
 fn display_model_id(id: &str) -> &str {
-    let provider_count = CATALOGUE
+    let mut providers = CATALOGUE
         .iter()
-        .filter_map(|model| model.id.split_once('/').map(|(provider, _)| provider))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    if provider_count == 1 {
-        id.split_once('/').map_or(id, |(_, model)| model)
-    } else {
-        id
+        .filter_map(|model| model.id.split_once('/').map(|(provider, _)| provider));
+    match providers.next() {
+        Some(provider) if providers.all(|candidate| candidate == provider) => {
+            id.split_once('/').map_or(id, |(_, model)| model)
+        }
+        _ => id,
     }
 }
 
