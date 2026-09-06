@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::SetTitle;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, Paragraph};
@@ -273,8 +273,8 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
-        if self.slash_overlay_mouse(mouse) {
-            return self.handle_slash_overlay_mouse(mouse);
+        if let Some(update) = self.handle_slash_overlay_mouse(mouse) {
+            return update;
         }
         let notice_cleared = self.clear_notice();
         let mut update = match mouse.kind {
@@ -293,34 +293,29 @@ impl App {
         update
     }
 
-    fn slash_overlay_mouse(&self, mouse: MouseEvent) -> bool {
-        matches!(
+    fn handle_slash_overlay_mouse(&mut self, mouse: MouseEvent) -> Option<Update> {
+        if !matches!(
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left)
                 | MouseEventKind::Drag(MouseButton::Left)
                 | MouseEventKind::Up(MouseButton::Left)
-        ) && self.slash_overlay.is_some_and(|overlay| {
-            mouse.column >= overlay.x
-                && mouse.column < overlay.right()
-                && mouse.row >= overlay.y
-                && mouse.row < overlay.bottom()
-        })
-    }
-
-    fn handle_slash_overlay_mouse(&mut self, mouse: MouseEvent) -> Update {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(drag) = &mut self.drag {
-                    drag.edge = None;
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.drag = None;
-                self.pending_copy = false;
-            }
-            _ => unreachable!("only primary overlay mouse events are handled"),
+        ) || !self
+            .slash_overlay
+            .is_some_and(|overlay| overlay.contains(Position::new(mouse.column, mouse.row)))
+        {
+            return None;
         }
-        Update::default()
+        let Some(_) = self.drag.take() else {
+            return Some(Update::default());
+        };
+        let visible_changed = self.selection.take().is_some();
+        self.pending_copy = false;
+        self.pending_copy_text = None;
+        Some(Update {
+            commands: Vec::new(),
+            visible_changed,
+            quit: false,
+        })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Update {
@@ -1690,7 +1685,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             .saturating_sub(prompt_box_height),
     );
     let layout = render_history(frame, app, history);
-    render_slash_overlay(frame, app, history, content);
+    render_slash_overlay(frame, app, history);
     let rule_style = thinking_rule_style(app.settings_selection);
     render_rule(
         frame,
@@ -1753,7 +1748,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     layout
 }
 
-fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect, content: Rect) {
+fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
     if app.is_submission_disabled() || app.picker.is_some() {
         return;
     }
@@ -1772,7 +1767,7 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect, content
     if width == 0 {
         return;
     }
-    let x = content
+    let x = history
         .x
         .saturating_add(PROMPT_GUTTER_WIDTH)
         .min(history.right().saturating_sub(width));
@@ -3091,18 +3086,18 @@ mod tests {
         let now = Instant::now();
 
         app.set_notice("keep status".to_owned());
-        let down = app.handle_mouse(
-            mouse_event(
-                MouseEventKind::Down(MouseButton::Left),
-                overlay.x,
-                overlay.y,
-            ),
-            now,
-        );
-        assert!(!down.visible_changed);
-        assert_eq!(app.notice(), Some("keep status"));
-        assert!(app.selection.is_none());
-        assert!(app.drag.is_none());
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let update = app.handle_mouse(mouse_event(kind, overlay.x, overlay.y), now);
+            assert!(!update.visible_changed);
+            assert_eq!(app.notice(), Some("keep status"));
+            assert!(app.selection.is_none());
+            assert!(app.drag.is_none());
+            assert!(!app.pending_copy);
+        }
 
         let outside_column = viewport.area.x + 1;
         let outside_row = viewport.area.y;
@@ -3124,10 +3119,9 @@ mod tests {
         );
         assert!(app.selection.is_some());
         assert!(app.drag.as_ref().is_some_and(|drag| drag.edge.is_some()));
-        let selection = app.selection;
         app.set_notice("keep drag status".to_owned());
 
-        app.handle_mouse(
+        let cancelled = app.handle_mouse(
             mouse_event(
                 MouseEventKind::Drag(MouseButton::Left),
                 overlay.x,
@@ -3135,20 +3129,79 @@ mod tests {
             ),
             now,
         );
-        assert_eq!(app.selection, selection);
+        assert!(cancelled.visible_changed);
         assert_eq!(app.notice(), Some("keep drag status"));
-        assert!(app.drag.as_ref().is_some_and(|drag| drag.edge.is_none()));
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(!app.pending_copy);
+        assert!(!app.tick(now + super::POLL_INTERVAL).visible_changed);
+
         app.handle_mouse(
-            mouse_event(MouseEventKind::Up(MouseButton::Left), overlay.x, overlay.y),
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
             now,
         );
-        assert_eq!(app.notice(), Some("keep drag status"));
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        assert!(app.selection.is_none());
         assert!(app.drag.is_none());
         assert!(!app.pending_copy);
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         let mut clipboard = FakeClipboard::available();
         assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
         assert!(clipboard.writes.is_empty());
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                outside_column,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        let selection = app.selection;
+        assert!(selection.is_some());
+        assert!(app.drag.is_none());
+        assert!(app.pending_copy);
+        app.set_notice("keep completed status".to_owned());
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let update = app.handle_mouse(mouse_event(kind, overlay.x, overlay.y), now);
+            assert!(!update.visible_changed);
+            assert_eq!(app.notice(), Some("keep completed status"));
+            assert_eq!(app.selection, selection);
+            assert!(app.drag.is_none());
+            assert!(app.pending_copy);
+        }
     }
 
     #[test]
