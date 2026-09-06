@@ -156,7 +156,8 @@ mod tests {
             "A gather failure can follow completed host calls",
             "Run project-local, one-shot commands.",
             "Keep model-visible output focused.",
-            "five-minute deadline",
+            "five minutes of chargeable time",
+            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");

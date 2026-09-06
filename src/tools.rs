@@ -645,7 +645,7 @@ fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> Str
         " Run project-local, one-shot commands."
     };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
@@ -6967,6 +6967,11 @@ mod tests {
         assert_eq!(reference.matches("class CommandResult:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("Run project-local, one-shot commands."));
+        assert!(reference.contains("five minutes of chargeable time"));
+        assert!(reference.contains(
+            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged."
+        ));
+        assert!(!reference.contains("five-minute deadline"));
         assert!(reference.contains("    ..."));
     }
 

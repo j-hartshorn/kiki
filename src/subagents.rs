@@ -8,7 +8,7 @@ use std::sync::{Mutex as SyncMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
@@ -457,6 +457,22 @@ pub(crate) enum InvocationOperation {
     Cancel,
 }
 
+#[derive(Clone)]
+pub(crate) struct WaitPhaseSignal {
+    call_id: u32,
+    sender: mpsc::UnboundedSender<u32>,
+}
+
+impl WaitPhaseSignal {
+    pub(crate) fn new(call_id: u32, sender: mpsc::UnboundedSender<u32>) -> Self {
+        Self { call_id, sender }
+    }
+
+    fn notify(&self) {
+        let _ = self.sender.send(self.call_id);
+    }
+}
+
 impl InvocationOperation {
     pub(crate) fn from_private_name(name: &str) -> Option<Self> {
         match name {
@@ -484,6 +500,7 @@ pub(crate) async fn invoke(
     context: Option<&TrustedExecutionContext>,
     operation: InvocationOperation,
     arguments: ToolValue,
+    wait_phase: Option<WaitPhaseSignal>,
 ) -> Result<ToolValue, ToolError> {
     let context = context.ok_or_else(|| {
         ToolError::runtime("subagent invocation context is unavailable for this execution")
@@ -523,7 +540,11 @@ pub(crate) async fn invoke(
         }
         InvocationOperation::Wait => {
             let id = task_id_argument(arguments, "wait_subagent")?;
-            match context.coordinator().wait(context.caller(), &id).await {
+            match context
+                .coordinator()
+                .wait_with_phase(context.caller(), &id, wait_phase.as_ref())
+                .await
+            {
                 Ok((result, observation)) => Ok(wait_value(
                     "completed",
                     observation,
@@ -550,7 +571,7 @@ pub(crate) async fn invoke(
             let id = task_id_argument(arguments, "cancel_subagent")?;
             let observation = context
                 .coordinator()
-                .cancel(context.caller(), &id)
+                .cancel_with_phase(context.caller(), &id, wait_phase.as_ref())
                 .await
                 .map_err(access_error)?;
             Ok(observation_value(&observation))
@@ -1378,6 +1399,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         caller: &Caller,
         id: &TaskId,
     ) -> Result<(ChildResult, TaskObservation), WaitError> {
+        self.wait_with_phase(caller, id, None).await
+    }
+
+    async fn wait_with_phase(
+        &self,
+        caller: &Caller,
+        id: &TaskId,
+        wait_phase: Option<&WaitPhaseSignal>,
+    ) -> Result<(ChildResult, TaskObservation), WaitError> {
         let updates = {
             let inner = self.inner.lock().await;
             ensure_access(&inner, caller, id)?;
@@ -1388,6 +1418,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .updates
                 .subscribe()
         };
+        if let Some(wait_phase) = wait_phase {
+            wait_phase.notify();
+        }
         self.wait_for_outcome(id, updates).await
     }
 
@@ -1396,12 +1429,26 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         caller: &Caller,
         id: &TaskId,
     ) -> Result<TaskObservation, AccessError> {
+        self.cancel_with_phase(caller, id, None).await
+    }
+
+    async fn cancel_with_phase(
+        &self,
+        caller: &Caller,
+        id: &TaskId,
+        wait_phase: Option<&WaitPhaseSignal>,
+    ) -> Result<TaskObservation, AccessError> {
         {
             let inner = self.inner.lock().await;
             ensure_access(&inner, caller, id)?;
         }
         let stopping = self.request_stop_subtree(id, StopReason::Cancelled).await;
-        self.wait_for_all(stopping).await;
+        if !stopping.is_empty() {
+            if let Some(wait_phase) = wait_phase {
+                wait_phase.notify();
+            }
+            self.wait_for_all(stopping).await;
+        }
         self.get(caller, id).await
     }
 
@@ -1880,7 +1927,7 @@ mod tests {
     use super::{
         AccessError, AdmissionError, ChildFailure, ChildParameters, ChildResult, ChildRun,
         ChildRunner, Clock, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture, SubagentCoordinator,
-        SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError,
+        SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError, WaitPhaseSignal,
     };
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
@@ -2706,6 +2753,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_phase_signals_after_subscribing_and_requesting_stop() {
+        let (coordinator, mut started) = coordinator(policy());
+        let caller = coordinator.root_caller().await;
+        let (id, running) = start(&coordinator, &mut started, &caller).await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(7, sender);
+        let mut wait = Box::pin(coordinator.wait_with_phase(&caller, &id, Some(&signal)));
+
+        tokio::select! {
+            phase = receiver.recv() => assert_eq!(phase, Some(7)),
+            result = &mut wait => panic!("wait finished before its phase signal: {result:?}"),
+        }
+        running.finish.send(Ok(result("done"))).unwrap();
+        assert_eq!(wait.await.unwrap().0.message(), "done");
+
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(CleanupRunner {
+                started: started_sender,
+            }),
+        );
+        let caller = coordinator.root_caller().await;
+        let task = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let cleanup = started.recv().await.expect("child starts");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(8, sender);
+        let mut cancel = Box::pin(coordinator.cancel_with_phase(&caller, task.id(), Some(&signal)));
+
+        tokio::select! {
+            phase = receiver.recv() => assert_eq!(phase, Some(8)),
+            result = &mut cancel => panic!("cancellation finished before its phase signal: {result:?}"),
+        }
+        assert_eq!(
+            coordinator.get(&caller, task.id()).await.unwrap().state(),
+            TaskState::Stopping
+        );
+        cleanup.release.send(()).unwrap();
+        assert_eq!(cancel.await.unwrap().state(), TaskState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn terminal_cancellation_does_not_signal_a_wait_phase() {
+        let (coordinator, mut started) = coordinator(policy());
+        let caller = coordinator.root_caller().await;
+        let (id, running) = start(&coordinator, &mut started, &caller).await;
+        running.finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, &id).await.unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(7, sender);
+
+        let observation = coordinator
+            .cancel_with_phase(&caller, &id, Some(&signal))
+            .await
+            .unwrap();
+
+        assert_eq!(observation.state(), TaskState::Completed);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn concurrent_waiters_each_receive_independent_results_and_observations() {
         let (coordinator, mut started) = coordinator(policy());
         let caller = coordinator.root_caller().await;
@@ -3228,6 +3339,60 @@ mod tests {
             coordinator.wait(&root, next.id()).await.unwrap_err(),
             next.id(),
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_admission_keeps_lookup_wait_and_cancel_operable() {
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy {
+                max_concurrent: 1,
+                ..policy()
+            },
+            Arc::new(CleanupRunner {
+                started: started_sender,
+            }),
+        );
+        let caller = coordinator.root_caller().await;
+        let task = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let cleanup = started.recv().await.expect("child starts");
+
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::ConcurrentLimit)
+        );
+        assert_eq!(
+            coordinator.get(&caller, task.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(9, sender);
+        let mut wait = Box::pin(coordinator.wait_with_phase(&caller, task.id(), Some(&signal)));
+        tokio::select! {
+            phase = receiver.recv() => assert_eq!(phase, Some(9)),
+            result = &mut wait => panic!("wait finished before its phase signal: {result:?}"),
+        }
+        let mut cancel = Box::pin(coordinator.cancel(&caller, task.id()));
+        let stopping = async {
+            loop {
+                if coordinator.get(&caller, task.id()).await.unwrap().state() == TaskState::Stopping
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::pin!(stopping);
+        tokio::select! {
+            _ = &mut stopping => {}
+            result = &mut cancel => panic!("cancellation finished before cleanup: {result:?}"),
+        }
+        assert_eq!(coordinator.active_count().await, 1);
+        cleanup.release.send(()).unwrap();
+
+        assert_eq!(cancel.await.unwrap().state(), TaskState::Cancelled);
+        assert_cancelled(wait.await.unwrap_err(), task.id());
+        assert_eq!(coordinator.active_count().await, 0);
     }
 
     #[test]

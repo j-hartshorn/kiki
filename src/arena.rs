@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,7 @@ use tokio::process::Command;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -28,7 +27,7 @@ use crate::{
         },
     },
     subagents::{
-        AgentInvocationContext, InvocationOperation, TrustedExecutionContext,
+        AgentInvocationContext, InvocationOperation, TrustedExecutionContext, WaitPhaseSignal,
         invoke as invoke_subagent,
     },
     tools::{
@@ -522,6 +521,137 @@ enum AttemptFailure {
     Driver(ArenaError),
 }
 
+#[derive(Clone, Copy)]
+enum BudgetInterruption {
+    Cancelled,
+    TimedOut,
+}
+
+trait ArenaClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    #[cfg(test)]
+    fn test_budget_paused(&self) {}
+}
+
+struct SystemArenaClock;
+
+impl ArenaClock for SystemArenaClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline,
+        )))
+    }
+}
+
+struct ChargeableBudget {
+    clock: Arc<dyn ArenaClock>,
+    remaining: Duration,
+    charged_since: Option<Instant>,
+}
+
+impl ChargeableBudget {
+    fn new(clock: Arc<dyn ArenaClock>, duration: Duration) -> Self {
+        let charged_since = clock.now();
+        Self {
+            clock,
+            remaining: duration,
+            charged_since: Some(charged_since),
+        }
+    }
+
+    fn pause(&mut self) {
+        if self.charged_since.is_some() {
+            self.charge();
+            self.charged_since = None;
+            #[cfg(test)]
+            self.clock.test_budget_paused();
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.charged_since.is_none() {
+            self.charged_since = Some(self.clock.now());
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.charged_since.is_none()
+    }
+
+    fn charge(&mut self) {
+        let Some(charged_since) = self.charged_since else {
+            return;
+        };
+        let now = self.clock.now();
+        self.remaining = self
+            .remaining
+            .saturating_sub(now.saturating_duration_since(charged_since));
+        self.charged_since = Some(now);
+    }
+
+    fn check(&mut self, cancellation: &CancellationToken) -> Result<(), BudgetInterruption> {
+        self.charge();
+        if cancellation.is_cancelled() {
+            Err(BudgetInterruption::Cancelled)
+        } else if self.remaining.is_zero() {
+            Err(BudgetInterruption::TimedOut)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn wait<T>(
+        &mut self,
+        cancellation: &CancellationToken,
+        future: impl Future<Output = T>,
+    ) -> Result<T, BudgetInterruption> {
+        if self.is_paused() {
+            return tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(BudgetInterruption::Cancelled),
+                result = future => Ok(result),
+            };
+        }
+
+        self.charge();
+        let deadline = self.clock.now().checked_add(self.remaining);
+        let result = match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(BudgetInterruption::Cancelled),
+                    _ = self.clock.sleep_until(deadline) => Err(BudgetInterruption::TimedOut),
+                    result = future => Ok(result),
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(BudgetInterruption::Cancelled),
+                    result = future => Ok(result),
+                }
+            }
+        };
+        self.charge();
+        result
+    }
+}
+
+impl From<BudgetInterruption> for AttemptFailure {
+    fn from(interruption: BudgetInterruption) -> Self {
+        match interruption {
+            BudgetInterruption::Cancelled => Self::Cancelled,
+            BudgetInterruption::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
 impl AttemptFailure {
     fn with_interrupted_execution(self, execution: InterruptedExecution) -> ArenaError {
         match self {
@@ -544,6 +674,7 @@ pub(crate) struct ArenaChildSource {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     execution_timeout: Duration,
+    clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
     collection_test_gate: Option<CollectionTestGate>,
     #[cfg(test)]
@@ -591,6 +722,7 @@ impl ArenaChildSource {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             execution_timeout: self.execution_timeout,
+            clock: self.clock.clone(),
             #[cfg(test)]
             collection_test_gate: self.collection_test_gate.clone(),
             #[cfg(test)]
@@ -616,6 +748,7 @@ pub struct Arena {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     execution_timeout: Duration,
+    clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
     collection_test_gate: Option<CollectionTestGate>,
     #[cfg(test)]
@@ -636,6 +769,7 @@ impl Arena {
             tool_host,
             ARENA_EXECUTION_TIMEOUT,
             Some(ARENA_MAX_MEMORY_BYTES),
+            Arc::new(SystemArenaClock),
         )
         .await
     }
@@ -652,6 +786,25 @@ impl Arena {
             tool_host,
             execution_timeout,
             max_memory,
+            Arc::new(SystemArenaClock),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn with_limits_and_clock(
+        worker_path: impl AsRef<Path>,
+        tool_host: ToolHost,
+        execution_timeout: Duration,
+        max_memory: Option<usize>,
+        clock: Arc<dyn ArenaClock>,
+    ) -> Result<Self, ArenaError> {
+        Self::open(
+            worker_path.as_ref().to_path_buf(),
+            tool_host,
+            execution_timeout,
+            max_memory,
+            clock,
         )
         .await
     }
@@ -661,6 +814,7 @@ impl Arena {
         tool_host: ToolHost,
         execution_timeout: Duration,
         max_memory: Option<usize>,
+        clock: Arc<dyn ArenaClock>,
     ) -> Result<Self, ArenaError> {
         let runtime = validate_worker(&worker_path).await?;
         let pool = Self::open_pool(worker_path.clone()).await?;
@@ -689,6 +843,7 @@ impl Arena {
             runtime,
             repl_config,
             execution_timeout,
+            clock,
             #[cfg(test)]
             collection_test_gate: None,
             #[cfg(test)]
@@ -714,6 +869,7 @@ impl Arena {
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
             execution_timeout: self.execution_timeout,
+            clock: self.clock.clone(),
             #[cfg(test)]
             collection_test_gate: self.collection_test_gate.clone(),
             #[cfg(test)]
@@ -760,7 +916,21 @@ impl Arena {
         invocation: Option<&AgentInvocationContext>,
         selection: Option<ModelSelection>,
     ) -> Result<Execution, ArenaError> {
-        self.restore_current_checkpoint_if_needed().await?;
+        let mut budget = ChargeableBudget::new(self.clock.clone(), self.execution_timeout);
+        match budget
+            .wait(cancellation, self.restore_current_checkpoint_if_needed())
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(interruption) => {
+                let error = AttemptFailure::from(interruption).with_interrupted_execution(
+                    InterruptedExecutionState::new().finish(Instant::now(), progress),
+                );
+                self.checkout.take();
+                return Err(self.recover(error).await);
+            }
+        }
         let context = invocation.map(|invocation| {
             invocation.execution(self.child_source(), selection, self.checkpoint())
         });
@@ -775,21 +945,19 @@ impl Arena {
             .and_then(|limits| limits.max_memory);
         let mut interruption = InterruptedExecutionState::new();
         let mut authorisations = self.checkpoint.authorisations.clone();
-        let attempt = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(AttemptFailure::Cancelled),
-            _ = sleep(self.execution_timeout) => Err(AttemptFailure::TimedOut),
-            result = execute_checkout(
-                &mut checkout,
-                &self.tool_host,
-                code,
-                context.as_ref(),
-                max_memory,
-                &mut authorisations,
-                progress,
-                &mut interruption,
-            ) => result.map_err(AttemptFailure::Driver),
-        };
+        let attempt = execute_checkout(
+            &mut checkout,
+            &self.tool_host,
+            code,
+            context.as_ref(),
+            max_memory,
+            &mut authorisations,
+            progress,
+            &mut interruption,
+            &mut budget,
+            cancellation,
+        )
+        .await;
 
         match attempt {
             Ok((outcome, state)) => {
@@ -1234,7 +1402,9 @@ async fn execute_checkout(
     authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
-) -> Result<(ExecutionOutcome, Vec<u8>), ArenaError> {
+    budget: &mut ChargeableBudget,
+    cancellation: &CancellationToken,
+) -> Result<(ExecutionOutcome, Vec<u8>), AttemptFailure> {
     let result = drive(
         checkout,
         tool_host,
@@ -1243,6 +1413,8 @@ async fn execute_checkout(
         authorisations,
         progress,
         interruption,
+        budget,
+        cancellation,
     )
     .await;
     interruption.streams.flush_stdout(Instant::now(), progress);
@@ -1264,23 +1436,30 @@ async fn execute_checkout(
                 Some(error_text),
             )
         }
-        Err(DriverError::Fatal(error)) => return Err(error),
+        Err(DriverError::Fatal(error)) => return Err(AttemptFailure::Driver(error)),
+        Err(DriverError::Cancelled) => return Err(AttemptFailure::Cancelled),
+        Err(DriverError::TimedOut) => return Err(AttemptFailure::TimedOut),
     };
-    let state = checkout.dump().await.map_err(|error| {
-        let context = error_text.as_deref().unwrap_or("completed execution");
-        ArenaError::Infrastructure {
-            message: format!("post-execution checkpoint failed after {context}: {error}"),
-            execution: None,
-        }
-    })?;
+    let state = budget
+        .wait(cancellation, checkout.dump())
+        .await
+        .map_err(AttemptFailure::from)?
+        .map_err(|error| {
+            let context = error_text.as_deref().unwrap_or("completed execution");
+            AttemptFailure::Driver(ArenaError::Infrastructure {
+                message: format!("post-execution checkpoint failed after {context}: {error}"),
+                execution: None,
+            })
+        })?;
+    budget.check(cancellation).map_err(AttemptFailure::from)?;
     if unsafe_memory {
-        return Err(ArenaError::Infrastructure {
+        return Err(AttemptFailure::Driver(ArenaError::Infrastructure {
             message: format!(
                 "unsafe resource memory failure: {}",
                 error_text.expect("memory errors have diagnostics")
             ),
             execution: None,
-        });
+        }));
     }
     Ok((outcome, state))
 }
@@ -1320,6 +1499,8 @@ fn parse_canonical_usize(value: &str) -> Option<usize> {
 enum DriverError {
     Runtime(MontyException),
     Fatal(ArenaError),
+    Cancelled,
+    TimedOut,
 }
 
 struct PendingToolCall {
@@ -1331,6 +1512,34 @@ struct PendingToolCall {
     run_preview: Option<RunPreviewState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCallMode {
+    Ordinary,
+    Control,
+    Waiting,
+}
+
+fn update_budget_pause(budget: &mut ChargeableBudget, call_modes: &BTreeMap<u32, PendingCallMode>) {
+    if !call_modes.is_empty()
+        && call_modes
+            .values()
+            .all(|mode| *mode == PendingCallMode::Waiting)
+    {
+        budget.pause();
+    } else {
+        budget.resume();
+    }
+}
+
+enum BatchEvent {
+    Result(ToolResult),
+    WaitPhase(u32),
+    ChildDeadline,
+    FilesystemComplete,
+    Output(Option<ToolOutputChunk>),
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
@@ -1339,6 +1548,8 @@ async fn drive(
     authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
+    budget: &mut ChargeableBudget,
+    cancellation: &CancellationToken,
 ) -> Result<MontyObject, DriverError> {
     let InterruptedExecutionState {
         streams,
@@ -1354,15 +1565,22 @@ async fn drive(
             $operation
         }};
     }
+    macro_rules! turn {
+        ($label:lifetime, $on_print:ident => $operation:expr) => {{
+            match with_print!($on_print => budget.wait(cancellation, $operation).await) {
+                Ok(Ok(event)) => event,
+                Ok(Err(PoolError::Runtime(error))) => {
+                    break $label Err(DriverError::Runtime(error));
+                }
+                Ok(Err(error)) => break $label Err(DriverError::Fatal(pool_failure(error))),
+                Err(BudgetInterruption::Cancelled) => break $label Err(DriverError::Cancelled),
+                Err(BudgetInterruption::TimedOut) => break $label Err(DriverError::TimedOut),
+            }
+        }};
+    }
     'drive: {
-        let mut event = match with_print!(on_print => checkout
-            .feed(code, vec![], vec![], false, &mut on_print)
-            .await)
-        {
-            Ok(event) => event,
-            Err(PoolError::Runtime(error)) => break 'drive Err(DriverError::Runtime(error)),
-            Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
-        };
+        let mut event =
+            turn!('drive, on_print => checkout.feed(code, vec![], vec![], false, &mut on_print));
 
         let mut pending_calls = Vec::new();
         loop {
@@ -1379,38 +1597,16 @@ async fn drive(
                     let Some(tool) = ToolName::from_private_name(&function_name)
                         .or_else(|| invocation.map(InvocationOperation::tool))
                     else {
-                        event = match with_print!(on_print => checkout
-                            .resume(ResumeValue::NotFound, &mut on_print)
-                            .await)
-                        {
-                            Ok(event) => event,
-                            Err(PoolError::Runtime(error)) => {
-                                break 'drive Err(DriverError::Runtime(error));
-                            }
-                            Err(error) => {
-                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                            }
-                        };
+                        event = turn!('drive, on_print => checkout.resume(ResumeValue::NotFound, &mut on_print));
                         continue;
                     };
                     if method_call || !kwargs.is_empty() {
-                        match with_print!(on_print => checkout
-                            .resume(
-                                ResumeValue::Error(tool_error(ToolError::type_error(
-                                    "host functions accept positional arguments only",
-                                ))),
-                                &mut on_print,
-                            )
-                            .await)
-                        {
-                            Ok(event) => event,
-                            Err(PoolError::Runtime(error)) => {
-                                break 'drive Err(DriverError::Runtime(error));
-                            }
-                            Err(error) => {
-                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                            }
-                        }
+                        turn!('drive, on_print => checkout.resume(
+                            ResumeValue::Error(tool_error(ToolError::type_error(
+                                "host functions accept positional arguments only",
+                            ))),
+                            &mut on_print,
+                        ))
                     } else {
                         let arguments = match args
                             .into_iter()
@@ -1419,18 +1615,8 @@ async fn drive(
                         {
                             Ok(arguments) => ToolValue::List(arguments),
                             Err(error) => {
-                                event = match with_print!(on_print => checkout
-                                    .resume(ResumeValue::Error(tool_error(error)), &mut on_print)
-                                    .await)
-                                {
-                                    Ok(event) => event,
-                                    Err(PoolError::Runtime(error)) => {
-                                        break 'drive Err(DriverError::Runtime(error));
-                                    }
-                                    Err(error) => {
-                                        break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                                    }
-                                };
+                                event = turn!('drive, on_print => checkout
+                                    .resume(ResumeValue::Error(tool_error(error)), &mut on_print));
                                 continue;
                             }
                         };
@@ -1455,18 +1641,7 @@ async fn drive(
                             token,
                             run_preview,
                         });
-                        match with_print!(on_print => checkout
-                            .resume(ResumeValue::Future, &mut on_print)
-                            .await)
-                        {
-                            Ok(event) => event,
-                            Err(PoolError::Runtime(error)) => {
-                                break 'drive Err(DriverError::Runtime(error));
-                            }
-                            Err(error) => {
-                                break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                            }
-                        }
+                        turn!('drive, on_print => checkout.resume(ResumeValue::Future, &mut on_print))
                     }
                 }
                 TurnEvent::NameLookup { name } => {
@@ -1479,27 +1654,11 @@ async fn drive(
                             name: name.to_owned(),
                             docstring: None,
                         });
-                    match with_print!(on_print => checkout
-                        .resume_name_lookup(value, &mut on_print)
-                        .await)
-                    {
-                        Ok(event) => event,
-                        Err(PoolError::Runtime(error)) => {
-                            break 'drive Err(DriverError::Runtime(error));
-                        }
-                        Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
-                    }
+                    turn!('drive, on_print => checkout.resume_name_lookup(value, &mut on_print))
                 }
-                TurnEvent::OsCall { .. } => match with_print!(on_print => checkout
-                    .resume(ResumeValue::NotHandled, &mut on_print)
-                    .await)
-                {
-                    Ok(event) => event,
-                    Err(PoolError::Runtime(error)) => {
-                        break 'drive Err(DriverError::Runtime(error));
-                    }
-                    Err(error) => break 'drive Err(DriverError::Fatal(pool_failure(error))),
-                },
+                TurnEvent::OsCall { .. } => {
+                    turn!('drive, on_print => checkout.resume(ResumeValue::NotHandled, &mut on_print))
+                }
                 TurnEvent::ResolveFutures { pending_call_ids } => {
                     let pending = std::mem::take(&mut pending_calls);
                     if !matches_pending_batch(&pending, &pending_call_ids) {
@@ -1516,8 +1675,10 @@ async fn drive(
                         .map(|call| (call.call_id, call))
                         .collect::<BTreeMap<_, _>>();
                     let mut tokens = BTreeMap::new();
+                    let mut call_modes = BTreeMap::new();
                     let mut run_previews = BTreeMap::new();
                     let mut filesystem_calls = Vec::new();
+                    let (wait_phase_sender, mut wait_phase_receiver) = mpsc::unbounded_channel();
                     let mut invocation_calls: FuturesUnordered<
                         Pin<Box<dyn Future<Output = ToolResult> + Send + '_>>,
                     > = FuturesUnordered::new();
@@ -1531,6 +1692,15 @@ async fn drive(
                                 .is_none(),
                             "a pending host call must have a unique call ID"
                         );
+                        let mode = if call.invocation.is_some() {
+                            PendingCallMode::Control
+                        } else {
+                            PendingCallMode::Ordinary
+                        };
+                        assert!(
+                            call_modes.insert(call.call_id, mode).is_none(),
+                            "a pending host call must have a unique call ID"
+                        );
                         if let Some(run_preview) = call.run_preview {
                             assert!(
                                 run_previews
@@ -1542,10 +1712,20 @@ async fn drive(
                         if let Some(operation) = call.invocation {
                             let call_id = call.call_id;
                             let arguments = call.arguments;
+                            let wait_phase_sender = wait_phase_sender.clone();
                             invocation_calls.push(Box::pin(async move {
                                 ToolResult::from_result(
                                     call_id,
-                                    invoke_subagent(context, operation, arguments).await,
+                                    invoke_subagent(
+                                        context,
+                                        operation,
+                                        arguments,
+                                        Some(WaitPhaseSignal::new(
+                                            call_id,
+                                            wait_phase_sender.clone(),
+                                        )),
+                                    )
+                                    .await,
                                 )
                             }));
                         } else {
@@ -1570,22 +1750,108 @@ async fn drive(
                     ));
                     let mut filesystem_complete = false;
                     while !tokens.is_empty() {
-                        let result = tokio::select! {
-                            result = filesystem.next(), if !filesystem_complete => match result {
-                                Some(result) => result,
-                                None => {
-                                    filesystem_complete = true;
-                                    continue;
+                        budget.resume();
+                        let child_deadline = match context {
+                            Some(context) => match budget
+                                .wait(cancellation, context.coordinator().next_deadline())
+                                .await
+                            {
+                                Ok(deadline) => deadline,
+                                Err(BudgetInterruption::Cancelled) => {
+                                    break 'drive Err(DriverError::Cancelled);
+                                }
+                                Err(BudgetInterruption::TimedOut) => {
+                                    break 'drive Err(DriverError::TimedOut);
                                 }
                             },
-                            result = invocation_calls.next(), if !invocation_calls.is_empty() => {
-                                result.expect("every admitted subagent call must settle")
-                            },
-                            output = output_receiver.recv(), if !run_previews.is_empty() => {
+                            None => None,
+                        };
+                        update_budget_pause(budget, &call_modes);
+                        let clock = budget.clock.clone();
+                        let child_deadline = async {
+                            if let Some(deadline) = child_deadline {
+                                clock.sleep_until(deadline).await;
+                                BatchEvent::ChildDeadline
+                            } else {
+                                std::future::pending().await
+                            }
+                        };
+                        let next_event = async {
+                            tokio::select! {
+                                event = child_deadline => event,
+                                call_id = wait_phase_receiver.recv() => {
+                                    BatchEvent::WaitPhase(call_id.expect("wait-phase sender remains open"))
+                                },
+                                result = filesystem.next(), if !filesystem_complete => match result {
+                                    Some(result) => BatchEvent::Result(result),
+                                    None => BatchEvent::FilesystemComplete,
+                                },
+                                result = invocation_calls.next(), if !invocation_calls.is_empty() => {
+                                    BatchEvent::Result(result.expect("every admitted subagent call must settle"))
+                                },
+                                output = output_receiver.recv(), if !run_previews.is_empty() => BatchEvent::Output(output),
+                            }
+                        };
+                        let event = if budget.is_paused() {
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => break 'drive Err(DriverError::Cancelled),
+                                event = next_event => event,
+                            }
+                        } else {
+                            match budget.wait(cancellation, next_event).await {
+                                Ok(event) => event,
+                                Err(BudgetInterruption::Cancelled) => {
+                                    break 'drive Err(DriverError::Cancelled);
+                                }
+                                Err(BudgetInterruption::TimedOut) => {
+                                    break 'drive Err(DriverError::TimedOut);
+                                }
+                            }
+                        };
+                        let result = match event {
+                            BatchEvent::WaitPhase(call_id) => {
+                                if let Some(mode) = call_modes.get_mut(&call_id) {
+                                    assert_eq!(
+                                        *mode,
+                                        PendingCallMode::Control,
+                                        "only control calls can enter the child wait phase"
+                                    );
+                                    *mode = PendingCallMode::Waiting;
+                                }
+                                continue;
+                            }
+                            BatchEvent::ChildDeadline => {
+                                let context =
+                                    context.expect("child deadlines require an invocation context");
+                                budget.resume();
+                                match budget
+                                    .wait(cancellation, context.coordinator().service())
+                                    .await
+                                {
+                                    Ok(()) => {}
+                                    Err(BudgetInterruption::Cancelled) => {
+                                        break 'drive Err(DriverError::Cancelled);
+                                    }
+                                    Err(BudgetInterruption::TimedOut) => {
+                                        break 'drive Err(DriverError::TimedOut);
+                                    }
+                                }
+                                continue;
+                            }
+                            BatchEvent::FilesystemComplete => {
+                                filesystem_complete = true;
+                                continue;
+                            }
+                            BatchEvent::Output(output) => {
                                 if let Some(output) = output {
                                     update_run_preview(output, &mut run_previews, progress);
                                 }
                                 continue;
+                            }
+                            BatchEvent::Result(result) => {
+                                budget.resume();
+                                result
                             }
                         };
                         while let Ok(output) = output_receiver.try_recv() {
@@ -1595,6 +1861,9 @@ async fn drive(
                         let (tool, token) = tokens
                             .remove(&call_id)
                             .expect("a host result must retain an admitted call ID");
+                        call_modes
+                            .remove(&call_id)
+                            .expect("a host result must retain an admitted call mode");
                         let summary = tool_summary(tool, &result);
                         assert!(
                             results.insert(call_id, result).is_none(),
@@ -1603,7 +1872,18 @@ async fn drive(
                         let call = tools.settle(token, summary);
                         run_previews.remove(&call_id);
                         #[cfg(test)]
-                        tool_host.wait_after_read_settled().await;
+                        match budget
+                            .wait(cancellation, tool_host.wait_after_read_settled())
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(BudgetInterruption::Cancelled) => {
+                                break 'drive Err(DriverError::Cancelled);
+                            }
+                            Err(BudgetInterruption::TimedOut) => {
+                                break 'drive Err(DriverError::TimedOut);
+                            }
+                        }
                         progress(ArenaProgress::ToolUpdated { token, call });
                         #[cfg(test)]
                         tool_host.note_batch_driver_settled(call_id);
@@ -1611,6 +1891,10 @@ async fn drive(
                     assert!(
                         tokens.is_empty(),
                         "every admitted host call must settle exactly once"
+                    );
+                    assert!(
+                        call_modes.is_empty(),
+                        "every admitted host call mode must settle exactly once"
                     );
                     for call_id in &pending_call_ids {
                         results
@@ -1629,16 +1913,7 @@ async fn drive(
                         .collect();
                     #[cfg(test)]
                     tool_host.note_batch_driver_resume_futures();
-                    match with_print!(on_print => checkout.resume_futures(results, &mut on_print).await)
-                    {
-                        Ok(event) => event,
-                        Err(PoolError::Runtime(error)) => {
-                            break 'drive Err(DriverError::Runtime(error));
-                        }
-                        Err(error) => {
-                            break 'drive Err(DriverError::Fatal(pool_failure(error)));
-                        }
-                    }
+                    turn!('drive, on_print => checkout.resume_futures(results, &mut on_print))
                 }
             };
         }
@@ -2373,24 +2648,27 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::env;
     use std::fs;
+    use std::future::Future;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use monty_types::{MontyObject, MontyType, PrintStream};
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Semaphore, mpsc, oneshot, watch};
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Arena, ArenaError, Checkout, DriverError, Execution, ExecutionOutcome,
+        Arena, ArenaError, ChargeableBudget, Checkout, DriverError, Execution, ExecutionOutcome,
         INTERRUPTED_EVIDENCE_TEXT_LIMIT, InterruptedExecutionState, OBSERVATION_LIMITS,
-        Observation, ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY,
-        RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName, ToolTraceState,
-        drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
-        result_values_from_monty, tool_summary, validate_worker, validate_worker_with_timeout,
+        Observation, ObservationAccumulator, ObservationLimits, PendingCallMode, PythonError,
+        RUNTIME_IDENTITY, RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName,
+        ToolTraceState, drive, is_unsafe_memory_error, is_unsafe_soft_memory_error,
+        parse_soft_memory_limit, result_values_from_monty, tool_summary, update_budget_pause,
+        validate_worker, validate_worker_with_timeout,
     };
     use crate::model::{
         Model, ModelFailure, ModelHistory, ModelProgress, ModelStep, ScriptedAction, ScriptedModel,
@@ -2456,6 +2734,27 @@ mod tests {
         let arena = Arena::new(worker_path(), tool_host)
             .await
             .expect("create arena");
+        (arena, gate)
+    }
+
+    async fn arena_with_read_gate_and_clock(
+        workspace: &TempDir,
+        clock: Arc<InvocationClock>,
+    ) -> (Arena, ReadTestGate) {
+        let gate = ReadTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .expect("open tool host")
+            .with_test_gate(gate.clone());
+        let arena = Arena::with_limits_and_clock(
+            worker_path(),
+            tool_host,
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock,
+        )
+        .await
+        .expect("create arena");
         (arena, gate)
     }
 
@@ -2562,32 +2861,90 @@ mod tests {
         started: mpsc::UnboundedSender<oneshot::Sender<Result<ChildResult, ChildFailure>>>,
     }
 
+    struct CleanupInvocationRunner {
+        started: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+
     struct CallerCapturingInvocationRunner {
         callers: mpsc::UnboundedSender<Caller>,
     }
 
     #[derive(Clone)]
-    struct InvocationClock(Arc<Mutex<(Instant, i64)>>);
+    struct InvocationClock {
+        time: Arc<Mutex<(Instant, i64)>>,
+        changed: watch::Sender<u64>,
+        paused: Arc<Semaphore>,
+        coordinator_advance: Arc<Mutex<Option<Duration>>>,
+    }
 
     impl InvocationClock {
         fn new() -> Self {
-            Self(Arc::new(Mutex::new((Instant::now(), 0))))
+            Self {
+                time: Arc::new(Mutex::new((Instant::now(), 0))),
+                changed: watch::channel(0).0,
+                paused: Arc::new(Semaphore::new(0)),
+                coordinator_advance: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        async fn wait_until_budget_paused(&self) {
+            self.paused
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test clock remains open")
+                .forget();
         }
 
         fn advance(&self, duration: Duration) {
-            let mut value = self.0.lock().unwrap();
+            let mut value = self.time.lock().unwrap();
             value.0 += duration;
             value.1 += i64::try_from(duration.as_millis()).unwrap();
+            self.changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+
+        fn advance_next_coordinator_now(&self, duration: Duration) {
+            *self.coordinator_advance.lock().unwrap() = Some(duration);
         }
     }
 
     impl Clock for InvocationClock {
         fn now(&self) -> Instant {
-            self.0.lock().unwrap().0
+            if let Some(duration) = self.coordinator_advance.lock().unwrap().take() {
+                self.advance(duration);
+            }
+            self.time.lock().unwrap().0
         }
 
         fn unix_time_ms(&self) -> i64 {
-            self.0.lock().unwrap().1
+            self.time.lock().unwrap().1
+        }
+    }
+
+    impl super::ArenaClock for InvocationClock {
+        fn now(&self) -> Instant {
+            self.time.lock().unwrap().0
+        }
+
+        fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let clock = self.clone();
+            Box::pin(async move {
+                let mut changed = clock.changed.subscribe();
+                loop {
+                    if <InvocationClock as super::ArenaClock>::now(&clock) >= deadline {
+                        return;
+                    }
+                    changed
+                        .changed()
+                        .await
+                        .expect("test clock sender remains open");
+                }
+            })
+        }
+
+        fn test_budget_paused(&self) {
+            self.paused.add_permits(1);
         }
     }
 
@@ -2682,6 +3039,24 @@ mod tests {
                     result = result => result.expect("test settles started child"),
                     _ = cancellation.cancelled() => Err(ChildFailure::new("child cancelled")),
                 }
+            })
+        }
+    }
+
+    impl ChildRunner<ChildPayload> for CleanupInvocationRunner {
+        fn run(
+            &self,
+            _child: ChildRun<ChildPayload>,
+            cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            let (release, cleanup) = oneshot::channel();
+            self.started
+                .send(release)
+                .expect("test receives started child");
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                cleanup.await.expect("test releases child cleanup");
+                Err(ChildFailure::new("child cancelled"))
             })
         }
     }
@@ -3383,7 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_arena_sets_a_whole_execution_deadline_and_memory_limit() {
+    async fn production_arena_sets_a_chargeable_execution_budget_and_memory_limit() {
         let workspace = tempfile::tempdir().unwrap();
         let arena = arena(&workspace).await;
         let limits = arena
@@ -3962,6 +4337,700 @@ mod tests {
         )
         .await;
         assert_eq!(complete(&execution).unwrap().head, "'timed_out'");
+    }
+
+    #[tokio::test]
+    async fn sole_subagent_wait_pauses_the_chargeable_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let (context, _coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('wait')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let finish = started.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "(await task.wait())['message']",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(6 * 60));
+        finish
+            .send(Ok(ChildResult::new("done".to_owned(), BTreeMap::new())))
+            .unwrap();
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'done'");
+    }
+
+    #[tokio::test]
+    async fn concurrent_subagent_waits_pause_the_chargeable_budget_and_preserve_result_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let (context, _coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "first = await start_subagent('first')\nsecond = await start_subagent('second')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let first = started.recv().await.expect("first child starts");
+        let second = started.recv().await.expect("second child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "import asyncio\nfirst_result, second_result = await asyncio.gather(first.wait(), second.wait())\n(first_result['message'], second_result['message'])",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before both child waits entered their wait phase: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(6 * 60));
+        second
+            .send(Ok(ChildResult::new(
+                "second done".to_owned(),
+                BTreeMap::new(),
+            )))
+            .unwrap();
+        first
+            .send(Ok(ChildResult::new(
+                "first done".to_owned(),
+                BTreeMap::new(),
+            )))
+            .unwrap();
+
+        let execution = execution.await.unwrap();
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('first done', 'second done')"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_subagent_wait_and_repeated_waits_keep_the_same_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let (context, _coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "result = await run_subagent('wait')\ntask = await get_subagent(result['id'])\nagain = await task.wait()\n(result['message'], again['message'])",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        let finish = tokio::select! {
+            finish = started.recv() => finish.expect("child starts"),
+            result = &mut execution => panic!("execution finished before its child started: {result:?}"),
+        };
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(6 * 60));
+        finish
+            .send(Ok(ChildResult::new("done".to_owned(), BTreeMap::new())))
+            .unwrap();
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "('done', 'done')");
+        assert_eq!(
+            execution
+                .tool_calls
+                .iter()
+                .map(|call| call.tool)
+                .collect::<Vec<_>>(),
+            [
+                ToolName::StartSubagent,
+                ToolName::WaitSubagent,
+                ToolName::GetSubagent,
+                ToolName::WaitSubagent,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_wait_preserves_remaining_budget_for_later_host_work() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("before"), "before").unwrap();
+        fs::write(workspace.path().join("after"), "after").unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let (mut arena, gate) = arena_with_read_gate_and_clock(&workspace, clock.clone()).await;
+        let (context, _coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        let mut start = Box::pin(arena.execute_with_progress_and_context(
+            "task = await start_subagent('wait')",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut start => panic!("start finished before its control call settled: {result:?}"),
+        }
+        gate.resume_driver();
+        start.await.unwrap();
+        let finish = started.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "import asyncio\nawait asyncio.gather(task.wait(), read('before'))\nawait read('after')",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before the first read: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(2));
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before the first read settled: {result:?}"),
+        }
+        gate.resume_driver();
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(10 * 60));
+        finish
+            .send(Ok(ChildResult::new("done".to_owned(), BTreeMap::new())))
+            .unwrap();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its child wait settled: {result:?}"),
+        }
+        gate.resume_driver();
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before the second read: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(3));
+
+        assert!(matches!(execution.await, Err(ArenaError::TimedOut { .. })));
+    }
+
+    #[tokio::test]
+    async fn mixed_gather_keeps_child_wait_chargeable_until_ordinary_call_settles() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("blocked"), "blocked").unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let (mut arena, gate) = arena_with_read_gate_and_clock(&workspace, clock.clone()).await;
+        let (context, coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        let mut start = Box::pin(arena.execute_with_progress_and_context(
+            "task = await start_subagent('wait')",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut start => panic!("start finished before its control call settled: {result:?}"),
+        }
+        gate.resume_driver();
+        start.await.unwrap();
+        let _finish = started.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "import asyncio\nawait asyncio.gather(task.wait(), read('blocked'))",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before the ordinary call started: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(5));
+
+        assert!(matches!(execution.await, Err(ArenaError::TimedOut { .. })));
+        coordinator.cancel_all().await;
+    }
+
+    #[tokio::test]
+    async fn queued_ordinary_calls_remain_chargeable() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..17 {
+            fs::write(
+                workspace.path().join(format!("file-{index}")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let clock = Arc::new(InvocationClock::new());
+        let gate = BatchTestGate::new();
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_batch_test_gate(gate.clone());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            tool_host,
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let code = gathered_reads(17);
+        let mut execution = Box::pin(arena.execute(&code, &cancellation));
+
+        tokio::select! {
+            _ = gate.wait_until_calls_started(16) => {}
+            result = &mut execution => panic!("execution finished before its active calls started: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(5));
+
+        assert!(matches!(execution.await, Err(ArenaError::TimedOut { .. })));
+        assert!(gate.active_call_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_ordinary_gather_sibling_does_not_pause_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("blocked"), "blocked").unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let (mut arena, gate) = arena_with_read_gate_and_clock(&workspace, clock.clone()).await;
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "import asyncio\nawait asyncio.gather(run('true', 'missing'), read('blocked'))",
+            &cancellation,
+        ));
+
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before the ordinary call started: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(5));
+
+        assert!(matches!(execution.await, Err(ArenaError::TimedOut { .. })));
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_while_paused_recovers_without_stopping_the_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        execute_without_cancellation(&mut arena, "value = 7")
+            .await
+            .unwrap();
+        let (context, coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('wait')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let _finish = started.recv().await.expect("child starts");
+        let child = coordinator.records().await.pop().unwrap().id().clone();
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "await task.wait()",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        cancellation.cancel();
+
+        assert!(matches!(execution.await, Err(ArenaError::Cancelled { .. })));
+        assert_eq!(coordinator.active_count().await, 1);
+        let observer = coordinator.root_caller().await;
+        assert_eq!(
+            coordinator.get(&observer, &child).await.unwrap().state(),
+            TaskState::Running
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .head,
+            "7"
+        );
+        coordinator.cancel_all().await;
+    }
+
+    #[tokio::test]
+    async fn chargeable_budget_ties_prioritise_cancellation_then_timeout() {
+        let clock = Arc::new(InvocationClock::new());
+        let cancellation = CancellationToken::new();
+        let mut budget = ChargeableBudget::new(clock.clone(), Duration::ZERO);
+        assert!(matches!(
+            budget.wait(&cancellation, std::future::ready(())).await,
+            Err(super::BudgetInterruption::TimedOut)
+        ));
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut budget = ChargeableBudget::new(clock, Duration::ZERO);
+        assert!(matches!(
+            budget.wait(&cancellation, std::future::ready(())).await,
+            Err(super::BudgetInterruption::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn budget_pauses_for_all_and_only_waiting_call_modes() {
+        for (modes, expected_paused) in [
+            (vec![], false),
+            (vec![PendingCallMode::Waiting], true),
+            (
+                vec![PendingCallMode::Waiting, PendingCallMode::Waiting],
+                true,
+            ),
+            (
+                vec![
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Waiting,
+                ],
+                true,
+            ),
+            (vec![PendingCallMode::Control], false),
+            (vec![PendingCallMode::Ordinary], false),
+            (
+                vec![PendingCallMode::Waiting, PendingCallMode::Control],
+                false,
+            ),
+            (
+                vec![PendingCallMode::Control, PendingCallMode::Waiting],
+                false,
+            ),
+            (
+                vec![PendingCallMode::Waiting, PendingCallMode::Ordinary],
+                false,
+            ),
+            (
+                vec![PendingCallMode::Ordinary, PendingCallMode::Waiting],
+                false,
+            ),
+            (
+                vec![
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Control,
+                ],
+                false,
+            ),
+            (
+                vec![
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Waiting,
+                    PendingCallMode::Ordinary,
+                ],
+                false,
+            ),
+        ] {
+            let mut budget =
+                ChargeableBudget::new(Arc::new(InvocationClock::new()), Duration::from_secs(1));
+            let call_modes = modes
+                .into_iter()
+                .zip(0_u32..)
+                .map(|(mode, call_id)| (call_id, mode))
+                .collect();
+
+            update_budget_pause(&mut budget, &call_modes);
+
+            assert_eq!(budget.is_paused(), expected_paused, "{call_modes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn child_cancellation_cleanup_pauses_the_chargeable_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let (started, mut children) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(CleanupInvocationRunner { started }),
+            clock.clone(),
+        );
+        let context =
+            AgentInvocationContext::new(coordinator.root_caller().await, coordinator.clone())
+                .with_accepted_thinking(AcceptedThinking::new(
+                    selection,
+                    snapshot.settings().clone(),
+                ));
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('cancel')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let release = children.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "(await task.cancel()).state",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before child cleanup: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(6 * 60));
+        release.send(()).unwrap();
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'cancelled'");
+        assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn child_deadline_expires_while_the_parent_budget_is_paused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let (context, coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('wait')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let _finish = started.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "caught = None\ntry:\n    await task.wait()\nexcept TimeoutError:\n    caught = 'timed out'\ncaught",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        clock.advance(Duration::from_secs(901));
+
+        let execution = execution.await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'timed out'");
+        assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn child_deadline_service_work_consumes_the_parent_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let clock = Arc::new(InvocationClock::new());
+        let mut arena = Arena::with_limits_and_clock(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::from_secs(5),
+            Some(64 * 1024 * 1024),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let (context, coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('wait')",
+                &cancellation,
+                &mut progress,
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        let _finish = started.recv().await.expect("child starts");
+        let mut execution = Box::pin(arena.execute_with_progress_and_context(
+            "caught = None\ntry:\n    await task.wait()\nexcept TimeoutError:\n    caught = 'timed out'\ncaught",
+            &cancellation,
+            &mut progress,
+            Some(&context),
+            Some(selection),
+        ));
+        let wait_phase = clock.wait_until_budget_paused();
+        tokio::pin!(wait_phase);
+        tokio::select! {
+            _ = &mut wait_phase => {}
+            result = &mut execution => panic!("execution finished before its child wait: {result:?}"),
+        }
+        clock.advance_next_coordinator_now(Duration::from_secs(5));
+        clock.advance(Duration::from_secs(900));
+
+        assert!(matches!(execution.await, Err(ArenaError::TimedOut { .. })));
+        coordinator.cancel_all().await;
     }
 
     #[tokio::test]
@@ -7314,6 +8383,8 @@ mod tests {
         let mut progress = |_| {};
         let mut interruption = InterruptedExecutionState::new();
         let mut authorisations = WholeFileAuthorisations::default();
+        let cancellation = CancellationToken::new();
+        let mut budget = ChargeableBudget::new(arena.clock.clone(), Duration::from_secs(1));
         let result = drive(
             checkout,
             &arena.tool_host,
@@ -7322,6 +8393,8 @@ mod tests {
             &mut authorisations,
             &mut progress,
             &mut interruption,
+            &mut budget,
+            &cancellation,
         )
         .await;
         let Err(DriverError::Runtime(error)) = result else {
