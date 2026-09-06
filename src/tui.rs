@@ -1560,25 +1560,24 @@ fn render(frame: &mut Frame, app: &mut App) {
         area.width,
         1,
     );
-    if area.height == 2 {
-        render_rule(
-            frame,
+    if area.height <= 3 {
+        let rule_style = thinking_rule_style(app.settings_selection);
+        if area.height == 3 {
+            render_rule(
+                frame,
+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                rule_style,
+            );
+        }
+        let layout = match app.footer_context() {
+            Some(context) => app
+                .transcript
+                .layout_with_footer(bottom_rule.width, context),
+            None => app.transcript.layout(bottom_rule.width),
+        };
+        frame.render_widget(
+            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
             bottom_rule,
-            thinking_rule_style(app.settings_selection),
-        );
-        app.history_unavailable();
-        return;
-    }
-    if area.height == 3 {
-        render_rule(
-            frame,
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
-            thinking_rule_style(app.settings_selection),
-        );
-        render_rule(
-            frame,
-            bottom_rule,
-            thinking_rule_style(app.settings_selection),
         );
         app.history_unavailable();
         return;
@@ -5736,6 +5735,49 @@ mod tests {
     }
 
     #[test]
+    fn configured_two_row_prompt_renders_footer_model_and_thinking() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+
+        let screen = rendered(&mut app, 33, 2);
+        let rows = screen.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1], "─ gpt-5.6-sol • thinking medium ─");
+
+        let buffer = rendered_buffer(&mut app, 33, 2);
+        assert_eq!(buffer[(0, 1)].fg, super::THINKING_RULE_COLOURS[2]);
+
+        for width in 0..=4 {
+            let backend = TestBackend::new(width, 2);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_three_row_prompt_keeps_top_rule_and_footer_model_and_thinking() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+
+        let screen = rendered(&mut app, 33, 3);
+        let rows = screen.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], "─".repeat(33));
+        assert_eq!(rows[2], "─ gpt-5.6-sol • thinking medium ─");
+
+        let buffer = rendered_buffer(&mut app, 33, 3);
+        assert_eq!(buffer[(0, 2)].fg, super::THINKING_RULE_COLOURS[2]);
+
+        for width in 0..=4 {
+            let backend = TestBackend::new(width, 3);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, &mut app))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn prompt_chrome_is_safe_at_small_dimensions_and_configuration_stays_unchanged() {
         let mut app = App::default();
         for height in 0..=6 {
@@ -5866,13 +5908,17 @@ mod tests {
         assert!(one.starts_with("Status:"));
         assert!(!one.contains("> ask"));
         let two = rendered(&mut app, 80, 2);
-        assert!(two.lines().nth(1).is_some_and(|row| row == "─".repeat(80)));
+        assert!(
+            two.lines()
+                .nth(1)
+                .is_some_and(|row| row.ends_with("↑100 ↓20 R10 W5 CH10.0% $0.0007690 0.0%/272k ─"))
+        );
 
         let three = rendered(&mut app, 80, 3);
         let rows = three.lines().collect::<Vec<_>>();
         assert!(rows[0].starts_with("Status:"));
         assert_eq!(rows[1], "─".repeat(80));
-        assert_eq!(rows[2], "─".repeat(80));
+        assert!(rows[2].ends_with("↑100 ↓20 R10 W5 CH10.0% $0.0007690 0.0%/272k ─"));
 
         let four = rendered(&mut app, 80, 4);
         let rows = four.lines().collect::<Vec<_>>();
