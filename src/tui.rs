@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod picker;
+mod slash;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -13,9 +15,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::terminal::SetTitle;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -25,7 +27,7 @@ use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::CATALOGUE;
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
-use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout};
+use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
 use crate::selection::{DocumentPosition, Selection};
 #[cfg(test)]
@@ -163,6 +165,8 @@ struct App {
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
+    completion: slash::Completion,
+    slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
     pending_settings_revision: Option<u64>,
@@ -194,6 +198,8 @@ impl Default for App {
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
+            completion: slash::Completion::default(),
+            slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
             pending_settings_revision: None,
@@ -261,6 +267,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        if self.slash_overlay_mouse(mouse) {
+            return self.handle_slash_overlay_mouse(mouse);
+        }
         let notice_cleared = self.clear_notice();
         let mut update = match mouse.kind {
             MouseEventKind::ScrollUp => self.update_scroll(
@@ -284,6 +293,36 @@ impl App {
         update
     }
 
+    fn slash_overlay_mouse(&self, mouse: MouseEvent) -> bool {
+        matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+        ) && self.slash_overlay.is_some_and(|overlay| {
+            mouse.column >= overlay.x
+                && mouse.column < overlay.right()
+                && mouse.row >= overlay.y
+                && mouse.row < overlay.bottom()
+        })
+    }
+
+    fn handle_slash_overlay_mouse(&mut self, mouse: MouseEvent) -> Update {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(drag) = &mut self.drag {
+                    drag.edge = None;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = None;
+                self.pending_copy = false;
+            }
+            _ => unreachable!("only primary overlay mouse events are handled"),
+        }
+        Update::default()
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Update {
         self.handle_key_at(key, Instant::now())
     }
@@ -300,7 +339,7 @@ impl App {
 
     fn handle_paste(&mut self, text: &str) -> Update {
         let notice_cleared = self.clear_notice();
-        let visible_changed = if self.is_submission_disabled() || self.picker.is_some() {
+        let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
             false
         } else {
             let text = normalise_terminal_text(&normalise_paste_line_endings(text));
@@ -308,7 +347,7 @@ impl App {
         };
         Update {
             commands: Vec::new(),
-            visible_changed: visible_changed || notice_cleared,
+            visible_changed: prompt_changed || self.refresh_completion() || notice_cleared,
             quit: false,
         }
     }
@@ -375,9 +414,12 @@ impl App {
         if key.code == KeyCode::Esc && !self.transcript.is_idle() {
             return Update::with_commands([RuntimeCommand::Cancel]);
         }
+        if let Some(update) = self.handle_completion_key(key) {
+            return update;
+        }
         if key.code == KeyCode::Enter && key.modifiers.is_empty() && !self.prompt.is_empty() {
             let draft = self.prompt.take();
-            if let Some(command) = slash_command(&draft) {
+            if let Some(command) = slash::parse(&draft) {
                 return self.handle_slash_command(command);
             }
             if self.transcript.is_idle() {
@@ -397,18 +439,49 @@ impl App {
             };
         }
         if let Some(edit) = self.prompt_edit(key) {
+            let prompt_changed = self.prompt.apply(edit, self.prompt_width);
             return Update {
                 commands: Vec::new(),
-                visible_changed: self.prompt.apply(edit, self.prompt_width),
+                visible_changed: prompt_changed || self.refresh_completion(),
                 quit: false,
             };
         }
         Update::default()
     }
 
-    fn handle_slash_command(&mut self, command: SlashCommand<'_>) -> Update {
-        match command {
-            SlashCommand::Model(argument) => {
+    fn handle_completion_key(&mut self, key: KeyEvent) -> Option<Update> {
+        self.refresh_completion();
+        if !key.modifiers.is_empty() || self.completion.selected_token().is_none() {
+            return None;
+        }
+        let visible_changed = match key.code {
+            KeyCode::Up => self.completion.move_selection(-1),
+            KeyCode::Down => self.completion.move_selection(1),
+            KeyCode::Tab | KeyCode::Enter => {
+                let token = self.completion.selected_token()?;
+                self.prompt.take();
+                self.prompt.insert_paste(token);
+                self.refresh_completion();
+                true
+            }
+            _ => return None,
+        };
+        Some(Update {
+            commands: Vec::new(),
+            visible_changed,
+            quit: false,
+        })
+    }
+
+    fn refresh_completion(&mut self) -> bool {
+        self.completion
+            .sync(self.prompt.text(), self.prompt.caret_at_end())
+    }
+
+    fn handle_slash_command(&mut self, command: slash::Parsed<'_>) -> Update {
+        match command.action {
+            slash::Action::Model => {
+                let argument = command.argument;
                 if let Some(model) = CATALOGUE
                     .iter()
                     .copied()
@@ -424,8 +497,9 @@ impl App {
                     }
                 }
             }
-            SlashCommand::Name(argument) => self.name_session(argument),
-            SlashCommand::Thinking(argument) => {
+            slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Thinking => {
+                let argument = command.argument;
                 let model = self.settings_selection.model();
                 if argument.is_empty() {
                     self.open_thinking_picker();
@@ -1066,39 +1140,6 @@ impl App {
     }
 }
 
-enum SlashCommand<'a> {
-    Model(&'a str),
-    Name(&'a str),
-    Thinking(&'a str),
-}
-
-fn slash_command(draft: &str) -> Option<SlashCommand<'_>> {
-    if draft.contains('\n') {
-        return None;
-    }
-    if let Some(rest) = draft.strip_prefix("/model") {
-        return slash_argument(rest).map(SlashCommand::Model);
-    }
-    if let Some(rest) = draft.strip_prefix("/name") {
-        return slash_argument(rest).map(SlashCommand::Name);
-    }
-    draft
-        .strip_prefix("/thinking")
-        .and_then(slash_argument)
-        .map(SlashCommand::Thinking)
-}
-
-fn slash_argument(rest: &str) -> Option<&str> {
-    if rest.is_empty() {
-        Some("")
-    } else {
-        rest.chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-            .then(|| rest.trim())
-    }
-}
-
 fn is_shift_tab(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::BackTab => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
@@ -1482,6 +1523,9 @@ const PROMPT_GUTTER_WIDTH: u16 = 2;
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    if let Some(stale_overlay) = app.slash_overlay.take() {
+        frame.render_widget(Clear, stale_overlay.intersection(area));
+    }
     frame.buffer_mut().set_style(area, page_style());
     if area.width == 0 || area.height == 0 {
         app.history_unavailable();
@@ -1573,6 +1617,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     app.prompt_width = area.width.saturating_sub(PROMPT_GUTTER_WIDTH);
+    app.refresh_completion();
     let prompt = app
         .prompt
         .layout(app.prompt_width, prompt_content_capacity(area.height));
@@ -1596,6 +1641,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             .saturating_sub(prompt_box_height),
     );
     let layout = render_history(frame, app, history);
+    render_slash_overlay(frame, app, history, content);
     let rule_style = thinking_rule_style(app.settings_selection);
     render_rule(
         frame,
@@ -1607,6 +1653,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         &prompt,
         content,
         !app.is_submission_disabled() && app.picker.is_none(),
+        slash::recognised_token_range(app.prompt.text()),
     );
     frame.render_widget(
         Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
@@ -1658,6 +1705,45 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     layout
 }
 
+fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect, content: Rect) {
+    if app.is_submission_disabled() || app.picker.is_some() {
+        return;
+    }
+    let rows = app.completion.visible_rows(usize::from(history.height));
+    let Some(height) = u16::try_from(rows.len()).ok().filter(|height| *height > 0) else {
+        return;
+    };
+    let natural_width = rows
+        .iter()
+        .map(|row| Line::raw(format!("{} {}", row.token, row.purpose)).width())
+        .max()
+        .unwrap_or(0);
+    let width = history
+        .width
+        .min(u16::try_from(natural_width).unwrap_or(u16::MAX));
+    if width == 0 {
+        return;
+    }
+    let x = content
+        .x
+        .saturating_add(PROMPT_GUTTER_WIDTH)
+        .min(history.right().saturating_sub(width));
+    let overlay = Rect::new(x, history.bottom().saturating_sub(height), width, height);
+    frame.render_widget(Clear, overlay);
+    frame.buffer_mut().set_style(overlay, page_style());
+    let lines = rows.into_iter().map(|row| {
+        let text = format!("{} {}", row.token, row.purpose);
+        let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
+        let style = row
+            .selected
+            .then(|| Style::new().add_modifier(Modifier::REVERSED))
+            .unwrap_or_default();
+        Line::styled(format!("{text}{}", " ".repeat(padding)), style)
+    });
+    frame.render_widget(Paragraph::new(Text::from_iter(lines)), overlay);
+    app.slash_overlay = Some(overlay);
+}
+
 fn prompt_content_capacity(height: u16) -> usize {
     let prompt_box_capacity = usize::from(height)
         .saturating_div(3)
@@ -1666,7 +1752,13 @@ fn prompt_content_capacity(height: u16) -> usize {
     prompt_box_capacity.saturating_sub(2).max(1)
 }
 
-fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor_visible: bool) {
+fn render_prompt(
+    frame: &mut Frame,
+    prompt: &PromptLayout,
+    content: Rect,
+    cursor_visible: bool,
+    recognised_token: Option<Range<usize>>,
+) {
     if content.height == 0 {
         return;
     }
@@ -1686,8 +1778,7 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
     let text: Text<'_> = prompt
         .rows()
         .iter()
-        .map(String::as_str)
-        .map(Line::from)
+        .map(|row| prompt_line(row, recognised_token.as_ref()))
         .collect();
     frame.render_widget(
         Paragraph::new(text),
@@ -1712,6 +1803,26 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
             content.y.saturating_add(row),
         ));
     }
+}
+
+fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) -> Line<'a> {
+    let source = row.source();
+    let Some(token) =
+        recognised_token.filter(|token| token.start < source.end && source.start < token.end)
+    else {
+        return Line::raw(row.text());
+    };
+    let start = token.start.max(source.start) - source.start;
+    let end = token.end.min(source.end) - source.start;
+    let text = row.text();
+    Line::from(vec![
+        Span::raw(&text[..start]),
+        Span::styled(
+            &text[start..end],
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(&text[end..]),
+    ])
 }
 
 const THINKING_RULE_COLOURS: [Color; 6] = [
@@ -2666,6 +2777,322 @@ mod tests {
         assert!(app.cycle_thinking_preview(now).visible_changed);
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(buffer[(0, 7)].fg, super::THINKING_RULE_COLOURS[3]);
+    }
+
+    #[test]
+    fn slash_completion_enter_completes_then_executes() {
+        let mut app = app_with_prompt("/mo");
+
+        let complete = app.handle_key(key(KeyCode::Enter));
+
+        assert!(complete.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/model");
+        assert!(app.picker.is_none());
+
+        let execute = app.handle_key(key(KeyCode::Enter));
+
+        assert!(execute.commands.is_empty());
+        assert!(app.prompt.is_empty());
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn slash_exact_tokens_are_cyan_and_bold_without_styling_arguments() {
+        let mut app = app_with_prompt("/model terra");
+
+        let buffer = rendered_buffer(&mut app, 8, 15);
+        let (command_column, command_row) = cell_start(&buffer, "/model");
+        let (argument_column, argument_row) = cell_start(&buffer, "terra");
+
+        assert_eq!(buffer[(command_column, command_row)].fg, Color::Cyan);
+        assert!(
+            buffer[(command_column, command_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_ne!(buffer[(argument_column, argument_row)].fg, Color::Cyan);
+        assert!(
+            !buffer[(argument_column, argument_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        assert!(app.handle_key(key(KeyCode::Left)).visible_changed);
+        let interior = rendered_buffer(&mut app, 8, 15);
+        assert_eq!(interior[(command_column, command_row)].fg, Color::Cyan);
+        assert!(
+            interior[(command_column, command_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
+        let mut app = app_with_prompt("/");
+        let initial = rendered_buffer(&mut app, 40, 8);
+        let overlay = app.slash_overlay.expect("slash overlay");
+        let (model_column, model_row) = cell_start(&initial, "/model");
+        let (name_column, name_row) = cell_start(&initial, "/name");
+        let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
+
+        assert_eq!(model_column, overlay.x);
+        assert!(model_row < name_row && name_row < thinking_row);
+        assert!(
+            initial[(model_column, model_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let name = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            name[(name_column, name_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(
+            !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        let thinking = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            thinking[(thinking_column, thinking_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert_eq!(app.prompt.text(), "/");
+    }
+
+    #[test]
+    fn slash_completion_tab_completes_before_the_second_enter_executes() {
+        let mut app = app_with_prompt("/thi");
+
+        let complete = app.handle_key(key(KeyCode::Tab));
+
+        assert!(complete.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/thinking");
+        assert!(app.picker.is_none());
+
+        let execute = app.handle_key(key(KeyCode::Enter));
+
+        assert!(execute.commands.is_empty());
+        assert!(app.prompt.is_empty());
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn slash_completion_keeps_picker_shift_tab_active_run_and_release_precedence() {
+        let now = Instant::now();
+        let mut shift_tab = App::configured(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut shift_tab, "/");
+        assert!(
+            shift_tab
+                .handle_key_at(shifted_key(KeyCode::Tab), now)
+                .visible_changed
+        );
+        assert_eq!(shift_tab.settings_selection.thinking(), "high");
+        assert_eq!(shift_tab.prompt.text(), "/");
+
+        let mut picker = App::default();
+        picker.open_model_picker("");
+        set_prompt(&mut picker, "/mo");
+        assert!(!picker.handle_key(key(KeyCode::Tab)).visible_changed);
+        assert_eq!(picker.prompt.text(), "/mo");
+        assert!(picker.picker.is_some());
+        let picker_screen = rendered(&mut picker, 40, 8);
+        assert!(picker_screen.contains("Models"));
+        assert!(!picker_screen.contains("Choose model"));
+
+        let mut active = app_with_prompt("/mo");
+        active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        assert!(active.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(active.prompt.text(), "/model");
+        assert!(active.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(active.picker.is_some());
+
+        let mut cancel = app_with_prompt("/mo");
+        cancel.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        assert_eq!(
+            cancel.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel]
+        );
+        assert_eq!(cancel.prompt.text(), "/mo");
+
+        let mut release = app_with_prompt("/mo");
+        release.set_notice("keep status".to_owned());
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            let update = release.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(release.prompt.text(), "/mo");
+            assert_eq!(release.notice(), Some("keep status"));
+        }
+    }
+
+    #[test]
+    fn slash_completion_hides_for_interior_arguments_unknown_and_multiline_drafts() {
+        let mut interior = app_with_prompt("/mo");
+        assert!(interior.handle_key(key(KeyCode::Left)).visible_changed);
+        rendered_buffer(&mut interior, 40, 8);
+        assert!(interior.slash_overlay.is_none());
+
+        for draft in ["/model terra", "/future", "/model\nterra"] {
+            let mut app = app_with_prompt(draft);
+            let screen = rendered(&mut app, 40, 8);
+            assert!(app.slash_overlay.is_none(), "{draft}");
+            assert!(!screen.contains("Choose model"), "{draft}");
+        }
+    }
+
+    #[test]
+    fn slash_exact_token_style_crosses_soft_wraps_and_leaves_ordinary_drafts_plain() {
+        let mut wrapped = app_with_prompt("/model arg");
+        let buffer = rendered_buffer(&mut wrapped, 5, 18);
+        let (token_column, token_row) = cell_start(&buffer, "/mo");
+        let (argument_column, argument_row) = cell_start(&buffer, " ar");
+
+        for column in token_column..token_column + 3 {
+            assert_eq!(buffer[(column, token_row)].fg, Color::Cyan);
+            assert!(
+                buffer[(column, token_row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+            assert_eq!(buffer[(column, token_row + 1)].fg, Color::Cyan);
+            assert!(
+                buffer[(column, token_row + 1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, Color::Cyan);
+        assert!(
+            !buffer[(argument_column + 1, argument_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        for (draft, token) in [("/future", "/future"), ("/model\narg", "/model")] {
+            let mut app = app_with_prompt(draft);
+            let buffer = rendered_buffer(&mut app, 40, 12);
+            let (column, row) = cell_start(&buffer, token);
+            assert_ne!(buffer[(column, row)].fg, Color::Cyan, "{draft}");
+            assert!(
+                !buffer[(column, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+    }
+
+    #[test]
+    fn slash_overlay_preserves_history_geometry_and_clips_to_tiny_history() {
+        let mut plain = app_with_history(App::default());
+        let mut completed = app_with_history(app_with_prompt("/"));
+        rendered_buffer(&mut plain, 40, 8);
+        rendered_buffer(&mut completed, 40, 8);
+        let overlay = completed.slash_overlay.expect("slash overlay");
+        let viewport = completed.history_viewport.expect("history viewport");
+
+        assert_eq!(completed.history_height, plain.history_height);
+        assert_eq!(
+            viewport.area,
+            plain.history_viewport.expect("history viewport").area
+        );
+        assert_eq!(overlay.bottom(), viewport.area.bottom());
+        assert_eq!(overlay.x, 2);
+
+        let mut tiny = app_with_prompt("/");
+        rendered_buffer(&mut tiny, 5, 5);
+        assert_eq!(tiny.history_height, 1);
+        assert_eq!(tiny.slash_overlay.expect("tiny overlay").height, 1);
+        assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
+        let buffer = rendered_buffer(&mut tiny, 5, 5);
+        let (column, row) = cell_start(&buffer, "/thin");
+        assert!(
+            buffer[(column, row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+
+        rendered_buffer(&mut tiny, 5, 4);
+        assert!(tiny.slash_overlay.is_none());
+    }
+
+    #[test]
+    fn slash_overlay_shields_primary_mouse_events_but_not_history_outside_it() {
+        let mut app = app_with_history(app_with_prompt("/"));
+        rendered_buffer(&mut app, 40, 12);
+        let overlay = app.slash_overlay.expect("slash overlay");
+        let viewport = app.history_viewport.expect("history viewport");
+        let now = Instant::now();
+
+        app.set_notice("keep status".to_owned());
+        let down = app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                overlay.x,
+                overlay.y,
+            ),
+            now,
+        );
+        assert!(!down.visible_changed);
+        assert_eq!(app.notice(), Some("keep status"));
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+
+        let outside_column = viewport.area.x + 1;
+        let outside_row = viewport.area.y;
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                outside_column,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        assert!(app.selection.is_some());
+        assert!(app.drag.as_ref().is_some_and(|drag| drag.edge.is_some()));
+        let selection = app.selection;
+        app.set_notice("keep drag status".to_owned());
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                overlay.x,
+                overlay.y,
+            ),
+            now,
+        );
+        assert_eq!(app.selection, selection);
+        assert_eq!(app.notice(), Some("keep drag status"));
+        assert!(app.drag.as_ref().is_some_and(|drag| drag.edge.is_none()));
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), overlay.x, overlay.y),
+            now,
+        );
+        assert_eq!(app.notice(), Some("keep drag status"));
+        assert!(app.drag.is_none());
+        assert!(!app.pending_copy);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+        assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert!(clipboard.writes.is_empty());
     }
 
     #[test]

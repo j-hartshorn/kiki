@@ -75,7 +75,7 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - The configured prompt has a visible terminal cursor and a 64 KiB UTF-8 input limit. `Left` / `Right`, `Backspace`, and `Delete` operate on extended grapheme clusters; `Ctrl-B` / `Ctrl-F` move by grapheme and `Ctrl-D` deletes the next one. `Up` / `Down` move through visual wrapped rows.
 - The `Command` shortcuts below work where the terminal reports `SUPER` or `META`. `Home` / `End` move within the current logical line; `Command-Left` / `Command-Right` do the same, with `Ctrl-A` / `Ctrl-E` as portable fallbacks. `Command-Up` / `Command-Down` move to the start / end of the whole prompt.
 - `Option-Left` / `Option-Right`, `Alt-B` / `Alt-F`, and `Ctrl-Left` / `Ctrl-Right` move by Unicode word. `Option-Backspace` / `Ctrl-W` delete the preceding word and `Alt-D` deletes the next one. `Command-Backspace` / `Ctrl-U` delete to the logical line start; `Command-Delete` / `Ctrl-K` delete to its end.
-- `Enter` submits while idle.
+- Typing `/` shows automatic command suggestions. With suggestions visible, `Up` / `Down` select, `Tab` or the first `Enter` completes, and a second `Enter` executes the command. Otherwise `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
 - `Shift-Enter` or `Ctrl-J` inserts a prompt newline. `Ctrl-J` remains available when a terminal cannot report modified Enter; plain `Enter` retains submission behaviour.
 - `Esc` cancels the active run.

@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -34,8 +36,14 @@ pub(crate) struct PromptEditor {
 }
 
 pub(crate) struct PromptLayout {
-    rows: Vec<String>,
+    rows: Vec<PromptRow>,
     cursor: Option<(usize, usize)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PromptRow {
+    text: String,
+    source: Range<usize>,
 }
 
 struct VisualRow {
@@ -45,9 +53,12 @@ struct VisualRow {
 }
 
 impl PromptEditor {
-    #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn caret_at_end(&self) -> bool {
+        self.caret == self.text.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -109,7 +120,10 @@ impl PromptEditor {
         PromptLayout {
             rows: rows[self.viewport_top..bottom]
                 .iter()
-                .map(|row| self.text[row.start..row.end].to_owned())
+                .map(|row| PromptRow {
+                    text: self.text[row.start..row.end].to_owned(),
+                    source: row.start..row.end,
+                })
                 .collect(),
             cursor: cursor.and_then(|(row, column)| {
                 (row >= self.viewport_top && row < bottom && column < usize::from(width))
@@ -280,12 +294,22 @@ impl PromptEditor {
 }
 
 impl PromptLayout {
-    pub(crate) fn rows(&self) -> &[String] {
+    pub(crate) fn rows(&self) -> &[PromptRow] {
         &self.rows
     }
 
     pub(crate) fn cursor(&self) -> Option<(usize, usize)> {
         self.cursor
+    }
+}
+
+impl PromptRow {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn source(&self) -> Range<usize> {
+        self.source.clone()
     }
 }
 
@@ -540,7 +564,15 @@ mod tests {
     #[test]
     fn moves_vertically_through_hard_wrapped_and_explicit_rows() {
         let mut editor = from_text("ab日本\n🙂cdef");
-        assert_eq!(editor.layout(4, 10).rows(), ["ab日", "本", "🙂cd", "ef"]);
+        assert_eq!(
+            editor
+                .layout(4, 10)
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["ab日", "本", "🙂cd", "ef"]
+        );
         assert_eq!(editor.layout(4, 10).cursor(), Some((3, 2)));
         assert!(editor.apply(PromptEdit::Up, 4));
         assert_eq!(editor.layout(4, 10).cursor(), Some((2, 2)));
@@ -558,13 +590,27 @@ mod tests {
     fn preserves_explicit_empty_and_trailing_rows_and_exposes_full_row_end() {
         let mut editor = from_text("a\n\nb\n");
         let layout = editor.layout(4, 10);
-        assert_eq!(layout.rows(), ["a", "", "b", ""]);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["a", "", "b", ""]
+        );
         assert_eq!(layout.rows().len(), 4);
         assert_eq!(layout.cursor(), Some((3, 0)));
 
         let mut editor = from_text("abcd");
         let layout = editor.layout(4, 10);
-        assert_eq!(layout.rows(), ["abcd", ""]);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["abcd", ""]
+        );
         assert_eq!(layout.cursor(), Some((1, 0)));
 
         let mut editor = from_text("abcd\nx");
@@ -578,18 +624,96 @@ mod tests {
     fn keeps_the_tail_and_moved_caret_visible_in_its_viewport() {
         let mut editor = from_text("abcdefghij");
         let layout = editor.layout(3, 2);
-        assert_eq!(layout.rows(), ["ghi", "j"]);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["ghi", "j"]
+        );
         assert_eq!(layout.cursor(), Some((1, 1)));
 
         assert!(editor.apply(PromptEdit::Up, 3));
         let layout = editor.layout(3, 2);
-        assert_eq!(layout.rows(), ["ghi", "j"]);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["ghi", "j"]
+        );
         assert_eq!(layout.cursor(), Some((0, 1)));
 
         assert!(editor.apply(PromptEdit::Up, 3));
         let layout = editor.layout(3, 2);
-        assert_eq!(layout.rows(), ["def", "ghi"]);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| row.text())
+                .collect::<Vec<_>>(),
+            ["def", "ghi"]
+        );
         assert_eq!(layout.cursor(), Some((0, 1)));
+    }
+
+    #[test]
+    fn visible_rows_keep_absolute_sources_through_wrapping_newlines_and_viewports() {
+        let mut editor = from_text("ab界cd\n\nxyz\n");
+
+        let layout = editor.layout(3, 6);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| (row.text(), row.source()))
+                .collect::<Vec<_>>(),
+            [
+                ("ab", 0..2),
+                ("界c", 2..6),
+                ("d", 6..7),
+                ("", 8..8),
+                ("xyz", 9..12),
+                ("", 13..13),
+            ]
+        );
+
+        let layout = editor.layout(3, 2);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| (row.text(), row.source()))
+                .collect::<Vec<_>>(),
+            [("xyz", 9..12), ("", 13..13)]
+        );
+
+        assert!(editor.apply(PromptEdit::PromptStart, 3));
+        let layout = editor.layout(3, 2);
+        assert_eq!(
+            layout
+                .rows()
+                .iter()
+                .map(|row| (row.text(), row.source()))
+                .collect::<Vec<_>>(),
+            [("ab", 0..2), ("界c", 2..6)]
+        );
+    }
+
+    #[test]
+    fn layout_does_not_change_the_caret() {
+        let mut editor = from_text("abcdef");
+        assert!(editor.caret_at_end());
+        assert!(editor.apply(PromptEdit::Left, 3));
+        assert!(!editor.caret_at_end());
+
+        let _ = editor.layout(3, 1);
+        assert!(!editor.caret_at_end());
+        assert!(editor.apply(PromptEdit::Insert('X'), 3));
+
+        assert_eq!(editor.text(), "abcdeXf");
     }
 
     #[test]
