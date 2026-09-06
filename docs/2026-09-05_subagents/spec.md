@@ -6,7 +6,7 @@ Kiki runs one foreground agent with a persistent Python arena. Its async tools s
 
 Subagents let an agent delegate focused work without copying the parent's model history. Each child receives an independent copy of the parent's pre-execution arena checkpoint and a task prompt. Background children continue across Python executions, parent replies, and subsequent user requests, allowing the parent to keep working or ask for clarification.
 
-Delegation remains inspectable without embedding child activity inside Python-run cards. Separate subagent event cards provide retained history and expandable prompts. A compact sticky list above the prompt shows running and completed children, including model, model-step count, runtime, and estimated cost. Session accounting includes all descendant work without double-counting.
+Delegation remains inspectable without embedding child activity inside Python-run cards. Separate subagent event cards provide retained history and expandable prompts and terminal results. A compact sticky list above the prompt shows running and completed children, including model, model-step count, runtime, and estimated cost. Session accounting includes all descendant work without double-counting.
 
 ## Goals
 
@@ -159,7 +159,7 @@ Each agent's cost covers only its own attempts. Session cost and token totals in
 
 A Spawned history card contains the ID, fixed qualified model, applicable parent ID, and prompt. A terminal card contains outcome, step count, final runtime/cost, and a bounded final-message or diagnostic preview. Python tool rows use concise Spawned, Refreshed, Waiting, and cancellation summaries referencing the same ID without embedding child activity or repeating full prompts.
 
-History prompts show their first three wrapped display lines by default, with an omission indicator when necessary. `Ctrl-O` expands the retained prompt completely; it wraps and scrolls with ordinary history. The sticky list never expands. Apply terminal-text sanitisation and existing rendering bounds to previews; do not render exported dictionaries automatically.
+History prompts and terminal messages show their first three wrapped display lines by default, with an omission indicator when necessary. Omitted terminal messages append `[result omitted · Ctrl-O to expand]`, including failure diagnostics. `Ctrl-O` expands retained prompts and terminal messages completely; they wrap and scroll with ordinary history. The sticky list never expands. Apply terminal-text sanitisation and existing rendering bounds to previews; do not render exported dictionaries automatically.
 
 Cards are immutable event-time observations. New child records join committed history in runtime publication order, even while the foreground has a live tail; they do not consume or replace that live step. A child's Spawned record always precedes its terminal record. Preserve existing settled rasters during unrelated live updates; no nested mutable child timelines are added to Python cards.
 
@@ -218,7 +218,7 @@ On small terminals, remove padding and reduce visible entries while preserving t
 - Background work survives foreground Python completion, replies, cancellation, and later accepted requests. Subtree failures/cancellation, immutable settlement, restoration, and shutdown follow Ownership and Cancellation without escaping work or reviving results.
 - All admission limits, settings precedence, permission restrictions, and sole-wait clock rules are enforced, including nesting and mixed host batches at saturation.
 - Reliable records account for root and descendant attempts once, retain child evidence separately, and preserve foreground-only context/cache indicators under dropped progress.
-- History cards and the sticky list match Presentation, including full prompt expansion, exact gutters, elapsed runtime, terminal retention, tiny terminals, selection/cache safety, and rapid two-stage Escape.
+- History cards and the sticky list match Presentation, including full prompt and terminal-message expansion, exact gutters, elapsed runtime, terminal retention, tiny terminals, selection/cache safety, and rapid two-stage Escape.
 
 ### Overall validation
 
@@ -245,7 +245,7 @@ git diff --check
 
 Expect exact worker identity `monty-runtime 0.0.21`, all credential-free tests/checks passing, and no dependency-seam leakage. Tests must inject home/workspace/settings and gates rather than observe real configuration or use sleeps to establish ordering. Use deterministic host-time control for clock tests; do not wait fifteen minutes or make provider calls in the ordinary suite.
 
-Manual acceptance, after deterministic verification: start two children using different configured models; let the foreground reply; submit a clarification while they run; inspect changing steps/runtime/cost, expand long history prompts, and verify the sticky list stays compact. Confirm completed entries survive idle time and clear on the next accepted request. Verify Esc once stops only the foreground and Esc again stops background work, including rapid presses and picker precedence. Check shared-file warnings, readonly denial, an ordinary child failure, Unicode gutters, narrow terminal layout, and session cost retention. Live checks are opt-in, not replacements for deterministic assertions.
+Manual acceptance, after deterministic verification: start two children using different configured models; let the foreground reply; submit a clarification while they run; inspect changing steps/runtime/cost, expand long history prompts and terminal results, and verify the sticky list stays compact. Confirm completed entries survive idle time and clear on the next accepted request. Verify Esc once stops only the foreground and Esc again stops background work, including rapid presses and picker precedence. Check shared-file warnings, readonly denial, an ordinary child failure, Unicode gutters, narrow terminal layout, and session cost retention. Live checks are opt-in, not replacements for deterministic assertions.
 
 ### Planning context
 
@@ -340,9 +340,9 @@ Manual acceptance, after deterministic verification: start two children using di
 
 ### Task 9: Render separate subagent history cards
 
-**Changes** — Project Spawned and terminal records into independent history cards with the specified previews, parent/child identity, measures, and prompt expansion. Render concise subagent tool summaries without nested traces. Preserve publication order and the existing live foreground tail, selection text, and settled-raster cache behaviour.
+**Changes** — Project Spawned and terminal records into independent history cards with the specified previews, parent/child identity, measures, and prompt and terminal-message expansion. Render concise subagent tool summaries without nested traces. Preserve publication order and the existing live foreground tail, selection text, and settled-raster cache behaviour.
 
-**Tests** (`src/transcript.rs`, rendering/projection) — First red: a Spawned card arriving during a live foreground Python execution appears separately without replacing that live execution. Cover spawn-before-terminal order, multiple children/descendants, first-three-wrapped-line prompt preview and full Ctrl-O expansion, narrow Unicode/control-text rendering, final diagnostic previews, no exported-data dump or child execution interleaving, no duplicate costs, copying retained history text, and construction counters showing old settled cards are not rebuilt by child progress.
+**Tests** (`src/transcript.rs`, rendering/projection) — First red: a Spawned card arriving during a live foreground Python execution appears separately without replacing that live execution. Cover spawn-before-terminal order, multiple children/descendants, first-three-wrapped-line prompt and terminal-message previews with full Ctrl-O expansion, narrow Unicode/control-text rendering, no exported-data dump or child execution interleaving, no duplicate costs, copying retained history text, and construction counters showing old settled cards are not rebuilt by child progress.
 
 **Files** — Modify: `src/transcript.rs`.
 

@@ -5960,6 +5960,39 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_rebuilds_finished_subagent_history_without_expanding_the_sticky_monitor() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(
+            RuntimeEvent::SubagentFinished {
+                record: crate::subagents::TaskRecord::for_test(
+                    "child1",
+                    1,
+                    crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                ),
+            },
+            now,
+        );
+
+        let before = rendered_at(&mut app, 80, 12, now);
+        let before_counts = app.transcript.construction_counts();
+        assert!(before.contains("Completed · subagent:child1"), "{before}");
+        assert!(before.contains("✓ subagent:child1"), "{before}");
+
+        let update =
+            app.handle_key_at(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL), now);
+        assert!(update.commands.is_empty());
+        assert!(update.visible_changed);
+
+        let expanded = rendered_at(&mut app, 80, 12, now);
+        assert!(expanded.contains("✓ subagent:child1"), "{expanded}");
+        assert_ne!(app.transcript.construction_counts(), before_counts);
+    }
+
+    #[test]
     fn subagent_monitor_ticks_only_for_visible_seconds_without_rebuilding_history() {
         let now = Instant::now();
         let mut app = App::default();

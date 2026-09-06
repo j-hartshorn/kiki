@@ -680,12 +680,12 @@ fn literal_execution_text(text: &str, style: Style) -> Text<'static> {
 }
 
 const SUBAGENT_CARD_HORIZONTAL_PADDING: u16 = 2;
-const SUBAGENT_PROMPT_PREVIEW_ROWS: u16 = 3;
+const SUBAGENT_PREVIEW_ROWS: u16 = 3;
 
 fn subagent_spawned_text(card: &SubagentSpawnedCard, width: u16, expanded: bool) -> Text<'static> {
     let (left_padding, right_padding) = effective_padding(width, SUBAGENT_CARD_HORIZONTAL_PADDING);
     let prompt_width = width.saturating_sub(left_padding.saturating_add(right_padding));
-    let (mut prompt, omitted) = prompt_preview(&card.prompt, prompt_width, expanded);
+    let (mut prompt, omitted) = subagent_preview(&card.prompt, prompt_width, expanded);
     let mut lines = vec![
         Line::raw(format!("Spawned · subagent:{}", card.id)),
         Line::raw(format!("Model · {}", card.model)),
@@ -701,10 +701,9 @@ fn subagent_spawned_text(card: &SubagentSpawnedCard, width: u16, expanded: bool)
     Text::from(lines)
 }
 
-fn prompt_preview(prompt: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, bool) {
+fn subagent_preview(text: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, bool) {
     let full = || {
-        prompt
-            .split('\n')
+        text.split('\n')
             .map(|line| Line::raw(line.to_owned()))
             .collect::<Vec<_>>()
     };
@@ -712,15 +711,15 @@ fn prompt_preview(prompt: &str, width: u16, expanded: bool) -> (Vec<Line<'static
         return (full(), false);
     }
 
-    let paragraph = Paragraph::new(Text::raw(prompt.to_owned())).wrap(Wrap { trim: false });
-    if paragraph.line_count(width) <= usize::from(SUBAGENT_PROMPT_PREVIEW_ROWS) {
+    let paragraph = Paragraph::new(Text::raw(text.to_owned())).wrap(Wrap { trim: false });
+    if paragraph.line_count(width) <= usize::from(SUBAGENT_PREVIEW_ROWS) {
         return (full(), false);
     }
 
-    let area = Rect::new(0, 0, width, SUBAGENT_PROMPT_PREVIEW_ROWS);
+    let area = Rect::new(0, 0, width, SUBAGENT_PREVIEW_ROWS);
     let mut buffer = Buffer::empty(area);
     paragraph.render(area, &mut buffer);
-    let rows = (0..SUBAGENT_PROMPT_PREVIEW_ROWS)
+    let rows = (0..SUBAGENT_PREVIEW_ROWS)
         .map(|row| {
             let mut text = String::new();
             let mut column = 0;
@@ -735,13 +734,23 @@ fn prompt_preview(prompt: &str, width: u16, expanded: bool) -> (Vec<Line<'static
     (rows, true)
 }
 
-fn subagent_finished_text(card: &SubagentFinishedCard) -> Text<'static> {
+fn subagent_finished_text(
+    card: &SubagentFinishedCard,
+    width: u16,
+    expanded: bool,
+) -> Text<'static> {
+    let (left_padding, right_padding) = effective_padding(width, SUBAGENT_CARD_HORIZONTAL_PADDING);
+    let message_width = width.saturating_sub(left_padding.saturating_add(right_padding));
     let mut lines = vec![
         Line::raw(format!("{} · subagent:{}", card.outcome, card.id)),
         Line::raw(card.measures.clone()),
     ];
     if let Some(message) = &card.message {
-        lines.extend(message.split('\n').map(|line| Line::raw(line.to_owned())));
+        let (mut preview, omitted) = subagent_preview(message, message_width, expanded);
+        lines.append(&mut preview);
+        if omitted {
+            lines.push(Line::raw("[result omitted · Ctrl-O to expand]"));
+        }
     }
     Text::from(lines)
 }
@@ -1962,7 +1971,9 @@ impl SettledBlock {
     fn invalidates_for_expansion(&self) -> bool {
         matches!(
             self.source,
-            NormalisedBlock::Arena(..) | NormalisedBlock::SubagentSpawned(..)
+            NormalisedBlock::Arena(..)
+                | NormalisedBlock::SubagentSpawned(..)
+                | NormalisedBlock::SubagentFinished(..)
         )
     }
 }
@@ -2951,7 +2962,7 @@ fn build_render_block(
         NormalisedBlock::SubagentFinished(card) => {
             let style = card_style(COMPLETE_ARENA);
             RenderBlock::card(
-                subagent_finished_text(card),
+                subagent_finished_text(card, width, expand_arenas),
                 style,
                 width,
                 SUBAGENT_CARD_HORIZONTAL_PADDING,
@@ -3818,7 +3829,7 @@ mod tests {
         FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter, NormalisedBlock,
         RenderBlock, SubagentFinishedCard, SubagentSpawnedCard, TEXT, Transcript, TranscriptBlock,
         TranscriptLayout, USER, assistant_text, format_footer_usd, format_token_count, markdown,
-        muted_page_style, normalise_terminal_text, own_styled_text, page_style, prompt_preview,
+        muted_page_style, normalise_terminal_text, own_styled_text, page_style, subagent_preview,
         tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
@@ -3943,9 +3954,37 @@ mod tests {
     }
 
     #[test]
+    fn finished_subagent_result_uses_three_wrapped_rows_until_ctrl_o_expands_and_recollapses_it() {
+        let message = "alpha beta gamma delta epsilon zeta eta theta iota";
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([finished_subagent_card(
+            "child1",
+            "Completed",
+            "1 step · 00:01",
+            Some(message),
+        )]);
+
+        let collapsed = copied_text(&mut transcript, 20);
+        assert_eq!(
+            collapsed,
+            "Completed · subagent:child1\n1 step · 00:01\nalpha beta gamma\ndelta epsilon\nzeta eta theta\n[result omitted · Ctrl-O to expand]"
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = copied_text(&mut transcript, 20);
+        assert_eq!(
+            expanded,
+            format!("Completed · subagent:child1\n1 step · 00:01\n{message}")
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        assert_eq!(copied_text(&mut transcript, 20), collapsed);
+    }
+
+    #[test]
     fn collapsed_spawned_prompt_preserves_wide_graphemes_when_copied() {
         let prompt = "日本🦀e\u{301}日本🦀e\u{301}日本🦀e\u{301}";
-        let (rows, omitted) = prompt_preview(prompt, 4, false);
+        let (rows, omitted) = subagent_preview(prompt, 4, false);
         assert!(omitted);
         assert_eq!(
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -3990,6 +4029,10 @@ mod tests {
         for absent in ["secret_value", "42", "attempt"] {
             assert!(!rendered.contains(absent), "{rendered}");
         }
+        assert!(
+            !copied_text(&mut transcript, 20).contains("[result omitted · Ctrl-O to expand]"),
+            "short results remain fully visible"
+        );
     }
 
     #[test]
@@ -4020,26 +4063,35 @@ mod tests {
     #[test]
     fn subagent_cards_normalise_unicode_and_controls_at_narrow_widths() {
         let prompt = "Café 日本 🦀 e\u{301}\t\r\nnext\u{7}";
+        let diagnostic =
+            "failed \u{1b}日本 🦀 e\u{301} alpha beta gamma delta epsilon zeta eta theta iota";
         let mut transcript = Transcript::default();
         transcript.append_settled_blocks([
             spawned_subagent_card("child1", prompt, None),
-            finished_subagent_card(
-                "child1",
-                "Failed",
-                "1 step · 00:01",
-                Some("failed 日本 🦀\t\u{1b}"),
-            ),
+            finished_subagent_card("child1", "Failed", "1 step · 00:01", Some(diagnostic)),
         ]);
 
         for width in 1..=20 {
             let buffer = rendered_buffer(&mut transcript, width);
             assert_eq!(buffer.area.width, width);
         }
-        let copied = copied_text(&mut transcript, 80);
-        assert!(copied.contains("Café 日本 🦀 e\u{301}"), "{copied}");
-        assert!(copied.contains("next\\x07"), "{copied}");
-        assert!(copied.contains("failed 日本 🦀    \\x1B"), "{copied}");
-        assert!(!copied.contains('\u{1b}'), "{copied}");
+        let collapsed = copied_text(&mut transcript, 20);
+        assert!(collapsed.contains("Café 日本 🦀 e\u{301}"), "{collapsed}");
+        assert!(collapsed.contains("next\\x07"), "{collapsed}");
+        assert!(collapsed.contains("\\x1B"), "{collapsed}");
+        assert!(collapsed.contains("日本"), "{collapsed}");
+        assert!(collapsed.contains("🦀 e\u{301}"), "{collapsed}");
+        assert!(
+            collapsed.contains("[result omitted · Ctrl-O to expand]"),
+            "{collapsed}"
+        );
+        assert!(!collapsed.contains("iota"), "{collapsed}");
+        assert!(!collapsed.contains('\u{1b}'), "{collapsed}");
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = copied_text(&mut transcript, 20);
+        assert!(expanded.contains("iota"), "{expanded}");
+        assert!(!expanded.contains("result omitted"), "{expanded}");
     }
 
     #[test]
@@ -4118,7 +4170,20 @@ mod tests {
             spawned.render_block_builds + 1
         );
 
-        assert!(!transcript.apply(RuntimeEvent::SubagentFinished { record: child }, false));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: child.clone()
+            },
+            false
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 2,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
         transcript.layout(20);
         assert_eq!(transcript.construction_counts(), finished);
         assert_eq!(transcript.settled_blocks.len(), 2);
@@ -4126,10 +4191,10 @@ mod tests {
         assert!(transcript.toggle_arena_expansion());
         transcript.layout(20);
         let expanded = transcript.construction_counts();
-        assert_eq!(expanded.rasterisations, finished.rasterisations + 1);
+        assert_eq!(expanded.rasterisations, finished.rasterisations + 2);
         assert_eq!(
             expanded.render_block_builds,
-            finished.render_block_builds + 1
+            finished.render_block_builds + 2
         );
     }
 
@@ -4198,6 +4263,7 @@ mod tests {
                 Some("bad\x1b diagnostic"),
             ),
             finished_subagent_card("none01", "Cancelled", "0 steps · 00:09", None),
+            finished_subagent_card("late01", "Timed out", "1 step · 15:00", None),
         ]);
 
         let copied = copied_text(&mut transcript, 80);
@@ -4211,6 +4277,11 @@ mod tests {
             copied.contains("Cancelled · subagent:none01\n0 steps · 00:09"),
             "{copied}"
         );
+        assert!(
+            copied.contains("Timed out · subagent:late01\n1 step · 15:00"),
+            "{copied}"
+        );
+        assert!(!copied.contains("result omitted"), "{copied}");
         assert!(!copied.contains("unavailable"), "{copied}");
         assert!(!copied.contains("cancellation requested"), "{copied}");
     }

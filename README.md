@@ -83,7 +83,7 @@ Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by
 
 Child work continues after the foreground execution, final reply, or later request. Waiting does not join a completed child's descendants. Cancelling a task cancels its unfinished subtree while preserving completed results. Child failure cancels that child's unfinished descendants only, never its parent or siblings. There are no automatic retries, merges, result printing, or root model-context insertion: inspect a waited result deliberately.
 
-Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. `Ctrl-O` expands retained history prompts; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting includes foreground and every descendant attempt once, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
+Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. `Ctrl-O` expands retained history prompts and terminal results; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting includes foreground and every descendant attempt once, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
 
 ## Commands
 
@@ -124,7 +124,7 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title.
-- `Ctrl-O` toggles retained arena cards and subagent history prompts between automatic collapse and expanded display; it does not expand the sticky subagent list.
+- `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; `Ctrl-Home` / `Ctrl-End` jump to the oldest / newest history. The mouse wheel scrolls history three lines per event.
 - Drag the primary mouse button over display history to select its rendered text in either direction. Resting the drag at the viewport's top or bottom edge scrolls history one row at a time; release copies a non-empty selection to the local native desktop clipboard.
