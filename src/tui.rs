@@ -5694,7 +5694,7 @@ mod tests {
         let screen = rendered(&mut app, 33, 2);
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], "─ gpt-5.6-sol • thinking medium ─");
+        assert_eq!(rows[1], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 2);
         assert_eq!(buffer[(0, 1)].fg, super::THINKING_RULE_COLOURS[2]);
@@ -5716,7 +5716,7 @@ mod tests {
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1], "─".repeat(33));
-        assert_eq!(rows[2], "─ gpt-5.6-sol • thinking medium ─");
+        assert_eq!(rows[2], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 3);
         assert_eq!(buffer[(0, 2)].fg, super::THINKING_RULE_COLOURS[2]);
@@ -6001,7 +6001,7 @@ mod tests {
         let one = rendered(&mut app, 1, 4);
         assert_eq!(one.lines().nth(3), Some("…"));
         let narrow = rendered(&mut app, 29, 4);
-        assert_eq!(narrow.lines().nth(3), Some("─ ───────$0.2829 80.0%/272k ─"));
+        assert_eq!(narrow.lines().nth(3), Some("─ ────── $0.2829 80.0%/272k ─"));
     }
 
     #[test]
