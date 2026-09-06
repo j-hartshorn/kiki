@@ -23,6 +23,7 @@ use crate::{
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
         OpaqueReplayItem, ProviderFailure, ProviderReplay,
     },
+    subagents::ChildModelFactory,
 };
 
 const OPENAI_PROVIDER: &str = "openai";
@@ -45,6 +46,29 @@ pub(crate) struct OpenAiModel {
     client: Client<OpenAIConfig>,
     settings: watch::Receiver<ModelSelection>,
     api_key: String,
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct OpenAiChildModelFactory {
+    api_key: String,
+}
+
+impl OpenAiChildModelFactory {
+    pub(crate) fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+        }
+    }
+}
+
+impl ChildModelFactory for OpenAiChildModelFactory {
+    type Model = OpenAiModel;
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
+        OpenAiModel::with_fixed_selection(prompt, self.api_key.clone(), selection)
+    }
 }
 
 impl OpenAiModel {
@@ -5491,29 +5515,39 @@ mod tests {
     async fn start_live_controller() -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
         let persisted_settings = configuration.snapshot().settings().clone();
-        let (worker_path, workspace_root, prompt, api_key, selection) = {
+        let (worker_path, workspace_root, prompt, prompt_base, api_key, selection, policy) = {
             let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
                 ready.system_prompt().to_owned(),
+                ready.prompt_base().to_owned(),
                 ready.api_key().expose().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),
+                configuration.snapshot().subagents(),
             )
         };
         let (settings, model_settings) = watch::channel(selection);
-        let model = super::OpenAiModel::with_settings(prompt, api_key, model_settings);
+        let model = super::OpenAiModel::with_settings(prompt, api_key.clone(), model_settings);
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
         let arena = crate::arena::Arena::new(worker_path, tool_host)
             .await
             .map_err(|_| LIVE_SETUP_ARENA)?;
+        let subagents = crate::subagents::SubagentCoordinator::new(
+            crate::subagents::SubagentPolicy::from(policy),
+            Arc::new(crate::subagents::CompleteChildRunner::new(
+                prompt_base,
+                super::OpenAiChildModelFactory::new(api_key.clone()),
+            )),
+        );
         let runtime = crate::runtime::RuntimeController::new(
             crate::agent::Agent::new(arena, model),
             settings,
             persisted_settings,
+            subagents,
         );
         let (commands, command_receiver) = mpsc::channel(8);
         let (event_sender, events) = mpsc::unbounded_channel();

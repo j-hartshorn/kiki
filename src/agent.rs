@@ -10,6 +10,7 @@ use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
     ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
+use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +419,7 @@ pub struct Agent<M: Model> {
     model: M,
     model_context: ModelHistory,
     staged_final_message: Option<StagedFinalMessage>,
+    invocation_context: Option<AgentInvocationContext>,
 }
 
 impl<M: Model> Agent<M> {
@@ -427,7 +429,25 @@ impl<M: Model> Agent<M> {
             model,
             model_context: ModelHistory::new(),
             staged_final_message: None,
+            invocation_context: None,
         }
+    }
+
+    pub(crate) fn set_invocation_context(&mut self, context: AgentInvocationContext) {
+        self.invocation_context = Some(context);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn collect_child_result_values(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        std::collections::BTreeMap<String, crate::tools::ToolValue>,
+        crate::arena::ResultValuesError,
+    > {
+        self.arena
+            .collect_result_values_with_cancellation(cancellation)
+            .await
     }
 
     pub async fn run(
@@ -582,10 +602,12 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_with_progress(
+                            .execute_with_progress_and_context(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
+                                self.invocation_context.as_ref(),
+                                pending.selection,
                             )
                             .await
                     };
@@ -835,7 +857,7 @@ mod tests {
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::tools::{ReadTestGate, ToolHost};
+    use crate::tools::{ReadTestGate, ToolHost, ToolValue};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -993,6 +1015,50 @@ mod tests {
             agent.admit_staged_final_message(),
             Err(AgentError::NoStagedFinalMessage)
         ));
+    }
+
+    #[tokio::test]
+    async fn child_result_exports_remain_outside_model_context_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "result_values = {'answer': 42}".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "child complete".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(
+            agent
+                .discard_staged_final_message()
+                .expect("child final message is staged")
+                .text(),
+            "child complete"
+        );
+        assert_eq!(
+            agent
+                .collect_child_result_values(&cancellation)
+                .await
+                .unwrap(),
+            std::collections::BTreeMap::from([("answer".to_owned(), ToolValue::Integer(42))])
+        );
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
     }
 
     #[tokio::test]

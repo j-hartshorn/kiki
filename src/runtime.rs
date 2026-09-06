@@ -10,6 +10,11 @@ use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallTok
 use crate::config::DEFAULT_MODEL;
 use crate::config::{ModelConfiguration, ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
+use crate::subagents::{AgentInvocationContext, Caller, SessionSubagents};
+#[cfg(test)]
+use crate::subagents::{
+    ChildFailure, ChildPayload, ChildRunner, RunnerFuture, SubagentCoordinator, SubagentPolicy,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RunId(pub(crate) u64);
@@ -27,6 +32,8 @@ pub(crate) enum RuntimeCommand {
         revision: u64,
     },
     Cancel,
+    #[cfg_attr(not(test), allow(dead_code))]
+    CancelBackground,
     Shutdown,
 }
 
@@ -233,6 +240,20 @@ impl AcceptedThinking {
     }
 }
 
+#[cfg(test)]
+struct UnavailableChildRunner;
+
+#[cfg(test)]
+impl ChildRunner<ChildPayload> for UnavailableChildRunner {
+    fn run(
+        &self,
+        _child: crate::subagents::ChildRun<ChildPayload>,
+        _cancellation: CancellationToken,
+    ) -> RunnerFuture {
+        Box::pin(async { Err(ChildFailure::new("test child runner was not configured")) })
+    }
+}
+
 pub(crate) struct RuntimeController<M: Model> {
     agent: Option<Agent<M>>,
     disabled_reason: Option<RuntimeDisabledReason>,
@@ -241,6 +262,8 @@ pub(crate) struct RuntimeController<M: Model> {
     next_model_step_id: u64,
     settings: watch::Sender<ModelSelection>,
     accepted_thinking: AcceptedThinking,
+    subagents: SessionSubagents,
+    active_caller: Option<Caller>,
     active: Option<ActiveRun<M>>,
 }
 
@@ -286,6 +309,8 @@ enum ControllerInput<M: Model> {
     Command(Option<RuntimeCommand>),
     Worker(Option<WorkerMessage<M>>),
     Progress(Option<ProgressEnvelope<WorkerProgress>>),
+    SubagentsChanged,
+    SubagentDeadline,
 }
 
 fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
@@ -351,6 +376,7 @@ impl<M: Model> RuntimeController<M> {
         agent: Agent<M>,
         settings: watch::Sender<ModelSelection>,
         persisted_settings: SettingsContext,
+        subagents: SessionSubagents,
     ) -> Self {
         let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
         Self {
@@ -361,6 +387,8 @@ impl<M: Model> RuntimeController<M> {
             next_model_step_id: 1,
             settings,
             accepted_thinking,
+            subagents,
+            active_caller: None,
             active: None,
         }
     }
@@ -379,10 +407,15 @@ impl<M: Model> RuntimeController<M> {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
             .expect("default model selection must be valid");
         let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
         Self::new(
             agent,
             settings,
-            crate::config::ready_snapshot_for_test().settings().clone(),
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                std::sync::Arc::new(UnavailableChildRunner),
+            ),
         )
     }
 
@@ -403,74 +436,76 @@ impl<M: Model> RuntimeController<M> {
         let mut progress = ProgressPublisher::new(progress_sender);
         let mut commands_open = true;
         let mut shutdown_requested = false;
+        let mut subagent_updates = self.subagents.subscribe().await;
 
         loop {
-            if self.active.is_some() {
-                let input = {
-                    let active = self
-                        .active
-                        .as_mut()
-                        .expect("active run checked before receiving worker input");
-                    tokio::select! {
-                        biased;
-                        command = commands.recv(), if commands_open => ControllerInput::Command(command),
-                        message = active.worker.recv() => ControllerInput::Worker(message),
-                        worker_progress = active.progress.recv(), if active.progress_open => ControllerInput::Progress(worker_progress),
-                    }
-                };
-                match input {
-                    ControllerInput::Command(Some(command)) => {
-                        self.handle_command(
-                            command,
-                            &events,
-                            &mut progress,
-                            &mut shutdown_requested,
-                        );
-                    }
-                    ControllerInput::Command(None) => {
-                        commands_open = false;
-                        shutdown_requested = true;
-                        self.request_active_cancellation();
-                    }
-                    ControllerInput::Worker(Some(message)) => {
-                        self.handle_worker_message(message, &events, &mut progress);
-                    }
-                    ControllerInput::Worker(None) => {
-                        shutdown_requested = true;
-                        self.handle_worker_closed(&events, &mut progress);
-                    }
-                    ControllerInput::Progress(Some(progress_envelope)) => {
-                        self.handle_worker_progress(progress_envelope, &mut progress);
-                    }
-                    ControllerInput::Progress(None) => {
-                        self.active
-                            .as_mut()
-                            .expect("active run checked before closing worker progress")
-                            .progress_open = false;
-                    }
-                }
-            } else {
-                if shutdown_requested || !commands_open {
-                    return self.records;
-                }
-                match commands.recv().await {
-                    Some(command) => self.handle_command(
-                        command,
-                        &events,
-                        &mut progress,
-                        &mut shutdown_requested,
-                    ),
-                    None => return self.records,
-                }
-            }
-
             if shutdown_requested && self.active.is_none() {
+                self.subagents.shutdown().await;
                 return self.records;
             }
+
+            let deadline = self.subagents.next_deadline().await;
+            let deadline_wait = async {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
+                    None => futures::future::pending::<()>().await,
+                }
+            };
+            let input = if let Some(active) = self.active.as_mut() {
+                tokio::select! {
+                    biased;
+                    command = commands.recv(), if commands_open => ControllerInput::Command(command),
+                    message = active.worker.recv() => ControllerInput::Worker(message),
+                    worker_progress = active.progress.recv(), if active.progress_open => ControllerInput::Progress(worker_progress),
+                    _ = subagent_updates.changed() => ControllerInput::SubagentsChanged,
+                    _ = deadline_wait => ControllerInput::SubagentDeadline,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    command = commands.recv(), if commands_open => ControllerInput::Command(command),
+                    _ = subagent_updates.changed() => ControllerInput::SubagentsChanged,
+                    _ = deadline_wait => ControllerInput::SubagentDeadline,
+                }
+            };
+
+            match input {
+                ControllerInput::Command(Some(command)) => {
+                    self.handle_command(command, &events, &mut progress, &mut shutdown_requested)
+                        .await;
+                }
+                ControllerInput::Command(None) => {
+                    commands_open = false;
+                    shutdown_requested = true;
+                    self.request_shutdown().await;
+                }
+                ControllerInput::Worker(Some(message)) => {
+                    self.handle_worker_message(message, &events, &mut progress);
+                }
+                ControllerInput::Worker(None) => {
+                    shutdown_requested = true;
+                    self.request_shutdown().await;
+                    self.handle_worker_closed(&events, &mut progress);
+                }
+                ControllerInput::Progress(Some(progress_envelope)) => {
+                    self.handle_worker_progress(progress_envelope, &mut progress);
+                }
+                ControllerInput::Progress(None) => {
+                    self.active
+                        .as_mut()
+                        .expect("active run checked before closing worker progress")
+                        .progress_open = false;
+                }
+                ControllerInput::SubagentsChanged => {}
+                ControllerInput::SubagentDeadline => self.subagents.service().await,
+            }
+            self.subagents.service().await;
         }
     }
 
-    fn handle_command(
+    async fn handle_command(
         &mut self,
         command: RuntimeCommand,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -494,7 +529,7 @@ impl<M: Model> RuntimeController<M> {
                         },
                     );
                 } else {
-                    self.start_run(request, events, progress);
+                    self.start_run(request, events, progress).await;
                 }
             }
             RuntimeCommand::ApplySettings {
@@ -506,19 +541,26 @@ impl<M: Model> RuntimeController<M> {
                 self.emit(events, RuntimeEvent::SettingsAccepted { revision });
             }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
+            RuntimeCommand::CancelBackground => {
+                let caller = self.active_caller.clone();
+                self.subagents
+                    .request_background_cancellation(caller.as_ref())
+                    .await;
+            }
             RuntimeCommand::Shutdown => {
                 *shutdown_requested = true;
-                self.request_active_cancellation();
+                self.request_shutdown().await;
             }
         }
     }
 
-    fn start_run(
+    async fn start_run(
         &mut self,
         request: String,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
         progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
+        let caller = self.subagents.root_caller().await;
         let run_id = self.next_run_id();
         self.publish_progress(progress, RuntimeEvent::RunStarted { run_id }, false);
         self.append_record(
@@ -530,10 +572,14 @@ impl<M: Model> RuntimeController<M> {
             false,
         );
 
-        let agent = self
+        let mut agent = self
             .agent
             .take()
             .expect("an idle runtime controller owns its agent");
+        agent.set_invocation_context(AgentInvocationContext::new(
+            caller.clone(),
+            self.subagents.clone(),
+        ));
         let cancellation = CancellationToken::new();
         let cancellation_for_worker = cancellation.clone();
         let (sender, worker) = mpsc::unbounded_channel();
@@ -608,6 +654,7 @@ impl<M: Model> RuntimeController<M> {
             });
         });
         drop(worker_task);
+        self.active_caller = Some(caller);
         self.active = Some(ActiveRun {
             run_id,
             cancellation,
@@ -624,6 +671,14 @@ impl<M: Model> RuntimeController<M> {
             active.cancellation_requested = true;
             active.cancellation.cancel();
         }
+    }
+
+    async fn request_shutdown(&mut self) {
+        let caller = self.active_caller.clone();
+        self.request_active_cancellation();
+        self.subagents
+            .request_background_cancellation(caller.as_ref())
+            .await;
     }
 
     fn handle_worker_message(
@@ -764,6 +819,7 @@ impl<M: Model> RuntimeController<M> {
                 }
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;
+                self.active_caller = None;
             }
         }
     }
@@ -792,6 +848,7 @@ impl<M: Model> RuntimeController<M> {
         self.append_record(events, run_id, record, progress.take_pending_gap());
         self.emit(events, RuntimeEvent::RunSettled { run_id });
         self.active = None;
+        self.active_caller = None;
     }
 
     fn drain_worker_progress(&mut self, progress: &mut ProgressPublisher<RuntimeEvent>) {
@@ -979,6 +1036,7 @@ fn utf8_prefix_len(value: &str, limit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1013,6 +1071,10 @@ mod tests {
         AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
+    };
+    use crate::subagents::{
+        ChildModelFactory, ChildParameters, ChildPayload, CompleteChildRunner, SessionSubagents,
+        SubagentCoordinator, SubagentPolicy, TaskState,
     };
     use crate::tools::{ReadTestGate, ToolHost};
     use tokio_util::sync::CancellationToken;
@@ -1049,6 +1111,175 @@ mod tests {
 
     async fn default_controller(workspace: &tempfile::TempDir) -> RuntimeController<ScriptedModel> {
         controller_with_model(workspace, ScriptedModel::default()).await
+    }
+
+    async fn controller_with_subagents<M: Model>(
+        workspace: &tempfile::TempDir,
+        model: M,
+        subagents: SessionSubagents,
+    ) -> RuntimeController<M> {
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let (settings, _) = watch::channel(selection);
+        RuntimeController::new(
+            Agent::new(arena, model),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            subagents,
+        )
+    }
+
+    async fn child_payload(workspace: &tempfile::TempDir) -> ChildPayload {
+        let mut arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create child source arena");
+        arena
+            .execute(
+                "result_values = {'parent': 'kept'}",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("initialise parent exports");
+        ChildPayload::new(arena.child_source(), arena.checkpoint())
+    }
+
+    fn child_parameters() -> ChildParameters {
+        ChildParameters::new(
+            "background work".to_owned(),
+            ModelSelection::new(
+                crate::config::DEFAULT_MODEL,
+                crate::config::DEFAULT_MODEL.default_thinking,
+            )
+            .unwrap(),
+            false,
+        )
+    }
+
+    #[derive(Clone)]
+    struct GatedChildFactory {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl ChildModelFactory for GatedChildFactory {
+        type Model = GatedChildModel;
+
+        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+            GatedChildModel {
+                started: self.started.clone(),
+                release: self.release.clone(),
+            }
+        }
+    }
+
+    struct GatedChildModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Model for GatedChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                self.started.notify_one();
+                tokio::select! {
+                    _ = cancellation.cancelled() => Err(ModelFailure::new(
+                        ModelError::Cancelled,
+                        vec![AttemptAccounting::UsageUnavailable],
+                    )),
+                    _ = self.release.notified() => Ok(ModelStep {
+                        action: CompletedModelAction::Message {
+                            text: "child complete".to_owned(),
+                        },
+                        selection: None,
+                        reasoning_summary: String::new(),
+                        replay: ProviderReplay::new("test", Vec::new()),
+                        attempts: vec![AttemptAccounting::UsageUnavailable],
+                    }),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CleanupGatedChildFactory {
+        started: Arc<Notify>,
+        cleanup_started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl ChildModelFactory for CleanupGatedChildFactory {
+        type Model = CleanupGatedChildModel;
+
+        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+            CleanupGatedChildModel {
+                started: self.started.clone(),
+                cleanup_started: self.cleanup_started.clone(),
+                release: self.release.clone(),
+            }
+        }
+    }
+
+    struct CleanupGatedChildModel {
+        started: Arc<Notify>,
+        cleanup_started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Model for CleanupGatedChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                self.started.notify_one();
+                cancellation.cancelled().await;
+                self.cleanup_started.notify_one();
+                self.release.notified().await;
+                Err(ModelFailure::new(
+                    ModelError::Cancelled,
+                    vec![AttemptAccounting::UsageUnavailable],
+                ))
+            }
+        }
+    }
+
+    fn complete_child_coordinator<F: ChildModelFactory + Clone>(factory: F) -> SessionSubagents {
+        SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CompleteChildRunner::new(
+                "test child prompt".to_owned(),
+                factory,
+            )),
+        )
     }
 
     fn start_controller<M: Model>(
@@ -1202,6 +1433,354 @@ mod tests {
             ToolCallSummary::Replaced => format!("{}:replaced", call.tool.label()),
             ToolCallSummary::Applied => format!("{}:applied", call.tool.label()),
         }
+    }
+
+    #[tokio::test]
+    async fn background_children_do_not_block_later_foreground_requests() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+
+        let controller = controller_with_subagents(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "foreground complete".to_owned(),
+            }]),
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "first".to_owned(),
+            })
+            .await
+            .unwrap();
+        let first_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            first_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { request },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FinalMessage { text, .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ] if request == "first" && text == "foreground complete"
+        ));
+        assert_eq!(
+            coordinator.get(&caller, child.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+        assert_eq!(
+            coordinator
+                .get(&caller, child.id())
+                .await
+                .unwrap()
+                .step_count(),
+            1
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "second".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest { request },
+                },
+                ..
+            } if request == "second"
+        ));
+        assert_eq!(
+            coordinator.get(&caller, child.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+        let second_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            second_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(2),
+                        record: Record::FinalMessage { text, .. },
+                    },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(2) },
+            ] if text == "foreground complete"
+        ));
+        assert_eq!(
+            coordinator.get(&caller, child.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+
+        factory.release.notify_one();
+        let (result, observation) = coordinator.wait(&caller, child.id()).await.unwrap();
+        assert_eq!(result.message(), "child complete");
+        assert_eq!(result.values(), &BTreeMap::new());
+        assert_eq!(observation.state(), TaskState::Completed);
+        assert_eq!(observation.step_count(), 1);
+        let records = coordinator.records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id(), child.id());
+        assert_eq!(
+            records[0].attempts(),
+            &[AttemptAccounting::UsageUnavailable]
+        );
+        assert!(matches!(
+            records[0].outcome(),
+            Some(crate::subagents::TaskOutcome::Completed(result))
+                if result.message() == "child complete" && result.values().is_empty()
+        ));
+        assert_eq!(coordinator.active_count().await, 0);
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_background_cancellation_leaves_foreground_running() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        let foreground_ready = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            WaitingCancellationModel {
+                ready: foreground_ready.clone(),
+                partial: false,
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "foreground".to_owned(),
+            })
+            .await
+            .unwrap();
+        foreground_ready.notified().await;
+
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .unwrap();
+        let error = coordinator.wait(&caller, child.id()).await.unwrap_err();
+        assert_eq!(
+            error.observation().unwrap().step_count(),
+            1,
+            "the real child started one model step"
+        );
+        assert!(matches!(
+            error,
+            crate::subagents::WaitError::Cancelled { .. }
+        ));
+        assert_eq!(
+            coordinator.records().await[0].attempts(),
+            &[AttemptAccounting::UsageUnavailable]
+        );
+        assert!(
+            timeout(Duration::from_millis(50), events_until_settled(&mut events))
+                .await
+                .is_err(),
+            "background cancellation settled the foreground request"
+        );
+
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_blocked_child_cleanup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = CleanupGatedChildFactory {
+            started: Arc::new(Notify::new()),
+            cleanup_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        let controller =
+            controller_with_subagents(&workspace, ScriptedModel::default(), coordinator.clone())
+                .await;
+        let (commands, _, _, mut task) = start_controller(controller);
+
+        commands.send(RuntimeCommand::Shutdown).await.unwrap();
+        factory.cleanup_started.notified().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut task).await.is_err(),
+            "shutdown returned before child cleanup"
+        );
+        factory.release.notify_one();
+        let records = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown should finish after child cleanup")
+            .expect("controller should not panic");
+        assert!(records.is_empty());
+        let error = coordinator.wait(&caller, child.id()).await.unwrap_err();
+        assert_eq!(error.observation().unwrap().state(), TaskState::Cancelled);
+        assert_eq!(error.observation().unwrap().step_count(), 1);
+        assert!(matches!(
+            error,
+            crate::subagents::WaitError::Cancelled { .. }
+        ));
+        assert_eq!(
+            coordinator.records().await[0].attempts(),
+            &[AttemptAccounting::UsageUnavailable]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_cancels_background_children_via_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = CleanupGatedChildFactory {
+            started: Arc::new(Notify::new()),
+            cleanup_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = controller_with_subagents(
+            &workspace,
+            AuthenticationFailureModel {
+                calls: calls.clone(),
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _, mut task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "disable runtime".to_owned(),
+            })
+            .await
+            .unwrap();
+        let disabled_events = events_until_settled(&mut events).await;
+        assert!(matches!(
+            disabled_events.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { request },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::FailedRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::OpenAiAuthentication,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ] if request == "disable runtime"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coordinator.get(&caller, child.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+        assert_eq!(
+            coordinator
+                .get(&caller, child.id())
+                .await
+                .unwrap()
+                .step_count(),
+            1
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "rejected while disabled".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .unwrap();
+        factory.cleanup_started.notified().await;
+        assert_eq!(
+            coordinator.get(&caller, child.id()).await.unwrap().state(),
+            TaskState::Stopping
+        );
+        factory.release.notify_one();
+        let error = coordinator.wait(&caller, child.id()).await.unwrap_err();
+        assert_eq!(error.observation().unwrap().state(), TaskState::Cancelled);
+        assert_eq!(error.observation().unwrap().step_count(), 1);
+        assert!(matches!(
+            error,
+            crate::subagents::WaitError::Cancelled { .. }
+        ));
+        let child_records = coordinator.records().await;
+        assert_eq!(child_records.len(), 1);
+        assert_eq!(
+            child_records[0].attempts(),
+            &[AttemptAccounting::UsageUnavailable]
+        );
+        assert!(
+            timeout(Duration::from_millis(50), &mut task).await.is_err(),
+            "disabled controller stopped before shutdown"
+        );
+        let records = shutdown_controller(commands, task).await;
+        assert_eq!(records.len(), 2);
     }
 
     #[test]
@@ -5092,15 +5671,17 @@ mod tests {
         let mut progress = ProgressPublisher::new(progress_sender);
         let mut shutdown_requested = false;
 
-        controller.handle_command(
-            RuntimeCommand::ApplySettings {
-                selection: selection_b,
-                revision: 1,
-            },
-            &event_sender,
-            &mut progress,
-            &mut shutdown_requested,
-        );
+        controller
+            .handle_command(
+                RuntimeCommand::ApplySettings {
+                    selection: selection_b,
+                    revision: 1,
+                },
+                &event_sender,
+                &mut progress,
+                &mut shutdown_requested,
+            )
+            .await;
 
         assert_eq!(
             controller.resolve_child_selection(selection_a, Some(&TERRA)),

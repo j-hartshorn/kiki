@@ -16,6 +16,7 @@ mod transcript;
 pub mod tui;
 
 use std::error::Error;
+use std::sync::Arc;
 
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
@@ -23,9 +24,12 @@ use tokio::sync::{mpsc, watch};
 use crate::agent::Agent;
 use crate::arena::Arena;
 use crate::config::ModelSelection;
-use crate::openai::OpenAiModel;
+use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
+};
+use crate::subagents::{
+    CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
 use crate::tools::ToolHost;
 
@@ -64,10 +68,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(tui::run_configuration(configuration.snapshot().clone())?);
         }
     };
+    let subagents: SessionSubagents = SubagentCoordinator::new(
+        SubagentPolicy::from(startup.subagents()),
+        Arc::new(CompleteChildRunner::new(
+            ready.prompt_base().to_owned(),
+            OpenAiChildModelFactory::new(ready.api_key().expose()),
+        )),
+    );
     let controller = RuntimeController::new(
         Agent::new(arena, model),
         settings,
         startup.settings().clone(),
+        subagents,
     );
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();

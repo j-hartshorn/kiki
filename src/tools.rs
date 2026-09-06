@@ -36,6 +36,7 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
+use crate::subagents::TrustedExecutionContext;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -618,13 +619,13 @@ fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> Str
     .flatten()
     .collect::<Vec<_>>()
     .join("\n\n");
-    let run_guidance = if read_only {
-        ""
+    let availability_guidance = if read_only {
+        " This Arena is read-only; write, edit, and run are unavailable."
     } else {
         " Run project-local, one-shot commands."
     };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{run_guidance} Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
@@ -1647,6 +1648,7 @@ impl ToolHost {
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
         output: mpsc::Sender<ToolOutputChunk>,
+        _context: Option<&TrustedExecutionContext>,
     ) -> impl Stream<Item = ToolResult> + '_ {
         stream::unfold(
             BatchDispatch::new(self, calls, authorisations, Some(output)),

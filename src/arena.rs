@@ -18,10 +18,14 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::constants::{
-        ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, COLLECTION_MAX_ITEMS,
-        COLLECTION_MAX_PAYLOAD_BYTES,
+    config::{
+        ModelSelection,
+        constants::{
+            ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, COLLECTION_MAX_ITEMS,
+            COLLECTION_MAX_PAYLOAD_BYTES,
+        },
     },
+    subagents::{AgentInvocationContext, TrustedExecutionContext},
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
         ToolValue, WholeFileAuthorisations, bootstrap_source,
@@ -356,6 +360,8 @@ impl ArenaError {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Error)]
 pub(crate) enum ResultValuesError {
+    #[error("result_values collection was cancelled")]
+    Cancelled,
     #[error("result_values export failed: {message}")]
     Export { message: String },
 }
@@ -435,6 +441,66 @@ impl RecoveryTestGate {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ChildConstructionTestGate {
+    construction_started: Arc<Semaphore>,
+    construction_allowed: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl ChildConstructionTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            construction_started: Arc::new(Semaphore::new(0)),
+            construction_allowed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_construction_started(&self) {
+        take_test_permit(&self.construction_started).await;
+    }
+
+    pub(crate) fn resume_construction(&self) {
+        self.construction_allowed.add_permits(1);
+    }
+
+    async fn wait_before_construction(&self) {
+        self.construction_started.add_permits(1);
+        take_test_permit(&self.construction_allowed).await;
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CollectionTestGate {
+    collection_started: Arc<Semaphore>,
+    collection_allowed: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl CollectionTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            collection_started: Arc::new(Semaphore::new(0)),
+            collection_allowed: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_collection_started(&self) {
+        take_test_permit(&self.collection_started).await;
+    }
+
+    pub(crate) fn resume_collection(&self) {
+        self.collection_allowed.add_permits(1);
+    }
+
+    async fn wait_before_collection(&self) {
+        self.collection_started.add_permits(1);
+        take_test_permit(&self.collection_allowed).await;
+    }
+}
+
+#[cfg(test)]
 async fn take_test_permit(semaphore: &Arc<Semaphore>) {
     semaphore
         .clone()
@@ -464,8 +530,78 @@ impl AttemptFailure {
     }
 }
 
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ArenaChildSource {
+    worker_path: std::path::PathBuf,
+    tool_host: ToolHost,
+    runtime: RuntimeIdentity,
+    repl_config: ReplConfig,
+    execution_timeout: Duration,
+    #[cfg(test)]
+    collection_test_gate: Option<CollectionTestGate>,
+    #[cfg(test)]
+    child_construction_test_gate: Option<ChildConstructionTestGate>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ArenaChildSource {
+    pub(crate) async fn child(
+        &self,
+        checkpoint: &Checkpoint,
+        requested_read_only: bool,
+    ) -> Result<Arena, ArenaError> {
+        #[cfg(test)]
+        if let Some(child_construction_test_gate) = &self.child_construction_test_gate {
+            child_construction_test_gate
+                .wait_before_construction()
+                .await;
+        }
+        if checkpoint.identity != self.runtime {
+            return Err(ArenaError::IncompatibleCheckpoint {
+                expected: self.runtime.0.clone(),
+                actual: checkpoint.identity.0.clone(),
+            });
+        }
+        let pool = Arena::open_pool(self.worker_path.clone()).await?;
+        let mut checkout = pool
+            .checkout(&self.repl_config)
+            .await
+            .map_err(pool_failure)?;
+        Arena::restore_checkout(&mut checkout, checkpoint).await?;
+        reset_result_values(&mut checkout).await?;
+        let state = checkout.dump().await.map_err(pool_failure)?;
+
+        Ok(Arena {
+            worker_path: self.worker_path.clone(),
+            pool,
+            checkout: Some(checkout),
+            tool_host: self.tool_host.for_child(requested_read_only),
+            checkpoint: Checkpoint {
+                identity: self.runtime.clone(),
+                state,
+                authorisations: checkpoint.authorisations.clone(),
+            },
+            runtime: self.runtime.clone(),
+            repl_config: self.repl_config.clone(),
+            execution_timeout: self.execution_timeout,
+            #[cfg(test)]
+            collection_test_gate: self.collection_test_gate.clone(),
+            #[cfg(test)]
+            child_construction_test_gate: self.child_construction_test_gate.clone(),
+            #[cfg(test)]
+            fail_next_recovery: false,
+            #[cfg(test)]
+            recovery_test_gate: None,
+        })
+    }
+
+    pub(crate) fn prompt_reference(&self, read_only: bool) -> String {
+        self.tool_host.for_child(read_only).prompt_reference()
+    }
+}
+
 pub struct Arena {
-    #[cfg_attr(not(test), allow(dead_code))]
     worker_path: std::path::PathBuf,
     pool: Pool,
     checkout: Option<Checkout>,
@@ -474,6 +610,10 @@ pub struct Arena {
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
     execution_timeout: Duration,
+    #[cfg(test)]
+    collection_test_gate: Option<CollectionTestGate>,
+    #[cfg(test)]
+    child_construction_test_gate: Option<ChildConstructionTestGate>,
     #[cfg(test)]
     fail_next_recovery: bool,
     #[cfg(test)]
@@ -544,6 +684,10 @@ impl Arena {
             repl_config,
             execution_timeout,
             #[cfg(test)]
+            collection_test_gate: None,
+            #[cfg(test)]
+            child_construction_test_gate: None,
+            #[cfg(test)]
             fail_next_recovery: false,
             #[cfg(test)]
             recovery_test_gate: None,
@@ -557,38 +701,29 @@ impl Arena {
         Pool::new(config).await.map_err(pool_failure)
     }
 
+    pub(crate) fn child_source(&self) -> ArenaChildSource {
+        ArenaChildSource {
+            worker_path: self.worker_path.clone(),
+            tool_host: self.tool_host.clone(),
+            runtime: self.runtime.clone(),
+            repl_config: self.repl_config.clone(),
+            execution_timeout: self.execution_timeout,
+            #[cfg(test)]
+            collection_test_gate: self.collection_test_gate.clone(),
+            #[cfg(test)]
+            child_construction_test_gate: self.child_construction_test_gate.clone(),
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn child(
         &self,
         checkpoint: &Checkpoint,
         requested_read_only: bool,
     ) -> Result<Self, ArenaError> {
-        self.validate_checkpoint(checkpoint)?;
-        let pool = Self::open_pool(self.worker_path.clone()).await?;
-        let repl_config = self.repl_config.clone();
-        let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
-        Self::restore_checkout(&mut checkout, checkpoint).await?;
-        reset_result_values(&mut checkout).await?;
-        let state = checkout.dump().await.map_err(pool_failure)?;
-
-        Ok(Self {
-            worker_path: self.worker_path.clone(),
-            pool,
-            checkout: Some(checkout),
-            tool_host: self.tool_host.for_child(requested_read_only),
-            checkpoint: Checkpoint {
-                identity: self.runtime.clone(),
-                state,
-                authorisations: checkpoint.authorisations.clone(),
-            },
-            runtime: self.runtime.clone(),
-            repl_config,
-            execution_timeout: self.execution_timeout,
-            #[cfg(test)]
-            fail_next_recovery: false,
-            #[cfg(test)]
-            recovery_test_gate: None,
-        })
+        self.child_source()
+            .child(checkpoint, requested_read_only)
+            .await
     }
 
     pub async fn execute(
@@ -607,7 +742,22 @@ impl Arena {
         cancellation: &CancellationToken,
         progress: &mut (impl FnMut(ArenaProgress) + Send),
     ) -> Result<Execution, ArenaError> {
+        self.execute_with_progress_and_context(code, cancellation, progress, None, None)
+            .await
+    }
+
+    pub(crate) async fn execute_with_progress_and_context(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
+        invocation: Option<&AgentInvocationContext>,
+        selection: Option<ModelSelection>,
+    ) -> Result<Execution, ArenaError> {
         self.restore_current_checkpoint_if_needed().await?;
+        let context = invocation.map(|invocation| {
+            invocation.execution(self.child_source(), selection, self.checkpoint())
+        });
         let mut checkout = self
             .checkout
             .take()
@@ -627,6 +777,7 @@ impl Arena {
                 &mut checkout,
                 &self.tool_host,
                 code,
+                context.as_ref(),
                 max_memory,
                 &mut authorisations,
                 progress,
@@ -666,26 +817,48 @@ impl Arena {
     pub(crate) async fn collect_result_values(
         &mut self,
     ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
-        self.restore_current_checkpoint_if_needed()
+        let cancellation = CancellationToken::new();
+        self.collect_result_values_with_cancellation(&cancellation)
             .await
-            .map_err(result_values_arena_failure)?;
+    }
+
+    pub(crate) async fn collect_result_values_with_cancellation(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ResultValuesError::Cancelled),
+            result = self.restore_current_checkpoint_if_needed() => {
+                result.map_err(result_values_arena_failure)?;
+            }
+        }
         let mut checkout = self
             .checkout
             .take()
             .expect("restoring a missing checkout should install one");
         let authorisations = self.checkpoint.authorisations.clone();
-        let result = async {
-            let value = timeout(
-                self.execution_timeout,
-                collect_result_values_checkout(&mut checkout),
-            )
-            .await
-            .map_err(|_| ResultValuesError::export("collection timed out"))??;
-            let values = result_values_from_monty(value)?;
-            let state = checkout.dump().await.map_err(result_values_pool_failure)?;
-            Ok((values, state))
-        }
-        .await;
+        #[cfg(test)]
+        let collection_test_gate = self.collection_test_gate.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ResultValuesError::Cancelled),
+            result = async {
+                #[cfg(test)]
+                if let Some(collection_test_gate) = collection_test_gate {
+                    collection_test_gate.wait_before_collection().await;
+                }
+                let value = timeout(
+                    self.execution_timeout,
+                    collect_result_values_checkout(&mut checkout),
+                )
+                .await
+                .map_err(|_| ResultValuesError::export("collection timed out"))??;
+                let values = result_values_from_monty(value)?;
+                let state = checkout.dump().await.map_err(result_values_pool_failure)?;
+                Ok((values, state))
+            } => result,
+        };
 
         match result {
             Ok((values, state)) => {
@@ -731,6 +904,24 @@ impl Arena {
             self.checkout = Some(self.checkout_from_checkpoint(&self.checkpoint).await?);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_child_construction_test_gate(
+        mut self,
+        child_construction_test_gate: ChildConstructionTestGate,
+    ) -> Self {
+        self.child_construction_test_gate = Some(child_construction_test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_collection_test_gate(
+        mut self,
+        collection_test_gate: CollectionTestGate,
+    ) -> Self {
+        self.collection_test_gate = Some(collection_test_gate);
+        self
     }
 
     #[cfg(test)]
@@ -1027,10 +1218,12 @@ async fn bootstrap(checkout: &mut Checkout) -> Result<(), ArenaError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_checkout(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    context: Option<&TrustedExecutionContext>,
     max_memory: Option<usize>,
     authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
@@ -1040,6 +1233,7 @@ async fn execute_checkout(
         checkout,
         tool_host,
         code,
+        context,
         authorisations,
         progress,
         interruption,
@@ -1134,6 +1328,7 @@ async fn drive(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    context: Option<&TrustedExecutionContext>,
     authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
     interruption: &mut InterruptedExecutionState,
@@ -1345,6 +1540,7 @@ async fn drive(
                         calls,
                         authorisations.clone(),
                         output_sender,
+                        context,
                     ));
                     while !tokens.is_empty() {
                         let result = tokio::select! {
@@ -2923,6 +3119,34 @@ mod tests {
         assert_eq!(
             parent.collect_result_values().await.unwrap(),
             BTreeMap::from([("parent".to_owned(), ToolValue::String("kept".to_owned()))])
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_export_restores_its_checkpoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        let collection_gate = super::CollectionTestGate::new();
+        let parent = arena(&workspace)
+            .await
+            .with_collection_test_gate(collection_gate.clone());
+        let mut child = parent.child(&parent.checkpoint(), false).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let mut collection = Box::pin(child.collect_result_values_with_cancellation(&cancellation));
+
+        tokio::select! {
+            _ = collection_gate.wait_until_collection_started() => {}
+            result = &mut collection => panic!("collection finished before cancellation: {result:?}"),
+        }
+        cancellation.cancel();
+        collection_gate.resume_collection();
+
+        assert!(matches!(
+            collection.await,
+            Err(super::ResultValuesError::Cancelled)
+        ));
+        assert_eq!(
+            child.collect_result_values().await.unwrap(),
+            BTreeMap::new()
         );
     }
 
@@ -6095,6 +6319,7 @@ mod tests {
             checkout,
             &arena.tool_host,
             "x = ' ' * (1 << 60)",
+            None,
             &mut authorisations,
             &mut progress,
             &mut interruption,

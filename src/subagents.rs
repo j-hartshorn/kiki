@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,17 +11,26 @@ use futures::FutureExt;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
+use crate::arena::{ArenaChildSource, Checkpoint};
 use crate::config::{ModelSelection, settings::SubagentSettings};
+use crate::model::{AttemptAccounting, Model};
+use crate::prompt::child_prompt;
 use crate::tools::ToolValue;
 
+#[cfg_attr(not(test), allow(dead_code))]
 const TASK_ID_WIDTH: usize = 6;
+#[cfg_attr(not(test), allow(dead_code))]
 const TASK_ID_SPACE: u64 = 36_u64.pow(TASK_ID_WIDTH as u32);
+#[cfg_attr(not(test), allow(dead_code))]
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskId(String);
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TaskId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
@@ -36,6 +44,7 @@ impl std::fmt::Display for TaskId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TaskState {
     Starting,
     Running,
@@ -46,6 +55,7 @@ pub(crate) enum TaskState {
     TimedOut,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TaskState {
     fn is_terminal(self) -> bool {
         matches!(
@@ -56,12 +66,14 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildParameters {
     prompt: String,
     selection: ModelSelection,
     read_only: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ChildParameters {
     pub(crate) fn new(prompt: String, selection: ModelSelection, read_only: bool) -> Self {
         Self {
@@ -69,10 +81,6 @@ impl ChildParameters {
             selection,
             read_only,
         }
-    }
-
-    pub(crate) fn prompt(&self) -> &str {
-        &self.prompt
     }
 
     pub(crate) fn selection(&self) -> ModelSelection {
@@ -89,11 +97,13 @@ impl ChildParameters {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildResult {
     message: String,
     values: BTreeMap<String, ToolValue>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ChildResult {
     pub(crate) fn new(message: String, values: BTreeMap<String, ToolValue>) -> Self {
         Self { message, values }
@@ -113,8 +123,10 @@ impl ChildResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildFailure(String);
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ChildFailure {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(bounded_utf8(message.into(), FAILURE_MESSAGE_LIMIT))
@@ -126,6 +138,7 @@ impl ChildFailure {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Caller {
     session: u64,
     owner: CallerOwner,
@@ -133,15 +146,18 @@ pub(crate) struct Caller {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum CallerOwner {
     Root,
     Child(TaskId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct OriginId(u64);
 
-pub(crate) struct ChildRun<P> {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChildRun<P: Send + 'static> {
     id: TaskId,
     caller: Caller,
     parent: Option<TaskId>,
@@ -149,19 +165,17 @@ pub(crate) struct ChildRun<P> {
     parameters: ChildParameters,
     payload: P,
     reporter: TaskReporter,
+    coordinator: SubagentCoordinator<P>,
 }
 
-impl<P> ChildRun<P> {
+#[cfg_attr(not(test), allow(dead_code))]
+impl<P: Send + 'static> ChildRun<P> {
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
     }
 
     pub(crate) fn caller(&self) -> &Caller {
         &self.caller
-    }
-
-    pub(crate) fn parent(&self) -> Option<&TaskId> {
-        self.parent.as_ref()
     }
 
     pub(crate) fn depth(&self) -> usize {
@@ -176,8 +190,8 @@ impl<P> ChildRun<P> {
         &self.payload
     }
 
-    pub(crate) async fn model_step_started(&self) {
-        self.reporter.model_step_started().await;
+    pub(crate) fn model_step_started(&self) {
+        self.reporter.model_step_started();
     }
 
     pub(crate) fn into_parts(
@@ -190,6 +204,7 @@ impl<P> ChildRun<P> {
         ChildParameters,
         P,
         TaskReporter,
+        SubagentCoordinator<P>,
     ) {
         (
             self.id,
@@ -199,42 +214,226 @@ impl<P> ChildRun<P> {
             self.parameters,
             self.payload,
             self.reporter,
+            self.coordinator,
         )
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct TaskReporter {
-    id: TaskId,
-    inner: Arc<Mutex<Inner>>,
+#[cfg_attr(not(test), allow(dead_code))]
+struct TaskMetrics {
+    step_count: AtomicU64,
+    attempts: SyncMutex<Vec<AttemptAccounting>>,
+    notifications: watch::Sender<u64>,
 }
 
-impl TaskReporter {
-    pub(crate) async fn model_step_started(&self) {
-        let mut inner = self.inner.lock().await;
-        let task = inner
-            .tasks
-            .get_mut(&self.id)
-            .expect("admitted child must remain retained");
-        if !task.state.is_terminal() {
-            task.step_count = task.step_count.saturating_add(1);
-        }
+#[cfg_attr(not(test), allow(dead_code))]
+impl TaskMetrics {
+    fn notify(&self) {
+        self.notifications
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TaskReporter {
+    metrics: Arc<TaskMetrics>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl TaskReporter {
+    pub(crate) fn model_step_started(&self) {
+        self.metrics.step_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.notify();
+    }
+
+    pub(crate) fn set_attempts(&self, attempts: Vec<AttemptAccounting>) {
+        *self.metrics.attempts.lock().expect("task metrics lock") = attempts;
+        self.metrics.notify();
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type RunnerFuture =
     Pin<Box<dyn Future<Output = Result<ChildResult, ChildFailure>> + Send + 'static>>;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait ChildRunner<P: Send + 'static>: Send + Sync + 'static {
     fn run(&self, child: ChildRun<P>, cancellation: CancellationToken) -> RunnerFuture;
 }
 
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChildPayload {
+    source: ArenaChildSource,
+    checkpoint: Checkpoint,
+}
+
+impl ChildPayload {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(source: ArenaChildSource, checkpoint: Checkpoint) -> Self {
+        Self { source, checkpoint }
+    }
+}
+
+pub(crate) type SessionSubagents = SubagentCoordinator<ChildPayload>;
+
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AgentInvocationContext {
+    caller: Caller,
+    coordinator: SessionSubagents,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl AgentInvocationContext {
+    pub(crate) fn new(caller: Caller, coordinator: SessionSubagents) -> Self {
+        Self {
+            caller,
+            coordinator,
+        }
+    }
+
+    pub(crate) fn execution(
+        &self,
+        source: ArenaChildSource,
+        selection: Option<ModelSelection>,
+        checkpoint: Checkpoint,
+    ) -> TrustedExecutionContext {
+        TrustedExecutionContext {
+            caller: self.caller.clone(),
+            selection,
+            checkpoint,
+            source,
+            coordinator: self.coordinator.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct TrustedExecutionContext {
+    caller: Caller,
+    selection: Option<ModelSelection>,
+    checkpoint: Checkpoint,
+    source: ArenaChildSource,
+    coordinator: SessionSubagents,
+}
+
+#[allow(dead_code)]
+impl TrustedExecutionContext {
+    pub(crate) fn caller(&self) -> &Caller {
+        &self.caller
+    }
+
+    pub(crate) fn selection(&self) -> Option<ModelSelection> {
+        self.selection
+    }
+
+    pub(crate) fn payload(&self) -> ChildPayload {
+        ChildPayload::new(self.source.clone(), self.checkpoint.clone())
+    }
+
+    pub(crate) fn coordinator(&self) -> &SessionSubagents {
+        &self.coordinator
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait ChildModelFactory: Send + Sync + 'static {
+    type Model: Model;
+
+    fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model;
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct CompleteChildRunner<F> {
+    prompt_base: String,
+    models: F,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<F> CompleteChildRunner<F> {
+    pub(crate) fn new(prompt_base: String, models: F) -> Self {
+        Self {
+            prompt_base,
+            models,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRunner<F> {
+    fn run(&self, child: ChildRun<ChildPayload>, cancellation: CancellationToken) -> RunnerFuture {
+        let prompt_base = self.prompt_base.clone();
+        let models = self.models.clone();
+        let (id, caller, _parent, _depth, parameters, payload, reporter, coordinator) =
+            child.into_parts();
+        let (request, selection, read_only) = parameters.into_parts();
+        let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
+        let model = models.create(child_prompt, selection);
+        Box::pin(async move {
+            let arena = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ChildFailure::new(format!(
+                    "subagent {id} was cancelled before arena construction"
+                ))),
+                result = payload.source.child(&payload.checkpoint, read_only) => {
+                    result.map_err(|error| ChildFailure::new(error.to_string()))?
+                }
+            };
+            let mut agent = Agent::new(arena, model);
+            agent.set_invocation_context(AgentInvocationContext::new(caller, coordinator));
+            let mut progress = |event| {
+                if matches!(event, AgentProgress::ModelStepStarted) {
+                    reporter.model_step_started();
+                }
+            };
+            match agent
+                .run_with_progress(request, &cancellation, &mut progress)
+                .await
+            {
+                Ok(AgentRunOutcome::FinalMessageStaged) => {
+                    let final_message = agent
+                        .discard_staged_final_message()
+                        .expect("completed child must stage a final message");
+                    reporter.set_attempts(final_message.attempts().to_vec());
+                    if cancellation.is_cancelled() {
+                        return Err(ChildFailure::new(format!(
+                            "subagent {id} was cancelled before result admission"
+                        )));
+                    }
+                    let message = final_message.text().to_owned();
+                    let values = agent.collect_child_result_values(&cancellation).await;
+                    if cancellation.is_cancelled() {
+                        return Err(ChildFailure::new(format!(
+                            "subagent {id} was cancelled before result admission"
+                        )));
+                    }
+                    match values {
+                        Ok(values) => Ok(ChildResult::new(message, values)),
+                        Err(error) => Err(ChildFailure::new(format!(
+                            "{error}; final message: {message}"
+                        ))),
+                    }
+                }
+                Err(error) => {
+                    reporter.set_attempts(error.attempts().to_vec());
+                    Err(ChildFailure::new(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum CostStatus {
     Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskObservation {
     id: TaskId,
     state: TaskState,
@@ -247,6 +446,7 @@ pub(crate) struct TaskObservation {
     error: Option<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TaskObservation {
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
@@ -294,6 +494,7 @@ impl TaskObservation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TaskOutcome {
     Completed(ChildResult),
     Failed(ChildFailure),
@@ -302,6 +503,7 @@ pub(crate) enum TaskOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskRecord {
     id: TaskId,
     parent: Option<TaskId>,
@@ -309,14 +511,18 @@ pub(crate) struct TaskRecord {
     depth: usize,
     parameters: ChildParameters,
     observation: TaskObservation,
+    attempts: Vec<AttemptAccounting>,
     outcome: Option<TaskOutcome>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TaskRecord {
+    #[allow(dead_code)]
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parent(&self) -> Option<&TaskId> {
         self.parent.as_ref()
     }
@@ -325,6 +531,7 @@ impl TaskRecord {
         self.origin.0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
@@ -333,8 +540,13 @@ impl TaskRecord {
         &self.parameters
     }
 
+    #[allow(dead_code)]
     pub(crate) fn observation(&self) -> &TaskObservation {
         &self.observation
+    }
+
+    pub(crate) fn attempts(&self) -> &[AttemptAccounting] {
+        &self.attempts
     }
 
     pub(crate) fn outcome(&self) -> Option<&TaskOutcome> {
@@ -343,6 +555,7 @@ impl TaskRecord {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubagentPolicy {
     allow_nested: bool,
     max_concurrent: usize,
@@ -351,6 +564,7 @@ pub(crate) struct SubagentPolicy {
     timeout: Duration,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl From<SubagentSettings> for SubagentPolicy {
     fn from(settings: SubagentSettings) -> Self {
         Self {
@@ -364,6 +578,7 @@ impl From<SubagentSettings> for SubagentPolicy {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AdmissionError {
     #[error("subagent admission is unavailable during shutdown")]
     ShuttingDown,
@@ -384,6 +599,7 @@ pub(crate) enum AdmissionError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AccessError {
     #[error("subagent caller is not trusted by this session")]
     InvalidCaller,
@@ -394,6 +610,7 @@ pub(crate) enum AccessError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WaitError {
     #[error(transparent)]
     Access(#[from] AccessError),
@@ -415,6 +632,7 @@ pub(crate) enum WaitError {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl WaitError {
     pub(crate) fn observation(&self) -> Option<&TaskObservation> {
         match self {
@@ -426,13 +644,16 @@ impl WaitError {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
     fn unix_time_ms(&self) -> i64;
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SystemClock;
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
@@ -449,6 +670,7 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
     policy: SubagentPolicy,
@@ -456,6 +678,7 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     clock: Arc<dyn Clock>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     fn clone(&self) -> Self {
         Self {
@@ -467,16 +690,28 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct Inner {
     session: u64,
     next_origin: u64,
     next_task: u64,
     active_slots: usize,
     shutting_down: bool,
+    blocked_origins: BTreeSet<OriginId>,
     origin_starts: BTreeMap<OriginId, usize>,
+    notifications: watch::Sender<u64>,
     tasks: BTreeMap<TaskId, Task>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+impl Inner {
+    fn notify(&self) {
+        self.notifications
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 struct Task {
     id: TaskId,
     parent: Option<TaskId>,
@@ -486,7 +721,7 @@ struct Task {
     admitted_at: Instant,
     deadline: Option<Instant>,
     settled_at: Option<Instant>,
-    step_count: u64,
+    metrics: Arc<TaskMetrics>,
     state: TaskState,
     stop: Option<StopReason>,
     outcome: Option<TaskOutcome>,
@@ -495,6 +730,7 @@ struct Task {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum StopReason {
     Cancelled,
     TimedOut,
@@ -503,6 +739,7 @@ enum StopReason {
     RunnerFailed(ChildFailure),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl StopReason {
     fn outcome(&self) -> TaskOutcome {
         match self {
@@ -523,6 +760,7 @@ impl StopReason {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Task {
     fn observation(&self, now: Instant, observed_at_ms: i64) -> TaskObservation {
         let finished_at = self.settled_at.unwrap_or(now);
@@ -530,7 +768,7 @@ impl Task {
             id: self.id.clone(),
             state: self.state,
             selection: self.parameters.selection(),
-            step_count: self.step_count,
+            step_count: self.metrics.step_count.load(Ordering::Relaxed),
             elapsed: finished_at.saturating_duration_since(self.admitted_at),
             observed_at_ms,
             estimated_cost_usd: None,
@@ -548,6 +786,7 @@ impl Task {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) fn new(policy: SubagentPolicy, runner: Arc<dyn ChildRunner<P>>) -> Self {
         Self::with_clock(policy, runner, Arc::new(SystemClock))
@@ -565,7 +804,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 next_task: 0,
                 active_slots: 0,
                 shutting_down: false,
+                blocked_origins: BTreeSet::new(),
                 origin_starts: BTreeMap::new(),
+                notifications: watch::channel(0).0,
                 tasks: BTreeMap::new(),
             })),
             policy,
@@ -603,6 +844,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             }
             if caller.session != inner.session {
                 return Err(AdmissionError::InvalidCaller);
+            }
+            if inner.blocked_origins.contains(&caller.origin) {
+                return Err(AdmissionError::CallerStopped);
             }
 
             let (parent, depth, inherited_read_only, inherited_deadline) = match &caller.owner {
@@ -652,6 +896,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             parameters.read_only |= inherited_read_only;
             let (updates, _) = watch::channel(TaskState::Starting);
             let cancellation = CancellationToken::new();
+            let metrics = Arc::new(TaskMetrics {
+                step_count: AtomicU64::new(0),
+                attempts: SyncMutex::new(Vec::new()),
+                notifications: inner.notifications.clone(),
+            });
             let task = Task {
                 id: id.clone(),
                 parent: parent.clone(),
@@ -661,7 +910,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 admitted_at: now,
                 deadline,
                 settled_at: None,
-                step_count: 0,
+                metrics: metrics.clone(),
                 state: TaskState::Starting,
                 stop: None,
                 outcome: None,
@@ -673,6 +922,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             inner.active_slots += 1;
             *inner.origin_starts.entry(caller.origin).or_default() += 1;
             inner.tasks.insert(id.clone(), task);
+            inner
+                .notifications
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
             (
                 ChildRun {
                     id,
@@ -685,10 +937,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     depth,
                     parameters,
                     payload,
-                    reporter: TaskReporter {
-                        id: observation.id.clone(),
-                        inner: self.inner.clone(),
-                    },
+                    reporter: TaskReporter { metrics },
+                    coordinator: self.clone(),
                 },
                 observation,
             )
@@ -699,6 +949,10 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             coordinator.run_child(child).await;
         });
         Ok(observation)
+    }
+
+    pub(crate) async fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.lock().await.notifications.subscribe()
     }
 
     pub(crate) async fn get(
@@ -747,9 +1001,26 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.get(caller, id).await
     }
 
+    pub(crate) async fn request_background_cancellation(&self, active: Option<&Caller>) {
+        self.request_stop_all(StopReason::Cancelled, active).await;
+    }
+
+    pub(crate) async fn join_active(&self) {
+        let active = self
+            .inner
+            .lock()
+            .await
+            .tasks
+            .values()
+            .filter(|task| !task.state.is_terminal())
+            .map(|task| task.id.clone())
+            .collect();
+        self.wait_for_all(active).await;
+    }
+
     pub(crate) async fn cancel_all(&self) {
-        let stopping = self.request_stop_all(StopReason::Cancelled).await;
-        self.wait_for_all(stopping).await;
+        self.request_background_cancellation(None).await;
+        self.join_active().await;
     }
 
     pub(crate) async fn service(&self) {
@@ -788,9 +1059,10 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         {
             let mut inner = self.inner.lock().await;
             inner.shutting_down = true;
+            inner.notify();
         }
-        let stopping = self.request_stop_all(StopReason::Shutdown).await;
-        self.wait_for_all(stopping).await;
+        self.request_stop_all(StopReason::Shutdown, None).await;
+        self.join_active().await;
     }
 
     pub(crate) async fn records(&self) -> Vec<TaskRecord> {
@@ -807,6 +1079,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 depth: task.depth,
                 parameters: task.parameters.clone(),
                 observation: task.observation(now, observed_at_ms),
+                attempts: task
+                    .metrics
+                    .attempts
+                    .lock()
+                    .expect("task metrics lock")
+                    .clone(),
                 outcome: task.outcome.clone(),
             })
             .collect()
@@ -820,15 +1098,22 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let id = child.id().clone();
         let cancellation = {
             let mut inner = self.inner.lock().await;
-            let task = inner
-                .tasks
-                .get_mut(&id)
-                .expect("admitted child must remain retained");
-            if task.state == TaskState::Starting {
-                task.state = TaskState::Running;
-                task.publish();
+            let (changed, cancellation) = {
+                let task = inner
+                    .tasks
+                    .get_mut(&id)
+                    .expect("admitted child must remain retained");
+                let changed = task.state == TaskState::Starting;
+                if changed {
+                    task.state = TaskState::Running;
+                    task.publish();
+                }
+                (changed, task.cancellation.clone())
+            };
+            if changed {
+                inner.notify();
             }
-            task.cancellation.clone()
+            cancellation
         };
         let result = if cancellation.is_cancelled() {
             Err(ChildFailure::new("child was cancelled before startup"))
@@ -865,6 +1150,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                         task.stop = Some(StopReason::RunnerFailed(failure.clone()));
                         task.state = TaskState::Stopping;
                         task.publish();
+                        inner.notify();
                         TaskOutcome::Failed(failure)
                     }
                 }
@@ -923,10 +1209,26 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         stopping
     }
 
-    async fn request_stop_all(&self, reason: StopReason) -> Vec<TaskId> {
+    async fn request_stop_all(&self, reason: StopReason, active: Option<&Caller>) {
         let mut inner = self.inner.lock().await;
-        let ids = inner.tasks.keys().cloned().collect::<Vec<_>>();
-        stop_tasks(&mut inner, &ids, reason)
+        let mut origins = inner
+            .tasks
+            .values()
+            .filter(|task| !task.state.is_terminal())
+            .map(|task| task.origin)
+            .collect::<BTreeSet<_>>();
+        if let Some(caller) = active.filter(|caller| caller.session == inner.session) {
+            origins.insert(caller.origin);
+        }
+        inner.blocked_origins.extend(origins);
+        let ids = inner
+            .tasks
+            .values()
+            .filter(|task| !task.state.is_terminal())
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        stop_tasks(&mut inner, &ids, reason);
+        inner.notify();
     }
 
     async fn wait_for_all(&self, ids: Vec<TaskId>) {
@@ -1016,6 +1318,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn earliest_deadline(own: Option<Instant>, inherited: Option<Instant>) -> Option<Instant> {
     match (own, inherited) {
         (Some(own), Some(inherited)) => Some(own.min(inherited)),
@@ -1024,6 +1327,7 @@ fn earliest_deadline(own: Option<Instant>, inherited: Option<Instant>) -> Option
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn ensure_access(inner: &Inner, caller: &Caller, id: &TaskId) -> Result<(), AccessError> {
     if caller.session != inner.session {
         return Err(AccessError::InvalidCaller);
@@ -1048,6 +1352,7 @@ fn ensure_access(inner: &Inner, caller: &Caller, id: &TaskId) -> Result<(), Acce
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_proper_descendant(
     tasks: &BTreeMap<TaskId, Task>,
     candidate: &TaskId,
@@ -1063,10 +1368,12 @@ fn is_proper_descendant(
     false
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_in_subtree(tasks: &BTreeMap<TaskId, Task>, candidate: &TaskId, ancestor: &TaskId) -> bool {
     candidate == ancestor || is_proper_descendant(tasks, candidate, ancestor)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<TaskId> {
     let mut stopping = Vec::new();
     for id in ids {
@@ -1081,12 +1388,14 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
             task.state = TaskState::Stopping;
             task.cancellation.cancel();
             task.publish();
+            inner.notify();
         }
         stopping.push(id.clone());
     }
     stopping
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn settle_task(inner: &mut Inner, id: &TaskId, outcome: TaskOutcome, now: Instant) {
     let settled = {
         let task = inner
@@ -1105,6 +1414,7 @@ fn settle_task(inner: &mut Inner, id: &TaskId, outcome: TaskOutcome, now: Instan
             task.outcome = Some(outcome);
             task.settled_at = Some(now);
             task.publish();
+            inner.notify();
             true
         }
     };
@@ -1116,6 +1426,7 @@ fn settle_task(inner: &mut Inner, id: &TaskId, outcome: TaskOutcome, now: Instan
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn task_id(mut sequence: u64) -> Option<TaskId> {
     if sequence >= TASK_ID_SPACE {
         return None;
@@ -1135,11 +1446,13 @@ fn task_id(mut sequence: u64) -> Option<TaskId> {
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bounded_utf8(mut value: String, limit: usize) -> String {
     value.truncate(utf8_prefix_len(&value, limit));
     value
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn utf8_prefix_len(value: &str, limit: usize) -> usize {
     let mut end = value.len().min(limit);
     while !value.is_char_boundary(end) {
@@ -1150,19 +1463,94 @@ fn utf8_prefix_len(value: &str, limit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::env;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         AccessError, AdmissionError, ChildFailure, ChildParameters, ChildResult, ChildRun,
         ChildRunner, Clock, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture, SubagentCoordinator,
         SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError,
     };
+    use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
-    use crate::tools::ToolValue;
+    use crate::model::{
+        Model, ModelContextEntry, ModelFailure, ModelHistory, ModelProgress, ModelStep,
+        ScriptedAction, ScriptedModel,
+    };
+    use crate::tools::{ToolHost, ToolValue};
+
+    fn worker_path() -> PathBuf {
+        env::var_os("MONTY_BIN")
+            .map(PathBuf::from)
+            .expect("MONTY_BIN must point to the monty-runtime 0.0.21 worker")
+    }
+
+    #[derive(Clone)]
+    struct ScriptedChildFactory {
+        scripts: Arc<Mutex<VecDeque<Vec<ScriptedAction>>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        selections: Arc<Mutex<Vec<ModelSelection>>>,
+        histories: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+    }
+
+    struct RecordingScriptedModel {
+        model: ScriptedModel,
+        histories: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+    }
+
+    impl Model for RecordingScriptedModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            self.histories
+                .lock()
+                .unwrap()
+                .push(history.entries().to_vec());
+            self.model.step(history, cancellation, progress)
+        }
+    }
+
+    impl ScriptedChildFactory {
+        fn new(scripts: impl IntoIterator<Item = Vec<ScriptedAction>>) -> Self {
+            Self {
+                scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                selections: Arc::new(Mutex::new(Vec::new())),
+                histories: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl super::ChildModelFactory for ScriptedChildFactory {
+        type Model = RecordingScriptedModel;
+
+        fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
+            self.prompts.lock().unwrap().push(prompt);
+            self.selections.lock().unwrap().push(selection);
+            RecordingScriptedModel {
+                model: ScriptedModel::new(
+                    self.scripts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("test configures one child script"),
+                ),
+                histories: self.histories.clone(),
+            }
+        }
+    }
 
     struct Started {
         child: ChildRun<()>,
@@ -1385,7 +1773,8 @@ mod tests {
             cancellation: tokio_util::sync::CancellationToken,
         ) -> RunnerFuture {
             assert_eq!(child.payload().get(), 7);
-            let (id, caller, parent, depth, parameters, payload, reporter) = child.into_parts();
+            let (id, caller, parent, depth, parameters, payload, reporter, coordinator) =
+                child.into_parts();
             assert_eq!(id.as_str().len(), 6);
             assert_eq!(parent, None);
             assert_eq!(depth, 1);
@@ -1397,7 +1786,7 @@ mod tests {
                     .expect("default selection is valid")
             );
             assert!(!read_only);
-            drop((caller, reporter));
+            drop((caller, reporter, coordinator));
             self.payloads
                 .send(payload.get())
                 .expect("test receives the moved payload");
@@ -2075,6 +2464,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_runner_uses_a_child_checkpoint_and_validated_exports() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        parent
+            .execute(
+                "inherited = 41\nresult_values = {'parent': 'kept'}",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("initialise parent state");
+        let payload = super::ChildPayload::new(parent.child_source(), parent.checkpoint());
+        let factory = ScriptedChildFactory::new([vec![
+            ScriptedAction::Code {
+                source: "result_values['child'] = inherited + 1".to_owned(),
+            },
+            ScriptedAction::Message {
+                text: "child complete".to_owned(),
+            },
+        ]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "canonical base".to_owned(),
+                factory.clone(),
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let selection = ModelSelection::new(&crate::config::models::TERRA, "high").unwrap();
+        let admitted = coordinator
+            .start(
+                &caller,
+                ChildParameters::new("do the child work".to_owned(), selection, false),
+                payload,
+            )
+            .await
+            .expect("admit child");
+        let (result, observation) = coordinator.wait(&caller, admitted.id()).await.unwrap();
+
+        assert_eq!(result.message(), "child complete");
+        assert_eq!(
+            result.values(),
+            &BTreeMap::from([("child".to_owned(), ToolValue::Integer(42))])
+        );
+        assert_eq!(observation.state(), TaskState::Completed);
+        assert_eq!(observation.step_count(), 2);
+        assert_eq!(coordinator.records().await[0].attempts(), &[]);
+        assert_eq!(*factory.selections.lock().unwrap(), [selection]);
+        {
+            let histories = factory.histories.lock().unwrap();
+            assert_eq!(histories.len(), 2);
+            assert_eq!(
+                histories[0],
+                [ModelContextEntry::UserRequest {
+                    text: "do the child work".to_owned(),
+                }]
+            );
+            assert!(matches!(
+                histories[1].as_slice(),
+                [
+                    ModelContextEntry::UserRequest { .. },
+                    ModelContextEntry::CompletedCode(_)
+                ]
+            ));
+        }
+        let prompt = factory.prompts.lock().unwrap().pop().unwrap();
+        assert!(prompt.starts_with("canonical base\n\n# Subagent work"));
+        assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);
+        assert!(matches!(
+            parent
+                .execute("result_values", &CancellationToken::new())
+                .await
+                .unwrap()
+                .outcome,
+            ExecutionOutcome::Complete { result: Some(ref value) } if value.head == "{'parent': 'kept'}"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_runner_fails_exports_without_losing_final_message_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let payload = super::ChildPayload::new(parent.child_source(), parent.checkpoint());
+        let factory = ScriptedChildFactory::new([vec![
+            ScriptedAction::Code {
+                source: "result_values = 1".to_owned(),
+            },
+            ScriptedAction::Message {
+                text: "generated but not admitted".to_owned(),
+            },
+        ]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "canonical base".to_owned(),
+                factory,
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator
+            .start(&caller, parameters(), payload)
+            .await
+            .expect("admit child");
+
+        let error = coordinator.wait(&caller, admitted.id()).await.unwrap_err();
+        assert_failed(
+            error,
+            admitted.id(),
+            "result_values export failed: result_values must be a dictionary; final message: generated but not admitted",
+        );
+        let records = coordinator.records().await;
+        assert_eq!(records[0].attempts(), &[]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_child_construction_does_not_wait_for_arena_startup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let construction_gate = ChildConstructionTestGate::new();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena")
+        .with_child_construction_test_gate(construction_gate.clone());
+        let payload = super::ChildPayload::new(parent.child_source(), parent.checkpoint());
+        let factory = ScriptedChildFactory::new([vec![ScriptedAction::Message {
+            text: "child complete".to_owned(),
+        }]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "canonical base".to_owned(),
+                factory,
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator
+            .start(&caller, parameters(), payload)
+            .await
+            .expect("admit child");
+        construction_gate.wait_until_construction_started().await;
+
+        let mut cancellation = Box::pin(coordinator.cancel(&caller, admitted.id()));
+        let cancellation_result = timeout(Duration::from_secs(1), &mut cancellation).await;
+        construction_gate.resume_construction();
+        let (settled, observation) = match cancellation_result {
+            Ok(observation) => (true, observation.unwrap()),
+            Err(_) => (false, cancellation.await.unwrap()),
+        };
+
+        assert!(settled, "cancellation waited for arena construction");
+        assert_eq!(observation.state(), TaskState::Cancelled);
+        assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_child_collection_does_not_wait_for_execution_timeout() {
+        let workspace = tempfile::tempdir().unwrap();
+        let collection_gate = CollectionTestGate::new();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena")
+        .with_collection_test_gate(collection_gate.clone());
+        let payload = super::ChildPayload::new(parent.child_source(), parent.checkpoint());
+        let factory = ScriptedChildFactory::new([vec![ScriptedAction::Message {
+            text: "child complete".to_owned(),
+        }]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "canonical base".to_owned(),
+                factory,
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator
+            .start(&caller, parameters(), payload)
+            .await
+            .expect("admit child");
+        collection_gate.wait_until_collection_started().await;
+
+        let mut cancellation = Box::pin(coordinator.cancel(&caller, admitted.id()));
+        let cancellation_result = timeout(Duration::from_secs(1), &mut cancellation).await;
+        collection_gate.resume_collection();
+        let (settled, observation) = match cancellation_result {
+            Ok(observation) => (true, observation.unwrap()),
+            Err(_) => (false, cancellation.await.unwrap()),
+        };
+
+        assert!(settled, "cancellation waited for result collection");
+        assert_eq!(observation.state(), TaskState::Cancelled);
+        assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn observations_report_fixed_selection_steps_time_and_unavailable_cost() {
         let clock = Arc::new(ManualClock::new(1_000));
         let (started_sender, mut started) = mpsc::unbounded_channel();
@@ -2103,8 +2708,8 @@ mod tests {
         assert_eq!(admitted.error(), None);
 
         let running = started.recv().await.expect("child starts");
-        running.child.model_step_started().await;
-        running.child.model_step_started().await;
+        running.child.model_step_started();
+        running.child.model_step_started();
         clock.advance(Duration::from_millis(2_500));
         let observation = coordinator.get(&root, admitted.id()).await.unwrap();
         assert_eq!(observation.state(), TaskState::Running);

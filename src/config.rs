@@ -217,7 +217,6 @@ impl StartupSnapshot {
         self.thinking
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn subagents(&self) -> settings::SubagentSettings {
         self.subagents
     }
@@ -273,6 +272,7 @@ impl StartupConfiguration {
             worker_path: self.construction.worker_path.as_deref()?,
             workspace_root: self.construction.workspace_root.as_deref()?,
             system_prompt: self.construction.system_prompt.as_deref()?,
+            prompt_base: self.construction.prompt_base.as_deref()?,
             api_key: self.construction.api_key.as_ref()?,
             model: self.construction.model,
             thinking: self.snapshot.thinking,
@@ -312,6 +312,7 @@ struct StartupConstruction {
     worker_path: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     system_prompt: Option<String>,
+    prompt_base: Option<String>,
     api_key: Option<ApiKey>,
     model: &'static ModelConfiguration,
 }
@@ -320,6 +321,7 @@ pub(crate) struct ReadyStartup<'a> {
     worker_path: &'a Path,
     workspace_root: &'a Path,
     system_prompt: &'a str,
+    prompt_base: &'a str,
     api_key: &'a ApiKey,
     model: &'static ModelConfiguration,
     thinking: &'static str,
@@ -336,6 +338,10 @@ impl<'a> ReadyStartup<'a> {
 
     pub(crate) fn system_prompt(&self) -> &'a str {
         self.system_prompt
+    }
+
+    pub(crate) fn prompt_base(&self) -> &'a str {
+        self.prompt_base
     }
 
     pub(crate) fn api_key(&self) -> &'a ApiKey {
@@ -372,6 +378,7 @@ struct StartupInput {
 enum PromptResolution {
     Resolved {
         text: String,
+        base: String,
         source: PromptSource,
     },
     Failed {
@@ -390,6 +397,7 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
         match resolution {
             Ok(resolved) => Self::Resolved {
                 text: resolved.text().to_owned(),
+                base: resolved.base().to_owned(),
                 source: resolved.source().clone(),
             },
             Err(PromptError::UnreadableOverride { path, source }) => Self::Failed {
@@ -450,7 +458,8 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     let (worker_path, worker_problem) = resolve_worker_path(worker_path, exposed_api_key);
     let (workspace_root, workspace_problem) =
         resolve_workspace_root(workspace_root, exposed_api_key);
-    let (prompt_source, system_prompt, prompt_problem) = resolve_prompt(prompt, exposed_api_key);
+    let (prompt_source, system_prompt, prompt_base, prompt_problem) =
+        resolve_prompt(prompt, exposed_api_key);
 
     let worker_path_display = worker_path
         .as_deref()
@@ -484,6 +493,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
             worker_path,
             workspace_root,
             system_prompt,
+            prompt_base,
             api_key,
             model,
         },
@@ -606,9 +616,14 @@ fn resolve_workspace_root(
 fn resolve_prompt(
     prompt: PromptResolution,
     api_key: Option<&str>,
-) -> (PromptSource, Option<String>, Option<StartupProblem>) {
+) -> (
+    PromptSource,
+    Option<String>,
+    Option<String>,
+    Option<StartupProblem>,
+) {
     match prompt {
-        PromptResolution::Resolved { text, source } => (source, Some(text), None),
+        PromptResolution::Resolved { text, base, source } => (source, Some(text), Some(base), None),
         PromptResolution::Failed { source, failure } => {
             let (kind, diagnostic) = match &failure {
                 PromptFailure::Unreadable { detail } => (
@@ -632,7 +647,7 @@ fn resolve_prompt(
                 "Fix or unset KIKI_SYSTEM_PROMPT, then restart Kiki.",
                 api_key,
             );
-            (source, None, Some(problem))
+            (source, None, None, Some(problem))
         }
     }
 }
@@ -662,6 +677,7 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
         workspace_root: Ok(workspace_root.to_path_buf()),
         prompt: PromptResolution::Resolved {
             text: "system instructions".to_owned(),
+            base: "system instructions".to_owned(),
             source: PromptSource::Bundled {
                 name: "read_only_agent",
             },
@@ -712,6 +728,7 @@ mod tests {
     fn bundled_prompt() -> PromptResolution {
         PromptResolution::Resolved {
             text: "system instructions".to_owned(),
+            base: "system instructions".to_owned(),
             source: PromptSource::Bundled {
                 name: "read_only_agent",
             },
@@ -1038,6 +1055,7 @@ mod tests {
             workspace_root: Ok(workspace_root.clone()),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),
+                base: "system instructions".to_owned(),
                 source: PromptSource::Override {
                     path: prompt_path.clone(),
                 },
@@ -1320,6 +1338,7 @@ mod tests {
         input.workspace_root = Ok(PathBuf::from(format!("/{long_segment}/workspace")));
         input.prompt = PromptResolution::Resolved {
             text: "system instructions".to_owned(),
+            base: "system instructions".to_owned(),
             source: PromptSource::Override {
                 path: PathBuf::from(format!("/{long_segment}/prompt.md")),
             },
@@ -1380,6 +1399,7 @@ mod tests {
             workspace_root: Ok(PathBuf::from(format!("/workspace/{api_key}/project\r"))),
             prompt: PromptResolution::Resolved {
                 text: "system instructions".to_owned(),
+                base: "system instructions".to_owned(),
                 source: PromptSource::Override {
                     path: PathBuf::from(format!("/prompts/{api_key}/agent\t\x1b.md")),
                 },
