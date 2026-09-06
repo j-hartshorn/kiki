@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -6,7 +8,7 @@ use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEv
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 #[cfg(test)]
 use crate::config::DEFAULT_MODEL;
-use crate::config::ModelSelection;
+use crate::config::{ModelConfiguration, ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -194,6 +196,43 @@ impl<T> ProgressPublisher<T> {
 
 pub(crate) type RuntimeProgressReceiver = mpsc::Receiver<ProgressEnvelope<RuntimeEvent>>;
 
+struct AcceptedThinking {
+    persisted: SettingsContext,
+    values: BTreeMap<&'static str, &'static str>,
+}
+
+impl AcceptedThinking {
+    fn new(selection: ModelSelection, persisted: SettingsContext) -> Self {
+        Self {
+            persisted,
+            values: BTreeMap::from([(selection.model().id, selection.thinking())]),
+        }
+    }
+
+    fn accept(&mut self, selection: ModelSelection) {
+        self.values
+            .insert(selection.model().id, selection.thinking());
+    }
+
+    fn resolve(
+        &self,
+        invoking: ModelSelection,
+        target: Option<&'static ModelConfiguration>,
+    ) -> ModelSelection {
+        let Some(target) = target else {
+            return invoking;
+        };
+        let thinking = self
+            .values
+            .get(target.id)
+            .copied()
+            .or_else(|| self.persisted.thinking_for(target))
+            .unwrap_or(target.default_thinking);
+        ModelSelection::new(target, thinking)
+            .expect("accepted or persisted thinking must be supported by its model")
+    }
+}
+
 pub(crate) struct RuntimeController<M: Model> {
     agent: Option<Agent<M>>,
     disabled_reason: Option<RuntimeDisabledReason>,
@@ -201,6 +240,7 @@ pub(crate) struct RuntimeController<M: Model> {
     next_run_id: u64,
     next_model_step_id: u64,
     settings: watch::Sender<ModelSelection>,
+    accepted_thinking: AcceptedThinking,
     active: Option<ActiveRun<M>>,
 }
 
@@ -258,7 +298,7 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
         AgentProgress::ModelStepStarted
-        | AgentProgress::ExecutionStarted
+        | AgentProgress::ExecutionStarted { .. }
         | AgentProgress::ExecutionCompleted { .. } => 0,
     }
 }
@@ -307,7 +347,12 @@ fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting
 }
 
 impl<M: Model> RuntimeController<M> {
-    pub(crate) fn new(agent: Agent<M>, settings: watch::Sender<ModelSelection>) -> Self {
+    pub(crate) fn new(
+        agent: Agent<M>,
+        settings: watch::Sender<ModelSelection>,
+        persisted_settings: SettingsContext,
+    ) -> Self {
+        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
         Self {
             agent: Some(agent),
             disabled_reason: None,
@@ -315,8 +360,18 @@ impl<M: Model> RuntimeController<M> {
             next_run_id: 1,
             next_model_step_id: 1,
             settings,
+            accepted_thinking,
             active: None,
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_child_selection(
+        &self,
+        invoking: ModelSelection,
+        target: Option<&'static ModelConfiguration>,
+    ) -> ModelSelection {
+        self.accepted_thinking.resolve(invoking, target)
     }
 
     #[cfg(test)]
@@ -324,11 +379,17 @@ impl<M: Model> RuntimeController<M> {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
             .expect("default model selection must be valid");
         let (settings, _) = watch::channel(selection);
-        Self::new(agent, settings)
+        Self::new(
+            agent,
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+        )
     }
 
     #[cfg(test)]
     fn with_settings(mut self, settings: watch::Sender<ModelSelection>) -> Self {
+        self.accepted_thinking =
+            AcceptedThinking::new(*settings.borrow(), self.accepted_thinking.persisted.clone());
         self.settings = settings;
         self
     }
@@ -440,6 +501,7 @@ impl<M: Model> RuntimeController<M> {
                 selection,
                 revision,
             } => {
+                self.accepted_thinking.accept(selection);
                 self.settings.send_replace(selection);
                 self.emit(events, RuntimeEvent::SettingsAccepted { revision });
             }
@@ -767,7 +829,9 @@ impl<M: Model> RuntimeController<M> {
                 step_id,
                 progress,
             },
-            AgentProgress::ExecutionStarted => RuntimeEvent::ExecutionStarted { run_id, step_id },
+            AgentProgress::ExecutionStarted { .. } => {
+                RuntimeEvent::ExecutionStarted { run_id, step_id }
+            }
             AgentProgress::ToolUpdated { token, call } => RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
@@ -917,7 +981,7 @@ fn utf8_prefix_len(value: &str, limit: usize) -> usize {
 mod tests {
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -929,9 +993,10 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        ActiveRun, ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher,
-        Record, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason, RuntimeEvent,
-        RuntimeProgressReceiver, StoredRecord, WorkerMessage, runtime_event_payload_bytes,
+        AcceptedThinking, ActiveRun, ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope,
+        ProgressPublisher, Record, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
+        RuntimeEvent, RuntimeProgressReceiver, StoredRecord, WorkerMessage,
+        runtime_event_payload_bytes,
     };
     use crate::agent::{
         Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
@@ -1285,6 +1350,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1387,6 +1453,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1422,6 +1489,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1462,6 +1530,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1792,6 +1861,7 @@ mod tests {
                 self.next_action += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1899,6 +1969,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1933,6 +2004,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1968,6 +2040,7 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2007,6 +2080,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -2048,6 +2122,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2080,6 +2155,7 @@ mod tests {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("summary-code"),
                     },
+                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2107,6 +2183,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: self.text.clone(),
                     },
+                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2173,6 +2250,7 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -4947,6 +5025,92 @@ mod tests {
             ] if text == "later completed"
         ));
         assert_eq!(shutdown_controller(commands, task).await.len(), 2);
+    }
+
+    fn persisted_settings(
+        home: &tempfile::TempDir,
+        workspace: &Path,
+    ) -> crate::config::settings::SettingsContext {
+        let path = home.path().join(".kiki/config.toml");
+        fs::create_dir_all(path.parent().expect("settings parent")).unwrap();
+        fs::write(path, "[thinking]\n\"openai/gpt-5.6-terra\" = \"low\"\n").unwrap();
+        crate::config::ready_snapshot_with_settings_for_test(Some(home.path()), workspace)
+            .settings()
+            .clone()
+    }
+
+    #[test]
+    fn child_selection_prefers_accepted_target_thinking_then_persisted_then_default() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let invoking = ModelSelection::new(&SOL, "high").unwrap();
+        let mut accepted =
+            AcceptedThinking::new(invoking, persisted_settings(&home, workspace.path()));
+
+        assert_eq!(accepted.resolve(invoking, None), invoking);
+        assert_eq!(
+            accepted.resolve(ModelSelection::new(&LUNA, "none").unwrap(), Some(&SOL)),
+            invoking
+        );
+        assert_eq!(
+            accepted.resolve(invoking, Some(&TERRA)),
+            ModelSelection::new(&TERRA, "low").unwrap()
+        );
+        assert_eq!(
+            accepted.resolve(invoking, Some(&LUNA)),
+            ModelSelection::new(&LUNA, LUNA.default_thinking).unwrap()
+        );
+
+        let accepted_target = ModelSelection::new(&TERRA, "max").unwrap();
+        accepted.accept(accepted_target);
+
+        assert_eq!(accepted.resolve(invoking, Some(&TERRA)), accepted_target);
+    }
+
+    #[test]
+    fn grandchild_without_an_override_inherits_its_invoking_child_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let root = ModelSelection::new(&SOL, "low").unwrap();
+        let child = ModelSelection::new(&LUNA, "max").unwrap();
+        let accepted = AcceptedThinking::new(root, persisted_settings(&home, workspace.path()));
+
+        assert_eq!(accepted.resolve(child, None), child);
+    }
+
+    #[tokio::test]
+    async fn accepted_thinking_updates_before_its_settings_acknowledgement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, _) = watch::channel(selection_a);
+        let mut controller = controller(&workspace, Vec::new())
+            .await
+            .with_settings(settings.clone());
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let mut shutdown_requested = false;
+
+        controller.handle_command(
+            RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            },
+            &event_sender,
+            &mut progress,
+            &mut shutdown_requested,
+        );
+
+        assert_eq!(
+            controller.resolve_child_selection(selection_a, Some(&TERRA)),
+            selection_b
+        );
+        assert_eq!(*settings.borrow(), selection_b);
+        assert_eq!(
+            events.recv().await,
+            Some(RuntimeEvent::SettingsAccepted { revision: 1 })
+        );
     }
 
     #[tokio::test]

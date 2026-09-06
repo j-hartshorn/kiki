@@ -69,6 +69,17 @@ impl OpenAiModel {
         Self::build(prompt.into(), api_key.into(), settings, OPENAI_API_BASE)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_fixed_selection(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        selection: ModelSelection,
+    ) -> Self {
+        let (sender, settings) = watch::channel(selection);
+        drop(sender);
+        Self::with_settings(prompt, api_key, settings)
+    }
+
     fn build(
         prompt: String,
         api_key: String,
@@ -539,7 +550,7 @@ impl OpenAiModel {
                     presentation.flush_all(progress);
                     let accounting = terminal_accounting.expect("terminal response accounting");
                     return self
-                        .completed_step(history, response, &mut content)
+                        .completed_step(selection, history, response, &mut content)
                         .map(|mut step| {
                             step.attempts.push(accounting.clone());
                             step
@@ -662,6 +673,7 @@ impl OpenAiModel {
 
     fn completed_step(
         &self,
+        selection: ModelSelection,
         history: &ModelHistory,
         response: WireResponse,
         content: &mut ApplicationContentGuard,
@@ -700,6 +712,7 @@ impl OpenAiModel {
         );
         Ok(ModelStep {
             action,
+            selection: Some(selection),
             reasoning_summary,
             replay,
             attempts: Vec::new(),
@@ -1682,6 +1695,12 @@ mod tests {
         "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":23,\"input_tokens_details\":{\"cached_tokens\":5,\"cache_write_tokens\":7},\"output_tokens\":11,\"output_tokens_details\":{\"reasoning_tokens\":3},\"total_tokens\":34}}}\n\n",
         "data: [DONE]\n\n",
     );
+    const COMPLETED_STREAM_WITHOUT_USAGE: &str = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"code\\\":\\\"print(1)\\\"}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}]}}\n\n",
+        "data: [DONE]\n\n",
+    );
     const FAILED_STREAM: &str = concat!(
         "data: {\"type\":\"response.failed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"output\":[],\"error\":{\"code\":\"server_error\",\"message\":\"failed\"}}}\n\n",
         "data: [DONE]\n\n",
@@ -1790,6 +1809,10 @@ mod tests {
         };
         assert_eq!(usage.model, SOL.id);
         assert_eq!(
+            step.selection,
+            Some(ModelSelection::new(&SOL, "high").unwrap())
+        );
+        assert_eq!(
             crate::pricing::estimate_usage(usage)
                 .unwrap()
                 .pricing()
@@ -1844,10 +1867,62 @@ mod tests {
             panic!("completed retry should report known usage")
         };
         assert_eq!(usage.model, SOL.id);
+        assert_eq!(step.selection, Some(selection_a));
         assert_eq!(
             crate::pricing::estimate_usage(usage).unwrap().pricing(),
             SOL.pricing.identity
         );
+    }
+
+    #[test]
+    fn fixed_selection_does_not_follow_foreground_settings() {
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, foreground_settings) = watch::channel(selection_a);
+        let mut foreground =
+            super::OpenAiModel::with_settings("system prompt", "fixture-key", foreground_settings);
+        let mut fixed =
+            super::OpenAiModel::with_fixed_selection("system prompt", "fixture-key", selection_a);
+
+        settings.send_replace(selection_b);
+
+        assert_eq!(*foreground.settings.borrow_and_update(), selection_b);
+        assert_eq!(*fixed.settings.borrow_and_update(), selection_a);
+    }
+
+    #[tokio::test]
+    async fn a_successful_step_keeps_its_selection_when_usage_is_unavailable() {
+        let allow_reply = Arc::new(Notify::new());
+        let fixture = Fixture::start(FixtureReply::GatedSse {
+            body: COMPLETED_STREAM_WITHOUT_USAGE,
+            allow: allow_reply.clone(),
+        })
+        .await;
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
+            "system prompt",
+            "fixture-key",
+            selection_receiver,
+            &fixture.endpoint,
+        );
+        let step_history = history();
+        let task = tokio::spawn(async move {
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            model
+                .step(&step_history, &cancellation, &mut progress)
+                .await
+        });
+
+        fixture.wait_for_requests(1).await;
+        settings.send_replace(selection_b);
+        allow_reply.notify_one();
+        let step = task.await.unwrap().unwrap();
+
+        assert_eq!(step.attempts, [AttemptAccounting::UsageUnavailable]);
+        assert_eq!(step.selection, Some(selection_a));
     }
 
     #[tokio::test]
@@ -5415,6 +5490,7 @@ mod tests {
 
     async fn start_live_controller() -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
+        let persisted_settings = configuration.snapshot().settings().clone();
         let (worker_path, workspace_root, prompt, api_key, selection) = {
             let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
             (
@@ -5437,6 +5513,7 @@ mod tests {
         let runtime = crate::runtime::RuntimeController::new(
             crate::agent::Agent::new(arena, model),
             settings,
+            persisted_settings,
         );
         let (commands, command_receiver) = mpsc::channel(8);
         let (event_sender, events) = mpsc::unbounded_channel();

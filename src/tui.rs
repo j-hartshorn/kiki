@@ -2836,7 +2836,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_previews_both_encodings_and_debounces_with_injected_time() {
+    fn uncommitted_thinking_preview_does_not_reach_runtime_or_session_memory() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 

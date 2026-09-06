@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let Some(ready) = configuration.ready() else {
         return Ok(tui::run_configuration(configuration.snapshot().clone())?);
     };
+    let startup = configuration.snapshot().clone();
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
@@ -62,8 +63,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(tui::run_configuration(configuration.snapshot().clone())?);
         }
     };
-    let startup = configuration.snapshot().clone();
-    let controller = RuntimeController::new(Agent::new(arena, model), settings);
+    let controller = RuntimeController::new(
+        Agent::new(arena, model),
+        settings,
+        startup.settings().clone(),
+    );
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =

@@ -5,7 +5,7 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
     Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
-use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
+use crate::config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
     ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
@@ -69,7 +69,9 @@ impl ExecutionFailure {
 pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
-    ExecutionStarted,
+    ExecutionStarted {
+        selection: Option<ModelSelection>,
+    },
     ToolUpdated {
         token: ToolCallToken,
         call: ToolCall,
@@ -389,6 +391,7 @@ impl AgentError {
 
 struct PendingCode {
     source: String,
+    selection: Option<ModelSelection>,
     call_id: ModelCallId,
     reasoning_summary: String,
     replay: ProviderReplay,
@@ -513,6 +516,7 @@ impl<M: Model> Agent<M> {
             };
             let ModelStep {
                 action,
+                selection,
                 reasoning_summary,
                 replay,
                 attempts: step_attempts,
@@ -533,6 +537,7 @@ impl<M: Model> Agent<M> {
                     generation.clear();
                     let pending = PendingCode {
                         source,
+                        selection,
                         call_id,
                         reasoning_summary,
                         replay,
@@ -558,7 +563,9 @@ impl<M: Model> Agent<M> {
                             evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
                         });
                     }
-                    progress(AgentProgress::ExecutionStarted);
+                    progress(AgentProgress::ExecutionStarted {
+                        selection: pending.selection,
+                    });
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ToolUpdated { token, call } => {
@@ -822,6 +829,7 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
+    use crate::config::{ModelSelection, models::SOL};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -1054,6 +1062,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1141,6 +1150,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: "message summary".to_owned(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1169,12 +1179,85 @@ mod tests {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("summary-code"),
                     },
+                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
             }
         }
+    }
+
+    struct SelectedCodeThenMessageModel {
+        selection: ModelSelection,
+        step: u8,
+    }
+
+    impl Model for SelectedCodeThenMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "value = 1".to_owned(),
+                        call_id: ModelCallId::new("selected-code"),
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: Some(self.selection),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_exposes_code_execution_selection_from_the_pending_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(&SOL, "low").unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            SelectedCodeThenMessageModel { selection, step: 0 },
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        {
+            let mut capture = |event| progress.push(event);
+            assert_eq!(
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+        }
+
+        assert_eq!(
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    AgentProgress::ExecutionStarted { selection } => Some(*selection),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [Some(selection)]
+        );
     }
 
     struct MessageWithAccountingModel;
@@ -1193,6 +1276,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -1716,6 +1800,7 @@ mod tests {
                 cancellation.cancel();
                 Ok(ModelStep {
                     action: self.action.clone(),
+                    selection: None,
                     reasoning_summary: "boundary summary".to_owned(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
                     attempts: Vec::new(),
@@ -1751,7 +1836,7 @@ mod tests {
 
             assert!(!progress.iter().any(|event| matches!(
                 event,
-                AgentProgress::ExecutionStarted | AgentProgress::ExecutionCompleted { .. }
+                AgentProgress::ExecutionStarted { .. } | AgentProgress::ExecutionCompleted { .. }
             )));
             if code_action {
                 let AgentError::Cancelled {
@@ -2118,7 +2203,7 @@ mod tests {
             progress.as_slice(),
             [
                 AgentProgress::ModelStepStarted,
-                AgentProgress::ExecutionStarted,
+                AgentProgress::ExecutionStarted { selection: None },
                 AgentProgress::ExecutionCompleted {
                     reasoning_summary,
                     ..
