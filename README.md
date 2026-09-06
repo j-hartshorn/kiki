@@ -77,7 +77,7 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - `Option-Left` / `Option-Right`, `Alt-B` / `Alt-F`, and `Ctrl-Left` / `Ctrl-Right` move by Unicode word. `Option-Backspace` / `Ctrl-W` delete the preceding word and `Alt-D` deletes the next one. `Command-Backspace` / `Ctrl-U` delete to the logical line start; `Command-Delete` / `Ctrl-K` delete to its end.
 - `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
-- The `Shift-Enter newline` header hint appears only when enhanced modified-key reporting is available; then `Shift-Enter` inserts a newline. Without that capability, a modified Enter does nothing and plain `Enter` retains submission behaviour.
+- `Shift-Enter` or `Ctrl-J` inserts a prompt newline. `Ctrl-J` remains available when a terminal cannot report modified Enter; plain `Enter` retains submission behaviour.
 - `Esc` cancels the active run.
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
@@ -119,7 +119,7 @@ Submit this prompt:
 Use the Python arena in separate steps. First read `README.md` into persistent Python state named `readme` and print its character count. In a later Python step, use that retained `readme` value to count its `## ` headings and print the count. Then return a GFM response with a heading, task list, link to `README.md`, and fenced code block.
 ```
 
-Check streamed GFM and thinking, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, unlabelled user cards, activity without internal identifiers, a closed rounded lifecycle frame with closed labelled source and execution sections, unboxed accounting, and the neutral borderless assistant block. On a terminal with enhanced modified-key reporting, verify `Shift-Enter` adds a prompt newline; verify the bottom-anchored wrapping prompt, `Ctrl-T`, `Ctrl-O`, scrolling, and the footer embedded in its bottom rule, including cwd front-truncation and model/thinking preservation.
+Check streamed GFM and thinking, partial and settled highlighted Python, live stdout, blue-to-green arena state transition for the successful prompt, red only on cancellation or error, unlabelled user cards, activity without internal identifiers, a closed rounded lifecycle frame with closed labelled source and execution sections, unboxed accounting, and the neutral borderless assistant block. Verify `Shift-Enter` and `Ctrl-J` add prompt newlines; verify the bottom-anchored wrapping prompt, `Ctrl-T`, `Ctrl-O`, scrolling, and the footer embedded in its bottom rule, including cwd front-truncation and model/thinking preservation.
 
 ## Deterministic verification
 

@@ -143,7 +143,6 @@ struct ThinkingPreview {
 
 struct App {
     mode: AppMode,
-    enhanced_keyboard: bool,
     prompt: PromptEditor,
     prompt_width: u16,
     transcript: Transcript,
@@ -175,7 +174,6 @@ impl Default for App {
             .expect("default model thinking must be supported");
         Self {
             mode: AppMode::Configured,
-            enhanced_keyboard: false,
             prompt: PromptEditor::default(),
             prompt_width: 80,
             transcript: Transcript::default(),
@@ -979,6 +977,9 @@ impl App {
             KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::Right)
             }
+            KeyCode::Char('j' | 'J') if key.modifiers == KeyModifiers::CONTROL => {
+                Some(PromptEdit::InsertNewline)
+            }
             KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::DeleteToLineEnd)
             }
@@ -1004,9 +1005,7 @@ impl App {
             {
                 Some(PromptEdit::Insert(character))
             }
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT) && self.enhanced_keyboard =>
-            {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 Some(PromptEdit::InsertNewline)
             }
             _ => None,
@@ -1199,8 +1198,7 @@ pub(crate) fn run(
                     with_keyboard_enhancement(
                         enable_keyboard_enhancement,
                         disable_keyboard_enhancement,
-                        |enhanced_keyboard| {
-                            app.enhanced_keyboard = enhanced_keyboard;
+                        || {
                             run_loop_with_titles(
                                 terminal,
                                 &mut app,
@@ -1293,16 +1291,12 @@ fn with_mouse_capture<T>(
     run()
 }
 
-fn enable_keyboard_enhancement() -> io::Result<bool> {
-    if !ratatui::crossterm::terminal::supports_keyboard_enhancement()? {
-        return Ok(false);
-    }
+fn enable_keyboard_enhancement() -> io::Result<()> {
     let mut stdout = io::stdout();
     ratatui::crossterm::execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    Ok(true)
+    )
 }
 
 fn disable_keyboard_enhancement() {
@@ -1311,13 +1305,13 @@ fn disable_keyboard_enhancement() {
 }
 
 fn with_keyboard_enhancement<T>(
-    enable: impl FnOnce() -> io::Result<bool>,
+    enable: impl FnOnce() -> io::Result<()>,
     disable: impl FnOnce(),
-    run: impl FnOnce(bool) -> T,
+    run: impl FnOnce() -> T,
 ) -> T {
-    let enabled = enable().unwrap_or(false);
-    let _guard = enabled.then(|| RestoreGuard::new(disable));
-    run(enabled)
+    let pushed = enable().is_ok();
+    let _guard = pushed.then(|| RestoreGuard::new(disable));
+    run()
 }
 
 fn draw_frame<B: Backend>(
@@ -1515,14 +1509,9 @@ fn render(frame: &mut Frame, app: &mut App) {
             app.transcript.status()
         )
     } else {
-        let enhanced_keyboard_hint = if app.enhanced_keyboard {
-            " | Shift-Enter newline"
-        } else {
-            ""
-        };
         let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {}{notice} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
+            "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
             app.transcript.status()
         )
     };
@@ -3260,10 +3249,7 @@ mod tests {
 
     #[test]
     fn shift_enter_edits_a_multiline_prompt_without_submitting() {
-        let mut app = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        let mut app = App::default();
         app.handle_key(key(KeyCode::Char('f')));
         assert!(
             app.handle_key(shifted_key(KeyCode::Enter))
@@ -3279,10 +3265,7 @@ mod tests {
             }]
         );
 
-        let mut active = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        let mut active = App::default();
         active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
         assert!(
             active
@@ -3304,6 +3287,7 @@ mod tests {
             key(KeyCode::Backspace),
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
         ] {
             assert!(!disabled.handle_key(event).visible_changed);
         }
@@ -3316,15 +3300,13 @@ mod tests {
             key(KeyCode::Backspace),
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
         ] {
             assert!(!configuration.handle_key(event).visible_changed);
         }
         assert_eq!(configuration.prompt.text(), "locked");
 
-        let mut bounded = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        let mut bounded = App::default();
         set_prompt(&mut bounded, &"a".repeat(MAX_PROMPT_BYTES - 1));
         assert!(
             bounded
@@ -3644,10 +3626,7 @@ mod tests {
             modified_key(KeyCode::Backspace, KeyModifiers::META),
             modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
         ] {
-            let mut app = App {
-                enhanced_keyboard: true,
-                ..App::default()
-            };
+            let mut app = App::default();
             set_prompt(&mut app, "one\ntwo");
             assert!(app.handle_key(event).visible_changed);
             assert_eq!(submitted_prompt(&mut app), "one\n");
@@ -3780,28 +3759,33 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_requires_keyboard_enhancement_but_plain_enter_still_submits() {
-        let mut plain = App::default();
-        type_prompt(&mut plain, "f");
-        assert!(
-            !plain
-                .handle_key(shifted_key(KeyCode::Enter))
-                .visible_changed
-        );
-        assert_eq!(submitted_prompt(&mut plain), "f");
+    fn control_j_edits_a_multiline_prompt_without_submitting() {
+        for code in ['j', 'J'] {
+            let mut app = App::default();
+            type_prompt(&mut app, "f");
 
-        let mut enhanced = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
-        type_prompt(&mut enhanced, "f");
-        assert!(
-            enhanced
-                .handle_key(shifted_key(KeyCode::Enter))
-                .visible_changed
-        );
-        type_prompt(&mut enhanced, "g");
-        assert_eq!(submitted_prompt(&mut enhanced), "f\ng");
+            let update = app.handle_key(modified_key(KeyCode::Char(code), KeyModifiers::CONTROL));
+
+            assert!(update.commands.is_empty());
+            assert!(update.visible_changed);
+            type_prompt(&mut app, "g");
+            assert_eq!(submitted_prompt(&mut app), "f\ng");
+        }
+
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::META,
+        ] {
+            let mut app = app_with_prompt("keep");
+
+            let update = app.handle_key(modified_key(KeyCode::Char('j'), modifiers));
+
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(app.prompt.text(), "keep");
+        }
     }
 
     #[test]
@@ -3824,16 +3808,16 @@ mod tests {
     }
 
     #[test]
-    fn configured_header_without_keyboard_enhancement_omits_newline_hint() {
+    fn shift_enter_and_control_j_are_advertised_in_configured_header() {
         let mut app = App::default();
 
         let header = rendered(&mut app, 200, 4);
 
         assert!(header.starts_with("Status: idle | Enter submit"));
+        assert!(header.contains("Shift-Enter/Ctrl-J newline"));
         assert!(header.contains("Arrows edit | PgUp/PgDn scroll"));
         assert!(header.contains("Ctrl-C clear/quit"));
         assert!(!header.contains("Up/Down scroll"));
-        assert!(!header.contains("Shift-Enter newline"));
     }
 
     #[test]
@@ -3845,20 +3829,6 @@ mod tests {
         assert!(header.contains("Ctrl-T thinking"));
         assert!(!header.contains("reasoning"));
         assert!(!include_str!("../README.md").contains("reasoning"));
-    }
-
-    #[test]
-    fn configured_header_with_keyboard_enhancement_advertises_newline_hint() {
-        let mut app = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
-
-        let header = rendered(&mut app, 120, 4);
-
-        assert!(header.starts_with("Status: idle | Enter submit"));
-        assert!(header.contains("Arrows edit | PgUp/PgDn scroll"));
-        assert!(header.contains("Shift-Enter newline"));
     }
 
     #[test]
@@ -3991,43 +3961,30 @@ mod tests {
     #[test]
     fn keyboard_enhancement_pops_before_terminal_restore_and_fails_soft() {
         let calls = RefCell::new(Vec::new());
-        let enabled = Cell::new(false);
         let result = {
             let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
             super::with_keyboard_enhancement(
                 || {
                     calls.borrow_mut().push("push");
-                    Ok(true)
+                    Ok(())
                 },
                 || calls.borrow_mut().push("pop"),
-                |available| {
-                    enabled.set(available);
-                    Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned()))
-                },
+                || Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned())),
             )
         };
         assert!(result.is_err());
-        assert!(enabled.get());
         assert_eq!(calls.into_inner(), ["push", "pop", "restore"]);
 
-        for enable in [Ok(false), Err(io::Error::other("push failed"))] {
-            let calls = RefCell::new(Vec::new());
-            let enabled = Cell::new(true);
-            {
-                let _terminal_restore =
-                    super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
-                super::with_keyboard_enhancement(
-                    || enable,
-                    || calls.borrow_mut().push("pop"),
-                    |available| {
-                        enabled.set(available);
-                        calls.borrow_mut().push("run");
-                    },
-                );
-            }
-            assert!(!enabled.get());
-            assert_eq!(calls.into_inner(), ["run", "restore"]);
+        let calls = RefCell::new(Vec::new());
+        {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_keyboard_enhancement(
+                || Err(io::Error::other("push failed")),
+                || calls.borrow_mut().push("pop"),
+                || calls.borrow_mut().push("run"),
+            );
         }
+        assert_eq!(calls.into_inner(), ["run", "restore"]);
 
         let calls = RefCell::new(Vec::new());
         let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -4035,13 +3992,10 @@ mod tests {
             super::with_keyboard_enhancement(
                 || {
                     calls.borrow_mut().push("push");
-                    Ok(true)
+                    Ok(())
                 },
                 || calls.borrow_mut().push("pop"),
-                |available| -> () {
-                    assert!(available);
-                    panic!("loop panic")
-                },
+                || panic!("loop panic"),
             );
         }));
         assert!(panic.is_err());
@@ -4152,11 +4106,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |enabled| {
-                                    assert!(enabled);
+                                || {
                                     calls.borrow_mut().push("run");
                                     Ok::<(), super::TuiError>(())
                                 },
@@ -4202,10 +4155,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |_| {
+                                || {
                                     calls.borrow_mut().push("run");
                                     Err::<(), _>(super::TuiError::Terminal(
                                         "loop failed".to_owned(),
@@ -4253,10 +4206,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |_| -> Result<(), super::TuiError> {
+                                || -> Result<(), super::TuiError> {
                                     calls.borrow_mut().push("run");
                                     panic!("loop panic")
                                 },
@@ -4443,7 +4396,7 @@ mod tests {
             !disabled_screen
                 .lines()
                 .next()
-                .is_some_and(|header| header.contains("Shift-Enter newline"))
+                .is_some_and(|header| header.contains("Shift-Enter/Ctrl-J newline"))
         );
 
         set_prompt(&mut app, "saved prompt");
@@ -5795,7 +5748,7 @@ mod tests {
             normal_header
                 .lines()
                 .next()
-                .is_some_and(|header| !header.contains("Shift-Enter newline"))
+                .is_some_and(|header| header.contains("Shift-Enter/Ctrl-J newline"))
         );
 
         let three_rows = rendered(&mut app, 10, 3);
@@ -5809,7 +5762,7 @@ mod tests {
         let configuration_screen = rendered(&mut configuration, 80, 15);
         assert!(configuration_screen.starts_with("Configuration only:"));
         assert!(configuration_screen.contains("Startup configuration"));
-        assert!(!configuration_screen.contains("Shift-Enter newline"));
+        assert!(!configuration_screen.contains("Shift-Enter/Ctrl-J newline"));
         assert!(!configuration_screen.contains("> hidden"));
         assert!(!configuration_screen.contains('─'));
         assert_eq!(configuration.history_height, 14);
