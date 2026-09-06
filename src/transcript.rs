@@ -1507,14 +1507,27 @@ impl FooterLayout {
         let right = self.right_spans();
         let right_width = right.iter().map(Span::width).sum::<usize>();
         let identity_width = self.identity.as_ref().map_or(0, FooterField::width);
+        let seams = footer_seam_width(self.identity.is_some(), !right.is_empty());
         let mut spans = self
             .identity
             .as_ref()
             .map(|field| field.spans.clone())
             .unwrap_or_default();
-        spans.push(Span::raw("─".repeat(
-            width.saturating_sub(identity_width.saturating_add(right_width)),
-        )));
+        if self.identity.is_some() {
+            spans.push(Span::styled(" ", muted_page_style()));
+        }
+        spans.push(Span::raw(
+            "─".repeat(
+                width.saturating_sub(
+                    identity_width
+                        .saturating_add(right_width)
+                        .saturating_add(seams),
+                ),
+            ),
+        ));
+        if !right.is_empty() {
+            spans.push(Span::styled(" ", muted_page_style()));
+        }
         spans.extend(right);
         spans
     }
@@ -1574,15 +1587,19 @@ impl Footer {
                 preferred_identity
             } else {
                 let right_width = right_width(&statistics, model.as_ref());
-                if right_width > width {
-                    model = self.model.as_ref().and_then(|model| model.truncated(width));
+                let right_seam = footer_seam_width(false, right_width > 0);
+                if right_width.saturating_add(right_seam) > width {
+                    model = self
+                        .model
+                        .as_ref()
+                        .and_then(|model| model.truncated(width.saturating_sub(right_seam)));
                     None
                 } else {
                     self.identity.as_ref().and_then(|identity| {
                         identity.truncated(
                             width
                                 .saturating_sub(right_width)
-                                .saturating_sub(usize::from(right_width > 0)),
+                                .saturating_sub(footer_seam_width(true, right_width > 0)),
                         )
                     })
                 }
@@ -1608,12 +1625,15 @@ fn footer_fits(
     model: Option<&FooterField>,
 ) -> bool {
     let right_width = right_width(statistics, model);
-    identity.map_or(right_width, |identity| {
-        identity
-            .width()
-            .saturating_add(right_width)
-            .saturating_add(usize::from(right_width > 0))
-    }) <= width
+    identity
+        .map_or(0, FooterField::width)
+        .saturating_add(right_width)
+        .saturating_add(footer_seam_width(identity.is_some(), right_width > 0))
+        <= width
+}
+
+fn footer_seam_width(has_identity: bool, has_right: bool) -> usize {
+    usize::from(has_identity) + usize::from(has_right)
 }
 
 fn right_width(statistics: &[FooterField], model: Option<&FooterField>) -> usize {
@@ -3503,14 +3523,15 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line;
     use ratatui::widgets::{Paragraph, Widget, Wrap};
 
     use super::{
-        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, FooterContext,
-        FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter, NormalisedBlock,
-        RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
-        format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
-        own_styled_text, page_style, tool_call_label,
+        ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, Footer, FooterContext,
+        FooterField, FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter,
+        NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER,
+        assistant_text, format_footer_usd, format_token_count, markdown, muted_page_style,
+        normalise_terminal_text, own_styled_text, page_style, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -3717,6 +3738,16 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect()
         })
+    }
+
+    fn render_footer_rule(footer: Footer, width: u16) -> Line<'static> {
+        TranscriptLayout {
+            blocks: Vec::new(),
+            width,
+            total_height: 0,
+            footer: Some(footer),
+        }
+        .footer_rule(width)
     }
 
     fn layout_buffer(
@@ -5302,6 +5333,74 @@ truncated"
     }
 
     #[test]
+    fn footer_rule_separates_present_fields_and_reserves_empty_rule_seams() {
+        fn footer(identity: bool, right: bool) -> Footer {
+            Footer::new(
+                identity.then(|| FooterIdentity {
+                    cwd: Some("identity".to_owned()),
+                    name: None,
+                }),
+                right
+                    .then(|| FooterField::muted("model"))
+                    .into_iter()
+                    .collect(),
+                None,
+            )
+            .expect("footer")
+        }
+
+        for (identity, right, width, expected) in [
+            (true, true, 20, "─ identity ─ model ─"),
+            (true, false, 14, "─ identity ─ ─"),
+            (false, true, 11, "─ ─ model ─"),
+            (true, true, 19, "─ identity  model ─"),
+            (true, false, 13, "─ identity  ─"),
+            (false, true, 10, "─  model ─"),
+        ] {
+            let rule = render_footer_rule(footer(identity, right), width);
+            assert_eq!(rule.to_string(), expected);
+            assert_eq!(rule.width(), usize::from(width));
+        }
+    }
+
+    #[test]
+    fn footer_rule_accounts_for_seams_during_truncation_and_field_removal() {
+        let truncated = render_footer_rule(
+            Footer::new(
+                Some(FooterIdentity {
+                    cwd: Some("abc🦀".to_owned()),
+                    name: None,
+                }),
+                Vec::new(),
+                Some(ModelFooter {
+                    id: "m".to_owned(),
+                    thinking: "x".to_owned(),
+                }),
+            )
+            .expect("footer"),
+            23,
+        );
+        assert_eq!(truncated.to_string(), "─ …🦀  m • thinking x ─");
+        assert_eq!(truncated.width(), 23);
+
+        let prioritised = render_footer_rule(
+            Footer::new(
+                Some(FooterIdentity {
+                    cwd: Some("identity".to_owned()),
+                    name: None,
+                }),
+                vec![FooterField::muted("first"), FooterField::muted("last")],
+                None,
+            )
+            .expect("footer"),
+            19,
+        );
+        assert_eq!(prioritised.to_string(), "─ identity ─ last ─");
+        assert!(!prioritised.to_string().contains("first"));
+        assert_eq!(prioritised.width(), 19);
+    }
+
+    #[test]
     fn footer_adds_identity_and_preserves_model_thinking_under_pressure() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -5373,7 +5472,8 @@ truncated"
         let model_only = transcript
             .layout_with_footer(31, context.clone())
             .footer_rule(31);
-        assert_eq!(model_only.to_string(), "─ gpt-5.6-sol • thinking high ─");
+        assert_eq!(model_only.to_string(), "─  …t-5.6-sol • thinking high ─");
+        assert_eq!(model_only.width(), 31);
         for width in 0..=30 {
             let rule = transcript
                 .layout_with_footer(width, context.clone())
@@ -5424,7 +5524,7 @@ truncated"
 
         assert_eq!(
             footer,
-            "─ ~/…/kiki (Refactor auth)────$0.2829 80.0%/272k  gpt-5.6-sol • thinking high ─"
+            "─ ~/…/kiki (Refactor auth) ── $0.2829 80.0%/272k  gpt-5.6-sol • thinking high ─"
         );
     }
 
@@ -5729,7 +5829,7 @@ truncated"
 
         let narrow = transcript.layout(29).footer_rule(29);
         assert_eq!(narrow.width(), 29);
-        assert_eq!(narrow.to_string(), "─ ───────$0.2829 80.0%/272k ─");
+        assert_eq!(narrow.to_string(), "─ ────── $0.2829 80.0%/272k ─");
         assert_eq!(
             narrow
                 .spans

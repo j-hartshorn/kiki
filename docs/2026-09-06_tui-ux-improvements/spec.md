@@ -137,7 +137,7 @@ All commands must pass. Then run Kiki in Zed 1.18.1 with `TERM_PROGRAM=zed`, `TE
 
 **Tests** (`src/transcript.rs`, footer layout) — First fail on the full-width footer containing `identity ─` and `─ model`. At the owning footer seam, cover both-sided and each one-sided spacing, exact display width at normal and tiny widths, and retained truncation priority; update existing rendered expectations where required.
 
-**Files** — Modify: `src/transcript.rs`.
+**Files** — Modify: `src/transcript.rs`; update changed black-box expectations in `src/tui.rs` without changing TUI production logic.
 
 **Verification** — `cargo fmt --all -- --check && cargo test transcript::tests::footer -- --test-threads=1 && cargo check --all-targets` passes.
 
