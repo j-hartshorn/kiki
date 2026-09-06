@@ -73,6 +73,12 @@ enum AppMode {
     ConfigurationOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryPosition {
+    FollowingBottom,
+    Anchored(usize),
+}
+
 #[derive(Clone, Copy)]
 struct HistoryViewport {
     area: Rect,
@@ -148,7 +154,7 @@ struct App {
     prompt: PromptEditor,
     prompt_width: u16,
     transcript: Transcript,
-    scroll_from_bottom: usize,
+    history_position: HistoryPosition,
     history_height: usize,
     history_rows: usize,
     history_viewport: Option<HistoryViewport>,
@@ -181,7 +187,7 @@ impl Default for App {
             prompt: PromptEditor::default(),
             prompt_width: 80,
             transcript: Transcript::default(),
-            scroll_from_bottom: 0,
+            history_position: HistoryPosition::FollowingBottom,
             history_height: 0,
             history_rows: 0,
             history_viewport: None,
@@ -272,14 +278,8 @@ impl App {
         }
         let notice_cleared = self.clear_notice();
         let mut update = match mouse.kind {
-            MouseEventKind::ScrollUp => self.update_scroll(
-                self.scroll_from_bottom
-                    .saturating_add(MOUSE_WHEEL_SCROLL_ROWS),
-            ),
-            MouseEventKind::ScrollDown => self.update_scroll(
-                self.scroll_from_bottom
-                    .saturating_sub(MOUSE_WHEEL_SCROLL_ROWS),
-            ),
+            MouseEventKind::ScrollUp => self.scroll_older(MOUSE_WHEEL_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_newer(MOUSE_WHEEL_SCROLL_ROWS),
             MouseEventKind::Down(MouseButton::Left) => self.begin_selection(mouse, now),
             MouseEventKind::Drag(MouseButton::Left) => Update {
                 commands: Vec::new(),
@@ -787,7 +787,7 @@ impl App {
 
     fn begin_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
         let visible_changed = self.invalidate_selection();
-        let Some(position) = self.history_position(mouse.column, mouse.row) else {
+        let Some(position) = self.history_document_position(mouse.column, mouse.row) else {
             return Update {
                 commands: Vec::new(),
                 visible_changed,
@@ -812,7 +812,7 @@ impl App {
         let Some(viewport) = self.history_viewport else {
             return false;
         };
-        let Some(focus) = self.history_position(mouse.column, mouse.row) else {
+        let Some(focus) = self.history_document_position(mouse.column, mouse.row) else {
             if let Some(drag) = &mut self.drag {
                 drag.edge = None;
             }
@@ -879,18 +879,18 @@ impl App {
         if now < drag.next_tick {
             return false;
         }
-        let scroll = match edge {
-            Edge::Older => self.scroll_from_bottom.saturating_add(1),
-            Edge::Newer => self.scroll_from_bottom.saturating_sub(1),
+        let update = match edge {
+            Edge::Older => self.scroll_older(1),
+            Edge::Newer => self.scroll_newer(1),
         };
-        if !self.update_scroll(scroll).visible_changed {
+        if !update.visible_changed {
             if let Some(drag) = &mut self.drag {
                 drag.edge = None;
             }
             return false;
         }
         let focus = self
-            .history_position(drag.column, drag.row)
+            .history_document_position(drag.column, drag.row)
             .expect("drag position remains within history viewport");
         self.selection = Selection::from_inclusive_cells(drag.anchor, focus);
         if let Some(drag) = &mut self.drag {
@@ -916,13 +916,18 @@ impl App {
         true
     }
 
-    fn history_document_top(&self) -> usize {
-        self.history_rows
-            .saturating_sub(self.history_height)
-            .saturating_sub(self.scroll_from_bottom)
+    fn newest_history_top(&self) -> usize {
+        self.history_rows.saturating_sub(self.history_height)
     }
 
-    fn history_position(&self, column: u16, row: u16) -> Option<DocumentPosition> {
+    fn history_document_top(&self) -> usize {
+        match self.history_position {
+            HistoryPosition::FollowingBottom => self.newest_history_top(),
+            HistoryPosition::Anchored(top) => top,
+        }
+    }
+
+    fn history_document_position(&self, column: u16, row: u16) -> Option<DocumentPosition> {
         self.history_viewport?
             .position(column, row, self.history_document_top())
     }
@@ -979,25 +984,25 @@ impl App {
     }
 
     fn history_unavailable(&mut self) {
-        self.history_height = 0;
         self.history_viewport = None;
         self.invalidate_selection();
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<Update> {
         let editable = !self.is_submission_disabled();
-        let scroll = match key.code {
-            KeyCode::PageUp => Some(self.scroll_from_bottom.saturating_add(10)),
-            KeyCode::PageDown => Some(self.scroll_from_bottom.saturating_sub(10)),
+        match key.code {
+            KeyCode::PageUp => Some(self.scroll_older(10)),
+            KeyCode::PageDown => Some(self.scroll_newer(10)),
             KeyCode::Home if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(usize::MAX)
+                Some(self.scroll_oldest())
             }
-            KeyCode::End if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => Some(0),
-            KeyCode::Up if !editable => Some(self.scroll_from_bottom.saturating_add(1)),
-            KeyCode::Down if !editable => Some(self.scroll_from_bottom.saturating_sub(1)),
+            KeyCode::End if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(self.follow_history())
+            }
+            KeyCode::Up if !editable => Some(self.scroll_older(1)),
+            KeyCode::Down if !editable => Some(self.scroll_newer(1)),
             _ => None,
-        };
-        scroll.map(|scroll| self.update_scroll(scroll))
+        }
     }
 
     fn prompt_edit(&self, key: KeyEvent) -> Option<PromptEdit> {
@@ -1124,18 +1129,62 @@ impl App {
         }
     }
 
-    fn update_scroll(&mut self, scroll_from_bottom: usize) -> Update {
-        let hidden_lines = self.history_rows.saturating_sub(self.history_height);
-        let scroll_from_bottom = scroll_from_bottom.min(hidden_lines);
-        if self.scroll_from_bottom == scroll_from_bottom {
+    fn scroll_older(&mut self, rows: usize) -> Update {
+        if self.history_viewport.is_some() {
+            self.set_history_position(
+                self.history_position_at(self.history_document_top().saturating_sub(rows)),
+            )
+        } else {
+            Update::default()
+        }
+    }
+
+    fn scroll_newer(&mut self, rows: usize) -> Update {
+        if self.history_viewport.is_some() {
+            self.set_history_position(
+                self.history_position_at(self.history_document_top().saturating_add(rows)),
+            )
+        } else {
+            Update::default()
+        }
+    }
+
+    fn scroll_oldest(&mut self) -> Update {
+        if self.history_rows > self.history_height {
+            self.set_history_position(HistoryPosition::Anchored(0))
+        } else {
+            Update::default()
+        }
+    }
+
+    fn follow_history(&mut self) -> Update {
+        self.set_history_position(HistoryPosition::FollowingBottom)
+    }
+
+    fn history_position_at(&self, top: usize) -> HistoryPosition {
+        if top >= self.newest_history_top() {
+            HistoryPosition::FollowingBottom
+        } else {
+            HistoryPosition::Anchored(top)
+        }
+    }
+
+    fn set_history_position(&mut self, position: HistoryPosition) -> Update {
+        if self.history_position == position {
             Update::default()
         } else {
-            self.scroll_from_bottom = scroll_from_bottom;
+            self.history_position = position;
             Update {
                 commands: Vec::new(),
                 visible_changed: true,
                 quit: false,
             }
+        }
+    }
+
+    fn normalise_history_position(&mut self) {
+        if let HistoryPosition::Anchored(top) = self.history_position {
+            self.history_position = self.history_position_at(top);
         }
     }
 }
@@ -1681,10 +1730,9 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     }
     app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
-    let last_page_start = app.history_rows.saturating_sub(app.history_height);
-    app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-    let top = app.history_document_top();
     app.history_viewport = Some(HistoryViewport { area: viewport });
+    app.normalise_history_position();
+    let top = app.history_document_top();
     if let Some(selection) = app.selection_for_render() {
         layout.render_with_selection(viewport, top, Some(selection), frame.buffer_mut());
     } else {
@@ -1734,10 +1782,11 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect, content
     let lines = rows.into_iter().map(|row| {
         let text = format!("{} {}", row.token, row.purpose);
         let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
-        let style = row
-            .selected
-            .then(|| Style::new().add_modifier(Modifier::REVERSED))
-            .unwrap_or_default();
+        let style = if row.selected {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
         Line::styled(format!("{text}{}", " ".repeat(padding)), style)
     });
     frame.render_widget(Paragraph::new(Text::from_iter(lines)), overlay);
@@ -1909,7 +1958,7 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::Color;
 
-    use super::{App, TitlePublisher};
+    use super::{App, HistoryPosition, TitlePublisher};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -2027,6 +2076,13 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| super::render(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn history_top_row(screen: &str, viewport: super::HistoryViewport) -> &str {
+        screen
+            .lines()
+            .nth(usize::from(viewport.area.y))
+            .expect("history top row")
     }
 
     fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
@@ -2341,7 +2397,7 @@ mod tests {
             app.handle_event(delta);
             super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
         }
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         let mut key_samples = Vec::with_capacity(50);
         for ResponsivenessFrame { key, delta } in key_frames {
@@ -2352,7 +2408,7 @@ mod tests {
             key_samples.push(started.elapsed());
         }
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         let mut scroll_samples = Vec::with_capacity(50);
         for ResponsivenessFrame { key, delta } in scroll_frames {
             let started = Instant::now();
@@ -4135,22 +4191,19 @@ mod tests {
         rendered(&mut app, 8, 8);
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(
             app.handle_key(modified_key(KeyCode::Home, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(
             app.handle_key(modified_key(KeyCode::End, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -4173,16 +4226,20 @@ mod tests {
         });
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
         assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
         );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(app.handle_key(key(KeyCode::End)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -4316,7 +4373,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(redraws, 2);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(
             input
                 .timeouts
@@ -4891,7 +4948,7 @@ mod tests {
         assert!(!newest.contains("request 1"));
 
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
 
         app.handle_key(history_home());
         let oldest = rendered(&mut app, 40, 7);
@@ -4900,6 +4957,166 @@ mod tests {
 
         app.handle_key(history_end());
         assert!(rendered(&mut app, 40, 7).contains("request 8"));
+    }
+
+    #[test]
+    fn transcript_anchored_append_preserves_numeric_top_and_text() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 40, 7);
+        assert!(app.handle_key(history_home()).visible_changed);
+        let oldest = rendered(&mut app, 40, 7);
+        let viewport = app.history_viewport.expect("history viewport");
+        let request_row = app.history_document_top().saturating_add(
+            oldest
+                .lines()
+                .position(|row| row.contains("request 1"))
+                .expect("oldest request")
+                .saturating_sub(usize::from(viewport.area.y)),
+        );
+        assert!(app.scroll_newer(request_row).visible_changed);
+        let anchored = rendered(&mut app, 40, 7);
+        let top = app.history_document_top();
+        let top_row = history_top_row(&anchored, viewport);
+        assert_eq!(top_row.trim(), "request 1");
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(9),
+                record: Record::UserRequest {
+                    request: "request 9".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 40, 7);
+
+        assert_eq!(app.history_document_top(), top);
+        assert_eq!(history_top_row(&after_append, viewport), top_row);
+        assert!(!after_append.contains("request 9"));
+    }
+
+    #[test]
+    fn transcript_following_append_stays_following_bottom_and_shows_newest_row() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 40, 7);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(9),
+                record: Record::UserRequest {
+                    request: "request 9".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 40, 7);
+
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(app.history_document_top(), app.newest_history_top());
+        assert!(after_append.contains("request 9"));
+    }
+
+    #[test]
+    fn transcript_streamed_markdown_reflow_preserves_numeric_anchor() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: format!(
+                    "[mutable][id]\n{}",
+                    (0..10)
+                        .map(|row| format!("row {row}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            },
+        });
+        let full = rendered(&mut app, 20, 20);
+        let viewport = app.history_viewport.expect("history viewport");
+        let mutable_row = app.history_document_top().saturating_add(
+            full.lines()
+                .position(|row| row.contains("[mutable"))
+                .expect("unresolved link")
+                .saturating_sub(usize::from(viewport.area.y)),
+        );
+
+        rendered(&mut app, 20, 6);
+        assert!(
+            mutable_row < app.newest_history_top(),
+            "mutable row {mutable_row}, newest top {}",
+            app.newest_history_top()
+        );
+        assert!(
+            app.scroll_older(app.newest_history_top().saturating_sub(mutable_row))
+                .visible_changed
+        );
+        let before_reflow = rendered(&mut app, 20, 6);
+        let viewport = app.history_viewport.expect("history viewport");
+        assert_eq!(app.history_position, HistoryPosition::Anchored(mutable_row));
+        let top_row = history_top_row(&before_reflow, viewport);
+        assert!(top_row.contains("[mutable"), "{top_row}");
+
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "\n\n[id]: https://example.test".to_owned(),
+            },
+        });
+        let after_reflow = rendered(&mut app, 20, 6);
+
+        assert_eq!(app.history_position, HistoryPosition::Anchored(mutable_row));
+        assert_eq!(app.history_document_top(), mutable_row);
+        assert_ne!(history_top_row(&after_reflow, viewport), top_row);
+        assert!(history_top_row(&after_reflow, viewport).contains("mutable"));
+    }
+
+    #[test]
+    fn transcript_reflow_shrink_resumes_following_after_anchor_clamps() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "long live content ".repeat(40),
+            },
+        });
+        rendered(&mut app, 20, 6);
+        assert!(app.scroll_older(1).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "done".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered(&mut app, 20, 6);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::UserRequest {
+                    request: "followed tail".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 20, 6);
+
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(after_append.contains("followed tail"));
     }
 
     #[test]
@@ -4941,16 +5158,13 @@ mod tests {
 
         rendered(&mut app, 12, 5);
         assert!(app.history_rows > 2);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(app.handle_key(history_home()).visible_changed);
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(app.handle_key(history_end()).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -4969,9 +5183,10 @@ mod tests {
         }
         rendered(&mut app, 12, 5);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         let measured_rows = app.history_rows;
-        assert!(manual_scroll > 0);
+        let measured_height = app.history_height;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         for (width, height) in [(0, 0), (1, 2)] {
             let backend = TestBackend::new(width, height);
@@ -4980,20 +5195,25 @@ mod tests {
                 .draw(|frame| super::render(frame, &mut app))
                 .unwrap();
             assert_eq!(app.history_rows, measured_rows);
-            assert_eq!(app.scroll_from_bottom, manual_scroll);
+            assert_eq!(app.history_height, measured_height);
+            assert_eq!(app.history_position, position);
         }
 
+        assert!(!app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert_eq!(app.history_position, position);
+        assert!(app.handle_key(history_end()).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(history_home()).visible_changed);
+        assert_eq!(app.history_position, position);
+
         rendered(&mut app, 12, 5);
-        assert_eq!(app.scroll_from_bottom, manual_scroll);
+        assert_eq!(app.history_position, position);
         rendered(&mut app, 120, 5);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
-    fn transcript_scrolling_clamps_after_authoritative_replacement() {
+    fn transcript_scrolling_preserves_oldest_anchor_after_authoritative_replacement() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -5005,8 +5225,7 @@ mod tests {
         });
         rendered(&mut app, 20, 6);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
-        assert!(manual_scroll > 0);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
 
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -5022,18 +5241,9 @@ mod tests {
         });
         rendered(&mut app, 20, 6);
 
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
-        assert!(app.scroll_from_bottom < manual_scroll);
-        let replacement_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         rendered(&mut app, 120, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
-        assert!(app.scroll_from_bottom <= replacement_scroll);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
     }
 
     #[test]
@@ -5169,10 +5379,16 @@ mod tests {
         );
         assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
         assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 1);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
+        );
         rendered_buffer(&mut app, 40, 7);
         assert!(app.tick(now + Duration::from_millis(100)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 2);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(2))
+        );
         rendered_buffer(&mut app, 40, 7);
 
         app.handle_mouse(
@@ -5500,7 +5716,8 @@ mod tests {
     fn edge_drag_scrolls_newer_and_stops_at_history_bounds() {
         let mut newer = app_with_history(App::default());
         rendered_buffer(&mut newer, 40, 7);
-        assert!(newer.update_scroll(usize::MAX).visible_changed);
+        assert!(newer.handle_key(history_home()).visible_changed);
+        assert_eq!(newer.history_position, HistoryPosition::Anchored(0));
         let visible = rendered_buffer(&mut newer, 40, 7);
         let (column, row) = cell_start(&visible, "request 1");
         let viewport = newer.history_viewport.expect("history viewport");
@@ -5517,9 +5734,8 @@ mod tests {
             ),
             now,
         );
-        let before = newer.scroll_from_bottom;
         assert!(newer.tick(now + super::POLL_INTERVAL).visible_changed);
-        assert_eq!(newer.scroll_from_bottom, before - 1);
+        assert_eq!(newer.history_position, HistoryPosition::Anchored(1));
 
         let mut older = app_with_history(App::default());
         let visible = rendered_buffer(&mut older, 40, 7);
@@ -5541,10 +5757,7 @@ mod tests {
         for cadence in 1..=older.history_rows {
             let _ = older.tick(now + super::POLL_INTERVAL * u32::try_from(cadence).unwrap());
         }
-        assert_eq!(
-            older.scroll_from_bottom,
-            older.history_rows.saturating_sub(older.history_height)
-        );
+        assert_eq!(older.history_position, HistoryPosition::Anchored(0));
         assert!(older.drag.is_some_and(|drag| drag.edge.is_none()));
         assert!(
             !older
@@ -5614,7 +5827,10 @@ mod tests {
 
         let redraws = run_transcript_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+        );
         assert_eq!(redraws, 2);
     }
 
@@ -5622,13 +5838,13 @@ mod tests {
     fn mouse_wheel_scrolls_transcript_towards_newest_history() {
         let mut app = app_with_history(App::default());
         rendered(&mut app, 40, 7);
-        assert!(app.update_scroll(3).visible_changed);
+        assert!(app.scroll_older(3).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
         run_transcript_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -5643,7 +5859,10 @@ mod tests {
 
         let redraws = run_configuration_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+        );
         assert_eq!(redraws, 2);
     }
 
@@ -5652,13 +5871,13 @@ mod tests {
         let mut app =
             app_with_history(App::configuration(crate::config::ready_snapshot_for_test()));
         rendered(&mut app, 40, 7);
-        assert!(app.update_scroll(3).visible_changed);
+        assert!(app.scroll_older(3).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
         run_configuration_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -6211,28 +6430,25 @@ mod tests {
         }
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         set_prompt(&mut app, &"a".repeat(19));
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         set_prompt(&mut app, "");
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         set_prompt(&mut app, &"a".repeat(19));
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
-        let manual_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, position);
 
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(9) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -6245,25 +6461,18 @@ mod tests {
         });
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         set_prompt(&mut app, "");
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
-        let cached_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, position);
         let backend = TestBackend::new(0, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| super::render(frame, &mut app))
             .unwrap();
-        assert_eq!(app.scroll_from_bottom, cached_scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6523,7 +6732,7 @@ mod tests {
         }
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(5) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -6536,11 +6745,11 @@ mod tests {
         });
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
-        assert!(manual_scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
                 run_id: RunId(5),
@@ -6555,10 +6764,7 @@ mod tests {
         });
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6569,17 +6775,17 @@ mod tests {
         }
         rendered(&mut app, 20, 5);
         app.handle_key(history_home());
-        let scroll = app.scroll_from_bottom;
-        assert!(scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         rendered(&mut app, 20, 0);
-        assert_eq!(app.scroll_from_bottom, scroll);
+        assert_eq!(app.history_position, position);
         let backend = TestBackend::new(0, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| super::render(frame, &mut app))
             .unwrap();
-        assert_eq!(app.scroll_from_bottom, scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6651,7 +6857,7 @@ mod tests {
             app.handle_event(completed_record(1, step, &format!("line_{step}"), vec![]));
         }
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(2),
@@ -6661,13 +6867,13 @@ mod tests {
             },
         });
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         app.handle_event(completed_record(2, 5, "settled", vec![]));
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, manual_scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6836,7 +7042,7 @@ mod tests {
     }
 
     #[test]
-    fn controls_redraw_only_when_visible_and_clamp_scroll_after_height_reductions() {
+    fn controls_redraw_only_when_visible_and_preserve_oldest_anchor_after_height_reductions() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -6863,38 +7069,32 @@ mod tests {
             progress_gap: false,
         });
         rendered(&mut app, 20, 6);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(history_home()).visible_changed);
-        let expanded_scroll = app.scroll_from_bottom;
-        assert!(expanded_scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            expanded_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         rendered(&mut app, 20, 6);
         app.handle_key(history_home());
-        let reasoning_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            reasoning_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6954,7 +7154,7 @@ mod tests {
         ));
         rendered(&mut app, 20, 5);
         app.handle_key(history_home());
-        let scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         for (width, height) in [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (3, 3)] {
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
             let backend = TestBackend::new(width, height);
@@ -6963,7 +7163,7 @@ mod tests {
                 .draw(|frame| super::render(frame, &mut app))
                 .unwrap();
             if width == 0 {
-                assert_eq!(app.scroll_from_bottom, scroll);
+                assert_eq!(app.history_position, position);
             }
         }
     }
