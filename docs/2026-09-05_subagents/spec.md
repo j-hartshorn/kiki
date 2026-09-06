@@ -29,7 +29,7 @@ Delegation remains inspectable without embedding child activity inside Python-ru
 
 ## Key discoveries
 
-References describe prerequisite commit `64d8262`, inspected on 2026-09-05 and included in this planning branch. It is not yet on `main` (`4dc120d` at review time). Its [model-selector spec](../2026-09-05_interactive-model-thinking-settings/spec.md) is the assumed implementation baseline; refresh references against its final accepted result when it lands, without duplicating its work.
+References describe the accepted model/thinking prerequisite merged to `main` by `1d20e16` and inspected again on 2026-09-05 after this branch was rebased. Its [model-selector spec](../2026-09-05_interactive-model-thinking-settings/spec.md) and landed implementation are the implementation baseline; extend rather than duplicate that work.
 
 - Checkpoints are cloneable, include whole-file freshness fingerprints, and update after completed arena executions. A host call during an execution still has the earlier committed checkpoint available (`src/arena.rs:53`, `src/arena.rs:540`, `src/arena.rs:597`).
 - Restoring a suspended checkpoint preserves its continuation, not an independent idle environment; Kiki rejects that state as an ordinary arena restore (`src/arena.rs:664`). Monty's typed worker interface supplies no supported suspended-to-idle fork ([Monty checkout](https://github.com/pydantic/monty/blob/70fe3f5781381eb33579e45046f8cb3845953373/crates/monty-pool/src/checkout.rs#L336)).
@@ -37,9 +37,9 @@ References describe prerequisite commit `64d8262`, inspected on 2026-09-05 and i
 - Kiki already generates Python wrappers and record construction from neutral host values. Incoming values are limited to scalars, lists, and string-keyed dictionaries (`src/tools.rs:346`, `src/tools.rs:566`, `src/arena.rs:1172`).
 - The five-minute arena deadline currently includes every host wait. Each arena owns a one-worker pool, and Kiki dispatches gathered calls at `ResolveFutures` before resuming with all batch results (`src/arena.rs:488`, `src/arena.rs:540`, `src/arena.rs:1008`).
 - Tool exposure is static and `ToolHost` has no per-agent permission policy. Copied wrappers cannot determine authority (`src/tools.rs:521`, `src/tools.rs:922`, `src/tools.rs:1639`).
-- The runtime owns one foreground run and stops polling workers while idle. Its records and events have no child identity (`src/runtime.rs:19`, `src/runtime.rs:81`, `src/runtime.rs:336`).
-- The prerequisite provides qualified models, per-step immutable selections, layered TOML, mixed-model cost summation, and footer formatting (`src/config/models.rs:40`, `src/config/settings.rs:46`, `src/openai.rs:710`, `src/pricing.rs:143`). However, successful `ModelStep` results do not carry selection provenance, and remembered per-model thinking currently lives in the TUI (`src/model.rs:26`, `src/tui.rs:557`).
-- Settled history is cached separately from the live foreground tail; footer context/cache-hit currently use the latest root attempt (`src/transcript.rs:2266`, `src/transcript.rs:2391`, `src/transcript.rs:3204`).
+- The runtime owns one foreground run and stops polling workers while idle. Its records and events have no child identity (`src/runtime.rs:19`, `src/runtime.rs:83`, `src/runtime.rs:336`).
+- The prerequisite provides qualified models, per-step immutable selections, layered TOML, mixed-model cost summation, and footer formatting (`src/config/models.rs:40`, `src/config/settings.rs:46`, `src/openai.rs:710`, `src/pricing.rs:143`). However, successful `ModelStep` results do not carry selection provenance, and remembered per-model thinking currently lives in TUI state (`src/model.rs:26`, `src/tui.rs:164`, `src/tui.rs:625`).
+- Settled history is cached separately from the live foreground tail; footer context/cache-hit currently use the latest root attempt (`src/transcript.rs:2265`, `src/transcript.rs:2390`, `src/transcript.rs:3203`).
 
 ## Proposed approach
 
@@ -200,11 +200,11 @@ On small terminals, remove padding and reduce visible entries while preserving t
 - Active limits do not cap accumulated session records/results. Release settled execution resources; retained results remain subject to existing interpreter/transport constraints and can grow with session length.
 - Child selection must come from actual step provenance despite concurrent settings updates and missing usage.
 - Sticky geometry, Unicode truncation, and per-second updates must preserve prompt editing, scrolling, selection safety, and settled-history caching.
-- This planning branch includes the committed prerequisite baseline, but `main` does not yet include it. Independent review may still change that work; refresh against the accepted prerequisite before implementation rather than duplicating or reverting it.
+- The prerequisite now owns configured two- and three-row terminal fallbacks which retain the footer while omitting prompt/history. Sticky-list layout must preserve those accepted fallbacks rather than treating their rows as available monitor space (`src/tui.rs:1564`).
 
 ## Dependencies
 
-- [Interactive model, thinking, and session settings](../2026-09-05_interactive-model-thinking-settings/spec.md), landing first. Its catalogue, selections, TOML, pricing, formatting, selectors, and footer are the implementation baseline.
+- [Interactive model, thinking, and session settings](../2026-09-05_interactive-model-thinking-settings/spec.md), merged to `main` by `1d20e16`. Its catalogue, selections, TOML, pricing, formatting, selectors, and footer are the implementation baseline.
 - Existing Agent/Arena/tool execution and exact Monty `0.0.21` worker. No Monty dependency/protocol change.
 - [TUI responsiveness](../2026-09-03_tui-responsiveness/spec.md) and [history text selection](../2026-09-02_history-text-selection/spec.md); preserve their rendering and geometry guarantees.
 - [Default agent tools](../2026-09-01_default-agent-tools/spec.md) for host effects, authorisations, and Python composition; [Vision](../VISION.md#L98) for delegation intent. Whole-checkpoint inheritance intentionally widens Vision's transferable-data-only initial direction, without widening returned values.
@@ -222,7 +222,7 @@ On small terminals, remove padding and reduce visible entries while preserving t
 
 ### Overall validation
 
-Run from the implementation worktree after the prerequisite has landed. Isolate user settings without hiding the installed Rust toolchain. Use this shell for the focused commands below and the full suite:
+Run from this rebased implementation worktree. Isolate user settings without hiding the installed Rust toolchain. Use this shell for the focused commands below and the full suite:
 
 ```sh
 test_home="$(mktemp -d)"
@@ -249,13 +249,14 @@ Manual acceptance, after deterministic verification: start two children using di
 
 ### Planning context
 
-- Extend strict TOML validation and targeted-save preservation rather than creating another loader (`src/config/settings.rs:46`, `src/config/settings.rs:498`). Do not read the other worktree's uncommitted changes as an implementation contract.
-- `ModelStep` lacks selection provenance; OpenAI already captures it once at step start. `ModelUsage` is not a reliable substitute (`src/model.rs:26`, `src/openai.rs:710`). Runtime acceptance can remember per-model choices without publishing TUI previews (`src/runtime.rs:436`, `src/tui.rs:557`).
-- Agent final messages are staged and its successful-code attempts are recorded separately. Reuse that admission/accounting logic for children rather than inventing a second model loop or counting cumulative terminal attempts again (`src/agent.rs:440`, `src/agent.rs:477`, `src/runtime.rs:623`).
+- Extend strict TOML validation and targeted-save preservation rather than creating another loader (`src/config/settings.rs:46`, `src/config/settings.rs:472`, `src/config/settings.rs:686`). Settings diagnostics use `StartupProblemKind` from `src/config.rs:40`.
+- `ModelStep` lacks selection provenance; OpenAI already captures selection once at step start. `ModelUsage` is not a reliable substitute (`src/model.rs:26`, `src/openai.rs:710`). Accepted per-model thinking is currently remembered by the TUI when it sends settings (`src/tui.rs:164`, `src/tui.rs:625`), while runtime acceptance only updates the watch and acknowledges a revision (`src/runtime.rs:439`). Move the authoritative remembered values to trusted runtime state without publishing uncommitted TUI previews.
+- The resolved `SettingsContext` lives on `StartupSnapshot`, while `ReadyStartup` supplies the provider's initial model/thinking (`src/config.rs:191`, `src/config.rs:313`). Preserve that split when making persisted fallback choices available to child admission.
+- Agent final messages are staged and attempt evidence is admitted through runtime settlement. Reuse that admission/accounting logic for children rather than inventing a second model loop or counting cumulative terminal attempts again (`src/agent.rs:440`, `src/agent.rs:477`, `src/runtime.rs:665`).
 - Keep Monty imports in `src/arena.rs`, OpenAI imports in `src/openai.rs`, and filesystem-specific imports in `src/tools.rs`/the existing command adapter. Subagent policy uses neutral values and injected execution, not foreign runtime types.
 - Existing generated tool defaults/types need boolean and task-wrapper support; private names are independently reachable and must receive the same checks (`src/tools.rs:203`, `src/tools.rs:277`, `src/tools.rs:566`, `src/arena.rs:884`).
 - The controller's idle branch currently waits only for commands; session-owned children need servicing there and during foreground work (`src/runtime.rs:336`).
-- Extend existing inline module tests, scripted models, read/command gates, injected TUI time, and cache construction counters. Test through the same host/arena/runtime seams used by callers, not duplicate implementations inside fixtures (`src/arena.rs:2238`, `src/arena.rs:4604`, `src/runtime.rs:1297`, `src/transcript.rs:4249`, `src/tui.rs:6023`).
+- Extend existing inline module tests, scripted models, read/command gates, injected TUI time, and cache construction counters. Test through the same host/arena/runtime seams used by callers, not duplicate implementations inside fixtures (`src/arena.rs:2238`, `src/arena.rs:4604`, `src/runtime.rs:1297`, `src/transcript.rs:2364`, `src/transcript.rs:4248`, `src/tui.rs:2300`).
 
 ### Task 1: Resolve subagent admission settings
 
@@ -273,7 +274,7 @@ Manual acceptance, after deterministic verification: start two children using di
 
 **Tests** (`src/openai.rs`, adapter; `src/model.rs` and `src/agent.rs`, provenance; `src/runtime.rs`, accepted selection) — First red: settings change during a gated code-producing step, but its delegation provenance remains the original pair despite unavailable usage. Cover immutable retries, target-model remembered/persisted/default fallback, uncommitted previews excluded, grandchildren's caller selection, and independent fixed versus foreground model receivers.
 
-**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/agent.rs`, `src/runtime.rs`, `src/main.rs`.
+**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/agent.rs`, `src/runtime.rs`, `src/tui.rs`, `src/main.rs`.
 
 **Verification** — `cargo test model::tests && cargo test openai::tests && cargo test agent::tests -- --test-threads=1 && cargo test runtime::tests -- --test-threads=1 && cargo check --all-targets` passes.
 
@@ -349,9 +350,9 @@ Manual acceptance, after deterministic verification: start two children using di
 
 ### Task 10: Add the compact monitor and two-stage Escape
 
-**Changes** — Add a small TUI-owned sticky-list projection over authoritative child observations, without owning tasks or creating a second accounting source. Apply the exact two-row format, qualified IDs, elapsed display, six-cell gutters, active-first overflow, completed retention, and small-terminal fallbacks. Wire foreground-then-background Escape, including rapid presses and picker precedence. Reuse the existing footer numeric formatting and injected-time seam.
+**Changes** — Add a small TUI-owned sticky-list projection over authoritative child observations, without owning tasks or creating a second accounting source. Apply the exact two-row format, qualified IDs, elapsed display, six-cell gutters, active-first overflow, completed retention, and small-terminal fallbacks. Preserve the prerequisite's configured `height <= 3` footer-only rendering; those rows do not host the monitor. Wire foreground-then-background Escape, including rapid presses and picker precedence. Reuse the existing footer numeric formatting and injected-time seam.
 
-**Tests** (`src/tui/subagents.rs`, layout/time projection; `src/tui.rs`, input and geometry integration) — First red: a two-row child entry renders immediately above the prompt with exactly six cells of left/right prompt space. Cover width-filling ellipsis, graphemes/wide characters, model namespace, step/retry counts, cost formatting/unknown usage, whole-second redraw boundaries, elapsed freeze, four-entry limit/overflow/ordering, no sticky expansion, terminal entries across idle/slash/busy/rejected actions and accepted requests, active children surviving reset, growing prompts, tiny dimensions, history scroll/selection geometry, foreground-disabled control, rapid Esc Esc, and selector Escape without cancellation. Prove timer ticks with no visible active runtime cause no redraw or settled-history rebuilding.
+**Tests** (`src/tui/subagents.rs`, layout/time projection; `src/tui.rs`, input and geometry integration) — First red: where prompt rendering is available, a two-row child entry renders immediately above it with exactly six cells of left/right prompt space. Cover width-filling ellipsis, graphemes/wide characters, model namespace, step/retry counts, cost formatting/unknown usage, whole-second redraw boundaries, elapsed freeze, four-entry limit/overflow/ordering, no sticky expansion, terminal entries across idle/slash/busy/rejected actions and accepted requests, active children surviving reset, growing prompts, tiny dimensions including unchanged configured two-/three-row footer-only views, history scroll/selection geometry, foreground-disabled control, rapid Esc Esc, and selector Escape without cancellation. Prove timer ticks with no visible active runtime cause no redraw or settled-history rebuilding.
 
 **Files** — Create: `src/tui/subagents.rs`. Modify: `src/tui.rs`, `src/transcript.rs`.
 
@@ -359,7 +360,7 @@ Manual acceptance, after deterministic verification: start two children using di
 
 ### Task 11: Verify and document the complete delegation workflow
 
-**Changes** — Add the cross-request integration scenario and user/tool documentation tying together the approved contracts. Keep tests focused on composition not duplicating lower-level matrices. Document configuration, known-ID recovery, pre-execution handoff, shared files, frozen selection, status staleness, Escape escalation, output limits/failures, and the independent meanings of history expansion and sticky retention.
+**Changes** — Add the cross-request integration scenario and user/tool documentation tying together the approved contracts. Keep tests focused on composition not duplicating lower-level matrices. Extend README's existing model/thinking settings section with subagent configuration rather than restating prerequisite setup. Document known-ID recovery, pre-execution handoff, shared files, frozen selection, status staleness, Escape escalation, output limits/failures, and the independent meanings of history expansion and sticky retention.
 
 **Tests** (`src/runtime.rs`, scripted end-to-end integration; `src/prompt.rs`, guidance regression) — First red: one deterministic scenario starts mixed-model children, receives a foreground reply, changes foreground model, submits a clarification, retrieves an existing child by ID, collects values, and cancels another subtree while retaining correct history and session totals. Include one readonly descendant and a controlled failure; assert no escaped workers and no child data in root model context except deliberately inspected output. Lower-level timing/rendering boundaries remain owned by Tasks 3–10.
 
