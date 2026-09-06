@@ -427,7 +427,7 @@ fn byte_at_column(text: &str, row: &VisualRow, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
+    use super::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor, PromptLayout};
 
     fn from_text(text: &str) -> PromptEditor {
         let mut editor = PromptEditor::default();
@@ -440,6 +440,18 @@ mod tests {
             assert!(editor.apply(edit, 80));
         }
         editor
+    }
+
+    fn row_texts(layout: &PromptLayout) -> Vec<&str> {
+        layout.rows().iter().map(|row| row.text()).collect()
+    }
+
+    fn rows_with_sources(layout: &PromptLayout) -> Vec<(&str, std::ops::Range<usize>)> {
+        layout
+            .rows()
+            .iter()
+            .map(|row| (row.text(), row.source()))
+            .collect()
     }
 
     #[test]
@@ -564,15 +576,8 @@ mod tests {
     #[test]
     fn moves_vertically_through_hard_wrapped_and_explicit_rows() {
         let mut editor = from_text("ab日本\n🙂cdef");
-        assert_eq!(
-            editor
-                .layout(4, 10)
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["ab日", "本", "🙂cd", "ef"]
-        );
+        let layout = editor.layout(4, 10);
+        assert_eq!(row_texts(&layout), ["ab日", "本", "🙂cd", "ef"]);
         assert_eq!(editor.layout(4, 10).cursor(), Some((3, 2)));
         assert!(editor.apply(PromptEdit::Up, 4));
         assert_eq!(editor.layout(4, 10).cursor(), Some((2, 2)));
@@ -590,27 +595,13 @@ mod tests {
     fn preserves_explicit_empty_and_trailing_rows_and_exposes_full_row_end() {
         let mut editor = from_text("a\n\nb\n");
         let layout = editor.layout(4, 10);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["a", "", "b", ""]
-        );
+        assert_eq!(row_texts(&layout), ["a", "", "b", ""]);
         assert_eq!(layout.rows().len(), 4);
         assert_eq!(layout.cursor(), Some((3, 0)));
 
         let mut editor = from_text("abcd");
         let layout = editor.layout(4, 10);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["abcd", ""]
-        );
+        assert_eq!(row_texts(&layout), ["abcd", ""]);
         assert_eq!(layout.cursor(), Some((1, 0)));
 
         let mut editor = from_text("abcd\nx");
@@ -624,38 +615,17 @@ mod tests {
     fn keeps_the_tail_and_moved_caret_visible_in_its_viewport() {
         let mut editor = from_text("abcdefghij");
         let layout = editor.layout(3, 2);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["ghi", "j"]
-        );
+        assert_eq!(row_texts(&layout), ["ghi", "j"]);
         assert_eq!(layout.cursor(), Some((1, 1)));
 
         assert!(editor.apply(PromptEdit::Up, 3));
         let layout = editor.layout(3, 2);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["ghi", "j"]
-        );
+        assert_eq!(row_texts(&layout), ["ghi", "j"]);
         assert_eq!(layout.cursor(), Some((0, 1)));
 
         assert!(editor.apply(PromptEdit::Up, 3));
         let layout = editor.layout(3, 2);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| row.text())
-                .collect::<Vec<_>>(),
-            ["def", "ghi"]
-        );
+        assert_eq!(row_texts(&layout), ["def", "ghi"]);
         assert_eq!(layout.cursor(), Some((0, 1)));
     }
 
@@ -665,11 +635,7 @@ mod tests {
 
         let layout = editor.layout(3, 6);
         assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| (row.text(), row.source()))
-                .collect::<Vec<_>>(),
+            rows_with_sources(&layout),
             [
                 ("ab", 0..2),
                 ("界c", 2..6),
@@ -681,25 +647,11 @@ mod tests {
         );
 
         let layout = editor.layout(3, 2);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| (row.text(), row.source()))
-                .collect::<Vec<_>>(),
-            [("xyz", 9..12), ("", 13..13)]
-        );
+        assert_eq!(rows_with_sources(&layout), [("xyz", 9..12), ("", 13..13)]);
 
         assert!(editor.apply(PromptEdit::PromptStart, 3));
         let layout = editor.layout(3, 2);
-        assert_eq!(
-            layout
-                .rows()
-                .iter()
-                .map(|row| (row.text(), row.source()))
-                .collect::<Vec<_>>(),
-            [("ab", 0..2), ("界c", 2..6)]
-        );
+        assert_eq!(rows_with_sources(&layout), [("ab", 0..2), ("界c", 2..6)]);
     }
 
     #[test]

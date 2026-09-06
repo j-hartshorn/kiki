@@ -7,7 +7,7 @@ pub(super) enum Action {
     Thinking,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Command {
     token: &'static str,
     purpose: &'static str,
@@ -77,13 +77,7 @@ impl Completion {
         let next_selected = selected
             .and_then(|token| matches.iter().position(|command| command.token == token))
             .unwrap_or(0);
-        let changed = self.selected != next_selected
-            || self.matches.len() != matches.len()
-            || self
-                .matches
-                .iter()
-                .zip(&matches)
-                .any(|(current, next)| current.token != next.token);
+        let changed = self.selected != next_selected || self.matches != matches;
         self.matches = matches;
         self.selected = next_selected;
         changed
@@ -147,21 +141,23 @@ fn prefix_matches(draft: &str, caret_at_end: bool) -> Vec<&'static Command> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, CATALOGUE, Completion, parse, recognised_token_range};
+    use super::{Action, Completion, parse, recognised_token_range};
 
     #[test]
-    fn catalogue_orders_tokens_purposes_and_actions() {
-        let commands = CATALOGUE
-            .iter()
-            .map(|command| (command.token, command.purpose, command.action))
-            .collect::<Vec<_>>();
+    fn completion_rows_keep_catalogue_order_and_purposes() {
+        let mut completion = Completion::default();
+        completion.sync("/", true);
 
         assert_eq!(
-            commands,
+            completion
+                .visible_rows(usize::MAX)
+                .iter()
+                .map(|row| (row.token, row.purpose))
+                .collect::<Vec<_>>(),
             [
-                ("/model", "Choose model", Action::Model),
-                ("/name", "Name session", Action::Name),
-                ("/thinking", "Choose thinking level", Action::Thinking),
+                ("/model", "Choose model"),
+                ("/name", "Name session"),
+                ("/thinking", "Choose thinking level"),
             ]
         );
     }

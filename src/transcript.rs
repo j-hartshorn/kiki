@@ -5334,79 +5334,33 @@ truncated"
 
     #[test]
     fn footer_rule_separates_present_fields_and_reserves_empty_rule_seams() {
-        let both = render_footer_rule(
+        fn footer(identity: bool, right: bool) -> Footer {
             Footer::new(
-                Some(FooterIdentity {
+                identity.then(|| FooterIdentity {
                     cwd: Some("identity".to_owned()),
                     name: None,
                 }),
-                vec![FooterField::muted("model")],
+                right
+                    .then(|| FooterField::muted("model"))
+                    .into_iter()
+                    .collect(),
                 None,
             )
-            .expect("footer"),
-            20,
-        );
-        assert_eq!(both.to_string(), "─ identity ─ model ─");
-        assert_eq!(both.width(), 20);
+            .expect("footer")
+        }
 
-        let identity_only = render_footer_rule(
-            Footer::new(
-                Some(FooterIdentity {
-                    cwd: Some("identity".to_owned()),
-                    name: None,
-                }),
-                Vec::new(),
-                None,
-            )
-            .expect("footer"),
-            14,
-        );
-        assert_eq!(identity_only.to_string(), "─ identity ─ ─");
-        assert_eq!(identity_only.width(), 14);
-
-        let right_only = render_footer_rule(
-            Footer::new(None, vec![FooterField::muted("model")], None).expect("footer"),
-            11,
-        );
-        assert_eq!(right_only.to_string(), "─ ─ model ─");
-        assert_eq!(right_only.width(), 11);
-
-        let both_at_zero_fill = render_footer_rule(
-            Footer::new(
-                Some(FooterIdentity {
-                    cwd: Some("identity".to_owned()),
-                    name: None,
-                }),
-                vec![FooterField::muted("model")],
-                None,
-            )
-            .expect("footer"),
-            19,
-        );
-        assert_eq!(both_at_zero_fill.to_string(), "─ identity  model ─");
-        assert_eq!(both_at_zero_fill.width(), 19);
-
-        let identity_at_zero_fill = render_footer_rule(
-            Footer::new(
-                Some(FooterIdentity {
-                    cwd: Some("identity".to_owned()),
-                    name: None,
-                }),
-                Vec::new(),
-                None,
-            )
-            .expect("footer"),
-            13,
-        );
-        assert_eq!(identity_at_zero_fill.to_string(), "─ identity  ─");
-        assert_eq!(identity_at_zero_fill.width(), 13);
-
-        let right_at_zero_fill = render_footer_rule(
-            Footer::new(None, vec![FooterField::muted("model")], None).expect("footer"),
-            10,
-        );
-        assert_eq!(right_at_zero_fill.to_string(), "─  model ─");
-        assert_eq!(right_at_zero_fill.width(), 10);
+        for (identity, right, width, expected) in [
+            (true, true, 20, "─ identity ─ model ─"),
+            (true, false, 14, "─ identity ─ ─"),
+            (false, true, 11, "─ ─ model ─"),
+            (true, true, 19, "─ identity  model ─"),
+            (true, false, 13, "─ identity  ─"),
+            (false, true, 10, "─  model ─"),
+        ] {
+            let rule = render_footer_rule(footer(identity, right), width);
+            assert_eq!(rule.to_string(), expected);
+            assert_eq!(rule.width(), usize::from(width));
+        }
     }
 
     #[test]

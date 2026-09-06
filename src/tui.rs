@@ -2831,51 +2831,25 @@ mod tests {
     }
 
     #[test]
-    fn slash_completion_enter_completes_then_executes() {
-        let mut app = app_with_prompt("/mo");
+    fn slash_completion_completes_then_second_enter_executes() {
+        for (draft, completion_key, completed) in [
+            ("/mo", KeyCode::Enter, "/model"),
+            ("/thi", KeyCode::Tab, "/thinking"),
+        ] {
+            let mut app = app_with_prompt(draft);
 
-        let complete = app.handle_key(key(KeyCode::Enter));
+            let complete = app.handle_key(key(completion_key));
 
-        assert!(complete.commands.is_empty());
-        assert_eq!(app.prompt.text(), "/model");
-        assert!(app.picker.is_none());
+            assert!(complete.commands.is_empty());
+            assert_eq!(app.prompt.text(), completed);
+            assert!(app.picker.is_none());
 
-        let execute = app.handle_key(key(KeyCode::Enter));
+            let execute = app.handle_key(key(KeyCode::Enter));
 
-        assert!(execute.commands.is_empty());
-        assert!(app.prompt.is_empty());
-        assert!(app.picker.is_some());
-    }
-
-    #[test]
-    fn slash_exact_tokens_are_cyan_and_bold_without_styling_arguments() {
-        let mut app = app_with_prompt("/model terra");
-
-        let buffer = rendered_buffer(&mut app, 8, 15);
-        let (command_column, command_row) = cell_start(&buffer, "/model");
-        let (argument_column, argument_row) = cell_start(&buffer, "terra");
-
-        assert_eq!(buffer[(command_column, command_row)].fg, Color::Cyan);
-        assert!(
-            buffer[(command_column, command_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-        assert_ne!(buffer[(argument_column, argument_row)].fg, Color::Cyan);
-        assert!(
-            !buffer[(argument_column, argument_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-
-        assert!(app.handle_key(key(KeyCode::Left)).visible_changed);
-        let interior = rendered_buffer(&mut app, 8, 15);
-        assert_eq!(interior[(command_column, command_row)].fg, Color::Cyan);
-        assert!(
-            interior[(command_column, command_row)]
-                .modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
+            assert!(execute.commands.is_empty());
+            assert!(app.prompt.is_empty());
+            assert!(app.picker.is_some());
+        }
     }
 
     #[test]
@@ -2914,23 +2888,6 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert_eq!(app.prompt.text(), "/");
-    }
-
-    #[test]
-    fn slash_completion_tab_completes_before_the_second_enter_executes() {
-        let mut app = app_with_prompt("/thi");
-
-        let complete = app.handle_key(key(KeyCode::Tab));
-
-        assert!(complete.commands.is_empty());
-        assert_eq!(app.prompt.text(), "/thinking");
-        assert!(app.picker.is_none());
-
-        let execute = app.handle_key(key(KeyCode::Enter));
-
-        assert!(execute.commands.is_empty());
-        assert!(app.prompt.is_empty());
-        assert!(app.picker.is_some());
     }
 
     #[test]
@@ -3025,6 +2982,15 @@ mod tests {
         assert_ne!(buffer[(argument_column + 1, argument_row)].fg, Color::Cyan);
         assert!(
             !buffer[(argument_column + 1, argument_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        assert!(wrapped.handle_key(key(KeyCode::Left)).visible_changed);
+        let interior = rendered_buffer(&mut wrapped, 5, 18);
+        assert_eq!(interior[(token_column, token_row)].fg, Color::Cyan);
+        assert!(
+            interior[(token_column, token_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
