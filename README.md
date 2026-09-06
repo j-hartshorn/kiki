@@ -10,7 +10,7 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.21 --locked --root /tmp/kiki-monty-0.0.21
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. When unset, Kiki uses `openai/gpt-5.6-sol` with `medium` thinking. Export the variables:
+Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
@@ -27,6 +27,34 @@ cargo run
 ```
 
 Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
+
+## Model and thinking settings
+
+Settings use this precedence: built-in defaults < user settings < project settings < `KIKI_MODEL` / `KIKI_THINKING`. Model IDs are qualified; thinking values are stored per model.
+
+User defaults live at `~/.kiki/config.toml`:
+
+```toml
+model = "openai/gpt-5.6-terra"
+
+[thinking]
+"openai/gpt-5.6-sol" = "low"
+"openai/gpt-5.6-terra" = "high"
+"openai/gpt-5.6-luna" = "medium"
+```
+
+Project settings use the same TOML shape at `.kiki/config.toml` in the exact current working directory; parent directories are not read:
+
+```toml
+model = "openai/gpt-5.6-terra"
+
+[thinking]
+"openai/gpt-5.6-sol" = "low"
+"openai/gpt-5.6-terra" = "high"
+"openai/gpt-5.6-luna" = "medium"
+```
+
+`Ctrl-S` in either model or thinking picker writes only the user default. If project settings or environment variables mask it, Kiki reports that override.
 
 ## Commands
 
