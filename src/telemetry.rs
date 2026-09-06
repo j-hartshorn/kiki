@@ -71,6 +71,12 @@ pub(crate) enum CoordinatorOperation {
     WaitForOutcome,
 }
 
+impl CoordinatorOperation {
+    pub(crate) fn is_maintenance(self) -> bool {
+        matches!(self, Self::Service | Self::NextDeadline)
+    }
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ChildStopCause {
@@ -196,6 +202,10 @@ impl Trace {
         Self { sender: None }
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.sender.is_some()
+    }
+
     pub(crate) fn emit(&self, event: impl FnOnce() -> TraceEvent) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(WriterMessage::Event(event()));
@@ -301,6 +311,10 @@ pub(crate) enum TraceEvent {
     },
     CoordinatorLockReleased {
         operation: CoordinatorOperation,
+    },
+    CoordinatorLockContended {
+        operation: CoordinatorOperation,
+        wait_ms: u64,
     },
     RootRunStarted {
         run_id: u64,

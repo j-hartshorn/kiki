@@ -4,12 +4,16 @@ use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as SyncMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use serde::Serialize;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +34,7 @@ use crate::tools::{ToolError, ToolValue};
 const TASK_ID_WIDTH: usize = 6;
 const TASK_ID_SPACE: u64 = 36_u64.pow(TASK_ID_WIDTH as u32);
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
+const MAINTENANCE_LOCK_TRACE_THRESHOLD: Duration = Duration::from_millis(5);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -1532,6 +1537,62 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct StartSubagentTestGate {
+    first_start_locked: Arc<Semaphore>,
+    first_start_allowed: Arc<Semaphore>,
+    start_attempts: Arc<Semaphore>,
+    first_start_seen: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl StartSubagentTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            first_start_locked: Arc::new(Semaphore::new(0)),
+            first_start_allowed: Arc::new(Semaphore::new(0)),
+            start_attempts: Arc::new(Semaphore::new(0)),
+            first_start_seen: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) async fn wait_until_first_start_locked(&self) {
+        take_test_permit(&self.first_start_locked).await;
+    }
+
+    pub(crate) async fn wait_until_start_attempts(&self, count: usize) {
+        for _ in 0..count {
+            take_test_permit(&self.start_attempts).await;
+        }
+    }
+
+    pub(crate) fn allow_first_start(&self) {
+        self.first_start_allowed.add_permits(1);
+    }
+
+    fn note_start_attempt(&self) {
+        self.start_attempts.add_permits(1);
+    }
+
+    async fn wait_before_first_start_returns(&self) {
+        if !self.first_start_seen.swap(true, Ordering::SeqCst) {
+            self.first_start_locked.add_permits(1);
+            take_test_permit(&self.first_start_allowed).await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn take_test_permit(semaphore: &Arc<Semaphore>) {
+    semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("test gate semaphore remains open")
+        .forget();
+}
+
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
     publication: Arc<SyncMutex<CoordinatorPublication>>,
@@ -1539,6 +1600,8 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     runner: Arc<dyn ChildRunner<P>>,
     clock: Arc<dyn Clock>,
     trace: Trace,
+    #[cfg(test)]
+    start_test_gate: Option<StartSubagentTestGate>,
 }
 
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
@@ -1550,6 +1613,8 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             runner: self.runner.clone(),
             clock: self.clock.clone(),
             trace: self.trace.clone(),
+            #[cfg(test)]
+            start_test_gate: self.start_test_gate.clone(),
         }
     }
 }
@@ -1576,9 +1641,11 @@ impl DerefMut for CoordinatorLockGuard<'_> {
 
 impl Drop for CoordinatorLockGuard<'_> {
     fn drop(&mut self) {
-        self.trace.emit(|| TraceEvent::CoordinatorLockReleased {
-            operation: self.operation,
-        });
+        if !self.operation.is_maintenance() {
+            self.trace.emit(|| TraceEvent::CoordinatorLockReleased {
+                operation: self.operation,
+            });
+        }
     }
 }
 
@@ -1726,7 +1793,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             runner,
             clock: Arc::new(SystemClock),
             trace: Trace::disabled(),
+            #[cfg(test)]
+            start_test_gate: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_start_test_gate(mut self, start_test_gate: StartSubagentTestGate) -> Self {
+        self.start_test_gate = Some(start_test_gate);
+        self
     }
 
     pub(crate) fn with_trace(mut self, trace: Trace) -> Self {
@@ -1772,6 +1847,25 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn lock_inner(&self, operation: CoordinatorOperation) -> CoordinatorLockGuard<'_> {
+        if operation.is_maintenance() {
+            let wait_started = self.trace.is_enabled().then(Instant::now);
+            let inner = self.inner.lock().await;
+            if let Some(wait_started) = wait_started {
+                let wait = wait_started.elapsed();
+                if wait >= MAINTENANCE_LOCK_TRACE_THRESHOLD {
+                    self.trace.emit(|| TraceEvent::CoordinatorLockContended {
+                        operation,
+                        wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                    });
+                }
+            }
+            return CoordinatorLockGuard {
+                inner,
+                trace: &self.trace,
+                operation,
+            };
+        }
+
         self.trace
             .emit(|| TraceEvent::CoordinatorLockWaiting { operation });
         let inner = self.inner.lock().await;
@@ -1804,8 +1898,16 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         mut parameters: ChildParameters,
         payload: P,
     ) -> Result<TaskObservation, AdmissionError> {
+        #[cfg(test)]
+        if let Some(start_test_gate) = &self.start_test_gate {
+            start_test_gate.note_start_attempt();
+        }
         let (child, observation, spawned) = {
             let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
+            #[cfg(test)]
+            if let Some(start_test_gate) = &self.start_test_gate {
+                start_test_gate.wait_before_first_start_returns().await;
+            }
             let now = self.now();
             let observed_at_ms = self.unix_time_ms();
             if inner.shutting_down {
@@ -2974,6 +3076,90 @@ mod tests {
             spans
                 .iter()
                 .all(|(_, counts)| counts[0] == counts[1] && counts[1] == counts[2])
+        );
+    }
+
+    #[tokio::test]
+    async fn traced_uncontended_deadline_maintenance_omits_lock_spans() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let (id, running) = start(&coordinator, &mut started, &caller).await;
+
+        for _ in 0..3 {
+            assert!(coordinator.next_deadline().await.is_some());
+            coordinator.service().await;
+        }
+
+        running.finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, &id).await.unwrap();
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let maintenance_spans = fs::read_to_string(&trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .filter(|event| {
+                matches!(
+                    event["operation"].as_str(),
+                    Some("service" | "next_deadline")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(maintenance_spans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn traced_contended_deadline_maintenance_reports_the_wait() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let gate = super::StartSubagentTestGate::new();
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator
+            .with_trace(trace_owner.handle())
+            .with_start_test_gate(gate.clone());
+        let caller = coordinator.root_caller().await;
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            async move { coordinator.start(&caller, parameters(), ()).await }
+        });
+
+        gate.wait_until_first_start_locked().await;
+        let mut deadline = Box::pin({
+            let coordinator = coordinator.clone();
+            async move { coordinator.next_deadline().await }
+        });
+        assert!(
+            timeout(Duration::from_millis(10), &mut deadline)
+                .await
+                .is_err(),
+            "deadline maintenance should wait for the held coordinator lock"
+        );
+        gate.allow_first_start();
+        let admitted = start.await.unwrap().unwrap();
+        assert!(deadline.await.is_some());
+        let running = started.recv().await.expect("child starts");
+        running.finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, admitted.id()).await.unwrap();
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let contended = fs::read_to_string(&trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .find(|event| {
+                event["event"] == "coordinator_lock_contended"
+                    && event["operation"] == "next_deadline"
+            })
+            .expect("contended deadline maintenance should be traced");
+        assert!(
+            contended["wait_ms"].as_u64().expect("wait milliseconds")
+                >= u64::try_from(super::MAINTENANCE_LOCK_TRACE_THRESHOLD.as_millis()).unwrap()
         );
     }
 

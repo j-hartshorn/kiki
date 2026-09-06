@@ -1209,7 +1209,7 @@ fn utf8_prefix_len(value: &str, limit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1246,7 +1246,8 @@ mod tests {
         ModelUsage, ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::subagents::{
-        ChildModelFactory, ChildParameters, ChildPayload, CompleteChildRunner, SessionSubagents,
+        ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildRunner,
+        CompleteChildRunner, RunnerFuture, SessionSubagents, StartSubagentTestGate,
         SubagentCoordinator, SubagentPolicy, TaskOutcome, TaskState,
     };
     use crate::telemetry::TraceOwner;
@@ -1255,6 +1256,21 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct CancellationOnlyChildRunner;
+
+    impl ChildRunner<ChildPayload> for CancellationOnlyChildRunner {
+        fn run(
+            &self,
+            _child: crate::subagents::ChildRun<ChildPayload>,
+            cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                Err(ChildFailure::new("child cancelled"))
+            })
+        }
+    }
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -1416,6 +1432,36 @@ mod tests {
                         attempts: self.attempts.clone(),
                     }),
                 }
+            }
+        }
+    }
+
+    struct SelectedScriptedModel {
+        model: ScriptedModel,
+        selection: ModelSelection,
+        message_waiting: Option<Arc<Notify>>,
+    }
+
+    impl Model for SelectedScriptedModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let mut step = self.model.step(history, cancellation, progress).await?;
+                if matches!(&step.action, CompletedModelAction::Message { .. })
+                    && let Some(message_waiting) = &self.message_waiting
+                {
+                    message_waiting.notify_one();
+                    cancellation.cancelled().await;
+                    return Err(ModelError::Cancelled.into());
+                }
+                step.selection = Some(self.selection);
+                Ok(step)
             }
         }
     }
@@ -1855,6 +1901,123 @@ mod tests {
             ToolCallSummary::Applied => format!("{}:applied", call.tool.label()),
             ToolCallSummary::Subagent(id) => format!("{}:{id}", call.tool.label()),
         }
+    }
+
+    #[tokio::test]
+    async fn gathered_starts_do_not_starve_deadlines_or_background_cancellation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = StartSubagentTestGate::new();
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CancellationOnlyChildRunner),
+        )
+        .with_start_test_gate(gate.clone());
+        let source = "import asyncio\nhandles = await asyncio.gather(start_subagent('first'), start_subagent('second'), start_subagent('third'))\nlen(handles) == 3 and handles[0].id != handles[1].id and handles[0].id != handles[2].id and handles[1].id != handles[2].id";
+        let message_waiting = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: source.to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground complete".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: Some(message_waiting.clone()),
+            },
+            coordinator,
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start children".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        timeout(TEST_TIMEOUT, async {
+            gate.wait_until_first_start_locked().await;
+            gate.wait_until_start_attempts(3).await;
+        })
+        .await
+        .expect("all gathered starts should queue behind the held coordinator lock");
+        gate.allow_first_start();
+
+        let mut event_order = Vec::new();
+        let execution = match timeout(TEST_TIMEOUT, async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("runtime event channel remains open");
+                event_order.push(event_label(&event));
+                if let RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            record:
+                                Record::CompletedExecution {
+                                    source: completed_source,
+                                    execution,
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                } = event
+                    && completed_source == source
+                {
+                    return execution;
+                }
+            }
+        })
+        .await
+        {
+            Ok(execution) => execution,
+            Err(_) => panic!("gathered starts stalled; observed event order: {event_order:?}"),
+        };
+        let ExecutionOutcome::Complete {
+            result: Some(result),
+        } = execution.outcome
+        else {
+            panic!("gathered starts should return their handles");
+        };
+        assert_eq!(result.head, "True");
+        assert!(execution.tool_calls.iter().all(|call| {
+            matches!(
+                call,
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent(_),
+                }
+            )
+        }));
+        assert_eq!(execution.tool_calls.len(), 3);
+        timeout(TEST_TIMEOUT, message_waiting.notified())
+            .await
+            .expect("foreground should remain active while background cancellation runs");
+
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .unwrap();
+        let mut finished = BTreeSet::new();
+        timeout(TEST_TIMEOUT, async {
+            while finished.len() < 3 {
+                if let RuntimeEvent::SubagentFinished { record } = next_event(&mut events).await {
+                    assert_eq!(record.observation().state(), TaskState::Cancelled);
+                    finished.insert(record.id().clone());
+                }
+            }
+        })
+        .await
+        .expect("background cancellation should settle every gathered child");
+
+        shutdown_controller(commands, task).await;
     }
 
     #[tokio::test]

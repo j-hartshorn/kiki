@@ -1752,31 +1752,17 @@ async fn drive(
                     ));
                     let mut filesystem_complete = false;
                     while !tokens.is_empty() {
-                        budget.resume();
-                        let child_deadline = match context {
-                            Some(context) => match budget
-                                .wait(cancellation, context.coordinator().next_deadline())
-                                .await
-                            {
-                                Ok(deadline) => deadline,
-                                Err(BudgetInterruption::Cancelled) => {
-                                    break 'drive Err(DriverError::Cancelled);
-                                }
-                                Err(BudgetInterruption::TimedOut) => {
-                                    break 'drive Err(DriverError::TimedOut);
-                                }
-                            },
-                            None => None,
-                        };
                         update_budget_pause(budget, &call_modes);
                         let clock = budget.clock.clone();
                         let child_deadline = async {
-                            if let Some(deadline) = child_deadline {
-                                clock.sleep_until(deadline).await;
-                                BatchEvent::ChildDeadline
-                            } else {
-                                std::future::pending().await
-                            }
+                            let Some(context) = context else {
+                                return std::future::pending::<BatchEvent>().await;
+                            };
+                            let Some(deadline) = context.coordinator().next_deadline().await else {
+                                return std::future::pending::<BatchEvent>().await;
+                            };
+                            clock.sleep_until(deadline).await;
+                            BatchEvent::ChildDeadline
                         };
                         let next_event = async {
                             tokio::select! {
