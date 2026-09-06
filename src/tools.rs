@@ -1680,14 +1680,12 @@ impl ToolHost {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn for_child(&self, requested_read_only: bool) -> Self {
         let mut child = self.clone();
         child.read_only |= requested_read_only;
         child
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prompt_reference(&self) -> String {
         let definitions = ACTIVE_TOOLS
             .iter()

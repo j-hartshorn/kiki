@@ -24,19 +24,14 @@ use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
 use crate::tools::{ToolError, ToolValue};
 
-#[cfg_attr(not(test), allow(dead_code))]
 const TASK_ID_WIDTH: usize = 6;
-#[cfg_attr(not(test), allow(dead_code))]
 const TASK_ID_SPACE: u64 = 36_u64.pow(TASK_ID_WIDTH as u32);
-#[cfg_attr(not(test), allow(dead_code))]
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskId(String);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
@@ -58,7 +53,6 @@ impl std::fmt::Display for TaskId {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum CoordinatorEvent {
     Spawned { record: TaskRecord },
     Changed { id: TaskId, revision: u64 },
@@ -72,7 +66,6 @@ struct CoordinatorPublication {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TaskState {
     Starting,
     Running,
@@ -83,7 +76,6 @@ pub(crate) enum TaskState {
     TimedOut,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskState {
     fn is_terminal(self) -> bool {
         matches!(
@@ -94,14 +86,12 @@ impl TaskState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildParameters {
     prompt: String,
     selection: ModelSelection,
     read_only: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChildParameters {
     pub(crate) fn new(prompt: String, selection: ModelSelection, read_only: bool) -> Self {
         Self {
@@ -129,13 +119,11 @@ impl ChildParameters {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildResult {
     message: String,
     values: BTreeMap<String, ToolValue>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChildResult {
     pub(crate) fn new(message: String, values: BTreeMap<String, ToolValue>) -> Self {
         Self { message, values }
@@ -145,6 +133,7 @@ impl ChildResult {
         &self.message
     }
 
+    #[cfg(test)]
     pub(crate) fn values(&self) -> &BTreeMap<String, ToolValue> {
         &self.values
     }
@@ -155,10 +144,8 @@ impl ChildResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildFailure(String);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChildFailure {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(bounded_utf8(message.into(), FAILURE_MESSAGE_LIMIT))
@@ -170,7 +157,6 @@ impl ChildFailure {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Caller {
     session: u64,
     owner: CallerOwner,
@@ -178,17 +164,14 @@ pub(crate) struct Caller {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum CallerOwner {
     Root,
     Child(TaskId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct OriginId(u64);
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildRun<P: Send + 'static> {
     id: TaskId,
     caller: Caller,
@@ -200,28 +183,32 @@ pub(crate) struct ChildRun<P: Send + 'static> {
     coordinator: SubagentCoordinator<P>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<P: Send + 'static> ChildRun<P> {
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
     }
 
+    #[cfg(test)]
     pub(crate) fn caller(&self) -> &Caller {
         &self.caller
     }
 
+    #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
 
+    #[cfg(test)]
     pub(crate) fn parameters(&self) -> &ChildParameters {
         &self.parameters
     }
 
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> &P {
         &self.payload
     }
 
+    #[cfg(test)]
     pub(crate) fn model_step_started(&self) {
         self.reporter.model_step_started();
     }
@@ -252,15 +239,14 @@ impl<P: Send + 'static> ChildRun<P> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskAttempt {
     model_step: u64,
     provider_attempt: u32,
     accounting: Option<AttemptAccounting>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskAttempt {
+    #[cfg(test)]
     pub(crate) fn model_step(&self) -> u64 {
         self.model_step
     }
@@ -269,13 +255,13 @@ impl TaskAttempt {
         self.provider_attempt
     }
 
+    #[cfg(test)]
     pub(crate) fn accounting(&self) -> Option<&AttemptAccounting> {
         self.accounting.as_ref()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskExecution {
     model_step: u64,
     source: String,
@@ -284,7 +270,7 @@ pub(crate) struct TaskExecution {
     attempts: Vec<AttemptAccounting>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl TaskExecution {
     pub(crate) fn model_step(&self) -> u64 {
         self.model_step
@@ -447,12 +433,10 @@ fn rebuild_attempts(state: &mut TaskMetricState) {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskReporter {
     metrics: Arc<TaskMetrics>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskReporter {
     pub(crate) fn model_step_started(&self) {
         self.metrics.update(|state| {
@@ -522,17 +506,14 @@ impl TaskReporter {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type RunnerFuture =
     Pin<Box<dyn Future<Output = Result<ChildResult, ChildFailure>> + Send + 'static>>;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait ChildRunner<P: Send + 'static>: Send + Sync + 'static {
     fn run(&self, child: ChildRun<P>, cancellation: CancellationToken) -> RunnerFuture;
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildPayload {
     source: ArenaChildSource,
     checkpoint: Checkpoint,
@@ -540,7 +521,6 @@ pub(crate) struct ChildPayload {
 }
 
 impl ChildPayload {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(source: ArenaChildSource, checkpoint: Checkpoint) -> Self {
         Self {
             source,
@@ -614,14 +594,12 @@ impl AcceptedThinking {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AgentInvocationContext {
     caller: Caller,
     coordinator: SessionSubagents,
     accepted_thinking: Option<AcceptedThinking>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AgentInvocationContext {
     pub(crate) fn new(caller: Caller, coordinator: SessionSubagents) -> Self {
         Self {
@@ -654,7 +632,6 @@ impl AgentInvocationContext {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct TrustedExecutionContext {
     caller: Caller,
     selection: Option<ModelSelection>,
@@ -664,14 +641,9 @@ pub(crate) struct TrustedExecutionContext {
     accepted_thinking: Option<AcceptedThinking>,
 }
 
-#[allow(dead_code)]
 impl TrustedExecutionContext {
     pub(crate) fn caller(&self) -> &Caller {
         &self.caller
-    }
-
-    pub(crate) fn selection(&self) -> Option<ModelSelection> {
-        self.selection
     }
 
     pub(crate) fn payload(&self) -> ChildPayload {
@@ -1017,20 +989,17 @@ fn cost_status_name(status: CostStatus) -> &'static str {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait ChildModelFactory: Send + Sync + 'static {
     type Model: Model;
 
     fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model;
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CompleteChildRunner<F> {
     prompt_base: String,
     models: F,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<F> CompleteChildRunner<F> {
     pub(crate) fn new(prompt_base: String, models: F) -> Self {
         Self {
@@ -1040,7 +1009,6 @@ impl<F> CompleteChildRunner<F> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRunner<F> {
     fn run(&self, child: ChildRun<ChildPayload>, cancellation: CancellationToken) -> RunnerFuture {
         let prompt_base = self.prompt_base.clone();
@@ -1139,7 +1107,6 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum CostStatus {
     Complete,
     LowerBound,
@@ -1147,7 +1114,6 @@ pub(crate) enum CostStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskObservation {
     id: TaskId,
     state: TaskState,
@@ -1160,7 +1126,6 @@ pub(crate) struct TaskObservation {
     error: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskObservation {
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
@@ -1170,6 +1135,7 @@ impl TaskObservation {
         self.state
     }
 
+    #[cfg(test)]
     pub(crate) fn selection(&self) -> ModelSelection {
         self.selection
     }
@@ -1217,7 +1183,6 @@ impl TaskObservation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TaskOutcome {
     Completed(ChildResult),
     Failed(ChildFailure),
@@ -1226,7 +1191,6 @@ pub(crate) enum TaskOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskRecord {
     id: TaskId,
     revision: u64,
@@ -1241,9 +1205,7 @@ pub(crate) struct TaskRecord {
     outcome: Option<TaskOutcome>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TaskRecord {
-    #[allow(dead_code)]
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
     }
@@ -1252,16 +1214,16 @@ impl TaskRecord {
         self.revision
     }
 
-    #[allow(dead_code)]
     pub(crate) fn parent(&self) -> Option<&TaskId> {
         self.parent.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn origin(&self) -> u64 {
         self.origin.0
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
@@ -1270,7 +1232,6 @@ impl TaskRecord {
         &self.parameters
     }
 
-    #[allow(dead_code)]
     pub(crate) fn observation(&self) -> &TaskObservation {
         &self.observation
     }
@@ -1283,6 +1244,7 @@ impl TaskRecord {
         &self.attempt_evidence
     }
 
+    #[cfg(test)]
     pub(crate) fn executions(&self) -> &[TaskExecution] {
         &self.executions
     }
@@ -1346,7 +1308,6 @@ impl TaskRecord {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubagentPolicy {
     allow_nested: bool,
     max_concurrent: usize,
@@ -1355,7 +1316,6 @@ pub(crate) struct SubagentPolicy {
     timeout: Duration,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl From<SubagentSettings> for SubagentPolicy {
     fn from(settings: SubagentSettings) -> Self {
         Self {
@@ -1369,7 +1329,6 @@ impl From<SubagentSettings> for SubagentPolicy {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AdmissionError {
     #[error("subagent admission is unavailable during shutdown")]
     ShuttingDown,
@@ -1390,7 +1349,6 @@ pub(crate) enum AdmissionError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum AccessError {
     #[error("subagent caller is not trusted by this session")]
     InvalidCaller,
@@ -1401,7 +1359,6 @@ pub(crate) enum AccessError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WaitError {
     #[error(transparent)]
     Access(#[from] AccessError),
@@ -1423,7 +1380,6 @@ pub(crate) enum WaitError {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WaitError {
     pub(crate) fn observation(&self) -> Option<&TaskObservation> {
         match self {
@@ -1435,16 +1391,13 @@ impl WaitError {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
     fn unix_time_ms(&self) -> i64;
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SystemClock;
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
@@ -1461,7 +1414,6 @@ impl Clock for SystemClock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
     publication: Arc<SyncMutex<CoordinatorPublication>>,
@@ -1470,7 +1422,6 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     clock: Arc<dyn Clock>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     fn clone(&self) -> Self {
         Self {
@@ -1483,7 +1434,6 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Inner {
     session: u64,
     next_origin: u64,
@@ -1496,7 +1446,6 @@ struct Inner {
     tasks: BTreeMap<TaskId, Task>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Inner {
     fn notify(&self) {
         self.notifications
@@ -1504,7 +1453,6 @@ impl Inner {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Task {
     id: TaskId,
     parent: Option<TaskId>,
@@ -1522,7 +1470,6 @@ struct Task {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum StopReason {
     Cancelled,
     TimedOut,
@@ -1531,7 +1478,6 @@ enum StopReason {
     RunnerFailed(ChildFailure),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl StopReason {
     fn outcome(&self) -> TaskOutcome {
         match self {
@@ -1552,7 +1498,6 @@ impl StopReason {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Task {
     fn observation(&self, now: Instant, observed_at_ms: i64) -> TaskObservation {
         self.observation_with_metrics(now, observed_at_ms, self.metrics.snapshot())
@@ -1614,7 +1559,6 @@ impl Task {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) fn new(policy: SubagentPolicy, runner: Arc<dyn ChildRunner<P>>) -> Self {
         Self::with_clock(policy, runner, Arc::new(SystemClock))
@@ -1825,6 +1769,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         Ok(task.observation(self.now(), self.unix_time_ms()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait(
         &self,
         caller: &Caller,
@@ -1855,6 +1800,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.wait_for_outcome(id, updates).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn cancel(
         &self,
         caller: &Caller,
@@ -1900,6 +1846,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.wait_for_all(active).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn cancel_all(&self) {
         self.request_background_cancellation(None).await;
         self.join_active().await;
@@ -1947,6 +1894,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.join_active().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn records(&self) -> Vec<TaskRecord> {
         let inner = self.inner.lock().await;
         let now = self.now();
@@ -1968,6 +1916,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .map(|task| task.record(now, observed_at_ms))
     }
 
+    #[cfg(test)]
     pub(crate) async fn active_count(&self) -> usize {
         self.inner.lock().await.active_slots
     }
@@ -2203,7 +2152,6 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn earliest_deadline(own: Option<Instant>, inherited: Option<Instant>) -> Option<Instant> {
     match (own, inherited) {
         (Some(own), Some(inherited)) => Some(own.min(inherited)),
@@ -2212,7 +2160,6 @@ fn earliest_deadline(own: Option<Instant>, inherited: Option<Instant>) -> Option
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn ensure_access(inner: &Inner, caller: &Caller, id: &TaskId) -> Result<(), AccessError> {
     if caller.session != inner.session {
         return Err(AccessError::InvalidCaller);
@@ -2237,7 +2184,6 @@ fn ensure_access(inner: &Inner, caller: &Caller, id: &TaskId) -> Result<(), Acce
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_proper_descendant(
     tasks: &BTreeMap<TaskId, Task>,
     candidate: &TaskId,
@@ -2253,12 +2199,10 @@ fn is_proper_descendant(
     false
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_in_subtree(tasks: &BTreeMap<TaskId, Task>, candidate: &TaskId, ancestor: &TaskId) -> bool {
     candidate == ancestor || is_proper_descendant(tasks, candidate, ancestor)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<TaskId> {
     let mut stopping = Vec::new();
     for id in ids {
@@ -2278,7 +2222,6 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
     stopping
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn settle_task(
     inner: &mut Inner,
     id: &TaskId,
@@ -2309,7 +2252,6 @@ fn settle_task(
     Some(record)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn task_id(mut sequence: u64) -> Option<TaskId> {
     if sequence >= TASK_ID_SPACE {
         return None;
@@ -2329,13 +2271,11 @@ fn task_id(mut sequence: u64) -> Option<TaskId> {
     ))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn bounded_utf8(mut value: String, limit: usize) -> String {
     value.truncate(utf8_prefix_len(&value, limit));
     value
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn utf8_prefix_len(value: &str, limit: usize) -> usize {
     let mut end = value.len().min(limit);
     while !value.is_char_boundary(end) {

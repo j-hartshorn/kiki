@@ -30,7 +30,7 @@ use crate::runtime::{
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
-use crate::subagents::{TaskId, TaskObservation, TaskOutcome, TaskRecord, TaskState};
+use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet;
@@ -2194,7 +2194,6 @@ pub(crate) struct Transcript {
     status: String,
     records: Vec<DisplayedRecord>,
     subagent_records: BTreeMap<TaskId, TaskRecord>,
-    subagent_statuses: BTreeMap<TaskId, (u64, TaskObservation)>,
     subagent_lifecycle_cards: BTreeSet<(TaskId, SubagentCardPhase)>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
@@ -2218,7 +2217,6 @@ impl Default for Transcript {
             status: "idle".to_owned(),
             records: Vec::new(),
             subagent_records: BTreeMap::new(),
-            subagent_statuses: BTreeMap::new(),
             subagent_lifecycle_cards: BTreeSet::new(),
             settled_blocks: Vec::new(),
             live_step: None,
@@ -2440,22 +2438,7 @@ impl Transcript {
                 self.append_subagent_card(&record, SubagentCardPhase::Spawned)
                     | self.replace_subagent_record(record)
             }
-            RuntimeEvent::SubagentStatus {
-                id,
-                revision,
-                observation,
-            } => {
-                if self
-                    .subagent_statuses
-                    .get(&id)
-                    .is_some_and(|(latest, _)| *latest >= revision)
-                {
-                    false
-                } else {
-                    self.subagent_statuses.insert(id, (revision, observation));
-                    false
-                }
-            }
+            RuntimeEvent::SubagentStatus { .. } => false,
             RuntimeEvent::SubagentRecord { record } => self.replace_subagent_record(record),
             RuntimeEvent::SubagentFinished { record } => {
                 self.append_subagent_card(&record, SubagentCardPhase::Finished)
@@ -6473,14 +6456,6 @@ truncated"
             },
             false,
         ));
-        assert_eq!(
-            transcript
-                .subagent_statuses
-                .get(child.id())
-                .map(|(revision, _)| *revision),
-            Some(4)
-        );
-
         assert!(!transcript.apply(
             RuntimeEvent::SubagentRecord {
                 record: child.clone(),

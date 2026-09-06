@@ -437,7 +437,6 @@ impl<M: Model> Agent<M> {
         self.invocation_context = Some(context);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn collect_child_result_values(
         &mut self,
         cancellation: &CancellationToken,

@@ -49,7 +49,6 @@ pub(crate) struct OpenAiModel {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OpenAiChildModelFactory {
     api_key: String,
 }
@@ -65,7 +64,6 @@ impl OpenAiChildModelFactory {
 impl ChildModelFactory for OpenAiChildModelFactory {
     type Model = OpenAiModel;
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
         OpenAiModel::with_fixed_selection(prompt, self.api_key.clone(), selection)
     }
@@ -93,7 +91,6 @@ impl OpenAiModel {
         Self::build(prompt.into(), api_key.into(), settings, OPENAI_API_BASE)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_fixed_selection(
         prompt: impl Into<String>,
         api_key: impl Into<String>,
@@ -1517,7 +1514,6 @@ fn hexadecimal(character: char) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum WireEvent {
@@ -1529,16 +1525,19 @@ enum WireEvent {
     InProgress,
     #[serde(rename = "response.completed")]
     Completed {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
     #[serde(rename = "response.failed")]
     Failed {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
     #[serde(rename = "response.incomplete")]
     Incomplete {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
@@ -1590,6 +1589,7 @@ enum WireEvent {
     },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryDelta {
+        #[cfg(test)]
         sequence_number: u64,
         output_index: usize,
         summary_index: usize,
@@ -1603,6 +1603,7 @@ enum WireEvent {
     },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionArgumentsDelta {
+        #[cfg(test)]
         sequence_number: u64,
         output_index: usize,
         item_id: String,
@@ -1616,6 +1617,7 @@ enum WireEvent {
     },
     #[serde(rename = "error")]
     Error {
+        #[cfg(test)]
         sequence_number: u64,
         code: Option<String>,
         message: String,
@@ -1624,9 +1626,9 @@ enum WireEvent {
     Unexpected,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct WireResponse {
+    #[cfg(test)]
     id: String,
     status: WireStatus,
     #[serde(default)]

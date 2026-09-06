@@ -42,9 +42,7 @@ const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
-#[cfg_attr(not(test), allow(dead_code))]
 const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
-#[cfg_attr(not(test), allow(dead_code))]
 const RESULT_VALUES_BINDING: &str = "result_values";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
@@ -362,7 +360,6 @@ impl ArenaError {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Error)]
 pub(crate) enum ResultValuesError {
     #[error("result_values collection was cancelled")]
@@ -371,7 +368,6 @@ pub(crate) enum ResultValuesError {
     Export { message: String },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ResultValuesError {
     fn export(message: impl Into<String>) -> Self {
         let mut message = message.into();
@@ -667,7 +663,6 @@ impl AttemptFailure {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ArenaChildSource {
     worker_path: std::path::PathBuf,
     tool_host: ToolHost,
@@ -681,7 +676,6 @@ pub(crate) struct ArenaChildSource {
     child_construction_test_gate: Option<ChildConstructionTestGate>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ArenaChildSource {
     pub(crate) async fn child(
         &self,
@@ -877,7 +871,7 @@ impl Arena {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn child(
         &self,
         checkpoint: &Checkpoint,
@@ -987,7 +981,7 @@ impl Arena {
         self.checkpoint.clone()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn collect_result_values(
         &mut self,
     ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
@@ -1165,7 +1159,6 @@ impl Arena {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> {
     let mut on_print = on_print_sync(|_, _| {});
     match checkout
@@ -1180,7 +1173,6 @@ async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> 
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 async fn collect_result_values_checkout(
     checkout: &mut Checkout,
 ) -> Result<MontyObject, ResultValuesError> {
@@ -1202,25 +1194,21 @@ async fn collect_result_values_checkout(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn result_values_pool_failure(error: PoolError) -> ResultValuesError {
     ResultValuesError::export(format!("collection transport failed: {error}"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn result_values_arena_failure(error: ArenaError) -> ResultValuesError {
     ResultValuesError::export(format!(
         "could not restore result_values checkpoint: {error}"
     ))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct ResultValueBounds {
     items: usize,
     payload_bytes: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ResultValueBounds {
     fn new() -> Self {
         Self {
@@ -1256,7 +1244,6 @@ impl ResultValueBounds {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn result_values_from_monty(
     value: MontyObject,
 ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
@@ -1285,7 +1272,6 @@ fn result_values_from_monty(
     Ok(converted)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn result_value_from_monty(
     value: MontyObject,
     bounds: &mut ResultValueBounds,

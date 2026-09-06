@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentError, AgentProgress, AgentRunOutcome, TerminalEvidence};
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 #[cfg(test)]
-use crate::config::DEFAULT_MODEL;
-use crate::config::{ModelConfiguration, ModelSelection, settings::SettingsContext};
+use crate::config::{DEFAULT_MODEL, ModelConfiguration};
+use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -35,7 +35,6 @@ pub(crate) enum RuntimeCommand {
         revision: u64,
     },
     Cancel,
-    #[cfg_attr(not(test), allow(dead_code))]
     CancelBackground,
     Shutdown,
 }
@@ -384,7 +383,7 @@ impl<M: Model> RuntimeController<M> {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn resolve_child_selection(
         &self,
         invoking: ModelSelection,

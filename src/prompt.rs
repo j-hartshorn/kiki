@@ -8,7 +8,6 @@ use std::str::Utf8Error;
 use crate::tools::prompt_reference;
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/read_only_agent.md");
-#[cfg_attr(not(test), allow(dead_code))]
 const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
 const BUNDLED_PROMPT_NAME: &str = "read_only_agent";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
@@ -43,7 +42,6 @@ pub(crate) fn root_prompt(base: &str) -> String {
     assemble(base, prompt_reference())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
     assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
 }

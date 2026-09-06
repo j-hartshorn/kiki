@@ -261,7 +261,6 @@ impl Default for SubagentSettings {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl SubagentSettings {
     pub(crate) fn allow_nested(self) -> bool {
         self.allow_nested

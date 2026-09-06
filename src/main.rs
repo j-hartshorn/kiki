@@ -10,7 +10,7 @@ pub mod prompt;
 mod prompt_editor;
 pub mod runtime;
 mod selection;
-pub mod subagents;
+mod subagents;
 pub mod tools;
 mod transcript;
 pub mod tui;
