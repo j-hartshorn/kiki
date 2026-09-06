@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -10,7 +8,7 @@ use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallTok
 use crate::config::DEFAULT_MODEL;
 use crate::config::{ModelConfiguration, ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
-use crate::subagents::{AgentInvocationContext, Caller, SessionSubagents};
+use crate::subagents::{AcceptedThinking, AgentInvocationContext, Caller, SessionSubagents};
 #[cfg(test)]
 use crate::subagents::{
     ChildFailure, ChildPayload, ChildRunner, RunnerFuture, SubagentCoordinator, SubagentPolicy,
@@ -203,43 +201,6 @@ impl<T> ProgressPublisher<T> {
 
 pub(crate) type RuntimeProgressReceiver = mpsc::Receiver<ProgressEnvelope<RuntimeEvent>>;
 
-struct AcceptedThinking {
-    persisted: SettingsContext,
-    values: BTreeMap<&'static str, &'static str>,
-}
-
-impl AcceptedThinking {
-    fn new(selection: ModelSelection, persisted: SettingsContext) -> Self {
-        Self {
-            persisted,
-            values: BTreeMap::from([(selection.model().id, selection.thinking())]),
-        }
-    }
-
-    fn accept(&mut self, selection: ModelSelection) {
-        self.values
-            .insert(selection.model().id, selection.thinking());
-    }
-
-    fn resolve(
-        &self,
-        invoking: ModelSelection,
-        target: Option<&'static ModelConfiguration>,
-    ) -> ModelSelection {
-        let Some(target) = target else {
-            return invoking;
-        };
-        let thinking = self
-            .values
-            .get(target.id)
-            .copied()
-            .or_else(|| self.persisted.thinking_for(target))
-            .unwrap_or(target.default_thinking);
-        ModelSelection::new(target, thinking)
-            .expect("accepted or persisted thinking must be supported by its model")
-    }
-}
-
 #[cfg(test)]
 struct UnavailableChildRunner;
 
@@ -421,8 +382,10 @@ impl<M: Model> RuntimeController<M> {
 
     #[cfg(test)]
     fn with_settings(mut self, settings: watch::Sender<ModelSelection>) -> Self {
-        self.accepted_thinking =
-            AcceptedThinking::new(*settings.borrow(), self.accepted_thinking.persisted.clone());
+        self.accepted_thinking = AcceptedThinking::new(
+            *settings.borrow(),
+            self.accepted_thinking.persisted_settings(),
+        );
         self.settings = settings;
         self
     }
@@ -576,10 +539,10 @@ impl<M: Model> RuntimeController<M> {
             .agent
             .take()
             .expect("an idle runtime controller owns its agent");
-        agent.set_invocation_context(AgentInvocationContext::new(
-            caller.clone(),
-            self.subagents.clone(),
-        ));
+        agent.set_invocation_context(
+            AgentInvocationContext::new(caller.clone(), self.subagents.clone())
+                .with_accepted_thinking(self.accepted_thinking.clone()),
+        );
         let cancellation = CancellationToken::new();
         let cancellation_for_worker = cancellation.clone();
         let (sender, worker) = mpsc::unbounded_channel();
@@ -1398,7 +1361,7 @@ mod tests {
                 "tool-updated:{}:{}:{}",
                 run_id.0,
                 step_id.0,
-                tool_call_label(*call)
+                tool_call_label(call.clone())
             ),
             RuntimeEvent::RunPreviewUpdated { .. } => "run-preview-updated".to_owned(),
             RuntimeEvent::StdoutDelta { .. } => "stdout-delta".to_owned(),
@@ -1432,6 +1395,7 @@ mod tests {
             ToolCallSummary::Created => format!("{}:created", call.tool.label()),
             ToolCallSummary::Replaced => format!("{}:replaced", call.tool.label()),
             ToolCallSummary::Applied => format!("{}:applied", call.tool.label()),
+            ToolCallSummary::Subagent(id) => format!("{}:{id}", call.tool.label()),
         }
     }
 
@@ -5623,8 +5587,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let invoking = ModelSelection::new(&SOL, "high").unwrap();
-        let mut accepted =
-            AcceptedThinking::new(invoking, persisted_settings(&home, workspace.path()));
+        let accepted = AcceptedThinking::new(invoking, persisted_settings(&home, workspace.path()));
 
         assert_eq!(accepted.resolve(invoking, None), invoking);
         assert_eq!(

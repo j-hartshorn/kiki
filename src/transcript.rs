@@ -387,7 +387,10 @@ fn tool_call_text(
         .enumerate()
         .skip(omitted.unwrap_or_default())
     {
-        lines.push(Line::styled(tool_call_label(*call), card_style(background)));
+        lines.push(Line::styled(
+            tool_call_label(call.clone()),
+            card_style(background),
+        ));
         if let Some(preview) = run_previews.get(index).and_then(Option::as_ref) {
             lines.push(Line::styled(
                 format!("╭─ $ {}", preview.command),
@@ -422,6 +425,7 @@ fn tool_call_label(call: ToolCall) -> String {
         ToolCallSummary::Created => "created".to_owned(),
         ToolCallSummary::Replaced => "replaced".to_owned(),
         ToolCallSummary::Applied => "applied".to_owned(),
+        ToolCallSummary::Subagent(id) => format!("subagent:{id}"),
     };
     format!("{} · {summary}", call.tool.label())
 }
@@ -2107,7 +2111,7 @@ impl Transcript {
                 token,
                 call,
             } => {
-                let activity = tool_call_label(call);
+                let activity = tool_call_label(call.clone());
                 let mut accepted = false;
                 let mut changed =
                     self.update_live_step(run_id, step_id, gap_before, None, |live| {
@@ -2117,7 +2121,7 @@ impl Transcript {
                             .position(|existing| *existing == token);
                         if index.is_some_and(|index| {
                             !matches!(live.tool_calls[index].summary, ToolCallSummary::Pending)
-                                && matches!(call.summary, ToolCallSummary::Pending)
+                                && matches!(&call.summary, ToolCallSummary::Pending)
                         }) {
                             return;
                         }

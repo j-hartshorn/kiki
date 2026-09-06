@@ -134,12 +134,20 @@ mod tests {
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
             "async def run(command: str, cwd: str = \".\") -> CommandResult:",
+            "async def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:",
+            "async def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:",
+            "async def get_subagent(id: str) -> SubagentTask:",
+            "async def refresh(self) -> SubagentStatus:",
+            "async def wait(self) -> dict:",
+            "async def cancel(self) -> SubagentStatus:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
         assert_eq!(reference.matches("class CommandResult:").count(), 1);
+        assert_eq!(reference.matches("class SubagentStatus:").count(), 1);
+        assert_eq!(reference.matches("class SubagentTask:").count(), 1);
         for guidance in [
             "Every host call must be awaited.",
             "independent calls expected to succeed",

@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{StreamExt, stream::FuturesUnordered};
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
@@ -25,7 +27,10 @@ use crate::{
             COLLECTION_MAX_PAYLOAD_BYTES,
         },
     },
-    subagents::{AgentInvocationContext, TrustedExecutionContext},
+    subagents::{
+        AgentInvocationContext, InvocationOperation, TrustedExecutionContext,
+        invoke as invoke_subagent,
+    },
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
         ToolValue, WholeFileAuthorisations, bootstrap_source,
@@ -200,7 +205,7 @@ impl RunPreviewState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolCallSummary {
     Pending,
     Failed,
@@ -210,9 +215,10 @@ pub(crate) enum ToolCallSummary {
     Created,
     Replaced,
     Applied,
+    Subagent(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolCall {
     pub(crate) tool: ToolName,
     pub(crate) summary: ToolCallSummary,
@@ -257,14 +263,14 @@ impl ToolTraceState {
             "a tool call must settle once"
         );
         call.summary = summary;
-        *call
+        call.clone()
     }
 
     fn call(&self, token: ToolCallToken) -> ToolCall {
-        *self
-            .calls
+        self.calls
             .get(token.0)
             .expect("tool call token must identify an admitted row")
+            .clone()
     }
 
     #[cfg(test)]
@@ -1319,6 +1325,7 @@ enum DriverError {
 struct PendingToolCall {
     call_id: u32,
     tool: ToolName,
+    invocation: Option<InvocationOperation>,
     arguments: ToolValue,
     token: ToolCallToken,
     run_preview: Option<RunPreviewState>,
@@ -1368,7 +1375,10 @@ async fn drive(
                     call_id,
                     method_call,
                 } => {
-                    let Some(tool) = ToolName::from_private_name(&function_name) else {
+                    let invocation = InvocationOperation::from_private_name(&function_name);
+                    let Some(tool) = ToolName::from_private_name(&function_name)
+                        .or_else(|| invocation.map(InvocationOperation::tool))
+                    else {
                         event = match with_print!(on_print => checkout
                             .resume(ResumeValue::NotFound, &mut on_print)
                             .await)
@@ -1440,6 +1450,7 @@ async fn drive(
                         pending_calls.push(PendingToolCall {
                             call_id,
                             tool,
+                            invocation,
                             arguments,
                             token,
                             run_preview,
@@ -1459,9 +1470,13 @@ async fn drive(
                     }
                 }
                 TurnEvent::NameLookup { name } => {
-                    let value =
-                        ToolName::from_private_name(&name).map(|tool| MontyObject::Function {
-                            name: tool.private_name().to_owned(),
+                    let value = ToolName::from_private_name(&name)
+                        .map(|tool| tool.private_name())
+                        .or_else(|| {
+                            InvocationOperation::from_private_name(&name).map(|_| name.as_str())
+                        })
+                        .map(|name| MontyObject::Function {
+                            name: name.to_owned(),
                             docstring: None,
                         });
                     match with_print!(on_print => checkout
@@ -1502,49 +1517,70 @@ async fn drive(
                         .collect::<BTreeMap<_, _>>();
                     let mut tokens = BTreeMap::new();
                     let mut run_previews = BTreeMap::new();
-                    let calls = pending_call_ids
-                        .iter()
-                        .map(|call_id| {
-                            let call = pending
-                                .remove(call_id)
-                                .expect("validated call ID must be admitted");
+                    let mut filesystem_calls = Vec::new();
+                    let mut invocation_calls: FuturesUnordered<
+                        Pin<Box<dyn Future<Output = ToolResult> + Send + '_>>,
+                    > = FuturesUnordered::new();
+                    for call_id in &pending_call_ids {
+                        let call = pending
+                            .remove(call_id)
+                            .expect("validated call ID must be admitted");
+                        assert!(
+                            tokens
+                                .insert(call.call_id, (call.tool, call.token))
+                                .is_none(),
+                            "a pending host call must have a unique call ID"
+                        );
+                        if let Some(run_preview) = call.run_preview {
                             assert!(
-                                tokens
-                                    .insert(call.call_id, (call.tool, call.token))
+                                run_previews
+                                    .insert(call.call_id, (call.token, run_preview))
                                     .is_none(),
-                                "a pending host call must have a unique call ID"
+                                "a pending run call must have a unique call ID"
                             );
-                            if let Some(run_preview) = call.run_preview {
-                                assert!(
-                                    run_previews
-                                        .insert(call.call_id, (call.token, run_preview))
-                                        .is_none(),
-                                    "a pending run call must have a unique call ID"
-                                );
-                            }
-                            HostToolCall {
+                        }
+                        if let Some(operation) = call.invocation {
+                            let call_id = call.call_id;
+                            let arguments = call.arguments;
+                            invocation_calls.push(Box::pin(async move {
+                                ToolResult::from_result(
+                                    call_id,
+                                    invoke_subagent(context, operation, arguments).await,
+                                )
+                            }));
+                        } else {
+                            filesystem_calls.push(HostToolCall {
                                 call_id: call.call_id,
                                 tool: call.tool,
                                 arguments: call.arguments,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let mutation_paths = calls
+                            });
+                        }
+                    }
+                    let mutation_paths = filesystem_calls
                         .iter()
                         .filter_map(HostToolCall::mutation_path)
                         .collect::<BTreeSet<_>>();
                     let mut results = BTreeMap::new();
                     let (output_sender, mut output_receiver) =
                         mpsc::channel(RUN_OUTPUT_CHANNEL_CAPACITY);
-                    let mut calls = Box::pin(tool_host.dispatch_batch_with_output(
-                        calls,
+                    let mut filesystem = Box::pin(tool_host.dispatch_batch_with_output(
+                        filesystem_calls,
                         authorisations.clone(),
                         output_sender,
-                        context,
                     ));
+                    let mut filesystem_complete = false;
                     while !tokens.is_empty() {
                         let result = tokio::select! {
-                            result = calls.next() => result.expect("every admitted host call must settle"),
+                            result = filesystem.next(), if !filesystem_complete => match result {
+                                Some(result) => result,
+                                None => {
+                                    filesystem_complete = true;
+                                    continue;
+                                }
+                            },
+                            result = invocation_calls.next(), if !invocation_calls.is_empty() => {
+                                result.expect("every admitted subagent call must settle")
+                            },
                             output = output_receiver.recv(), if !run_previews.is_empty() => {
                                 if let Some(output) = output {
                                     update_run_preview(output, &mut run_previews, progress);
@@ -1722,6 +1758,16 @@ fn tool_resume_value(result: ToolResult) -> ResumeValue {
 }
 
 fn tool_summary(tool: ToolName, result: &ToolResult) -> ToolCallSummary {
+    if matches!(
+        tool,
+        ToolName::StartSubagent
+            | ToolName::GetSubagent
+            | ToolName::RefreshSubagent
+            | ToolName::WaitSubagent
+            | ToolName::CancelSubagent
+    ) {
+        return subagent_tool_summary(result);
+    }
     if let Some(status) = result.mutation_status() {
         return match status {
             crate::tools::MutationStatus::Created => ToolCallSummary::Created,
@@ -1747,7 +1793,33 @@ fn tool_summary(tool: ToolName, result: &ToolResult) -> ToolCallSummary {
                 Err(_) => ToolCallSummary::Failed,
             }
         }
+        ToolName::StartSubagent
+        | ToolName::GetSubagent
+        | ToolName::RefreshSubagent
+        | ToolName::WaitSubagent
+        | ToolName::CancelSubagent => unreachable!("subagent calls return above"),
     }
+}
+
+fn subagent_tool_summary(result: &ToolResult) -> ToolCallSummary {
+    let Ok(ToolValue::Dictionary(value)) = &result.result else {
+        return ToolCallSummary::Failed;
+    };
+    let id = value
+        .get("id")
+        .or_else(|| {
+            value.get("status").and_then(|status| match status {
+                ToolValue::Dictionary(status) => status.get("id"),
+                _ => None,
+            })
+        })
+        .and_then(|id| match id {
+            ToolValue::String(id) => Some(id),
+            _ => None,
+        });
+    id.map_or(ToolCallSummary::Failed, |id| {
+        ToolCallSummary::Subagent(id.clone())
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2298,18 +2370,18 @@ fn is_line_boundary_after(previous: char, next: Option<char>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use monty_types::{MontyObject, MontyType, PrintStream};
     use tempfile::TempDir;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -2319,6 +2391,15 @@ mod tests {
         RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName, ToolTraceState,
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
         result_values_from_monty, tool_summary, validate_worker, validate_worker_with_timeout,
+    };
+    use crate::model::{
+        Model, ModelFailure, ModelHistory, ModelProgress, ModelStep, ScriptedAction, ScriptedModel,
+    };
+    use crate::subagents::{
+        AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
+        ChildParameters, ChildPayload, ChildResult, ChildRun, ChildRunner, Clock,
+        CompleteChildRunner, RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
+        TaskOutcome, TaskState,
     };
     use crate::tools::{
         BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolHost, ToolResult,
@@ -2475,6 +2556,257 @@ mod tests {
             .authorisations
             .authorisation(Path::new(path))
             .is_some()
+    }
+
+    struct InvocationRunner {
+        started: mpsc::UnboundedSender<oneshot::Sender<Result<ChildResult, ChildFailure>>>,
+    }
+
+    struct CallerCapturingInvocationRunner {
+        callers: mpsc::UnboundedSender<Caller>,
+    }
+
+    #[derive(Clone)]
+    struct InvocationClock(Arc<Mutex<(Instant, i64)>>);
+
+    impl InvocationClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new((Instant::now(), 0))))
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut value = self.0.lock().unwrap();
+            value.0 += duration;
+            value.1 += i64::try_from(duration.as_millis()).unwrap();
+        }
+    }
+
+    impl Clock for InvocationClock {
+        fn now(&self) -> Instant {
+            self.0.lock().unwrap().0
+        }
+
+        fn unix_time_ms(&self) -> i64 {
+            self.0.lock().unwrap().1
+        }
+    }
+
+    struct SelectionRunner {
+        selections: mpsc::UnboundedSender<crate::config::ModelSelection>,
+    }
+
+    impl ChildRunner<ChildPayload> for SelectionRunner {
+        fn run(
+            &self,
+            child: ChildRun<ChildPayload>,
+            _cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            self.selections
+                .send(child.parameters().selection())
+                .expect("test receives child selection");
+            Box::pin(async { Ok(ChildResult::new("done".to_owned(), BTreeMap::new())) })
+        }
+    }
+
+    struct SelectedScriptedModel {
+        model: ScriptedModel,
+        selection: crate::config::ModelSelection,
+    }
+
+    impl Model for SelectedScriptedModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let mut step = self.model.step(history, cancellation, progress).await?;
+                step.selection = Some(self.selection);
+                Ok(step)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedInvocationFactory {
+        scripts: Arc<Mutex<VecDeque<Vec<ScriptedAction>>>>,
+        selection: crate::config::ModelSelection,
+    }
+
+    impl ScriptedInvocationFactory {
+        fn new(scripts: impl IntoIterator<Item = Vec<ScriptedAction>>) -> Self {
+            Self {
+                scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+                selection: crate::config::ModelSelection::new(
+                    crate::config::DEFAULT_MODEL,
+                    crate::config::DEFAULT_MODEL.default_thinking,
+                )
+                .unwrap(),
+            }
+        }
+    }
+
+    impl ChildModelFactory for ScriptedInvocationFactory {
+        type Model = SelectedScriptedModel;
+
+        fn create(&self, _prompt: String, selection: crate::config::ModelSelection) -> Self::Model {
+            assert_eq!(selection, self.selection);
+            SelectedScriptedModel {
+                model: ScriptedModel::new(
+                    self.scripts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("test configures one child script"),
+                ),
+                selection,
+            }
+        }
+    }
+
+    impl ChildRunner<ChildPayload> for InvocationRunner {
+        fn run(
+            &self,
+            _child: ChildRun<ChildPayload>,
+            cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            let (finish, result) = oneshot::channel();
+            self.started
+                .send(finish)
+                .expect("test receives started child");
+            Box::pin(async move {
+                tokio::select! {
+                    result = result => result.expect("test settles started child"),
+                    _ = cancellation.cancelled() => Err(ChildFailure::new("child cancelled")),
+                }
+            })
+        }
+    }
+
+    impl ChildRunner<ChildPayload> for CallerCapturingInvocationRunner {
+        fn run(
+            &self,
+            child: ChildRun<ChildPayload>,
+            cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            self.callers
+                .send(child.caller().clone())
+                .expect("test receives child caller");
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                Err(ChildFailure::new("child cancelled"))
+            })
+        }
+    }
+
+    async fn invocation_context() -> (
+        AgentInvocationContext,
+        mpsc::UnboundedReceiver<oneshot::Sender<Result<ChildResult, ChildFailure>>>,
+    ) {
+        let (started, receiver) = mpsc::unbounded_channel();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(InvocationRunner { started }),
+        );
+        let caller = coordinator.root_caller().await;
+        (
+            AgentInvocationContext::new(caller, coordinator).with_accepted_thinking(
+                AcceptedThinking::new(selection, snapshot.settings().clone()),
+            ),
+            receiver,
+        )
+    }
+
+    async fn invocation_context_with_clock(
+        clock: Arc<InvocationClock>,
+    ) -> (
+        AgentInvocationContext,
+        SessionSubagents,
+        mpsc::UnboundedReceiver<oneshot::Sender<Result<ChildResult, ChildFailure>>>,
+    ) {
+        let (started, receiver) = mpsc::unbounded_channel();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let coordinator: SessionSubagents = SubagentCoordinator::with_clock(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(InvocationRunner { started }),
+            clock,
+        );
+        let context =
+            AgentInvocationContext::new(coordinator.root_caller().await, coordinator.clone())
+                .with_accepted_thinking(AcceptedThinking::new(
+                    selection,
+                    snapshot.settings().clone(),
+                ));
+        (context, coordinator, receiver)
+    }
+
+    async fn complete_invocation_context(
+        scripts: impl IntoIterator<Item = Vec<ScriptedAction>>,
+    ) -> AgentInvocationContext {
+        complete_invocation_context_with_coordinator(scripts)
+            .await
+            .0
+    }
+
+    async fn complete_invocation_context_with_coordinator(
+        scripts: impl IntoIterator<Item = Vec<ScriptedAction>>,
+    ) -> (AgentInvocationContext, SessionSubagents) {
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(CompleteChildRunner::new(
+                "canonical base".to_owned(),
+                ScriptedInvocationFactory::new(scripts),
+            )),
+        );
+        let context =
+            AgentInvocationContext::new(coordinator.root_caller().await, coordinator.clone())
+                .with_accepted_thinking(AcceptedThinking::new(
+                    selection,
+                    snapshot.settings().clone(),
+                ));
+        (context, coordinator)
+    }
+
+    async fn execute_with_invocation(
+        arena: &mut Arena,
+        context: &AgentInvocationContext,
+        code: &str,
+    ) -> Execution {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        arena
+            .execute_with_progress_and_context(
+                code,
+                &CancellationToken::new(),
+                &mut |_| {},
+                Some(context),
+                Some(selection),
+            )
+            .await
+            .unwrap()
     }
 
     fn assert_interrupted_batch_trace(tool_calls: &[ToolCall]) {
@@ -2888,7 +3220,7 @@ mod tests {
         let updates = progress
             .iter()
             .filter_map(|event| match event {
-                super::ArenaProgress::ToolUpdated { token, call } => Some((*token, *call)),
+                super::ArenaProgress::ToolUpdated { token, call } => Some((*token, call.clone())),
                 super::ArenaProgress::RunPreviewUpdated { .. }
                 | super::ArenaProgress::StdoutDelta { .. }
                 | super::ArenaProgress::StdoutTruncated => None,
@@ -3212,6 +3544,674 @@ mod tests {
             )
             .text
             .contains("changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn python_starts_refreshes_and_waits_for_a_subagent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        let execution = arena
+            .execute_with_progress_and_context(
+                "task = await start_subagent('child work')\ncontinued = 'yes'\ntask.status.state",
+                &cancellation,
+                &mut |_| {},
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "'starting'");
+        assert_eq!(execution.stdout.total_bytes, 0);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::StartSubagent,
+                summary: ToolCallSummary::Subagent("000000".to_owned()),
+            }]
+        );
+        let finish = started.recv().await.expect("child starts");
+
+        let execution = arena
+            .execute_with_progress_and_context(
+                "(continued, (await task.refresh()).state)",
+                &cancellation,
+                &mut |_| {},
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "('yes', 'running')");
+        assert_eq!(execution.stdout.total_bytes, 0);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::RefreshSubagent,
+                summary: ToolCallSummary::Subagent("000000".to_owned()),
+            }]
+        );
+
+        finish
+            .send(Ok(ChildResult::new(
+                "done".to_owned(),
+                BTreeMap::from([("answer".to_owned(), ToolValue::Integer(42))]),
+            )))
+            .unwrap();
+        let execution = arena
+            .execute_with_progress_and_context(
+                "result = await task.wait()\n(continued, result['message'], result['values']['answer'], task.status.state)",
+                &cancellation,
+                &mut |_| {},
+                Some(&context),
+                Some(selection),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('yes', 'done', 42, 'completed')"
+        );
+        assert_eq!(execution.stdout.total_bytes, 0);
+        assert_eq!(
+            execution.tool_calls,
+            [ToolCall {
+                tool: ToolName::WaitSubagent,
+                summary: ToolCallSummary::Subagent("000000".to_owned()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn python_reconnects_and_repeats_waits_and_runs_subagents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await start_subagent('first child')\nrecovered = await get_subagent(task.id)\nrecovered.id == task.id",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        let finish = started.recv().await.expect("first child starts");
+        finish
+            .send(Ok(ChildResult::new(
+                "first done".to_owned(),
+                BTreeMap::from([("answer".to_owned(), ToolValue::Integer(42))]),
+            )))
+            .unwrap();
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "import asyncio\nfirst, second = await asyncio.gather(task.wait(), recovered.wait())\nfirst['values']['answer'] = 0\nsecond['values']['answer']",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "42");
+
+        let mut run = Box::pin(execute_with_invocation(
+            &mut arena,
+            &context,
+            "result = await run_subagent('second child')\nresult['message']",
+        ));
+        let finish = tokio::select! {
+            finish = started.recv() => finish.expect("second child starts"),
+            execution = &mut run => panic!("run_subagent completed before its child: {execution:?}"),
+        };
+        finish
+            .send(Ok(ChildResult::new(
+                "second done".to_owned(),
+                BTreeMap::new(),
+            )))
+            .unwrap();
+        let execution = run.await;
+        assert_eq!(complete(&execution).unwrap().head, "'second done'");
+    }
+
+    #[tokio::test]
+    async fn completed_children_survive_parent_result_delivery_failures() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, coordinator) = complete_invocation_context_with_coordinator([vec![
+            ScriptedAction::Code {
+                source: "result_values['answer'] = 42".to_owned(),
+            },
+            ScriptedAction::Message {
+                text: "child completed".to_owned(),
+            },
+        ]])
+        .await;
+
+        let failed = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await start_subagent('complete before delivery failure')\nsaved_id = task.id\npublished = await task.wait()\nraise Exception('parent delivery failure')",
+        )
+        .await;
+        assert!(
+            python_error(&failed)
+                .text
+                .contains("parent delivery failure")
+        );
+        assert!(matches!(
+            coordinator.records().await.as_slice(),
+            [record] if matches!(
+                record.outcome(),
+                Some(TaskOutcome::Completed(result))
+                    if result.message() == "child completed"
+                        && result.values().get("answer") == Some(&ToolValue::Integer(42))
+            )
+        ));
+
+        let repeated = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await get_subagent(saved_id)\nfirst = await task.wait()\nfirst['values']['answer'] = 0\nsecond = await task.wait()\n(task.status.state, second['message'], second['values']['answer'])",
+        )
+        .await;
+        assert_eq!(
+            complete(&repeated).unwrap().head,
+            "('completed', 'child completed', 42)"
+        );
+        assert!(matches!(
+            coordinator.records().await.as_slice(),
+            [record] if matches!(record.outcome(), Some(TaskOutcome::Completed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn subagent_prompt_limits_accept_exact_ascii_and_unicode_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+        let limit = crate::config::constants::MAX_PROMPT_BYTES;
+
+        for (prompt, expected_id) in [
+            ("a".repeat(limit), "000000"),
+            ("🦀".repeat(limit / '🦀'.len_utf8()), "000001"),
+        ] {
+            let execution = execute_with_invocation(
+                &mut arena,
+                &context,
+                &format!("task = await start_subagent('{prompt}')\ntask.id"),
+            )
+            .await;
+            assert_eq!(
+                complete(&execution).unwrap().head,
+                format!("'{expected_id}'")
+            );
+            let _finish = started.recv().await.expect("exact-byte child starts");
+
+            let cancelled =
+                execute_with_invocation(&mut arena, &context, "(await task.cancel()).state").await;
+            assert_eq!(complete(&cancelled).unwrap().head, "'cancelled'");
+        }
+
+        for prompt in [
+            "a".repeat(limit + 1),
+            "🦀".repeat(limit / '🦀'.len_utf8() + 1),
+        ] {
+            let execution = execute_with_invocation(
+                &mut arena,
+                &context,
+                &format!("caught = None\ntry:\n    await start_subagent('{prompt}')\nexcept ValueError:\n    caught = 'ValueError'\ncaught"),
+            )
+            .await;
+            assert_eq!(complete(&execution).unwrap().head, "'ValueError'");
+            assert!(started.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_only_wait_does_not_emit_child_results() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+
+        execute_with_invocation(&mut arena, &context, "task = await start_subagent('child')").await;
+        let finish = started.recv().await.expect("child starts");
+        finish
+            .send(Ok(ChildResult::new(
+                "hidden child message".to_owned(),
+                BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(42))]),
+            )))
+            .unwrap();
+
+        let execution =
+            execute_with_invocation(&mut arena, &context, "result = await task.wait()").await;
+        assert_eq!(complete(&execution), None);
+        assert_eq!(execution.stdout.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn python_subagent_validation_and_terminal_errors_use_builtin_exceptions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+        let limit = crate::config::constants::MAX_PROMPT_BYTES;
+        let validation = format!(
+            "errors = []\ntry:\n    await _kiki_start_subagent('missing arguments')\nexcept TypeError:\n    errors.append('start_arity')\ntry:\n    await _kiki_start_subagent(prompt='keyword', model=None, read_only=False)\nexcept TypeError:\n    errors.append('keywords')\ntry:\n    await _kiki_get_subagent()\nexcept TypeError:\n    errors.append('get_arity')\ntry:\n    await _kiki_refresh_subagent('000000', 'extra')\nexcept TypeError:\n    errors.append('refresh_arity')\ntry:\n    await _kiki_wait_subagent(0)\nexcept TypeError:\n    errors.append('wait_type')\ntry:\n    await _kiki_cancel_subagent('000000', 'extra')\nexcept TypeError:\n    errors.append('cancel_arity')\ntry:\n    await start_subagent('', None, False)\nexcept ValueError:\n    errors.append('empty')\ntry:\n    await start_subagent('🦀' * {}, None, False)\nexcept ValueError:\n    errors.append('unicode')\ntry:\n    await start_subagent('valid', 'unknown/model', False)\nexcept ValueError:\n    errors.append('model')\ntry:\n    await start_subagent('valid', None, 1)\nexcept TypeError:\n    errors.append('boolean')\ntry:\n    await get_subagent('invalid')\nexcept ValueError:\n    errors.append('id')\nerrors",
+            limit / '🦀'.len_utf8() + 1,
+        );
+        let execution = execute_with_invocation(&mut arena, &context, &validation).await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "['start_arity', 'keywords', 'get_arity', 'refresh_arity', 'wait_type', 'cancel_arity', 'empty', 'unicode', 'model', 'boolean', 'id']"
+        );
+        assert!(started.try_recv().is_err());
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await start_subagent('failure')\ntask.id",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        let finish = started.recv().await.expect("child starts");
+        finish.send(Err(ChildFailure::new("failed work"))).unwrap();
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "caught = None\ntry:\n    await task.wait()\nexcept RuntimeError as error:\n    caught = (task.status.state, task.status.error, task.id in str(error))\ncaught",
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('failed', 'failed work', True)"
+        );
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "cancelled = await start_subagent('cancel')\nstatus = await cancelled.cancel()\ncaught = None\ntry:\n    await cancelled.wait()\nexcept RuntimeError:\n    caught = cancelled.status.state\n(status.state, caught)",
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('cancelled', 'cancelled')"
+        );
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "caught = None\ntry:\n    await start_subagent('missing context')\nexcept RuntimeError as error:\n    caught = str(error)\ncaught",
+        )
+        .await
+        .unwrap();
+        assert!(
+            complete(&execution)
+                .unwrap()
+                .head
+                .contains("context is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn gathered_subagent_starts_preserve_filesystem_effects_and_result_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, _started) = invocation_context().await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "import asyncio\ncontents, task = await asyncio.gather(read('file'), start_subagent('child'))\nawait write('file', contents + '!')\nawait task.cancel()\ntask.id",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before!"
+        );
+        assert_eq!(
+            execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Count(6),
+                },
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Replaced,
+                },
+                ToolCall {
+                    tool: ToolName::CancelSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn gathered_waits_settle_successful_siblings_after_a_child_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "first = await start_subagent('first')\nsecond = await start_subagent('second')\n(second.id)",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'000001'");
+        let first = started.recv().await.expect("first child starts");
+        let second = started.recv().await.expect("second child starts");
+        first.send(Err(ChildFailure::new("failed first"))).unwrap();
+        second
+            .send(Ok(ChildResult::new(
+                "second done".to_owned(),
+                BTreeMap::new(),
+            )))
+            .unwrap();
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "import asyncio\nawait asyncio.gather(first.wait(), second.wait())",
+        )
+        .await;
+        assert!(python_error(&execution).text.contains("RuntimeError"));
+        assert_eq!(
+            complete(
+                &execute_with_invocation(&mut arena, &context, "(await second.wait())['message']")
+                    .await,
+            )
+            .unwrap()
+            .head,
+            "'second done'"
+        );
+    }
+
+    #[tokio::test]
+    async fn python_wait_maps_timed_out_children_and_updates_the_cached_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let clock = Arc::new(InvocationClock::new());
+        let (context, coordinator, mut started) =
+            invocation_context_with_clock(clock.clone()).await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await start_subagent('timeout')\ntask.id",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        let _finish = started.recv().await.expect("child starts");
+        clock.advance(Duration::from_secs(901));
+        coordinator.service().await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "caught = None\ntry:\n    await task.wait()\nexcept TimeoutError:\n    caught = task.status.state\ncaught",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'timed_out'");
+    }
+
+    #[tokio::test]
+    async fn python_subagent_selection_uses_the_invoking_step_or_accepted_target_thinking() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let invoking = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let accepted = AcceptedThinking::new(invoking, snapshot.settings().clone());
+        let terra =
+            crate::config::ModelSelection::new(&crate::config::models::TERRA, "high").unwrap();
+        accepted.accept(terra);
+        let (selections, mut received) = mpsc::unbounded_channel();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(SelectionRunner { selections }),
+        );
+        let context = AgentInvocationContext::new(coordinator.root_caller().await, coordinator)
+            .with_accepted_thinking(accepted);
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "inherited = await start_subagent('inherit')\noverridden = await start_subagent('override', 'openai/gpt-5.6-terra')\n(inherited.status.model, inherited.status.thinking, overridden.status.model, overridden.status.thinking)",
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('openai/gpt-5.6-sol', 'medium', 'openai/gpt-5.6-terra', 'high')"
+        );
+        assert_eq!(received.recv().await, Some(invoking));
+        assert_eq!(received.recv().await, Some(terra));
+    }
+
+    #[tokio::test]
+    async fn same_execution_starts_inherit_the_pre_execution_checkpoint_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        execute_without_cancellation(&mut arena, "inherited = 'before'")
+            .await
+            .unwrap();
+        let context = complete_invocation_context([
+            vec![
+                ScriptedAction::Code {
+                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "first".to_owned(),
+                },
+            ],
+            vec![
+                ScriptedAction::Code {
+                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "second".to_owned(),
+                },
+            ],
+        ])
+        .await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "same_execution = 'later'\nfirst = await start_subagent('first')\nsecond = await start_subagent('second')\n(first.id, second.id)",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "('000000', '000001')");
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "first_result = await first.wait()\nsecond_result = await second.wait()\nroot_exports = None\ntry:\n    result_values\nexcept NameError:\n    root_exports = 'missing'\n(first_result['values']['inherited'], first_result['values']['same_execution'], second_result['values']['inherited'], second_result['values']['same_execution'], root_exports)",
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "('before', 'missing', 'before', 'missing', 'missing')"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutated_task_ids_are_rejected_without_affecting_reconnectable_children() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, mut started) = invocation_context().await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await start_subagent('child')\nsaved_id = task.id\nerrors = []\ntask.id = 'bad'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('malformed_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('malformed_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('malformed_cancel')\ntask.id = 'zzzzzz'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('unknown_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('unknown_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('unknown_cancel')\n(errors, saved_id)",
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "(['malformed_refresh', 'malformed_wait', 'malformed_cancel', 'unknown_refresh', 'unknown_wait', 'unknown_cancel'], '000000')"
+        );
+        let checkpoint = arena.checkpoint();
+        arena.restore(checkpoint).await.unwrap();
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "task = await get_subagent(saved_id)\n(task.id, task.status.state)",
+        )
+        .await;
+        assert!(matches!(
+            complete(&execution).unwrap().head.as_str(),
+            "('000000', 'starting')" | "('000000', 'running')"
+        ));
+        let finish = started.recv().await.expect("child starts");
+        finish
+            .send(Ok(ChildResult::new("done".to_owned(), BTreeMap::new())))
+            .unwrap();
+        let execution =
+            execute_with_invocation(&mut arena, &context, "(await task.wait())['id']").await;
+        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+    }
+
+    #[tokio::test]
+    async fn child_callers_map_self_ancestor_and_sibling_denials_to_permission_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap();
+        let (callers, mut captured) = mpsc::unbounded_channel();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(CallerCapturingInvocationRunner { callers }),
+        );
+        let root = coordinator.root_caller().await;
+        let payload = || ChildPayload::new(arena.child_source(), arena.checkpoint());
+        let parameters = || ChildParameters::new("child".to_owned(), selection, false);
+
+        let parent = coordinator
+            .start(&root, parameters(), payload())
+            .await
+            .unwrap();
+        let parent_caller = captured.recv().await.expect("parent caller");
+        let child = coordinator
+            .start(&parent_caller, parameters(), payload())
+            .await
+            .unwrap();
+        let child_caller = captured.recv().await.expect("child caller");
+        let sibling = coordinator
+            .start(&parent_caller, parameters(), payload())
+            .await
+            .unwrap();
+        let _sibling_caller = captured.recv().await.expect("sibling caller");
+        let context =
+            AgentInvocationContext::new(child_caller, coordinator.clone()).with_accepted_thinking(
+                AcceptedThinking::new(selection, snapshot.settings().clone()),
+            );
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            &format!(
+                "errors = []\nalias = _kiki_get_subagent\ntry:\n    await alias('{}')\nexcept PermissionError:\n    errors.append('self_get')\ntry:\n    await _kiki_refresh_subagent('{}')\nexcept PermissionError:\n    errors.append('ancestor_refresh')\ntry:\n    await _kiki_wait_subagent('{}')\nexcept PermissionError:\n    errors.append('sibling_wait')\ntry:\n    await _kiki_cancel_subagent('{}')\nexcept PermissionError:\n    errors.append('self_cancel')\nerrors",
+                child.id(),
+                parent.id(),
+                sibling.id(),
+                child.id(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            complete(&execution).unwrap().head,
+            "['self_get', 'ancestor_refresh', 'sibling_wait', 'self_cancel']"
+        );
+        for id in [parent.id(), child.id(), sibling.id()] {
+            assert_eq!(
+                coordinator.get(&root, id).await.unwrap().state(),
+                TaskState::Running
+            );
+        }
+        coordinator.cancel_all().await;
+        assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn nested_subagents_use_the_same_trusted_selection_context() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let context = complete_invocation_context([
+            vec![
+                ScriptedAction::Code {
+                    source: "grandchild = await start_subagent('nested')\nresult_values['nested_id'] = grandchild.id".to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "child complete".to_owned(),
+                },
+            ],
+            vec![ScriptedAction::Message {
+                text: "grandchild complete".to_owned(),
+            }],
+        ])
+        .await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "child = await start_subagent('parent child')\nchild_result = await child.wait()\ngrandchild = await get_subagent(child_result['values']['nested_id'])\n(await grandchild.wait())['message']",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "'grandchild complete'");
+    }
+
+    #[tokio::test]
+    async fn child_invocation_authority_and_read_only_permissions_are_host_enforced() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let mut arena = arena(&workspace).await;
+        let context = complete_invocation_context([
+            vec![
+                ScriptedAction::Code {
+                    source: "try:\n    await get_subagent('000000')\nexcept PermissionError:\n    result_values['self_denied'] = True".to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "authority checked".to_owned(),
+                },
+            ],
+            vec![
+                ScriptedAction::Code {
+                    source: "try:\n    await write('file', 'after')\nexcept PermissionError:\n    result_values['write_denied'] = True".to_owned(),
+                },
+                ScriptedAction::Message {
+                    text: "permissions checked".to_owned(),
+                },
+            ],
+        ])
+        .await;
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            "parent = await start_subagent('authority')\nreadonly = await start_subagent('permissions', None, True)\nparent_result = await parent.wait()\nreadonly_result = await readonly.wait()\n(parent_result['values']['self_denied'], readonly_result['values']['write_denied'])",
+        )
+        .await;
+        assert_eq!(complete(&execution).unwrap().head, "(True, True)");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before"
         );
     }
 
@@ -5340,11 +6340,10 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert_eq!(execution.tool_calls.len(), 6);
         assert!(execution.tool_calls.iter().all(|call| {
-            *call
-                == ToolCall {
-                    tool: ToolName::Read,
-                    summary: ToolCallSummary::Count(1),
-                }
+            call == &ToolCall {
+                tool: ToolName::Read,
+                summary: ToolCallSummary::Count(1),
+            }
         }));
     }
 

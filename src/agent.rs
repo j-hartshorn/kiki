@@ -832,6 +832,7 @@ fn error_truncation_warning() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -851,11 +852,15 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
-    use crate::config::{ModelSelection, models::SOL};
+    use crate::config::{DEFAULT_MODEL, ModelSelection, models::SOL};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
+    };
+    use crate::subagents::{
+        AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
+        RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
     };
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
 
@@ -910,6 +915,45 @@ mod tests {
             .collect()
     }
 
+    struct SelectedScriptedModel {
+        model: ScriptedModel,
+        selection: ModelSelection,
+    }
+
+    impl Model for SelectedScriptedModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let mut step = self.model.step(history, cancellation, progress).await?;
+                step.selection = Some(self.selection);
+                Ok(step)
+            }
+        }
+    }
+
+    struct ImmediateChildResultRunner;
+
+    impl ChildRunner<ChildPayload> for ImmediateChildResultRunner {
+        fn run(
+            &self,
+            _child: ChildRun<ChildPayload>,
+            _cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            Box::pin(async {
+                Ok(ChildResult::new(
+                    "hidden child message".to_owned(),
+                    BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(42))]),
+                ))
+            })
+        }
+    }
+
     struct ObservationMetadata {
         head_lines: usize,
         tail_lines: usize,
@@ -935,6 +979,60 @@ mod tests {
             tail_starts_mid_line: metadata.tail_starts_mid_line,
             partial_lines: metadata.head_ends_mid_line || metadata.tail_starts_mid_line,
         }
+    }
+
+    #[tokio::test]
+    async fn assignment_only_wait_keeps_child_results_out_of_model_feedback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(ImmediateChildResultRunner),
+        );
+        let context = AgentInvocationContext::new(coordinator.root_caller().await, coordinator)
+            .with_accepted_thinking(AcceptedThinking::new(
+                selection,
+                snapshot.settings().clone(),
+            ));
+        let mut agent = agent_with_model(
+            &workspace,
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "task = await start_subagent('child')".to_owned(),
+                    },
+                    ModelAction::Code {
+                        source: "result = await task.wait()".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ]),
+                selection,
+            },
+        )
+        .await;
+        agent.set_invocation_context(context);
+
+        assert_eq!(
+            agent
+                .run("inspect", &CancellationToken::new())
+                .await
+                .unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        let feedback = agent.model.model.contexts()[2]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("final model step receives the wait execution")
+            .result();
+        assert_eq!(
+            feedback,
+            &CodeResult::Execution {
+                feedback: String::new()
+            }
+        );
     }
 
     #[tokio::test]

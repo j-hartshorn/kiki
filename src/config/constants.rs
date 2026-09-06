@@ -5,6 +5,7 @@ pub(crate) const PROVIDER_CODE_LIMIT: usize = 256;
 pub(crate) const PROVIDER_MESSAGE_LIMIT: usize = 4 * 1024;
 pub(crate) const ARENA_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const ARENA_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub(crate) const FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const COLLECTION_MAX_ITEMS: usize = 10_000;
 pub(crate) const COLLECTION_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;

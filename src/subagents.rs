@@ -3,8 +3,8 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as SyncMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
@@ -13,10 +13,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
 use crate::arena::{ArenaChildSource, Checkpoint};
-use crate::config::{ModelSelection, settings::SubagentSettings};
+use crate::config::{
+    ModelSelection,
+    constants::MAX_PROMPT_BYTES,
+    models::{ModelConfiguration, model_by_id},
+    settings::{SettingsContext, SubagentSettings},
+};
 use crate::model::{AttemptAccounting, Model};
 use crate::prompt::child_prompt;
-use crate::tools::ToolValue;
+use crate::tools::{ToolError, ToolValue};
 
 #[cfg_attr(not(test), allow(dead_code))]
 const TASK_ID_WIDTH: usize = 6;
@@ -34,6 +39,14 @@ pub(crate) struct TaskId(String);
 impl TaskId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        (value.len() == TASK_ID_WIDTH
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+        .then(|| Self(value.to_owned()))
     }
 }
 
@@ -267,22 +280,89 @@ pub(crate) trait ChildRunner<P: Send + 'static>: Send + Sync + 'static {
 pub(crate) struct ChildPayload {
     source: ArenaChildSource,
     checkpoint: Checkpoint,
+    accepted_thinking: Option<AcceptedThinking>,
 }
 
 impl ChildPayload {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(source: ArenaChildSource, checkpoint: Checkpoint) -> Self {
-        Self { source, checkpoint }
+        Self {
+            source,
+            checkpoint,
+            accepted_thinking: None,
+        }
+    }
+
+    fn with_accepted_thinking(mut self, accepted_thinking: AcceptedThinking) -> Self {
+        self.accepted_thinking = Some(accepted_thinking);
+        self
     }
 }
 
 pub(crate) type SessionSubagents = SubagentCoordinator<ChildPayload>;
 
 #[derive(Clone)]
+pub(crate) struct AcceptedThinking(Arc<RwLock<AcceptedThinkingState>>);
+
+struct AcceptedThinkingState {
+    persisted: SettingsContext,
+    values: BTreeMap<&'static str, &'static str>,
+}
+
+impl AcceptedThinking {
+    pub(crate) fn new(selection: ModelSelection, persisted: SettingsContext) -> Self {
+        Self(Arc::new(RwLock::new(AcceptedThinkingState {
+            persisted,
+            values: BTreeMap::from([(selection.model().id, selection.thinking())]),
+        })))
+    }
+
+    pub(crate) fn accept(&self, selection: ModelSelection) {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values
+            .insert(selection.model().id, selection.thinking());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persisted_settings(&self) -> SettingsContext {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .persisted
+            .clone()
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        invoking: ModelSelection,
+        target: Option<&'static ModelConfiguration>,
+    ) -> ModelSelection {
+        let Some(target) = target else {
+            return invoking;
+        };
+        let state = self
+            .0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let thinking = state
+            .values
+            .get(target.id)
+            .copied()
+            .or_else(|| state.persisted.thinking_for(target))
+            .unwrap_or(target.default_thinking);
+        ModelSelection::new(target, thinking)
+            .expect("accepted or persisted thinking must be supported by its model")
+    }
+}
+
+#[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AgentInvocationContext {
     caller: Caller,
     coordinator: SessionSubagents,
+    accepted_thinking: Option<AcceptedThinking>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -291,7 +371,13 @@ impl AgentInvocationContext {
         Self {
             caller,
             coordinator,
+            accepted_thinking: None,
         }
+    }
+
+    pub(crate) fn with_accepted_thinking(mut self, accepted_thinking: AcceptedThinking) -> Self {
+        self.accepted_thinking = Some(accepted_thinking);
+        self
     }
 
     pub(crate) fn execution(
@@ -306,6 +392,7 @@ impl AgentInvocationContext {
             checkpoint,
             source,
             coordinator: self.coordinator.clone(),
+            accepted_thinking: self.accepted_thinking.clone(),
         }
     }
 }
@@ -318,6 +405,7 @@ pub(crate) struct TrustedExecutionContext {
     checkpoint: Checkpoint,
     source: ArenaChildSource,
     coordinator: SessionSubagents,
+    accepted_thinking: Option<AcceptedThinking>,
 }
 
 #[allow(dead_code)]
@@ -331,11 +419,322 @@ impl TrustedExecutionContext {
     }
 
     pub(crate) fn payload(&self) -> ChildPayload {
-        ChildPayload::new(self.source.clone(), self.checkpoint.clone())
+        let payload = ChildPayload::new(self.source.clone(), self.checkpoint.clone());
+        match &self.accepted_thinking {
+            Some(accepted_thinking) => payload.with_accepted_thinking(accepted_thinking.clone()),
+            None => payload,
+        }
+    }
+
+    fn resolve_selection(&self, model: Option<&str>) -> Result<ModelSelection, ToolError> {
+        let invoking = self.selection.ok_or_else(|| {
+            ToolError::runtime("subagent model selection is unavailable for this execution")
+        })?;
+        let target = match model {
+            Some(model) => Some(
+                model_by_id(model)
+                    .ok_or_else(|| ToolError::value(format!("unknown subagent model `{model}`")))?,
+            ),
+            None => None,
+        };
+        let accepted_thinking = self.accepted_thinking.as_ref().ok_or_else(|| {
+            ToolError::runtime("subagent invocation context is unavailable for this execution")
+        })?;
+        Ok(accepted_thinking.resolve(invoking, target))
     }
 
     pub(crate) fn coordinator(&self) -> &SessionSubagents {
         &self.coordinator
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum InvocationOperation {
+    Start,
+    Get,
+    Refresh,
+    Wait,
+    Cancel,
+}
+
+impl InvocationOperation {
+    pub(crate) fn from_private_name(name: &str) -> Option<Self> {
+        match name {
+            "_kiki_start_subagent" => Some(Self::Start),
+            "_kiki_get_subagent" => Some(Self::Get),
+            "_kiki_refresh_subagent" => Some(Self::Refresh),
+            "_kiki_wait_subagent" => Some(Self::Wait),
+            "_kiki_cancel_subagent" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tool(self) -> crate::tools::ToolName {
+        match self {
+            Self::Start => crate::tools::ToolName::StartSubagent,
+            Self::Get => crate::tools::ToolName::GetSubagent,
+            Self::Refresh => crate::tools::ToolName::RefreshSubagent,
+            Self::Wait => crate::tools::ToolName::WaitSubagent,
+            Self::Cancel => crate::tools::ToolName::CancelSubagent,
+        }
+    }
+}
+
+pub(crate) async fn invoke(
+    context: Option<&TrustedExecutionContext>,
+    operation: InvocationOperation,
+    arguments: ToolValue,
+) -> Result<ToolValue, ToolError> {
+    let context = context.ok_or_else(|| {
+        ToolError::runtime("subagent invocation context is unavailable for this execution")
+    })?;
+    match operation {
+        InvocationOperation::Start => {
+            let (prompt, model, read_only) = start_arguments(arguments)?;
+            let selection = context.resolve_selection(model.as_deref())?;
+            let observation = context
+                .coordinator()
+                .start(
+                    context.caller(),
+                    ChildParameters::new(prompt, selection, read_only),
+                    context.payload(),
+                )
+                .await
+                .map_err(admission_error)?;
+            Ok(task_handle_value(&observation))
+        }
+        InvocationOperation::Get => {
+            let id = task_id_argument(arguments, "get_subagent")?;
+            let observation = context
+                .coordinator()
+                .get(context.caller(), &id)
+                .await
+                .map_err(access_error)?;
+            Ok(task_handle_value(&observation))
+        }
+        InvocationOperation::Refresh => {
+            let id = task_id_argument(arguments, "refresh_subagent")?;
+            let observation = context
+                .coordinator()
+                .get(context.caller(), &id)
+                .await
+                .map_err(access_error)?;
+            Ok(observation_value(&observation))
+        }
+        InvocationOperation::Wait => {
+            let id = task_id_argument(arguments, "wait_subagent")?;
+            match context.coordinator().wait(context.caller(), &id).await {
+                Ok((result, observation)) => Ok(wait_value(
+                    "completed",
+                    observation,
+                    Some(result_value(&id, result)),
+                    None,
+                )),
+                Err(WaitError::Access(error)) => Err(access_error(error)),
+                Err(error) => {
+                    let message = error.to_string();
+                    let observation = error
+                        .observation()
+                        .expect("terminal wait errors carry observations")
+                        .clone();
+                    let outcome = match observation.state() {
+                        TaskState::TimedOut => "timed_out",
+                        TaskState::Failed | TaskState::Cancelled => "failed",
+                        state => unreachable!("wait errors have terminal states, got {state:?}"),
+                    };
+                    Ok(wait_value(outcome, observation, None, Some(message)))
+                }
+            }
+        }
+        InvocationOperation::Cancel => {
+            let id = task_id_argument(arguments, "cancel_subagent")?;
+            let observation = context
+                .coordinator()
+                .cancel(context.caller(), &id)
+                .await
+                .map_err(access_error)?;
+            Ok(observation_value(&observation))
+        }
+    }
+}
+
+fn start_arguments(arguments: ToolValue) -> Result<(String, Option<String>, bool), ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(
+            "start_subagent requires prompt, model, and read_only positional arguments",
+        ));
+    };
+    let [prompt, model, read_only] = arguments.as_slice() else {
+        return Err(ToolError::type_error(
+            "start_subagent requires prompt, model, and read_only positional arguments",
+        ));
+    };
+    let ToolValue::String(prompt) = prompt else {
+        return Err(ToolError::type_error("subagent prompt must be a string"));
+    };
+    if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+        return Err(ToolError::value(format!(
+            "subagent prompt must be non-empty and at most {MAX_PROMPT_BYTES} UTF-8 bytes"
+        )));
+    }
+    let model = match model {
+        ToolValue::None => None,
+        ToolValue::String(model) => Some(model.clone()),
+        _ => {
+            return Err(ToolError::type_error(
+                "subagent model must be a string or None",
+            ));
+        }
+    };
+    let ToolValue::Bool(read_only) = read_only else {
+        return Err(ToolError::type_error(
+            "subagent read_only must be a boolean",
+        ));
+    };
+    Ok((prompt.clone(), model, *read_only))
+}
+
+fn task_id_argument(arguments: ToolValue, operation: &str) -> Result<TaskId, ToolError> {
+    let ToolValue::List(arguments) = arguments else {
+        return Err(ToolError::type_error(format!(
+            "{operation} requires one task ID positional argument"
+        )));
+    };
+    let [id] = arguments.as_slice() else {
+        return Err(ToolError::type_error(format!(
+            "{operation} requires one task ID positional argument"
+        )));
+    };
+    let ToolValue::String(id) = id else {
+        return Err(ToolError::type_error("subagent task ID must be a string"));
+    };
+    TaskId::parse(id)
+        .ok_or_else(|| ToolError::value("subagent task ID must be six base-36 characters"))
+}
+
+fn admission_error(error: AdmissionError) -> ToolError {
+    match error {
+        AdmissionError::InvalidCaller => ToolError::runtime(error.to_string()),
+        AdmissionError::ShuttingDown
+        | AdmissionError::CallerStopped
+        | AdmissionError::NestedDisabled
+        | AdmissionError::DepthLimit
+        | AdmissionError::ConcurrentLimit
+        | AdmissionError::StartBudget
+        | AdmissionError::IdentifierSpaceExhausted => ToolError::runtime(error.to_string()),
+    }
+}
+
+fn access_error(error: AccessError) -> ToolError {
+    match error {
+        AccessError::InvalidCaller => ToolError::runtime(error.to_string()),
+        AccessError::UnknownTask(_) => ToolError::value(error.to_string()),
+        AccessError::Denied(_) => ToolError::permission(error.to_string()),
+    }
+}
+
+fn task_handle_value(observation: &TaskObservation) -> ToolValue {
+    ToolValue::Dictionary(BTreeMap::from([
+        (
+            "id".to_owned(),
+            ToolValue::String(observation.id().as_str().to_owned()),
+        ),
+        ("status".to_owned(), observation_value(observation)),
+    ]))
+}
+
+fn observation_value(observation: &TaskObservation) -> ToolValue {
+    ToolValue::Dictionary(BTreeMap::from([
+        (
+            "id".to_owned(),
+            ToolValue::String(observation.id().as_str().to_owned()),
+        ),
+        (
+            "state".to_owned(),
+            ToolValue::String(task_state_name(observation.state()).to_owned()),
+        ),
+        (
+            "model".to_owned(),
+            ToolValue::String(observation.model().to_owned()),
+        ),
+        (
+            "thinking".to_owned(),
+            ToolValue::String(observation.thinking().to_owned()),
+        ),
+        (
+            "step_count".to_owned(),
+            ToolValue::Integer(i64::try_from(observation.step_count()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "elapsed_ms".to_owned(),
+            ToolValue::Integer(
+                i64::try_from(observation.elapsed().as_millis()).unwrap_or(i64::MAX),
+            ),
+        ),
+        (
+            "observed_at_ms".to_owned(),
+            ToolValue::Integer(observation.observed_at_ms()),
+        ),
+        (
+            "estimated_cost_usd".to_owned(),
+            observation
+                .estimated_cost_usd()
+                .map_or(ToolValue::None, ToolValue::Float),
+        ),
+        (
+            "cost_status".to_owned(),
+            ToolValue::String(cost_status_name(observation.cost_status()).to_owned()),
+        ),
+        (
+            "error".to_owned(),
+            observation
+                .error()
+                .map_or(ToolValue::None, |error| ToolValue::String(error.to_owned())),
+        ),
+    ]))
+}
+
+fn result_value(id: &TaskId, result: ChildResult) -> ToolValue {
+    let (message, values) = result.into_parts();
+    ToolValue::Dictionary(BTreeMap::from([
+        ("id".to_owned(), ToolValue::String(id.as_str().to_owned())),
+        ("message".to_owned(), ToolValue::String(message)),
+        ("values".to_owned(), ToolValue::Dictionary(values)),
+    ]))
+}
+
+fn wait_value(
+    outcome: &str,
+    observation: TaskObservation,
+    result: Option<ToolValue>,
+    error: Option<String>,
+) -> ToolValue {
+    ToolValue::Dictionary(BTreeMap::from([
+        ("outcome".to_owned(), ToolValue::String(outcome.to_owned())),
+        ("status".to_owned(), observation_value(&observation)),
+        ("result".to_owned(), result.unwrap_or(ToolValue::None)),
+        (
+            "error".to_owned(),
+            error.map_or(ToolValue::None, ToolValue::String),
+        ),
+    ]))
+}
+
+fn task_state_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Starting => "starting",
+        TaskState::Running => "running",
+        TaskState::Stopping => "stopping",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Cancelled => "cancelled",
+        TaskState::TimedOut => "timed_out",
+    }
+}
+
+fn cost_status_name(status: CostStatus) -> &'static str {
+    match status {
+        CostStatus::Unavailable => "unavailable",
     }
 }
 
@@ -370,6 +769,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let (id, caller, _parent, _depth, parameters, payload, reporter, coordinator) =
             child.into_parts();
         let (request, selection, read_only) = parameters.into_parts();
+        let accepted_thinking = payload.accepted_thinking.clone();
         let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
         let model = models.create(child_prompt, selection);
         Box::pin(async move {
@@ -383,7 +783,11 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                 }
             };
             let mut agent = Agent::new(arena, model);
-            agent.set_invocation_context(AgentInvocationContext::new(caller, coordinator));
+            let mut context = AgentInvocationContext::new(caller, coordinator);
+            if let Some(accepted_thinking) = accepted_thinking {
+                context = context.with_accepted_thinking(accepted_thinking);
+            }
+            agent.set_invocation_context(context);
             let mut progress = |event| {
                 if matches!(event, AgentProgress::ModelStepStarted) {
                     reporter.model_step_started();
