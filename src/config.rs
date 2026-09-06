@@ -193,6 +193,7 @@ pub struct StartupSnapshot {
     workspace_root: Option<RedactedPath>,
     model: &'static ModelConfiguration,
     thinking: &'static str,
+    subagents: settings::SubagentSettings,
     settings: settings::SettingsContext,
     prompt_source: PromptProvenance,
     api_key_presence: ApiKeyPresence,
@@ -214,6 +215,11 @@ impl StartupSnapshot {
 
     pub fn thinking(&self) -> &'static str {
         self.thinking
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subagents(&self) -> settings::SubagentSettings {
+        self.subagents
     }
 
     pub(crate) fn settings(&self) -> &settings::SettingsContext {
@@ -435,6 +441,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     });
     let model = settings.model();
     let thinking = settings.thinking();
+    let subagents = settings.subagents();
     let settings_context = settings.context().clone();
     let settings_problems = settings
         .problems()
@@ -467,6 +474,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
             workspace_root: workspace_root_display,
             model,
             thinking,
+            subagents,
             settings: settings_context,
             prompt_source: prompt_source_display,
             api_key_presence,
@@ -832,11 +840,11 @@ mod tests {
         let project = tempdir().expect("project directory");
         write_settings(
             home.path(),
-            "model = \"openai/gpt-5.6-sol\"\n\n[thinking]\n\"openai/gpt-5.6-sol\" = \"low\"\n",
+            "model = \"openai/gpt-5.6-sol\"\n\n[thinking]\n\"openai/gpt-5.6-sol\" = \"low\"\n\n[subagents]\nallow_nested = false\nmax_concurrent = 3\nmax_starts_per_run = 12\ntimeout_seconds = 60\n",
         );
         write_settings(
             project.path(),
-            "model = \"openai/gpt-5.6-terra\"\n\n[thinking]\n\"openai/gpt-5.6-terra\" = \"high\"\n",
+            "model = \"openai/gpt-5.6-terra\"\n\n[thinking]\n\"openai/gpt-5.6-terra\" = \"high\"\n\n[subagents]\nmax_depth = 2\n",
         );
         let mut input = ready_input_with_settings(home.path(), project.path());
         input.model = Some(OsString::from(LUNA.id));
@@ -859,6 +867,12 @@ mod tests {
         );
         assert_eq!(snapshot.settings().thinking_for(&SOL), Some("low"));
         assert_eq!(snapshot.settings().thinking_for(&TERRA), Some("high"));
+        let subagents = snapshot.subagents();
+        assert!(!subagents.allow_nested());
+        assert_eq!(subagents.max_concurrent(), 3);
+        assert_eq!(subagents.max_starts_per_run(), 12);
+        assert_eq!(subagents.max_depth(), 2);
+        assert_eq!(subagents.timeout().as_secs(), 60);
         let ready = configuration.ready().expect("ready configuration");
         assert_eq!(ready.thinking(), "max");
     }
@@ -868,10 +882,7 @@ mod tests {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         write_settings(home.path(), "model = [\n");
-        write_settings(
-            project.path(),
-            "[thinking]\n\"openai/gpt-5.6-sol\" = \"untrusted-value\"\n",
-        );
+        write_settings(project.path(), "[subagents]\nmax_depth = 0\n");
 
         let configuration = resolve_startup(ready_input_with_settings(home.path(), project.path()));
         let snapshot = configuration.snapshot();
@@ -886,6 +897,11 @@ mod tests {
                 StartupProblemKind::UserSettingsMalformed,
                 StartupProblemKind::ProjectSettingsInvalid,
             ]
+        );
+        assert!(
+            snapshot.problems()[1]
+                .diagnostic()
+                .contains("subagents.max_depth")
         );
         assert_eq!(
             snapshot.submission_availability(),
