@@ -27,8 +27,11 @@ use crate::config::models::CATALOGUE;
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout};
-use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
+use crate::runtime::{
+    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver, control_command,
+};
 use crate::selection::{DocumentPosition, Selection};
+use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -1215,6 +1218,7 @@ pub(crate) fn run(
     commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
+    trace: Trace,
 ) -> Result<(), TuiError> {
     let mut app = App::configured(startup);
     let mut input = CrosstermEvents;
@@ -1240,6 +1244,7 @@ pub(crate) fn run(
                                 &mut progress,
                                 &mut clipboard,
                                 &mut titles,
+                                &trace,
                             )
                             .map(|_| ())
                         },
@@ -1404,11 +1409,19 @@ fn run_configuration_loop<B: Backend>(
 fn dispatch_commands(
     commands: &mpsc::Sender<RuntimeCommand>,
     update: &Update,
+    trace: &Trace,
 ) -> Result<(), TuiError> {
     for command in &update.commands {
+        let control = control_command(command);
+        if let Some(command) = control {
+            trace.emit(|| TraceEvent::TuiCommandDispatch { command });
+        }
         commands
             .blocking_send(command.clone())
             .map_err(|_| TuiError::RuntimeClosed)?;
+        if let Some(command) = control {
+            trace.emit(|| TraceEvent::TuiCommandQueued { command });
+        }
     }
     Ok(())
 }
@@ -1432,6 +1445,7 @@ fn run_loop<B: Backend>(
         progress,
         clipboard,
         &mut NoopTitlePublisher,
+        &Trace::disabled(),
     )
 }
 
@@ -1445,6 +1459,7 @@ fn run_loop_with_titles<B: Backend>(
     progress: &mut RuntimeProgressReceiver,
     clipboard: &mut impl ClipboardPort,
     titles: &mut impl TitlePublisher,
+    trace: &Trace,
 ) -> Result<usize, TuiError> {
     let mut dirty = true;
     publish_title(app, titles);
@@ -1467,7 +1482,7 @@ fn run_loop_with_titles<B: Backend>(
                     if previous_title != app.title() {
                         dirty |= publish_title(app, titles);
                     }
-                    dispatch_commands(commands, &update)?;
+                    dispatch_commands(commands, &update, trace)?;
                     quit = update.quit;
                 }
                 Event::Mouse(mouse) => {
@@ -1510,7 +1525,7 @@ fn run_loop_with_titles<B: Backend>(
 
         let update = app.tick(Instant::now());
         dirty |= update.visible_changed;
-        dispatch_commands(commands, &update)?;
+        dispatch_commands(commands, &update, trace)?;
     }
 }
 
@@ -1872,6 +1887,7 @@ mod tests {
         StoredRecord, TerminalDetails,
     };
     use crate::subagents::TaskState;
+    use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -2561,6 +2577,7 @@ mod tests {
             &mut progress,
             &mut clipboard,
             &mut titles,
+            &Trace::disabled(),
         )
         .expect("loop");
 
@@ -2599,6 +2616,7 @@ mod tests {
                     &mut progress,
                     &mut clipboard,
                     &mut titles,
+                    &Trace::disabled(),
                 )
                 .map(|_| ())
             },
@@ -2927,6 +2945,61 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_brackets_tui_cancellation_command_queueing() {
+        let directory = tempdir().expect("trace directory");
+        let trace_file = directory.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let (sender, mut receiver) = mpsc::channel(3);
+        let update = super::Update::with_commands([
+            RuntimeCommand::Cancel,
+            RuntimeCommand::CancelBackground,
+            RuntimeCommand::Shutdown,
+        ]);
+
+        super::dispatch_commands(&sender, &update, &trace_owner.handle())
+            .expect("dispatch cancellation commands");
+        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Cancel)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::CancelBackground)
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Shutdown)));
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let events = fs::read_to_string(trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .filter_map(|event| {
+                let name = event["event"].as_str()?;
+                match name {
+                    "tui_command_dispatch" | "tui_command_queued" => {
+                        Some((name.to_owned(), event["command"].as_str()?.to_owned()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [
+                ("tui_command_dispatch".to_owned(), "cancel".to_owned()),
+                ("tui_command_queued".to_owned(), "cancel".to_owned()),
+                (
+                    "tui_command_dispatch".to_owned(),
+                    "cancel_background".to_owned(),
+                ),
+                (
+                    "tui_command_queued".to_owned(),
+                    "cancel_background".to_owned(),
+                ),
+                ("tui_command_dispatch".to_owned(), "shutdown".to_owned()),
+                ("tui_command_queued".to_owned(), "shutdown".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn timer_updates_are_dispatched_without_a_key_event() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
@@ -2934,7 +3007,8 @@ mod tests {
         let update = app.tick(now + Duration::from_secs(2));
         let (sender, mut receiver) = mpsc::channel(1);
 
-        super::dispatch_commands(&sender, &update).expect("dispatch timer update");
+        super::dispatch_commands(&sender, &update, &Trace::disabled())
+            .expect("dispatch timer update");
 
         assert!(matches!(
             receiver.try_recv(),
@@ -3084,7 +3158,7 @@ mod tests {
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
 
         let (sender, mut receiver) = mpsc::channel(2);
-        super::dispatch_commands(&sender, &update).expect("dispatch commands");
+        super::dispatch_commands(&sender, &update, &Trace::disabled()).expect("dispatch commands");
         assert!(matches!(
             receiver.try_recv(),
             Ok(RuntimeCommand::ApplySettings { .. })

@@ -11,6 +11,7 @@ mod prompt_editor;
 pub mod runtime;
 mod selection;
 mod subagents;
+mod telemetry;
 pub mod tools;
 mod transcript;
 pub mod tui;
@@ -31,6 +32,7 @@ use crate::runtime::{
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
+use crate::telemetry::TraceOwner;
 use crate::tools::ToolHost;
 
 fn production_model(
@@ -40,10 +42,23 @@ fn production_model(
     OpenAiModel::with_settings(ready.system_prompt(), ready.api_key().expose(), settings)
 }
 
+fn run_configuration(
+    startup: config::StartupSnapshot,
+    trace_owner: TraceOwner,
+) -> Result<(), Box<dyn Error>> {
+    let tui_result = tui::run_configuration(startup);
+    let trace_result = trace_owner.shutdown();
+    tui_result?;
+    trace_result?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let trace_owner = TraceOwner::from_path(std::env::var_os("KIKI_TRACE_FILE"))?;
+    let trace = trace_owner.handle();
     let configuration = config::load();
     let Some(ready) = configuration.ready() else {
-        return Ok(tui::run_configuration(configuration.snapshot().clone())?);
+        return run_configuration(configuration.snapshot().clone(), trace_owner);
     };
     let startup = configuration.snapshot().clone();
     let worker_path = ready.worker_path().to_path_buf();
@@ -58,14 +73,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(tool_host) => tool_host,
         Err(error) => {
             let configuration = configuration.with_workspace_construction_failure(error);
-            return Ok(tui::run_configuration(configuration.snapshot().clone())?);
+            return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
     let arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
-            return Ok(tui::run_configuration(configuration.snapshot().clone())?);
+            return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
     let subagents: SessionSubagents = SubagentCoordinator::new(
@@ -74,13 +89,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             ready.prompt_base().to_owned(),
             OpenAiChildModelFactory::new(ready.api_key().expose()),
         )),
-    );
+    )
+    .with_trace(trace.clone());
     let controller = RuntimeController::new(
         Agent::new(arena, model),
         settings,
         startup.settings().clone(),
         subagents,
-    );
+    )
+    .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =
@@ -92,12 +109,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         command_sender.clone(),
         event_receiver,
         progress_receiver,
+        trace,
     );
     let _ = command_sender.blocking_send(RuntimeCommand::Shutdown);
     let controller_result = runtime.block_on(controller);
+    let trace_result = trace_owner.shutdown();
 
     tui_result?;
     controller_result?;
+    trace_result?;
     Ok(())
 }
 

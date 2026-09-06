@@ -8,6 +8,7 @@ use std::sync::{Mutex as SyncMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
+use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +23,7 @@ use crate::config::{
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
+use crate::telemetry::{ChildStopCause, Settlement, Trace, TraceEvent};
 use crate::tools::{ToolError, ToolValue};
 
 const TASK_ID_WIDTH: usize = 6;
@@ -29,7 +31,8 @@ const TASK_ID_SPACE: u64 = 36_u64.pow(TASK_ID_WIDTH as u32);
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub(crate) struct TaskId(String);
 
 impl TaskId {
@@ -181,6 +184,7 @@ pub(crate) struct ChildRun<P: Send + 'static> {
     payload: P,
     reporter: TaskReporter,
     coordinator: SubagentCoordinator<P>,
+    trace: Trace,
 }
 
 impl<P: Send + 'static> ChildRun<P> {
@@ -211,6 +215,10 @@ impl<P: Send + 'static> ChildRun<P> {
     #[cfg(test)]
     pub(crate) fn model_step_started(&self) {
         self.reporter.model_step_started();
+    }
+
+    fn trace(&self) -> Trace {
+        self.trace.clone()
     }
 
     pub(crate) fn into_parts(
@@ -1013,6 +1021,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
     fn run(&self, child: ChildRun<ChildPayload>, cancellation: CancellationToken) -> RunnerFuture {
         let prompt_base = self.prompt_base.clone();
         let models = self.models.clone();
+        let trace = child.trace();
         let (id, caller, _parent, _depth, parameters, payload, reporter, coordinator) =
             child.into_parts();
         let (request, selection, read_only) = parameters.into_parts();
@@ -1020,13 +1029,38 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
         let model = models.create(child_prompt, selection);
         Box::pin(async move {
-            let arena = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(ChildFailure::new(format!(
-                    "subagent {id} was cancelled before arena construction"
-                ))),
-                result = payload.source.child(&payload.checkpoint, read_only) => {
-                    result.map_err(|error| ChildFailure::new(error.to_string()))?
+            let arena_result = {
+                let mut construction_progress = |phase| {
+                    trace.emit(|| TraceEvent::child_arena_phase(id.clone(), phase));
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        trace.emit(|| TraceEvent::ChildArenaSettled {
+                            child_id: id.clone(),
+                            outcome: Settlement::Cancelled,
+                        });
+                        return Err(ChildFailure::new(format!(
+                            "subagent {id} was cancelled before arena construction"
+                        )));
+                    }
+                    result = payload.source.child(&payload.checkpoint, read_only, &mut construction_progress) => result,
+                }
+            };
+            let arena = match arena_result {
+                Ok(arena) => {
+                    trace.emit(|| TraceEvent::ChildArenaSettled {
+                        child_id: id.clone(),
+                        outcome: Settlement::Succeeded,
+                    });
+                    arena
+                }
+                Err(error) => {
+                    trace.emit(|| TraceEvent::ChildArenaSettled {
+                        child_id: id.clone(),
+                        outcome: Settlement::Failed,
+                    });
+                    return Err(ChildFailure::new(error.to_string()));
                 }
             };
             let mut agent = Agent::new(arena, model);
@@ -1042,14 +1076,30 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                         .checked_add(1)
                         .expect("subagent model step ordinal overflowed");
                     reporter.model_step_started();
+                    trace.emit(|| TraceEvent::ChildModelStepStarted {
+                        child_id: id.clone(),
+                        model_step,
+                    });
                 }
                 AgentProgress::ModelProgress(ModelProgress::AttemptStarted { attempt }) => {
                     reporter.attempt_started(model_step, attempt);
+                    trace.emit(|| TraceEvent::ChildProviderAttemptStarted {
+                        child_id: id.clone(),
+                        model_step,
+                        attempt,
+                    });
                 }
                 AgentProgress::ModelProgress(ModelProgress::AttemptSettled {
                     attempt,
                     accounting,
-                }) => reporter.attempt_settled(model_step, attempt, accounting),
+                }) => {
+                    reporter.attempt_settled(model_step, attempt, accounting);
+                    trace.emit(|| TraceEvent::ChildProviderAttemptSettled {
+                        child_id: id.clone(),
+                        model_step,
+                        attempt,
+                    });
+                }
                 AgentProgress::ExecutionCompleted {
                     source,
                     reasoning_summary,
@@ -1420,6 +1470,7 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     policy: SubagentPolicy,
     runner: Arc<dyn ChildRunner<P>>,
     clock: Arc<dyn Clock>,
+    trace: Trace,
 }
 
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
@@ -1430,6 +1481,7 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             policy: self.policy,
             runner: self.runner.clone(),
             clock: self.clock.clone(),
+            trace: self.trace.clone(),
         }
     }
 }
@@ -1561,14 +1613,6 @@ impl Task {
 
 impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) fn new(policy: SubagentPolicy, runner: Arc<dyn ChildRunner<P>>) -> Self {
-        Self::with_clock(policy, runner, Arc::new(SystemClock))
-    }
-
-    pub(crate) fn with_clock(
-        policy: SubagentPolicy,
-        runner: Arc<dyn ChildRunner<P>>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -1584,8 +1628,25 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             publication: Arc::new(SyncMutex::new(CoordinatorPublication::default())),
             policy,
             runner,
-            clock,
+            clock: Arc::new(SystemClock),
+            trace: Trace::disabled(),
         }
+    }
+
+    pub(crate) fn with_trace(mut self, trace: Trace) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        policy: SubagentPolicy,
+        runner: Arc<dyn ChildRunner<P>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let mut coordinator = Self::new(policy, runner);
+        coordinator.clock = clock;
+        coordinator
     }
 
     pub(crate) fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<CoordinatorEvent>> {
@@ -1737,12 +1798,20 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     payload,
                     reporter: TaskReporter { metrics },
                     coordinator: self.clone(),
+                    trace: self.trace.clone(),
                 },
                 observation,
                 spawned,
             )
         };
 
+        self.trace.emit(|| {
+            TraceEvent::child_admitted(
+                &child.id,
+                child.parent.as_ref(),
+                child.parameters.selection(),
+            )
+        });
         self.publish_event(CoordinatorEvent::Spawned { record: spawned });
         let coordinator = self.clone();
         tokio::spawn(async move {
@@ -1923,6 +1992,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
 
     async fn run_child(&self, child: ChildRun<P>) {
         let id = child.id().clone();
+        self.trace.emit(|| TraceEvent::ChildRunnerStarted {
+            child_id: id.clone(),
+        });
         let cancellation = {
             let mut inner = self.inner.lock().await;
             let task = inner
@@ -1936,11 +2008,21 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             Err(ChildFailure::new("child was cancelled before startup"))
         } else {
             let runner = self.runner.clone();
-            AssertUnwindSafe(async move { runner.run(child, cancellation).await })
+            let runner_cancellation = cancellation.clone();
+            AssertUnwindSafe(async move { runner.run(child, runner_cancellation).await })
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| Err(ChildFailure::new("child runner panicked")))
         };
+        let outcome = match &result {
+            Ok(_) => Settlement::Succeeded,
+            Err(_) if cancellation.is_cancelled() => Settlement::Cancelled,
+            Err(_) => Settlement::Failed,
+        };
+        self.trace.emit(|| TraceEvent::ChildRunnerReturned {
+            child_id: id.clone(),
+            outcome,
+        });
         self.finish_child(&id, result).await;
     }
 
@@ -1966,6 +2048,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                             TaskOutcome::Completed(result),
                             now,
                             self.unix_time_ms(),
+                            &self.trace,
                         );
                         drop(inner);
                         if let Some(record) = record {
@@ -1987,7 +2070,14 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.wait_for_all(descendants).await;
         let record = {
             let mut inner = self.inner.lock().await;
-            settle_task(&mut inner, id, outcome, self.now(), self.unix_time_ms())
+            settle_task(
+                &mut inner,
+                id,
+                outcome,
+                self.now(),
+                self.unix_time_ms(),
+                &self.trace,
+            )
         };
         if let Some(record) = record {
             self.publish_event(CoordinatorEvent::Finished { record });
@@ -2002,7 +2092,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|candidate| is_in_subtree(&inner.tasks, candidate, id))
             .cloned()
             .collect::<Vec<_>>();
-        stop_tasks(&mut inner, &ids, reason)
+        stop_tasks(&mut inner, &ids, reason, &self.trace)
     }
 
     async fn request_stop_descendants(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
@@ -2013,7 +2103,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|candidate| *candidate != id && is_in_subtree(&inner.tasks, candidate, id))
             .cloned()
             .collect::<Vec<_>>();
-        stop_tasks(&mut inner, &ids, reason)
+        stop_tasks(&mut inner, &ids, reason, &self.trace)
     }
 
     async fn request_timeout(&self, id: &TaskId) -> Vec<TaskId> {
@@ -2030,11 +2120,17 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|candidate| *candidate != id && is_in_subtree(&inner.tasks, candidate, id))
             .cloned()
             .collect::<Vec<_>>();
-        let mut stopping = stop_tasks(&mut inner, std::slice::from_ref(id), StopReason::TimedOut);
+        let mut stopping = stop_tasks(
+            &mut inner,
+            std::slice::from_ref(id),
+            StopReason::TimedOut,
+            &self.trace,
+        );
         stopping.extend(stop_tasks(
             &mut inner,
             &descendants,
             StopReason::AncestorStopped,
+            &self.trace,
         ));
         stopping
     }
@@ -2057,7 +2153,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|task| !task.state.is_terminal())
             .map(|task| task.id.clone())
             .collect::<Vec<_>>();
-        stop_tasks(&mut inner, &ids, reason);
+        stop_tasks(&mut inner, &ids, reason, &self.trace);
         inner.notify();
     }
 
@@ -2203,7 +2299,7 @@ fn is_in_subtree(tasks: &BTreeMap<TaskId, Task>, candidate: &TaskId, ancestor: &
     candidate == ancestor || is_proper_descendant(tasks, candidate, ancestor)
 }
 
-fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<TaskId> {
+fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason, trace: &Trace) -> Vec<TaskId> {
     let mut stopping = Vec::new();
     for id in ids {
         let Some(task) = inner.tasks.get_mut(id) else {
@@ -2213,6 +2309,10 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
             continue;
         }
         if task.stop.is_none() {
+            trace.emit(|| TraceEvent::ChildStopRequested {
+                child_id: id.clone(),
+                cause: stop_cause(&reason),
+            });
             task.stop = Some(reason.clone());
             task.transition(TaskState::Stopping);
             task.cancellation.cancel();
@@ -2222,13 +2322,33 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
     stopping
 }
 
+fn stop_cause(reason: &StopReason) -> ChildStopCause {
+    match reason {
+        StopReason::Cancelled => ChildStopCause::Cancelled,
+        StopReason::TimedOut => ChildStopCause::TimedOut,
+        StopReason::Shutdown => ChildStopCause::Shutdown,
+        StopReason::AncestorStopped => ChildStopCause::AncestorStopped,
+        StopReason::RunnerFailed(_) => ChildStopCause::RunnerFailed,
+    }
+}
+
+fn settlement(outcome: &TaskOutcome) -> Settlement {
+    match outcome {
+        TaskOutcome::Completed(_) => Settlement::Succeeded,
+        TaskOutcome::Failed(_) => Settlement::Failed,
+        TaskOutcome::Cancelled | TaskOutcome::TimedOut => Settlement::Cancelled,
+    }
+}
+
 fn settle_task(
     inner: &mut Inner,
     id: &TaskId,
     outcome: TaskOutcome,
     now: Instant,
     observed_at_ms: i64,
+    trace: &Trace,
 ) -> Option<TaskRecord> {
+    let outcome_classification = settlement(&outcome);
     let record = {
         let task = inner
             .tasks
@@ -2249,6 +2369,10 @@ fn settle_task(
         .active_slots
         .checked_sub(1)
         .expect("every settled task owns exactly one active slot");
+    trace.emit(|| TraceEvent::ChildSettled {
+        child_id: id.clone(),
+        outcome: outcome_classification,
+    });
     Some(record)
 }
 
@@ -2288,11 +2412,12 @@ fn utf8_prefix_len(value: &str, limit: usize) -> usize {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::env;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Notify, mpsc, oneshot};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
@@ -2305,9 +2430,10 @@ mod tests {
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::model::{
-        Model, ModelContextEntry, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ScriptedAction, ScriptedModel,
+        AttemptAccounting, Model, ModelAction, ModelContextEntry, ModelFailure, ModelHistory,
+        ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
+    use crate::telemetry::TraceOwner;
     use crate::tools::{ToolHost, ToolValue};
 
     fn worker_path() -> PathBuf {
@@ -3500,6 +3626,165 @@ mod tests {
         );
         let records = coordinator.records().await;
         assert_eq!(records[0].attempts(), &[]);
+    }
+
+    #[derive(Clone)]
+    struct TracedChildFactory {
+        model_step_started: Arc<Notify>,
+    }
+
+    struct TracedChildModel {
+        model_step_started: Arc<Notify>,
+    }
+
+    impl super::ChildModelFactory for TracedChildFactory {
+        type Model = TracedChildModel;
+
+        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+            TracedChildModel {
+                model_step_started: self.model_step_started.clone(),
+            }
+        }
+    }
+
+    impl Model for TracedChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let accounting = AttemptAccounting::UsageUnavailable;
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                self.model_step_started.notify_one();
+                progress(ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: accounting.clone(),
+                });
+                Ok(ModelStep {
+                    action: ModelAction::Message {
+                        text: "final-message-SECRET".to_owned(),
+                    },
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: vec![accounting],
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_child_construction_precedes_its_model_step_without_sensitive_content() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let construction_gate = ChildConstructionTestGate::new();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena")
+        .with_child_construction_test_gate(construction_gate.clone());
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let model_step_started = Arc::new(Notify::new());
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                TracedChildFactory {
+                    model_step_started: model_step_started.clone(),
+                },
+            )),
+        )
+        .with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                ChildParameters::new(
+                    "child-request-SECRET".to_owned(),
+                    ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                        .expect("default selection"),
+                    false,
+                ),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        construction_gate.wait_until_construction_started().await;
+        assert!(
+            timeout(Duration::from_millis(50), model_step_started.notified())
+                .await
+                .is_err(),
+            "child model step started before construction was released"
+        );
+        construction_gate.resume_construction();
+        coordinator
+            .wait(&caller, child.id())
+            .await
+            .expect("child completion");
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        let events = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["event"].as_str().expect("event name"))
+                .collect::<Vec<_>>(),
+            [
+                "process_started",
+                "child_admitted",
+                "child_runner_started",
+                "child_arena_pool_opened",
+                "child_arena_checked_out",
+                "child_arena_checkpoint_restored",
+                "child_arena_result_values_reset",
+                "child_arena_dumped",
+                "child_arena_settled",
+                "child_model_step_started",
+                "child_provider_attempt_started",
+                "child_provider_attempt_settled",
+                "child_runner_returned",
+                "child_settled",
+                "process_shutdown",
+            ]
+        );
+        assert_eq!(events[1]["child_id"], "000000");
+        assert_eq!(events[1]["parent_id"], serde_json::Value::Null);
+        assert_eq!(events[1]["model"], DEFAULT_MODEL.id);
+        assert_eq!(events[1]["thinking"], DEFAULT_MODEL.default_thinking);
+        assert!(events.iter().all(|event| {
+            event["schema_version"] == 1
+                && event["process"].is_object()
+                && event["sequence"].is_u64()
+                && event["unix_ms"].is_i64()
+                && event["elapsed_ms"].is_u64()
+        }));
+        for sensitive in ["child-request-SECRET", "final-message-SECRET"] {
+            assert!(!trace.contains(sensitive), "trace leaked {sensitive}");
+        }
+        for event in &events {
+            for prohibited in [
+                "prompt", "request", "source", "stdout", "stderr", "result", "message", "payload",
+                "error",
+            ] {
+                assert!(
+                    event.get(prohibited).is_none(),
+                    "trace contained prohibited {prohibited} field"
+                );
+            }
+        }
     }
 
     #[tokio::test]

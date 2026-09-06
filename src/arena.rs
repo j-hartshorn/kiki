@@ -662,6 +662,15 @@ impl AttemptFailure {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChildArenaConstructionPhase {
+    PoolOpened,
+    CheckedOut,
+    CheckpointRestored,
+    ResultValuesReset,
+    Dumped,
+}
+
 #[derive(Clone)]
 pub(crate) struct ArenaChildSource {
     worker_path: std::path::PathBuf,
@@ -681,6 +690,7 @@ impl ArenaChildSource {
         &self,
         checkpoint: &Checkpoint,
         requested_read_only: bool,
+        progress: &mut impl FnMut(ChildArenaConstructionPhase),
     ) -> Result<Arena, ArenaError> {
         #[cfg(test)]
         if let Some(child_construction_test_gate) = &self.child_construction_test_gate {
@@ -695,13 +705,18 @@ impl ArenaChildSource {
             });
         }
         let pool = Arena::open_pool(self.worker_path.clone()).await?;
+        progress(ChildArenaConstructionPhase::PoolOpened);
         let mut checkout = pool
             .checkout(&self.repl_config)
             .await
             .map_err(pool_failure)?;
+        progress(ChildArenaConstructionPhase::CheckedOut);
         Arena::restore_checkout(&mut checkout, checkpoint).await?;
+        progress(ChildArenaConstructionPhase::CheckpointRestored);
         reset_result_values(&mut checkout).await?;
+        progress(ChildArenaConstructionPhase::ResultValuesReset);
         let state = checkout.dump().await.map_err(pool_failure)?;
+        progress(ChildArenaConstructionPhase::Dumped);
 
         Ok(Arena {
             worker_path: self.worker_path.clone(),
@@ -877,8 +892,9 @@ impl Arena {
         checkpoint: &Checkpoint,
         requested_read_only: bool,
     ) -> Result<Self, ArenaError> {
+        let mut progress = |_| {};
         self.child_source()
-            .child(checkpoint, requested_read_only)
+            .child(checkpoint, requested_read_only, &mut progress)
             .await
     }
 

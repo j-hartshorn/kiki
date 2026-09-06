@@ -18,6 +18,7 @@ use crate::subagents::{
 use crate::subagents::{
     ChildFailure, ChildPayload, ChildRunner, RunnerFuture, SubagentCoordinator, SubagentPolicy,
 };
+use crate::telemetry::{ControlCommand, Settlement, Trace, TraceEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RunId(pub(crate) u64);
@@ -247,6 +248,7 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_status_revisions: BTreeMap<TaskId, u64>,
     active_caller: Option<Caller>,
     active: Option<ActiveRun<M>>,
+    trace: Trace,
 }
 
 struct ActiveRun<M: Model> {
@@ -294,6 +296,26 @@ enum ControllerInput<M: Model> {
     SubagentsChanged,
     CoordinatorEvent(Option<CoordinatorEvent>),
     SubagentDeadline,
+}
+
+pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand> {
+    match command {
+        RuntimeCommand::Cancel => Some(ControlCommand::Cancel),
+        RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
+        RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
+        RuntimeCommand::Submit { .. } | RuntimeCommand::ApplySettings { .. } => None,
+    }
+}
+
+fn root_settlement(record: &Record) -> Settlement {
+    match record {
+        Record::FinalMessage { .. } => Settlement::Succeeded,
+        Record::CancelledRun { .. } => Settlement::Cancelled,
+        Record::FailedRun { .. } => Settlement::Failed,
+        Record::UserRequest { .. } | Record::CompletedExecution { .. } => {
+            unreachable!("only terminal root records settle runs")
+        }
+    }
 }
 
 fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
@@ -380,7 +402,13 @@ impl<M: Model> RuntimeController<M> {
             subagent_status_revisions: BTreeMap::new(),
             active_caller: None,
             active: None,
+            trace: Trace::disabled(),
         }
+    }
+
+    pub(crate) fn with_trace(mut self, trace: Trace) -> Self {
+        self.trace = trace;
+        self
     }
 
     #[cfg(test)]
@@ -523,6 +551,10 @@ impl<M: Model> RuntimeController<M> {
         progress: &mut ProgressPublisher<RuntimeEvent>,
         shutdown_requested: &mut bool,
     ) {
+        if let Some(command) = control_command(&command) {
+            self.trace
+                .emit(|| TraceEvent::RuntimeCommandReceived { command });
+        }
         match command {
             RuntimeCommand::Submit { request } => {
                 if let Some(active) = &self.active {
@@ -552,12 +584,7 @@ impl<M: Model> RuntimeController<M> {
                 self.emit(events, RuntimeEvent::SettingsAccepted { revision });
             }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
-            RuntimeCommand::CancelBackground => {
-                let caller = self.active_caller.clone();
-                self.subagents
-                    .request_background_cancellation(caller.as_ref())
-                    .await;
-            }
+            RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
             RuntimeCommand::Shutdown => {
                 *shutdown_requested = true;
                 self.request_shutdown().await;
@@ -687,6 +714,8 @@ impl<M: Model> RuntimeController<M> {
     ) {
         let caller = self.subagents.root_caller().await;
         let run_id = self.next_run_id();
+        self.trace
+            .emit(|| TraceEvent::RootRunStarted { run_id: run_id.0 });
         self.publish_progress(progress, RuntimeEvent::RunStarted { run_id }, false);
         self.append_record(
             events,
@@ -793,17 +822,26 @@ impl<M: Model> RuntimeController<M> {
 
     fn request_active_cancellation(&mut self) {
         if let Some(active) = &mut self.active {
+            self.trace
+                .emit(|| TraceEvent::ForegroundCancellationRequested);
             active.cancellation_requested = true;
             active.cancellation.cancel();
         }
     }
 
-    async fn request_shutdown(&mut self) {
-        let caller = self.active_caller.clone();
-        self.request_active_cancellation();
+    async fn request_background_cancellation(&mut self) {
+        self.trace
+            .emit(|| TraceEvent::BackgroundCancellationRequested);
         self.subagents
-            .request_background_cancellation(caller.as_ref())
+            .request_background_cancellation(self.active_caller.as_ref())
             .await;
+        self.trace
+            .emit(|| TraceEvent::BackgroundCancellationReturned);
+    }
+
+    async fn request_shutdown(&mut self) {
+        self.request_active_cancellation();
+        self.request_background_cancellation().await;
     }
 
     fn handle_worker_message(
@@ -924,6 +962,7 @@ impl<M: Model> RuntimeController<M> {
                         ),
                     },
                 };
+                let settlement = root_settlement(&record);
                 if let Some(reason) = disabled_reason {
                     self.disabled_reason = Some(reason.clone());
                     self.append_record(
@@ -942,6 +981,10 @@ impl<M: Model> RuntimeController<M> {
                         progress_gap || progress.take_pending_gap(),
                     );
                 }
+                self.trace.emit(|| TraceEvent::RootRunSettled {
+                    run_id: run_id.0,
+                    outcome: settlement,
+                });
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;
                 self.active_caller = None;
@@ -970,7 +1013,12 @@ impl<M: Model> RuntimeController<M> {
                 terminal: TerminalDetails::new(None, Vec::new()),
             }
         };
+        let settlement = root_settlement(&record);
         self.append_record(events, run_id, record, progress.take_pending_gap());
+        self.trace.emit(|| TraceEvent::RootRunSettled {
+            run_id: run_id.0,
+            outcome: settlement,
+        });
         self.emit(events, RuntimeEvent::RunSettled { run_id });
         self.active = None;
         self.active_caller = None;
@@ -1201,6 +1249,7 @@ mod tests {
         ChildModelFactory, ChildParameters, ChildPayload, CompleteChildRunner, SessionSubagents,
         SubagentCoordinator, SubagentPolicy, TaskOutcome, TaskState,
     };
+    use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
     use crate::transcript::Transcript;
     use tokio_util::sync::CancellationToken;
@@ -1996,6 +2045,137 @@ mod tests {
         commands.send(RuntimeCommand::Cancel).await.unwrap();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn traced_runtime_cancellation_commands_bracket_foreground_and_background_work() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let child_factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                child_factory.clone(),
+            )),
+        )
+        .with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                ChildParameters::new(
+                    "child-request-SECRET".to_owned(),
+                    ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                    false,
+                ),
+                child_payload(&workspace).await,
+            )
+            .await
+            .expect("admit background child");
+        child_factory.started.notified().await;
+
+        let foreground_ready = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            WaitingCancellationModel {
+                ready: foreground_ready.clone(),
+                partial: false,
+            },
+            coordinator.clone(),
+        )
+        .await
+        .with_trace(trace_owner.handle());
+        let (commands, mut events, _, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "foreground-request-SECRET".to_owned(),
+            })
+            .await
+            .unwrap();
+        foreground_ready.notified().await;
+        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        events_until_settled(&mut events).await;
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .unwrap();
+        assert!(matches!(
+            coordinator.wait(&caller, child.id()).await,
+            Err(crate::subagents::WaitError::Cancelled { .. })
+        ));
+        shutdown_controller(commands, task).await;
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        let events = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .collect::<Vec<_>>();
+        let commands = events
+            .iter()
+            .filter_map(|event| {
+                let name = event["event"].as_str()?;
+                matches!(
+                    name,
+                    "root_run_started"
+                        | "root_run_settled"
+                        | "runtime_command_received"
+                        | "foreground_cancellation_requested"
+                        | "background_cancellation_requested"
+                        | "child_stop_requested"
+                        | "background_cancellation_returned"
+                )
+                .then_some((name, event["command"].as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            [
+                ("root_run_started", None),
+                ("runtime_command_received", Some("cancel")),
+                ("foreground_cancellation_requested", None),
+                ("root_run_settled", None),
+                ("runtime_command_received", Some("cancel_background")),
+                ("background_cancellation_requested", None),
+                ("child_stop_requested", None),
+                ("background_cancellation_returned", None),
+                ("runtime_command_received", Some("shutdown")),
+                ("background_cancellation_requested", None),
+                ("background_cancellation_returned", None),
+            ]
+        );
+        assert_eq!(
+            events[events
+                .iter()
+                .position(|event| event["event"] == "root_run_settled")
+                .unwrap()]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            events[events
+                .iter()
+                .position(|event| event["event"] == "child_stop_requested")
+                .unwrap()]["cause"],
+            "cancelled"
+        );
+        let child_returned = events
+            .iter()
+            .position(|event| event["event"] == "child_runner_returned")
+            .unwrap();
+        let child_settled = events
+            .iter()
+            .position(|event| event["event"] == "child_settled")
+            .unwrap();
+        assert!(child_returned < child_settled);
+        for sensitive in ["child-request-SECRET", "foreground-request-SECRET"] {
+            assert!(!trace.contains(sensitive), "trace leaked {sensitive}");
+        }
     }
 
     #[tokio::test]

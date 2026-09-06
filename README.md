@@ -93,6 +93,18 @@ A normal or non-zero exit returns `CommandResult(exit_code, stdout, stderr)`; si
 
 `run` has ordinary host filesystem, environment, and network authority. It is not a sandbox or approval boundary: a command can access host resources available to the Kiki process.
 
+## Diagnostics
+
+Set `KIKI_TRACE_FILE` to a trace-file path to opt into append-only JSONL diagnostic telemetry:
+
+```sh
+export KIKI_TRACE_FILE=/absolute/path/to/kiki-trace.jsonl
+```
+
+When unset, Kiki creates no trace file or telemetry writer. A trace records fixed process events, control-command events, root-run events, child-lifecycle events, settled Arena-construction milestones, and provider-attempt events with timestamps and model selections. It does not record prompts, model messages, Python source or output, tool values, result values, credentials, provider responses, or arbitrary dynamic data.
+
+A trace is diagnostic only, not authoritative or resumable history: it cannot restore a session, Arena, conversation, or child result. Use exactly one Kiki process per trace path. Multiple processes appending to the same file can interleave their event streams. Kiki flushes each event; a runtime trace-write failure is reported after normal terminal restoration and controller shutdown.
+
 ## Privacy and costs
 
 `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
