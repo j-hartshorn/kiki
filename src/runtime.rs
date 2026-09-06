@@ -1194,15 +1194,15 @@ mod tests {
         models::{LUNA, SOL, TERRA},
     };
     use crate::model::{
-        AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId,
+        AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ModelUsage, ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::subagents::{
         ChildModelFactory, ChildParameters, ChildPayload, CompleteChildRunner, SessionSubagents,
-        SubagentCoordinator, SubagentPolicy, TaskState,
+        SubagentCoordinator, SubagentPolicy, TaskOutcome, TaskState,
     };
-    use crate::tools::{ReadTestGate, ToolHost};
+    use crate::tools::{ReadTestGate, ToolHost, ToolValue};
     use crate::transcript::Transcript;
     use tokio_util::sync::CancellationToken;
 
@@ -1456,6 +1456,191 @@ mod tests {
                 factory,
             )),
         )
+    }
+
+    #[derive(Clone)]
+    struct WorkflowChildFactory {
+        sol_models: Arc<AtomicUsize>,
+        selections: Arc<Mutex<Vec<ModelSelection>>>,
+        grandchild_started: Arc<Notify>,
+    }
+
+    impl WorkflowChildFactory {
+        fn new() -> Self {
+            Self {
+                sol_models: Arc::new(AtomicUsize::new(0)),
+                selections: Arc::new(Mutex::new(Vec::new())),
+                grandchild_started: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    enum WorkflowChildModel {
+        Scripted {
+            model: ScriptedModel,
+            selection: ModelSelection,
+            attempt: AttemptAccounting,
+        },
+        Failed {
+            attempt: AttemptAccounting,
+        },
+        Blocked {
+            attempt: AttemptAccounting,
+            started: Arc<Notify>,
+        },
+    }
+
+    impl Model for WorkflowChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                match self {
+                    Self::Scripted {
+                        model,
+                        selection,
+                        attempt,
+                    } => {
+                        let mut step = model.step(history, cancellation, progress).await?;
+                        step.selection = Some(*selection);
+                        step.attempts = vec![attempt.clone()];
+                        Ok(step)
+                    }
+                    Self::Failed { attempt } => {
+                        progress(ModelProgress::AttemptStarted { attempt: 1 });
+                        Err(ModelFailure::new(
+                            ModelError::InvalidResponse("controlled failure"),
+                            vec![attempt.clone()],
+                        ))
+                    }
+                    Self::Blocked { attempt, started } => {
+                        progress(ModelProgress::AttemptStarted { attempt: 1 });
+                        started.notify_one();
+                        cancellation.cancelled().await;
+                        Err(ModelFailure::new(
+                            ModelError::Cancelled,
+                            vec![attempt.clone()],
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    impl ChildModelFactory for WorkflowChildFactory {
+        type Model = WorkflowChildModel;
+
+        fn create(&self, _prompt: String, selection: ModelSelection) -> Self::Model {
+            self.selections.lock().unwrap().push(selection);
+            let attempt = known_usage(selection.model(), 10, 1, 0);
+            match selection.model().id {
+                id if id == TERRA.id => WorkflowChildModel::Scripted {
+                    model: ScriptedModel::new(vec![
+                        ModelAction::Code {
+                            source: "result_values['handoff'] = handoff\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                        },
+                        ModelAction::Message {
+                            text: "recoverable child completed".to_owned(),
+                        },
+                    ]),
+                    selection,
+                    attempt,
+                },
+                id if id == LUNA.id => WorkflowChildModel::Failed { attempt },
+                id if id == SOL.id
+                    && self.sol_models.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    WorkflowChildModel::Scripted {
+                        model: ScriptedModel::new(vec![
+                            ModelAction::Code {
+                                source: "descendant = await start_subagent('read-only descendant', None, True)\nresult_values['descendant_id'] = descendant.id".to_owned(),
+                            },
+                            ModelAction::Message {
+                                text: "cancellable parent completed".to_owned(),
+                            },
+                        ]),
+                        selection,
+                        attempt,
+                    }
+                }
+                id if id == SOL.id => WorkflowChildModel::Blocked {
+                    attempt,
+                    started: self.grandchild_started.clone(),
+                },
+                _ => panic!("unexpected child selection {selection:?}"),
+            }
+        }
+    }
+
+    struct WorkflowRootModel {
+        selection: watch::Receiver<ModelSelection>,
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        selections: Arc<Mutex<Vec<ModelSelection>>>,
+        request: usize,
+        step: usize,
+    }
+
+    impl Model for WorkflowRootModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                let request = history
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, ModelContextEntry::UserRequest { .. }))
+                    .count();
+                if request != self.request {
+                    self.request = request;
+                    self.step = 0;
+                }
+                let selection = *self.selection.borrow_and_update();
+                self.selections.lock().unwrap().push(selection);
+                let action = match (request, self.step) {
+                    (1, 0) => CompletedModelAction::Code {
+                        source: "handoff = 'before'".to_owned(),
+                        call_id: ModelCallId::new("workflow-1-1"),
+                    },
+                    (1, 1) => CompletedModelAction::Code {
+                        source: "same_execution = 'after'\nrecoverable_id = (await start_subagent('recoverable work', 'openai/gpt-5.6-terra')).id\nfailed_id = (await start_subagent('failing work', 'openai/gpt-5.6-luna')).id\nparent_id = (await start_subagent('cancellable parent')).id".to_owned(),
+                        call_id: ModelCallId::new("workflow-1-2"),
+                    },
+                    (1, 2) => CompletedModelAction::Message {
+                        text: "first foreground final".to_owned(),
+                    },
+                    (2, 0) => CompletedModelAction::Code {
+                        source: "recoverable = await get_subagent(recoverable_id)\nawait recoverable.refresh()\nrecoverable_result = await recoverable.wait()\nassert recoverable.status.state == 'completed'\nassert recoverable_result['values']['handoff'] == handoff\nassert set(recoverable_result['values']) == {'handoff', 'same_execution'}\nfailed = await get_subagent(failed_id)\ntry:\n    await failed.wait()\nexcept RuntimeError:\n    pass\nassert failed.status.state == 'failed'\nparent = await get_subagent(parent_id)\nparent_result = await parent.wait()\ndescendant = await get_subagent(parent_result['values']['descendant_id'])\nawait descendant.refresh()\nassert descendant.status.state in ('starting', 'running')\nassert (await parent.cancel()).state == 'completed'\nassert (await descendant.refresh()).state == 'cancelled'\nrecoverable_result['values']['same_execution']".to_owned(),
+                        call_id: ModelCallId::new("workflow-2-1"),
+                    },
+                    (2, 1) => CompletedModelAction::Message {
+                        text: "second foreground final".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: Some(selection),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: vec![known_usage(selection.model(), 100, 10, 20)],
+                })
+            }
+        }
     }
 
     fn start_controller<M: Model>(
@@ -6210,6 +6395,356 @@ mod tests {
             controller.subagent_record_revisions.get(finished.id()),
             Some(&finished.revision())
         );
+    }
+
+    #[tokio::test]
+    async fn complete_delegation_workflow_crosses_requests_without_context_leaks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let initial_selection = ModelSelection::new(&SOL, "high").unwrap();
+        let changed_selection = ModelSelection::new(&TERRA, "low").unwrap();
+        let (settings, selection) = watch::channel(initial_selection);
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let root_selections = Arc::new(Mutex::new(Vec::new()));
+        let children = WorkflowChildFactory::new();
+        let coordinator = complete_child_coordinator(children.clone());
+        let controller = controller_with_subagents(
+            &workspace,
+            WorkflowRootModel {
+                selection,
+                contexts: contexts.clone(),
+                selections: root_selections.clone(),
+                request: 0,
+                step: 0,
+            },
+            coordinator.clone(),
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, mut progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "delegate the first request".to_owned(),
+            })
+            .await
+            .unwrap();
+        let mut workflow_events = events_until_settled(&mut events).await;
+        children.grandchild_started.notified().await;
+
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: changed_selection,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            let accepted = event == (RuntimeEvent::SettingsAccepted { revision: 1 });
+            workflow_events.push(event);
+            if accepted {
+                break;
+            }
+        }
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "clarify the delegated work".to_owned(),
+            })
+            .await
+            .unwrap();
+        workflow_events.extend(events_until_settled(&mut events).await);
+        while workflow_events
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::SubagentFinished { .. }))
+            .count()
+            < 4
+        {
+            workflow_events.push(next_event(&mut events).await);
+        }
+        let status_events = drain_progress(&mut progress)
+            .into_iter()
+            .map(|event| event.item)
+            .collect::<Vec<_>>();
+
+        let records = shutdown_controller(commands, task).await;
+        assert_eq!(records, committed_records(&workflow_events));
+        assert_eq!(coordinator.active_count().await, 0);
+
+        let child_records = coordinator.records().await;
+        assert_eq!(
+            child_records
+                .iter()
+                .map(|record| record.id().to_string())
+                .collect::<Vec<_>>(),
+            ["000000", "000001", "000002", "000003"]
+        );
+        assert_eq!(
+            child_records
+                .iter()
+                .map(|record| record.parameters().selection())
+                .collect::<Vec<_>>(),
+            [
+                ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                ModelSelection::new(&LUNA, LUNA.default_thinking).unwrap(),
+                initial_selection,
+                initial_selection,
+            ]
+        );
+        assert!(child_records[3].parameters().read_only());
+        assert_eq!(child_records[3].parent().unwrap().to_string(), "000002");
+        assert!(matches!(
+            child_records[0].outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.message() == "recoverable child completed"
+                    && result.values() == &BTreeMap::from([
+                        ("handoff".to_owned(), ToolValue::String("before".to_owned())),
+                        ("same_execution".to_owned(), ToolValue::String("missing".to_owned())),
+                    ])
+        ));
+        assert!(matches!(
+            child_records[1].outcome(),
+            Some(TaskOutcome::Failed(failure)) if failure.message().contains("controlled failure")
+        ));
+        assert!(matches!(
+            child_records[2].outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.values() == &BTreeMap::from([(
+                    "descendant_id".to_owned(),
+                    ToolValue::String("000003".to_owned()),
+                )])
+        ));
+        assert!(matches!(
+            child_records[3].outcome(),
+            Some(TaskOutcome::Cancelled)
+        ));
+
+        let mut factory_selections = children
+            .selections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|selection| format!("{}:{}", selection.model().id, selection.thinking()))
+            .collect::<Vec<_>>();
+        factory_selections.sort();
+        assert_eq!(
+            factory_selections,
+            [
+                "openai/gpt-5.6-luna:medium",
+                "openai/gpt-5.6-sol:high",
+                "openai/gpt-5.6-sol:high",
+                "openai/gpt-5.6-terra:medium",
+            ]
+        );
+
+        let first_spawns = workflow_events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::SubagentSpawned { record } => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_spawns.len(), 4);
+        assert_eq!(
+            first_spawns
+                .iter()
+                .map(|record| record.id().to_string())
+                .collect::<Vec<_>>(),
+            ["000000", "000001", "000002", "000003"]
+        );
+        for record in &child_records {
+            assert_eq!(
+                workflow_events
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, RuntimeEvent::SubagentFinished { record: finished }
+                            if finished.id() == record.id())
+                    })
+                    .count(),
+                1,
+                "{} should have one terminal card event",
+                record.id()
+            );
+            assert!(workflow_events.iter().any(|event| {
+                matches!(event, RuntimeEvent::SubagentRecord { record: updated }
+                if updated.id() == record.id()
+                    && matches!(
+                        updated.observation().state(),
+                        TaskState::Completed
+                            | TaskState::Failed
+                            | TaskState::Cancelled
+                            | TaskState::TimedOut
+                    ))
+            }));
+        }
+        for (id, state) in [
+            ("000000", TaskState::Completed),
+            ("000001", TaskState::Failed),
+            ("000002", TaskState::Completed),
+            ("000003", TaskState::Cancelled),
+        ] {
+            assert!(status_events.iter().any(|event| {
+                matches!(event, RuntimeEvent::SubagentStatus { id: observed, observation, .. }
+                    if observed.as_str() == id && observation.state() == state)
+            }));
+        }
+
+        let first_execution = completed_execution(&records, RunId(1), ModelStepId(2));
+        assert_eq!(
+            first_execution.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::StartSubagent,
+                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                },
+            ]
+        );
+        let clarification = completed_execution(&records, RunId(2), ModelStepId(4));
+        assert_eq!(result_head(clarification), "'missing'");
+        assert_eq!(
+            clarification.tool_calls,
+            [
+                ToolCall {
+                    tool: ToolName::GetSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::RefreshSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::WaitSubagent,
+                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::GetSubagent,
+                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::WaitSubagent,
+                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::GetSubagent,
+                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::WaitSubagent,
+                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::GetSubagent,
+                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::RefreshSubagent,
+                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::CancelSubagent,
+                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                },
+                ToolCall {
+                    tool: ToolName::RefreshSubagent,
+                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                },
+            ]
+        );
+
+        assert_eq!(
+            root_selections.lock().unwrap().as_slice(),
+            [
+                initial_selection,
+                initial_selection,
+                initial_selection,
+                changed_selection,
+                changed_selection,
+            ]
+        );
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 5);
+        assert!(matches!(
+            contexts[3].as_slice(),
+            [
+                ModelContextEntry::UserRequest { text: first },
+                ModelContextEntry::CompletedCode(_),
+                ModelContextEntry::CompletedCode(_),
+                ModelContextEntry::FinalMessage { text: final_message, .. },
+                ModelContextEntry::UserRequest { text: clarification },
+            ] if first == "delegate the first request"
+                && final_message == "first foreground final"
+                && clarification == "clarify the delegated work"
+        ));
+        let [
+            ModelContextEntry::UserRequest { text: first },
+            ModelContextEntry::CompletedCode(_),
+            ModelContextEntry::CompletedCode(_),
+            ModelContextEntry::FinalMessage {
+                text: final_message,
+                ..
+            },
+            ModelContextEntry::UserRequest {
+                text: clarification,
+            },
+            ModelContextEntry::CompletedCode(clarification_result),
+        ] = contexts[4].as_slice()
+        else {
+            panic!("unexpected clarification context: {:#?}", contexts[4]);
+        };
+        assert_eq!(first, "delegate the first request");
+        assert_eq!(final_message, "first foreground final");
+        assert_eq!(clarification, "clarify the delegated work");
+        let CodeResult::Execution { feedback } = clarification_result.result() else {
+            panic!("expected clarification execution feedback");
+        };
+        assert_eq!(
+            feedback,
+            concat!(
+                "<kiki_result truncated=\"false\" total_lines=\"1\" total_bytes=\"9\">\n",
+                "<kiki_output_head lines=\"1\" bytes=\"9\" ends_mid_line=\"false\">\n",
+                "'missing'</kiki_output_head>\n",
+                "</kiki_result>"
+            )
+        );
+        let context_debug = format!("{contexts:#?}");
+        for child_text in [
+            "recoverable child completed",
+            "cancellable parent completed",
+            "controlled failure",
+        ] {
+            assert!(
+                !context_debug.contains(child_text),
+                "root model context leaked `{child_text}`: {context_debug}"
+            );
+        }
+        assert_eq!(
+            context_debug.matches("missing").count(),
+            1,
+            "the deliberate child value must appear only in execution feedback: {context_debug}"
+        );
+
+        let mut transcript = Transcript::default();
+        for event in workflow_events
+            .iter()
+            .cloned()
+            .chain(status_events.iter().cloned())
+        {
+            transcript.apply(event, false);
+        }
+        let footer = transcript.layout(160).footer_rule(160).to_string();
+        assert!(footer.contains("↑560 ↓56 R100 W0"), "{footer}");
+        assert!(footer.contains("CH20.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+        assert!(footer.contains('$'), "{footer}");
     }
 
     #[tokio::test]

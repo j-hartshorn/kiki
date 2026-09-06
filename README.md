@@ -56,6 +56,35 @@ model = "openai/gpt-5.6-terra"
 
 `Ctrl-S` in either model or thinking picker writes only the user default. If project settings or environment variables mask it, Kiki reports that override.
 
+## Subagents
+
+Subagent settings use the same user/project precedence as model settings. Omitted fields use these defaults:
+
+```toml
+[subagents]
+allow_nested = true
+max_concurrent = 8
+max_starts_per_run = 64
+max_depth = 4
+timeout_seconds = 900
+```
+
+`max_concurrent` covers every admitted unsettled child in the session. `max_starts_per_run` covers a root request and all of its descendants. The root has depth 0, so `max_depth = 4` permits four child levels. Starts beyond a limit fail immediately; they are never queued.
+
+### Delegation workflow
+
+Use `start_subagent(...)` to receive a `SubagentTask` immediately, or `run_subagent(...)` when the current Python execution should wait. Keep `task.id`: `get_subagent(id)` reconnects an authorised task later, including after a foreground reply or a lost Arena variable. `refresh()`, `wait()`, and `cancel()` replace the handle's cached status. A status is only the last observation, not live state.
+
+A child receives an independent copy of the invoking Python execution's **pre-execution** Arena checkpoint. Values committed before that execution are available; assignments made earlier in the same execution are not. Every child starts with a fresh `result_values` dictionary. A successful `wait()` returns a dictionary with `id`, `message`, and `values` keys. Export only supported neutral scalars, lists, and string-keyed dictionaries within the existing Arena and transport limits. Missing, non-dictionary, cyclic, or unsupported `result_values` make that child fail; they do not disable the foreground agent. `wait()` raises `RuntimeError` for a failed or cancelled child and `TimeoutError` for a timed-out child.
+
+Children have fresh model context and a model/thinking selection fixed at admission. Without an override, that selection is the invoking model step's selection. An explicit model uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
+
+Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by the host. A read-only child cannot widen a descendant. All agents still share the same filesystem. Completed file effects are visible to every agent and cancellation never rolls them back.
+
+Child work continues after the foreground execution, final reply, or later request. Waiting does not join a completed child's descendants. Cancelling a task cancels its unfinished subtree while preserving completed results. Child failure cancels that child's unfinished descendants only, never its parent or siblings. There are no automatic retries, merges, result printing, or root model-context insertion: inspect a waited result deliberately.
+
+Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. `Ctrl-O` expands retained history prompts; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting includes foreground and every descendant attempt once, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
+
 ## Commands
 
 `run(command, cwd=".")` starts one non-login `/bin/sh -c` command with null standard input and Kiki's inherited environment; interactive input is unavailable. `cwd` is workspace-relative, rejects absolute and parent paths, and is opened component by component without following symlinks before the validated directory descriptor is applied immediately before the command starts. There is no command-specific timeout: the five-minute whole-Arena deadline is the only limit.
@@ -78,12 +107,12 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
 - The `Shift-Enter newline` header hint appears only when enhanced modified-key reporting is available; then `Shift-Enter` inserts a newline. Without that capability, a modified Enter does nothing and plain `Enter` retains submission behaviour.
-- `Esc` cancels the active run.
+- `Esc` first cancels the active foreground run. Press it again while cancellation is pending, or press it while foreground work is idle, to cancel background subagent work.
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title.
-- `Ctrl-O` toggles all arena cards between automatic collapse and expanded display.
+- `Ctrl-O` toggles retained arena cards and subagent history prompts between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; `Ctrl-Home` / `Ctrl-End` jump to the oldest / newest history. The mouse wheel scrolls history three lines per event.
 - Drag the primary mouse button over display history to select its rendered text in either direction. Resting the drag at the viewport's top or bottom edge scrolls history one row at a time; release copies a non-empty selection to the local native desktop clipboard.

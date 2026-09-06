@@ -175,7 +175,7 @@ mod tests {
         ]);
         assert_concept(&["host access", "tool reference"]);
         assert_concept(&["execution feedback", "python error", "committed"]);
-        for managed_guidance in ["asyncio.gather", "focused", "five-minute deadline"] {
+        for managed_guidance in ["asyncio.gather", "five-minute deadline"] {
             assert!(
                 !BUNDLED_PROMPT.contains(managed_guidance),
                 "bundled prompt must not duplicate managed `{managed_guidance}` guidance"
@@ -186,13 +186,19 @@ mod tests {
         assert_concept(&["untrusted", "files", "output", "instructions"]);
         assert!(!BUNDLED_PROMPT.contains("async def"));
 
+        assert_concept(&[
+            "delegate",
+            "focused",
+            "subagents",
+            "task ids",
+            "do not enter model context",
+        ]);
         for speculative_capability in [
             "resource registry",
             "write(path)",
             "edit(path)",
             "glob(",
             "grep(",
-            "subagent",
         ] {
             assert!(
                 !BUNDLED_PROMPT
@@ -273,6 +279,9 @@ mod tests {
         assert!(full.contains("share the filesystem"));
         assert!(full.contains("not rolled back"));
         assert!(full.contains("no implicit merge or context insertion"));
+        assert!(full.contains("frozen for this subagent"));
+        assert!(full.contains("last observed"));
+        assert!(full.contains("may fail"));
     }
 
     #[tokio::test]
