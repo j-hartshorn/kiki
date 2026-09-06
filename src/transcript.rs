@@ -1869,7 +1869,7 @@ fn display_model_id(id: &str) -> &str {
     }
 }
 
-fn truncate_front(text: &str, width: usize) -> String {
+pub(crate) fn truncate_front(text: &str, width: usize) -> String {
     if Line::raw(text).width() <= width {
         return text.to_owned();
     }
@@ -1893,7 +1893,7 @@ fn truncate_front(text: &str, width: usize) -> String {
     format!("…{}", suffix.concat())
 }
 
-fn truncate_end(text: &str, width: usize) -> String {
+pub(crate) fn truncate_end(text: &str, width: usize) -> String {
     if Line::raw(text).width() <= width {
         return text.to_owned();
     }
@@ -3652,7 +3652,7 @@ fn footer_estimated_cost<'a>(
     }
 }
 
-fn format_footer_usd(nanodollars: u128) -> String {
+pub(crate) fn format_footer_usd(nanodollars: u128) -> String {
     const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
     let mut decimals = footer_cost_decimals(nanodollars);
     let mut rounded = round_nanodollars(nanodollars, decimals);
