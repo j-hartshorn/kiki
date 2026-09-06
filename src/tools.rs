@@ -95,6 +95,10 @@ impl ToolName {
         self.name()
     }
 
+    fn is_allowed_read_only(self) -> bool {
+        matches!(self, Self::Read | Self::ListDir | Self::Glob | Self::Grep)
+    }
+
     pub(crate) fn count_label(self, count: usize) -> &'static str {
         match (self, count) {
             (Self::Read, 1) => "byte",
@@ -564,7 +568,8 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
 ];
 
 pub(crate) fn bootstrap_source() -> String {
-    let records = record_definitions()
+    let definitions = ACTIVE_TOOLS.iter().collect::<Vec<_>>();
+    let records = record_definitions(&definitions)
         .into_iter()
         .map(ToolRecord::bootstrap_definition)
         .collect::<Vec<_>>();
@@ -588,11 +593,15 @@ pub(crate) fn bootstrap_source() -> String {
 }
 
 pub(crate) fn prompt_reference() -> String {
-    let records = record_definitions()
+    prompt_reference_for(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), false)
+}
+
+fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
+    let records = record_definitions(definitions)
         .into_iter()
         .map(ToolRecord::bootstrap_definition)
         .collect::<Vec<_>>();
-    let definitions = ACTIVE_TOOLS
+    let definitions = definitions
         .iter()
         .map(|definition| definition.prompt_skeleton())
         .collect::<Vec<_>>();
@@ -609,14 +618,19 @@ pub(crate) fn prompt_reference() -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join("\n\n");
+    let run_guidance = if read_only {
+        ""
+    } else {
+        " Run project-local, one-shot commands."
+    };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables. Run project-local, one-shot commands. Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{run_guidance} Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
 }
 
-fn record_definitions() -> Vec<&'static ToolRecord> {
-    let mut records: Vec<&'static ToolRecord> = Vec::new();
-    for definition in ACTIVE_TOOLS {
+fn record_definitions<'a>(definitions: &'a [&'a ToolDefinition]) -> Vec<&'a ToolRecord> {
+    let mut records: Vec<&ToolRecord> = Vec::new();
+    for definition in definitions {
         let Some(record) = definition.result.record() else {
             continue;
         };
@@ -919,9 +933,11 @@ impl<'a> BatchDispatch<'a> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
     limits: ToolLimits,
+    read_only: bool,
     #[cfg(test)]
     write_test_hook: Option<WriteTestHook>,
     #[cfg(test)]
@@ -1540,6 +1556,7 @@ impl ToolHost {
         Ok(Self {
             workspace,
             limits,
+            read_only: false,
             #[cfg(test)]
             write_test_hook: None,
             #[cfg(test)]
@@ -1553,6 +1570,22 @@ impl ToolHost {
             #[cfg(test)]
             command_test_gate: None,
         })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn for_child(&self, requested_read_only: bool) -> Self {
+        let mut child = self.clone();
+        child.read_only |= requested_read_only;
+        child
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prompt_reference(&self) -> String {
+        let definitions = ACTIVE_TOOLS
+            .iter()
+            .filter(|definition| !self.read_only || definition.name.is_allowed_read_only())
+            .collect::<Vec<_>>();
+        prompt_reference_for(&definitions, self.read_only)
     }
 
     #[cfg(test)]
@@ -1647,6 +1680,15 @@ impl ToolHost {
             tool,
             arguments,
         } = call;
+        if self.read_only && !tool.is_allowed_read_only() {
+            return ToolResult {
+                call_id,
+                result: Err(ToolError::permission(
+                    "tool is unavailable in a read-only arena",
+                )),
+                effect: None,
+            };
+        }
         #[cfg(test)]
         let batch_call = self
             .batch_test_gate
@@ -6742,6 +6784,69 @@ mod tests {
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("Run project-local, one-shot commands."));
         assert!(reference.contains("    ..."));
+    }
+
+    #[tokio::test]
+    async fn read_only_child_tool_hosts_narrow_prompts_and_deny_effects() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let root = tool_host(&workspace).await;
+        let root_reference = prompt_reference();
+        assert_eq!(root.prompt_reference(), root_reference);
+        assert_eq!(root.for_child(false).prompt_reference(), root_reference);
+
+        let child = root.for_child(true);
+        let reference = child.prompt_reference();
+        for signature in [
+            "async def read(path: str) -> str:",
+            "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+            "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
+            "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+        ] {
+            assert_eq!(reference.matches(signature).count(), 1);
+        }
+        for omitted in [
+            "async def write(",
+            "async def edit(",
+            "async def run(",
+            "class CommandResult:",
+            "Run project-local, one-shot commands.",
+        ] {
+            assert!(
+                !reference.contains(omitted),
+                "restricted reference retained {omitted}"
+            );
+        }
+
+        let descendant = child.for_child(false);
+        assert_eq!(descendant.prompt_reference(), reference);
+        assert_eq!(read(&descendant, "file").await.unwrap(), "before");
+
+        let path = normalise_path("file").unwrap();
+        let digest = content_fingerprint(b"before");
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), digest);
+        for call in [
+            batch_write(1, "created", "write"),
+            batch_edit(2, "file", "before", "after"),
+            batch_run(3, "printf run > command-effect", None),
+        ] {
+            let before = authorisations.clone();
+            let result = descendant.call_with_authorisation(call, Some(digest)).await;
+            assert!(matches!(
+                &result.result,
+                Err(error) if error.kind == ToolErrorKind::Permission
+            ));
+            assert!(result.effect.is_none());
+            result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+            assert_eq!(authorisations, before);
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before"
+        );
+        assert!(!workspace.path().join("created").exists());
+        assert!(!workspace.path().join("command-effect").exists());
     }
 
     #[tokio::test]

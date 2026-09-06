@@ -18,7 +18,10 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::constants::{ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES},
+    config::constants::{
+        ARENA_EXECUTION_TIMEOUT, ARENA_MAX_MEMORY_BYTES, COLLECTION_MAX_ITEMS,
+        COLLECTION_MAX_PAYLOAD_BYTES,
+    },
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
         ToolValue, WholeFileAuthorisations, bootstrap_source,
@@ -31,6 +34,10 @@ const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+const RESULT_VALUES_ERROR_BYTES: usize = 4 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
+const RESULT_VALUES_BINDING: &str = "result_values";
 const STDOUT_DELTA_BYTES: usize = 4 * 1024;
 const STDOUT_RATE_WINDOW: Duration = Duration::from_millis(50);
 const RUN_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -346,6 +353,22 @@ impl ArenaError {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Error)]
+pub(crate) enum ResultValuesError {
+    #[error("result_values export failed: {message}")]
+    Export { message: String },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ResultValuesError {
+    fn export(message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        message.truncate(utf8_prefix_len(&message, RESULT_VALUES_ERROR_BYTES));
+        Self::Export { message }
+    }
+}
+
 struct InterruptedExecutionState {
     streams: StreamAccumulators,
     tools: ToolTraceState,
@@ -442,6 +465,8 @@ impl AttemptFailure {
 }
 
 pub struct Arena {
+    #[cfg_attr(not(test), allow(dead_code))]
+    worker_path: std::path::PathBuf,
     pool: Pool,
     checkout: Option<Checkout>,
     tool_host: ToolHost,
@@ -492,10 +517,7 @@ impl Arena {
         max_memory: Option<usize>,
     ) -> Result<Self, ArenaError> {
         let runtime = validate_worker(&worker_path).await?;
-        let mut config = PoolConfig::subprocess(worker_path);
-        config.min_processes = 1;
-        config.max_processes = 1;
-        let pool = Pool::new(config).await.map_err(pool_failure)?;
+        let pool = Self::open_pool(worker_path.clone()).await?;
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
                 max_memory,
@@ -513,6 +535,7 @@ impl Arena {
         };
 
         Ok(Self {
+            worker_path,
             pool,
             checkout: Some(checkout),
             tool_host,
@@ -520,6 +543,47 @@ impl Arena {
             runtime,
             repl_config,
             execution_timeout,
+            #[cfg(test)]
+            fail_next_recovery: false,
+            #[cfg(test)]
+            recovery_test_gate: None,
+        })
+    }
+
+    async fn open_pool(worker_path: std::path::PathBuf) -> Result<Pool, ArenaError> {
+        let mut config = PoolConfig::subprocess(worker_path);
+        config.min_processes = 1;
+        config.max_processes = 1;
+        Pool::new(config).await.map_err(pool_failure)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn child(
+        &self,
+        checkpoint: &Checkpoint,
+        requested_read_only: bool,
+    ) -> Result<Self, ArenaError> {
+        self.validate_checkpoint(checkpoint)?;
+        let pool = Self::open_pool(self.worker_path.clone()).await?;
+        let repl_config = self.repl_config.clone();
+        let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
+        Self::restore_checkout(&mut checkout, checkpoint).await?;
+        reset_result_values(&mut checkout).await?;
+        let state = checkout.dump().await.map_err(pool_failure)?;
+
+        Ok(Self {
+            worker_path: self.worker_path.clone(),
+            pool,
+            checkout: Some(checkout),
+            tool_host: self.tool_host.for_child(requested_read_only),
+            checkpoint: Checkpoint {
+                identity: self.runtime.clone(),
+                state,
+                authorisations: checkpoint.authorisations.clone(),
+            },
+            runtime: self.runtime.clone(),
+            repl_config,
+            execution_timeout: self.execution_timeout,
             #[cfg(test)]
             fail_next_recovery: false,
             #[cfg(test)]
@@ -598,6 +662,51 @@ impl Arena {
         self.checkpoint.clone()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn collect_result_values(
+        &mut self,
+    ) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
+        self.restore_current_checkpoint_if_needed()
+            .await
+            .map_err(result_values_arena_failure)?;
+        let mut checkout = self
+            .checkout
+            .take()
+            .expect("restoring a missing checkout should install one");
+        let authorisations = self.checkpoint.authorisations.clone();
+        let result = async {
+            let value = timeout(
+                self.execution_timeout,
+                collect_result_values_checkout(&mut checkout),
+            )
+            .await
+            .map_err(|_| ResultValuesError::export("collection timed out"))??;
+            let values = result_values_from_monty(value)?;
+            let state = checkout.dump().await.map_err(result_values_pool_failure)?;
+            Ok((values, state))
+        }
+        .await;
+
+        match result {
+            Ok((values, state)) => {
+                self.checkout = Some(checkout);
+                self.checkpoint = Checkpoint {
+                    identity: self.runtime.clone(),
+                    state,
+                    authorisations,
+                };
+                Ok(values)
+            }
+            Err(error) => {
+                drop(checkout);
+                self.restore_current_checkpoint_if_needed()
+                    .await
+                    .map_err(result_values_arena_failure)?;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn restore(&mut self, checkpoint: Checkpoint) -> Result<(), ArenaError> {
         self.validate_checkpoint(&checkpoint)?;
         self.checkout.take();
@@ -671,6 +780,14 @@ impl Arena {
             .checkout(&self.repl_config)
             .await
             .map_err(pool_failure)?;
+        Self::restore_checkout(&mut checkout, checkpoint).await?;
+        Ok(checkout)
+    }
+
+    async fn restore_checkout(
+        checkout: &mut Checkout,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), ArenaError> {
         let mut on_print = on_print_sync(|_, _| {});
         let (event, _) = checkout
             .restore(checkpoint.state.clone(), vec![], &mut on_print)
@@ -679,7 +796,175 @@ impl Arena {
         if event.is_some() {
             return Err(ArenaError::SuspendedCheckpoint);
         }
-        Ok(checkout)
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> {
+    let mut on_print = on_print_sync(|_, _| {});
+    match checkout
+        .feed("result_values = {}", vec![], vec![], false, &mut on_print)
+        .await
+        .map_err(pool_failure)?
+    {
+        TurnEvent::Complete(MontyObject::None) => Ok(()),
+        event => Err(ArenaError::unsupported_suspension(format!(
+            "result_values initialisation did not complete: {event:?}"
+        ))),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn collect_result_values_checkout(
+    checkout: &mut Checkout,
+) -> Result<MontyObject, ResultValuesError> {
+    let mut on_print = on_print_sync(|_, _| {});
+    match checkout
+        .feed(RESULT_VALUES_BINDING, vec![], vec![], false, &mut on_print)
+        .await
+        .map_err(result_values_pool_failure)?
+    {
+        TurnEvent::Complete(value) => Ok(value),
+        TurnEvent::NameLookup { .. } => {
+            Err(ResultValuesError::export("result_values is not defined"))
+        }
+        TurnEvent::FunctionCall { .. }
+        | TurnEvent::OsCall { .. }
+        | TurnEvent::ResolveFutures { .. } => Err(ResultValuesError::export(
+            "collection attempted a host suspension",
+        )),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn result_values_pool_failure(error: PoolError) -> ResultValuesError {
+    ResultValuesError::export(format!("collection transport failed: {error}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn result_values_arena_failure(error: ArenaError) -> ResultValuesError {
+    ResultValuesError::export(format!(
+        "could not restore result_values checkpoint: {error}"
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct ResultValueBounds {
+    items: usize,
+    payload_bytes: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ResultValueBounds {
+    fn new() -> Self {
+        Self {
+            items: 0,
+            payload_bytes: 0,
+        }
+    }
+
+    fn add_item(&mut self) -> Result<(), ResultValuesError> {
+        self.items = self
+            .items
+            .checked_add(1)
+            .filter(|items| *items <= COLLECTION_MAX_ITEMS)
+            .ok_or_else(|| {
+                ResultValuesError::export(format!(
+                    "export exceeds the {COLLECTION_MAX_ITEMS}-item limit"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn add_payload(&mut self, bytes: usize) -> Result<(), ResultValuesError> {
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(bytes)
+            .filter(|payload_bytes| *payload_bytes <= COLLECTION_MAX_PAYLOAD_BYTES)
+            .ok_or_else(|| {
+                ResultValuesError::export(format!(
+                    "export exceeds the {COLLECTION_MAX_PAYLOAD_BYTES}-byte payload limit"
+                ))
+            })?;
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn result_values_from_monty(
+    value: MontyObject,
+) -> Result<BTreeMap<String, ToolValue>, ResultValuesError> {
+    let MontyObject::Dict(values) = value else {
+        return Err(ResultValuesError::export(
+            "result_values must be a dictionary",
+        ));
+    };
+    let mut bounds = ResultValueBounds::new();
+    let mut converted = BTreeMap::new();
+    for (key, value) in values {
+        bounds.add_item()?;
+        let MontyObject::String(key) = key else {
+            return Err(ResultValuesError::export(
+                "result_values dictionaries require string keys",
+            ));
+        };
+        bounds.add_payload(key.len())?;
+        let value = result_value_from_monty(value, &mut bounds)?;
+        if converted.insert(key, value).is_some() {
+            return Err(ResultValuesError::export(
+                "result_values dictionaries cannot contain duplicate keys",
+            ));
+        }
+    }
+    Ok(converted)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn result_value_from_monty(
+    value: MontyObject,
+    bounds: &mut ResultValueBounds,
+) -> Result<ToolValue, ResultValuesError> {
+    match value {
+        MontyObject::None => Ok(ToolValue::None),
+        MontyObject::Bool(value) => Ok(ToolValue::Bool(value)),
+        MontyObject::Int(value) => Ok(ToolValue::Integer(value)),
+        MontyObject::Float(value) => Ok(ToolValue::Float(value)),
+        MontyObject::String(value) => {
+            bounds.add_payload(value.len())?;
+            Ok(ToolValue::String(value))
+        }
+        MontyObject::List(values) => {
+            let mut converted = Vec::new();
+            for value in values {
+                bounds.add_item()?;
+                converted.push(result_value_from_monty(value, bounds)?);
+            }
+            Ok(ToolValue::List(converted))
+        }
+        MontyObject::Dict(values) => {
+            let mut converted = BTreeMap::new();
+            for (key, value) in values {
+                bounds.add_item()?;
+                let MontyObject::String(key) = key else {
+                    return Err(ResultValuesError::export(
+                        "result_values dictionaries require string keys",
+                    ));
+                };
+                bounds.add_payload(key.len())?;
+                let value = result_value_from_monty(value, bounds)?;
+                if converted.insert(key, value).is_some() {
+                    return Err(ResultValuesError::export(
+                        "result_values dictionaries cannot contain duplicate keys",
+                    ));
+                }
+            }
+            Ok(ToolValue::Dictionary(converted))
+        }
+        value => Err(ResultValuesError::export(format!(
+            "result_values contains unsupported {}",
+            value.type_name()
+        ))),
     }
 }
 
@@ -1817,6 +2102,7 @@ fn is_line_boundary_after(previous: char, next: Option<char>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     #[cfg(unix)]
@@ -1825,7 +2111,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use monty_types::PrintStream;
+    use monty_types::{MontyObject, MontyType, PrintStream};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
@@ -1836,7 +2122,7 @@ mod tests {
         Observation, ObservationAccumulator, ObservationLimits, PythonError, RUNTIME_IDENTITY,
         RuntimeIdentity, StreamAccumulators, ToolCall, ToolCallSummary, ToolName, ToolTraceState,
         drive, is_unsafe_memory_error, is_unsafe_soft_memory_error, parse_soft_memory_limit,
-        tool_summary, validate_worker, validate_worker_with_timeout,
+        result_values_from_monty, tool_summary, validate_worker, validate_worker_with_timeout,
     };
     use crate::tools::{
         BatchTestGate, BlockingTestGate, CommandTestGate, ReadTestGate, ToolHost, ToolResult,
@@ -2059,6 +2345,46 @@ mod tests {
             result.result = Ok(ToolValue::None);
             assert_failed_without_count_label_panic(tool, &result);
         }
+    }
+
+    #[test]
+    fn result_value_converter_rejects_unrepresentable_transport_values_without_partial_exports() {
+        let values = [
+            (
+                "function",
+                MontyObject::Function {
+                    name: "external".to_owned(),
+                    docstring: None,
+                },
+            ),
+            (
+                "class",
+                MontyObject::Type(MontyType::Instance("Unsupported".to_owned())),
+            ),
+            ("bytes", MontyObject::Bytes(b"bytes".to_vec())),
+            ("big integer", MontyObject::BigInt(Default::default())),
+            ("repr", MontyObject::Repr("unsupported".to_owned())),
+            ("cycle", MontyObject::Cycle(1, "[...]".to_owned())),
+        ];
+
+        for (kind, value) in values {
+            let error = result_values_from_monty(MontyObject::dict(vec![
+                (MontyObject::String("valid".to_owned()), MontyObject::Int(1)),
+                (MontyObject::String("invalid".to_owned()), value),
+            ]))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported"),
+                "{kind} should not produce a partial export: {error}"
+            );
+        }
+
+        let error = super::ResultValuesError::export("é".repeat(super::RESULT_VALUES_ERROR_BYTES));
+        let text = error.to_string();
+        assert!(
+            text.len() <= "result_values export failed: ".len() + super::RESULT_VALUES_ERROR_BYTES
+        );
+        assert!(text.is_char_boundary(text.len()));
     }
 
     #[test]
@@ -2546,6 +2872,380 @@ mod tests {
         assert_eq!(
             limits.max_memory,
             Some(crate::config::constants::ARENA_MAX_MEMORY_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn child_clones_an_idle_checkpoint_with_empty_exports_and_independent_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = arena(&workspace).await;
+        execute_without_cancellation(
+            &mut parent,
+            "values = [1]\ndef helper():\n    return values[0]\nalias = helper\nresult_values = {'parent': 'kept'}",
+        )
+        .await
+        .unwrap();
+        let checkpoint = parent.checkpoint();
+
+        let mut child = parent.child(&checkpoint, false).await.unwrap();
+
+        assert_eq!(
+            child.collect_result_values().await.unwrap(),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(
+                    &mut child,
+                    "values[0] = 2\nresult_values = {'child': alias()}\nalias()",
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "2"
+        );
+        assert_eq!(
+            child.collect_result_values().await.unwrap(),
+            BTreeMap::from([("child".to_owned(), ToolValue::Integer(2))])
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut parent, "alias()")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "1"
+        );
+        assert_eq!(
+            parent.collect_result_values().await.unwrap(),
+            BTreeMap::from([("parent".to_owned(), ToolValue::String("kept".to_owned()))])
+        );
+    }
+
+    #[tokio::test]
+    async fn children_exclude_later_parent_state_and_keep_freshness_separate() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let mut parent = arena(&workspace).await;
+        execute_without_cancellation(&mut parent, "await read('file')")
+            .await
+            .unwrap();
+        let checkpoint = parent.checkpoint();
+        execute_without_cancellation(&mut parent, "after_checkpoint = 'parent'")
+            .await
+            .unwrap();
+
+        let mut child = parent.child(&checkpoint, false).await.unwrap();
+        assert_eq!(
+            child.tool_host.prompt_reference(),
+            crate::tools::prompt_reference()
+        );
+        assert!(
+            python_error(
+                &execute_without_cancellation(&mut child, "after_checkpoint")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("NameError")
+        );
+        fs::write(workspace.path().join("file"), "external").unwrap();
+        assert!(
+            python_error(
+                &execute_without_cancellation(&mut child, "await write('file', 'child')")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("RuntimeError")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "external"
+        );
+        execute_without_cancellation(&mut child, "await read('file')")
+            .await
+            .unwrap();
+        execute_without_cancellation(&mut child, "await write('file', 'child')")
+            .await
+            .unwrap();
+
+        assert!(has_authorisation(&child, "file"));
+        assert!(has_authorisation(&parent, "file"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "child"
+        );
+        assert!(
+            python_error(
+                &execute_without_cancellation(&mut parent, "await write('file', 'parent')")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn children_can_share_a_checkpoint_and_reject_foreign_identities() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = arena(&workspace).await;
+        execute_without_cancellation(&mut parent, "value = 1")
+            .await
+            .unwrap();
+        let checkpoint = parent.checkpoint();
+
+        let mut first = parent.child(&checkpoint, false).await.unwrap();
+        let mut second = parent.child(&checkpoint, false).await.unwrap();
+        execute_without_cancellation(&mut first, "value = 2")
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut second, "value")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "1"
+        );
+
+        let mut foreign = checkpoint;
+        foreign.identity = RuntimeIdentity("monty-runtime 9.9.9".to_owned());
+        let Err(error) = parent.child(&foreign, false).await else {
+            panic!("foreign checkpoint unexpectedly created a child");
+        };
+        assert!(matches!(error, ArenaError::IncompatibleCheckpoint { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_only_children_deny_mutating_wrappers_and_descendants() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let mut parent = arena(&workspace).await;
+        execute_without_cancellation(&mut parent, "await read('file')")
+            .await
+            .unwrap();
+        let checkpoint = parent.checkpoint();
+        let mut child = parent.child(&checkpoint, true).await.unwrap();
+        let authorisations = child.checkpoint().authorisations.clone();
+
+        for code in [
+            "await write('created', 'child')",
+            "await _kiki_write('created', 'child')",
+            "write_alias = write\nawait write_alias('created', 'child')",
+            "await edit('file', 'before', 'child')",
+            "await _kiki_edit('file', 'before', 'child')",
+            "edit_alias = edit\nawait edit_alias('file', 'before', 'child')",
+            "await run('touch command-effect')",
+            "await _kiki_run('touch command-effect')",
+            "run_alias = run\nawait run_alias('touch command-effect')",
+        ] {
+            let execution = execute_without_cancellation(&mut child, code)
+                .await
+                .unwrap();
+            assert!(python_error(&execution).text.contains("PermissionError"));
+            assert_eq!(execution.tool_calls.len(), 1);
+            assert_eq!(execution.tool_calls[0].summary, ToolCallSummary::Failed);
+            assert_eq!(child.checkpoint().authorisations, authorisations);
+        }
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut child, "await read('file')")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "'before'"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before"
+        );
+        assert!(!workspace.path().join("created").exists());
+        assert!(!workspace.path().join("command-effect").exists());
+
+        let mut grandchild = child.child(&child.checkpoint(), false).await.unwrap();
+        assert!(
+            python_error(
+                &execute_without_cancellation(&mut grandchild, "await write('created', 'child')")
+                    .await
+                    .unwrap()
+            )
+            .text
+            .contains("PermissionError")
+        );
+    }
+
+    #[tokio::test]
+    async fn result_values_exports_neutral_values_and_recovers_after_rejection() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut root = arena(&workspace).await;
+        let root_checkpoint = root.checkpoint();
+        let missing = root.collect_result_values().await.unwrap_err();
+        assert!(missing.to_string().contains("result_values is not defined"));
+        assert_eq!(root.checkpoint(), root_checkpoint);
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut root, "1 + 1")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "2"
+        );
+
+        let mut parent = arena(&workspace).await;
+        execute_without_cancellation(&mut parent, "def source():\n    return 42")
+            .await
+            .unwrap();
+        let checkpoint = parent.checkpoint();
+        let mut child = parent.child(&checkpoint, false).await.unwrap();
+        execute_without_cancellation(
+            &mut child,
+            "result_values = {'none': None, 'bool': True, 'integer': -1, 'float': 1.5, 'string': 'value', 'list': [1, {'nested': 'value'}]}",
+        )
+        .await
+        .unwrap();
+        let expected = BTreeMap::from([
+            ("bool".to_owned(), ToolValue::Bool(true)),
+            ("float".to_owned(), ToolValue::Float(1.5)),
+            ("integer".to_owned(), ToolValue::Integer(-1)),
+            (
+                "list".to_owned(),
+                ToolValue::List(vec![
+                    ToolValue::Integer(1),
+                    ToolValue::Dictionary(BTreeMap::from([(
+                        "nested".to_owned(),
+                        ToolValue::String("value".to_owned()),
+                    )])),
+                ]),
+            ),
+            ("none".to_owned(), ToolValue::None),
+            ("string".to_owned(), ToolValue::String("value".to_owned())),
+        ]);
+        let child_checkpoint = child.checkpoint();
+        assert_eq!(child.collect_result_values().await.unwrap(), expected);
+        assert_eq!(
+            child.checkpoint().authorisations,
+            child_checkpoint.authorisations
+        );
+        assert_eq!(child.collect_result_values().await.unwrap(), expected);
+        assert_eq!(
+            child.checkpoint().authorisations,
+            child_checkpoint.authorisations
+        );
+
+        let cases = [
+            ("non-dictionary", "result_values = 1"),
+            ("non-string key", "result_values = {1: 'value'}"),
+            (
+                "function",
+                "def unsupported():\n    return None\nresult_values = {'value': unsupported}",
+            ),
+            (
+                "class",
+                "class Unsupported:\n    pass\nresult_values = {'value': Unsupported}",
+            ),
+            ("bytes", "result_values = {'value': b'bytes'}"),
+            ("big integer", "result_values = {'value': 1 << 100}"),
+            ("repr", "result_values = {'value': iter([])}"),
+            (
+                "cycle",
+                "cycle = []\ncycle.append(cycle)\nresult_values = {'value': cycle}",
+            ),
+            (
+                "transport depth",
+                "result_values = {}\nvalue = result_values\nfor _ in range(1_100):\n    next_value = {}\n    value['next'] = next_value\n    value = next_value",
+            ),
+            ("too many values", "result_values = {'value': [0] * 10_001}"),
+            (
+                "too much payload",
+                "result_values = {'value': 'x' * (4 * 1024 * 1024 + 1)}",
+            ),
+        ];
+        for (case, code) in cases {
+            let setup = execute_without_cancellation(&mut child, code)
+                .await
+                .unwrap();
+            assert!(
+                matches!(setup.outcome, ExecutionOutcome::Complete { .. }),
+                "{case} setup did not complete: {setup:?}"
+            );
+            let checkpoint = child.checkpoint();
+            let error = child.collect_result_values().await.unwrap_err();
+            assert!(matches!(error, super::ResultValuesError::Export { .. }));
+            assert!(
+                error.to_string().len()
+                    <= "result_values export failed: ".len() + super::RESULT_VALUES_ERROR_BYTES
+            );
+            assert_eq!(child.checkpoint(), checkpoint);
+            assert_eq!(
+                complete(
+                    &execute_without_cancellation(&mut child, "1 + 1")
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+                .head,
+                "2",
+                "child did not recover after {case} export"
+            );
+        }
+
+        let hostile_setup = execute_without_cancellation(
+            &mut child,
+            "repr_mutations = []\nclass Hostile:\n    def __repr__(self):\n        repr_mutations.append('changed')\n        _kiki_write('collection-side-effect', 'bad')\n        return 'Hostile()'\nresult_values = {'value': Hostile()}",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            hostile_setup.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        let checkpoint = child.checkpoint();
+        let error = child.collect_result_values().await.unwrap_err();
+        assert!(matches!(error, super::ResultValuesError::Export { .. }));
+        assert_eq!(child.checkpoint(), checkpoint);
+        assert!(!workspace.path().join("collection-side-effect").exists());
+        assert_eq!(child.checkpoint().authorisations, checkpoint.authorisations);
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut child, "repr_mutations")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "[]"
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut child, "source()")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "42"
+        );
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut parent, "source()")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+            .head,
+            "42"
         );
     }
 
