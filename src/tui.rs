@@ -1079,7 +1079,7 @@ impl App {
             {
                 Some(PromptEdit::Insert(character))
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {
                 Some(PromptEdit::InsertNewline)
             }
             _ => None,
@@ -3800,6 +3800,21 @@ mod tests {
                 request: "f\ng".to_owned(),
             }]
         );
+
+        for modifiers in [
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+            KeyModifiers::SHIFT | KeyModifiers::META,
+        ] {
+            let mut app = app_with_prompt("keep");
+
+            let update = app.handle_key(modified_key(KeyCode::Enter, modifiers));
+
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(app.prompt.text(), "keep");
+        }
 
         let mut active = App::default();
         active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
