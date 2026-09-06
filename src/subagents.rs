@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
+use std::ops::{Deref, DerefMut};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use serde::Serialize;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
@@ -23,7 +24,7 @@ use crate::config::{
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
-use crate::telemetry::{ChildStopCause, Settlement, Trace, TraceEvent};
+use crate::telemetry::{ChildStopCause, CoordinatorOperation, Settlement, Trace, TraceEvent};
 use crate::tools::{ToolError, ToolValue};
 
 const TASK_ID_WIDTH: usize = 6;
@@ -1003,6 +1004,66 @@ pub(crate) trait ChildModelFactory: Send + Sync + 'static {
     fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model;
 }
 
+struct ChildExecutionSpan<'a> {
+    trace: &'a Trace,
+    child_id: &'a TaskId,
+    cancellation: &'a CancellationToken,
+    model_step: Option<u64>,
+}
+
+impl<'a> ChildExecutionSpan<'a> {
+    fn new(trace: &'a Trace, child_id: &'a TaskId, cancellation: &'a CancellationToken) -> Self {
+        Self {
+            trace,
+            child_id,
+            cancellation,
+            model_step: None,
+        }
+    }
+
+    fn started(&mut self, model_step: u64) {
+        assert!(
+            self.model_step.is_none(),
+            "child execution started before the previous execution settled"
+        );
+        self.model_step = Some(model_step);
+        self.trace.emit(|| TraceEvent::ChildExecutionStarted {
+            child_id: self.child_id.clone(),
+            model_step,
+        });
+    }
+
+    fn completed(&mut self) {
+        let model_step = self
+            .model_step
+            .take()
+            .expect("child execution completed without starting");
+        self.trace.emit(|| TraceEvent::ChildExecutionSettled {
+            child_id: self.child_id.clone(),
+            model_step,
+            outcome: Settlement::Succeeded,
+        });
+    }
+}
+
+impl Drop for ChildExecutionSpan<'_> {
+    fn drop(&mut self) {
+        let Some(model_step) = self.model_step else {
+            return;
+        };
+        let outcome = if self.cancellation.is_cancelled() {
+            Settlement::Cancelled
+        } else {
+            Settlement::Failed
+        };
+        self.trace.emit(|| TraceEvent::ChildExecutionSettled {
+            child_id: self.child_id.clone(),
+            model_step,
+            outcome,
+        });
+    }
+}
+
 pub(crate) struct CompleteChildRunner<F> {
     prompt_base: String,
     models: F,
@@ -1029,6 +1090,9 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
         let model = models.create(child_prompt, selection);
         Box::pin(async move {
+            trace.emit(|| TraceEvent::ChildArenaConstructionStarted {
+                child_id: id.clone(),
+            });
             let arena_result = {
                 let mut construction_progress = |phase| {
                     trace.emit(|| TraceEvent::child_arena_phase(id.clone(), phase));
@@ -1070,6 +1134,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
             }
             agent.set_invocation_context(context);
             let mut model_step: u64 = 0;
+            let mut execution_span = ChildExecutionSpan::new(&trace, &id, &cancellation);
             let mut progress = |event| match event {
                 AgentProgress::ModelStepStarted => {
                     model_step = model_step
@@ -1100,20 +1165,23 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                         attempt,
                     });
                 }
+                AgentProgress::ExecutionStarted { .. } => execution_span.started(model_step),
                 AgentProgress::ExecutionCompleted {
                     source,
                     reasoning_summary,
                     execution,
                     attempts,
-                } => reporter.execution_completed(
-                    model_step,
-                    source,
-                    reasoning_summary,
-                    execution,
-                    attempts,
-                ),
-                AgentProgress::ExecutionStarted { .. }
-                | AgentProgress::ToolUpdated { .. }
+                } => {
+                    execution_span.completed();
+                    reporter.execution_completed(
+                        model_step,
+                        source,
+                        reasoning_summary,
+                        execution,
+                        attempts,
+                    );
+                }
+                AgentProgress::ToolUpdated { .. }
                 | AgentProgress::RunPreviewUpdated { .. }
                 | AgentProgress::StdoutDelta { .. }
                 | AgentProgress::StdoutTruncated
@@ -1486,6 +1554,34 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     }
 }
 
+struct CoordinatorLockGuard<'a> {
+    inner: MutexGuard<'a, Inner>,
+    trace: &'a Trace,
+    operation: CoordinatorOperation,
+}
+
+impl Deref for CoordinatorLockGuard<'_> {
+    type Target = Inner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for CoordinatorLockGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for CoordinatorLockGuard<'_> {
+    fn drop(&mut self) {
+        self.trace.emit(|| TraceEvent::CoordinatorLockReleased {
+            operation: self.operation,
+        });
+    }
+}
+
 struct Inner {
     session: u64,
     next_origin: u64,
@@ -1675,8 +1771,21 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         }
     }
 
+    async fn lock_inner(&self, operation: CoordinatorOperation) -> CoordinatorLockGuard<'_> {
+        self.trace
+            .emit(|| TraceEvent::CoordinatorLockWaiting { operation });
+        let inner = self.inner.lock().await;
+        self.trace
+            .emit(|| TraceEvent::CoordinatorLockAcquired { operation });
+        CoordinatorLockGuard {
+            inner,
+            trace: &self.trace,
+            operation,
+        }
+    }
+
     pub(crate) async fn root_caller(&self) -> Caller {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.lock_inner(CoordinatorOperation::RootCaller).await;
         let origin = OriginId(inner.next_origin);
         inner.next_origin = inner
             .next_origin
@@ -1696,7 +1805,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         payload: P,
     ) -> Result<TaskObservation, AdmissionError> {
         let (child, observation, spawned) = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
             let now = self.now();
             let observed_at_ms = self.unix_time_ms();
             if inner.shutting_down {
@@ -1821,7 +1930,10 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     pub(crate) async fn subscribe(&self) -> watch::Receiver<u64> {
-        self.inner.lock().await.notifications.subscribe()
+        self.lock_inner(CoordinatorOperation::Subscribe)
+            .await
+            .notifications
+            .subscribe()
     }
 
     pub(crate) async fn get(
@@ -1829,7 +1941,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         caller: &Caller,
         id: &TaskId,
     ) -> Result<TaskObservation, AccessError> {
-        let inner = self.inner.lock().await;
+        let inner = self.lock_inner(CoordinatorOperation::Get).await;
         ensure_access(&inner, caller, id)?;
         let task = inner
             .tasks
@@ -1854,7 +1966,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         wait_phase: Option<&WaitPhaseSignal>,
     ) -> Result<(ChildResult, TaskObservation), WaitError> {
         let updates = {
-            let inner = self.inner.lock().await;
+            let inner = self.lock_inner(CoordinatorOperation::WaitInitial).await;
             ensure_access(&inner, caller, id)?;
             inner
                 .tasks
@@ -1885,7 +1997,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         wait_phase: Option<&WaitPhaseSignal>,
     ) -> Result<TaskObservation, AccessError> {
         {
-            let inner = self.inner.lock().await;
+            let inner = self.lock_inner(CoordinatorOperation::Cancel).await;
             ensure_access(&inner, caller, id)?;
         }
         let stopping = self.request_stop_subtree(id, StopReason::Cancelled).await;
@@ -1904,8 +2016,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
 
     pub(crate) async fn join_active(&self) {
         let active = self
-            .inner
-            .lock()
+            .lock_inner(CoordinatorOperation::JoinActive)
             .await
             .tasks
             .values()
@@ -1924,7 +2035,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) async fn service(&self) {
         let now = self.now();
         let mut expired = {
-            let inner = self.inner.lock().await;
+            let inner = self.lock_inner(CoordinatorOperation::Service).await;
             inner
                 .tasks
                 .values()
@@ -1943,8 +2054,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     pub(crate) async fn next_deadline(&self) -> Option<Instant> {
-        self.inner
-            .lock()
+        self.lock_inner(CoordinatorOperation::NextDeadline)
             .await
             .tasks
             .values()
@@ -1955,7 +2065,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
 
     pub(crate) async fn shutdown(&self) {
         {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.lock_inner(CoordinatorOperation::Shutdown).await;
             inner.shutting_down = true;
             inner.notify();
         }
@@ -1976,7 +2086,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     pub(crate) async fn record(&self, id: &TaskId) -> Option<TaskRecord> {
-        let inner = self.inner.lock().await;
+        let inner = self.lock_inner(CoordinatorOperation::Record).await;
         let now = self.now();
         let observed_at_ms = self.unix_time_ms();
         inner
@@ -1996,7 +2106,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             child_id: id.clone(),
         });
         let cancellation = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.lock_inner(CoordinatorOperation::RunChild).await;
             let task = inner
                 .tasks
                 .get_mut(&id)
@@ -2009,10 +2119,20 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         } else {
             let runner = self.runner.clone();
             let runner_cancellation = cancellation.clone();
-            AssertUnwindSafe(async move { runner.run(child, runner_cancellation).await })
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| Err(ChildFailure::new("child runner panicked")))
+            self.trace.emit(|| TraceEvent::ChildRunnerSetupStarted {
+                child_id: id.clone(),
+            });
+            let runner = catch_unwind(AssertUnwindSafe(|| runner.run(child, runner_cancellation)));
+            self.trace.emit(|| TraceEvent::ChildRunnerSetupFinished {
+                child_id: id.clone(),
+            });
+            match runner {
+                Ok(runner) => AssertUnwindSafe(runner)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(ChildFailure::new("child runner panicked"))),
+                Err(_) => Err(ChildFailure::new("child runner panicked")),
+            }
         };
         let outcome = match &result {
             Ok(_) => Settlement::Succeeded,
@@ -2029,7 +2149,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     async fn finish_child(&self, id: &TaskId, result: Result<ChildResult, ChildFailure>) {
         let now = self.now();
         let outcome = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.lock_inner(CoordinatorOperation::FinishChild).await;
             let task = inner
                 .tasks
                 .get_mut(id)
@@ -2069,7 +2189,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .await;
         self.wait_for_all(descendants).await;
         let record = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self
+                .lock_inner(CoordinatorOperation::FinishChildSettlement)
+                .await;
             settle_task(
                 &mut inner,
                 id,
@@ -2085,7 +2207,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn request_stop_subtree(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self
+            .lock_inner(CoordinatorOperation::RequestStopSubtree)
+            .await;
         let ids = inner
             .tasks
             .keys()
@@ -2096,7 +2220,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn request_stop_descendants(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self
+            .lock_inner(CoordinatorOperation::RequestStopDescendants)
+            .await;
         let ids = inner
             .tasks
             .keys()
@@ -2107,7 +2233,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn request_timeout(&self, id: &TaskId) -> Vec<TaskId> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.lock_inner(CoordinatorOperation::RequestTimeout).await;
         let Some(task) = inner.tasks.get(id) else {
             return Vec::new();
         };
@@ -2136,7 +2262,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn request_stop_all(&self, reason: StopReason, active: Option<&Caller>) {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.lock_inner(CoordinatorOperation::RequestStopAll).await;
         let mut origins = inner
             .tasks
             .values()
@@ -2165,7 +2291,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
 
     async fn wait_for_terminal(&self, id: &TaskId) -> TaskOutcome {
         let updates = {
-            let inner = self.inner.lock().await;
+            let inner = self
+                .lock_inner(CoordinatorOperation::WaitForTerminalSubscribe)
+                .await;
             inner
                 .tasks
                 .get(id)
@@ -2176,8 +2304,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let mut updates = updates;
         loop {
             if let Some(outcome) = self
-                .inner
-                .lock()
+                .lock_inner(CoordinatorOperation::WaitForTerminalCheck)
                 .await
                 .tasks
                 .get(id)
@@ -2200,7 +2327,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     ) -> Result<(ChildResult, TaskObservation), WaitError> {
         loop {
             let terminal = {
-                let inner = self.inner.lock().await;
+                let inner = self.lock_inner(CoordinatorOperation::WaitForOutcome).await;
                 let task = inner
                     .tasks
                     .get(id)
@@ -2417,6 +2544,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use futures::FutureExt;
     use tokio::sync::{Notify, mpsc, oneshot};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
@@ -2434,7 +2562,7 @@ mod tests {
         ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
     use crate::telemetry::TraceOwner;
-    use crate::tools::{ToolHost, ToolValue};
+    use crate::tools::{ReadTestGate, ToolHost, ToolValue};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -2594,6 +2722,35 @@ mod tests {
 
     fn result(message: &str) -> ChildResult {
         ChildResult::new(message.to_owned(), BTreeMap::new())
+    }
+
+    fn child_execution_events(trace: &str) -> Vec<serde_json::Value> {
+        trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .filter(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("child_execution_started" | "child_execution_settled")
+                )
+            })
+            .collect()
+    }
+
+    fn child_execution_event_summaries(
+        events: &[serde_json::Value],
+    ) -> Vec<(&str, &str, u64, Option<&str>)> {
+        events
+            .iter()
+            .map(|event| {
+                (
+                    event["child_id"].as_str().expect("child id"),
+                    event["event"].as_str().expect("event name"),
+                    event["model_step"].as_u64().expect("model step"),
+                    event["outcome"].as_str(),
+                )
+            })
+            .collect()
     }
 
     fn known_usage() -> crate::model::AttemptAccounting {
@@ -2758,6 +2915,66 @@ mod tests {
                 Err(ChildFailure::new("runner cancelled"))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn traced_coordinator_locks_are_balanced_after_success_and_early_return() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let (coordinator, mut started) = coordinator(SubagentPolicy {
+            max_starts_per_run: 1,
+            ..policy()
+        });
+        let coordinator = coordinator.with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let running = started.recv().await.expect("child starts");
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::StartBudget)
+        );
+        running.finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, admitted.id()).await.unwrap();
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let events = fs::read_to_string(&trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .collect::<Vec<_>>();
+        let mut spans = BTreeMap::<String, [usize; 3]>::new();
+        for event in events.iter().filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some(
+                    "coordinator_lock_waiting"
+                        | "coordinator_lock_acquired"
+                        | "coordinator_lock_released"
+                )
+            )
+        }) {
+            assert_eq!(
+                event.as_object().expect("trace event object").len(),
+                7,
+                "coordinator lock events contain only their fixed operation"
+            );
+            let phase = match event["event"].as_str() {
+                Some("coordinator_lock_waiting") => 0,
+                Some("coordinator_lock_acquired") => 1,
+                Some("coordinator_lock_released") => 2,
+                _ => unreachable!("filtered coordinator lock event"),
+            };
+            let operation = event["operation"].as_str().expect("fixed operation");
+            spans.entry(operation.to_owned()).or_default()[phase] += 1;
+        }
+
+        assert_eq!(spans["start"], [2, 2, 2]);
+        assert!(
+            spans
+                .iter()
+                .all(|(_, counts)| counts[0] == counts[1] && counts[1] == counts[2])
+        );
     }
 
     #[tokio::test]
@@ -3737,8 +3954,17 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
             .collect::<Vec<_>>();
+        let child_events = events
+            .iter()
+            .filter(|event| {
+                !event["event"]
+                    .as_str()
+                    .expect("event name")
+                    .starts_with("coordinator_lock_")
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            events
+            child_events
                 .iter()
                 .map(|event| event["event"].as_str().expect("event name"))
                 .collect::<Vec<_>>(),
@@ -3746,6 +3972,9 @@ mod tests {
                 "process_started",
                 "child_admitted",
                 "child_runner_started",
+                "child_runner_setup_started",
+                "child_runner_setup_finished",
+                "child_arena_construction_started",
                 "child_arena_pool_opened",
                 "child_arena_checked_out",
                 "child_arena_checkpoint_restored",
@@ -3760,10 +3989,10 @@ mod tests {
                 "process_shutdown",
             ]
         );
-        assert_eq!(events[1]["child_id"], "000000");
-        assert_eq!(events[1]["parent_id"], serde_json::Value::Null);
-        assert_eq!(events[1]["model"], DEFAULT_MODEL.id);
-        assert_eq!(events[1]["thinking"], DEFAULT_MODEL.default_thinking);
+        assert_eq!(child_events[1]["child_id"], "000000");
+        assert_eq!(child_events[1]["parent_id"], serde_json::Value::Null);
+        assert_eq!(child_events[1]["model"], DEFAULT_MODEL.id);
+        assert_eq!(child_events[1]["thinking"], DEFAULT_MODEL.default_thinking);
         assert!(events.iter().all(|event| {
             event["schema_version"] == 1
                 && event["process"].is_object()
@@ -3785,6 +4014,256 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn traced_child_execution_brackets_completed_execution_without_content() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let factory = ScriptedChildFactory::new([vec![
+            ScriptedAction::Code {
+                source: "result_values = {'key-SECRET': 'value-SECRET'}".to_owned(),
+            },
+            ScriptedAction::Message {
+                text: "final-message-SECRET".to_owned(),
+            },
+        ]]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory,
+            )),
+        )
+        .with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                ChildParameters::new(
+                    "child-request-SECRET".to_owned(),
+                    ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                        .expect("default selection"),
+                    false,
+                ),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+        coordinator
+            .wait(&caller, child.id())
+            .await
+            .expect("child completion");
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        let execution_events = child_execution_events(&trace);
+        assert_eq!(
+            child_execution_event_summaries(&execution_events),
+            [
+                ("000000", "child_execution_started", 1, None),
+                ("000000", "child_execution_settled", 1, Some("succeeded")),
+            ]
+        );
+        assert!(execution_events.iter().all(|event| {
+            event.get("source").is_none()
+                && event.get("stdout").is_none()
+                && event.get("stderr").is_none()
+                && event.get("result").is_none()
+        }));
+        for sensitive in [
+            "child-request-SECRET",
+            "key-SECRET",
+            "value-SECRET",
+            "final-message-SECRET",
+        ] {
+            assert!(!trace.contains(sensitive), "trace leaked {sensitive}");
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_child_execution_settles_cancelled_and_failed_executions() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("cancelled-SECRET"), "contents").expect("write fixture");
+        let read_gate = ReadTestGate::new();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host")
+                .with_test_gate(read_gate.clone()),
+        )
+        .await
+        .expect("create parent arena");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let factory = ScriptedChildFactory::new([
+            vec![ScriptedAction::Code {
+                source: "contents = await read('cancelled-SECRET')".to_owned(),
+            }],
+            vec![ScriptedAction::Code {
+                source: "x = 'failure-SECRET' * (1 << 60)".to_owned(),
+            }],
+        ]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory,
+            )),
+        )
+        .with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let cancelled = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit cancelled child");
+        read_gate.wait_until_read_started().await;
+        assert_eq!(
+            coordinator
+                .cancel(&caller, cancelled.id())
+                .await
+                .expect("cancel child")
+                .state(),
+            TaskState::Cancelled
+        );
+
+        let failed = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit failed child");
+        let failure = coordinator
+            .wait(&caller, failed.id())
+            .await
+            .expect_err("arena failure settles child");
+        assert_eq!(
+            failure.observation().expect("failed observation").state(),
+            TaskState::Failed
+        );
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        assert_eq!(
+            child_execution_event_summaries(&child_execution_events(&trace)),
+            [
+                ("000000", "child_execution_started", 1, None),
+                ("000000", "child_execution_settled", 1, Some("cancelled")),
+                ("000001", "child_execution_started", 1, None),
+                ("000001", "child_execution_settled", 1, Some("failed")),
+            ]
+        );
+        for sensitive in ["cancelled-SECRET", "failure-SECRET"] {
+            assert!(!trace.contains(sensitive), "trace leaked {sensitive}");
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_child_execution_settles_timed_out_execution_as_cancelled() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("timed-out-SECRET"), "contents").expect("write fixture");
+        let read_gate = ReadTestGate::new();
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host")
+                .with_test_gate(read_gate.clone()),
+        )
+        .await
+        .expect("create parent arena");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let clock = Arc::new(ManualClock::new(0));
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                timeout: Duration::from_secs(1),
+                ..policy()
+            },
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                ScriptedChildFactory::new([vec![ScriptedAction::Code {
+                    source: "contents = await read('timed-out-SECRET')".to_owned(),
+                }]]),
+            )),
+            clock.clone(),
+        )
+        .with_trace(trace_owner.handle());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+        read_gate.wait_until_read_started().await;
+        clock.advance(Duration::from_secs(1));
+        coordinator.service().await;
+        assert_timed_out(
+            coordinator
+                .wait(&caller, child.id())
+                .await
+                .expect_err("timed-out child fails to wait"),
+            child.id(),
+        );
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        assert_eq!(
+            child_execution_event_summaries(&child_execution_events(&trace)),
+            [
+                ("000000", "child_execution_started", 1, None),
+                ("000000", "child_execution_settled", 1, Some("cancelled")),
+            ]
+        );
+        assert!(!trace.contains("timed-out-SECRET"));
+    }
+
+    #[tokio::test]
+    async fn traced_child_execution_settles_runner_future_unwind() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let trace = trace_owner.handle();
+        let child_id = TaskId::parse("000000").expect("valid child id");
+        let cancellation = CancellationToken::new();
+
+        let unwind = std::panic::AssertUnwindSafe(async {
+            let mut execution = super::ChildExecutionSpan::new(&trace, &child_id, &cancellation);
+            execution.started(1);
+            panic!("runner future unwound");
+        })
+        .catch_unwind()
+        .await;
+        assert!(unwind.is_err());
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let trace = fs::read_to_string(&trace_file).expect("trace file");
+        assert_eq!(
+            child_execution_event_summaries(&child_execution_events(&trace)),
+            [
+                ("000000", "child_execution_started", 1, None),
+                ("000000", "child_execution_settled", 1, Some("failed")),
+            ]
+        );
     }
 
     #[tokio::test]

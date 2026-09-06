@@ -47,6 +47,32 @@ pub(crate) enum Settlement {
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum CoordinatorOperation {
+    RootCaller,
+    Start,
+    Subscribe,
+    Get,
+    WaitInitial,
+    Cancel,
+    JoinActive,
+    Service,
+    NextDeadline,
+    Shutdown,
+    Record,
+    RunChild,
+    FinishChild,
+    FinishChildSettlement,
+    RequestStopSubtree,
+    RequestStopDescendants,
+    RequestTimeout,
+    RequestStopAll,
+    WaitForTerminalSubscribe,
+    WaitForTerminalCheck,
+    WaitForOutcome,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ChildStopCause {
     Cancelled,
     TimedOut,
@@ -267,6 +293,15 @@ pub(crate) enum TraceEvent {
     ForegroundCancellationRequested,
     BackgroundCancellationRequested,
     BackgroundCancellationReturned,
+    CoordinatorLockWaiting {
+        operation: CoordinatorOperation,
+    },
+    CoordinatorLockAcquired {
+        operation: CoordinatorOperation,
+    },
+    CoordinatorLockReleased {
+        operation: CoordinatorOperation,
+    },
     RootRunStarted {
         run_id: u64,
     },
@@ -283,6 +318,12 @@ pub(crate) enum TraceEvent {
     ChildRunnerStarted {
         child_id: TaskId,
     },
+    ChildRunnerSetupStarted {
+        child_id: TaskId,
+    },
+    ChildRunnerSetupFinished {
+        child_id: TaskId,
+    },
     ChildRunnerReturned {
         child_id: TaskId,
         outcome: Settlement,
@@ -294,6 +335,9 @@ pub(crate) enum TraceEvent {
     ChildStopRequested {
         child_id: TaskId,
         cause: ChildStopCause,
+    },
+    ChildArenaConstructionStarted {
+        child_id: TaskId,
     },
     ChildArenaPoolOpened {
         child_id: TaskId,
@@ -317,6 +361,15 @@ pub(crate) enum TraceEvent {
     ChildModelStepStarted {
         child_id: TaskId,
         model_step: u64,
+    },
+    ChildExecutionStarted {
+        child_id: TaskId,
+        model_step: u64,
+    },
+    ChildExecutionSettled {
+        child_id: TaskId,
+        model_step: u64,
+        outcome: Settlement,
     },
     ChildProviderAttemptStarted {
         child_id: TaskId,

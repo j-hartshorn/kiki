@@ -101,7 +101,7 @@ Set `KIKI_TRACE_FILE` to a trace-file path to opt into append-only JSONL diagnos
 export KIKI_TRACE_FILE=/absolute/path/to/kiki-trace.jsonl
 ```
 
-When unset, Kiki creates no trace file or telemetry writer. A trace records fixed process events, control-command events, root-run events, child-lifecycle events, settled Arena-construction milestones, and provider-attempt events with timestamps and model selections. It does not record prompts, model messages, Python source or output, tool values, result values, credentials, provider responses, or arbitrary dynamic data.
+When unset, Kiki creates no trace file or telemetry writer. A trace records fixed process and coordinator-lock-span events, control-command events, root-run and child-lifecycle events, child-runner setup, Arena-construction and execution milestones, and provider-attempt events with timestamps and model selections. It does not record prompts, model messages, Python source or output, tool values, result values, credentials, provider responses, or arbitrary dynamic data.
 
 A trace is diagnostic only, not authoritative or resumable history: it cannot restore a session, Arena, conversation, or child result. Use exactly one Kiki process per trace path. Multiple processes appending to the same file can interleave their event streams. Kiki flushes each event; a runtime trace-write failure is reported after normal terminal restoration and controller shutdown.
 
