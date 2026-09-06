@@ -12,14 +12,15 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
-use crate::arena::{ArenaChildSource, Checkpoint};
+use crate::arena::{ArenaChildSource, Checkpoint, Execution};
 use crate::config::{
     ModelSelection,
     constants::MAX_PROMPT_BYTES,
     models::{ModelConfiguration, model_by_id},
     settings::{SettingsContext, SubagentSettings},
 };
-use crate::model::{AttemptAccounting, Model};
+use crate::model::{AttemptAccounting, Model, ModelProgress};
+use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
 use crate::tools::{ToolError, ToolValue};
 
@@ -54,6 +55,20 @@ impl std::fmt::Display for TaskId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum CoordinatorEvent {
+    Spawned { record: TaskRecord },
+    Changed { id: TaskId, revision: u64 },
+    Finished { record: TaskRecord },
+}
+
+#[derive(Default)]
+struct CoordinatorPublication {
+    taken: bool,
+    sender: Option<mpsc::UnboundedSender<CoordinatorEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +109,10 @@ impl ChildParameters {
             selection,
             read_only,
         }
+    }
+
+    pub(crate) fn prompt(&self) -> &str {
+        &self.prompt
     }
 
     pub(crate) fn selection(&self) -> ModelSelection {
@@ -232,19 +251,199 @@ impl<P: Send + 'static> ChildRun<P> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-struct TaskMetrics {
-    step_count: AtomicU64,
-    attempts: SyncMutex<Vec<AttemptAccounting>>,
-    notifications: watch::Sender<u64>,
+pub(crate) struct TaskAttempt {
+    model_step: u64,
+    provider_attempt: u32,
+    accounting: Option<AttemptAccounting>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-impl TaskMetrics {
-    fn notify(&self) {
-        self.notifications
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+impl TaskAttempt {
+    pub(crate) fn model_step(&self) -> u64 {
+        self.model_step
     }
+
+    pub(crate) fn provider_attempt(&self) -> u32 {
+        self.provider_attempt
+    }
+
+    pub(crate) fn accounting(&self) -> Option<&AttemptAccounting> {
+        self.accounting.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TaskExecution {
+    model_step: u64,
+    source: String,
+    reasoning_summary: String,
+    execution: Execution,
+    attempts: Vec<AttemptAccounting>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl TaskExecution {
+    pub(crate) fn model_step(&self) -> u64 {
+        self.model_step
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn reasoning_summary(&self) -> &str {
+        &self.reasoning_summary
+    }
+
+    pub(crate) fn execution(&self) -> &Execution {
+        &self.execution
+    }
+
+    pub(crate) fn attempts(&self) -> &[AttemptAccounting] {
+        &self.attempts
+    }
+}
+
+struct TaskMetrics {
+    state: SyncMutex<TaskMetricState>,
+    updates: watch::Sender<u64>,
+    notifications: watch::Sender<u64>,
+    publication: Arc<SyncMutex<CoordinatorPublication>>,
+    id: TaskId,
+}
+
+#[derive(Default)]
+struct TaskMetricState {
+    revision: u64,
+    step_count: u64,
+    attempts_by_key: BTreeMap<(u64, u32), Option<AttemptAccounting>>,
+    attempts: Vec<AttemptAccounting>,
+    executions: Vec<TaskExecution>,
+    settled: bool,
+}
+
+#[derive(Clone)]
+struct TaskMetricSnapshot {
+    revision: u64,
+    step_count: u64,
+    attempt_evidence: Vec<TaskAttempt>,
+    attempts: Vec<AttemptAccounting>,
+    executions: Vec<TaskExecution>,
+}
+
+impl TaskMetrics {
+    fn new(
+        id: TaskId,
+        notifications: watch::Sender<u64>,
+        publication: Arc<SyncMutex<CoordinatorPublication>>,
+    ) -> Self {
+        let (updates, _) = watch::channel(1);
+        Self {
+            state: SyncMutex::new(TaskMetricState {
+                revision: 1,
+                ..TaskMetricState::default()
+            }),
+            updates,
+            notifications,
+            publication,
+            id,
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut TaskMetricState)) -> Option<u64> {
+        let revision = {
+            let mut state = self.state.lock().expect("task metrics lock");
+            if state.settled {
+                return None;
+            }
+            update(&mut state);
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .expect("subagent task revision overflowed");
+            state.revision
+        };
+        self.publish_changed(revision);
+        Some(revision)
+    }
+
+    fn revise(&self) -> Option<u64> {
+        self.update(|_| {})
+    }
+
+    fn settle(&self) -> Option<u64> {
+        let mut state = self.state.lock().expect("task metrics lock");
+        if state.settled {
+            return None;
+        }
+        state.settled = true;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .expect("subagent task revision overflowed");
+        let revision = state.revision;
+        drop(state);
+        self.notify(revision);
+        Some(revision)
+    }
+
+    fn publish_changed(&self, revision: u64) {
+        self.notify(revision);
+        if let Some(sender) = self
+            .publication
+            .lock()
+            .expect("coordinator publication lock")
+            .sender
+            .as_ref()
+        {
+            let _ = sender.send(CoordinatorEvent::Changed {
+                id: self.id.clone(),
+                revision,
+            });
+        }
+    }
+
+    fn notify(&self, revision: u64) {
+        self.updates.send_replace(revision);
+        self.notifications
+            .send_modify(|global_revision| *global_revision = global_revision.wrapping_add(1));
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    fn snapshot(&self) -> TaskMetricSnapshot {
+        let state = self.state.lock().expect("task metrics lock");
+        TaskMetricSnapshot {
+            revision: state.revision,
+            step_count: state.step_count,
+            attempt_evidence: state
+                .attempts_by_key
+                .iter()
+                .map(
+                    |(&(model_step, provider_attempt), accounting)| TaskAttempt {
+                        model_step,
+                        provider_attempt,
+                        accounting: accounting.clone(),
+                    },
+                )
+                .collect(),
+            attempts: state.attempts.clone(),
+            executions: state.executions.clone(),
+        }
+    }
+}
+
+fn rebuild_attempts(state: &mut TaskMetricState) {
+    state.attempts = state
+        .attempts_by_key
+        .values()
+        .filter_map(Clone::clone)
+        .collect();
 }
 
 #[derive(Clone)]
@@ -256,13 +455,70 @@ pub(crate) struct TaskReporter {
 #[cfg_attr(not(test), allow(dead_code))]
 impl TaskReporter {
     pub(crate) fn model_step_started(&self) {
-        self.metrics.step_count.fetch_add(1, Ordering::Relaxed);
-        self.metrics.notify();
+        self.metrics.update(|state| {
+            state.step_count = state
+                .step_count
+                .checked_add(1)
+                .expect("subagent model step count overflowed");
+        });
+    }
+
+    pub(crate) fn attempt_started(&self, model_step: u64, provider_attempt: u32) {
+        self.metrics.update(|state| {
+            state
+                .attempts_by_key
+                .entry((model_step, provider_attempt))
+                .or_insert(None);
+        });
+    }
+
+    pub(crate) fn attempt_settled(
+        &self,
+        model_step: u64,
+        provider_attempt: u32,
+        accounting: AttemptAccounting,
+    ) {
+        self.metrics.update(|state| {
+            state
+                .attempts_by_key
+                .insert((model_step, provider_attempt), Some(accounting));
+            rebuild_attempts(state);
+        });
+    }
+
+    pub(crate) fn execution_completed(
+        &self,
+        model_step: u64,
+        source: String,
+        reasoning_summary: String,
+        execution: Execution,
+        attempts: Vec<AttemptAccounting>,
+    ) {
+        self.metrics.update(|state| {
+            for (index, accounting) in attempts.iter().cloned().enumerate() {
+                let provider_attempt =
+                    u32::try_from(index + 1).expect("provider attempt ordinal overflowed");
+                let evidence = state
+                    .attempts_by_key
+                    .entry((model_step, provider_attempt))
+                    .or_insert(None);
+                if evidence.is_none() {
+                    *evidence = Some(accounting);
+                }
+            }
+            rebuild_attempts(state);
+            state.executions.push(TaskExecution {
+                model_step,
+                source,
+                reasoning_summary,
+                execution,
+                attempts,
+            });
+        });
     }
 
     pub(crate) fn set_attempts(&self, attempts: Vec<AttemptAccounting>) {
-        *self.metrics.attempts.lock().expect("task metrics lock") = attempts;
-        self.metrics.notify();
+        self.metrics.update(|state| state.attempts = attempts);
     }
 }
 
@@ -755,6 +1011,8 @@ fn task_state_name(state: TaskState) -> &'static str {
 
 fn cost_status_name(status: CostStatus) -> &'static str {
     match status {
+        CostStatus::Complete => "complete",
+        CostStatus::LowerBound => "lower_bound",
         CostStatus::Unavailable => "unavailable",
     }
 }
@@ -809,10 +1067,39 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                 context = context.with_accepted_thinking(accepted_thinking);
             }
             agent.set_invocation_context(context);
-            let mut progress = |event| {
-                if matches!(event, AgentProgress::ModelStepStarted) {
+            let mut model_step: u64 = 0;
+            let mut progress = |event| match event {
+                AgentProgress::ModelStepStarted => {
+                    model_step = model_step
+                        .checked_add(1)
+                        .expect("subagent model step ordinal overflowed");
                     reporter.model_step_started();
                 }
+                AgentProgress::ModelProgress(ModelProgress::AttemptStarted { attempt }) => {
+                    reporter.attempt_started(model_step, attempt);
+                }
+                AgentProgress::ModelProgress(ModelProgress::AttemptSettled {
+                    attempt,
+                    accounting,
+                }) => reporter.attempt_settled(model_step, attempt, accounting),
+                AgentProgress::ExecutionCompleted {
+                    source,
+                    reasoning_summary,
+                    execution,
+                    attempts,
+                } => reporter.execution_completed(
+                    model_step,
+                    source,
+                    reasoning_summary,
+                    execution,
+                    attempts,
+                ),
+                AgentProgress::ExecutionStarted { .. }
+                | AgentProgress::ToolUpdated { .. }
+                | AgentProgress::RunPreviewUpdated { .. }
+                | AgentProgress::StdoutDelta { .. }
+                | AgentProgress::StdoutTruncated
+                | AgentProgress::ModelProgress(_) => {}
             };
             match agent
                 .run_with_progress(request, &cancellation, &mut progress)
@@ -854,6 +1141,8 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum CostStatus {
+    Complete,
+    LowerBound,
     Unavailable,
 }
 
@@ -866,7 +1155,7 @@ pub(crate) struct TaskObservation {
     step_count: u64,
     elapsed: Duration,
     observed_at_ms: i64,
-    estimated_cost_usd: Option<f64>,
+    cost: RunCostEstimate,
     cost_status: CostStatus,
     error: Option<String>,
 }
@@ -906,7 +1195,16 @@ impl TaskObservation {
     }
 
     pub(crate) fn estimated_cost_usd(&self) -> Option<f64> {
-        self.estimated_cost_usd
+        match self.cost {
+            RunCostEstimate::Complete(amount) | RunCostEstimate::LowerBound(amount) => {
+                Some(amount.as_nanos() as f64 / 1_000_000_000.0)
+            }
+            RunCostEstimate::Unavailable => None,
+        }
+    }
+
+    pub(crate) fn cost(&self) -> RunCostEstimate {
+        self.cost
     }
 
     pub(crate) fn cost_status(&self) -> CostStatus {
@@ -931,12 +1229,15 @@ pub(crate) enum TaskOutcome {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TaskRecord {
     id: TaskId,
+    revision: u64,
     parent: Option<TaskId>,
     origin: OriginId,
     depth: usize,
     parameters: ChildParameters,
     observation: TaskObservation,
+    attempt_evidence: Vec<TaskAttempt>,
     attempts: Vec<AttemptAccounting>,
+    executions: Vec<TaskExecution>,
     outcome: Option<TaskOutcome>,
 }
 
@@ -945,6 +1246,10 @@ impl TaskRecord {
     #[allow(dead_code)]
     pub(crate) fn id(&self) -> &TaskId {
         &self.id
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     #[allow(dead_code)]
@@ -974,8 +1279,69 @@ impl TaskRecord {
         &self.attempts
     }
 
+    pub(crate) fn attempt_evidence(&self) -> &[TaskAttempt] {
+        &self.attempt_evidence
+    }
+
+    pub(crate) fn executions(&self) -> &[TaskExecution] {
+        &self.executions
+    }
+
     pub(crate) fn outcome(&self) -> Option<&TaskOutcome> {
         self.outcome.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: &str,
+        revision: u64,
+        selection: ModelSelection,
+        parent: Option<&str>,
+        depth: usize,
+        attempts: Vec<AttemptAccounting>,
+    ) -> Self {
+        let id = TaskId::parse(id).expect("test task ID must be valid");
+        let parent = parent.map(|id| TaskId::parse(id).expect("test parent ID must be valid"));
+        let cost = estimate_run_cost(&attempts);
+        let cost_status = match cost {
+            RunCostEstimate::Complete(_) => CostStatus::Complete,
+            RunCostEstimate::LowerBound(_) => CostStatus::LowerBound,
+            RunCostEstimate::Unavailable => CostStatus::Unavailable,
+        };
+        Self {
+            id: id.clone(),
+            revision,
+            parent,
+            origin: OriginId(0),
+            depth,
+            parameters: ChildParameters::new("test child".to_owned(), selection, false),
+            observation: TaskObservation {
+                id,
+                state: TaskState::Completed,
+                selection,
+                step_count: 0,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 0,
+                cost,
+                cost_status,
+                error: None,
+            },
+            attempt_evidence: Vec::new(),
+            attempts,
+            executions: Vec::new(),
+            outcome: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observation_for_test(
+        mut self,
+        elapsed: Duration,
+        observed_at_ms: i64,
+    ) -> Self {
+        self.observation.elapsed = elapsed;
+        self.observation.observed_at_ms = observed_at_ms;
+        self
     }
 }
 
@@ -1098,6 +1464,7 @@ impl Clock for SystemClock {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
+    publication: Arc<SyncMutex<CoordinatorPublication>>,
     policy: SubagentPolicy,
     runner: Arc<dyn ChildRunner<P>>,
     clock: Arc<dyn Clock>,
@@ -1108,6 +1475,7 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            publication: self.publication.clone(),
             policy: self.policy,
             runner: self.runner.clone(),
             clock: self.clock.clone(),
@@ -1151,7 +1519,6 @@ struct Task {
     stop: Option<StopReason>,
     outcome: Option<TaskOutcome>,
     cancellation: CancellationToken,
-    updates: watch::Sender<TaskState>,
 }
 
 #[derive(Clone)]
@@ -1188,16 +1555,31 @@ impl StopReason {
 #[cfg_attr(not(test), allow(dead_code))]
 impl Task {
     fn observation(&self, now: Instant, observed_at_ms: i64) -> TaskObservation {
+        self.observation_with_metrics(now, observed_at_ms, self.metrics.snapshot())
+    }
+
+    fn observation_with_metrics(
+        &self,
+        now: Instant,
+        observed_at_ms: i64,
+        metrics: TaskMetricSnapshot,
+    ) -> TaskObservation {
         let finished_at = self.settled_at.unwrap_or(now);
+        let cost = estimate_run_cost(&metrics.attempts);
+        let cost_status = match cost {
+            RunCostEstimate::Complete(_) => CostStatus::Complete,
+            RunCostEstimate::LowerBound(_) => CostStatus::LowerBound,
+            RunCostEstimate::Unavailable => CostStatus::Unavailable,
+        };
         TaskObservation {
             id: self.id.clone(),
             state: self.state,
             selection: self.parameters.selection(),
-            step_count: self.metrics.step_count.load(Ordering::Relaxed),
+            step_count: metrics.step_count,
             elapsed: finished_at.saturating_duration_since(self.admitted_at),
             observed_at_ms,
-            estimated_cost_usd: None,
-            cost_status: CostStatus::Unavailable,
+            cost,
+            cost_status,
             error: match (&self.state, &self.stop, &self.outcome) {
                 (TaskState::Stopping, Some(reason), _) => Some(reason.message()),
                 (_, _, Some(TaskOutcome::Failed(failure))) => Some(failure.message().to_owned()),
@@ -1206,8 +1588,29 @@ impl Task {
         }
     }
 
-    fn publish(&mut self) {
-        self.updates.send_replace(self.state);
+    fn record(&self, now: Instant, observed_at_ms: i64) -> TaskRecord {
+        let metrics = self.metrics.snapshot();
+        TaskRecord {
+            id: self.id.clone(),
+            revision: metrics.revision,
+            parent: self.parent.clone(),
+            origin: self.origin,
+            depth: self.depth,
+            parameters: self.parameters.clone(),
+            observation: self.observation_with_metrics(now, observed_at_ms, metrics.clone()),
+            attempt_evidence: metrics.attempt_evidence,
+            attempts: metrics.attempts,
+            executions: metrics.executions,
+            outcome: self.outcome.clone(),
+        }
+    }
+
+    fn transition(&mut self, state: TaskState) -> bool {
+        if self.state == state {
+            return false;
+        }
+        self.state = state;
+        self.metrics.revise().is_some()
     }
 }
 
@@ -1234,9 +1637,36 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 notifications: watch::channel(0).0,
                 tasks: BTreeMap::new(),
             })),
+            publication: Arc::new(SyncMutex::new(CoordinatorPublication::default())),
             policy,
             runner,
             clock,
+        }
+    }
+
+    pub(crate) fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<CoordinatorEvent>> {
+        let mut publication = self
+            .publication
+            .lock()
+            .expect("coordinator publication lock");
+        if publication.taken {
+            return None;
+        }
+        publication.taken = true;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        publication.sender = Some(sender);
+        Some(receiver)
+    }
+
+    fn publish_event(&self, event: CoordinatorEvent) {
+        if let Some(sender) = self
+            .publication
+            .lock()
+            .expect("coordinator publication lock")
+            .sender
+            .as_ref()
+        {
+            let _ = sender.send(event);
         }
     }
 
@@ -1260,7 +1690,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         mut parameters: ChildParameters,
         payload: P,
     ) -> Result<TaskObservation, AdmissionError> {
-        let (child, observation) = {
+        let (child, observation, spawned) = {
             let mut inner = self.inner.lock().await;
             let now = self.now();
             let observed_at_ms = self.unix_time_ms();
@@ -1319,13 +1749,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             let own_deadline = now.checked_add(self.policy.timeout);
             let deadline = earliest_deadline(own_deadline, inherited_deadline);
             parameters.read_only |= inherited_read_only;
-            let (updates, _) = watch::channel(TaskState::Starting);
             let cancellation = CancellationToken::new();
-            let metrics = Arc::new(TaskMetrics {
-                step_count: AtomicU64::new(0),
-                attempts: SyncMutex::new(Vec::new()),
-                notifications: inner.notifications.clone(),
-            });
+            let metrics = Arc::new(TaskMetrics::new(
+                id.clone(),
+                inner.notifications.clone(),
+                self.publication.clone(),
+            ));
             let task = Task {
                 id: id.clone(),
                 parent: parent.clone(),
@@ -1340,9 +1769,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 stop: None,
                 outcome: None,
                 cancellation: cancellation.clone(),
-                updates,
             };
             let observation = task.observation(now, observed_at_ms);
+            let spawned = task.record(now, observed_at_ms);
             inner.next_task += 1;
             inner.active_slots += 1;
             *inner.origin_starts.entry(caller.origin).or_default() += 1;
@@ -1366,9 +1795,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     coordinator: self.clone(),
                 },
                 observation,
+                spawned,
             )
         };
 
+        self.publish_event(CoordinatorEvent::Spawned { record: spawned });
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator.run_child(child).await;
@@ -1415,7 +1846,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .tasks
                 .get(id)
                 .expect("authorised task must be retained")
-                .updates
+                .metrics
                 .subscribe()
         };
         if let Some(wait_phase) = wait_phase {
@@ -1523,22 +1954,18 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         inner
             .tasks
             .values()
-            .map(|task| TaskRecord {
-                id: task.id.clone(),
-                parent: task.parent.clone(),
-                origin: task.origin,
-                depth: task.depth,
-                parameters: task.parameters.clone(),
-                observation: task.observation(now, observed_at_ms),
-                attempts: task
-                    .metrics
-                    .attempts
-                    .lock()
-                    .expect("task metrics lock")
-                    .clone(),
-                outcome: task.outcome.clone(),
-            })
+            .map(|task| task.record(now, observed_at_ms))
             .collect()
+    }
+
+    pub(crate) async fn record(&self, id: &TaskId) -> Option<TaskRecord> {
+        let inner = self.inner.lock().await;
+        let now = self.now();
+        let observed_at_ms = self.unix_time_ms();
+        inner
+            .tasks
+            .get(id)
+            .map(|task| task.record(now, observed_at_ms))
     }
 
     pub(crate) async fn active_count(&self) -> usize {
@@ -1549,22 +1976,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let id = child.id().clone();
         let cancellation = {
             let mut inner = self.inner.lock().await;
-            let (changed, cancellation) = {
-                let task = inner
-                    .tasks
-                    .get_mut(&id)
-                    .expect("admitted child must remain retained");
-                let changed = task.state == TaskState::Starting;
-                if changed {
-                    task.state = TaskState::Running;
-                    task.publish();
-                }
-                (changed, task.cancellation.clone())
-            };
-            if changed {
-                inner.notify();
-            }
-            cancellation
+            let task = inner
+                .tasks
+                .get_mut(&id)
+                .expect("admitted child must remain retained");
+            task.transition(TaskState::Running);
+            task.cancellation.clone()
         };
         let result = if cancellation.is_cancelled() {
             Err(ChildFailure::new("child was cancelled before startup"))
@@ -1594,14 +2011,22 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             } else {
                 match result {
                     Ok(result) => {
-                        settle_task(&mut inner, id, TaskOutcome::Completed(result), now);
+                        let record = settle_task(
+                            &mut inner,
+                            id,
+                            TaskOutcome::Completed(result),
+                            now,
+                            self.unix_time_ms(),
+                        );
+                        drop(inner);
+                        if let Some(record) = record {
+                            self.publish_event(CoordinatorEvent::Finished { record });
+                        }
                         return;
                     }
                     Err(failure) => {
                         task.stop = Some(StopReason::RunnerFailed(failure.clone()));
-                        task.state = TaskState::Stopping;
-                        task.publish();
-                        inner.notify();
+                        task.transition(TaskState::Stopping);
                         TaskOutcome::Failed(failure)
                     }
                 }
@@ -1611,8 +2036,13 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .request_stop_descendants(id, StopReason::AncestorStopped)
             .await;
         self.wait_for_all(descendants).await;
-        let mut inner = self.inner.lock().await;
-        settle_task(&mut inner, id, outcome, self.now());
+        let record = {
+            let mut inner = self.inner.lock().await;
+            settle_task(&mut inner, id, outcome, self.now(), self.unix_time_ms())
+        };
+        if let Some(record) = record {
+            self.publish_event(CoordinatorEvent::Finished { record });
+        }
     }
 
     async fn request_stop_subtree(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
@@ -1695,22 +2125,21 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .tasks
                 .get(id)
                 .expect("retained task must exist")
-                .updates
+                .metrics
                 .subscribe()
         };
         let mut updates = updates;
         loop {
-            if updates.borrow().is_terminal() {
-                return self
-                    .inner
-                    .lock()
-                    .await
-                    .tasks
-                    .get(id)
-                    .expect("retained terminal task must exist")
-                    .outcome
-                    .clone()
-                    .expect("terminal task must have an outcome");
+            if let Some(outcome) = self
+                .inner
+                .lock()
+                .await
+                .tasks
+                .get(id)
+                .and_then(|task| task.state.is_terminal().then(|| task.outcome.clone()))
+                .flatten()
+            {
+                return outcome;
             }
             updates
                 .changed()
@@ -1722,20 +2151,25 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     async fn wait_for_outcome(
         &self,
         id: &TaskId,
-        mut updates: watch::Receiver<TaskState>,
+        mut updates: watch::Receiver<u64>,
     ) -> Result<(ChildResult, TaskObservation), WaitError> {
         loop {
-            if updates.borrow().is_terminal() {
+            let terminal = {
                 let inner = self.inner.lock().await;
                 let task = inner
                     .tasks
                     .get(id)
                     .expect("retained terminal task must exist");
-                let outcome = task
-                    .outcome
-                    .clone()
-                    .expect("terminal task must have an outcome");
-                let observation = task.observation(self.now(), self.unix_time_ms());
+                task.state.is_terminal().then(|| {
+                    (
+                        task.outcome
+                            .clone()
+                            .expect("terminal task must have an outcome"),
+                        task.observation(self.now(), self.unix_time_ms()),
+                    )
+                })
+            };
+            if let Some((outcome, observation)) = terminal {
                 return match outcome {
                     TaskOutcome::Completed(result) => Ok((result, observation)),
                     TaskOutcome::Failed(failure) => Err(WaitError::Failed {
@@ -1836,10 +2270,8 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
         }
         if task.stop.is_none() {
             task.stop = Some(reason.clone());
-            task.state = TaskState::Stopping;
+            task.transition(TaskState::Stopping);
             task.cancellation.cancel();
-            task.publish();
-            inner.notify();
         }
         stopping.push(id.clone());
     }
@@ -1847,34 +2279,34 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason) -> Vec<Task
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn settle_task(inner: &mut Inner, id: &TaskId, outcome: TaskOutcome, now: Instant) {
-    let settled = {
+fn settle_task(
+    inner: &mut Inner,
+    id: &TaskId,
+    outcome: TaskOutcome,
+    now: Instant,
+    observed_at_ms: i64,
+) -> Option<TaskRecord> {
+    let record = {
         let task = inner
             .tasks
             .get_mut(id)
             .expect("admitted child must remain retained");
-        if task.state.is_terminal() {
-            false
-        } else {
-            task.state = match outcome {
-                TaskOutcome::Completed(_) => TaskState::Completed,
-                TaskOutcome::Failed(_) => TaskState::Failed,
-                TaskOutcome::Cancelled => TaskState::Cancelled,
-                TaskOutcome::TimedOut => TaskState::TimedOut,
-            };
-            task.outcome = Some(outcome);
-            task.settled_at = Some(now);
-            task.publish();
-            inner.notify();
-            true
-        }
+        task.metrics.settle()?;
+        task.state = match outcome {
+            TaskOutcome::Completed(_) => TaskState::Completed,
+            TaskOutcome::Failed(_) => TaskState::Failed,
+            TaskOutcome::Cancelled => TaskState::Cancelled,
+            TaskOutcome::TimedOut => TaskState::TimedOut,
+        };
+        task.outcome = Some(outcome);
+        task.settled_at = Some(now);
+        task.record(now, observed_at_ms)
     };
-    if settled {
-        inner.active_slots = inner
-            .active_slots
-            .checked_sub(1)
-            .expect("every settled task owns exactly one active slot");
-    }
+    inner.active_slots = inner
+        .active_slots
+        .checked_sub(1)
+        .expect("every settled task owns exactly one active slot");
+    Some(record)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1926,8 +2358,9 @@ mod tests {
 
     use super::{
         AccessError, AdmissionError, ChildFailure, ChildParameters, ChildResult, ChildRun,
-        ChildRunner, Clock, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture, SubagentCoordinator,
-        SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError, WaitPhaseSignal,
+        ChildRunner, Clock, CoordinatorEvent, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture,
+        SubagentCoordinator, SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError,
+        WaitPhaseSignal,
     };
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
@@ -2095,6 +2528,19 @@ mod tests {
 
     fn result(message: &str) -> ChildResult {
         ChildResult::new(message.to_owned(), BTreeMap::new())
+    }
+
+    fn known_usage() -> crate::model::AttemptAccounting {
+        crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+            model: DEFAULT_MODEL.id.to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(1),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(0),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(1),
+        })
     }
 
     fn assert_failed(error: WaitError, id: &TaskId, message: &str) {
@@ -3031,7 +3477,17 @@ mod tests {
         );
         assert_eq!(observation.state(), TaskState::Completed);
         assert_eq!(observation.step_count(), 2);
-        assert_eq!(coordinator.records().await[0].attempts(), &[]);
+        let records = coordinator.records().await;
+        assert_eq!(records[0].attempts(), &[]);
+        let execution = &records[0].executions()[0];
+        assert_eq!(execution.model_step(), 1);
+        assert_eq!(execution.source(), "result_values['child'] = inherited + 1");
+        assert_eq!(execution.reasoning_summary(), "");
+        assert!(matches!(
+            &execution.execution().outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert!(execution.attempts().is_empty());
         assert_eq!(*factory.selections.lock().unwrap(), [selection]);
         {
             let histories = factory.histories.lock().unwrap();
@@ -3243,6 +3699,215 @@ mod tests {
         let later = coordinator.get(&root, admitted.id()).await.unwrap();
         assert_eq!(later.elapsed(), Duration::from_secs(3));
         assert_eq!(later.observed_at_ms(), 9_000);
+    }
+
+    #[tokio::test]
+    async fn authoritative_attempts_update_child_cost_before_settlement() {
+        let (coordinator, mut started) = coordinator(policy());
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        let (_, _, _, _, _, _, reporter, _) = child.into_parts();
+        let known = known_usage();
+        reporter.set_attempts(vec![known.clone()]);
+
+        let observation = coordinator.get(&caller, admitted.id()).await.unwrap();
+        assert!(observation.estimated_cost_usd().is_some());
+        assert!(matches!(
+            observation.cost(),
+            crate::pricing::RunCostEstimate::Complete(_)
+        ));
+        assert_eq!(observation.cost_status(), CostStatus::Complete);
+
+        reporter.set_attempts(vec![
+            known,
+            crate::model::AttemptAccounting::UsageUnavailable,
+        ]);
+        let lower_bound = coordinator.get(&caller, admitted.id()).await.unwrap();
+        assert!(lower_bound.estimated_cost_usd().is_some());
+        assert_eq!(lower_bound.cost_status(), CostStatus::LowerBound);
+
+        reporter.set_attempts(vec![crate::model::AttemptAccounting::UsageUnavailable]);
+        let unavailable = coordinator.get(&caller, admitted.id()).await.unwrap();
+        assert_eq!(unavailable.estimated_cost_usd(), None);
+        assert_eq!(unavailable.cost_status(), CostStatus::Unavailable);
+
+        finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, admitted.id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_and_cancellation_retain_known_usage() {
+        let (coordinator, mut started) = coordinator(policy());
+        let caller = coordinator.root_caller().await;
+        let failed = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        let (_, _, _, _, _, _, reporter, _) = child.into_parts();
+        reporter.set_attempts(vec![known_usage()]);
+        finish
+            .send(Err(ChildFailure::new("provider failed")))
+            .unwrap();
+        assert_failed(
+            coordinator.wait(&caller, failed.id()).await.unwrap_err(),
+            failed.id(),
+            "provider failed",
+        );
+        let failed_record = coordinator.record(failed.id()).await.unwrap();
+        assert_eq!(failed_record.observation().state(), TaskState::Failed);
+        assert_eq!(failed_record.attempts().len(), 1);
+        assert_eq!(
+            failed_record.observation().cost_status(),
+            CostStatus::Complete
+        );
+
+        let cancelled = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let Started { child, .. } = started.recv().await.expect("child starts");
+        let (_, _, _, _, _, _, reporter, _) = child.into_parts();
+        reporter.set_attempts(vec![known_usage()]);
+        coordinator.cancel(&caller, cancelled.id()).await.unwrap();
+        let cancelled_record = coordinator.record(cancelled.id()).await.unwrap();
+        assert_eq!(cancelled_record.observation().state(), TaskState::Cancelled);
+        assert_eq!(cancelled_record.attempts().len(), 1);
+        assert_eq!(
+            cancelled_record.observation().cost_status(),
+            CostStatus::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_orders_spawn_record_and_finish_and_freezes_reporters() {
+        let (coordinator, mut started) = coordinator(policy());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("first observer takes coordinator events");
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator.start(&caller, parameters(), ()).await.unwrap();
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        let (_, _, _, _, _, _, reporter, _) = child.into_parts();
+
+        let CoordinatorEvent::Spawned { record } = events.recv().await.expect("spawn event") else {
+            panic!("first event must be spawned");
+        };
+        assert_eq!(record.id(), admitted.id());
+        assert_eq!(record.parameters().prompt(), "inspect the lifecycle");
+        assert_eq!(record.revision(), 1);
+        assert!(record.attempts().is_empty());
+
+        reporter.model_step_started();
+        reporter.attempt_started(1, 7);
+        let accounting = known_usage();
+        reporter.attempt_settled(1, 7, accounting.clone());
+        reporter.attempt_started(1, 8);
+        reporter.attempt_settled(1, 8, accounting.clone());
+        reporter.set_attempts(vec![accounting.clone(), accounting]);
+        finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, admitted.id()).await.unwrap();
+
+        let mut revisions = Vec::new();
+        let final_record = loop {
+            match events.recv().await.expect("lifecycle event") {
+                CoordinatorEvent::Changed { id, revision } => {
+                    assert_eq!(id, admitted.id().clone());
+                    revisions.push(revision);
+                }
+                CoordinatorEvent::Finished { record } => break record,
+                CoordinatorEvent::Spawned { .. } => panic!("spawn is emitted exactly once"),
+            }
+        };
+        assert!(revisions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            revisions
+                .iter()
+                .all(|revision| *revision < final_record.revision())
+        );
+        assert_eq!(final_record.observation().step_count(), 1);
+        assert_eq!(final_record.attempts().len(), 2);
+        assert_eq!(coordinator.active_count().await, 0);
+        assert_eq!(final_record.attempt_evidence().len(), 2);
+        assert_eq!(final_record.attempt_evidence()[0].model_step(), 1);
+        assert_eq!(final_record.attempt_evidence()[0].provider_attempt(), 7);
+        assert!(final_record.attempt_evidence()[0].accounting().is_some());
+        assert_eq!(final_record.attempt_evidence()[1].provider_attempt(), 8);
+
+        reporter.set_attempts(vec![crate::model::AttemptAccounting::UsageUnavailable]);
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            coordinator.record(admitted.id()).await.unwrap().attempts(),
+            final_record.attempts()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_admission_has_no_publication_and_nested_lifecycle_stays_ordered() {
+        let (coordinator, mut started) = coordinator(SubagentPolicy {
+            max_starts_per_run: 2,
+            ..policy()
+        });
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("first observer takes coordinator events");
+        let root = coordinator.root_caller().await;
+        let parent = coordinator.start(&root, parameters(), ()).await.unwrap();
+        let parent_running = started.recv().await.expect("parent starts");
+        let child = coordinator
+            .start(parent_running.child.caller(), parameters(), ())
+            .await
+            .expect("child starts");
+        let child_running = started.recv().await.expect("child starts");
+        assert_eq!(
+            coordinator.start(&root, parameters(), ()).await,
+            Err(AdmissionError::StartBudget)
+        );
+
+        parent_running.finish.send(Ok(result("parent"))).unwrap();
+        coordinator.wait(&root, parent.id()).await.unwrap();
+        assert_eq!(
+            coordinator.get(&root, child.id()).await.unwrap().state(),
+            TaskState::Running
+        );
+        child_running.finish.send(Ok(result("child"))).unwrap();
+        coordinator.wait(&root, child.id()).await.unwrap();
+
+        let mut spawns = Vec::new();
+        let mut finishes = Vec::new();
+        while finishes.len() < 2 {
+            match events.recv().await.expect("lifecycle event") {
+                CoordinatorEvent::Spawned { record } => {
+                    spawns.push((record.id().clone(), record.parent().cloned()));
+                }
+                CoordinatorEvent::Finished { record } => finishes.push(record.id().clone()),
+                CoordinatorEvent::Changed { .. } => {}
+            }
+        }
+        assert_eq!(
+            spawns,
+            vec![
+                (parent.id().clone(), None),
+                (child.id().clone(), Some(parent.id().clone()))
+            ]
+        );
+        assert_eq!(finishes, vec![parent.id().clone(), child.id().clone()]);
+    }
+
+    #[tokio::test]
+    async fn inactive_event_receivers_do_not_accumulate_publications() {
+        let (coordinator, mut started) = coordinator(policy());
+        let root = coordinator.root_caller().await;
+        let task = coordinator.start(&root, parameters(), ()).await.unwrap();
+        let running = started.recv().await.expect("child starts");
+
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("first observer takes coordinator events");
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        running.finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&root, task.id()).await.unwrap();
     }
 
     #[tokio::test]

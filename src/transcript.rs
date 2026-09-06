@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use crate::runtime::{
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
+use crate::subagents::{TaskId, TaskObservation, TaskRecord};
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet;
@@ -70,6 +72,13 @@ struct DisplayedRecord {
     record: StoredRecord,
     run_previews: Vec<Option<RunPreview>>,
     progress_gap: bool,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum RetainedSubagentEvent {
+    Spawned(TaskRecord),
+    Finished(TaskRecord),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1963,6 +1972,9 @@ pub(crate) struct Transcript {
     pending_run_gap: bool,
     status: String,
     records: Vec<DisplayedRecord>,
+    subagent_records: BTreeMap<TaskId, TaskRecord>,
+    subagent_statuses: BTreeMap<TaskId, (u64, TaskObservation)>,
+    subagent_history: Vec<RetainedSubagentEvent>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
     show_reasoning: bool,
@@ -1984,6 +1996,9 @@ impl Default for Transcript {
             pending_run_gap: false,
             status: "idle".to_owned(),
             records: Vec::new(),
+            subagent_records: BTreeMap::new(),
+            subagent_statuses: BTreeMap::new(),
+            subagent_history: Vec::new(),
             settled_blocks: Vec::new(),
             live_step: None,
             show_reasoning: true,
@@ -2200,6 +2215,34 @@ impl Transcript {
                 record,
                 progress_gap,
             } => self.append_record(record, progress_gap),
+            RuntimeEvent::SubagentSpawned { record } => {
+                self.subagent_history
+                    .push(RetainedSubagentEvent::Spawned(record.clone()));
+                self.replace_subagent_record(record);
+                false
+            }
+            RuntimeEvent::SubagentStatus {
+                id,
+                revision,
+                observation,
+            } => {
+                if self
+                    .subagent_statuses
+                    .get(&id)
+                    .is_some_and(|(latest, _)| *latest >= revision)
+                {
+                    false
+                } else {
+                    self.subagent_statuses.insert(id, (revision, observation));
+                    false
+                }
+            }
+            RuntimeEvent::SubagentRecord { record } => self.replace_subagent_record(record),
+            RuntimeEvent::SubagentFinished { record } => {
+                self.subagent_history
+                    .push(RetainedSubagentEvent::Finished(record.clone()));
+                self.replace_subagent_record(record)
+            }
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
             RuntimeEvent::SettingsAccepted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
@@ -2218,6 +2261,26 @@ impl Transcript {
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
             RuntimeEvent::SubmissionRejectedBusy { .. } => false,
         }
+    }
+
+    fn replace_subagent_record(&mut self, record: TaskRecord) -> bool {
+        let id = record.id().clone();
+        let Some(current) = self.subagent_records.get(&id) else {
+            let accounting_changed = !record.attempts().is_empty();
+            self.subagent_records.insert(id, record);
+            return accounting_changed;
+        };
+        if current.revision() >= record.revision() {
+            return false;
+        }
+        let accounting_changed = current.attempts() != record.attempts();
+        self.subagent_records.insert(id, record);
+        accounting_changed
+    }
+
+    #[cfg(test)]
+    fn clear_subagent_history(&mut self) {
+        self.subagent_history.clear();
     }
 
     pub(crate) fn toggle_reasoning(&mut self) -> bool {
@@ -2392,14 +2455,21 @@ impl Transcript {
     }
 
     fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
-        let mut attempts = Vec::new();
+        let mut foreground_attempts = Vec::new();
         for displayed in &self.records {
-            append_record_attempts(&displayed.record.record, &mut attempts);
+            append_record_attempts(&displayed.record.record, &mut foreground_attempts);
         }
         if let Some(live) = &self.live_step {
-            attempts.extend(&live.settled_attempts);
+            foreground_attempts.extend(&live.settled_attempts);
         }
-        session_footer(&attempts, context)
+        let latest_foreground_attempt = foreground_attempts.last().copied();
+        let mut attempts = foreground_attempts;
+        attempts.extend(
+            self.subagent_records
+                .values()
+                .flat_map(|record| record.attempts()),
+        );
+        session_footer(&attempts, latest_foreground_attempt, context)
     }
 
     fn append_settled_blocks(&mut self, blocks: impl IntoIterator<Item = TranscriptBlock>) {
@@ -3206,6 +3276,7 @@ fn latest_cache_hit_field(usage: &ModelUsage) -> Option<FooterField> {
 
 fn session_footer(
     attempts: &[&AttemptAccounting],
+    latest_foreground_attempt: Option<&AttemptAccounting>,
     context: Option<FooterContext>,
 ) -> Option<Footer> {
     let mut accounting = SessionAccounting::default();
@@ -3219,7 +3290,7 @@ fn session_footer(
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
-    ) = attempts.iter().next_back()
+    ) = latest_foreground_attempt
         && let Some(cache_hit) = latest_cache_hit_field(usage)
     {
         statistics.push(cache_hit);
@@ -3230,7 +3301,7 @@ fn session_footer(
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
-    ) = attempts.iter().next_back()
+    ) = latest_foreground_attempt
         && let Some(context) = latest_context_field(usage)
     {
         statistics.push(context);
@@ -3504,6 +3575,8 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
@@ -3521,15 +3594,17 @@ mod tests {
         Execution, ExecutionOutcome, Observation, PythonError, RunPreview, ToolCall,
         ToolCallSummary, ToolCallToken, ToolName,
     };
-    use crate::config::models::{SOL, TERRA};
+    use crate::config::models::{LUNA, SOL, TERRA};
     use crate::config::{ModelSelection, ready_snapshot_for_test};
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
+    use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
         ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
         TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
+    use crate::subagents::TaskRecord;
 
     #[test]
     fn page_uses_terminal_background() {
@@ -3872,8 +3947,28 @@ mod tests {
         reasoning: Option<u64>,
         total: Option<u64>,
     ) -> AttemptAccounting {
+        detailed_usage_for(
+            SOL.id,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            total,
+        )
+    }
+
+    fn detailed_usage_for(
+        model: &str,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
+        total: Option<u64>,
+    ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "openai/gpt-5.6-sol".to_owned(),
+            model: model.to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: input,
             cached_input_tokens: cache_read,
@@ -5695,6 +5790,318 @@ truncated"
         let unavailable_footer = footer_text(&unavailable_layout).expect("footer");
         assert!(!unavailable_footer.contains("%/"));
         assert!(!unavailable_footer.contains("CH"));
+    }
+
+    #[test]
+    fn footer_aggregates_child_records_without_changing_foreground_context() {
+        let root = detailed_usage(Some(100), Some(0), Some(50), Some(0), Some(0), Some(100));
+        let child = detailed_usage(Some(200), Some(10), Some(0), Some(0), Some(0), Some(210));
+        let mut transcript = Transcript::default();
+        transcript.apply(completed_execution(1, 1, "root()", "", vec![root]), false);
+        transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false);
+
+        let before = footer_text(&transcript.layout(128)).expect("root footer");
+        assert!(before.contains("CH50.0%"), "{before}");
+        assert!(before.contains("0.0%/272k"), "{before}");
+
+        let child = TaskRecord::for_test(
+            "child1",
+            3,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            vec![child],
+        );
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        let footer = footer_text(&transcript.layout(128)).expect("aggregated footer");
+        assert!(footer.contains("↑300 ↓10 R50 W0"), "{footer}");
+        assert!(footer.contains("CH50.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 4,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 2,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        assert_eq!(
+            transcript
+                .subagent_statuses
+                .get(child.id())
+                .map(|(revision, _)| *revision),
+            Some(4)
+        );
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: child.clone(),
+            },
+            false,
+        ));
+        transcript.clear_subagent_history();
+        assert_eq!(
+            footer_text(&transcript.layout(128)).as_deref(),
+            Some(footer.as_str())
+        );
+    }
+
+    #[test]
+    fn footer_counts_mixed_model_descendants_once_and_keeps_root_context() {
+        let root = detailed_usage_for(
+            LUNA.id,
+            Some(100),
+            Some(10),
+            Some(50),
+            Some(0),
+            Some(0),
+            Some(110),
+        );
+        let child_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(200),
+            Some(20),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(220),
+        );
+        let nested_attempt = detailed_usage_for(
+            SOL.id,
+            Some(300),
+            Some(30),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(330),
+        );
+        let child = TaskRecord::for_test(
+            "child1",
+            2,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            vec![child_attempt.clone()],
+        );
+        let nested = TaskRecord::for_test(
+            "nest01",
+            2,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            Some("child1"),
+            2,
+            vec![nested_attempt.clone()],
+        );
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(1, 1, "root", vec![root.clone()], false),
+            false,
+        );
+        let before = footer_text(&transcript.layout(128)).expect("root footer");
+
+        assert_eq!(child.attempts(), std::slice::from_ref(&child_attempt));
+        assert_eq!(nested.parent(), Some(child.id()));
+        assert_eq!(nested.depth(), 2);
+        assert_eq!(nested.attempts(), std::slice::from_ref(&nested_attempt));
+        assert_eq!(
+            child.observation().cost(),
+            estimate_run_cost([&child_attempt])
+        );
+        assert_eq!(
+            nested.observation().cost(),
+            estimate_run_cost([&nested_attempt])
+        );
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: nested.clone(),
+            },
+            false,
+        ));
+
+        let footer = footer_text(&transcript.layout(128)).expect("mixed-model footer");
+        assert!(footer.contains("↑600 ↓60 R50 W0"), "{footer}");
+        let RunCostEstimate::Complete(cost) =
+            estimate_run_cost([&root, &child_attempt, &nested_attempt])
+        else {
+            panic!("complete mixed-model cost");
+        };
+        assert!(
+            footer.contains(&format_footer_usd(cost.as_nanos())),
+            "{footer}"
+        );
+        assert!(footer.contains("CH50.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+        assert!(before.contains("CH50.0%"), "{before}");
+        assert!(before.contains("0.0%/272k"), "{before}");
+    }
+
+    #[test]
+    fn child_records_replace_live_attempts_and_ignore_equal_or_stale_revisions() {
+        let partial_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(100),
+            Some(10),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(110),
+        );
+        let additional_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(200),
+            Some(20),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(220),
+        );
+        let unexpected_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(300),
+            Some(30),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(330),
+        );
+        let selection = ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap();
+        let partial = TaskRecord::for_test(
+            "child1",
+            2,
+            selection,
+            None,
+            1,
+            vec![partial_attempt.clone()],
+        );
+        let terminal = TaskRecord::for_test(
+            "child1",
+            4,
+            selection,
+            None,
+            1,
+            vec![partial_attempt.clone(), additional_attempt.clone()],
+        );
+        let equal_projection = terminal
+            .clone()
+            .with_observation_for_test(Duration::from_secs(10), 10_000);
+        let equal_revision = TaskRecord::for_test(
+            "child1",
+            4,
+            selection,
+            None,
+            1,
+            vec![
+                partial_attempt.clone(),
+                additional_attempt.clone(),
+                unexpected_attempt.clone(),
+            ],
+        );
+        let stale = TaskRecord::for_test(
+            "child1",
+            3,
+            selection,
+            None,
+            1,
+            vec![
+                partial_attempt.clone(),
+                additional_attempt.clone(),
+                unexpected_attempt,
+            ],
+        );
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: partial.clone(),
+            },
+            false,
+        ));
+        let partial_footer = footer_text(&transcript.layout(128)).expect("partial footer");
+        assert!(
+            partial_footer.contains("↑100 ↓10 R0 W0"),
+            "{partial_footer}"
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: terminal.clone(),
+            },
+            false,
+        ));
+        let footer = footer_text(&transcript.layout(128)).expect("terminal footer");
+        assert!(footer.contains("↑300 ↓30 R0 W0"), "{footer}");
+        let RunCostEstimate::Complete(cost) =
+            estimate_run_cost([&partial_attempt, &additional_attempt])
+        else {
+            panic!("complete terminal cost");
+        };
+        assert!(
+            footer.contains(&format_footer_usd(cost.as_nanos())),
+            "{footer}"
+        );
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: terminal.clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: equal_projection,
+            },
+            false,
+        ));
+        let retained = transcript
+            .subagent_records
+            .get(terminal.id())
+            .expect("retained terminal record")
+            .observation();
+        assert_eq!(retained.elapsed(), Duration::ZERO);
+        assert_eq!(retained.observed_at_ms(), 0);
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: equal_revision.clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(RuntimeEvent::SubagentRecord { record: stale }, false,));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: equal_revision,
+            },
+            false,
+        ));
+        assert_eq!(transcript.subagent_history.len(), 2);
+        assert_eq!(
+            footer_text(&transcript.layout(128)).as_deref(),
+            Some(footer.as_str())
+        );
     }
 
     #[test]

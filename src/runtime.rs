@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -8,7 +10,10 @@ use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallTok
 use crate::config::DEFAULT_MODEL;
 use crate::config::{ModelConfiguration, ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
-use crate::subagents::{AcceptedThinking, AgentInvocationContext, Caller, SessionSubagents};
+use crate::subagents::{
+    AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
+    TaskObservation, TaskRecord,
+};
 #[cfg(test)]
 use crate::subagents::{
     ChildFailure, ChildPayload, ChildRunner, RunnerFuture, SubagentCoordinator, SubagentPolicy,
@@ -93,7 +98,7 @@ pub(crate) struct StoredRecord {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RuntimeEvent {
     RunStarted {
         run_id: RunId,
@@ -135,6 +140,20 @@ pub(crate) enum RuntimeEvent {
     RecordAppended {
         record: StoredRecord,
         progress_gap: bool,
+    },
+    SubagentSpawned {
+        record: TaskRecord,
+    },
+    SubagentStatus {
+        id: TaskId,
+        revision: u64,
+        observation: TaskObservation,
+    },
+    SubagentRecord {
+        record: TaskRecord,
+    },
+    SubagentFinished {
+        record: TaskRecord,
     },
     RunSettled {
         run_id: RunId,
@@ -224,6 +243,9 @@ pub(crate) struct RuntimeController<M: Model> {
     settings: watch::Sender<ModelSelection>,
     accepted_thinking: AcceptedThinking,
     subagents: SessionSubagents,
+    subagent_events: Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
+    subagent_record_revisions: BTreeMap<TaskId, u64>,
+    subagent_status_revisions: BTreeMap<TaskId, u64>,
     active_caller: Option<Caller>,
     active: Option<ActiveRun<M>>,
 }
@@ -271,6 +293,7 @@ enum ControllerInput<M: Model> {
     Worker(Option<WorkerMessage<M>>),
     Progress(Option<ProgressEnvelope<WorkerProgress>>),
     SubagentsChanged,
+    CoordinatorEvent(Option<CoordinatorEvent>),
     SubagentDeadline,
 }
 
@@ -302,6 +325,10 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::ModelStepStarted { .. }
         | RuntimeEvent::ExecutionStarted { .. }
         | RuntimeEvent::RecordAppended { .. }
+        | RuntimeEvent::SubagentSpawned { .. }
+        | RuntimeEvent::SubagentStatus { .. }
+        | RuntimeEvent::SubagentRecord { .. }
+        | RuntimeEvent::SubagentFinished { .. }
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
@@ -348,7 +375,10 @@ impl<M: Model> RuntimeController<M> {
             next_model_step_id: 1,
             settings,
             accepted_thinking,
+            subagent_events: subagents.take_event_receiver(),
             subagents,
+            subagent_record_revisions: BTreeMap::new(),
+            subagent_status_revisions: BTreeMap::new(),
             active_caller: None,
             active: None,
         }
@@ -404,6 +434,7 @@ impl<M: Model> RuntimeController<M> {
         loop {
             if shutdown_requested && self.active.is_none() {
                 self.subagents.shutdown().await;
+                self.drain_coordinator_events(&events, &mut progress).await;
                 return self.records;
             }
 
@@ -417,18 +448,22 @@ impl<M: Model> RuntimeController<M> {
                 }
             };
             let input = if let Some(active) = self.active.as_mut() {
+                let subagent_events = &mut self.subagent_events;
                 tokio::select! {
                     biased;
                     command = commands.recv(), if commands_open => ControllerInput::Command(command),
                     message = active.worker.recv() => ControllerInput::Worker(message),
                     worker_progress = active.progress.recv(), if active.progress_open => ControllerInput::Progress(worker_progress),
+                    event = Self::next_coordinator_event(subagent_events) => ControllerInput::CoordinatorEvent(event),
                     _ = subagent_updates.changed() => ControllerInput::SubagentsChanged,
                     _ = deadline_wait => ControllerInput::SubagentDeadline,
                 }
             } else {
+                let subagent_events = &mut self.subagent_events;
                 tokio::select! {
                     biased;
                     command = commands.recv(), if commands_open => ControllerInput::Command(command),
+                    event = Self::next_coordinator_event(subagent_events) => ControllerInput::CoordinatorEvent(event),
                     _ = subagent_updates.changed() => ControllerInput::SubagentsChanged,
                     _ = deadline_wait => ControllerInput::SubagentDeadline,
                 }
@@ -462,9 +497,23 @@ impl<M: Model> RuntimeController<M> {
                         .progress_open = false;
                 }
                 ControllerInput::SubagentsChanged => {}
+                ControllerInput::CoordinatorEvent(Some(event)) => {
+                    self.handle_coordinator_event(event, &events, &mut progress)
+                        .await;
+                }
+                ControllerInput::CoordinatorEvent(None) => self.subagent_events = None,
                 ControllerInput::SubagentDeadline => self.subagents.service().await,
             }
             self.subagents.service().await;
+        }
+    }
+
+    async fn next_coordinator_event(
+        receiver: &mut Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
+    ) -> Option<CoordinatorEvent> {
+        match receiver {
+            Some(receiver) => receiver.recv().await,
+            None => futures::future::pending().await,
         }
     }
 
@@ -514,6 +563,120 @@ impl<M: Model> RuntimeController<M> {
                 *shutdown_requested = true;
                 self.request_shutdown().await;
             }
+        }
+    }
+
+    async fn handle_coordinator_event(
+        &mut self,
+        event: CoordinatorEvent,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+    ) {
+        match event {
+            CoordinatorEvent::Spawned { record } => {
+                self.emit(
+                    events,
+                    RuntimeEvent::SubagentSpawned {
+                        record: record.clone(),
+                    },
+                );
+                self.accept_subagent_record(&record);
+                self.publish_subagent_status(progress, &record);
+            }
+            CoordinatorEvent::Changed { id, revision } => {
+                let Some(record) = self.subagents.record(&id).await else {
+                    return;
+                };
+                if record.revision() < revision {
+                    return;
+                }
+                self.publish_subagent_record(events, &record);
+                self.publish_subagent_status(progress, &record);
+            }
+            CoordinatorEvent::Finished { record } => {
+                self.publish_subagent_record(events, &record);
+                self.publish_subagent_status(progress, &record);
+                self.emit(events, RuntimeEvent::SubagentFinished { record });
+            }
+        }
+    }
+
+    fn accept_subagent_record(&mut self, record: &TaskRecord) -> bool {
+        let id = record.id().clone();
+        let revision = record.revision();
+        if self
+            .subagent_record_revisions
+            .get(&id)
+            .is_some_and(|latest| *latest >= revision)
+        {
+            return false;
+        }
+        self.subagent_record_revisions.insert(id, revision);
+        true
+    }
+
+    fn publish_subagent_record(
+        &mut self,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        record: &TaskRecord,
+    ) {
+        if self.accept_subagent_record(record) {
+            self.emit(
+                events,
+                RuntimeEvent::SubagentRecord {
+                    record: record.clone(),
+                },
+            );
+        }
+    }
+
+    fn publish_subagent_status(
+        &mut self,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+        record: &TaskRecord,
+    ) {
+        let id = record.id().clone();
+        let revision = record.revision();
+        if self
+            .subagent_status_revisions
+            .get(&id)
+            .is_some_and(|latest| *latest >= revision)
+        {
+            return;
+        }
+        self.subagent_status_revisions.insert(id.clone(), revision);
+        self.publish_progress(
+            progress,
+            RuntimeEvent::SubagentStatus {
+                id,
+                revision,
+                observation: record.observation().clone(),
+            },
+            false,
+        );
+    }
+
+    async fn drain_coordinator_events(
+        &mut self,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        progress: &mut ProgressPublisher<RuntimeEvent>,
+    ) {
+        loop {
+            let event = match self.subagent_events.as_mut() {
+                Some(receiver) => match receiver.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        self.subagent_events = None;
+                        None
+                    }
+                },
+                None => None,
+            };
+            let Some(event) = event else {
+                return;
+            };
+            self.handle_coordinator_event(event, events, progress).await;
         }
     }
 
@@ -1014,9 +1177,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        AcceptedThinking, ActiveRun, ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope,
-        ProgressPublisher, Record, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
-        RuntimeEvent, RuntimeProgressReceiver, StoredRecord, WorkerMessage,
+        AcceptedThinking, ActiveRun, CoordinatorEvent, ModelStepId, PROGRESS_CHANNEL_CAPACITY,
+        ProgressEnvelope, ProgressPublisher, Record, RunId, RuntimeCommand, RuntimeController,
+        RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord, WorkerMessage,
         runtime_event_payload_bytes,
     };
     use crate::agent::{
@@ -1027,19 +1190,20 @@ mod tests {
         ToolCallSummary, ToolName,
     };
     use crate::config::{
-        ModelSelection,
+        DEFAULT_MODEL, ModelSelection,
         models::{LUNA, SOL, TERRA},
     };
     use crate::model::{
         AttemptAccounting, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
+        ModelUsage, ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::subagents::{
         ChildModelFactory, ChildParameters, ChildPayload, CompleteChildRunner, SessionSubagents,
         SubagentCoordinator, SubagentPolicy, TaskState,
     };
     use crate::tools::{ReadTestGate, ToolHost};
+    use crate::transcript::Transcript;
     use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1134,10 +1298,29 @@ mod tests {
         )
     }
 
+    fn known_usage(
+        model: &'static crate::config::ModelConfiguration,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+    ) -> AttemptAccounting {
+        AttemptAccounting::KnownUsage(ModelUsage {
+            model: model.id.to_owned(),
+            service_tier: Some(model.service_tier.to_owned()),
+            input_tokens: Some(input_tokens),
+            cached_input_tokens: Some(cached_input_tokens),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(output_tokens),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(input_tokens + output_tokens),
+        })
+    }
+
     #[derive(Clone)]
     struct GatedChildFactory {
         started: Arc<Notify>,
         release: Arc<Notify>,
+        attempts: Vec<AttemptAccounting>,
     }
 
     impl ChildModelFactory for GatedChildFactory {
@@ -1147,6 +1330,7 @@ mod tests {
             GatedChildModel {
                 started: self.started.clone(),
                 release: self.release.clone(),
+                attempts: self.attempts.clone(),
             }
         }
     }
@@ -1154,6 +1338,7 @@ mod tests {
     struct GatedChildModel {
         started: Arc<Notify>,
         release: Arc<Notify>,
+        attempts: Vec<AttemptAccounting>,
     }
 
     impl Model for GatedChildModel {
@@ -1180,9 +1365,37 @@ mod tests {
                         selection: None,
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new("test", Vec::new()),
-                        attempts: vec![AttemptAccounting::UsageUnavailable],
+                        attempts: self.attempts.clone(),
                     }),
                 }
+            }
+        }
+    }
+
+    struct UsageMessageModel {
+        attempts: Option<Vec<AttemptAccounting>>,
+    }
+
+    impl Model for UsageMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let attempts = self.attempts.take().ok_or(ModelError::Exhausted)?;
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "foreground complete".to_owned(),
+                    },
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts,
+                })
             }
         }
     }
@@ -1367,6 +1580,18 @@ mod tests {
             RuntimeEvent::StdoutDelta { .. } => "stdout-delta".to_owned(),
             RuntimeEvent::StdoutTruncated { .. } => "stdout-truncated".to_owned(),
             RuntimeEvent::RecordAppended { record, .. } => record_label(record),
+            RuntimeEvent::SubagentSpawned { record } => {
+                format!("subagent-spawned:{}", record.id())
+            }
+            RuntimeEvent::SubagentStatus { id, revision, .. } => {
+                format!("subagent-status:{id}:{revision}")
+            }
+            RuntimeEvent::SubagentRecord { record } => {
+                format!("subagent-record:{}:{}", record.id(), record.revision())
+            }
+            RuntimeEvent::SubagentFinished { record } => {
+                format!("subagent-finished:{}", record.id())
+            }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
@@ -1405,6 +1630,7 @@ mod tests {
         let factory = GatedChildFactory {
             started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
         };
         let coordinator = complete_child_coordinator(factory.clone());
         let caller = coordinator.root_caller().await;
@@ -1530,6 +1756,7 @@ mod tests {
         let factory = GatedChildFactory {
             started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
         };
         let coordinator = complete_child_coordinator(factory.clone());
         let caller = coordinator.root_caller().await;
@@ -1605,7 +1832,7 @@ mod tests {
         let controller =
             controller_with_subagents(&workspace, ScriptedModel::default(), coordinator.clone())
                 .await;
-        let (commands, _, _, mut task) = start_controller(controller);
+        let (commands, mut events, _, mut task) = start_controller(controller);
 
         commands.send(RuntimeCommand::Shutdown).await.unwrap();
         factory.cleanup_started.notified().await;
@@ -1630,6 +1857,11 @@ mod tests {
             coordinator.records().await[0].attempts(),
             &[AttemptAccounting::UsageUnavailable]
         );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(RuntimeEvent::SubagentRecord { .. })
+        ));
+        while !matches!(events.try_recv(), Ok(RuntimeEvent::SubagentFinished { .. })) {}
     }
 
     #[tokio::test]
@@ -1745,6 +1977,14 @@ mod tests {
         );
         let records = shutdown_controller(commands, task).await;
         assert_eq!(records.len(), 2);
+        let mut relayed_finish = false;
+        while let Ok(event) = events.try_recv() {
+            relayed_finish |= matches!(event, RuntimeEvent::SubagentFinished { record } if record.id() == child.id());
+        }
+        assert!(
+            relayed_finish,
+            "disabled runtime must relay child settlement"
+        );
     }
 
     #[test]
@@ -5654,6 +5894,321 @@ mod tests {
         assert_eq!(
             events.recv().await,
             Some(RuntimeEvent::SettingsAccepted { revision: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_controller_relays_queued_child_lifecycle_in_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let controller =
+            controller_with_subagents(&workspace, ScriptedModel::default(), coordinator.clone())
+                .await;
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit child");
+        factory.started.notified().await;
+        factory.release.notify_one();
+        coordinator.wait(&caller, child.id()).await.unwrap();
+
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        let mut lifecycle = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            let finished = matches!(event, RuntimeEvent::SubagentFinished { .. });
+            lifecycle.push(event);
+            if finished {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            lifecycle.first(),
+            Some(RuntimeEvent::SubagentSpawned { record }) if record.id() == child.id()
+        ));
+        assert!(lifecycle[1..lifecycle.len() - 1]
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::SubagentRecord { record } if record.id() == child.id())));
+        assert!(matches!(
+            lifecycle.last(),
+            Some(RuntimeEvent::SubagentFinished { record }) if record.id() == child.id()
+        ));
+        assert_eq!(coordinator.active_count().await, 0);
+
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn child_records_relay_after_foreground_settlement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![known_usage(&TERRA, 200, 20, 0)],
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let root_attempt = known_usage(&LUNA, 100, 10, 50);
+        let controller = controller_with_subagents(
+            &workspace,
+            UsageMessageModel {
+                attempts: Some(vec![root_attempt]),
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "foreground".to_owned(),
+            })
+            .await
+            .unwrap();
+        let foreground = events_until_settled(&mut events).await;
+        assert!(matches!(
+            foreground.last(),
+            Some(RuntimeEvent::RunSettled { run_id: RunId(1) })
+        ));
+        let mut transcript = Transcript::default();
+        for event in foreground {
+            transcript.apply(event, false);
+        }
+        let before = transcript.layout(128).footer_rule(128).to_string();
+        assert!(before.contains("↑100 ↓10 R50 W0"), "{before}");
+        assert!(before.contains("$0.00002300"), "{before}");
+        assert!(before.contains("CH50.0%"), "{before}");
+        assert!(before.contains("0.0%/272k"), "{before}");
+
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(
+                &caller,
+                ChildParameters::new(
+                    "background work".to_owned(),
+                    ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    false,
+                ),
+                child_payload(&workspace).await,
+            )
+            .await
+            .expect("admit child after root settlement");
+        factory.started.notified().await;
+        factory.release.notify_one();
+        coordinator.wait(&caller, child.id()).await.unwrap();
+
+        let mut first_child_event = true;
+        loop {
+            let event = next_event(&mut events).await;
+            if first_child_event {
+                assert!(matches!(
+                    event,
+                    RuntimeEvent::SubagentSpawned { ref record } if record.id() == child.id()
+                ));
+                first_child_event = false;
+            }
+            let finished = matches!(
+                event,
+                RuntimeEvent::SubagentFinished { ref record } if record.id() == child.id()
+            );
+            transcript.apply(event, false);
+            if finished {
+                break;
+            }
+        }
+        let after = transcript.layout(128).footer_rule(128).to_string();
+        assert!(after.contains("↑300 ↓30 R50 W0"), "{after}");
+        assert!(after.contains("$0.0006630"), "{after}");
+        assert!(after.contains("CH50.0%"), "{after}");
+        assert!(after.contains("0.0%/272k"), "{after}");
+        assert_ne!(after, before);
+        shutdown_controller(commands, task).await;
+    }
+
+    #[tokio::test]
+    async fn full_progress_drops_only_child_status_and_ignores_stale_revisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller(&workspace, Vec::new()).await;
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut statuses) = mpsc::channel(1);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let spawned = crate::subagents::TaskRecord::for_test(
+            "child1",
+            3,
+            selection,
+            None,
+            1,
+            vec![AttemptAccounting::UsageUnavailable],
+        );
+        let finished = crate::subagents::TaskRecord::for_test(
+            "child1",
+            5,
+            selection,
+            None,
+            1,
+            vec![AttemptAccounting::UsageUnavailable],
+        );
+
+        controller
+            .handle_coordinator_event(
+                CoordinatorEvent::Spawned {
+                    record: spawned.clone(),
+                },
+                &event_sender,
+                &mut progress,
+            )
+            .await;
+        controller
+            .handle_coordinator_event(
+                CoordinatorEvent::Finished {
+                    record: finished.clone(),
+                },
+                &event_sender,
+                &mut progress,
+            )
+            .await;
+        controller.publish_subagent_status(&mut progress, &spawned);
+
+        assert!(matches!(
+            events.recv().await,
+            Some(RuntimeEvent::SubagentSpawned { record }) if record == spawned
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(RuntimeEvent::SubagentRecord { record }) if record == finished
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(RuntimeEvent::SubagentFinished { record }) if record == finished
+        ));
+        assert!(matches!(
+            statuses.recv().await,
+            Some(ProgressEnvelope {
+                item: RuntimeEvent::SubagentStatus { revision: 3, .. },
+                ..
+            })
+        ));
+        assert!(statuses.try_recv().is_err());
+        assert_eq!(
+            controller.subagent_status_revisions.get(finished.id()),
+            Some(&5)
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_child_changes_publish_the_latest_record_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit child");
+        factory.started.notified().await;
+        let mut controller =
+            controller_with_subagents(&workspace, ScriptedModel::default(), coordinator.clone())
+                .await;
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _statuses) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let record = coordinator.record(child.id()).await.expect("child record");
+        let changed = CoordinatorEvent::Changed {
+            id: child.id().clone(),
+            revision: record.revision(),
+        };
+
+        controller
+            .handle_coordinator_event(changed.clone(), &event_sender, &mut progress)
+            .await;
+        controller
+            .handle_coordinator_event(changed, &event_sender, &mut progress)
+            .await;
+
+        assert!(matches!(
+            events.recv().await,
+            Some(RuntimeEvent::SubagentRecord { record: emitted })
+                if emitted.id() == record.id() && emitted.revision() == record.revision()
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            controller.subagent_record_revisions.get(child.id()),
+            Some(&record.revision())
+        );
+
+        factory.release.notify_one();
+        coordinator.wait(&caller, child.id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_children_emit_one_new_authoritative_record_before_each_snapshot() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller(&workspace, Vec::new()).await;
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _statuses) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let spawned =
+            crate::subagents::TaskRecord::for_test("child1", 3, selection, None, 1, Vec::new());
+        let finished = crate::subagents::TaskRecord::for_test(
+            "child1",
+            5,
+            selection,
+            None,
+            1,
+            vec![AttemptAccounting::UsageUnavailable],
+        );
+
+        controller
+            .handle_coordinator_event(
+                CoordinatorEvent::Spawned {
+                    record: spawned.clone(),
+                },
+                &event_sender,
+                &mut progress,
+            )
+            .await;
+        for _ in 0..2 {
+            controller
+                .handle_coordinator_event(
+                    CoordinatorEvent::Finished {
+                        record: finished.clone(),
+                    },
+                    &event_sender,
+                    &mut progress,
+                )
+                .await;
+        }
+
+        let emitted = (0..4)
+            .map(|_| events.try_recv().expect("runtime event"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            emitted.as_slice(),
+            [
+                RuntimeEvent::SubagentSpawned { record },
+                RuntimeEvent::SubagentRecord { record: record_after_finish },
+                RuntimeEvent::SubagentFinished { record: first_snapshot },
+                RuntimeEvent::SubagentFinished { record: second_snapshot },
+            ] if record == &spawned
+                && record_after_finish == &finished
+                && first_snapshot == &finished
+                && second_snapshot == &finished
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            controller.subagent_record_revisions.get(finished.id()),
+            Some(&finished.revision())
         );
     }
 

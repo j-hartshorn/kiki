@@ -5430,6 +5430,10 @@ mod tests {
                 | RuntimeEvent::RunPreviewUpdated { .. }
                 | RuntimeEvent::StdoutDelta { .. }
                 | RuntimeEvent::StdoutTruncated { .. }
+                | RuntimeEvent::SubagentSpawned { .. }
+                | RuntimeEvent::SubagentStatus { .. }
+                | RuntimeEvent::SubagentRecord { .. }
+                | RuntimeEvent::SubagentFinished { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
