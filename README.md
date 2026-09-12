@@ -7,14 +7,14 @@ Kiki runs a production OpenAI Responses API agent against the standard OpenAI en
 Install the exact Monty worker:
 
 ```sh
-cargo install monty-runtime --version 0.0.21 --locked --root /tmp/kiki-monty-0.0.21
+cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
 ```
 
 Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
-export MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty
+export MONTY_BIN=/tmp/kiki-monty/bin/monty
 export KIKI_SYSTEM_PROMPT=/absolute/path/to/read_only_agent.md
 export KIKI_MODEL=openai/gpt-5.6-terra
 export KIKI_THINKING=high
@@ -150,7 +150,7 @@ Start Kiki with live credentials:
 
 ```sh
 OPENAI_API_KEY=... \
-MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty \
+MONTY_BIN=/tmp/kiki-monty/bin/monty \
 cargo run
 ```
 
@@ -169,7 +169,7 @@ The ordinary suite is credential-free and uses local fixtures:
 ```sh
 cargo fmt --all -- --check
 cargo check --all-targets
-env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test --all-targets -- --test-threads=1
+env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1
 cargo clippy --all-targets -- -D warnings
 test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
 test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"
@@ -181,7 +181,7 @@ test "$(rg -l '(cap_std|rustix|blake3|getrandom)' src --glob '*.rs')" = "src/too
 The ignored live scenario is selected explicitly and requires the setup above:
 
 ```sh
-OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty just live-test
+OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
 ```
 
 It runs three requests on one controller. The complete scenario has a five-minute watchdog; every provider attempt has a two-minute deadline; if the first request starts a ninth model step, the test cancels it and fails. The cancellation request must start an attempt within 30 seconds and settle within another 30 seconds. The follow-up request must finish within two minutes. Cleanup always requests shutdown, waits up to ten seconds, then aborts and awaits the controller if necessary.

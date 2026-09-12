@@ -205,7 +205,7 @@ On small terminals, remove padding and reduce visible entries while preserving t
 ## Dependencies
 
 - [Interactive model, thinking, and session settings](../2026-09-05_interactive-model-thinking-settings/spec.md), merged to `main` by `1d20e16`. Its catalogue, selections, TOML, pricing, formatting, selectors, and footer are the implementation baseline.
-- Existing Agent/Arena/tool execution and exact Monty `0.0.21` worker. No Monty dependency/protocol change.
+- Existing Agent/Arena/tool execution with exact Monty `0.0.22`, the minimum release that accepts valid multiline exception traceback spans.
 - [TUI responsiveness](../2026-09-03_tui-responsiveness/spec.md) and [history text selection](../2026-09-02_history-text-selection/spec.md); preserve their rendering and geometry guarantees.
 - [Default agent tools](../2026-09-01_default-agent-tools/spec.md) for host effects, authorisations, and Python composition; [Vision](../VISION.md#L98) for delegation intent. Whole-checkpoint inheritance intentionally widens Vision's transferable-data-only initial direction, without widening returned values.
 
@@ -229,7 +229,7 @@ test_home="$(mktemp -d)"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$test_home"
-export MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty
+export MONTY_BIN=/tmp/kiki-monty/bin/monty
 unset OPENAI_API_KEY KIKI_MODEL KIKI_THINKING KIKI_SYSTEM_PROMPT
 trap 'rm -rf "$test_home"' EXIT
 "$MONTY_BIN" --version
@@ -243,7 +243,7 @@ test "$(rg -l '(cap_std|rustix|blake3|getrandom)' src --glob '*.rs')" = "src/too
 git diff --check
 ```
 
-Expect exact worker identity `monty-runtime 0.0.21`, all credential-free tests/checks passing, and no dependency-seam leakage. Tests must inject home/workspace/settings and gates rather than observe real configuration or use sleeps to establish ordering. Use deterministic host-time control for clock tests; do not wait fifteen minutes or make provider calls in the ordinary suite.
+Expect exact worker identity `monty-runtime 0.0.22`, all credential-free tests/checks passing, and no dependency-seam leakage. Tests must inject home/workspace/settings and gates rather than observe real configuration or use sleeps to establish ordering. Use deterministic host-time control for clock tests; do not wait fifteen minutes or make provider calls in the ordinary suite.
 
 Manual acceptance, after deterministic verification: start two children using different configured models; let the foreground reply; submit a clarification while they run; inspect changing steps/runtime/cost, expand long history prompts and terminal results, and verify the sticky list stays compact. Confirm completed entries survive idle time and clear on the next accepted request. Verify Esc once stops only the foreground and Esc again stops background work, including rapid presses and picker precedence. Check shared-file warnings, readonly denial, an ordinary child failure, Unicode gutters, narrow terminal layout, and session cost retention. Live checks are opt-in, not replacements for deterministic assertions.
 

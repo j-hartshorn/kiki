@@ -283,7 +283,7 @@ impl StartupConfiguration {
         self.with_construction_failure(
             StartupProblemKind::WorkerConstructionFailed,
             format!("Monty worker construction failed: {failure}"),
-            "Check that MONTY_BIN points to a working monty-runtime 0.0.21 executable, then restart Kiki.",
+            "Check that MONTY_BIN points to a working monty-runtime 0.0.22 executable, then restart Kiki.",
         )
     }
 
@@ -562,7 +562,7 @@ fn resolve_worker_path(
             Some(StartupProblem::new(
                 StartupProblemKind::WorkerPathMissing,
                 "MONTY_BIN is not set.",
-                "Set MONTY_BIN to the absolute path of monty-runtime 0.0.21, then restart Kiki.",
+                "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
                 api_key,
             )),
         );
@@ -575,7 +575,7 @@ fn resolve_worker_path(
                 "MONTY_BIN must be an absolute path, but is `{}`.",
                 worker_path.display()
             ),
-            "Set MONTY_BIN to the absolute path of monty-runtime 0.0.21, then restart Kiki.",
+            "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
             api_key,
         )
     });
@@ -1423,7 +1423,7 @@ mod tests {
         assert!(rendered.contains(
             "Problem: Workspace construction failed: workspace failure \\x0D [redacted]"
         ));
-        assert!(rendered.contains("Remediation: Check that MONTY_BIN points to a working monty-runtime 0.0.21 executable, then restart Kiki."));
+        assert!(rendered.contains("Remediation: Check that MONTY_BIN points to a working monty-runtime 0.0.22 executable, then restart Kiki."));
         assert!(rendered.contains("Remediation: Check the workspace directory permissions and filesystem access, then restart Kiki."));
         assert!(rendered.contains("store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."));
         assert!(!rendered.contains(api_key), "{rendered}");

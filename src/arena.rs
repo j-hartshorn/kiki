@@ -38,7 +38,7 @@ use crate::{
 
 pub(crate) use crate::tools::ToolName;
 
-const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.21";
+const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.22";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
@@ -1593,7 +1593,7 @@ async fn drive(
                     args,
                     kwargs,
                     call_id,
-                    method_call,
+                    object_id,
                 } => {
                     let invocation = InvocationOperation::from_private_name(&function_name);
                     let Some(tool) = ToolName::from_private_name(&function_name)
@@ -1602,7 +1602,7 @@ async fn drive(
                         event = turn!('drive, on_print => checkout.resume(ResumeValue::NotFound, &mut on_print));
                         continue;
                     };
-                    if method_call || !kwargs.is_empty() {
+                    if object_id.is_some() || !kwargs.is_empty() {
                         turn!('drive, on_print => checkout.resume(
                             ResumeValue::Error(tool_error(ToolError::type_error(
                                 "host functions accept positional arguments only",
@@ -1646,16 +1646,20 @@ async fn drive(
                         turn!('drive, on_print => checkout.resume(ResumeValue::Future, &mut on_print))
                     }
                 }
-                TurnEvent::NameLookup { name } => {
-                    let value = ToolName::from_private_name(&name)
-                        .map(|tool| tool.private_name())
-                        .or_else(|| {
-                            InvocationOperation::from_private_name(&name).map(|_| name.as_str())
-                        })
-                        .map(|name| MontyObject::Function {
-                            name: name.to_owned(),
-                            docstring: None,
-                        });
+                TurnEvent::NameLookup { name, object_id } => {
+                    let value = if object_id.is_none() {
+                        ToolName::from_private_name(&name)
+                            .map(|tool| tool.private_name())
+                            .or_else(|| {
+                                InvocationOperation::from_private_name(&name).map(|_| name.as_str())
+                            })
+                            .map(|name| MontyObject::Function {
+                                name: name.to_owned(),
+                                docstring: None,
+                            })
+                    } else {
+                        None
+                    };
                     turn!('drive, on_print => checkout.resume_name_lookup(value, &mut on_print))
                 }
                 TurnEvent::OsCall { .. } => {
@@ -2684,7 +2688,7 @@ mod tests {
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.21 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
     }
 
     async fn arena(workspace: &TempDir) -> Arena {
@@ -3250,7 +3254,13 @@ mod tests {
             ),
             (
                 "class",
-                MontyObject::Type(MontyType::Instance("Unsupported".to_owned())),
+                MontyObject::Type(MontyType::Instance(Box::new(monty_types::MontyClassType {
+                    name: "Unsupported".to_owned(),
+                    id: monty_types::MontyUuid::from_u128(1),
+                    host_defined: true,
+                    is_dataclass: false,
+                    attrs: Vec::new().into(),
+                }))),
             ),
             ("bytes", MontyObject::Bytes(b"bytes".to_vec())),
             ("big integer", MontyObject::BigInt(Default::default())),
@@ -4154,6 +4164,29 @@ mod tests {
             execute_with_invocation(&mut arena, &context, "result = await task.wait()").await;
         assert_eq!(complete(&execution), None);
         assert_eq!(execution.stdout.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn multiline_subagent_concurrency_limit_is_a_python_exception() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let (context, _started) = invocation_context().await;
+        let calls = (0..9)
+            .map(|index| format!("start_subagent('child {index}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let execution = execute_with_invocation(
+            &mut arena,
+            &context,
+            &format!("import asyncio\ntasks = await asyncio.gather(\n    {calls}\n)"),
+        )
+        .await;
+        assert!(
+            python_error(&execution)
+                .text
+                .contains("subagent concurrency limit is exhausted")
+        );
     }
 
     #[tokio::test]

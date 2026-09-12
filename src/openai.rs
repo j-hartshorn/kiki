@@ -5238,7 +5238,7 @@ mod tests {
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
     const LIVE_SETUP_CONFIGURATION: &str =
-        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.21";
+        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
     const LIVE_SETUP_READ_TOOL: &str =
         "live test could not initialise the workspace read capability";
     const LIVE_SETUP_ARENA: &str = "live test could not initialise the Monty arena";

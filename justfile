@@ -4,7 +4,7 @@ monty_root := "/tmp/kiki-monty"
 export MONTY_BIN := monty_root + "/bin/monty"
 
 monty:
-    test -x "$MONTY_BIN" || cargo install monty-runtime --version 0.0.21 --locked --root "{{ monty_root }}"
+    test -x "$MONTY_BIN" && test "$("$MONTY_BIN" --version)" = "monty-runtime 0.0.22" || cargo install monty-runtime --version 0.0.22 --locked --root "{{ monty_root }}" --force
 
 check:
     cargo check --all-targets
