@@ -1123,8 +1123,7 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
-        if matches!(&event, RuntimeEvent::RecordAppended { record, .. } if matches!(&record.record, crate::runtime::Record::UserRequest { .. }))
-        {
+        if matches!(&event, RuntimeEvent::RunSettled { .. }) {
             self.foreground_cancellation_requested = false;
         }
         if let RuntimeEvent::SettingsAccepted { revision } = &event {
@@ -6653,13 +6652,37 @@ mod tests {
             app.handle_key_at(key(KeyCode::Esc), now).commands,
             vec![RuntimeCommand::Cancel]
         );
+        app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert_eq!(
+            enter_at(&mut app, "second prompt", now).commands,
+            vec![RuntimeCommand::Submit {
+                request: "second prompt".to_owned(),
+            }]
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::Cancel]
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "second prompt".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
             vec![RuntimeCommand::CancelBackground]
         );
-        app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+
+        let mut idle = App::default();
         assert_eq!(
-            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            idle.handle_key_at(key(KeyCode::Esc), now).commands,
             vec![RuntimeCommand::CancelBackground]
         );
 
