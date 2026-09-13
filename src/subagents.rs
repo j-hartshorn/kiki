@@ -1611,6 +1611,53 @@ async fn take_test_permit(semaphore: &Arc<Semaphore>) {
         .forget();
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RunChildTestGate {
+    before_lock: Arc<Semaphore>,
+    allow_lock: Arc<Semaphore>,
+    after_lock: Arc<Semaphore>,
+    allow_finish: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl RunChildTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            before_lock: Arc::new(Semaphore::new(0)),
+            allow_lock: Arc::new(Semaphore::new(0)),
+            after_lock: Arc::new(Semaphore::new(0)),
+            allow_finish: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_before_lock(&self) {
+        take_test_permit(&self.before_lock).await;
+    }
+
+    pub(crate) fn allow_lock(&self) {
+        self.allow_lock.add_permits(1);
+    }
+
+    pub(crate) async fn wait_until_after_lock(&self) {
+        take_test_permit(&self.after_lock).await;
+    }
+
+    pub(crate) fn allow_finish(&self) {
+        self.allow_finish.add_permits(1);
+    }
+
+    async fn wait_before_lock(&self) {
+        self.before_lock.add_permits(1);
+        take_test_permit(&self.allow_lock).await;
+    }
+
+    async fn wait_after_lock(&self) {
+        self.after_lock.add_permits(1);
+        take_test_permit(&self.allow_finish).await;
+    }
+}
+
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
     publication: Arc<SyncMutex<CoordinatorPublication>>,
@@ -1620,6 +1667,8 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     trace: Trace,
     #[cfg(test)]
     start_test_gate: Option<StartSubagentTestGate>,
+    #[cfg(test)]
+    run_child_test_gate: Option<RunChildTestGate>,
 }
 
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
@@ -1633,6 +1682,8 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             trace: self.trace.clone(),
             #[cfg(test)]
             start_test_gate: self.start_test_gate.clone(),
+            #[cfg(test)]
+            run_child_test_gate: self.run_child_test_gate.clone(),
         }
     }
 }
@@ -1813,12 +1864,23 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             trace: Trace::disabled(),
             #[cfg(test)]
             start_test_gate: None,
+            #[cfg(test)]
+            run_child_test_gate: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_start_test_gate(mut self, start_test_gate: StartSubagentTestGate) -> Self {
         self.start_test_gate = Some(start_test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_run_child_test_gate(
+        mut self,
+        run_child_test_gate: RunChildTestGate,
+    ) -> Self {
+        self.run_child_test_gate = Some(run_child_test_gate);
         self
     }
 
@@ -2228,15 +2290,25 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.trace.emit(|| TraceEvent::ChildRunnerStarted {
             child_id: id.clone(),
         });
+        #[cfg(test)]
+        if let Some(run_child_test_gate) = &self.run_child_test_gate {
+            run_child_test_gate.wait_before_lock().await;
+        }
         let cancellation = {
             let mut inner = self.lock_inner(CoordinatorOperation::RunChild).await;
             let task = inner
                 .tasks
                 .get_mut(&id)
                 .expect("admitted child must remain retained");
-            task.transition(TaskState::Running);
+            if task.state == TaskState::Starting && task.stop.is_none() {
+                task.transition(TaskState::Running);
+            }
             task.cancellation.clone()
         };
+        #[cfg(test)]
+        if let Some(run_child_test_gate) = &self.run_child_test_gate {
+            run_child_test_gate.wait_after_lock().await;
+        }
         let result = if cancellation.is_cancelled() {
             Err(ChildFailure::new("child was cancelled before startup"))
         } else {
@@ -3696,6 +3768,38 @@ mod tests {
             &parent_id,
         );
         assert_eq!(coordinator.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn background_cancellation_keeps_a_stopping_child_stopping_before_runner_start() {
+        let gate = super::RunChildTestGate::new();
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_run_child_test_gate(gate.clone());
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator.start(&caller, parameters(), ()).await.unwrap();
+
+        gate.wait_until_before_lock().await;
+        coordinator.request_background_cancellation(None).await;
+        let stopping = coordinator.get(&caller, admitted.id()).await.unwrap();
+        assert_eq!(stopping.state(), TaskState::Stopping);
+        assert_eq!(stopping.error(), Some("cancellation requested"));
+
+        gate.allow_lock();
+        gate.wait_until_after_lock().await;
+        let after_runner_start = coordinator.get(&caller, admitted.id()).await.unwrap();
+        assert_eq!(after_runner_start.state(), TaskState::Stopping);
+        assert_eq!(after_runner_start.error(), Some("cancellation requested"));
+
+        gate.allow_finish();
+        assert_cancelled(
+            coordinator.wait(&caller, admitted.id()).await.unwrap_err(),
+            admitted.id(),
+        );
+        assert_eq!(coordinator.active_count().await, 0);
+        assert!(matches!(
+            started.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
