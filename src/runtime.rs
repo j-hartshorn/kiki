@@ -6566,7 +6566,7 @@ mod tests {
         let mut progress = ProgressPublisher::new(progress_sender);
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let spawned = crate::subagents::TaskRecord::for_test(
-            "child1",
+            "c1",
             3,
             selection,
             None,
@@ -6574,7 +6574,7 @@ mod tests {
             vec![AttemptAccounting::UsageUnavailable],
         );
         let finished = crate::subagents::TaskRecord::for_test(
-            "child1",
+            "c1",
             5,
             selection,
             None,
@@ -6686,9 +6686,9 @@ mod tests {
         let mut progress = ProgressPublisher::new(progress_sender);
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let spawned =
-            crate::subagents::TaskRecord::for_test("child1", 3, selection, None, 1, Vec::new());
+            crate::subagents::TaskRecord::for_test("c1", 3, selection, None, 1, Vec::new());
         let finished = crate::subagents::TaskRecord::for_test(
-            "child1",
+            "c1",
             5,
             selection,
             None,
@@ -6819,7 +6819,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id().to_string())
                 .collect::<Vec<_>>(),
-            ["000000", "000001", "000002", "000003"]
+            ["00", "01", "02", "03"]
         );
         assert_eq!(
             child_records
@@ -6834,7 +6834,7 @@ mod tests {
             ]
         );
         assert!(child_records[3].parameters().read_only());
-        assert_eq!(child_records[3].parent().unwrap().to_string(), "000002");
+        assert_eq!(child_records[3].parent().unwrap().to_string(), "02");
         assert!(matches!(
             child_records[0].outcome(),
             Some(TaskOutcome::Completed(result))
@@ -6853,7 +6853,7 @@ mod tests {
             Some(TaskOutcome::Completed(result))
                 if result.values() == &BTreeMap::from([(
                     "descendant_id".to_owned(),
-                    ToolValue::String("000003".to_owned()),
+                    ToolValue::String("03".to_owned()),
                 )])
         ));
         assert!(matches!(
@@ -6892,7 +6892,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id().to_string())
                 .collect::<Vec<_>>(),
-            ["000000", "000001", "000002", "000003"]
+            ["00", "01", "02", "03"]
         );
         for record in &child_records {
             assert_eq!(
@@ -6920,10 +6920,10 @@ mod tests {
             }));
         }
         for (id, state) in [
-            ("000000", TaskState::Completed),
-            ("000001", TaskState::Failed),
-            ("000002", TaskState::Completed),
-            ("000003", TaskState::Cancelled),
+            ("00", TaskState::Completed),
+            ("01", TaskState::Failed),
+            ("02", TaskState::Completed),
+            ("03", TaskState::Cancelled),
         ] {
             assert!(status_events.iter().any(|event| {
                 matches!(event, RuntimeEvent::SubagentStatus { id: observed, observation, .. }
@@ -6937,15 +6937,15 @@ mod tests {
             [
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                    summary: ToolCallSummary::Subagent("01".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                    summary: ToolCallSummary::Subagent("02".to_owned()),
                 },
             ]
         );
@@ -6956,47 +6956,47 @@ mod tests {
             [
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                    summary: ToolCallSummary::Subagent("01".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("000001".to_owned()),
+                    summary: ToolCallSummary::Subagent("01".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                    summary: ToolCallSummary::Subagent("02".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                    summary: ToolCallSummary::Subagent("02".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                    summary: ToolCallSummary::Subagent("03".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                    summary: ToolCallSummary::Subagent("03".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
-                    summary: ToolCallSummary::Subagent("000002".to_owned()),
+                    summary: ToolCallSummary::Subagent("02".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("000003".to_owned()),
+                    summary: ToolCallSummary::Subagent("03".to_owned()),
                 },
             ]
         );

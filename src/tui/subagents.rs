@@ -732,7 +732,7 @@ mod tests {
     fn reliable_records_and_newer_statuses_survive_stale_updates_and_terminal_reset() {
         let now = Instant::now();
         let original = TaskRecord::for_test(
-            "child1",
+            "c1",
             1,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,
@@ -740,7 +740,7 @@ mod tests {
             Vec::new(),
         );
         let status = TaskRecord::for_test(
-            "child1",
+            "c1",
             3,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,
@@ -749,7 +749,7 @@ mod tests {
         )
         .with_observation_for_test(Duration::from_secs(10), 0);
         let stale_record = TaskRecord::for_test(
-            "child1",
+            "c1",
             2,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,

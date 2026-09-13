@@ -31,13 +31,11 @@ use crate::prompt::child_prompt;
 use crate::telemetry::{ChildStopCause, CoordinatorOperation, Settlement, Trace, TraceEvent};
 use crate::tools::{ToolError, ToolValue};
 
-const TASK_ID_WIDTH: usize = 6;
-const TASK_ID_SPACE: u64 = 36_u64.pow(TASK_ID_WIDTH as u32);
 const FAILURE_MESSAGE_LIMIT: usize = 4 * 1024;
 const MAINTENANCE_LOCK_TRACE_THRESHOLD: Duration = Duration::from_millis(5);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub(crate) struct TaskId(String);
 
@@ -47,11 +45,28 @@ impl TaskId {
     }
 
     fn parse(value: &str) -> Option<Self> {
-        (value.len() == TASK_ID_WIDTH
+        (value.len() >= 2
+            && (value.len() == 2 || !value.starts_with('0'))
             && value
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            && u64::from_str_radix(value, 16).is_ok())
         .then(|| Self(value.to_owned()))
+    }
+}
+
+impl PartialOrd for TaskId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TaskId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
     }
 }
 
@@ -871,8 +886,11 @@ fn task_id_argument(arguments: ToolValue, operation: &str) -> Result<TaskId, Too
     let ToolValue::String(id) = id else {
         return Err(ToolError::type_error("subagent task ID must be a string"));
     };
-    TaskId::parse(id)
-        .ok_or_else(|| ToolError::value("subagent task ID must be six base-36 characters"))
+    TaskId::parse(id).ok_or_else(|| {
+        ToolError::value(
+            "subagent task ID must be a canonical lowercase hexadecimal string with at least two characters",
+        )
+    })
 }
 
 fn admission_error(error: AdmissionError) -> ToolError {
@@ -1652,7 +1670,7 @@ impl Drop for CoordinatorLockGuard<'_> {
 struct Inner {
     session: u64,
     next_origin: u64,
-    next_task: u64,
+    next_task: Option<u64>,
     active_slots: usize,
     shutting_down: bool,
     blocked_origins: BTreeSet<OriginId>,
@@ -1780,7 +1798,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             inner: Arc::new(Mutex::new(Inner {
                 session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
                 next_origin: 1,
-                next_task: 0,
+                next_task: Some(0),
                 active_slots: 0,
                 shutting_down: false,
                 blocked_origins: BTreeSet::new(),
@@ -1961,7 +1979,10 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             {
                 return Err(AdmissionError::StartBudget);
             }
-            let id = task_id(inner.next_task).ok_or(AdmissionError::IdentifierSpaceExhausted)?;
+            let sequence = inner
+                .next_task
+                .ok_or(AdmissionError::IdentifierSpaceExhausted)?;
+            let id = task_id(sequence);
             let own_deadline = now.checked_add(self.policy.timeout);
             let deadline = earliest_deadline(own_deadline, inherited_deadline);
             parameters.read_only |= inherited_read_only;
@@ -1988,7 +2009,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             };
             let observation = task.observation(now, observed_at_ms);
             let spawned = task.record(now, observed_at_ms);
-            inner.next_task += 1;
+            inner.next_task = sequence.checked_add(1);
             inner.active_slots += 1;
             *inner.origin_starts.entry(caller.origin).or_default() += 1;
             inner.tasks.insert(id.clone(), task);
@@ -2605,23 +2626,8 @@ fn settle_task(
     Some(record)
 }
 
-fn task_id(mut sequence: u64) -> Option<TaskId> {
-    if sequence >= TASK_ID_SPACE {
-        return None;
-    }
-    let mut bytes = [b'0'; TASK_ID_WIDTH];
-    for byte in bytes.iter_mut().rev() {
-        let digit = (sequence % 36) as u8;
-        *byte = if digit < 10 {
-            b'0' + digit
-        } else {
-            b'a' + digit - 10
-        };
-        sequence /= 36;
-    }
-    Some(TaskId(
-        String::from_utf8(bytes.to_vec()).expect("base-36 task identifiers are UTF-8"),
-    ))
+fn task_id(sequence: u64) -> TaskId {
+    TaskId(format!("{sequence:02x}"))
 }
 
 fn bounded_utf8(mut value: String, limit: usize) -> String {
@@ -2655,7 +2661,7 @@ mod tests {
         AccessError, AdmissionError, ChildFailure, ChildParameters, ChildResult, ChildRun,
         ChildRunner, Clock, CoordinatorEvent, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture,
         SubagentCoordinator, SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError,
-        WaitPhaseSignal,
+        WaitPhaseSignal, task_id, task_id_argument,
     };
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
@@ -2916,6 +2922,10 @@ mod tests {
         (id, running)
     }
 
+    async fn seed_next_task(coordinator: &SubagentCoordinator<()>, sequence: u64) {
+        coordinator.inner.lock().await.next_task = Some(sequence);
+    }
+
     #[derive(Clone, Copy)]
     enum PanicKind {
         Synchronous,
@@ -2997,7 +3007,7 @@ mod tests {
             assert_eq!(child.payload().get(), 7);
             let (id, caller, parent, depth, parameters, payload, reporter, coordinator) =
                 child.into_parts();
-            assert_eq!(id.as_str().len(), 6);
+            assert_eq!(id.as_str().len(), 2);
             assert_eq!(parent, None);
             assert_eq!(depth, 1);
             let (prompt, selection, read_only) = parameters.into_parts();
@@ -3183,8 +3193,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task_identifiers_use_canonical_hexadecimal_sequence() {
+        for (sequence, expected) in [
+            (0, "00"),
+            (1, "01"),
+            (15, "0f"),
+            (16, "10"),
+            (255, "ff"),
+            (256, "100"),
+        ] {
+            assert_eq!(task_id(sequence).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn task_identifier_parsing_is_strict_and_keeps_canonical_unknowns() {
+        for canonical in ["00", "01", "0f", "10", "ff", "100", "dead"] {
+            assert_eq!(TaskId::parse(canonical).unwrap().as_str(), canonical);
+        }
+        for malformed in ["", "0", "0A", "0g", "000", "0100", "10000000000000000"] {
+            assert!(TaskId::parse(malformed).is_none(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn task_identifiers_sort_numerically_across_widths() {
+        let mut identifiers = ["100", "0f", "ff", "10", "00", "01"].map(|id| TaskId(id.to_owned()));
+        identifiers.sort();
+        assert_eq!(
+            identifiers.map(|id| id.to_string()),
+            ["00", "01", "0f", "10", "ff", "100"]
+        );
+    }
+
+    #[test]
+    fn malformed_task_identifier_errors_describe_canonical_hexadecimal_ids() {
+        assert_eq!(
+            task_id_argument(
+                ToolValue::List(vec![ToolValue::String("0g".to_owned())]),
+                "get_subagent",
+            )
+            .unwrap_err()
+            .to_string(),
+            "subagent task ID must be a canonical lowercase hexadecimal string with at least two characters"
+        );
+    }
+
     #[tokio::test]
-    async fn task_identifiers_are_six_base36_characters_and_never_reused() {
+    async fn canonical_unknown_task_identifiers_remain_distinct_from_malformed_ids() {
+        assert!(TaskId::parse("0g").is_none());
+        let unknown = TaskId::parse("dead").expect("canonical unknown task ID");
+        let (coordinator, _) = coordinator(policy());
+        let caller = coordinator.root_caller().await;
+
+        assert_eq!(
+            coordinator.get(&caller, &unknown).await,
+            Err(AccessError::UnknownTask(unknown))
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_task_identifiers_are_never_reused() {
         let (coordinator, mut started) = coordinator(policy());
         let caller = coordinator.root_caller().await;
         let (first_id, first) = start(&coordinator, &mut started, &caller).await;
@@ -3195,14 +3265,35 @@ mod tests {
         second.finish.send(Ok(result("second"))).unwrap();
         coordinator.wait(&caller, &second_id).await.unwrap();
 
-        assert!(
-            first_id
-                .as_str()
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        assert_eq!(first_id.as_str(), "00");
+        assert_eq!(second_id.as_str(), "01");
+    }
+
+    #[tokio::test]
+    async fn final_task_identifier_is_allocated_once_before_exhaustion() {
+        let (coordinator, mut started) = coordinator(policy());
+        seed_next_task(&coordinator, u64::MAX).await;
+        let caller = coordinator.root_caller().await;
+
+        let (id, final_task) = start(&coordinator, &mut started, &caller).await;
+        assert_eq!(id.as_str(), "ffffffffffffffff");
+        final_task.finish.send(Ok(result("final"))).unwrap();
+        coordinator.wait(&caller, &id).await.unwrap();
+
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::IdentifierSpaceExhausted)
         );
-        assert_eq!(first_id.as_str().len(), 6);
-        assert_ne!(first_id, second_id);
+        assert_eq!(
+            coordinator
+                .records()
+                .await
+                .iter()
+                .map(|record| record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["ffffffffffffffff"]
+        );
+        assert!(started.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3310,7 +3401,7 @@ mod tests {
             coordinator.get(child.child.caller(), &left_id).await,
             Err(AccessError::Denied(left_id.clone()))
         );
-        let guessed = TaskId("zzzzzz".to_owned());
+        let guessed = TaskId::parse("dead").expect("canonical unknown task ID");
         assert_eq!(
             coordinator.get(left.child.caller(), &guessed).await,
             Err(AccessError::UnknownTask(guessed))
@@ -3335,7 +3426,7 @@ mod tests {
         let (session, _) = coordinator(policy());
         let (other, _) = coordinator(policy());
         let other_caller = other.root_caller().await;
-        let id = TaskId("000000".to_owned());
+        let id = TaskId::parse("00").expect("canonical task ID");
 
         assert_eq!(
             session.start(&other_caller, parameters(), ()).await,
@@ -4175,7 +4266,7 @@ mod tests {
                 "process_shutdown",
             ]
         );
-        assert_eq!(child_events[1]["child_id"], "000000");
+        assert_eq!(child_events[1]["child_id"], "00");
         assert_eq!(child_events[1]["parent_id"], serde_json::Value::Null);
         assert_eq!(child_events[1]["model"], DEFAULT_MODEL.id);
         assert_eq!(child_events[1]["thinking"], DEFAULT_MODEL.default_thinking);
@@ -4256,8 +4347,8 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&execution_events),
             [
-                ("000000", "child_execution_started", 1, None),
-                ("000000", "child_execution_settled", 1, Some("succeeded")),
+                ("00", "child_execution_started", 1, None),
+                ("00", "child_execution_settled", 1, Some("succeeded")),
             ]
         );
         assert!(execution_events.iter().all(|event| {
@@ -4349,10 +4440,10 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&child_execution_events(&trace)),
             [
-                ("000000", "child_execution_started", 1, None),
-                ("000000", "child_execution_settled", 1, Some("cancelled")),
-                ("000001", "child_execution_started", 1, None),
-                ("000001", "child_execution_settled", 1, Some("failed")),
+                ("00", "child_execution_started", 1, None),
+                ("00", "child_execution_settled", 1, Some("cancelled")),
+                ("01", "child_execution_started", 1, None),
+                ("01", "child_execution_settled", 1, Some("failed")),
             ]
         );
         for sensitive in ["cancelled-SECRET", "failure-SECRET"] {
@@ -4416,8 +4507,8 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&child_execution_events(&trace)),
             [
-                ("000000", "child_execution_started", 1, None),
-                ("000000", "child_execution_settled", 1, Some("cancelled")),
+                ("00", "child_execution_started", 1, None),
+                ("00", "child_execution_settled", 1, Some("cancelled")),
             ]
         );
         assert!(!trace.contains("timed-out-SECRET"));
@@ -4429,7 +4520,7 @@ mod tests {
         let trace_file = workspace.path().join("trace.jsonl");
         let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
         let trace = trace_owner.handle();
-        let child_id = TaskId::parse("000000").expect("valid child id");
+        let child_id = TaskId::parse("00").expect("valid child id");
         let cancellation = CancellationToken::new();
 
         let unwind = std::panic::AssertUnwindSafe(async {
@@ -4446,8 +4537,8 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&child_execution_events(&trace)),
             [
-                ("000000", "child_execution_started", 1, None),
-                ("000000", "child_execution_settled", 1, Some("failed")),
+                ("00", "child_execution_started", 1, None),
+                ("00", "child_execution_settled", 1, Some("failed")),
             ]
         );
     }

@@ -3948,7 +3948,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::StartSubagent,
-                summary: ToolCallSummary::Subagent("000000".to_owned()),
+                summary: ToolCallSummary::Subagent("00".to_owned()),
             }]
         );
         let finish = started.recv().await.expect("child starts");
@@ -3969,7 +3969,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::RefreshSubagent,
-                summary: ToolCallSummary::Subagent("000000".to_owned()),
+                summary: ToolCallSummary::Subagent("00".to_owned()),
             }]
         );
 
@@ -3998,7 +3998,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::WaitSubagent,
-                summary: ToolCallSummary::Subagent("000000".to_owned()),
+                summary: ToolCallSummary::Subagent("00".to_owned()),
             }]
         );
     }
@@ -4110,8 +4110,8 @@ mod tests {
         let limit = crate::config::constants::MAX_PROMPT_BYTES;
 
         for (prompt, expected_id) in [
-            ("a".repeat(limit), "000000"),
-            ("🦀".repeat(limit / '🦀'.len_utf8()), "000001"),
+            ("a".repeat(limit), "00"),
+            ("🦀".repeat(limit / '🦀'.len_utf8()), "01"),
         ] {
             let execution = execute_with_invocation(
                 &mut arena,
@@ -4196,7 +4196,7 @@ mod tests {
         let (context, mut started) = invocation_context().await;
         let limit = crate::config::constants::MAX_PROMPT_BYTES;
         let validation = format!(
-            "errors = []\ntry:\n    await _kiki_start_subagent('missing arguments')\nexcept TypeError:\n    errors.append('start_arity')\ntry:\n    await _kiki_start_subagent(prompt='keyword', model=None, read_only=False)\nexcept TypeError:\n    errors.append('keywords')\ntry:\n    await _kiki_get_subagent()\nexcept TypeError:\n    errors.append('get_arity')\ntry:\n    await _kiki_refresh_subagent('000000', 'extra')\nexcept TypeError:\n    errors.append('refresh_arity')\ntry:\n    await _kiki_wait_subagent(0)\nexcept TypeError:\n    errors.append('wait_type')\ntry:\n    await _kiki_cancel_subagent('000000', 'extra')\nexcept TypeError:\n    errors.append('cancel_arity')\ntry:\n    await start_subagent('', None, False)\nexcept ValueError:\n    errors.append('empty')\ntry:\n    await start_subagent('🦀' * {}, None, False)\nexcept ValueError:\n    errors.append('unicode')\ntry:\n    await start_subagent('valid', 'unknown/model', False)\nexcept ValueError:\n    errors.append('model')\ntry:\n    await start_subagent('valid', None, 1)\nexcept TypeError:\n    errors.append('boolean')\ntry:\n    await get_subagent('invalid')\nexcept ValueError:\n    errors.append('id')\nerrors",
+            "errors = []\ntry:\n    await _kiki_start_subagent('missing arguments')\nexcept TypeError:\n    errors.append('start_arity')\ntry:\n    await _kiki_start_subagent(prompt='keyword', model=None, read_only=False)\nexcept TypeError:\n    errors.append('keywords')\ntry:\n    await _kiki_get_subagent()\nexcept TypeError:\n    errors.append('get_arity')\ntry:\n    await _kiki_refresh_subagent('00', 'extra')\nexcept TypeError:\n    errors.append('refresh_arity')\ntry:\n    await _kiki_wait_subagent(0)\nexcept TypeError:\n    errors.append('wait_type')\ntry:\n    await _kiki_cancel_subagent('00', 'extra')\nexcept TypeError:\n    errors.append('cancel_arity')\ntry:\n    await start_subagent('', None, False)\nexcept ValueError:\n    errors.append('empty')\ntry:\n    await start_subagent('🦀' * {}, None, False)\nexcept ValueError:\n    errors.append('unicode')\ntry:\n    await start_subagent('valid', 'unknown/model', False)\nexcept ValueError:\n    errors.append('model')\ntry:\n    await start_subagent('valid', None, 1)\nexcept TypeError:\n    errors.append('boolean')\ntry:\n    await get_subagent('invalid')\nexcept ValueError:\n    errors.append('id')\nerrors",
             limit / '🦀'.len_utf8() + 1,
         );
         let execution = execute_with_invocation(&mut arena, &context, &validation).await;
@@ -4212,7 +4212,7 @@ mod tests {
             "task = await start_subagent('failure')\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        assert_eq!(complete(&execution).unwrap().head, "'00'");
         let finish = started.recv().await.expect("child starts");
         finish.send(Err(ChildFailure::new("failed work"))).unwrap();
         let execution = execute_with_invocation(
@@ -4264,7 +4264,7 @@ mod tests {
             "import asyncio\ncontents, task = await asyncio.gather(read('file'), start_subagent('child'))\nawait write('file', contents + '!')\nawait task.cancel()\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        assert_eq!(complete(&execution).unwrap().head, "'00'");
         assert_eq!(
             fs::read_to_string(workspace.path().join("file")).unwrap(),
             "before!"
@@ -4278,7 +4278,7 @@ mod tests {
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::Write,
@@ -4286,7 +4286,7 @@ mod tests {
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
-                    summary: ToolCallSummary::Subagent("000000".to_owned()),
+                    summary: ToolCallSummary::Subagent("00".to_owned()),
                 },
             ]
         );
@@ -4303,7 +4303,7 @@ mod tests {
             "first = await start_subagent('first')\nsecond = await start_subagent('second')\n(second.id)",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'000001'");
+        assert_eq!(complete(&execution).unwrap().head, "'01'");
         let first = started.recv().await.expect("first child starts");
         let second = started.recv().await.expect("second child starts");
         first.send(Err(ChildFailure::new("failed first"))).unwrap();
@@ -4346,7 +4346,7 @@ mod tests {
             "task = await start_subagent('timeout')\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        assert_eq!(complete(&execution).unwrap().head, "'00'");
         let _finish = started.recv().await.expect("child starts");
         clock.advance(Duration::from_secs(901));
         coordinator.service().await;
@@ -5123,7 +5123,7 @@ mod tests {
             "same_execution = 'later'\nfirst = await start_subagent('first')\nsecond = await start_subagent('second')\n(first.id, second.id)",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "('000000', '000001')");
+        assert_eq!(complete(&execution).unwrap().head, "('00', '01')");
 
         let execution = execute_with_invocation(
             &mut arena,
@@ -5146,12 +5146,12 @@ mod tests {
         let execution = execute_with_invocation(
             &mut arena,
             &context,
-            "task = await start_subagent('child')\nsaved_id = task.id\nerrors = []\ntask.id = 'bad'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('malformed_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('malformed_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('malformed_cancel')\ntask.id = 'zzzzzz'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('unknown_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('unknown_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('unknown_cancel')\n(errors, saved_id)",
+            "task = await start_subagent('child')\nsaved_id = task.id\nerrors = []\ntask.id = '0g'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('malformed_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('malformed_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('malformed_cancel')\ntask.id = 'dead'\ntry:\n    await task.refresh()\nexcept ValueError:\n    errors.append('unknown_refresh')\ntry:\n    await task.wait()\nexcept ValueError:\n    errors.append('unknown_wait')\ntry:\n    await task.cancel()\nexcept ValueError:\n    errors.append('unknown_cancel')\n(errors, saved_id)",
         )
         .await;
         assert_eq!(
             complete(&execution).unwrap().head,
-            "(['malformed_refresh', 'malformed_wait', 'malformed_cancel', 'unknown_refresh', 'unknown_wait', 'unknown_cancel'], '000000')"
+            "(['malformed_refresh', 'malformed_wait', 'malformed_cancel', 'unknown_refresh', 'unknown_wait', 'unknown_cancel'], '00')"
         );
         let checkpoint = arena.checkpoint();
         arena.restore(checkpoint).await.unwrap();
@@ -5163,7 +5163,7 @@ mod tests {
         .await;
         assert!(matches!(
             complete(&execution).unwrap().head.as_str(),
-            "('000000', 'starting')" | "('000000', 'running')"
+            "('00', 'starting')" | "('00', 'running')"
         ));
         let finish = started.recv().await.expect("child starts");
         finish
@@ -5171,7 +5171,7 @@ mod tests {
             .unwrap();
         let execution =
             execute_with_invocation(&mut arena, &context, "(await task.wait())['id']").await;
-        assert_eq!(complete(&execution).unwrap().head, "'000000'");
+        assert_eq!(complete(&execution).unwrap().head, "'00'");
     }
 
     #[tokio::test]
@@ -5275,7 +5275,7 @@ mod tests {
         let context = complete_invocation_context([
             vec![
                 ScriptedAction::Code {
-                    source: "try:\n    await get_subagent('000000')\nexcept PermissionError:\n    result_values['self_denied'] = True".to_owned(),
+                    source: "try:\n    await get_subagent('00')\nexcept PermissionError:\n    result_values['self_denied'] = True".to_owned(),
                 },
                 ScriptedAction::Message {
                     text: "authority checked".to_owned(),

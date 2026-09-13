@@ -60,7 +60,7 @@ The Python handle is `SubagentTask`, with `id: str` and `status: SubagentStatus`
 
 | Attribute | Python type | Meaning |
 | --- | --- | --- |
-| `id` | `str` | Six-character task ID. |
+| `id` | `str` | Canonical lowercase hexadecimal task ID with at least two characters. |
 | `state` | `str` | `starting`, `running`, `stopping`, `completed`, `failed`, `cancelled`, or `timed_out`. |
 | `model` | `str` | Fixed qualified model ID. |
 | `thinking` | `str` | Fixed catalogue-supported thinking value. |
@@ -75,7 +75,7 @@ Generate the record definition and prompt reference from one description. Keep t
 
 Cached data means **last observed**, not current. Refresh is authoritative at its observation point only. No automatic Python mutation, awaitable property, locally maintained `is_stale` flag, polling loop, or additional wait/result alias is introduced. Call fresh methods rather than attempting to reuse one coroutine object. Independent starts and waits compose with `asyncio.gather()`; a gather still waits for all its inputs.
 
-Validate arguments and admission policy before starting provider or arena work. Require a non-empty string prompt within the existing 64 KiB UTF-8 foreground-prompt limit, an omitted or supported exact qualified model ID, and a boolean `read_only`. IDs use exactly `[a-z0-9]{6}`, are unique within the session, and are not reused after completion. They are references, not secrets or permission grants.
+Validate arguments and admission policy before starting provider or arena work. Require a non-empty string prompt within the existing 64 KiB UTF-8 foreground-prompt limit, an omitted or supported exact qualified model ID, and a boolean `read_only`. IDs are canonical lowercase hexadecimal strings with at least two characters, expand from `00` through `ff` to `100`, fit an unsigned 64-bit sequence, and have no redundant leading zero beyond the two-character range. They are unique within the session and are not reused after completion. They are references, not secrets or permission grants.
 
 Malformed types raise `TypeError`; invalid values or unknown IDs raise `ValueError`; denied access raises `PermissionError`; exhausted admission limits raise `RuntimeError`. Child failure and cancellation raise `RuntimeError` containing the ID and outcome; child timeout raises `TimeoutError`. Operational child outcomes remain distinguishable in observations. A rejected start creates no child and consumes no admission; a failure after admission retains its ID, consumes that start, and settles as a failed task.
 
@@ -166,7 +166,7 @@ Cards are immutable event-time observations. New child records join committed hi
 The sticky list sits above the prompt with one blank row of padding above and below when space permits. Each entry has two rows:
 
 ```text
-  • subagent:a7k2m9  openai/gpt-5.6-luna  6 steps  04:47  $0.1200
+  • subagent:00  openai/gpt-5.6-luna  6 steps  04:47  $0.1200
     └ Review the cancellation paths and identify…
 ```
 

@@ -3923,7 +3923,7 @@ mod tests {
             false,
         ));
         let child = TaskRecord::for_test(
-            "child1",
+            "c1",
             1,
             ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
             None,
@@ -3935,7 +3935,7 @@ mod tests {
 
         let rendered = rendered_layout_text(&mut transcript);
         let spawned = rendered
-            .find("Spawned · subagent:child1")
+            .find("Spawned · subagent:c1")
             .expect("spawned card");
         let live = rendered
             .find("await start_subagent('review')")
@@ -4059,7 +4059,7 @@ mod tests {
     #[test]
     fn finished_subagent_events_project_record_measures() {
         let child = TaskRecord::for_test(
-            "child1",
+            "c1",
             2,
             ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
             None,
@@ -4077,7 +4077,7 @@ mod tests {
         assert!(transcript.apply(RuntimeEvent::SubagentFinished { record: child }, false));
 
         let copied = copied_text(&mut transcript, 80);
-        assert!(copied.contains("Completed · subagent:child1"), "{copied}");
+        assert!(copied.contains("Completed · subagent:c1"), "{copied}");
         assert!(copied.contains("0 steps · 00:00 · $0.000024"), "{copied}");
     }
 
@@ -4140,7 +4140,7 @@ mod tests {
     #[test]
     fn subagent_cards_are_immutable_cached_and_not_duplicated() {
         let child = TaskRecord::for_test(
-            "child1",
+            "c1",
             1,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,
@@ -6593,7 +6593,7 @@ truncated"
         assert!(before.contains("0.0%/272k"), "{before}");
 
         let child = TaskRecord::for_test(
-            "child1",
+            "c1",
             3,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,
@@ -6675,7 +6675,7 @@ truncated"
             Some(330),
         );
         let child = TaskRecord::for_test(
-            "child1",
+            "c1",
             2,
             ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
             None,
@@ -6683,10 +6683,10 @@ truncated"
             vec![child_attempt.clone()],
         );
         let nested = TaskRecord::for_test(
-            "nest01",
+            "d1",
             2,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
-            Some("child1"),
+            Some("c1"),
             2,
             vec![nested_attempt.clone()],
         );
@@ -6769,16 +6769,10 @@ truncated"
             Some(330),
         );
         let selection = ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap();
-        let partial = TaskRecord::for_test(
-            "child1",
-            2,
-            selection,
-            None,
-            1,
-            vec![partial_attempt.clone()],
-        );
+        let partial =
+            TaskRecord::for_test("c1", 2, selection, None, 1, vec![partial_attempt.clone()]);
         let terminal = TaskRecord::for_test(
-            "child1",
+            "c1",
             4,
             selection,
             None,
@@ -6789,7 +6783,7 @@ truncated"
             .clone()
             .with_observation_for_test(Duration::from_secs(10), 10_000);
         let equal_revision = TaskRecord::for_test(
-            "child1",
+            "c1",
             4,
             selection,
             None,
@@ -6801,7 +6795,7 @@ truncated"
             ],
         );
         let stale = TaskRecord::for_test(
-            "child1",
+            "c1",
             3,
             selection,
             None,
