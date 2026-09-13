@@ -19,7 +19,7 @@ Delegation remains inspectable without embedding child activity inside Python-ru
 
 ## Non-goals
 
-- Changing, upgrading, or forking Monty; cloning state created during the currently executing Python chunk.
+- Changing or forking Monty's implementation; cloning state created during the currently executing Python chunk.
 - Variable discovery, a variable registry, shared mutable arenas, or automatic merging of child state into the parent.
 - Filesystem isolation, automatic worktrees, or rollback of external effects. Agents share the workspace.
 - Modal navigation, interactive child conversations, steering running children, or resuming completed children.
