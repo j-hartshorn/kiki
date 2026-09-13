@@ -112,13 +112,14 @@ impl SubagentMonitor {
     }
 
     fn apply_record(&mut self, record: &TaskRecord, now: Instant) -> bool {
-        let id = record.id().to_string();
-        if self.cleared_terminals.contains(&id) {
+        let id = record.id().as_str();
+        if self.cleared_terminals.contains(id) {
             return false;
         }
-        let Some(entry) = self.entries.get_mut(&id) else {
-            self.admission_order.push(id.clone());
-            self.entries.insert(id, Entry::from_record(record, now));
+        let Some(entry) = self.entries.get_mut(id) else {
+            self.admission_order.push(id.to_owned());
+            self.entries
+                .insert(id.to_owned(), Entry::from_record(record, now));
             return true;
         };
         if record.revision() <= entry.record_revision {
@@ -317,37 +318,35 @@ impl SubagentMonitor {
         available_rows: usize,
     ) -> Option<(Projection, bool)> {
         let mut projection = Projection::new(forest, selected_path);
-        if projection.line_count(forest) <= available_rows {
-            return Some((
-                projection.clone(),
-                projection.line_count(forest).saturating_add(2) <= available_rows,
-            ));
+        let line_count = projection.line_count();
+        if line_count <= available_rows {
+            return Some((projection, line_count.saturating_add(2) <= available_rows));
         }
 
         for root in projection.roots.clone().into_iter().rev() {
             projection.collapsed_root_summaries.remove(&root);
-            if projection.line_count(forest) <= available_rows {
+            if projection.line_count() <= available_rows {
                 return Some((projection, false));
             }
         }
         projection.show_anchor_descendants = false;
-        if projection.line_count(forest) <= available_rows {
+        if projection.line_count() <= available_rows {
             return Some((projection, false));
         }
 
         for depth in projection.sibling_summaries.clone().into_iter().rev() {
             projection.sibling_summaries.remove(&depth);
-            if projection.line_count(forest) <= available_rows {
+            if projection.line_count() <= available_rows {
                 return Some((projection, false));
             }
         }
         projection.show_root_summary = false;
-        if projection.line_count(forest) <= available_rows {
+        if projection.line_count() <= available_rows {
             return Some((projection, false));
         }
 
         while projection.roots.pop().is_some() {
-            if projection.line_count(forest) <= available_rows {
+            if projection.line_count() <= available_rows {
                 return Some((projection, false));
             }
         }
@@ -355,13 +354,13 @@ impl SubagentMonitor {
         while projection.selected_count > 1 {
             projection.selected_count = projection.selected_count.saturating_sub(1);
             projection.show_deeper = true;
-            if projection.line_count(forest) <= available_rows {
+            if projection.line_count() <= available_rows {
                 return Some((projection, false));
             }
         }
 
         projection.show_deeper = false;
-        (projection.line_count(forest) <= available_rows).then_some((projection, false))
+        (projection.line_count() <= available_rows).then_some((projection, false))
     }
 
     fn render_projection(
@@ -392,21 +391,17 @@ impl SubagentMonitor {
 
         let anchor = &projection.selected_path[projection.selected_count.saturating_sub(1)];
         if projection.show_deeper && projection.selected_count < projection.selected_path.len() {
-            let descendants = forest.descendants(anchor);
+            let (descendant_count, active_descendant_count) = forest.descendant_counts(anchor);
             lines.push(summary_line(
                 projection.selected_count,
-                &format!(
-                    "+{} deeper · {} active",
-                    descendants.len(),
-                    active_count(&descendants, forest)
-                ),
+                &format!("+{descendant_count} deeper · {active_descendant_count} active"),
                 width,
             ));
         } else if projection.show_anchor_descendants {
-            let descendants = forest.descendants(anchor);
+            let (descendant_count, _) = forest.descendant_counts(anchor);
             lines.push(summary_line(
                 projection.selected_count,
-                &format!("+{} descendants", descendants.len()),
+                &format!("+{descendant_count} descendants"),
                 width,
             ));
         }
@@ -437,7 +432,7 @@ impl SubagentMonitor {
             if projection.collapsed_root_summaries.contains(root) {
                 lines.push(summary_line(
                     1,
-                    &format!("+{} descendants", forest.descendants(root).len()),
+                    &format!("+{} descendants", forest.descendant_counts(root).0),
                     width,
                 ));
             }
@@ -471,14 +466,22 @@ impl Forest {
         self.children.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    fn descendants(&self, id: &str) -> Vec<String> {
-        let mut descendants = Vec::new();
-        let mut stack = self.children(id).iter().rev().cloned().collect::<Vec<_>>();
+    fn descendant_counts(&self, id: &str) -> (usize, usize) {
+        let mut descendant_count = 0_usize;
+        let mut active_descendant_count = 0_usize;
+        let mut stack = self
+            .children(id)
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         while let Some(child) = stack.pop() {
-            stack.extend(self.children(&child).iter().rev().cloned());
-            descendants.push(child);
+            descendant_count = descendant_count.saturating_add(1);
+            active_descendant_count =
+                active_descendant_count.saturating_add(usize::from(self.active.contains(child)));
+            stack.extend(self.children(child).iter().rev().map(String::as_str));
         }
-        descendants
+        (descendant_count, active_descendant_count)
     }
 }
 
@@ -513,7 +516,7 @@ impl Projection {
             .collect::<Vec<_>>();
         let collapsed_root_summaries = roots
             .iter()
-            .filter(|root| !forest.descendants(root).is_empty())
+            .filter(|root| !forest.children(root).is_empty())
             .cloned()
             .collect();
         let sibling_summaries = (1..selected_count)
@@ -525,7 +528,7 @@ impl Projection {
             .collect();
         let anchor = &selected_path[selected_count.saturating_sub(1)];
         let show_anchor_descendants =
-            selected_count == selected_path.len() && !forest.descendants(anchor).is_empty();
+            selected_count == selected_path.len() && !forest.children(anchor).is_empty();
         let show_root_summary = forest.roots.len() > roots.len().saturating_add(1);
         Self {
             selected_path,
@@ -539,7 +542,7 @@ impl Projection {
         }
     }
 
-    fn line_count(&self, forest: &Forest) -> usize {
+    fn line_count(&self) -> usize {
         let mut count = self
             .selected_count
             .saturating_add(self.roots.len())
@@ -552,9 +555,7 @@ impl Projection {
         }
         count = count.saturating_add(self.sibling_summaries.len());
         count = count.saturating_add(self.collapsed_root_summaries.len());
-        count.saturating_add(usize::from(
-            self.show_root_summary && forest.roots.len() > self.roots.len().saturating_add(1),
-        ))
+        count.saturating_add(usize::from(self.show_root_summary))
     }
 }
 
@@ -654,10 +655,6 @@ fn summary_line(summary_depth: usize, label: &str, width: u16) -> Line<'static> 
         &format!("  {}└─… {label}", "  ".repeat(summary_depth)),
         width,
     ))
-}
-
-fn active_count(ids: &[String], forest: &Forest) -> usize {
-    ids.iter().filter(|id| forest.active.contains(*id)).count()
 }
 
 fn retry_count(record: &TaskRecord) -> u64 {
