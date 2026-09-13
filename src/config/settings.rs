@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
@@ -663,20 +663,34 @@ fn positive_subagent_counter(
 }
 
 fn positive_subagent_timeout(item: &Item, problems: &mut DocumentProblems) -> Option<Duration> {
-    match item
+    positive_subagent_timeout_at(item, problems, Instant::now())
+}
+
+fn positive_subagent_timeout_at(
+    item: &Item,
+    problems: &mut DocumentProblems,
+    now: Instant,
+) -> Option<Duration> {
+    let seconds = item
         .as_integer()
         .and_then(|value| u64::try_from(value).ok())
-        .filter(|value| *value > 0)
-    {
-        Some(seconds) => Some(Duration::from_secs(seconds)),
-        None => {
-            problems.push(
-                "field `subagents.timeout_seconds` must be a positive integer",
-                "Set it to a positive integer, then restart Kiki.",
-            );
-            None
-        }
+        .filter(|value| *value > 0);
+    let Some(seconds) = seconds else {
+        problems.push(
+            "field `subagents.timeout_seconds` must be a positive integer",
+            "Set it to a positive integer, then restart Kiki.",
+        );
+        return None;
+    };
+    let timeout = Duration::from_secs(seconds);
+    if now.checked_add(timeout).is_some() {
+        return Some(timeout);
     }
+    problems.push(
+        "field `subagents.timeout_seconds` must be a positive integer representable as a deadline",
+        "Set it to a smaller positive integer, then restart Kiki.",
+    );
+    None
 }
 
 fn environment_thinking_level(
@@ -888,6 +902,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
@@ -971,6 +986,30 @@ mod tests {
         assert_eq!(subagents.timeout().as_secs(), 900);
     }
 
+    fn instant_without_second_headroom() -> Instant {
+        let base = Instant::now();
+        let mut lower = 0;
+        let mut upper = u64::MAX;
+        while lower < upper {
+            let distance = upper - lower;
+            let midpoint = lower + distance / 2 + distance % 2;
+            if base.checked_add(Duration::from_secs(midpoint)).is_some() {
+                lower = midpoint;
+            } else {
+                upper = midpoint - 1;
+            }
+        }
+        assert!(lower < u64::MAX);
+        let now = base
+            .checked_add(Duration::from_secs(lower))
+            .expect("latest whole-second instant must be representable");
+        assert!(
+            now.checked_add(Duration::from_secs(1)).is_none(),
+            "instant must have less than one second of headroom"
+        );
+        now
+    }
+
     #[test]
     fn subagent_defaults_apply_with_absent_files_or_tables() {
         let home = tempdir().expect("home directory");
@@ -989,18 +1028,37 @@ mod tests {
     }
 
     #[test]
-    fn largest_toml_timeout_is_accepted() {
-        let home = tempdir().expect("home directory");
-        let project = tempdir().expect("project directory");
-        write_settings(
-            home.path(),
-            "[subagents]\ntimeout_seconds = 9223372036854775807\n",
+    fn unrepresentable_toml_timeout_is_rejected() {
+        let document = "timeout_seconds = 1\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("timeout setting");
+        let mut problems = super::DocumentProblems::new(super::FileLayer::User);
+
+        let timeout = super::positive_subagent_timeout_at(
+            &document["timeout_seconds"],
+            &mut problems,
+            instant_without_second_headroom(),
         );
 
-        let resolution = resolve(input(Some(home.path()), Some(project.path())));
-
-        assert_eq!(resolution.subagents().timeout().as_secs(), i64::MAX as u64);
-        assert!(resolution.problems().is_empty());
+        assert_eq!(timeout, None);
+        let problems = problems.finish();
+        let [problem] = problems.as_slice() else {
+            panic!("unrepresentable timeout reports exactly one problem");
+        };
+        assert_eq!(
+            problem.kind(),
+            crate::config::StartupProblemKind::UserSettingsInvalid
+        );
+        assert_eq!(
+            problem.diagnostic(),
+            "user settings file `~/.kiki/config.toml` field `subagents.timeout_seconds` must be a positive integer representable as a deadline."
+        );
+        assert_eq!(
+            problem.remediation(),
+            "Set it to a smaller positive integer, then restart Kiki."
+        );
+        assert!(problem.diagnostic().len() <= 256);
+        assert!(problem.remediation().len() <= 256);
     }
 
     #[cfg(target_pointer_width = "64")]

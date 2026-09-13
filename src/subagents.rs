@@ -902,6 +902,7 @@ fn admission_error(error: AdmissionError) -> ToolError {
         | AdmissionError::DepthLimit
         | AdmissionError::ConcurrentLimit
         | AdmissionError::StartBudget
+        | AdmissionError::DeadlineUnrepresentable
         | AdmissionError::IdentifierSpaceExhausted => ToolError::runtime(error.to_string()),
     }
 }
@@ -1485,6 +1486,8 @@ pub(crate) enum AdmissionError {
     ConcurrentLimit,
     #[error("subagent start budget is exhausted for this request")]
     StartBudget,
+    #[error("subagent timeout cannot be represented as a deadline")]
+    DeadlineUnrepresentable,
     #[error("subagent task identifier space is exhausted")]
     IdentifierSpaceExhausted,
 }
@@ -2041,12 +2044,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             {
                 return Err(AdmissionError::StartBudget);
             }
+            let own_deadline = now.checked_add(self.policy.timeout);
+            let deadline = earliest_deadline(own_deadline, inherited_deadline);
+            if deadline.is_none() {
+                return Err(AdmissionError::DeadlineUnrepresentable);
+            }
             let sequence = inner
                 .next_task
                 .ok_or(AdmissionError::IdentifierSpaceExhausted)?;
             let id = task_id(sequence);
-            let own_deadline = now.checked_add(self.policy.timeout);
-            let deadline = earliest_deadline(own_deadline, inherited_deadline);
             parameters.read_only |= inherited_read_only;
             let cancellation = CancellationToken::new();
             let metrics = Arc::new(TaskMetrics::new(
@@ -2843,7 +2849,11 @@ mod tests {
 
     impl ManualClock {
         fn new(observed_at_ms: i64) -> Self {
-            Self(Arc::new(Mutex::new((Instant::now(), observed_at_ms))))
+            Self::starting_at(Instant::now(), observed_at_ms)
+        }
+
+        fn starting_at(now: Instant, observed_at_ms: i64) -> Self {
+            Self(Arc::new(Mutex::new((now, observed_at_ms))))
         }
 
         fn advance(&self, duration: Duration) {
@@ -2861,6 +2871,35 @@ mod tests {
         fn unix_time_ms(&self) -> i64 {
             self.0.lock().expect("test clock lock").1
         }
+    }
+
+    fn instant_with_second_headroom(headroom: u64) -> Instant {
+        let base = Instant::now();
+        let mut lower = 0;
+        let mut upper = u64::MAX;
+        while lower < upper {
+            let distance = upper - lower;
+            let midpoint = lower + distance / 2 + distance % 2;
+            if base.checked_add(Duration::from_secs(midpoint)).is_some() {
+                lower = midpoint;
+            } else {
+                upper = midpoint - 1;
+            }
+        }
+        assert!(lower < u64::MAX);
+        assert!(lower >= headroom);
+        let now = base
+            .checked_add(Duration::from_secs(lower - headroom))
+            .expect("headroom instant must be representable");
+        assert!(
+            now.checked_add(Duration::from_secs(headroom)).is_some(),
+            "requested headroom must be representable"
+        );
+        assert!(
+            now.checked_add(Duration::from_secs(headroom + 1)).is_none(),
+            "instant must have exactly the requested whole-second headroom"
+        );
+        now
     }
 
     fn policy() -> SubagentPolicy {
@@ -4043,18 +4082,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn huge_timeouts_admit_and_do_not_have_a_representable_deadline() {
-        let (coordinator, mut started) = coordinator(SubagentPolicy {
-            timeout: Duration::from_secs(i64::MAX as u64),
-            ..policy()
-        });
+    async fn finite_inherited_deadline_clamps_unrepresentable_nested_timeout() {
+        let started_at = instant_with_second_headroom(2);
+        let inherited_deadline = started_at
+            .checked_add(Duration::from_secs(2))
+            .expect("parent deadline must be representable");
+        let clock = Arc::new(ManualClock::starting_at(started_at, 0));
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                timeout: Duration::from_secs(2),
+                ..policy()
+            },
+            Arc::new(GatedRunner {
+                started: started_sender,
+            }),
+            clock.clone(),
+        );
         let root = coordinator.root_caller().await;
-        let (id, running) = start(&coordinator, &mut started, &root).await;
+        let (parent_id, parent) = start(&coordinator, &mut started, &root).await;
+        clock.advance(Duration::from_secs(1));
 
-        assert_eq!(coordinator.next_deadline().await, None);
-        coordinator.cancel(&root, &id).await.unwrap();
+        let (child_id, child) = start(&coordinator, &mut started, parent.child.caller()).await;
+
+        parent.finish.send(Ok(result("parent"))).unwrap();
+        coordinator.wait(&root, &parent_id).await.unwrap();
+        assert_eq!(coordinator.next_deadline().await, Some(inherited_deadline));
+        clock.advance(Duration::from_secs(1));
+        coordinator.service().await;
+        assert_timed_out(
+            coordinator.wait(&root, &child_id).await.unwrap_err(),
+            &child_id,
+        );
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_policy_timeout_rejects_without_consuming_admission_state() {
+        let clock = Arc::new(ManualClock::starting_at(instant_with_second_headroom(1), 0));
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                timeout: Duration::from_secs(2),
+                ..policy()
+            },
+            Arc::new(GatedRunner {
+                started: started_sender,
+            }),
+            clock,
+        );
+        let root = coordinator.root_caller().await;
+
+        let error = coordinator
+            .start(&root, parameters(), ())
+            .await
+            .expect_err("unrepresentable timeout must reject admission");
+
+        assert_eq!(
+            error.to_string(),
+            "subagent timeout cannot be represented as a deadline"
+        );
+        assert!(coordinator.records().await.is_empty());
         assert_eq!(coordinator.active_count().await, 0);
-        drop(running);
+        let inner = coordinator.inner.lock().await;
+        assert_eq!(inner.next_task, Some(0));
+        assert!(!inner.origin_starts.contains_key(&root.origin));
+        drop(inner);
+        assert!(matches!(
+            started.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
