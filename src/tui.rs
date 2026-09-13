@@ -1742,12 +1742,18 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         area.width,
         monitor_top.saturating_sub(area.y.saturating_add(1)),
     );
+    let completion_area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        prompt_top.saturating_sub(area.y.saturating_add(1)),
+    );
     let layout = render_history(frame, app, history);
-    render_slash_overlay(frame, app, history);
     monitor.render(
         frame,
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
+    render_slash_overlay(frame, app, completion_area);
     let rule_style = thinking_rule_style(app.settings_selection);
     render_rule(
         frame,
@@ -1810,11 +1816,11 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     layout
 }
 
-fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
+fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.is_submission_disabled() || app.picker.is_some() {
         return;
     }
-    let rows = app.completion.visible_rows(usize::from(history.height));
+    let rows = app.completion.visible_rows(usize::from(area.height));
     let Some(height) = u16::try_from(rows.len()).ok().filter(|height| *height > 0) else {
         return;
     };
@@ -1823,17 +1829,17 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
         .map(|row| Line::raw(format!("{} {}", row.token, row.purpose)).width())
         .max()
         .unwrap_or(0);
-    let width = history
+    let width = area
         .width
         .min(u16::try_from(natural_width).unwrap_or(u16::MAX));
     if width == 0 {
         return;
     }
-    let x = history
+    let x = area
         .x
         .saturating_add(PROMPT_GUTTER_WIDTH)
-        .min(history.right().saturating_sub(width));
-    let overlay = Rect::new(x, history.bottom().saturating_sub(height), width, height);
+        .min(area.right().saturating_sub(width));
+    let overlay = Rect::new(x, area.bottom().saturating_sub(height), width, height);
     frame.render_widget(Clear, overlay);
     frame.buffer_mut().set_style(overlay, page_style());
     let lines = rows.into_iter().map(|row| {
@@ -3113,6 +3119,76 @@ mod tests {
 
         rendered_buffer(&mut tiny, 5, 4);
         assert!(tiny.slash_overlay.is_none());
+    }
+
+    #[test]
+    fn slash_overlay_stays_above_prompt_over_visible_subagent_monitor() {
+        let now = Instant::now();
+        for (height, last_suggestion) in [(12, "/thinking"), (6, "/name")] {
+            let mut plain = app_with_history(App::default());
+            plain
+                .subagent_monitor
+                .insert_for_test("child1", TaskState::Completed, now);
+            plain
+                .subagent_monitor
+                .insert_for_test("child2", TaskState::Completed, now);
+            let mut completed = app_with_history(app_with_prompt("/"));
+            completed
+                .subagent_monitor
+                .insert_for_test("child1", TaskState::Completed, now);
+            completed
+                .subagent_monitor
+                .insert_for_test("child2", TaskState::Completed, now);
+
+            rendered_at(&mut plain, 80, height, now);
+            let screen = rendered_at(&mut completed, 80, height, now);
+            let rows = screen.lines().collect::<Vec<_>>();
+            let prompt_row = u16::try_from(
+                rows.iter()
+                    .position(|row| row.starts_with("> "))
+                    .expect("prompt"),
+            )
+            .unwrap();
+            let prompt_top = prompt_row.saturating_sub(1);
+            let overlay = completed.slash_overlay.expect("slash overlay");
+            let last_suggestion_row = rows
+                .iter()
+                .position(|row| row.contains(last_suggestion))
+                .and_then(|row| u16::try_from(row).ok());
+
+            assert_eq!(completed.history_height, plain.history_height);
+            assert_eq!(
+                completed.history_viewport.map(|viewport| viewport.area),
+                plain.history_viewport.map(|viewport| viewport.area),
+            );
+            if height == 12 {
+                assert!(screen.contains("✓ subagent:child1"), "{screen}");
+            }
+
+            completed.set_notice("keep status".to_owned());
+            let mut shielded = true;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let update = completed.handle_mouse(
+                    mouse_event(kind, overlay.x, prompt_top.saturating_sub(1)),
+                    now,
+                );
+                shielded &= !update.visible_changed
+                    && completed.notice() == Some("keep status")
+                    && completed.selection.is_none()
+                    && completed.drag.is_none()
+                    && !completed.pending_copy;
+            }
+
+            assert_eq!(
+                (overlay.bottom(), last_suggestion_row, shielded),
+                (prompt_top, Some(prompt_top.saturating_sub(1)), true),
+                "height {height}",
+            );
+        }
     }
 
     #[test]
