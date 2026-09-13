@@ -246,13 +246,13 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_events: Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
     subagent_record_revisions: BTreeMap<TaskId, u64>,
     subagent_status_revisions: BTreeMap<TaskId, u64>,
-    active_caller: Option<Caller>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
 }
 
 struct ActiveRun<M: Model> {
     run_id: RunId,
+    caller: Caller,
     cancellation: CancellationToken,
     worker: mpsc::UnboundedReceiver<WorkerMessage<M>>,
     progress: mpsc::Receiver<ProgressEnvelope<WorkerProgress>>,
@@ -400,7 +400,6 @@ impl<M: Model> RuntimeController<M> {
             subagents,
             subagent_record_revisions: BTreeMap::new(),
             subagent_status_revisions: BTreeMap::new(),
-            active_caller: None,
             active: None,
             trace: Trace::disabled(),
         }
@@ -808,9 +807,9 @@ impl<M: Model> RuntimeController<M> {
             });
         });
         drop(worker_task);
-        self.active_caller = Some(caller);
         self.active = Some(ActiveRun {
             run_id,
+            caller,
             cancellation,
             worker,
             progress: worker_progress,
@@ -833,7 +832,7 @@ impl<M: Model> RuntimeController<M> {
         self.trace
             .emit(|| TraceEvent::BackgroundCancellationRequested);
         self.subagents
-            .request_background_cancellation(self.active_caller.as_ref())
+            .request_background_cancellation(self.active.as_ref().map(|active| &active.caller))
             .await;
         self.trace
             .emit(|| TraceEvent::BackgroundCancellationReturned);
@@ -987,7 +986,6 @@ impl<M: Model> RuntimeController<M> {
                 });
                 self.emit(events, RuntimeEvent::RunSettled { run_id });
                 self.active = None;
-                self.active_caller = None;
             }
         }
     }
@@ -1021,7 +1019,6 @@ impl<M: Model> RuntimeController<M> {
         });
         self.emit(events, RuntimeEvent::RunSettled { run_id });
         self.active = None;
-        self.active_caller = None;
     }
 
     fn drain_worker_progress(&mut self, progress: &mut ProgressPublisher<RuntimeEvent>) {
@@ -4079,6 +4076,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
             worker,
             progress: worker_progress,
@@ -5217,6 +5215,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
             worker,
             progress: worker_progress,
@@ -5367,6 +5366,7 @@ mod tests {
                 mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             controller.active = Some(ActiveRun {
                 run_id: RunId(1),
+                caller: controller.subagents.root_caller().await,
                 cancellation: CancellationToken::new(),
                 worker,
                 progress: worker_progress,
@@ -5509,6 +5509,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: cancellation.clone(),
             worker,
             progress: worker_progress,
@@ -5576,6 +5577,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: cancellation.clone(),
             worker,
             progress: worker_progress,
@@ -5933,6 +5935,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
             worker,
             progress: worker_progress,
@@ -6040,6 +6043,7 @@ mod tests {
         let diagnostic = "é".repeat(4 * 1024);
         controller.active = Some(ActiveRun {
             run_id: RunId(1),
+            caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
             worker,
             progress: worker_progress,
