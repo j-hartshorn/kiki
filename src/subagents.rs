@@ -21,7 +21,7 @@ use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
 use crate::arena::{ArenaChildSource, Checkpoint, Execution};
 use crate::config::{
     ModelSelection,
-    constants::MAX_PROMPT_BYTES,
+    constants::{MAX_PROMPT_BYTES, SUBAGENT_TIMER_HEADROOM},
     models::{ModelConfiguration, model_by_id},
     settings::{SettingsContext, SubagentSettings},
 };
@@ -1469,7 +1469,7 @@ pub(crate) enum AdmissionError {
     ConcurrentLimit,
     #[error("subagent start budget is exhausted for this request")]
     StartBudget,
-    #[error("subagent timeout cannot be represented as a deadline")]
+    #[error("subagent timeout cannot be represented as a timer-safe deadline")]
     DeadlineUnrepresentable,
     #[error("subagent task identifier space is exhausted")]
     IdentifierSpaceExhausted,
@@ -2020,6 +2020,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             }
             let deadline =
                 earliest_deadline(now.checked_add(self.policy.timeout), inherited_deadline)
+                    .filter(|deadline| deadline.checked_add(SUBAGENT_TIMER_HEADROOM).is_some())
                     .ok_or(AdmissionError::DeadlineUnrepresentable)?;
             let sequence = inner
                 .next_task
@@ -2712,7 +2713,10 @@ mod tests {
         WaitPhaseSignal, task_id, task_id_argument,
     };
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
-    use crate::config::{DEFAULT_MODEL, ModelSelection};
+    use crate::config::{
+        DEFAULT_MODEL, ModelSelection,
+        constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
+    };
     use crate::model::{
         AttemptAccounting, Model, ModelAction, ModelContextEntry, ModelFailure, ModelHistory,
         ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
@@ -2843,32 +2847,15 @@ mod tests {
         }
     }
 
-    fn instant_with_second_headroom(headroom: u64) -> Instant {
-        let base = Instant::now();
-        let mut lower = 0;
-        let mut upper = u64::MAX;
-        while lower < upper {
-            let distance = upper - lower;
-            let midpoint = lower + distance / 2 + distance % 2;
-            if base.checked_add(Duration::from_secs(midpoint)).is_some() {
-                lower = midpoint;
-            } else {
-                upper = midpoint - 1;
-            }
-        }
-        assert!(lower < u64::MAX);
-        assert!(lower >= headroom);
-        let now = base
-            .checked_add(Duration::from_secs(lower - headroom))
-            .expect("headroom instant must be representable");
-        assert!(
-            now.checked_add(Duration::from_secs(headroom)).is_some(),
-            "requested headroom must be representable"
-        );
-        assert!(
-            now.checked_add(Duration::from_secs(headroom + 1)).is_none(),
-            "instant must have exactly the requested whole-second headroom"
-        );
+    fn instant_with_tokio_unsafe_one_second_deadline() -> Instant {
+        let latest = latest_representable_instant();
+        let now = latest
+            .checked_sub(Duration::from_secs(1))
+            .expect("one-second timeout start must be representable");
+        let deadline = now
+            .checked_add(Duration::from_secs(1))
+            .expect("raw one-second deadline must be representable");
+        assert!(deadline.checked_add(SUBAGENT_TIMER_HEADROOM).is_none());
         now
     }
 
@@ -4053,10 +4040,17 @@ mod tests {
 
     #[tokio::test]
     async fn finite_inherited_deadline_clamps_unrepresentable_nested_timeout() {
-        let started_at = instant_with_second_headroom(2);
+        let started_at = latest_representable_instant()
+            .checked_sub(Duration::from_secs(2) + SUBAGENT_TIMER_HEADROOM)
+            .expect("parent start must be representable");
         let inherited_deadline = started_at
             .checked_add(Duration::from_secs(2))
             .expect("parent deadline must be representable");
+        assert!(
+            inherited_deadline
+                .checked_add(SUBAGENT_TIMER_HEADROOM)
+                .is_some()
+        );
         let clock = Arc::new(ManualClock::starting_at(started_at, 0));
         let (started_sender, mut started) = mpsc::unbounded_channel();
         let coordinator = SubagentCoordinator::with_clock(
@@ -4072,6 +4066,7 @@ mod tests {
         let root = coordinator.root_caller().await;
         let (parent_id, parent) = start(&coordinator, &mut started, &root).await;
         clock.advance(Duration::from_secs(1));
+        assert!(clock.now().checked_add(Duration::from_secs(2)).is_none());
 
         let (child_id, child) = start(&coordinator, &mut started, parent.child.caller()).await;
 
@@ -4088,12 +4083,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrepresentable_policy_timeout_rejects_without_consuming_admission_state() {
-        let clock = Arc::new(ManualClock::starting_at(instant_with_second_headroom(1), 0));
+    async fn timer_safe_inherited_deadline_clamps_tokio_unsafe_nested_timeout() {
+        let child_started_at = instant_with_tokio_unsafe_one_second_deadline();
+        let parent_started_at = child_started_at
+            .checked_sub(SUBAGENT_TIMER_HEADROOM)
+            .expect("earlier parent start must be representable");
+        let inherited_deadline = parent_started_at
+            .checked_add(Duration::from_secs(1))
+            .expect("parent deadline must be representable");
+        assert!(
+            inherited_deadline
+                .checked_add(SUBAGENT_TIMER_HEADROOM)
+                .is_some()
+        );
+        let clock = Arc::new(ManualClock::starting_at(parent_started_at, 0));
         let (started_sender, mut started) = mpsc::unbounded_channel();
         let coordinator = SubagentCoordinator::with_clock(
             SubagentPolicy {
-                timeout: Duration::from_secs(2),
+                timeout: Duration::from_secs(1),
+                ..policy()
+            },
+            Arc::new(GatedRunner {
+                started: started_sender,
+            }),
+            clock.clone(),
+        );
+        let root = coordinator.root_caller().await;
+        let (parent_id, parent) = start(&coordinator, &mut started, &root).await;
+        clock.advance(SUBAGENT_TIMER_HEADROOM);
+        let own_deadline = clock
+            .now()
+            .checked_add(Duration::from_secs(1))
+            .expect("raw child deadline must be representable");
+        assert!(own_deadline.checked_add(SUBAGENT_TIMER_HEADROOM).is_none());
+
+        let (child_id, child) = start(&coordinator, &mut started, parent.child.caller()).await;
+
+        parent.finish.send(Ok(result("parent"))).unwrap();
+        coordinator.wait(&root, &parent_id).await.unwrap();
+        assert_eq!(coordinator.next_deadline().await, Some(inherited_deadline));
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(inherited_deadline));
+        tokio::pin!(sleep);
+        assert!(matches!(
+            futures::poll!(sleep.as_mut()),
+            std::task::Poll::Pending
+        ));
+        child.finish.send(Ok(result("child"))).unwrap();
+        coordinator.wait(&root, &child_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokio_unsafe_root_deadline_rejects_without_consuming_admission_state() {
+        let clock = Arc::new(ManualClock::starting_at(
+            instant_with_tokio_unsafe_one_second_deadline(),
+            0,
+        ));
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                timeout: Duration::from_secs(1),
                 ..policy()
             },
             Arc::new(GatedRunner {
@@ -4106,11 +4154,11 @@ mod tests {
         let error = coordinator
             .start(&root, parameters(), ())
             .await
-            .expect_err("unrepresentable timeout must reject admission");
+            .expect_err("Tokio-unsafe timeout must reject admission");
 
         assert_eq!(
             error.to_string(),
-            "subagent timeout cannot be represented as a deadline"
+            "subagent timeout cannot be represented as a timer-safe deadline"
         );
         assert!(coordinator.records().await.is_empty());
         assert_eq!(coordinator.active_count().await, 0);

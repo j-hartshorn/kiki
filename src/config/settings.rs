@@ -13,7 +13,7 @@ use super::{
     DEFAULT_MODEL, ModelConfiguration, StartupProblemKind,
     constants::{
         DEFAULT_SUBAGENT_ALLOW_NESTED, DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_DEPTH,
-        DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN, DEFAULT_SUBAGENT_TIMEOUT,
+        DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN, DEFAULT_SUBAGENT_TIMEOUT, SUBAGENT_TIMER_HEADROOM,
     },
     model_by_id,
 };
@@ -683,11 +683,11 @@ fn positive_subagent_timeout_at(
         return None;
     };
     let timeout = Duration::from_secs(seconds);
-    if now.checked_add(timeout).is_some() {
+    if now.checked_add(timeout + SUBAGENT_TIMER_HEADROOM).is_some() {
         return Some(timeout);
     }
     problems.push(
-        "field `subagents.timeout_seconds` must be a positive integer representable as a deadline",
+        "field `subagents.timeout_seconds` must be a positive integer representable as a timer-safe deadline",
         "Set it to a smaller positive integer, then restart Kiki.",
     );
     None
@@ -906,7 +906,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::config::models::{LUNA, SOL, TERRA};
+    use crate::config::{
+        constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
+        models::{LUNA, SOL, TERRA},
+    };
 
     use super::{Input, SubagentSettings, resolve};
 
@@ -986,27 +989,15 @@ mod tests {
         assert_eq!(subagents.timeout().as_secs(), 900);
     }
 
-    fn instant_without_second_headroom() -> Instant {
-        let base = Instant::now();
-        let mut lower = 0;
-        let mut upper = u64::MAX;
-        while lower < upper {
-            let distance = upper - lower;
-            let midpoint = lower + distance / 2 + distance % 2;
-            if base.checked_add(Duration::from_secs(midpoint)).is_some() {
-                lower = midpoint;
-            } else {
-                upper = midpoint - 1;
-            }
-        }
-        assert!(lower < u64::MAX);
-        let now = base
-            .checked_add(Duration::from_secs(lower))
-            .expect("latest whole-second instant must be representable");
-        assert!(
-            now.checked_add(Duration::from_secs(1)).is_none(),
-            "instant must have less than one second of headroom"
-        );
+    fn instant_with_tokio_unsafe_one_second_deadline() -> Instant {
+        let latest = latest_representable_instant();
+        let now = latest
+            .checked_sub(Duration::from_secs(1))
+            .expect("one-second timeout start must be representable");
+        let deadline = now
+            .checked_add(Duration::from_secs(1))
+            .expect("raw one-second deadline must be representable");
+        assert!(deadline.checked_add(SUBAGENT_TIMER_HEADROOM).is_none());
         now
     }
 
@@ -1028,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_toml_timeout_is_rejected() {
+    fn tokio_unsafe_toml_timeout_is_rejected() {
         let document = "timeout_seconds = 1\n"
             .parse::<toml_edit::DocumentMut>()
             .expect("timeout setting");
@@ -1037,13 +1028,13 @@ mod tests {
         let timeout = super::positive_subagent_timeout_at(
             &document["timeout_seconds"],
             &mut problems,
-            instant_without_second_headroom(),
+            instant_with_tokio_unsafe_one_second_deadline(),
         );
 
         assert_eq!(timeout, None);
         let problems = problems.finish();
         let [problem] = problems.as_slice() else {
-            panic!("unrepresentable timeout reports exactly one problem");
+            panic!("timer-unsafe timeout reports exactly one problem");
         };
         assert_eq!(
             problem.kind(),
@@ -1051,7 +1042,7 @@ mod tests {
         );
         assert_eq!(
             problem.diagnostic(),
-            "user settings file `~/.kiki/config.toml` field `subagents.timeout_seconds` must be a positive integer representable as a deadline."
+            "user settings file `~/.kiki/config.toml` field `subagents.timeout_seconds` must be a positive integer representable as a timer-safe deadline."
         );
         assert_eq!(
             problem.remediation(),
