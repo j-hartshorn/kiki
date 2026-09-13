@@ -774,7 +774,7 @@ pub(crate) async fn invoke(
                     context.payload(),
                 )
                 .await
-                .map_err(admission_error)?;
+                .map_err(|error| ToolError::runtime(error.to_string()))?;
             Ok(task_handle_value(&observation))
         }
         InvocationOperation::Get => {
@@ -891,20 +891,6 @@ fn task_id_argument(arguments: ToolValue, operation: &str) -> Result<TaskId, Too
             "subagent task ID must be a canonical lowercase hexadecimal string with at least two characters",
         )
     })
-}
-
-fn admission_error(error: AdmissionError) -> ToolError {
-    match error {
-        AdmissionError::InvalidCaller => ToolError::runtime(error.to_string()),
-        AdmissionError::ShuttingDown
-        | AdmissionError::CallerStopped
-        | AdmissionError::NestedDisabled
-        | AdmissionError::DepthLimit
-        | AdmissionError::ConcurrentLimit
-        | AdmissionError::StartBudget
-        | AdmissionError::DeadlineUnrepresentable
-        | AdmissionError::IdentifierSpaceExhausted => ToolError::runtime(error.to_string()),
-    }
 }
 
 fn access_error(error: AccessError) -> ToolError {
@@ -1264,7 +1250,6 @@ pub(crate) struct TaskObservation {
     elapsed: Duration,
     observed_at_ms: i64,
     cost: RunCostEstimate,
-    cost_status: CostStatus,
     error: Option<String>,
 }
 
@@ -1316,7 +1301,11 @@ impl TaskObservation {
     }
 
     pub(crate) fn cost_status(&self) -> CostStatus {
-        self.cost_status
+        match self.cost {
+            RunCostEstimate::Complete(_) => CostStatus::Complete,
+            RunCostEstimate::LowerBound(_) => CostStatus::LowerBound,
+            RunCostEstimate::Unavailable => CostStatus::Unavailable,
+        }
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -1407,11 +1396,6 @@ impl TaskRecord {
         let id = TaskId::parse(id).expect("test task ID must be valid");
         let parent = parent.map(|id| TaskId::parse(id).expect("test parent ID must be valid"));
         let cost = estimate_run_cost(&attempts);
-        let cost_status = match cost {
-            RunCostEstimate::Complete(_) => CostStatus::Complete,
-            RunCostEstimate::LowerBound(_) => CostStatus::LowerBound,
-            RunCostEstimate::Unavailable => CostStatus::Unavailable,
-        };
         Self {
             id: id.clone(),
             revision,
@@ -1427,7 +1411,6 @@ impl TaskRecord {
                 elapsed: Duration::ZERO,
                 observed_at_ms: 0,
                 cost,
-                cost_status,
                 error: None,
             },
             attempt_evidence: Vec::new(),
@@ -1747,7 +1730,7 @@ struct Task {
     depth: usize,
     parameters: ChildParameters,
     admitted_at: Instant,
-    deadline: Option<Instant>,
+    deadline: Instant,
     settled_at: Option<Instant>,
     metrics: Arc<TaskMetrics>,
     state: TaskState,
@@ -1798,11 +1781,6 @@ impl Task {
     ) -> TaskObservation {
         let finished_at = self.settled_at.unwrap_or(now);
         let cost = estimate_run_cost(&metrics.attempts);
-        let cost_status = match cost {
-            RunCostEstimate::Complete(_) => CostStatus::Complete,
-            RunCostEstimate::LowerBound(_) => CostStatus::LowerBound,
-            RunCostEstimate::Unavailable => CostStatus::Unavailable,
-        };
         TaskObservation {
             id: self.id.clone(),
             state: self.state,
@@ -1811,7 +1789,6 @@ impl Task {
             elapsed: finished_at.saturating_duration_since(self.admitted_at),
             observed_at_ms,
             cost,
-            cost_status,
             error: match (&self.state, &self.stop, &self.outcome) {
                 (TaskState::Stopping, Some(reason), _) => Some(reason.message()),
                 (_, _, Some(TaskOutcome::Failed(failure))) => Some(failure.message().to_owned()),
@@ -2012,10 +1989,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     if task.origin != caller.origin {
                         return Err(AdmissionError::InvalidCaller);
                     }
-                    if task.state.is_terminal()
-                        || task.stop.is_some()
-                        || task.deadline.is_some_and(|deadline| deadline <= now)
-                    {
+                    if task.state.is_terminal() || task.stop.is_some() || task.deadline <= now {
                         return Err(AdmissionError::CallerStopped);
                     }
                     if !self.policy.allow_nested {
@@ -2025,7 +1999,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                         Some(parent.clone()),
                         task.depth.saturating_add(1),
                         task.parameters.read_only(),
-                        task.deadline,
+                        Some(task.deadline),
                     )
                 }
             };
@@ -2044,11 +2018,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             {
                 return Err(AdmissionError::StartBudget);
             }
-            let own_deadline = now.checked_add(self.policy.timeout);
-            let deadline = earliest_deadline(own_deadline, inherited_deadline);
-            if deadline.is_none() {
-                return Err(AdmissionError::DeadlineUnrepresentable);
-            }
+            let deadline =
+                earliest_deadline(now.checked_add(self.policy.timeout), inherited_deadline)
+                    .ok_or(AdmissionError::DeadlineUnrepresentable)?;
             let sequence = inner
                 .next_task
                 .ok_or(AdmissionError::IdentifierSpaceExhausted)?;
@@ -2231,9 +2203,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .tasks
                 .values()
                 .filter(|task| {
-                    !task.state.is_terminal()
-                        && task.stop.is_none()
-                        && task.deadline.is_some_and(|deadline| deadline <= now)
+                    !task.state.is_terminal() && task.stop.is_none() && task.deadline <= now
                 })
                 .map(|task| (task.depth, task.id.clone()))
                 .collect::<Vec<_>>()
@@ -2250,7 +2220,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .tasks
             .values()
             .filter(|task| !task.state.is_terminal() && task.stop.is_none())
-            .filter_map(|task| task.deadline)
+            .map(|task| task.deadline)
             .min()
     }
 
