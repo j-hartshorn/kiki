@@ -6542,9 +6542,53 @@ mod tests {
             rows[entry].trim_end(),
             "  ✓ subagent:c1  openai/gpt-5.6-terra  0 steps  04:47"
         );
-        assert!(rows[entry + 1].starts_with("    └ test child"));
-        assert!(rows[entry + 1].ends_with("      "));
+        assert!(rows[entry + 1].starts_with("    └ `test child`"));
         assert!(entry < prompt);
+    }
+
+    #[test]
+    fn subagent_monitor_renders_parent_context_above_the_prompt() {
+        let now = Instant::now();
+        let mut app = App::default();
+        for record in [
+            crate::subagents::TaskRecord::for_test(
+                "00",
+                1,
+                crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                None,
+                0,
+                Vec::new(),
+            ),
+            crate::subagents::TaskRecord::for_test(
+                "01",
+                1,
+                crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                Some("00"),
+                1,
+                Vec::new(),
+            ),
+        ] {
+            app.handle_event_at(RuntimeEvent::SubagentSpawned { record }, now);
+        }
+
+        let screen = rendered_at(&mut app, 80, 14, now);
+        let rows = screen.lines().collect::<Vec<_>>();
+        let root = rows
+            .iter()
+            .position(|row| row.contains("✓ subagent:00"))
+            .expect("root monitor entry");
+        let child = rows
+            .iter()
+            .position(|row| row.contains("└─✓ subagent:01"))
+            .expect("nested monitor entry");
+        let prompt = rows
+            .iter()
+            .position(|row| row.starts_with("> "))
+            .expect("prompt");
+
+        assert!(rows[root + 1].starts_with("    └ `test child`"));
+        assert!(rows[child + 1].starts_with("      └ `test child`"));
+        assert!(root < child && child < prompt, "{screen}");
     }
 
     #[test]

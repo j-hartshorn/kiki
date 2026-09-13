@@ -78,7 +78,7 @@ The real-node budget is four. A selected path of one, two, three, or at least fo
 Omission categories are disjoint and use explicit labels:
 
 - `… +N siblings` belongs to an expanded parent and is placed after the selected child's rendered subtree at that child's depth. `N` counts omitted direct children only; their subtrees stay folded beneath those siblings and do not increase `N`.
-- `… +N descendants` belongs to a collapsed displayed root and is rendered at depth 1. `N` counts every retained descendant in that root's subtree.
+- `… +N descendants` belongs to any collapsed displayed node and is rendered one level beneath it. `N` counts every retained descendant in that node's subtree. A selected active leaf with retained children is collapsed after the selected path and therefore uses this summary.
 - `… +N deeper · A active` belongs to the deepest visible selected-path node and is rendered one level beneath it. `N` counts every retained descendant of that anchor which is not otherwise visible, including a selected-path node removed by height degradation and its subtree; `A` is the active subset of those `N` tasks.
 - `… +N roots` is the global root-level summary. `N` counts omitted root nodes; each omitted root's whole subtree stays folded beneath it and does not increase `N`.
 
@@ -91,7 +91,7 @@ On an accepted user request, clear a terminal entry only when it is not an ances
 Build the preferred projection before fitting it to available rows. Never render half of a task's two-row entry. Height degradation is deterministic:
 
 1. Remove top and bottom padding.
-2. Remove collapsed-root descendant summaries, from the last displayed root backwards.
+2. Remove collapsed-node descendant summaries, from the last displayed node backwards.
 3. Remove selected-branch sibling summaries, deepest first.
 4. Remove the global omitted-root summary.
 5. Remove additional collapsed root node pairs, last displayed first.
@@ -189,7 +189,7 @@ git -C worktrees/subagents branch -d work/subagent-tree-and-ids
 
 **Changes** — Retain parent identity in monitor entries, preserve terminal ancestors of active tasks, derive the deepest preferred branch and collapsed roots during layout, and render the selected tree with a four-real-node budget, counted omission summaries and per-node prompt previews. Preserve active-tree/admission ordering, terminal styles, narrow-terminal degradation and visible-second ticking. Update the original subagent specification's sticky presentation contract.
 
-**Tests** (`src/tui/subagents.rs`, monitor behaviour; `src/tui.rs`, rendered geometry) — First render a forest where the deepest active branch is not the earliest root and require it first with its terminal ancestor and backtick-delimited prompt previews. Assert exact row prefixes and output for equal-depth admission tie-breaking, an active root competing with an earlier terminal root, all-terminal fallback, four/three/two/one root capacity, disjoint sibling/root/descendant/deeper counts, an active task below four terminal visible ancestors, collapsed non-selected descendants, and missing-parent roots. Cover prompt truncation retaining both backtick delimiters when they fit, re-anchored deeper counts as each height transition shortens the selected path, ancestor retention and later clearing, narrow width clipping, muted terminal rows, and redraws only for visible active whole seconds. Preserve outer prompt/history placement and exclusion from text selection.
+**Tests** (`src/tui/subagents.rs`, monitor behaviour; `src/tui.rs`, rendered geometry) — First render a forest where the deepest active branch is not the earliest root and require it first with its terminal ancestor and backtick-delimited prompt previews. Assert exact row prefixes and output for equal-depth admission tie-breaking, an active root competing with an earlier terminal root, all-terminal fallback, four/three/two/one root capacity, disjoint sibling/root/descendant/deeper counts, an active task below four terminal visible ancestors, a selected active leaf with collapsed terminal descendants, collapsed non-selected descendants, and missing-parent roots. Cover prompt truncation retaining both backtick delimiters when they fit, re-anchored deeper counts as each height transition shortens the selected path, ancestor retention and later clearing, narrow width clipping, muted terminal rows, and redraws only for visible active whole seconds. Preserve outer prompt/history placement and exclusion from text selection.
 
 **Files** — Modify: `src/tui/subagents.rs`, `src/tui.rs`, `docs/2026-09-05_subagents/spec.md`.
 
