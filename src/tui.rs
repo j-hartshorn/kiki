@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod picker;
+mod slash;
 mod subagents;
 
 use ratatui::backend::Backend;
@@ -13,10 +15,10 @@ use ratatui::crossterm::event::{
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::SetTitle;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -26,7 +28,7 @@ use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::CATALOGUE;
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
-use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout};
+use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
     ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver, control_command,
 };
@@ -73,6 +75,12 @@ pub(crate) enum TuiError {
 enum AppMode {
     Configured,
     ConfigurationOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryPosition {
+    FollowingBottom,
+    Anchored(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -147,13 +155,12 @@ struct ThinkingPreview {
 
 struct App {
     mode: AppMode,
-    enhanced_keyboard: bool,
     prompt: PromptEditor,
     prompt_width: u16,
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
-    scroll_from_bottom: usize,
+    history_position: HistoryPosition,
     history_height: usize,
     history_rows: usize,
     history_viewport: Option<HistoryViewport>,
@@ -170,6 +177,8 @@ struct App {
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
+    completion: slash::Completion,
+    slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
     pending_settings_revision: Option<u64>,
@@ -181,13 +190,12 @@ impl Default for App {
             .expect("default model thinking must be supported");
         Self {
             mode: AppMode::Configured,
-            enhanced_keyboard: false,
             prompt: PromptEditor::default(),
             prompt_width: 80,
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
-            scroll_from_bottom: 0,
+            history_position: HistoryPosition::FollowingBottom,
             history_height: 0,
             history_rows: 0,
             history_viewport: None,
@@ -204,6 +212,8 @@ impl Default for App {
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
+            completion: slash::Completion::default(),
+            slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
             pending_settings_revision: None,
@@ -271,16 +281,13 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        if let Some(update) = self.handle_slash_overlay_mouse(mouse) {
+            return update;
+        }
         let notice_cleared = self.clear_notice();
         let mut update = match mouse.kind {
-            MouseEventKind::ScrollUp => self.update_scroll(
-                self.scroll_from_bottom
-                    .saturating_add(MOUSE_WHEEL_SCROLL_ROWS),
-            ),
-            MouseEventKind::ScrollDown => self.update_scroll(
-                self.scroll_from_bottom
-                    .saturating_sub(MOUSE_WHEEL_SCROLL_ROWS),
-            ),
+            MouseEventKind::ScrollUp => self.scroll_older(MOUSE_WHEEL_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_newer(MOUSE_WHEEL_SCROLL_ROWS),
             MouseEventKind::Down(MouseButton::Left) => self.begin_selection(mouse, now),
             MouseEventKind::Drag(MouseButton::Left) => Update {
                 commands: Vec::new(),
@@ -292,6 +299,31 @@ impl App {
         };
         update.visible_changed |= notice_cleared;
         update
+    }
+
+    fn handle_slash_overlay_mouse(&mut self, mouse: MouseEvent) -> Option<Update> {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+        ) || !self
+            .slash_overlay
+            .is_some_and(|overlay| overlay.contains(Position::new(mouse.column, mouse.row)))
+        {
+            return None;
+        }
+        let Some(_) = self.drag.take() else {
+            return Some(Update::default());
+        };
+        let visible_changed = self.selection.take().is_some();
+        self.pending_copy = false;
+        self.pending_copy_text = None;
+        Some(Update {
+            commands: Vec::new(),
+            visible_changed,
+            quit: false,
+        })
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Update {
@@ -310,7 +342,7 @@ impl App {
 
     fn handle_paste(&mut self, text: &str) -> Update {
         let notice_cleared = self.clear_notice();
-        let visible_changed = if self.is_submission_disabled() || self.picker.is_some() {
+        let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
             false
         } else {
             let text = normalise_terminal_text(&normalise_paste_line_endings(text));
@@ -318,7 +350,7 @@ impl App {
         };
         Update {
             commands: Vec::new(),
-            visible_changed: visible_changed || notice_cleared,
+            visible_changed: prompt_changed || self.refresh_completion() || notice_cleared,
             quit: false,
         }
     }
@@ -395,9 +427,12 @@ impl App {
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
         }
+        if let Some(update) = self.handle_completion_key(key) {
+            return update;
+        }
         if key.code == KeyCode::Enter && key.modifiers.is_empty() && !self.prompt.is_empty() {
             let draft = self.prompt.take();
-            if let Some(command) = slash_command(&draft) {
+            if let Some(command) = slash::parse(&draft) {
                 return self.handle_slash_command(command);
             }
             if self.transcript.is_idle() {
@@ -417,18 +452,49 @@ impl App {
             };
         }
         if let Some(edit) = self.prompt_edit(key) {
+            let prompt_changed = self.prompt.apply(edit, self.prompt_width);
             return Update {
                 commands: Vec::new(),
-                visible_changed: self.prompt.apply(edit, self.prompt_width),
+                visible_changed: prompt_changed || self.refresh_completion(),
                 quit: false,
             };
         }
         Update::default()
     }
 
-    fn handle_slash_command(&mut self, command: SlashCommand<'_>) -> Update {
-        match command {
-            SlashCommand::Model(argument) => {
+    fn handle_completion_key(&mut self, key: KeyEvent) -> Option<Update> {
+        self.refresh_completion();
+        if !key.modifiers.is_empty() || self.completion.selected_token().is_none() {
+            return None;
+        }
+        let visible_changed = match key.code {
+            KeyCode::Up => self.completion.move_selection(-1),
+            KeyCode::Down => self.completion.move_selection(1),
+            KeyCode::Tab | KeyCode::Enter => {
+                let token = self.completion.selected_token()?;
+                self.prompt.take();
+                self.prompt.insert_paste(token);
+                self.refresh_completion();
+                true
+            }
+            _ => return None,
+        };
+        Some(Update {
+            commands: Vec::new(),
+            visible_changed,
+            quit: false,
+        })
+    }
+
+    fn refresh_completion(&mut self) -> bool {
+        self.completion
+            .sync(self.prompt.text(), self.prompt.caret_at_end())
+    }
+
+    fn handle_slash_command(&mut self, command: slash::Parsed<'_>) -> Update {
+        match command.action {
+            slash::Action::Model => {
+                let argument = command.argument;
                 if let Some(model) = CATALOGUE
                     .iter()
                     .copied()
@@ -444,8 +510,9 @@ impl App {
                     }
                 }
             }
-            SlashCommand::Name(argument) => self.name_session(argument),
-            SlashCommand::Thinking(argument) => {
+            slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Thinking => {
+                let argument = command.argument;
                 let model = self.settings_selection.model();
                 if argument.is_empty() {
                     self.open_thinking_picker();
@@ -733,7 +800,7 @@ impl App {
 
     fn begin_selection(&mut self, mouse: MouseEvent, now: Instant) -> Update {
         let visible_changed = self.invalidate_selection();
-        let Some(position) = self.history_position(mouse.column, mouse.row) else {
+        let Some(position) = self.history_document_position(mouse.column, mouse.row) else {
             return Update {
                 commands: Vec::new(),
                 visible_changed,
@@ -758,7 +825,7 @@ impl App {
         let Some(viewport) = self.history_viewport else {
             return false;
         };
-        let Some(focus) = self.history_position(mouse.column, mouse.row) else {
+        let Some(focus) = self.history_document_position(mouse.column, mouse.row) else {
             if let Some(drag) = &mut self.drag {
                 drag.edge = None;
             }
@@ -826,18 +893,18 @@ impl App {
         if now < drag.next_tick {
             return false;
         }
-        let scroll = match edge {
-            Edge::Older => self.scroll_from_bottom.saturating_add(1),
-            Edge::Newer => self.scroll_from_bottom.saturating_sub(1),
+        let update = match edge {
+            Edge::Older => self.scroll_older(1),
+            Edge::Newer => self.scroll_newer(1),
         };
-        if !self.update_scroll(scroll).visible_changed {
+        if !update.visible_changed {
             if let Some(drag) = &mut self.drag {
                 drag.edge = None;
             }
             return false;
         }
         let focus = self
-            .history_position(drag.column, drag.row)
+            .history_document_position(drag.column, drag.row)
             .expect("drag position remains within history viewport");
         self.selection = Selection::from_inclusive_cells(drag.anchor, focus);
         if let Some(drag) = &mut self.drag {
@@ -863,13 +930,18 @@ impl App {
         true
     }
 
-    fn history_document_top(&self) -> usize {
-        self.history_rows
-            .saturating_sub(self.history_height)
-            .saturating_sub(self.scroll_from_bottom)
+    fn newest_history_top(&self) -> usize {
+        self.history_rows.saturating_sub(self.history_height)
     }
 
-    fn history_position(&self, column: u16, row: u16) -> Option<DocumentPosition> {
+    fn history_document_top(&self) -> usize {
+        match self.history_position {
+            HistoryPosition::FollowingBottom => self.newest_history_top(),
+            HistoryPosition::Anchored(top) => top,
+        }
+    }
+
+    fn history_document_position(&self, column: u16, row: u16) -> Option<DocumentPosition> {
         self.history_viewport?
             .position(column, row, self.history_document_top())
     }
@@ -926,25 +998,25 @@ impl App {
     }
 
     fn history_unavailable(&mut self) {
-        self.history_height = 0;
         self.history_viewport = None;
         self.invalidate_selection();
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<Update> {
         let editable = !self.is_submission_disabled();
-        let scroll = match key.code {
-            KeyCode::PageUp => Some(self.scroll_from_bottom.saturating_add(10)),
-            KeyCode::PageDown => Some(self.scroll_from_bottom.saturating_sub(10)),
+        match key.code {
+            KeyCode::PageUp => Some(self.scroll_older(10)),
+            KeyCode::PageDown => Some(self.scroll_newer(10)),
             KeyCode::Home if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(usize::MAX)
+                Some(self.scroll_oldest())
             }
-            KeyCode::End if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => Some(0),
-            KeyCode::Up if !editable => Some(self.scroll_from_bottom.saturating_add(1)),
-            KeyCode::Down if !editable => Some(self.scroll_from_bottom.saturating_sub(1)),
+            KeyCode::End if !editable || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(self.follow_history())
+            }
+            KeyCode::Up if !editable => Some(self.scroll_older(1)),
+            KeyCode::Down if !editable => Some(self.scroll_newer(1)),
             _ => None,
-        };
-        scroll.map(|scroll| self.update_scroll(scroll))
+        }
     }
 
     fn prompt_edit(&self, key: KeyEvent) -> Option<PromptEdit> {
@@ -998,6 +1070,9 @@ impl App {
             KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::Right)
             }
+            KeyCode::Char('j' | 'J') if key.modifiers == KeyModifiers::CONTROL => {
+                Some(PromptEdit::InsertNewline)
+            }
             KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(PromptEdit::DeleteToLineEnd)
             }
@@ -1023,9 +1098,7 @@ impl App {
             {
                 Some(PromptEdit::Insert(character))
             }
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT) && self.enhanced_keyboard =>
-            {
+            KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {
                 Some(PromptEdit::InsertNewline)
             }
             _ => None,
@@ -1084,13 +1157,51 @@ impl App {
         }
     }
 
-    fn update_scroll(&mut self, scroll_from_bottom: usize) -> Update {
-        let hidden_lines = self.history_rows.saturating_sub(self.history_height);
-        let scroll_from_bottom = scroll_from_bottom.min(hidden_lines);
-        if self.scroll_from_bottom == scroll_from_bottom {
+    fn scroll_older(&mut self, rows: usize) -> Update {
+        if self.history_viewport.is_some() {
+            self.set_history_position(
+                self.history_position_at(self.history_document_top().saturating_sub(rows)),
+            )
+        } else {
+            Update::default()
+        }
+    }
+
+    fn scroll_newer(&mut self, rows: usize) -> Update {
+        if self.history_viewport.is_some() {
+            self.set_history_position(
+                self.history_position_at(self.history_document_top().saturating_add(rows)),
+            )
+        } else {
+            Update::default()
+        }
+    }
+
+    fn scroll_oldest(&mut self) -> Update {
+        if self.history_rows > self.history_height {
+            self.set_history_position(HistoryPosition::Anchored(0))
+        } else {
+            Update::default()
+        }
+    }
+
+    fn follow_history(&mut self) -> Update {
+        self.set_history_position(HistoryPosition::FollowingBottom)
+    }
+
+    fn history_position_at(&self, top: usize) -> HistoryPosition {
+        if top >= self.newest_history_top() {
+            HistoryPosition::FollowingBottom
+        } else {
+            HistoryPosition::Anchored(top)
+        }
+    }
+
+    fn set_history_position(&mut self, position: HistoryPosition) -> Update {
+        if self.history_position == position {
             Update::default()
         } else {
-            self.scroll_from_bottom = scroll_from_bottom;
+            self.history_position = position;
             Update {
                 commands: Vec::new(),
                 visible_changed: true,
@@ -1098,38 +1209,11 @@ impl App {
             }
         }
     }
-}
 
-enum SlashCommand<'a> {
-    Model(&'a str),
-    Name(&'a str),
-    Thinking(&'a str),
-}
-
-fn slash_command(draft: &str) -> Option<SlashCommand<'_>> {
-    if draft.contains('\n') {
-        return None;
-    }
-    if let Some(rest) = draft.strip_prefix("/model") {
-        return slash_argument(rest).map(SlashCommand::Model);
-    }
-    if let Some(rest) = draft.strip_prefix("/name") {
-        return slash_argument(rest).map(SlashCommand::Name);
-    }
-    draft
-        .strip_prefix("/thinking")
-        .and_then(slash_argument)
-        .map(SlashCommand::Thinking)
-}
-
-fn slash_argument(rest: &str) -> Option<&str> {
-    if rest.is_empty() {
-        Some("")
-    } else {
-        rest.chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-            .then(|| rest.trim())
+    fn normalise_history_position(&mut self) {
+        if let HistoryPosition::Anchored(top) = self.history_position {
+            self.history_position = self.history_position_at(top);
+        }
     }
 }
 
@@ -1233,8 +1317,7 @@ pub(crate) fn run(
                     with_keyboard_enhancement(
                         enable_keyboard_enhancement,
                         disable_keyboard_enhancement,
-                        |enhanced_keyboard| {
-                            app.enhanced_keyboard = enhanced_keyboard;
+                        || {
                             run_loop_with_titles(
                                 terminal,
                                 &mut app,
@@ -1328,16 +1411,12 @@ fn with_mouse_capture<T>(
     run()
 }
 
-fn enable_keyboard_enhancement() -> io::Result<bool> {
-    if !ratatui::crossterm::terminal::supports_keyboard_enhancement()? {
-        return Ok(false);
-    }
+fn enable_keyboard_enhancement() -> io::Result<()> {
     let mut stdout = io::stdout();
     ratatui::crossterm::execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    Ok(true)
+    )
 }
 
 fn disable_keyboard_enhancement() {
@@ -1346,13 +1425,13 @@ fn disable_keyboard_enhancement() {
 }
 
 fn with_keyboard_enhancement<T>(
-    enable: impl FnOnce() -> io::Result<bool>,
+    enable: impl FnOnce() -> io::Result<()>,
     disable: impl FnOnce(),
-    run: impl FnOnce(bool) -> T,
+    run: impl FnOnce() -> T,
 ) -> T {
-    let enabled = enable().unwrap_or(false);
-    let _guard = enabled.then(|| RestoreGuard::new(disable));
-    run(enabled)
+    let pushed = enable().is_ok();
+    let _guard = pushed.then(|| RestoreGuard::new(disable));
+    run()
 }
 
 fn draw_frame<B: Backend>(
@@ -1537,6 +1616,9 @@ fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     let area = frame.area();
+    if let Some(stale_overlay) = app.slash_overlay.take() {
+        frame.render_widget(Clear, stale_overlay.intersection(area));
+    }
     frame.buffer_mut().set_style(area, page_style());
     if area.width == 0 || area.height == 0 {
         let _ = app.subagent_monitor.layout(area.width, 0, now);
@@ -1565,14 +1647,9 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             app.transcript.status()
         )
     } else {
-        let enhanced_keyboard_hint = if app.enhanced_keyboard {
-            " | Shift-Enter newline"
-        } else {
-            ""
-        };
         let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
         format!(
-            "Status: {}{notice} | Enter submit{enhanced_keyboard_hint} | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
+            "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
             app.transcript.status()
         )
     };
@@ -1637,6 +1714,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     app.prompt_width = area.width.saturating_sub(PROMPT_GUTTER_WIDTH);
+    app.refresh_completion();
     let prompt = app
         .prompt
         .layout(app.prompt_width, prompt_content_capacity(area.height));
@@ -1666,6 +1744,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         monitor_top.saturating_sub(area.y.saturating_add(1)),
     );
     let layout = render_history(frame, app, history);
+    render_slash_overlay(frame, app, history);
     monitor.render(
         frame,
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
@@ -1681,6 +1760,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         &prompt,
         content,
         !app.is_submission_disabled() && app.picker.is_none(),
+        slash::recognised_token_range(app.prompt.text()),
     );
     frame.render_widget(
         Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
@@ -1708,10 +1788,9 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     }
     app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
-    let last_page_start = app.history_rows.saturating_sub(app.history_height);
-    app.scroll_from_bottom = app.scroll_from_bottom.min(last_page_start);
-    let top = app.history_document_top();
     app.history_viewport = Some(HistoryViewport { area: viewport });
+    app.normalise_history_position();
+    let top = app.history_document_top();
     if let Some(selection) = app.selection_for_render() {
         layout.render_with_selection(viewport, top, Some(selection), frame.buffer_mut());
     } else {
@@ -1732,6 +1811,46 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     layout
 }
 
+fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
+    if app.is_submission_disabled() || app.picker.is_some() {
+        return;
+    }
+    let rows = app.completion.visible_rows(usize::from(history.height));
+    let Some(height) = u16::try_from(rows.len()).ok().filter(|height| *height > 0) else {
+        return;
+    };
+    let natural_width = rows
+        .iter()
+        .map(|row| Line::raw(format!("{} {}", row.token, row.purpose)).width())
+        .max()
+        .unwrap_or(0);
+    let width = history
+        .width
+        .min(u16::try_from(natural_width).unwrap_or(u16::MAX));
+    if width == 0 {
+        return;
+    }
+    let x = history
+        .x
+        .saturating_add(PROMPT_GUTTER_WIDTH)
+        .min(history.right().saturating_sub(width));
+    let overlay = Rect::new(x, history.bottom().saturating_sub(height), width, height);
+    frame.render_widget(Clear, overlay);
+    frame.buffer_mut().set_style(overlay, page_style());
+    let lines = rows.into_iter().map(|row| {
+        let text = format!("{} {}", row.token, row.purpose);
+        let padding = usize::from(width).saturating_sub(Line::raw(&text).width());
+        let style = if row.selected {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        Line::styled(format!("{text}{}", " ".repeat(padding)), style)
+    });
+    frame.render_widget(Paragraph::new(Text::from_iter(lines)), overlay);
+    app.slash_overlay = Some(overlay);
+}
+
 fn prompt_content_capacity(height: u16) -> usize {
     let prompt_box_capacity = usize::from(height)
         .saturating_div(3)
@@ -1740,7 +1859,13 @@ fn prompt_content_capacity(height: u16) -> usize {
     prompt_box_capacity.saturating_sub(2).max(1)
 }
 
-fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor_visible: bool) {
+fn render_prompt(
+    frame: &mut Frame,
+    prompt: &PromptLayout,
+    content: Rect,
+    cursor_visible: bool,
+    recognised_token: Option<Range<usize>>,
+) {
     if content.height == 0 {
         return;
     }
@@ -1760,8 +1885,7 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
     let text: Text<'_> = prompt
         .rows()
         .iter()
-        .map(String::as_str)
-        .map(Line::from)
+        .map(|row| prompt_line(row, recognised_token.as_ref()))
         .collect();
     frame.render_widget(
         Paragraph::new(text),
@@ -1786,6 +1910,26 @@ fn render_prompt(frame: &mut Frame, prompt: &PromptLayout, content: Rect, cursor
             content.y.saturating_add(row),
         ));
     }
+}
+
+fn prompt_line<'a>(row: &'a PromptRow, recognised_token: Option<&Range<usize>>) -> Line<'a> {
+    let source = row.source();
+    let Some(token) =
+        recognised_token.filter(|token| token.start < source.end && source.start < token.end)
+    else {
+        return Line::raw(row.text());
+    };
+    let start = token.start.max(source.start) - source.start;
+    let end = token.end.min(source.end) - source.start;
+    let text = row.text();
+    Line::from(vec![
+        Span::raw(&text[..start]),
+        Span::styled(
+            &text[start..end],
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(&text[end..]),
+    ])
 }
 
 const THINKING_RULE_COLOURS: [Color; 6] = [
@@ -1872,7 +2016,7 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::Color;
 
-    use super::{App, TitlePublisher};
+    use super::{App, HistoryPosition, TitlePublisher};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -1998,6 +2142,13 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| super::render(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn history_top_row(screen: &str, viewport: super::HistoryViewport) -> &str {
+        screen
+            .lines()
+            .nth(usize::from(viewport.area.y))
+            .expect("history top row")
     }
 
     fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
@@ -2312,7 +2463,7 @@ mod tests {
             app.handle_event(delta);
             super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap();
         }
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         let mut key_samples = Vec::with_capacity(50);
         for ResponsivenessFrame { key, delta } in key_frames {
@@ -2323,7 +2474,7 @@ mod tests {
             key_samples.push(started.elapsed());
         }
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         let mut scroll_samples = Vec::with_capacity(50);
         for ResponsivenessFrame { key, delta } in scroll_frames {
             let started = Instant::now();
@@ -2750,6 +2901,346 @@ mod tests {
         assert!(app.cycle_thinking_preview(now).visible_changed);
         let buffer = rendered_buffer(&mut app, 80, 8);
         assert_eq!(buffer[(0, 7)].fg, super::THINKING_RULE_COLOURS[3]);
+    }
+
+    #[test]
+    fn slash_completion_completes_then_second_enter_executes() {
+        for (draft, completion_key, completed) in [
+            ("/mo", KeyCode::Enter, "/model"),
+            ("/thi", KeyCode::Tab, "/thinking"),
+        ] {
+            let mut app = app_with_prompt(draft);
+
+            let complete = app.handle_key(key(completion_key));
+
+            assert!(complete.commands.is_empty());
+            assert_eq!(app.prompt.text(), completed);
+            assert!(app.picker.is_none());
+
+            let execute = app.handle_key(key(KeyCode::Enter));
+
+            assert!(execute.commands.is_empty());
+            assert!(app.prompt.is_empty());
+            assert!(app.picker.is_some());
+        }
+    }
+
+    #[test]
+    fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
+        let mut app = app_with_prompt("/");
+        let initial = rendered_buffer(&mut app, 40, 8);
+        let overlay = app.slash_overlay.expect("slash overlay");
+        let (model_column, model_row) = cell_start(&initial, "/model");
+        let (name_column, name_row) = cell_start(&initial, "/name");
+        let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
+
+        assert_eq!(model_column, overlay.x);
+        assert!(model_row < name_row && name_row < thinking_row);
+        assert!(
+            initial[(model_column, model_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let name = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            name[(name_column, name_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(
+            !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        let thinking = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            thinking[(thinking_column, thinking_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert_eq!(app.prompt.text(), "/");
+    }
+
+    #[test]
+    fn slash_completion_keeps_picker_shift_tab_active_run_and_release_precedence() {
+        let now = Instant::now();
+        let mut shift_tab = App::configured(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut shift_tab, "/");
+        assert!(
+            shift_tab
+                .handle_key_at(shifted_key(KeyCode::Tab), now)
+                .visible_changed
+        );
+        assert_eq!(shift_tab.settings_selection.thinking(), "high");
+        assert_eq!(shift_tab.prompt.text(), "/");
+
+        let mut picker = App::default();
+        picker.open_model_picker("");
+        set_prompt(&mut picker, "/mo");
+        assert!(!picker.handle_key(key(KeyCode::Tab)).visible_changed);
+        assert_eq!(picker.prompt.text(), "/mo");
+        assert!(picker.picker.is_some());
+        let picker_screen = rendered(&mut picker, 40, 8);
+        assert!(picker_screen.contains("Models"));
+        assert!(!picker_screen.contains("Choose model"));
+
+        let mut active = app_with_prompt("/mo");
+        active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        assert!(active.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(active.prompt.text(), "/model");
+        assert!(active.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(active.picker.is_some());
+
+        let mut cancel = app_with_prompt("/mo");
+        cancel.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
+        assert_eq!(
+            cancel.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel]
+        );
+        assert_eq!(cancel.prompt.text(), "/mo");
+
+        let mut release = app_with_prompt("/mo");
+        release.set_notice("keep status".to_owned());
+        for code in [KeyCode::Enter, KeyCode::Tab] {
+            let update = release.handle_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(release.prompt.text(), "/mo");
+            assert_eq!(release.notice(), Some("keep status"));
+        }
+    }
+
+    #[test]
+    fn slash_completion_hides_for_interior_arguments_unknown_and_multiline_drafts() {
+        let mut interior = app_with_prompt("/mo");
+        assert!(interior.handle_key(key(KeyCode::Left)).visible_changed);
+        rendered_buffer(&mut interior, 40, 8);
+        assert!(interior.slash_overlay.is_none());
+
+        for draft in ["/model terra", "/future", "/model\nterra"] {
+            let mut app = app_with_prompt(draft);
+            let screen = rendered(&mut app, 40, 8);
+            assert!(app.slash_overlay.is_none(), "{draft}");
+            assert!(!screen.contains("Choose model"), "{draft}");
+        }
+    }
+
+    #[test]
+    fn slash_exact_token_style_crosses_soft_wraps_and_leaves_ordinary_drafts_plain() {
+        let mut wrapped = app_with_prompt("/model arg");
+        let buffer = rendered_buffer(&mut wrapped, 5, 18);
+        let (token_column, token_row) = cell_start(&buffer, "/mo");
+        let (argument_column, argument_row) = cell_start(&buffer, " ar");
+
+        for column in token_column..token_column + 3 {
+            assert_eq!(buffer[(column, token_row)].fg, Color::Cyan);
+            assert!(
+                buffer[(column, token_row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+            assert_eq!(buffer[(column, token_row + 1)].fg, Color::Cyan);
+            assert!(
+                buffer[(column, token_row + 1)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+        assert_ne!(buffer[(argument_column + 1, argument_row)].fg, Color::Cyan);
+        assert!(
+            !buffer[(argument_column + 1, argument_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        assert!(wrapped.handle_key(key(KeyCode::Left)).visible_changed);
+        let interior = rendered_buffer(&mut wrapped, 5, 18);
+        assert_eq!(interior[(token_column, token_row)].fg, Color::Cyan);
+        assert!(
+            interior[(token_column, token_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+
+        for (draft, token) in [("/future", "/future"), ("/model\narg", "/model")] {
+            let mut app = app_with_prompt(draft);
+            let buffer = rendered_buffer(&mut app, 40, 12);
+            let (column, row) = cell_start(&buffer, token);
+            assert_ne!(buffer[(column, row)].fg, Color::Cyan, "{draft}");
+            assert!(
+                !buffer[(column, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+    }
+
+    #[test]
+    fn slash_overlay_preserves_history_geometry_and_clips_to_tiny_history() {
+        let mut plain = app_with_history(App::default());
+        let mut completed = app_with_history(app_with_prompt("/"));
+        rendered_buffer(&mut plain, 40, 8);
+        rendered_buffer(&mut completed, 40, 8);
+        let overlay = completed.slash_overlay.expect("slash overlay");
+        let viewport = completed.history_viewport.expect("history viewport");
+
+        assert_eq!(completed.history_height, plain.history_height);
+        assert_eq!(
+            viewport.area,
+            plain.history_viewport.expect("history viewport").area
+        );
+        assert_eq!(overlay.bottom(), viewport.area.bottom());
+        assert_eq!(overlay.x, 2);
+
+        let mut tiny = app_with_prompt("/");
+        rendered_buffer(&mut tiny, 5, 5);
+        assert_eq!(tiny.history_height, 1);
+        assert_eq!(tiny.slash_overlay.expect("tiny overlay").height, 1);
+        assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
+        let buffer = rendered_buffer(&mut tiny, 5, 5);
+        let (column, row) = cell_start(&buffer, "/thin");
+        assert!(
+            buffer[(column, row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+
+        rendered_buffer(&mut tiny, 5, 4);
+        assert!(tiny.slash_overlay.is_none());
+    }
+
+    #[test]
+    fn slash_overlay_shields_primary_mouse_events_but_not_history_outside_it() {
+        let mut app = app_with_history(app_with_prompt("/"));
+        rendered_buffer(&mut app, 40, 12);
+        let overlay = app.slash_overlay.expect("slash overlay");
+        let viewport = app.history_viewport.expect("history viewport");
+        let now = Instant::now();
+
+        app.set_notice("keep status".to_owned());
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let update = app.handle_mouse(mouse_event(kind, overlay.x, overlay.y), now);
+            assert!(!update.visible_changed);
+            assert_eq!(app.notice(), Some("keep status"));
+            assert!(app.selection.is_none());
+            assert!(app.drag.is_none());
+            assert!(!app.pending_copy);
+        }
+
+        let outside_column = viewport.area.x + 1;
+        let outside_row = viewport.area.y;
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                outside_column,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        assert!(app.selection.is_some());
+        assert!(app.drag.as_ref().is_some_and(|drag| drag.edge.is_some()));
+        app.set_notice("keep drag status".to_owned());
+
+        let cancelled = app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                overlay.x,
+                overlay.y,
+            ),
+            now,
+        );
+        assert!(cancelled.visible_changed);
+        assert_eq!(app.notice(), Some("keep drag status"));
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(!app.pending_copy);
+        assert!(!app.tick(now + super::POLL_INTERVAL).visible_changed);
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert!(!app.pending_copy);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+        assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert!(clipboard.writes.is_empty());
+
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                outside_column,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        app.handle_mouse(
+            mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                outside_column + 1,
+                outside_row,
+            ),
+            now,
+        );
+        let selection = app.selection;
+        assert!(selection.is_some());
+        assert!(app.drag.is_none());
+        assert!(app.pending_copy);
+        app.set_notice("keep completed status".to_owned());
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let update = app.handle_mouse(mouse_event(kind, overlay.x, overlay.y), now);
+            assert!(!update.visible_changed);
+            assert_eq!(app.notice(), Some("keep completed status"));
+            assert_eq!(app.selection, selection);
+            assert!(app.drag.is_none());
+            assert!(app.pending_copy);
+        }
     }
 
     #[test]
@@ -3389,10 +3880,7 @@ mod tests {
 
     #[test]
     fn shift_enter_edits_a_multiline_prompt_without_submitting() {
-        let mut app = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        let mut app = App::default();
         app.handle_key(key(KeyCode::Char('f')));
         assert!(
             app.handle_key(shifted_key(KeyCode::Enter))
@@ -3408,10 +3896,22 @@ mod tests {
             }]
         );
 
-        let mut active = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        for modifiers in [
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+            KeyModifiers::SHIFT | KeyModifiers::META,
+        ] {
+            let mut app = app_with_prompt("keep");
+
+            let update = app.handle_key(modified_key(KeyCode::Enter, modifiers));
+
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(app.prompt.text(), "keep");
+        }
+
+        let mut active = App::default();
         active.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
         assert!(
             active
@@ -3433,6 +3933,7 @@ mod tests {
             key(KeyCode::Backspace),
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
         ] {
             assert!(!disabled.handle_key(event).visible_changed);
         }
@@ -3445,15 +3946,13 @@ mod tests {
             key(KeyCode::Backspace),
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
         ] {
             assert!(!configuration.handle_key(event).visible_changed);
         }
         assert_eq!(configuration.prompt.text(), "locked");
 
-        let mut bounded = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
+        let mut bounded = App::default();
         set_prompt(&mut bounded, &"a".repeat(MAX_PROMPT_BYTES - 1));
         assert!(
             bounded
@@ -3773,10 +4272,7 @@ mod tests {
             modified_key(KeyCode::Backspace, KeyModifiers::META),
             modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
         ] {
-            let mut app = App {
-                enhanced_keyboard: true,
-                ..App::default()
-            };
+            let mut app = App::default();
             set_prompt(&mut app, "one\ntwo");
             assert!(app.handle_key(event).visible_changed);
             assert_eq!(submitted_prompt(&mut app), "one\n");
@@ -3858,22 +4354,19 @@ mod tests {
         rendered(&mut app, 8, 8);
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(
             app.handle_key(modified_key(KeyCode::Home, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(
             app.handle_key(modified_key(KeyCode::End, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -3896,41 +4389,50 @@ mod tests {
         });
 
         assert!(app.handle_key(key(KeyCode::Up)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
-        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
         assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
         );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(app.handle_key(key(KeyCode::End)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
-    fn shift_enter_requires_keyboard_enhancement_but_plain_enter_still_submits() {
-        let mut plain = App::default();
-        type_prompt(&mut plain, "f");
-        assert!(
-            !plain
-                .handle_key(shifted_key(KeyCode::Enter))
-                .visible_changed
-        );
-        assert_eq!(submitted_prompt(&mut plain), "f");
+    fn control_j_edits_a_multiline_prompt_without_submitting() {
+        for code in ['j', 'J'] {
+            let mut app = App::default();
+            type_prompt(&mut app, "f");
 
-        let mut enhanced = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
-        type_prompt(&mut enhanced, "f");
-        assert!(
-            enhanced
-                .handle_key(shifted_key(KeyCode::Enter))
-                .visible_changed
-        );
-        type_prompt(&mut enhanced, "g");
-        assert_eq!(submitted_prompt(&mut enhanced), "f\ng");
+            let update = app.handle_key(modified_key(KeyCode::Char(code), KeyModifiers::CONTROL));
+
+            assert!(update.commands.is_empty());
+            assert!(update.visible_changed);
+            type_prompt(&mut app, "g");
+            assert_eq!(submitted_prompt(&mut app), "f\ng");
+        }
+
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::META,
+        ] {
+            let mut app = app_with_prompt("keep");
+
+            let update = app.handle_key(modified_key(KeyCode::Char('j'), modifiers));
+
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert_eq!(app.prompt.text(), "keep");
+        }
     }
 
     #[test]
@@ -3953,16 +4455,16 @@ mod tests {
     }
 
     #[test]
-    fn configured_header_without_keyboard_enhancement_omits_newline_hint() {
+    fn shift_enter_and_control_j_are_advertised_in_configured_header() {
         let mut app = App::default();
 
         let header = rendered(&mut app, 200, 4);
 
         assert!(header.starts_with("Status: idle | Enter submit"));
+        assert!(header.contains("Shift-Enter/Ctrl-J newline"));
         assert!(header.contains("Arrows edit | PgUp/PgDn scroll"));
         assert!(header.contains("Ctrl-C clear/quit"));
         assert!(!header.contains("Up/Down scroll"));
-        assert!(!header.contains("Shift-Enter newline"));
     }
 
     #[test]
@@ -3974,20 +4476,6 @@ mod tests {
         assert!(header.contains("Ctrl-T thinking"));
         assert!(!header.contains("reasoning"));
         assert!(!include_str!("../README.md").contains("reasoning"));
-    }
-
-    #[test]
-    fn configured_header_with_keyboard_enhancement_advertises_newline_hint() {
-        let mut app = App {
-            enhanced_keyboard: true,
-            ..App::default()
-        };
-
-        let header = rendered(&mut app, 120, 4);
-
-        assert!(header.starts_with("Status: idle | Enter submit"));
-        assert!(header.contains("Arrows edit | PgUp/PgDn scroll"));
-        assert!(header.contains("Shift-Enter newline"));
     }
 
     #[test]
@@ -4048,7 +4536,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(redraws, 2);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(
             input
                 .timeouts
@@ -4120,43 +4608,30 @@ mod tests {
     #[test]
     fn keyboard_enhancement_pops_before_terminal_restore_and_fails_soft() {
         let calls = RefCell::new(Vec::new());
-        let enabled = Cell::new(false);
         let result = {
             let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
             super::with_keyboard_enhancement(
                 || {
                     calls.borrow_mut().push("push");
-                    Ok(true)
+                    Ok(())
                 },
                 || calls.borrow_mut().push("pop"),
-                |available| {
-                    enabled.set(available);
-                    Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned()))
-                },
+                || Err::<(), _>(super::TuiError::Terminal("loop failed".to_owned())),
             )
         };
         assert!(result.is_err());
-        assert!(enabled.get());
         assert_eq!(calls.into_inner(), ["push", "pop", "restore"]);
 
-        for enable in [Ok(false), Err(io::Error::other("push failed"))] {
-            let calls = RefCell::new(Vec::new());
-            let enabled = Cell::new(true);
-            {
-                let _terminal_restore =
-                    super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
-                super::with_keyboard_enhancement(
-                    || enable,
-                    || calls.borrow_mut().push("pop"),
-                    |available| {
-                        enabled.set(available);
-                        calls.borrow_mut().push("run");
-                    },
-                );
-            }
-            assert!(!enabled.get());
-            assert_eq!(calls.into_inner(), ["run", "restore"]);
+        let calls = RefCell::new(Vec::new());
+        {
+            let _terminal_restore = super::RestoreGuard::new(|| calls.borrow_mut().push("restore"));
+            super::with_keyboard_enhancement(
+                || Err(io::Error::other("push failed")),
+                || calls.borrow_mut().push("pop"),
+                || calls.borrow_mut().push("run"),
+            );
         }
+        assert_eq!(calls.into_inner(), ["run", "restore"]);
 
         let calls = RefCell::new(Vec::new());
         let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -4164,13 +4639,10 @@ mod tests {
             super::with_keyboard_enhancement(
                 || {
                     calls.borrow_mut().push("push");
-                    Ok(true)
+                    Ok(())
                 },
                 || calls.borrow_mut().push("pop"),
-                |available| -> () {
-                    assert!(available);
-                    panic!("loop panic")
-                },
+                || panic!("loop panic"),
             );
         }));
         assert!(panic.is_err());
@@ -4281,11 +4753,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |enabled| {
-                                    assert!(enabled);
+                                || {
                                     calls.borrow_mut().push("run");
                                     Ok::<(), super::TuiError>(())
                                 },
@@ -4331,10 +4802,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |_| {
+                                || {
                                     calls.borrow_mut().push("run");
                                     Err::<(), _>(super::TuiError::Terminal(
                                         "loop failed".to_owned(),
@@ -4382,10 +4853,10 @@ mod tests {
                             super::with_keyboard_enhancement(
                                 || {
                                     calls.borrow_mut().push("keyboard enable");
-                                    Ok(true)
+                                    Ok(())
                                 },
                                 || calls.borrow_mut().push("keyboard disable"),
-                                |_| -> Result<(), super::TuiError> {
+                                || -> Result<(), super::TuiError> {
                                     calls.borrow_mut().push("run");
                                     panic!("loop panic")
                                 },
@@ -4572,7 +5043,7 @@ mod tests {
             !disabled_screen
                 .lines()
                 .next()
-                .is_some_and(|header| header.contains("Shift-Enter newline"))
+                .is_some_and(|header| header.contains("Shift-Enter/Ctrl-J newline"))
         );
 
         set_prompt(&mut app, "saved prompt");
@@ -4640,7 +5111,7 @@ mod tests {
         assert!(!newest.contains("request 1"));
 
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
 
         app.handle_key(history_home());
         let oldest = rendered(&mut app, 40, 7);
@@ -4649,6 +5120,166 @@ mod tests {
 
         app.handle_key(history_end());
         assert!(rendered(&mut app, 40, 7).contains("request 8"));
+    }
+
+    #[test]
+    fn transcript_anchored_append_preserves_numeric_top_and_text() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 40, 7);
+        assert!(app.handle_key(history_home()).visible_changed);
+        let oldest = rendered(&mut app, 40, 7);
+        let viewport = app.history_viewport.expect("history viewport");
+        let request_row = app.history_document_top().saturating_add(
+            oldest
+                .lines()
+                .position(|row| row.contains("request 1"))
+                .expect("oldest request")
+                .saturating_sub(usize::from(viewport.area.y)),
+        );
+        assert!(app.scroll_newer(request_row).visible_changed);
+        let anchored = rendered(&mut app, 40, 7);
+        let top = app.history_document_top();
+        let top_row = history_top_row(&anchored, viewport);
+        assert_eq!(top_row.trim(), "request 1");
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(9),
+                record: Record::UserRequest {
+                    request: "request 9".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 40, 7);
+
+        assert_eq!(app.history_document_top(), top);
+        assert_eq!(history_top_row(&after_append, viewport), top_row);
+        assert!(!after_append.contains("request 9"));
+    }
+
+    #[test]
+    fn transcript_following_append_stays_following_bottom_and_shows_newest_row() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 40, 7);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(9),
+                record: Record::UserRequest {
+                    request: "request 9".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 40, 7);
+
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(app.history_document_top(), app.newest_history_top());
+        assert!(after_append.contains("request 9"));
+    }
+
+    #[test]
+    fn transcript_streamed_markdown_reflow_preserves_numeric_anchor() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: format!(
+                    "[mutable][id]\n{}",
+                    (0..10)
+                        .map(|row| format!("row {row}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            },
+        });
+        let full = rendered(&mut app, 20, 20);
+        let viewport = app.history_viewport.expect("history viewport");
+        let mutable_row = app.history_document_top().saturating_add(
+            full.lines()
+                .position(|row| row.contains("[mutable"))
+                .expect("unresolved link")
+                .saturating_sub(usize::from(viewport.area.y)),
+        );
+
+        rendered(&mut app, 20, 6);
+        assert!(
+            mutable_row < app.newest_history_top(),
+            "mutable row {mutable_row}, newest top {}",
+            app.newest_history_top()
+        );
+        assert!(
+            app.scroll_older(app.newest_history_top().saturating_sub(mutable_row))
+                .visible_changed
+        );
+        let before_reflow = rendered(&mut app, 20, 6);
+        let viewport = app.history_viewport.expect("history viewport");
+        assert_eq!(app.history_position, HistoryPosition::Anchored(mutable_row));
+        let top_row = history_top_row(&before_reflow, viewport);
+        assert!(top_row.contains("[mutable"), "{top_row}");
+
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "\n\n[id]: https://example.test".to_owned(),
+            },
+        });
+        let after_reflow = rendered(&mut app, 20, 6);
+
+        assert_eq!(app.history_position, HistoryPosition::Anchored(mutable_row));
+        assert_eq!(app.history_document_top(), mutable_row);
+        assert_ne!(history_top_row(&after_reflow, viewport), top_row);
+        assert!(history_top_row(&after_reflow, viewport).contains("mutable"));
+    }
+
+    #[test]
+    fn transcript_reflow_shrink_resumes_following_after_anchor_clamps() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        app.handle_event(RuntimeEvent::ModelProgress {
+            run_id: RunId(1),
+            step_id: ModelStepId(1),
+            progress: ModelProgress::AssistantTextChunk {
+                text: "long live content ".repeat(40),
+            },
+        });
+        rendered(&mut app, 20, 6);
+        assert!(app.scroll_older(1).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "done".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        });
+        rendered(&mut app, 20, 6);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(2),
+                record: Record::UserRequest {
+                    request: "followed tail".to_owned(),
+                },
+            },
+            progress_gap: false,
+        });
+        let after_append = rendered(&mut app, 20, 6);
+
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(after_append.contains("followed tail"));
     }
 
     #[test]
@@ -4690,16 +5321,13 @@ mod tests {
 
         rendered(&mut app, 12, 5);
         assert!(app.history_rows > 2);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(app.handle_key(history_home()).visible_changed);
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(app.handle_key(history_end()).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -4718,9 +5346,10 @@ mod tests {
         }
         rendered(&mut app, 12, 5);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         let measured_rows = app.history_rows;
-        assert!(manual_scroll > 0);
+        let measured_height = app.history_height;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         for (width, height) in [(0, 0), (1, 2)] {
             let backend = TestBackend::new(width, height);
@@ -4729,20 +5358,25 @@ mod tests {
                 .draw(|frame| super::render(frame, &mut app))
                 .unwrap();
             assert_eq!(app.history_rows, measured_rows);
-            assert_eq!(app.scroll_from_bottom, manual_scroll);
+            assert_eq!(app.history_height, measured_height);
+            assert_eq!(app.history_position, position);
         }
 
+        assert!(!app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert_eq!(app.history_position, position);
+        assert!(app.handle_key(history_end()).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.handle_key(history_home()).visible_changed);
+        assert_eq!(app.history_position, position);
+
         rendered(&mut app, 12, 5);
-        assert_eq!(app.scroll_from_bottom, manual_scroll);
+        assert_eq!(app.history_position, position);
         rendered(&mut app, 120, 5);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
-    fn transcript_scrolling_clamps_after_authoritative_replacement() {
+    fn transcript_scrolling_preserves_oldest_anchor_after_authoritative_replacement() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -4754,8 +5388,7 @@ mod tests {
         });
         rendered(&mut app, 20, 6);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
-        assert!(manual_scroll > 0);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
 
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -4771,18 +5404,9 @@ mod tests {
         });
         rendered(&mut app, 20, 6);
 
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
-        assert!(app.scroll_from_bottom < manual_scroll);
-        let replacement_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         rendered(&mut app, 120, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            app.history_rows.saturating_sub(app.history_height)
-        );
-        assert!(app.scroll_from_bottom <= replacement_scroll);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
     }
 
     #[test]
@@ -4918,10 +5542,16 @@ mod tests {
         );
         assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
         assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 1);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(1))
+        );
         rendered_buffer(&mut app, 40, 7);
         assert!(app.tick(now + Duration::from_millis(100)).visible_changed);
-        assert_eq!(app.scroll_from_bottom, 2);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(2))
+        );
         rendered_buffer(&mut app, 40, 7);
 
         app.handle_mouse(
@@ -5249,7 +5879,8 @@ mod tests {
     fn edge_drag_scrolls_newer_and_stops_at_history_bounds() {
         let mut newer = app_with_history(App::default());
         rendered_buffer(&mut newer, 40, 7);
-        assert!(newer.update_scroll(usize::MAX).visible_changed);
+        assert!(newer.handle_key(history_home()).visible_changed);
+        assert_eq!(newer.history_position, HistoryPosition::Anchored(0));
         let visible = rendered_buffer(&mut newer, 40, 7);
         let (column, row) = cell_start(&visible, "request 1");
         let viewport = newer.history_viewport.expect("history viewport");
@@ -5266,9 +5897,8 @@ mod tests {
             ),
             now,
         );
-        let before = newer.scroll_from_bottom;
         assert!(newer.tick(now + super::POLL_INTERVAL).visible_changed);
-        assert_eq!(newer.scroll_from_bottom, before - 1);
+        assert_eq!(newer.history_position, HistoryPosition::Anchored(1));
 
         let mut older = app_with_history(App::default());
         let visible = rendered_buffer(&mut older, 40, 7);
@@ -5290,10 +5920,7 @@ mod tests {
         for cadence in 1..=older.history_rows {
             let _ = older.tick(now + super::POLL_INTERVAL * u32::try_from(cadence).unwrap());
         }
-        assert_eq!(
-            older.scroll_from_bottom,
-            older.history_rows.saturating_sub(older.history_height)
-        );
+        assert_eq!(older.history_position, HistoryPosition::Anchored(0));
         assert!(older.drag.is_some_and(|drag| drag.edge.is_none()));
         assert!(
             !older
@@ -5363,7 +5990,10 @@ mod tests {
 
         let redraws = run_transcript_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+        );
         assert_eq!(redraws, 2);
     }
 
@@ -5371,13 +6001,13 @@ mod tests {
     fn mouse_wheel_scrolls_transcript_towards_newest_history() {
         let mut app = app_with_history(App::default());
         rendered(&mut app, 40, 7);
-        assert!(app.update_scroll(3).visible_changed);
+        assert!(app.scroll_older(3).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
         run_transcript_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -5392,7 +6022,10 @@ mod tests {
 
         let redraws = run_configuration_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 3);
+        assert_eq!(
+            app.history_position,
+            HistoryPosition::Anchored(app.newest_history_top().saturating_sub(3))
+        );
         assert_eq!(redraws, 2);
     }
 
@@ -5401,13 +6034,13 @@ mod tests {
         let mut app =
             app_with_history(App::configuration(crate::config::ready_snapshot_for_test()));
         rendered(&mut app, 40, 7);
-        assert!(app.update_scroll(3).visible_changed);
+        assert!(app.scroll_older(3).visible_changed);
         let mut input =
             FakeInput::new([Some(mouse(MouseEventKind::ScrollDown)), Some(quit_event())]);
 
         run_configuration_loop(&mut app, &mut input);
 
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
     }
 
     #[test]
@@ -5891,7 +6524,7 @@ mod tests {
 
         rendered_at(&mut app, 80, 9, now);
         assert!(app.handle_key_at(history_home(), now).visible_changed);
-        assert!(app.scroll_from_bottom > 0);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
         assert!(rendered_at(&mut app, 80, 9, now).contains("• subagent:child1"));
     }
 
@@ -6126,7 +6759,7 @@ mod tests {
         let screen = rendered(&mut app, 33, 2);
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], "─ gpt-5.6-sol • thinking medium ─");
+        assert_eq!(rows[1], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 2);
         assert_eq!(buffer[(0, 1)].fg, super::THINKING_RULE_COLOURS[2]);
@@ -6148,7 +6781,7 @@ mod tests {
         let rows = screen.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1], "─".repeat(33));
-        assert_eq!(rows[2], "─ gpt-5.6-sol • thinking medium ─");
+        assert_eq!(rows[2], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 3);
         assert_eq!(buffer[(0, 2)].fg, super::THINKING_RULE_COLOURS[2]);
@@ -6180,7 +6813,7 @@ mod tests {
             normal_header
                 .lines()
                 .next()
-                .is_some_and(|header| !header.contains("Shift-Enter newline"))
+                .is_some_and(|header| header.contains("Shift-Enter/Ctrl-J newline"))
         );
 
         let three_rows = rendered(&mut app, 10, 3);
@@ -6194,7 +6827,7 @@ mod tests {
         let configuration_screen = rendered(&mut configuration, 80, 15);
         assert!(configuration_screen.starts_with("Configuration only:"));
         assert!(configuration_screen.contains("Startup configuration"));
-        assert!(!configuration_screen.contains("Shift-Enter newline"));
+        assert!(!configuration_screen.contains("Shift-Enter/Ctrl-J newline"));
         assert!(!configuration_screen.contains("> hidden"));
         assert!(!configuration_screen.contains('─'));
         assert_eq!(configuration.history_height, 14);
@@ -6216,28 +6849,25 @@ mod tests {
         }
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         set_prompt(&mut app, &"a".repeat(19));
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         set_prompt(&mut app, "");
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         set_prompt(&mut app, &"a".repeat(19));
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
-        let manual_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, position);
 
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(9) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -6250,25 +6880,18 @@ mod tests {
         });
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 7);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         set_prompt(&mut app, "");
         rendered(&mut app, 20, 12);
         assert_eq!(app.history_height, 8);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
-        let cached_scroll = app.scroll_from_bottom;
+        assert_eq!(app.history_position, position);
         let backend = TestBackend::new(0, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| super::render(frame, &mut app))
             .unwrap();
-        assert_eq!(app.scroll_from_bottom, cached_scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6433,7 +7056,7 @@ mod tests {
         let one = rendered(&mut app, 1, 4);
         assert_eq!(one.lines().nth(3), Some("…"));
         let narrow = rendered(&mut app, 29, 4);
-        assert_eq!(narrow.lines().nth(3), Some("─ ───────$0.2829 80.0%/272k ─"));
+        assert_eq!(narrow.lines().nth(3), Some("─ ────── $0.2829 80.0%/272k ─"));
     }
 
     #[test]
@@ -6528,7 +7151,7 @@ mod tests {
         }
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(5) });
         app.handle_event(RuntimeEvent::ModelProgress {
@@ -6541,11 +7164,11 @@ mod tests {
         });
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         assert!(app.handle_key(history_home()).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
-        assert!(manual_scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
                 run_id: RunId(5),
@@ -6560,10 +7183,7 @@ mod tests {
         });
         rendered(&mut app, 20, 5);
         assert_eq!(app.history_height, 1);
-        assert_eq!(
-            app.scroll_from_bottom,
-            manual_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6574,17 +7194,17 @@ mod tests {
         }
         rendered(&mut app, 20, 5);
         app.handle_key(history_home());
-        let scroll = app.scroll_from_bottom;
-        assert!(scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
 
         rendered(&mut app, 20, 0);
-        assert_eq!(app.scroll_from_bottom, scroll);
+        assert_eq!(app.history_position, position);
         let backend = TestBackend::new(0, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| super::render(frame, &mut app))
             .unwrap();
-        assert_eq!(app.scroll_from_bottom, scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6656,7 +7276,7 @@ mod tests {
             app.handle_event(completed_record(1, step, &format!("line_{step}"), vec![]));
         }
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(2),
@@ -6666,13 +7286,13 @@ mod tests {
             },
         });
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
 
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
-        let manual_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         app.handle_event(completed_record(2, 5, "settled", vec![]));
         rendered(&mut app, 50, 5);
-        assert_eq!(app.scroll_from_bottom, manual_scroll);
+        assert_eq!(app.history_position, position);
     }
 
     #[test]
@@ -6841,7 +7461,7 @@ mod tests {
     }
 
     #[test]
-    fn controls_redraw_only_when_visible_and_clamp_scroll_after_height_reductions() {
+    fn controls_redraw_only_when_visible_and_preserve_oldest_anchor_after_height_reductions() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -6868,38 +7488,32 @@ mod tests {
             progress_gap: false,
         });
         rendered(&mut app, 20, 6);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
         assert!(app.handle_key(history_home()).visible_changed);
-        let expanded_scroll = app.scroll_from_bottom;
-        assert!(expanded_scroll > 0);
+        let position = app.history_position;
+        assert_eq!(position, HistoryPosition::Anchored(0));
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            expanded_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         rendered(&mut app, 20, 6);
         app.handle_key(history_home());
-        let reasoning_scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .visible_changed
         );
         rendered(&mut app, 20, 6);
-        assert_eq!(
-            app.scroll_from_bottom,
-            reasoning_scroll.min(app.history_rows.saturating_sub(app.history_height))
-        );
+        assert_eq!(app.history_position, position);
 
         let backend = TestBackend::new(40, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6959,7 +7573,7 @@ mod tests {
         ));
         rendered(&mut app, 20, 5);
         app.handle_key(history_home());
-        let scroll = app.scroll_from_bottom;
+        let position = app.history_position;
         for (width, height) in [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (3, 3)] {
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
             let backend = TestBackend::new(width, height);
@@ -6968,7 +7582,7 @@ mod tests {
                 .draw(|frame| super::render(frame, &mut app))
                 .unwrap();
             if width == 0 {
-                assert_eq!(app.scroll_from_bottom, scroll);
+                assert_eq!(app.history_position, position);
             }
         }
     }
