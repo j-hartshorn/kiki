@@ -23,6 +23,7 @@ use crate::{
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
         OpaqueReplayItem, ProviderFailure, ProviderReplay,
     },
+    subagents::ChildModelFactory,
 };
 
 const OPENAI_PROVIDER: &str = "openai";
@@ -47,6 +48,27 @@ pub(crate) struct OpenAiModel {
     api_key: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct OpenAiChildModelFactory {
+    api_key: String,
+}
+
+impl OpenAiChildModelFactory {
+    pub(crate) fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+        }
+    }
+}
+
+impl ChildModelFactory for OpenAiChildModelFactory {
+    type Model = OpenAiModel;
+
+    fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
+        OpenAiModel::with_fixed_selection(prompt, self.api_key.clone(), selection)
+    }
+}
+
 impl OpenAiModel {
     #[cfg(test)]
     pub(crate) fn new(
@@ -67,6 +89,16 @@ impl OpenAiModel {
         settings: watch::Receiver<ModelSelection>,
     ) -> Self {
         Self::build(prompt.into(), api_key.into(), settings, OPENAI_API_BASE)
+    }
+
+    pub(crate) fn with_fixed_selection(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        selection: ModelSelection,
+    ) -> Self {
+        let (sender, settings) = watch::channel(selection);
+        drop(sender);
+        Self::with_settings(prompt, api_key, settings)
     }
 
     fn build(
@@ -539,7 +571,7 @@ impl OpenAiModel {
                     presentation.flush_all(progress);
                     let accounting = terminal_accounting.expect("terminal response accounting");
                     return self
-                        .completed_step(history, response, &mut content)
+                        .completed_step(selection, history, response, &mut content)
                         .map(|mut step| {
                             step.attempts.push(accounting.clone());
                             step
@@ -662,6 +694,7 @@ impl OpenAiModel {
 
     fn completed_step(
         &self,
+        selection: ModelSelection,
         history: &ModelHistory,
         response: WireResponse,
         content: &mut ApplicationContentGuard,
@@ -700,6 +733,7 @@ impl OpenAiModel {
         );
         Ok(ModelStep {
             action,
+            selection: Some(selection),
             reasoning_summary,
             replay,
             attempts: Vec::new(),
@@ -1480,7 +1514,6 @@ fn hexadecimal(character: char) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum WireEvent {
@@ -1492,16 +1525,19 @@ enum WireEvent {
     InProgress,
     #[serde(rename = "response.completed")]
     Completed {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
     #[serde(rename = "response.failed")]
     Failed {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
     #[serde(rename = "response.incomplete")]
     Incomplete {
+        #[cfg(test)]
         sequence_number: u64,
         response: WireResponse,
     },
@@ -1553,6 +1589,7 @@ enum WireEvent {
     },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryDelta {
+        #[cfg(test)]
         sequence_number: u64,
         output_index: usize,
         summary_index: usize,
@@ -1566,6 +1603,7 @@ enum WireEvent {
     },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionArgumentsDelta {
+        #[cfg(test)]
         sequence_number: u64,
         output_index: usize,
         item_id: String,
@@ -1579,6 +1617,7 @@ enum WireEvent {
     },
     #[serde(rename = "error")]
     Error {
+        #[cfg(test)]
         sequence_number: u64,
         code: Option<String>,
         message: String,
@@ -1587,9 +1626,9 @@ enum WireEvent {
     Unexpected,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct WireResponse {
+    #[cfg(test)]
     id: String,
     status: WireStatus,
     #[serde(default)]
@@ -1680,6 +1719,12 @@ mod tests {
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"code\\\":\\\"print(1)\\\"}\"}\n\n",
         "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":23,\"input_tokens_details\":{\"cached_tokens\":5,\"cache_write_tokens\":7},\"output_tokens\":11,\"output_tokens_details\":{\"reasoning_tokens\":3},\"total_tokens\":34}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    const COMPLETED_STREAM_WITHOUT_USAGE: &str = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"code\\\":\\\"print(1)\\\"}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}]}}\n\n",
         "data: [DONE]\n\n",
     );
     const FAILED_STREAM: &str = concat!(
@@ -1790,6 +1835,10 @@ mod tests {
         };
         assert_eq!(usage.model, SOL.id);
         assert_eq!(
+            step.selection,
+            Some(ModelSelection::new(&SOL, "high").unwrap())
+        );
+        assert_eq!(
             crate::pricing::estimate_usage(usage)
                 .unwrap()
                 .pricing()
@@ -1844,10 +1893,62 @@ mod tests {
             panic!("completed retry should report known usage")
         };
         assert_eq!(usage.model, SOL.id);
+        assert_eq!(step.selection, Some(selection_a));
         assert_eq!(
             crate::pricing::estimate_usage(usage).unwrap().pricing(),
             SOL.pricing.identity
         );
+    }
+
+    #[test]
+    fn fixed_selection_does_not_follow_foreground_settings() {
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, foreground_settings) = watch::channel(selection_a);
+        let mut foreground =
+            super::OpenAiModel::with_settings("system prompt", "fixture-key", foreground_settings);
+        let mut fixed =
+            super::OpenAiModel::with_fixed_selection("system prompt", "fixture-key", selection_a);
+
+        settings.send_replace(selection_b);
+
+        assert_eq!(*foreground.settings.borrow_and_update(), selection_b);
+        assert_eq!(*fixed.settings.borrow_and_update(), selection_a);
+    }
+
+    #[tokio::test]
+    async fn a_successful_step_keeps_its_selection_when_usage_is_unavailable() {
+        let allow_reply = Arc::new(Notify::new());
+        let fixture = Fixture::start(FixtureReply::GatedSse {
+            body: COMPLETED_STREAM_WITHOUT_USAGE,
+            allow: allow_reply.clone(),
+        })
+        .await;
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
+            "system prompt",
+            "fixture-key",
+            selection_receiver,
+            &fixture.endpoint,
+        );
+        let step_history = history();
+        let task = tokio::spawn(async move {
+            let cancellation = CancellationToken::new();
+            let mut progress = |_| {};
+            model
+                .step(&step_history, &cancellation, &mut progress)
+                .await
+        });
+
+        fixture.wait_for_requests(1).await;
+        settings.send_replace(selection_b);
+        allow_reply.notify_one();
+        let step = task.await.unwrap().unwrap();
+
+        assert_eq!(step.attempts, [AttemptAccounting::UsageUnavailable]);
+        assert_eq!(step.selection, Some(selection_a));
     }
 
     #[tokio::test]
@@ -5137,7 +5238,7 @@ mod tests {
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
     const LIVE_SETUP_CONFIGURATION: &str =
-        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.21";
+        "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
     const LIVE_SETUP_READ_TOOL: &str =
         "live test could not initialise the workspace read capability";
     const LIVE_SETUP_ARENA: &str = "live test could not initialise the Monty arena";
@@ -5331,6 +5432,10 @@ mod tests {
                 | RuntimeEvent::RunPreviewUpdated { .. }
                 | RuntimeEvent::StdoutDelta { .. }
                 | RuntimeEvent::StdoutTruncated { .. }
+                | RuntimeEvent::SubagentSpawned { .. }
+                | RuntimeEvent::SubagentStatus { .. }
+                | RuntimeEvent::SubagentRecord { .. }
+                | RuntimeEvent::SubagentFinished { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
@@ -5415,28 +5520,40 @@ mod tests {
 
     async fn start_live_controller() -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
-        let (worker_path, workspace_root, prompt, api_key, selection) = {
+        let persisted_settings = configuration.snapshot().settings().clone();
+        let (worker_path, workspace_root, prompt, prompt_base, api_key, selection, policy) = {
             let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
                 ready.system_prompt().to_owned(),
+                ready.prompt_base().to_owned(),
                 ready.api_key().expose().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),
+                configuration.snapshot().subagents(),
             )
         };
         let (settings, model_settings) = watch::channel(selection);
-        let model = super::OpenAiModel::with_settings(prompt, api_key, model_settings);
+        let model = super::OpenAiModel::with_settings(prompt, api_key.clone(), model_settings);
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
         let arena = crate::arena::Arena::new(worker_path, tool_host)
             .await
             .map_err(|_| LIVE_SETUP_ARENA)?;
+        let subagents = crate::subagents::SubagentCoordinator::new(
+            crate::subagents::SubagentPolicy::from(policy),
+            Arc::new(crate::subagents::CompleteChildRunner::new(
+                prompt_base,
+                super::OpenAiChildModelFactory::new(api_key.clone()),
+            )),
+        );
         let runtime = crate::runtime::RuntimeController::new(
             crate::agent::Agent::new(arena, model),
             settings,
+            persisted_settings,
+            subagents,
         );
         let (commands, command_receiver) = mpsc::channel(8);
         let (event_sender, events) = mpsc::unbounded_channel();

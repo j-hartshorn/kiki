@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT};
+use crate::config::{
+    ModelSelection,
+    constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
@@ -25,6 +28,7 @@ pub enum ModelAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStep {
     pub action: ModelAction,
+    pub selection: Option<ModelSelection>,
     pub reasoning_summary: String,
     pub replay: ProviderReplay,
     pub attempts: Vec<AttemptAccounting>,
@@ -518,6 +522,7 @@ impl Model for ScriptedModel {
             };
             Ok(ModelStep {
                 action,
+                selection: None,
                 reasoning_summary: String::new(),
                 replay,
                 attempts: Vec::new(),
@@ -589,6 +594,7 @@ mod tests {
                 call_id: ModelCallId::new("scripted-1-1"),
             }
         );
+        assert_eq!(step.selection, None);
         assert_eq!(step.replay.provider(), "scripted");
         assert_eq!(step.replay.items()[0].as_bytes(), b"scripted-1-1");
         assert_eq!(step.reasoning_summary, "");

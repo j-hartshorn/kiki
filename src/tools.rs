@@ -57,6 +57,11 @@ pub(crate) enum ToolName {
     Glob,
     Grep,
     Run,
+    StartSubagent,
+    GetSubagent,
+    RefreshSubagent,
+    WaitSubagent,
+    CancelSubagent,
 }
 
 impl ToolName {
@@ -69,6 +74,11 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Run => "run",
+            Self::StartSubagent => "start_subagent",
+            Self::GetSubagent => "get_subagent",
+            Self::RefreshSubagent => "refresh_subagent",
+            Self::WaitSubagent => "wait_subagent",
+            Self::CancelSubagent => "cancel_subagent",
         }
     }
 
@@ -81,6 +91,11 @@ impl ToolName {
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
             Self::Run => "_kiki_run",
+            Self::StartSubagent => "_kiki_start_subagent",
+            Self::GetSubagent => "_kiki_get_subagent",
+            Self::RefreshSubagent => "_kiki_refresh_subagent",
+            Self::WaitSubagent => "_kiki_wait_subagent",
+            Self::CancelSubagent => "_kiki_cancel_subagent",
         }
     }
 
@@ -93,6 +108,21 @@ impl ToolName {
 
     pub(crate) fn label(self) -> &'static str {
         self.name()
+    }
+
+    fn is_allowed_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::Read
+                | Self::ListDir
+                | Self::Glob
+                | Self::Grep
+                | Self::StartSubagent
+                | Self::GetSubagent
+                | Self::RefreshSubagent
+                | Self::WaitSubagent
+                | Self::CancelSubagent
+        )
     }
 
     pub(crate) fn count_label(self, count: usize) -> &'static str {
@@ -108,6 +138,16 @@ impl ToolName {
             }
             (Self::Run, _) => {
                 unreachable!("commands have exit or signal summaries rather than counts")
+            }
+            (
+                Self::StartSubagent
+                | Self::GetSubagent
+                | Self::RefreshSubagent
+                | Self::WaitSubagent
+                | Self::CancelSubagent,
+                _,
+            ) => {
+                unreachable!("subagent calls have identifier summaries rather than counts")
             }
         }
     }
@@ -129,7 +169,12 @@ impl ToolCall {
             | ToolName::ListDir
             | ToolName::Glob
             | ToolName::Grep
-            | ToolName::Run => None,
+            | ToolName::Run
+            | ToolName::StartSubagent
+            | ToolName::GetSubagent
+            | ToolName::RefreshSubagent
+            | ToolName::WaitSubagent
+            | ToolName::CancelSubagent => None,
         }
     }
 }
@@ -151,9 +196,13 @@ pub(crate) enum MutationStatus {
 impl ToolResult {
     #[cfg(test)]
     pub(crate) fn without_effect(result: ToolValue) -> Self {
+        Self::from_result(0, Ok(result))
+    }
+
+    pub(crate) fn from_result(call_id: u32, result: Result<ToolValue, ToolError>) -> Self {
         Self {
-            call_id: 0,
-            result: Ok(result),
+            call_id,
+            result,
             effect: None,
         }
     }
@@ -230,15 +279,15 @@ impl ToolError {
         Self::new(ToolErrorKind::Type, message)
     }
 
-    fn permission(message: impl Into<String>) -> Self {
+    pub(crate) fn permission(message: impl Into<String>) -> Self {
         Self::new(ToolErrorKind::Permission, message)
     }
 
-    fn value(message: impl Into<String>) -> Self {
+    pub(crate) fn value(message: impl Into<String>) -> Self {
         Self::new(ToolErrorKind::Value, message)
     }
 
-    fn runtime(message: impl Into<String>) -> Self {
+    pub(crate) fn runtime(message: impl Into<String>) -> Self {
         Self::new(ToolErrorKind::Runtime, message)
     }
 
@@ -564,7 +613,45 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
 ];
 
 pub(crate) fn bootstrap_source() -> String {
-    let records = record_definitions()
+    tool_source(false)
+}
+
+pub(crate) fn prompt_reference() -> String {
+    prompt_reference_for(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), false)
+}
+
+fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
+    let records = record_definitions(definitions)
+        .into_iter()
+        .map(ToolRecord::bootstrap_definition)
+        .collect::<Vec<_>>();
+    let definitions = definitions
+        .iter()
+        .map(|definition| definition.prompt_skeleton())
+        .collect::<Vec<_>>();
+    let source = [
+        Some("from dataclasses import dataclass".to_owned()),
+        (!records.is_empty()).then(|| records.join("\n\n")),
+        (!definitions.is_empty()).then(|| definitions.join("\n\n")),
+        Some(invocation_source(true)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let availability_guidance = if read_only {
+        " This Arena is read-only; write, edit, and run are unavailable."
+    } else {
+        " Run project-local, one-shot commands."
+    };
+    format!(
+        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+    )
+}
+
+fn tool_source(reference: bool) -> String {
+    let definitions = ACTIVE_TOOLS.iter().collect::<Vec<_>>();
+    let records = record_definitions(&definitions)
         .into_iter()
         .map(ToolRecord::bootstrap_definition)
         .collect::<Vec<_>>();
@@ -573,13 +660,10 @@ pub(crate) fn bootstrap_source() -> String {
         .map(|definition| definition.bootstrap_wrapper())
         .collect::<Vec<_>>();
     [
-        (!records.is_empty()).then(|| {
-            format!(
-                "from dataclasses import dataclass\n\n{}",
-                records.join("\n\n")
-            )
-        }),
+        Some("from dataclasses import dataclass".to_owned()),
+        (!records.is_empty()).then(|| records.join("\n\n")),
         (!wrappers.is_empty()).then(|| wrappers.join("\n\n")),
+        Some(invocation_source(reference)),
     ]
     .into_iter()
     .flatten()
@@ -587,36 +671,74 @@ pub(crate) fn bootstrap_source() -> String {
     .join("\n\n")
 }
 
-pub(crate) fn prompt_reference() -> String {
-    let records = record_definitions()
-        .into_iter()
-        .map(ToolRecord::bootstrap_definition)
-        .collect::<Vec<_>>();
-    let definitions = ACTIVE_TOOLS
+const SUBAGENT_STATUS_FIELDS: &[(&str, &str)] = &[
+    ("id", "str"),
+    ("state", "str"),
+    ("model", "str"),
+    ("thinking", "str"),
+    ("step_count", "int"),
+    ("elapsed_ms", "int"),
+    ("observed_at_ms", "int"),
+    ("estimated_cost_usd", "float | None"),
+    ("cost_status", "str"),
+    ("error", "str | None"),
+];
+
+const SUBAGENT_TASK_FIELDS: &[(&str, &str)] = &[("id", "str"), ("status", "SubagentStatus")];
+
+fn interface_fields_source(fields: &[(&str, &str)]) -> String {
+    fields
         .iter()
-        .map(|definition| definition.prompt_skeleton())
-        .collect::<Vec<_>>();
-    let source = [
-        (!records.is_empty()).then(|| {
-            format!(
-                "from dataclasses import dataclass\n\n{}",
-                records.join("\n\n")
-            )
-        }),
-        (!definitions.is_empty()).then(|| definitions.join("\n\n")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n\n");
+        .map(|(name, annotation)| format!("    {name}: {annotation}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn invocation_source(reference: bool) -> String {
+    let refresh = if reference {
+        "        ..."
+    } else {
+        "        self.status = SubagentStatus(**await _kiki_refresh_subagent(self.id))\n        return self.status"
+    };
+    let wait = if reference {
+        "        ..."
+    } else {
+        "        outcome = await _kiki_wait_subagent(self.id)\n        self.status = SubagentStatus(**outcome['status'])\n        if outcome['outcome'] == 'completed':\n            return outcome['result']\n        if outcome['outcome'] == 'timed_out':\n            raise TimeoutError(outcome['error'])\n        raise RuntimeError(outcome['error'])"
+    };
+    let cancel = if reference {
+        "        ..."
+    } else {
+        "        self.status = SubagentStatus(**await _kiki_cancel_subagent(self.id))\n        return self.status"
+    };
+    let constructor = (!reference).then_some(
+        "\n\n    def __init__(self, value: dict):\n        self.id = value['id']\n        self.status = SubagentStatus(**value['status'])",
+    );
+    let start = if reference {
+        "    ..."
+    } else {
+        "    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))"
+    };
+    let run = if reference {
+        "    ..."
+    } else {
+        "    return await (await start_subagent(prompt, model, read_only)).wait()"
+    };
+    let get = if reference {
+        "    ..."
+    } else {
+        "    return SubagentTask(await _kiki_get_subagent(id))"
+    };
     format!(
-        "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables. Run project-local, one-shot commands. Keep model-visible output focused. The whole Arena execution has a five-minute deadline.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
+        "@dataclass\nclass SubagentStatus:\n{}\n\nclass SubagentTask:\n{}{}\n\n    async def refresh(self) -> SubagentStatus:\n{refresh}\n\n    async def wait(self) -> dict:\n{wait}\n\n    async def cancel(self) -> SubagentStatus:\n{cancel}\n\nasync def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n    \"\"\"Start a subagent and return its task handle.\"\"\"\n{start}\n\nasync def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n    \"\"\"Start a subagent and wait for its result.\"\"\"\n{run}\n\nasync def get_subagent(id: str) -> SubagentTask:\n    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n{get}",
+        interface_fields_source(SUBAGENT_STATUS_FIELDS),
+        interface_fields_source(SUBAGENT_TASK_FIELDS),
+        constructor.unwrap_or_default(),
     )
 }
 
-fn record_definitions() -> Vec<&'static ToolRecord> {
-    let mut records: Vec<&'static ToolRecord> = Vec::new();
-    for definition in ACTIVE_TOOLS {
+fn record_definitions<'a>(definitions: &'a [&'a ToolDefinition]) -> Vec<&'a ToolRecord> {
+    let mut records: Vec<&ToolRecord> = Vec::new();
+    for definition in definitions {
         let Some(record) = definition.result.record() else {
             continue;
         };
@@ -919,9 +1041,11 @@ impl<'a> BatchDispatch<'a> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
     limits: ToolLimits,
+    read_only: bool,
     #[cfg(test)]
     write_test_hook: Option<WriteTestHook>,
     #[cfg(test)]
@@ -1540,6 +1664,7 @@ impl ToolHost {
         Ok(Self {
             workspace,
             limits,
+            read_only: false,
             #[cfg(test)]
             write_test_hook: None,
             #[cfg(test)]
@@ -1553,6 +1678,20 @@ impl ToolHost {
             #[cfg(test)]
             command_test_gate: None,
         })
+    }
+
+    pub(crate) fn for_child(&self, requested_read_only: bool) -> Self {
+        let mut child = self.clone();
+        child.read_only |= requested_read_only;
+        child
+    }
+
+    pub(crate) fn prompt_reference(&self) -> String {
+        let definitions = ACTIVE_TOOLS
+            .iter()
+            .filter(|definition| !self.read_only || definition.name.is_allowed_read_only())
+            .collect::<Vec<_>>();
+        prompt_reference_for(&definitions, self.read_only)
     }
 
     #[cfg(test)]
@@ -1647,6 +1786,15 @@ impl ToolHost {
             tool,
             arguments,
         } = call;
+        if self.read_only && !tool.is_allowed_read_only() {
+            return ToolResult {
+                call_id,
+                result: Err(ToolError::permission(
+                    "tool is unavailable in a read-only arena",
+                )),
+                effect: None,
+            };
+        }
         #[cfg(test)]
         let batch_call = self
             .batch_test_gate
@@ -1664,6 +1812,13 @@ impl ToolHost {
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
             ToolName::Run => self.run(call_id, arguments, output).await,
+            ToolName::StartSubagent
+            | ToolName::GetSubagent
+            | ToolName::RefreshSubagent
+            | ToolName::WaitSubagent
+            | ToolName::CancelSubagent => Err(ToolError::runtime(
+                "subagent calls require an arena invocation context",
+            )),
         };
         match result {
             Ok(ToolOutput { result, effect }) => ToolResult {
@@ -3555,7 +3710,7 @@ mod tests {
         ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolEffect, ToolError, ToolErrorKind, ToolHost,
         ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
         WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
-        normalise_path, open_content_no_follow, open_parent, prompt_reference,
+        invocation_source, normalise_path, open_content_no_follow, open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
@@ -6666,6 +6821,72 @@ mod tests {
     }
 
     #[test]
+    fn generated_subagent_interface_separates_reference_from_runtime_transport() {
+        let expected_reference = concat!(
+            "@dataclass\n",
+            "class SubagentStatus:\n",
+            "    id: str\n",
+            "    state: str\n",
+            "    model: str\n",
+            "    thinking: str\n",
+            "    step_count: int\n",
+            "    elapsed_ms: int\n",
+            "    observed_at_ms: int\n",
+            "    estimated_cost_usd: float | None\n",
+            "    cost_status: str\n",
+            "    error: str | None\n\n",
+            "class SubagentTask:\n",
+            "    id: str\n",
+            "    status: SubagentStatus\n\n",
+            "    async def refresh(self) -> SubagentStatus:\n",
+            "        ...\n\n",
+            "    async def wait(self) -> dict:\n",
+            "        ...\n\n",
+            "    async def cancel(self) -> SubagentStatus:\n",
+            "        ...\n\n",
+            "async def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:\n",
+            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n",
+            "    ...\n\n",
+            "async def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:\n",
+            "    \"\"\"Start a subagent and wait for its result.\"\"\"\n",
+            "    ...\n\n",
+            "async def get_subagent(id: str) -> SubagentTask:\n",
+            "    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n",
+            "    ..."
+        );
+        let expected_runtime = expected_reference.replace(
+            "    async def refresh(self) -> SubagentStatus:\n        ...",
+            "    def __init__(self, value: dict):\n        self.id = value['id']\n        self.status = SubagentStatus(**value['status'])\n\n    async def refresh(self) -> SubagentStatus:\n        self.status = SubagentStatus(**await _kiki_refresh_subagent(self.id))\n        return self.status",
+        )
+        .replace(
+            "    async def wait(self) -> dict:\n        ...",
+            "    async def wait(self) -> dict:\n        outcome = await _kiki_wait_subagent(self.id)\n        self.status = SubagentStatus(**outcome['status'])\n        if outcome['outcome'] == 'completed':\n            return outcome['result']\n        if outcome['outcome'] == 'timed_out':\n            raise TimeoutError(outcome['error'])\n        raise RuntimeError(outcome['error'])",
+        )
+        .replace(
+            "    async def cancel(self) -> SubagentStatus:\n        ...",
+            "    async def cancel(self) -> SubagentStatus:\n        self.status = SubagentStatus(**await _kiki_cancel_subagent(self.id))\n        return self.status",
+        )
+        .replace(
+            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    ...",
+            "    \"\"\"Start a subagent and return its task handle.\"\"\"\n    return SubagentTask(await _kiki_start_subagent(prompt, model, read_only))",
+        )
+        .replace(
+            "    \"\"\"Start a subagent and wait for its result.\"\"\"\n    ...",
+            "    \"\"\"Start a subagent and wait for its result.\"\"\"\n    return await (await start_subagent(prompt, model, read_only)).wait()",
+        )
+        .replace(
+            "    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n    ...",
+            "    \"\"\"Return an authorised subagent task handle by ID.\"\"\"\n    return SubagentTask(await _kiki_get_subagent(id))",
+        );
+
+        assert_eq!(invocation_source(true), expected_reference);
+        assert_eq!(invocation_source(false), expected_runtime);
+        assert!(prompt_reference().contains(expected_reference));
+        assert!(!prompt_reference().contains("def __init__(self, value: dict):"));
+        assert!(bootstrap_source().contains(&expected_runtime));
+    }
+
+    #[test]
     fn generated_sources_share_active_tool_definitions() {
         assert_eq!(
             ACTIVE_TOOLS
@@ -6684,44 +6905,47 @@ mod tests {
         );
         assert_eq!(
             bootstrap_source(),
-            concat!(
-                "from dataclasses import dataclass\n\n",
-                "@dataclass\n",
-                "class DirectoryEntry:\n",
-                "    path: str\n",
-                "    kind: str\n",
-                "    size_bytes: int | None\n\n",
-                "@dataclass\n",
-                "class GrepMatch:\n",
-                "    path: str\n",
-                "    line: int\n",
-                "    text: str\n\n",
-                "@dataclass\n",
-                "class CommandResult:\n",
-                "    exit_code: int | None\n",
-                "    stdout: str\n",
-                "    stderr: str\n\n",
-                "async def read(path: str) -> str:\n",
-                "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
-                "    return await _kiki_read(path)\n\n",
-                "async def write(path: str, content: str) -> None:\n",
-                "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
-                "    await _kiki_write(path, content)\n\n",
-                "async def edit(path: str, old: str, new: str) -> None:\n",
-                "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
-                "    await _kiki_edit(path, old, new)\n\n",
-                "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
-                "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
-                "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
-                "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
-                "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
-                "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
-                "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
-                "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
-                "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
-                "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
-                "    \"\"\"Run one project-local shell command.\"\"\"\n",
-                "    return CommandResult(**await _kiki_run(command, cwd))"
+            format!(
+                concat!(
+                    "from dataclasses import dataclass\n\n",
+                    "@dataclass\n",
+                    "class DirectoryEntry:\n",
+                    "    path: str\n",
+                    "    kind: str\n",
+                    "    size_bytes: int | None\n\n",
+                    "@dataclass\n",
+                    "class GrepMatch:\n",
+                    "    path: str\n",
+                    "    line: int\n",
+                    "    text: str\n\n",
+                    "@dataclass\n",
+                    "class CommandResult:\n",
+                    "    exit_code: int | None\n",
+                    "    stdout: str\n",
+                    "    stderr: str\n\n",
+                    "async def read(path: str) -> str:\n",
+                    "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
+                    "    return await _kiki_read(path)\n\n",
+                    "async def write(path: str, content: str) -> None:\n",
+                    "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
+                    "    await _kiki_write(path, content)\n\n",
+                    "async def edit(path: str, old: str, new: str) -> None:\n",
+                    "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
+                    "    await _kiki_edit(path, old, new)\n\n",
+                    "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
+                    "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
+                    "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
+                    "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
+                    "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
+                    "    return [DirectoryEntry(**row) for row in await _kiki_glob(pattern, path)]\n\n",
+                    "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:\n",
+                    "    \"\"\"Search workspace file contents with a regular expression.\"\"\"\n",
+                    "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
+                    "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
+                    "    \"\"\"Run one project-local shell command.\"\"\"\n",
+                    "    return CommandResult(**await _kiki_run(command, cwd))\n\n{}"
+                ),
+                invocation_source(false)
             )
         );
         let reference = prompt_reference();
@@ -6741,7 +6965,75 @@ mod tests {
         assert_eq!(reference.matches("class CommandResult:").count(), 1);
         assert!(reference.contains("Do not redefine these host functions."));
         assert!(reference.contains("Run project-local, one-shot commands."));
+        assert!(reference.contains("five minutes of chargeable time"));
+        assert!(reference.contains(
+            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged."
+        ));
+        assert!(!reference.contains("five-minute deadline"));
         assert!(reference.contains("    ..."));
+    }
+
+    #[tokio::test]
+    async fn read_only_child_tool_hosts_narrow_prompts_and_deny_effects() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("file"), "before").unwrap();
+        let root = tool_host(&workspace).await;
+        let root_reference = prompt_reference();
+        assert_eq!(root.prompt_reference(), root_reference);
+        assert_eq!(root.for_child(false).prompt_reference(), root_reference);
+
+        let child = root.for_child(true);
+        let reference = child.prompt_reference();
+        for signature in [
+            "async def read(path: str) -> str:",
+            "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:",
+            "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
+            "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
+        ] {
+            assert_eq!(reference.matches(signature).count(), 1);
+        }
+        for omitted in [
+            "async def write(",
+            "async def edit(",
+            "async def run(",
+            "class CommandResult:",
+            "Run project-local, one-shot commands.",
+        ] {
+            assert!(
+                !reference.contains(omitted),
+                "restricted reference retained {omitted}"
+            );
+        }
+
+        let descendant = child.for_child(false);
+        assert_eq!(descendant.prompt_reference(), reference);
+        assert_eq!(read(&descendant, "file").await.unwrap(), "before");
+
+        let path = normalise_path("file").unwrap();
+        let digest = content_fingerprint(b"before");
+        let mut authorisations = WholeFileAuthorisations::default();
+        authorisations.authorise(path.clone(), digest);
+        for call in [
+            batch_write(1, "created", "write"),
+            batch_edit(2, "file", "before", "after"),
+            batch_run(3, "printf run > command-effect", None),
+        ] {
+            let before = authorisations.clone();
+            let result = descendant.call_with_authorisation(call, Some(digest)).await;
+            assert!(matches!(
+                &result.result,
+                Err(error) if error.kind == ToolErrorKind::Permission
+            ));
+            assert!(result.effect.is_none());
+            result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+            assert_eq!(authorisations, before);
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("file")).unwrap(),
+            "before"
+        );
+        assert!(!workspace.path().join("created").exists());
+        assert!(!workspace.path().join("command-effect").exists());
     }
 
     #[tokio::test]

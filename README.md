@@ -7,14 +7,14 @@ Kiki runs a production OpenAI Responses API agent against the standard OpenAI en
 Install the exact Monty worker:
 
 ```sh
-cargo install monty-runtime --version 0.0.21 --locked --root /tmp/kiki-monty-0.0.21
+cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
 ```
 
 Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
-export MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty
+export MONTY_BIN=/tmp/kiki-monty/bin/monty
 export KIKI_SYSTEM_PROMPT=/absolute/path/to/read_only_agent.md
 export KIKI_MODEL=openai/gpt-5.6-terra
 export KIKI_THINKING=high
@@ -56,6 +56,35 @@ model = "openai/gpt-5.6-terra"
 
 `Ctrl-S` in either model or thinking picker writes only the user default. If project settings or environment variables mask it, Kiki reports that override.
 
+## Subagents
+
+Subagent settings use the same user/project precedence as model settings. Omitted fields use these defaults:
+
+```toml
+[subagents]
+allow_nested = true
+max_concurrent = 8
+max_starts_per_run = 64
+max_depth = 4
+timeout_seconds = 900
+```
+
+`max_concurrent` covers every admitted unsettled child in the session. `max_starts_per_run` covers a root request and all of its descendants. The root has depth 0, so `max_depth = 4` permits four child levels. Starts beyond a limit fail immediately; they are never queued.
+
+### Delegation workflow
+
+Use `start_subagent(...)` to receive a `SubagentTask` immediately, or `run_subagent(...)` when the current Python execution should wait. Keep `task.id`: `get_subagent(id)` reconnects an authorised task later, including after a foreground reply or a lost Arena variable. `refresh()`, `wait()`, and `cancel()` replace the handle's cached status. A status is only the last observation, not live state.
+
+A child receives an independent copy of the invoking Python execution's **pre-execution** Arena checkpoint. Values committed before that execution are available; assignments made earlier in the same execution are not. Every child starts with a fresh `result_values` dictionary. A successful `wait()` returns a dictionary with `id`, `message`, and `values` keys. Export only supported neutral scalars, lists, and string-keyed dictionaries within the existing Arena and transport limits. Missing, non-dictionary, cyclic, or unsupported `result_values` make that child fail; they do not disable the foreground agent. `wait()` raises `RuntimeError` for a failed or cancelled child and `TimeoutError` for a timed-out child.
+
+Children have fresh model context and a model/thinking selection fixed at admission. Without an override, that selection is the invoking model step's selection. An explicit model uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
+
+Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by the host. A read-only child cannot widen a descendant. All agents still share the same filesystem. Completed file effects are visible to every agent and cancellation never rolls them back.
+
+Child work continues after the foreground execution, final reply, or later request. Waiting does not join a completed child's descendants. Cancelling a task cancels its unfinished subtree while preserving completed results. Child failure cancels that child's unfinished descendants only, never its parent or siblings. There are no automatic retries, merges, result printing, or root model-context insertion: inspect a waited result deliberately.
+
+Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. `Ctrl-O` expands retained history prompts and terminal results; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting includes foreground and every descendant attempt once, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
+
 ## Commands
 
 `run(command, cwd=".")` starts one non-login `/bin/sh -c` command with null standard input and Kiki's inherited environment; interactive input is unavailable. `cwd` is workspace-relative, rejects absolute and parent paths, and is opened component by component without following symlinks before the validated directory descriptor is applied immediately before the command starts. There is no command-specific timeout: the five-minute whole-Arena deadline is the only limit.
@@ -63,6 +92,18 @@ model = "openai/gpt-5.6-terra"
 A normal or non-zero exit returns `CommandResult(exit_code, stdout, stderr)`; signal termination returns `exit_code=None`. stdout and stderr are captured independently, limited to 8 MiB each by their original byte counts, then lossily decoded as UTF-8. An overflowing stream kills the command's owned process group, drains both pipes, returns no partial result, and raises `RuntimeError` after any completed effects remain. Kiki also kills that group after shell exit; background services are unsupported.
 
 `run` has ordinary host filesystem, environment, and network authority. It is not a sandbox or approval boundary: a command can access host resources available to the Kiki process.
+
+## Diagnostics
+
+Set `KIKI_TRACE_FILE` to a trace-file path to opt into append-only JSONL diagnostic telemetry:
+
+```sh
+export KIKI_TRACE_FILE=/absolute/path/to/kiki-trace.jsonl
+```
+
+When unset, Kiki creates no trace file or telemetry writer. A trace records fixed process and coordinator-lock-span events, control-command events, root-run and child-lifecycle events, child-runner setup, Arena-construction and execution milestones, and provider-attempt events with timestamps and model selections. It does not record prompts, model messages, Python source or output, tool values, result values, credentials, provider responses, or arbitrary dynamic data.
+
+A trace is diagnostic only, not authoritative or resumable history: it cannot restore a session, Arena, conversation, or child result. Use exactly one Kiki process per trace path. Multiple processes appending to the same file can interleave their event streams. Kiki flushes each event; a runtime trace-write failure is reported after normal terminal restoration and controller shutdown.
 
 ## Privacy and costs
 
@@ -78,12 +119,12 @@ Credentials and opaque provider replay data stay hidden from Kiki records and di
 - Typing `/` shows automatic command suggestions. With suggestions visible, `Up` / `Down` select, `Tab` or the first `Enter` completes, and a second `Enter` executes the command. Otherwise `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
 - `Shift-Enter` or `Ctrl-J` inserts a prompt newline. `Ctrl-J` remains available when a terminal cannot report modified Enter; plain `Enter` retains submission behaviour.
-- `Esc` cancels the active run.
+- `Esc` first cancels the active foreground run. Press it again while cancellation is pending, or press it while foreground work is idle, to cancel background subagent work.
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title.
-- `Ctrl-O` toggles all arena cards between automatic collapse and expanded display.
+- `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; manual scrolling anchors its numeric document top. New history follows only at the newest page; reaching it or `Ctrl-End` resumes following. `Ctrl-Home` jumps to the oldest history. The mouse wheel scrolls history three lines per event.
 - Drag the primary mouse button over display history to select its rendered text in either direction. Resting the drag at the viewport's top or bottom edge scrolls it one row at a time; release copies a non-empty selection to the local native desktop clipboard.
@@ -109,7 +150,7 @@ Start Kiki with live credentials:
 
 ```sh
 OPENAI_API_KEY=... \
-MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty \
+MONTY_BIN=/tmp/kiki-monty/bin/monty \
 cargo run
 ```
 
@@ -128,7 +169,7 @@ The ordinary suite is credential-free and uses local fixtures:
 ```sh
 cargo fmt --all -- --check
 cargo check --all-targets
-env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty cargo test --all-targets -- --test-threads=1
+env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1
 cargo clippy --all-targets -- -D warnings
 test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
 test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"
@@ -140,7 +181,7 @@ test "$(rg -l '(cap_std|rustix|blake3|getrandom)' src --glob '*.rs')" = "src/too
 The ignored live scenario is selected explicitly and requires the setup above:
 
 ```sh
-OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty-0.0.21/bin/monty just live-test
+OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
 ```
 
 It runs three requests on one controller. The complete scenario has a five-minute watchdog; every provider attempt has a two-minute deadline; if the first request starts a ninth model step, the test cancels it and fails. The cancellation request must start an attempt within 30 seconds and settle within another 30 seconds. The follow-up request must finish within two minutes. Cleanup always requests shutdown, waits up to ten seconds, then aborts and awaits the controller if necessary.

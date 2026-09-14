@@ -4,11 +4,19 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
-use super::{DEFAULT_MODEL, ModelConfiguration, StartupProblemKind, model_by_id};
+use super::{
+    DEFAULT_MODEL, ModelConfiguration, StartupProblemKind,
+    constants::{
+        DEFAULT_SUBAGENT_ALLOW_NESTED, DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_DEPTH,
+        DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN, DEFAULT_SUBAGENT_TIMEOUT, SUBAGENT_TIMER_HEADROOM,
+    },
+    model_by_id,
+};
 
 const MAX_DOCUMENT_PROBLEMS: usize = 3;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
@@ -232,9 +240,53 @@ impl Problem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubagentSettings {
+    allow_nested: bool,
+    max_concurrent: usize,
+    max_starts_per_run: usize,
+    max_depth: usize,
+    timeout: Duration,
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            allow_nested: DEFAULT_SUBAGENT_ALLOW_NESTED,
+            max_concurrent: DEFAULT_SUBAGENT_MAX_CONCURRENT,
+            max_starts_per_run: DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN,
+            max_depth: DEFAULT_SUBAGENT_MAX_DEPTH,
+            timeout: DEFAULT_SUBAGENT_TIMEOUT,
+        }
+    }
+}
+
+impl SubagentSettings {
+    pub(crate) fn allow_nested(self) -> bool {
+        self.allow_nested
+    }
+
+    pub(crate) fn max_concurrent(self) -> usize {
+        self.max_concurrent
+    }
+
+    pub(crate) fn max_starts_per_run(self) -> usize {
+        self.max_starts_per_run
+    }
+
+    pub(crate) fn max_depth(self) -> usize {
+        self.max_depth
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
 pub(crate) struct Resolution {
     model: &'static ModelConfiguration,
     thinking: &'static str,
+    subagents: SubagentSettings,
     context: SettingsContext,
     problems: Vec<Problem>,
 }
@@ -246,6 +298,10 @@ impl Resolution {
 
     pub(crate) fn thinking(&self) -> &'static str {
         self.thinking
+    }
+
+    pub(crate) fn subagents(&self) -> SubagentSettings {
+        self.subagents
     }
 
     pub(crate) fn context(&self) -> &SettingsContext {
@@ -269,12 +325,14 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     let mut model = DEFAULT_MODEL;
     let mut model_origin = SettingsOrigin::BuiltIn;
     let mut thinking = BTreeMap::new();
+    let mut subagents = SubagentSettings::default();
     apply_layer(
         user.as_ref(),
         SettingsOrigin::User,
         &mut model,
         &mut model_origin,
         &mut thinking,
+        &mut subagents,
     );
     apply_layer(
         project.as_ref(),
@@ -282,6 +340,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut model,
         &mut model_origin,
         &mut thinking,
+        &mut subagents,
     );
 
     let model_is_valid = match input.model {
@@ -352,6 +411,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     Resolution {
         model,
         thinking: selected_thinking,
+        subagents,
         context: SettingsContext {
             user_path,
             project_path,
@@ -374,6 +434,7 @@ fn apply_layer(
     model: &mut &'static ModelConfiguration,
     model_origin: &mut SettingsOrigin,
     thinking: &mut BTreeMap<&'static str, PersistedThinking>,
+    subagents: &mut SubagentSettings,
 ) {
     let Some(settings) = settings else {
         return;
@@ -391,6 +452,21 @@ fn apply_layer(
             },
         )
     }));
+    if let Some(allow_nested) = settings.subagents.allow_nested {
+        subagents.allow_nested = allow_nested;
+    }
+    if let Some(max_concurrent) = settings.subagents.max_concurrent {
+        subagents.max_concurrent = max_concurrent;
+    }
+    if let Some(max_starts_per_run) = settings.subagents.max_starts_per_run {
+        subagents.max_starts_per_run = max_starts_per_run;
+    }
+    if let Some(max_depth) = settings.subagents.max_depth {
+        subagents.max_depth = max_depth;
+    }
+    if let Some(timeout) = settings.subagents.timeout {
+        subagents.timeout = timeout;
+    }
 }
 
 fn load_layer(path: Option<&Path>, layer: FileLayer) -> (Option<FileSettings>, Vec<Problem>) {
@@ -455,8 +531,9 @@ fn validate_document(
                 ),
             },
             "thinking" => validate_thinking_table(item, &mut settings.thinking, &mut problems),
+            "subagents" => validate_subagents_table(item, &mut settings.subagents, &mut problems),
             _ => problems.push(
-                "contains an unknown field; only `model` and `[thinking]` are allowed",
+                "contains an unknown field; only `model`, `[thinking]`, and `[subagents]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -521,6 +598,101 @@ fn validate_thinking_table(
     }
 }
 
+fn validate_subagents_table(
+    item: &Item,
+    subagents: &mut FileSubagentSettings,
+    problems: &mut DocumentProblems,
+) {
+    let Some(table) = item.as_table() else {
+        problems.push(
+            "field `subagents` must be a TOML table",
+            "Use [subagents] with supported settings, then restart Kiki.",
+        );
+        return;
+    };
+
+    for (key, item) in table.iter() {
+        match key {
+            "allow_nested" => match item.as_bool() {
+                Some(value) => subagents.allow_nested = Some(value),
+                None => problems.push(
+                    "field `subagents.allow_nested` must be a boolean",
+                    "Set it to true or false, then restart Kiki.",
+                ),
+            },
+            "max_concurrent" => {
+                subagents.max_concurrent = positive_subagent_counter(item, key, problems);
+            }
+            "max_starts_per_run" => {
+                subagents.max_starts_per_run = positive_subagent_counter(item, key, problems);
+            }
+            "max_depth" => {
+                subagents.max_depth = positive_subagent_counter(item, key, problems);
+            }
+            "timeout_seconds" => {
+                subagents.timeout = positive_subagent_timeout(item, problems);
+            }
+            _ => problems.push(
+                "table `subagents` contains an unknown key; only `allow_nested`, `max_concurrent`, `max_starts_per_run`, `max_depth`, and `timeout_seconds` are allowed",
+                "Remove the unknown key from table `subagents`, then restart Kiki.",
+            ),
+        }
+    }
+}
+
+fn positive_subagent_counter(
+    item: &Item,
+    field: &str,
+    problems: &mut DocumentProblems,
+) -> Option<usize> {
+    let value = item
+        .as_integer()
+        .and_then(|value| usize::try_from(value).ok());
+    match value.filter(|value| *value > 0) {
+        Some(value) => Some(value),
+        None => {
+            problems.push(
+                format!(
+                    "field `subagents.{field}` must be a positive integer that fits this platform"
+                ),
+                "Set it to a positive integer that fits this platform, then restart Kiki.",
+            );
+            None
+        }
+    }
+}
+
+fn positive_subagent_timeout(item: &Item, problems: &mut DocumentProblems) -> Option<Duration> {
+    positive_subagent_timeout_at(item, problems, Instant::now())
+}
+
+fn positive_subagent_timeout_at(
+    item: &Item,
+    problems: &mut DocumentProblems,
+    now: Instant,
+) -> Option<Duration> {
+    let seconds = item
+        .as_integer()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let Some(seconds) = seconds else {
+        problems.push(
+            "field `subagents.timeout_seconds` must be a positive integer",
+            "Set it to a positive integer, then restart Kiki.",
+        );
+        return None;
+    };
+    let timeout = Duration::from_secs(seconds);
+    if now.checked_add(timeout + SUBAGENT_TIMER_HEADROOM).is_some() {
+        return Some(timeout);
+    }
+    problems.push(
+        "field `subagents.timeout_seconds` must be a positive integer representable as a timer-safe deadline",
+        "Set it to a smaller positive integer, then restart Kiki.",
+    );
+    None
+}
+
 fn environment_thinking_level(
     model: &ModelConfiguration,
     level: &str,
@@ -549,6 +721,16 @@ fn known_thinking_level(level: &str) -> bool {
 struct FileSettings {
     model: Option<&'static ModelConfiguration>,
     thinking: BTreeMap<&'static str, &'static str>,
+    subagents: FileSubagentSettings,
+}
+
+#[derive(Default)]
+struct FileSubagentSettings {
+    allow_nested: Option<bool>,
+    max_concurrent: Option<usize>,
+    max_starts_per_run: Option<usize>,
+    max_depth: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy)]
@@ -720,12 +902,37 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
-    use crate::config::models::{LUNA, SOL, TERRA};
+    use crate::config::{
+        constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
+        models::{LUNA, SOL, TERRA},
+    };
 
-    use super::{Input, resolve};
+    use super::{Input, SubagentSettings, resolve};
+
+    #[test]
+    fn project_subagent_limit_overrides_only_matching_user_limits() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "[subagents]\nallow_nested = false\nmax_concurrent = 3\nmax_starts_per_run = 12\nmax_depth = 2\ntimeout_seconds = 60\n",
+        );
+        write_settings(project.path(), "[subagents]\nmax_concurrent = 5\n");
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let subagents = resolution.subagents();
+
+        assert!(!subagents.allow_nested());
+        assert_eq!(subagents.max_concurrent(), 5);
+        assert_eq!(subagents.max_starts_per_run(), 12);
+        assert_eq!(subagents.max_depth(), 2);
+        assert_eq!(subagents.timeout().as_secs(), 60);
+        assert!(resolution.problems().is_empty());
+    }
 
     #[test]
     fn project_model_overrides_user_model_while_unrelated_thinking_is_inherited() {
@@ -772,6 +979,236 @@ mod tests {
         let path = root.join(".kiki/config.toml");
         fs::create_dir_all(path.parent().expect("settings parent")).expect("settings directory");
         fs::write(path, content).expect("settings file");
+    }
+
+    fn assert_default_subagents(subagents: SubagentSettings) {
+        assert!(subagents.allow_nested());
+        assert_eq!(subagents.max_concurrent(), 8);
+        assert_eq!(subagents.max_starts_per_run(), 64);
+        assert_eq!(subagents.max_depth(), 4);
+        assert_eq!(subagents.timeout().as_secs(), 900);
+    }
+
+    fn instant_with_tokio_unsafe_one_second_deadline() -> Instant {
+        let latest = latest_representable_instant();
+        let now = latest
+            .checked_sub(Duration::from_secs(1))
+            .expect("one-second timeout start must be representable");
+        let deadline = now
+            .checked_add(Duration::from_secs(1))
+            .expect("raw one-second deadline must be representable");
+        assert!(deadline.checked_add(SUBAGENT_TIMER_HEADROOM).is_none());
+        now
+    }
+
+    #[test]
+    fn subagent_defaults_apply_with_absent_files_or_tables() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert_default_subagents(resolution.subagents());
+        assert!(resolution.problems().is_empty());
+
+        write_settings(home.path(), "model = \"openai/gpt-5.6-terra\"\n");
+        write_settings(project.path(), "[subagents]\n");
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_default_subagents(resolution.subagents());
+        assert!(resolution.problems().is_empty());
+    }
+
+    #[test]
+    fn tokio_unsafe_toml_timeout_is_rejected() {
+        let document = "timeout_seconds = 1\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("timeout setting");
+        let mut problems = super::DocumentProblems::new(super::FileLayer::User);
+
+        let timeout = super::positive_subagent_timeout_at(
+            &document["timeout_seconds"],
+            &mut problems,
+            instant_with_tokio_unsafe_one_second_deadline(),
+        );
+
+        assert_eq!(timeout, None);
+        let problems = problems.finish();
+        let [problem] = problems.as_slice() else {
+            panic!("timer-unsafe timeout reports exactly one problem");
+        };
+        assert_eq!(
+            problem.kind(),
+            crate::config::StartupProblemKind::UserSettingsInvalid
+        );
+        assert_eq!(
+            problem.diagnostic(),
+            "user settings file `~/.kiki/config.toml` field `subagents.timeout_seconds` must be a positive integer representable as a timer-safe deadline."
+        );
+        assert_eq!(
+            problem.remediation(),
+            "Set it to a smaller positive integer, then restart Kiki."
+        );
+        assert!(problem.diagnostic().len() <= 256);
+        assert!(problem.remediation().len() <= 256);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn counters_above_u32_max_are_accepted_when_usize_can_represent_them() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let value = u32::MAX as usize + 1;
+        write_settings(
+            home.path(),
+            &format!(
+                "[subagents]\nmax_concurrent = {value}\nmax_starts_per_run = {value}\nmax_depth = {value}\n"
+            ),
+        );
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let subagents = resolution.subagents();
+
+        assert_eq!(
+            u64::try_from(subagents.max_concurrent()).expect("counter fits u64"),
+            value as u64
+        );
+        assert_eq!(
+            u64::try_from(subagents.max_starts_per_run()).expect("counter fits u64"),
+            value as u64
+        );
+        assert_eq!(
+            u64::try_from(subagents.max_depth()).expect("counter fits u64"),
+            value as u64
+        );
+        assert!(resolution.problems().is_empty());
+    }
+
+    #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+    #[test]
+    fn counter_value_that_overflows_usize_is_rejected() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let value = u64::try_from(usize::MAX).expect("usize fits u64") + 1;
+        write_settings(
+            home.path(),
+            &format!("[subagents]\nmax_concurrent = {value}\n"),
+        );
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_default_subagents(resolution.subagents());
+        assert_eq!(
+            resolution.problems()[0].kind(),
+            crate::config::StartupProblemKind::UserSettingsInvalid
+        );
+        assert!(
+            resolution.problems()[0]
+                .diagnostic()
+                .contains("subagents.max_concurrent")
+        );
+    }
+
+    #[test]
+    fn invalid_subagent_layer_contributes_no_partial_values() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "model = \"openai/gpt-5.6-terra\"\n\n[subagents]\nallow_nested = false\nmax_concurrent = 3\nunknown = true\n",
+        );
+        write_settings(project.path(), "[subagents]\nmax_starts_per_run = 9\n");
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let subagents = resolution.subagents();
+
+        assert_eq!(resolution.model().id, SOL.id);
+        assert!(subagents.allow_nested());
+        assert_eq!(subagents.max_concurrent(), 8);
+        assert_eq!(subagents.max_starts_per_run(), 9);
+        assert_eq!(subagents.max_depth(), 4);
+        assert_eq!(subagents.timeout().as_secs(), 900);
+        assert_eq!(
+            resolution
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [crate::config::StartupProblemKind::UserSettingsInvalid]
+        );
+    }
+
+    #[test]
+    fn invalid_subagent_values_and_keys_are_rejected() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for field in [
+            "max_concurrent",
+            "max_starts_per_run",
+            "max_depth",
+            "timeout_seconds",
+        ] {
+            for value in ["\"8\"", "false", "0", "-1"] {
+                write_settings(home.path(), &format!("[subagents]\n{field} = {value}\n"));
+                let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+                assert_default_subagents(resolution.subagents());
+                assert_eq!(
+                    resolution.problems()[0].kind(),
+                    crate::config::StartupProblemKind::UserSettingsInvalid,
+                    "{field} = {value}"
+                );
+                let problem = &resolution.problems()[0];
+                assert!(
+                    problem.diagnostic().contains(&format!("subagents.{field}")),
+                    "{field} = {value}"
+                );
+                if field == "timeout_seconds" {
+                    assert!(!problem.diagnostic().contains(&u32::MAX.to_string()));
+                    assert!(!problem.remediation().contains(&u32::MAX.to_string()));
+                }
+            }
+        }
+
+        for (content, diagnostic) in [
+            (
+                "[subagents]\nallow_nested = \"true\"\n",
+                "subagents.allow_nested",
+            ),
+            ("subagents = true\n", "field `subagents`"),
+            ("[subagents]\nunknown = true\n", "table `subagents`"),
+            ("unknown = true\n", "unknown field"),
+        ] {
+            write_settings(home.path(), content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_default_subagents(resolution.subagents());
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{content}"
+            );
+            assert!(resolution.problems()[0].diagnostic().contains(diagnostic));
+            assert!(resolution.problems()[0].remediation().len() <= 256);
+        }
+    }
+
+    #[test]
+    fn out_of_range_toml_integers_are_malformed_settings() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "[subagents]\nmax_concurrent = 9223372036854775808\n",
+        );
+
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_default_subagents(resolution.subagents());
+        assert_eq!(
+            resolution.problems()[0].kind(),
+            crate::config::StartupProblemKind::UserSettingsMalformed
+        );
     }
 
     #[test]
@@ -1052,9 +1489,10 @@ mod tests {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         let secret = "sk-settings-SECRET";
-        let document = (0..10)
-            .map(|index| format!("\"{secret}-{index}\" = \"{secret}\"\n"))
-            .collect::<String>();
+        let document = "[subagents]\n".to_owned()
+            + &(0..10)
+                .map(|index| format!("\"{secret}-{index}\" = true\n"))
+                .collect::<String>();
         write_settings(home.path(), &document);
         write_settings(project.path(), &document);
 
@@ -1069,12 +1507,12 @@ mod tests {
     }
 
     #[test]
-    fn saving_one_model_or_thinking_key_preserves_comments_and_other_content() {
+    fn saving_one_model_or_thinking_key_preserves_comments_and_subagent_settings() {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         write_settings(
             home.path(),
-            "# keep this comment\nmodel = \"openai/gpt-5.6-sol\" # keep this too\nfuture = \"preserved\"\n\n[thinking]\n\"openai/gpt-5.6-luna\" = \"low\" # untouched\n\"openai/gpt-5.6-sol\" = \"medium\" # updated\n",
+            "# keep this comment\nmodel = \"openai/gpt-5.6-sol\" # keep this too\nfuture = \"preserved\"\n\n[thinking]\n\"openai/gpt-5.6-luna\" = \"low\" # untouched\n\"openai/gpt-5.6-sol\" = \"medium\" # updated\n\n[subagents] # keep this table\nallow_nested = false # untouched\nmax_concurrent = 3\nmax_starts_per_run = 12\nmax_depth = 2\ntimeout_seconds = 60\n",
         );
         let resolution = resolve(input(Some(home.path()), Some(project.path())));
         let context = resolution.context();
@@ -1094,6 +1532,12 @@ mod tests {
         assert!(content.contains("future = \"preserved\""));
         assert!(content.contains("\"openai/gpt-5.6-luna\" = \"low\" # untouched"));
         assert!(content.contains("\"openai/gpt-5.6-sol\" = \"high\" # updated"));
+        assert!(content.contains("[subagents] # keep this table"));
+        assert!(content.contains("allow_nested = false # untouched"));
+        assert!(content.contains("max_concurrent = 3"));
+        assert!(content.contains("max_starts_per_run = 12"));
+        assert!(content.contains("max_depth = 2"));
+        assert!(content.contains("timeout_seconds = 60"));
     }
 
     #[test]

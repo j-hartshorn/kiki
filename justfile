@@ -1,6 +1,10 @@
 set dotenv-load
 
-export MONTY_BIN := "/tmp/kiki-monty-0.0.21/bin/monty"
+monty_root := "/tmp/kiki-monty"
+export MONTY_BIN := monty_root + "/bin/monty"
+
+monty:
+    test -x "$MONTY_BIN" && test "$("$MONTY_BIN" --version)" = "monty-runtime 0.0.22" || cargo install monty-runtime --version 0.0.22 --locked --root "{{ monty_root }}" --force
 
 check:
     cargo check --all-targets
@@ -11,11 +15,11 @@ lint:
 format:
     cargo fmt --all
 
-run:
+run: monty
     cargo run
 
-test:
+test: monty
     cargo test --all-targets
 
-live-test:
+live-test: monty
     cargo test openai::tests::live_sol -- --exact --ignored --test-threads=1

@@ -3,7 +3,7 @@ use std::ops::Range;
 use ratatui::text::Line;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
+pub(crate) use crate::config::constants::MAX_PROMPT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptEdit {

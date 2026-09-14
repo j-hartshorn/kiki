@@ -5,11 +5,12 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
     Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
-use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
+use crate::config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
     ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
+use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +70,9 @@ impl ExecutionFailure {
 pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
-    ExecutionStarted,
+    ExecutionStarted {
+        selection: Option<ModelSelection>,
+    },
     ToolUpdated {
         token: ToolCallToken,
         call: ToolCall,
@@ -389,6 +392,7 @@ impl AgentError {
 
 struct PendingCode {
     source: String,
+    selection: Option<ModelSelection>,
     call_id: ModelCallId,
     reasoning_summary: String,
     replay: ProviderReplay,
@@ -415,6 +419,7 @@ pub struct Agent<M: Model> {
     model: M,
     model_context: ModelHistory,
     staged_final_message: Option<StagedFinalMessage>,
+    invocation_context: Option<AgentInvocationContext>,
 }
 
 impl<M: Model> Agent<M> {
@@ -424,7 +429,24 @@ impl<M: Model> Agent<M> {
             model,
             model_context: ModelHistory::new(),
             staged_final_message: None,
+            invocation_context: None,
         }
+    }
+
+    pub(crate) fn set_invocation_context(&mut self, context: AgentInvocationContext) {
+        self.invocation_context = Some(context);
+    }
+
+    pub(crate) async fn collect_child_result_values(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        std::collections::BTreeMap<String, crate::tools::ToolValue>,
+        crate::arena::ResultValuesError,
+    > {
+        self.arena
+            .collect_result_values_with_cancellation(cancellation)
+            .await
     }
 
     pub async fn run(
@@ -513,6 +535,7 @@ impl<M: Model> Agent<M> {
             };
             let ModelStep {
                 action,
+                selection,
                 reasoning_summary,
                 replay,
                 attempts: step_attempts,
@@ -533,6 +556,7 @@ impl<M: Model> Agent<M> {
                     generation.clear();
                     let pending = PendingCode {
                         source,
+                        selection,
                         call_id,
                         reasoning_summary,
                         replay,
@@ -558,7 +582,9 @@ impl<M: Model> Agent<M> {
                             evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
                         });
                     }
-                    progress(AgentProgress::ExecutionStarted);
+                    progress(AgentProgress::ExecutionStarted {
+                        selection: pending.selection,
+                    });
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ToolUpdated { token, call } => {
@@ -575,10 +601,12 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_with_progress(
+                            .execute_with_progress_and_context(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
+                                self.invocation_context.as_ref(),
+                                pending.selection,
                             )
                             .await
                     };
@@ -803,6 +831,7 @@ fn error_truncation_warning() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -822,17 +851,22 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
+    use crate::config::{DEFAULT_MODEL, ModelSelection, models::SOL};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::tools::{ReadTestGate, ToolHost};
+    use crate::subagents::{
+        AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
+        RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
+    };
+    use crate::tools::{ReadTestGate, ToolHost, ToolValue};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
-            .expect("MONTY_BIN must point to the monty-runtime 0.0.21 worker")
+            .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
     }
 
     async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent<ScriptedModel> {
@@ -880,6 +914,45 @@ mod tests {
             .collect()
     }
 
+    struct SelectedScriptedModel {
+        model: ScriptedModel,
+        selection: ModelSelection,
+    }
+
+    impl Model for SelectedScriptedModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let mut step = self.model.step(history, cancellation, progress).await?;
+                step.selection = Some(self.selection);
+                Ok(step)
+            }
+        }
+    }
+
+    struct ImmediateChildResultRunner;
+
+    impl ChildRunner<ChildPayload> for ImmediateChildResultRunner {
+        fn run(
+            &self,
+            _child: ChildRun<ChildPayload>,
+            _cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            Box::pin(async {
+                Ok(ChildResult::new(
+                    "hidden child message".to_owned(),
+                    BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(42))]),
+                ))
+            })
+        }
+    }
+
     struct ObservationMetadata {
         head_lines: usize,
         tail_lines: usize,
@@ -905,6 +978,60 @@ mod tests {
             tail_starts_mid_line: metadata.tail_starts_mid_line,
             partial_lines: metadata.head_ends_mid_line || metadata.tail_starts_mid_line,
         }
+    }
+
+    #[tokio::test]
+    async fn assignment_only_wait_keeps_child_results_out_of_model_feedback() {
+        let workspace = tempfile::tempdir().unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(ImmediateChildResultRunner),
+        );
+        let context = AgentInvocationContext::new(coordinator.root_caller().await, coordinator)
+            .with_accepted_thinking(AcceptedThinking::new(
+                selection,
+                snapshot.settings().clone(),
+            ));
+        let mut agent = agent_with_model(
+            &workspace,
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "task = await start_subagent('child')".to_owned(),
+                    },
+                    ModelAction::Code {
+                        source: "result = await task.wait()".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ]),
+                selection,
+            },
+        )
+        .await;
+        agent.set_invocation_context(context);
+
+        assert_eq!(
+            agent
+                .run("inspect", &CancellationToken::new())
+                .await
+                .unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        let feedback = agent.model.model.contexts()[2]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("final model step receives the wait execution")
+            .result();
+        assert_eq!(
+            feedback,
+            &CodeResult::Execution {
+                feedback: String::new()
+            }
+        );
     }
 
     #[tokio::test]
@@ -988,6 +1115,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_result_exports_remain_outside_model_context_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "result_values = {'answer': 42}".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "child complete".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("inspect", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        assert_eq!(
+            agent
+                .discard_staged_final_message()
+                .expect("child final message is staged")
+                .text(),
+            "child complete"
+        );
+        assert_eq!(
+            agent
+                .collect_child_result_values(&cancellation)
+                .await
+                .unwrap(),
+            std::collections::BTreeMap::from([("answer".to_owned(), ToolValue::Integer(42))])
+        );
+        assert!(
+            !agent
+                .model_context
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::FinalMessage { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn agent_admits_a_staged_final_message_exactly_once() {
         let workspace = tempfile::tempdir().unwrap();
         let mut agent = agent(
@@ -1054,6 +1225,7 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
+                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1141,6 +1313,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: "message summary".to_owned(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -1169,12 +1342,85 @@ mod tests {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("summary-code"),
                     },
+                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
                 })
             }
         }
+    }
+
+    struct SelectedCodeThenMessageModel {
+        selection: ModelSelection,
+        step: u8,
+    }
+
+    impl Model for SelectedCodeThenMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "value = 1".to_owned(),
+                        call_id: ModelCallId::new("selected-code"),
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: Some(self.selection),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_exposes_code_execution_selection_from_the_pending_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(&SOL, "low").unwrap();
+        let mut agent = agent_with_model(
+            &workspace,
+            SelectedCodeThenMessageModel { selection, step: 0 },
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut progress = Vec::new();
+
+        {
+            let mut capture = |event| progress.push(event);
+            assert_eq!(
+                agent
+                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .await
+                    .unwrap(),
+                AgentRunOutcome::FinalMessageStaged
+            );
+        }
+
+        assert_eq!(
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    AgentProgress::ExecutionStarted { selection } => Some(*selection),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [Some(selection)]
+        );
     }
 
     struct MessageWithAccountingModel;
@@ -1193,6 +1439,7 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
+                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -1716,6 +1963,7 @@ mod tests {
                 cancellation.cancel();
                 Ok(ModelStep {
                     action: self.action.clone(),
+                    selection: None,
                     reasoning_summary: "boundary summary".to_owned(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
                     attempts: Vec::new(),
@@ -1751,7 +1999,7 @@ mod tests {
 
             assert!(!progress.iter().any(|event| matches!(
                 event,
-                AgentProgress::ExecutionStarted | AgentProgress::ExecutionCompleted { .. }
+                AgentProgress::ExecutionStarted { .. } | AgentProgress::ExecutionCompleted { .. }
             )));
             if code_action {
                 let AgentError::Cancelled {
@@ -2118,7 +2366,7 @@ mod tests {
             progress.as_slice(),
             [
                 AgentProgress::ModelStepStarted,
-                AgentProgress::ExecutionStarted,
+                AgentProgress::ExecutionStarted { selection: None },
                 AgentProgress::ExecutionCompleted {
                     reasoning_summary,
                     ..

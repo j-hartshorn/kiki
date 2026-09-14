@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 mod picker;
 mod slash;
+mod subagents;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -28,8 +29,11 @@ use crate::config::models::CATALOGUE;
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
-use crate::runtime::{ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver};
+use crate::runtime::{
+    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver, control_command,
+};
 use crate::selection::{DocumentPosition, Selection};
+use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
@@ -154,6 +158,8 @@ struct App {
     prompt: PromptEditor,
     prompt_width: u16,
     transcript: Transcript,
+    subagent_monitor: subagents::SubagentMonitor,
+    foreground_cancellation_requested: bool,
     history_position: HistoryPosition,
     history_height: usize,
     history_rows: usize,
@@ -187,6 +193,8 @@ impl Default for App {
             prompt: PromptEditor::default(),
             prompt_width: 80,
             transcript: Transcript::default(),
+            subagent_monitor: subagents::SubagentMonitor::default(),
+            foreground_cancellation_requested: false,
             history_position: HistoryPosition::FollowingBottom,
             history_height: 0,
             history_rows: 0,
@@ -400,14 +408,24 @@ impl App {
         if let Some(update) = self.handle_history_key(key) {
             return update;
         }
+        if key.code == KeyCode::Esc {
+            if self.is_configuration_only() {
+                return Update::default();
+            }
+            if !self.transcript.is_disabled()
+                && !self.transcript.is_idle()
+                && !self.foreground_cancellation_requested
+            {
+                self.foreground_cancellation_requested = true;
+                return Update::with_commands([RuntimeCommand::Cancel]);
+            }
+            return Update::with_commands([RuntimeCommand::CancelBackground]);
+        }
         if self.is_submission_disabled() {
             return Update::default();
         }
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
-        }
-        if key.code == KeyCode::Esc && !self.transcript.is_idle() {
-            return Update::with_commands([RuntimeCommand::Cancel]);
         }
         if let Some(update) = self.handle_completion_key(key) {
             return update;
@@ -845,7 +863,8 @@ impl App {
 
     fn tick(&mut self, now: Instant) -> Update {
         let mut update = self.tick_thinking_preview(now);
-        update.visible_changed |= self.tick_edge_scroll(now) | self.tick_flash(now);
+        update.visible_changed |=
+            self.tick_edge_scroll(now) | self.tick_flash(now) | self.subagent_monitor.tick(now);
         update
     }
 
@@ -1087,22 +1106,35 @@ impl App {
     }
 
     fn handle_event(&mut self, event: RuntimeEvent) -> bool {
-        self.handle_event_with_gap(event, false)
+        self.handle_event_at(event, Instant::now())
+    }
+
+    fn handle_event_at(&mut self, event: RuntimeEvent, now: Instant) -> bool {
+        self.handle_event_with_gap_at(event, false, now)
     }
 
     fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
-        self.handle_event_with_gap(envelope.item, envelope.gap_before)
+        self.handle_event_with_gap_at(envelope.item, envelope.gap_before, Instant::now())
     }
 
-    fn handle_event_with_gap(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
+    fn handle_event_with_gap_at(
+        &mut self,
+        event: RuntimeEvent,
+        gap_before: bool,
+        now: Instant,
+    ) -> bool {
+        if matches!(&event, RuntimeEvent::RunSettled { .. }) {
+            self.foreground_cancellation_requested = false;
+        }
         if let RuntimeEvent::SettingsAccepted { revision } = &event {
             self.reconcile_settings(*revision);
         }
+        let monitor_changed = self.subagent_monitor.apply(&event, now);
         let transcript_changed = self.transcript.apply(event, gap_before);
         if transcript_changed {
             self.invalidate_selection();
         }
-        transcript_changed
+        monitor_changed || transcript_changed
     }
 
     fn reconcile_settings(&mut self, revision: u64) {
@@ -1269,6 +1301,7 @@ pub(crate) fn run(
     commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
+    trace: Trace,
 ) -> Result<(), TuiError> {
     let mut app = App::configured(startup);
     let mut input = CrosstermEvents;
@@ -1293,6 +1326,7 @@ pub(crate) fn run(
                                 &mut progress,
                                 &mut clipboard,
                                 &mut titles,
+                                &trace,
                             )
                             .map(|_| ())
                         },
@@ -1453,11 +1487,19 @@ fn run_configuration_loop<B: Backend>(
 fn dispatch_commands(
     commands: &mpsc::Sender<RuntimeCommand>,
     update: &Update,
+    trace: &Trace,
 ) -> Result<(), TuiError> {
     for command in &update.commands {
+        let control = control_command(command);
+        if let Some(command) = control {
+            trace.emit(|| TraceEvent::TuiCommandDispatch { command });
+        }
         commands
             .blocking_send(command.clone())
             .map_err(|_| TuiError::RuntimeClosed)?;
+        if let Some(command) = control {
+            trace.emit(|| TraceEvent::TuiCommandQueued { command });
+        }
     }
     Ok(())
 }
@@ -1481,6 +1523,7 @@ fn run_loop<B: Backend>(
         progress,
         clipboard,
         &mut NoopTitlePublisher,
+        &Trace::disabled(),
     )
 }
 
@@ -1494,6 +1537,7 @@ fn run_loop_with_titles<B: Backend>(
     progress: &mut RuntimeProgressReceiver,
     clipboard: &mut impl ClipboardPort,
     titles: &mut impl TitlePublisher,
+    trace: &Trace,
 ) -> Result<usize, TuiError> {
     let mut dirty = true;
     publish_title(app, titles);
@@ -1516,7 +1560,7 @@ fn run_loop_with_titles<B: Backend>(
                     if previous_title != app.title() {
                         dirty |= publish_title(app, titles);
                     }
-                    dispatch_commands(commands, &update)?;
+                    dispatch_commands(commands, &update, trace)?;
                     quit = update.quit;
                 }
                 Event::Mouse(mouse) => {
@@ -1559,19 +1603,24 @@ fn run_loop_with_titles<B: Backend>(
 
         let update = app.tick(Instant::now());
         dirty |= update.visible_changed;
-        dispatch_commands(commands, &update)?;
+        dispatch_commands(commands, &update, trace)?;
     }
 }
 
 const PROMPT_GUTTER_WIDTH: u16 = 2;
 
 fn render(frame: &mut Frame, app: &mut App) {
+    render_at(frame, app, Instant::now());
+}
+
+fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     let area = frame.area();
     if let Some(stale_overlay) = app.slash_overlay.take() {
         frame.render_widget(Clear, stale_overlay.intersection(area));
     }
     frame.buffer_mut().set_style(area, page_style());
     if area.width == 0 || area.height == 0 {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
         app.history_unavailable();
         return;
     }
@@ -1609,6 +1658,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     );
 
     if configuration_only {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
         if area.height == 1 {
             app.history_unavailable();
             return;
@@ -1627,6 +1677,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     if area.height == 1 {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
         app.history_unavailable();
         return;
     }
@@ -1638,6 +1689,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         1,
     );
     if area.height <= 3 {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
         let rule_style = thinking_rule_style(app.settings_selection);
         if area.height == 3 {
             render_rule(
@@ -1676,16 +1728,32 @@ fn render(frame: &mut Frame, app: &mut App) {
         area.width,
         prompt_box_height.saturating_sub(2),
     );
+    let history_height = area
+        .height
+        .saturating_sub(1)
+        .saturating_sub(prompt_box_height);
+    let monitor = app
+        .subagent_monitor
+        .layout(area.width, history_height.saturating_sub(1), now);
+    let monitor_top = prompt_top.saturating_sub(monitor.height());
     let history = Rect::new(
         area.x,
         area.y.saturating_add(1),
         area.width,
-        area.height
-            .saturating_sub(1)
-            .saturating_sub(prompt_box_height),
+        monitor_top.saturating_sub(area.y.saturating_add(1)),
+    );
+    let completion_area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        prompt_top.saturating_sub(area.y.saturating_add(1)),
     );
     let layout = render_history(frame, app, history);
-    render_slash_overlay(frame, app, history);
+    monitor.render(
+        frame,
+        Rect::new(area.x, monitor_top, area.width, monitor.height()),
+    );
+    render_slash_overlay(frame, app, completion_area);
     let rule_style = thinking_rule_style(app.settings_selection);
     render_rule(
         frame,
@@ -1748,11 +1816,11 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
     layout
 }
 
-fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
+fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.is_submission_disabled() || app.picker.is_some() {
         return;
     }
-    let rows = app.completion.visible_rows(usize::from(history.height));
+    let rows = app.completion.visible_rows(usize::from(area.height));
     let Some(height) = u16::try_from(rows.len()).ok().filter(|height| *height > 0) else {
         return;
     };
@@ -1761,17 +1829,17 @@ fn render_slash_overlay(frame: &mut Frame, app: &mut App, history: Rect) {
         .map(|row| Line::raw(format!("{} {}", row.token, row.purpose)).width())
         .max()
         .unwrap_or(0);
-    let width = history
+    let width = area
         .width
         .min(u16::try_from(natural_width).unwrap_or(u16::MAX));
     if width == 0 {
         return;
     }
-    let x = history
+    let x = area
         .x
         .saturating_add(PROMPT_GUTTER_WIDTH)
-        .min(history.right().saturating_sub(width));
-    let overlay = Rect::new(x, history.bottom().saturating_sub(height), width, height);
+        .min(area.right().saturating_sub(width));
+    let overlay = Rect::new(x, area.bottom().saturating_sub(height), width, height);
     frame.render_widget(Clear, overlay);
     frame.buffer_mut().set_style(overlay, page_style());
     let lines = rows.into_iter().map(|row| {
@@ -1967,6 +2035,8 @@ mod tests {
         ModelStepId, Record, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
         StoredRecord, TerminalDetails,
     };
+    use crate::subagents::TaskState;
+    use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -2054,9 +2124,15 @@ mod tests {
     }
 
     fn rendered(app: &mut App, width: u16, height: u16) -> String {
+        rendered_at(app, width, height, Instant::now())
+    }
+
+    fn rendered_at(app: &mut App, width: u16, height: u16, now: Instant) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| super::render(frame, app)).unwrap();
+        terminal
+            .draw(|frame| super::render_at(frame, app, now))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         buffer
             .content
@@ -2657,6 +2733,7 @@ mod tests {
             &mut progress,
             &mut clipboard,
             &mut titles,
+            &Trace::disabled(),
         )
         .expect("loop");
 
@@ -2695,6 +2772,7 @@ mod tests {
                     &mut progress,
                     &mut clipboard,
                     &mut titles,
+                    &Trace::disabled(),
                 )
                 .map(|_| ())
             },
@@ -3044,6 +3122,76 @@ mod tests {
     }
 
     #[test]
+    fn slash_overlay_stays_above_prompt_over_visible_subagent_monitor() {
+        let now = Instant::now();
+        for (height, last_suggestion) in [(12, "/thinking"), (6, "/name")] {
+            let mut plain = app_with_history(App::default());
+            plain
+                .subagent_monitor
+                .insert_for_test("child1", TaskState::Completed, now);
+            plain
+                .subagent_monitor
+                .insert_for_test("child2", TaskState::Completed, now);
+            let mut completed = app_with_history(app_with_prompt("/"));
+            completed
+                .subagent_monitor
+                .insert_for_test("child1", TaskState::Completed, now);
+            completed
+                .subagent_monitor
+                .insert_for_test("child2", TaskState::Completed, now);
+
+            rendered_at(&mut plain, 80, height, now);
+            let screen = rendered_at(&mut completed, 80, height, now);
+            let rows = screen.lines().collect::<Vec<_>>();
+            let prompt_row = u16::try_from(
+                rows.iter()
+                    .position(|row| row.starts_with("> "))
+                    .expect("prompt"),
+            )
+            .unwrap();
+            let prompt_top = prompt_row.saturating_sub(1);
+            let overlay = completed.slash_overlay.expect("slash overlay");
+            let last_suggestion_row = rows
+                .iter()
+                .position(|row| row.contains(last_suggestion))
+                .and_then(|row| u16::try_from(row).ok());
+
+            assert_eq!(completed.history_height, plain.history_height);
+            assert_eq!(
+                completed.history_viewport.map(|viewport| viewport.area),
+                plain.history_viewport.map(|viewport| viewport.area),
+            );
+            if height == 12 {
+                assert!(screen.contains("✓ subagent:child1"), "{screen}");
+            }
+
+            completed.set_notice("keep status".to_owned());
+            let mut shielded = true;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let update = completed.handle_mouse(
+                    mouse_event(kind, overlay.x, prompt_top.saturating_sub(1)),
+                    now,
+                );
+                shielded &= !update.visible_changed
+                    && completed.notice() == Some("keep status")
+                    && completed.selection.is_none()
+                    && completed.drag.is_none()
+                    && !completed.pending_copy;
+            }
+
+            assert_eq!(
+                (overlay.bottom(), last_suggestion_row, shielded),
+                (prompt_top, Some(prompt_top.saturating_sub(1)), true),
+                "height {height}",
+            );
+        }
+    }
+
+    #[test]
     fn slash_overlay_shields_primary_mouse_events_but_not_history_outside_it() {
         let mut app = app_with_history(app_with_prompt("/"));
         rendered_buffer(&mut app, 40, 12);
@@ -3327,7 +3475,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_previews_both_encodings_and_debounces_with_injected_time() {
+    fn uncommitted_thinking_preview_does_not_reach_runtime_or_session_memory() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
@@ -3363,6 +3511,61 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_brackets_tui_cancellation_command_queueing() {
+        let directory = tempdir().expect("trace directory");
+        let trace_file = directory.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let (sender, mut receiver) = mpsc::channel(3);
+        let update = super::Update::with_commands([
+            RuntimeCommand::Cancel,
+            RuntimeCommand::CancelBackground,
+            RuntimeCommand::Shutdown,
+        ]);
+
+        super::dispatch_commands(&sender, &update, &trace_owner.handle())
+            .expect("dispatch cancellation commands");
+        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Cancel)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::CancelBackground)
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Shutdown)));
+        trace_owner.shutdown().expect("trace shutdown");
+
+        let events = fs::read_to_string(trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .filter_map(|event| {
+                let name = event["event"].as_str()?;
+                match name {
+                    "tui_command_dispatch" | "tui_command_queued" => {
+                        Some((name.to_owned(), event["command"].as_str()?.to_owned()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [
+                ("tui_command_dispatch".to_owned(), "cancel".to_owned()),
+                ("tui_command_queued".to_owned(), "cancel".to_owned()),
+                (
+                    "tui_command_dispatch".to_owned(),
+                    "cancel_background".to_owned(),
+                ),
+                (
+                    "tui_command_queued".to_owned(),
+                    "cancel_background".to_owned(),
+                ),
+                ("tui_command_dispatch".to_owned(), "shutdown".to_owned()),
+                ("tui_command_queued".to_owned(), "shutdown".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn timer_updates_are_dispatched_without_a_key_event() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
@@ -3370,7 +3573,8 @@ mod tests {
         let update = app.tick(now + Duration::from_secs(2));
         let (sender, mut receiver) = mpsc::channel(1);
 
-        super::dispatch_commands(&sender, &update).expect("dispatch timer update");
+        super::dispatch_commands(&sender, &update, &Trace::disabled())
+            .expect("dispatch timer update");
 
         assert!(matches!(
             receiver.try_recv(),
@@ -3520,7 +3724,7 @@ mod tests {
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
 
         let (sender, mut receiver) = mpsc::channel(2);
-        super::dispatch_commands(&sender, &update).expect("dispatch commands");
+        super::dispatch_commands(&sender, &update, &Trace::disabled()).expect("dispatch commands");
         assert!(matches!(
             receiver.try_recv(),
             Ok(RuntimeCommand::ApplySettings { .. })
@@ -6306,6 +6510,330 @@ mod tests {
         let history = rendered(&mut app, 120, 40);
         assert!(history.find("first()").unwrap() < history.find("second()").unwrap());
         assert!(history.find("second()").unwrap() < history.find("final answer").unwrap());
+    }
+
+    #[test]
+    fn subagent_monitor_renders_two_rows_above_prompt() {
+        let mut app = App::default();
+        app.handle_event(RuntimeEvent::SubagentSpawned {
+            record: crate::subagents::TaskRecord::for_test(
+                "c1",
+                1,
+                crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                None,
+                1,
+                Vec::new(),
+            )
+            .with_observation_for_test(Duration::from_secs(287), 0),
+        });
+
+        let screen = rendered(&mut app, 80, 12);
+        let rows = screen.lines().collect::<Vec<_>>();
+        let entry = rows
+            .iter()
+            .position(|row| row.contains("✓ subagent:c1"))
+            .expect("subagent monitor entry");
+        let prompt = rows
+            .iter()
+            .position(|row| row.starts_with("> "))
+            .expect("prompt");
+
+        assert_eq!(
+            rows[entry].trim_end(),
+            "  ✓ subagent:c1  openai/gpt-5.6-terra  0 steps  04:47"
+        );
+        assert!(rows[entry + 1].starts_with("    └ `test child`"));
+        assert!(entry < prompt);
+    }
+
+    #[test]
+    fn subagent_monitor_renders_parent_context_above_the_prompt() {
+        let now = Instant::now();
+        let mut app = App::default();
+        for record in [
+            crate::subagents::TaskRecord::for_test(
+                "00",
+                1,
+                crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                None,
+                0,
+                Vec::new(),
+            ),
+            crate::subagents::TaskRecord::for_test(
+                "01",
+                1,
+                crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                Some("00"),
+                1,
+                Vec::new(),
+            ),
+        ] {
+            app.handle_event_at(RuntimeEvent::SubagentSpawned { record }, now);
+        }
+
+        let screen = rendered_at(&mut app, 80, 14, now);
+        let rows = screen.lines().collect::<Vec<_>>();
+        let root = rows
+            .iter()
+            .position(|row| row.contains("✓ subagent:00"))
+            .expect("root monitor entry");
+        let child = rows
+            .iter()
+            .position(|row| row.contains("└─✓ subagent:01"))
+            .expect("nested monitor entry");
+        let prompt = rows
+            .iter()
+            .position(|row| row.starts_with("> "))
+            .expect("prompt");
+
+        assert!(rows[root + 1].starts_with("    └ `test child`"));
+        assert!(rows[child + 1].starts_with("      └ `test child`"));
+        assert!(root < child && child < prompt, "{screen}");
+    }
+
+    #[test]
+    fn subagent_monitor_stays_outside_history_selection_and_shrinks_with_the_prompt() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.subagent_monitor
+            .insert_for_test("child1", TaskState::Completed, now);
+
+        let initial = rendered_at(&mut app, 80, 12, now);
+        let initial_history_height = app.history_height;
+        let buffer = rendered_buffer(&mut app, 80, 12);
+        let (column, row) = cell_start(&buffer, "✓ subagent:child1");
+        assert!(
+            app.history_viewport
+                .is_some_and(|viewport| !viewport.area.contains(Position::new(column, row)))
+        );
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            now,
+        );
+        assert!(app.selection.is_none());
+
+        set_prompt(&mut app, "one\ntwo");
+        let grown = rendered_at(&mut app, 80, 12, now);
+        assert_eq!(app.history_height + 1, initial_history_height);
+        assert!(initial.contains("✓ subagent:child1"));
+        assert!(grown.contains("✓ subagent:child1"));
+
+        let tiny = rendered_at(&mut app, 80, 3, now);
+        assert!(!tiny.contains("✓ subagent:child1"));
+
+        let mut configured = App::configured(crate::config::ready_snapshot_for_test());
+        let mut monitored = App::configured(crate::config::ready_snapshot_for_test());
+        monitored
+            .subagent_monitor
+            .insert_for_test("child1", TaskState::Completed, now);
+        for height in [2, 3] {
+            assert_eq!(
+                rendered_at(&mut monitored, 80, height, now),
+                rendered_at(&mut configured, 80, height, now)
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_monitor_does_not_scroll_with_history() {
+        let now = Instant::now();
+        let mut app = app_with_history(App::default());
+        app.subagent_monitor
+            .insert_for_test("child1", TaskState::Running, now);
+
+        rendered_at(&mut app, 80, 9, now);
+        assert!(app.handle_key_at(history_home(), now).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
+        assert!(rendered_at(&mut app, 80, 9, now).contains("• subagent:child1"));
+    }
+
+    #[test]
+    fn subagent_monitor_survives_non_request_actions_and_clears_on_accepted_request() {
+        let now = Instant::now();
+        let mut app = App::default();
+        let record = crate::subagents::TaskRecord::for_test(
+            "c1",
+            1,
+            crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        )
+        .with_observation_for_test(Duration::from_secs(47), 0);
+        app.handle_event_at(
+            RuntimeEvent::SubagentSpawned {
+                record: record.clone(),
+            },
+            now,
+        );
+
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        assert!(
+            app.handle_key_at(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL), now)
+                .commands
+                .is_empty()
+        );
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        set_prompt(&mut app, "/model");
+        app.handle_key_at(key(KeyCode::Enter), now);
+        app.handle_key_at(key(KeyCode::Esc), now);
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        set_prompt(&mut app, "busy draft");
+        assert!(
+            app.handle_key_at(key(KeyCode::Enter), now)
+                .commands
+                .is_empty()
+        );
+        app.handle_event_at(
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: RunId(1),
+            },
+            now,
+        );
+        assert!(rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "accepted".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+
+        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+        app.handle_event_at(RuntimeEvent::SubagentFinished { record }, now);
+        assert!(!rendered_at(&mut app, 80, 12, now).contains("✓ subagent:c1"));
+    }
+
+    #[test]
+    fn ctrl_o_rebuilds_finished_subagent_history_without_expanding_the_sticky_monitor() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(
+            RuntimeEvent::SubagentFinished {
+                record: crate::subagents::TaskRecord::for_test(
+                    "c1",
+                    1,
+                    crate::config::ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                ),
+            },
+            now,
+        );
+
+        let before = rendered_at(&mut app, 80, 12, now);
+        let before_counts = app.transcript.construction_counts();
+        assert!(before.contains("Completed · subagent:c1"), "{before}");
+        assert!(before.contains("✓ subagent:c1"), "{before}");
+
+        let update =
+            app.handle_key_at(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL), now);
+        assert!(update.commands.is_empty());
+        assert!(update.visible_changed);
+
+        let expanded = rendered_at(&mut app, 80, 12, now);
+        assert!(expanded.contains("✓ subagent:c1"), "{expanded}");
+        assert_ne!(app.transcript.construction_counts(), before_counts);
+    }
+
+    #[test]
+    fn subagent_monitor_ticks_only_for_visible_seconds_without_rebuilding_history() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event(completed_record(1, 1, "settled()", vec![]));
+        app.subagent_monitor
+            .insert_for_test("child1", TaskState::Running, now);
+
+        rendered_at(&mut app, 80, 12, now);
+        let before = app.transcript.construction_counts();
+        assert!(!app.tick(now + Duration::from_millis(999)).visible_changed);
+        assert!(app.tick(now + Duration::from_secs(1)).visible_changed);
+        rendered_at(&mut app, 80, 12, now + Duration::from_secs(1));
+        assert_eq!(app.transcript.construction_counts(), before);
+        rendered_at(&mut app, 80, 3, now + Duration::from_secs(2));
+        assert!(!app.tick(now + Duration::from_secs(3)).visible_changed);
+    }
+
+    #[test]
+    fn escape_cancels_foreground_once_then_background_except_in_configuration() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::Cancel]
+        );
+        app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert_eq!(
+            enter_at(&mut app, "second prompt", now).commands,
+            vec![RuntimeCommand::Submit {
+                request: "second prompt".to_owned(),
+            }]
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::Cancel]
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "second prompt".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::CancelBackground]
+        );
+
+        let mut idle = App::default();
+        assert_eq!(
+            idle.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::CancelBackground]
+        );
+
+        let mut disabled = App::default();
+        disabled.handle_event_at(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            },
+            now,
+        );
+        assert_eq!(
+            disabled.handle_key_at(key(KeyCode::Esc), now).commands,
+            vec![RuntimeCommand::CancelBackground]
+        );
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        assert!(
+            configuration
+                .handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+
+        let mut picker = App::default();
+        set_prompt(&mut picker, "/model");
+        picker.handle_key_at(key(KeyCode::Enter), now);
+        assert!(
+            picker
+                .handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
     }
 
     #[test]

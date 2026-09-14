@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use crate::runtime::{
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
+use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 
 #[derive(Clone, Copy)]
 struct MarkdownStyleSheet;
@@ -70,6 +72,28 @@ struct DisplayedRecord {
     record: StoredRecord,
     run_previews: Vec<Option<RunPreview>>,
     progress_gap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SubagentCardPhase {
+    Spawned,
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentSpawnedCard {
+    id: String,
+    model: String,
+    parent: Option<String>,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentFinishedCard {
+    id: String,
+    outcome: String,
+    measures: String,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +181,8 @@ enum TranscriptBlock {
     User {
         request: String,
     },
+    SubagentSpawned(SubagentSpawnedCard),
+    SubagentFinished(SubagentFinishedCard),
     Reasoning {
         markdown: String,
     },
@@ -210,6 +236,8 @@ enum NormalisedBlock {
     User {
         request: String,
     },
+    SubagentSpawned(SubagentSpawnedCard),
+    SubagentFinished(SubagentFinishedCard),
     Reasoning {
         markdown: String,
     },
@@ -254,6 +282,22 @@ impl TranscriptBlock {
             Self::User { request } => NormalisedBlock::User {
                 request: normalise_terminal_text(&request),
             },
+            Self::SubagentSpawned(card) => NormalisedBlock::SubagentSpawned(SubagentSpawnedCard {
+                id: normalise_terminal_text(&card.id),
+                model: normalise_terminal_text(&card.model),
+                parent: card.parent.map(|parent| normalise_terminal_text(&parent)),
+                prompt: bounded_terminal_text(&card.prompt, 64 * 1024),
+            }),
+            Self::SubagentFinished(card) => {
+                NormalisedBlock::SubagentFinished(SubagentFinishedCard {
+                    id: normalise_terminal_text(&card.id),
+                    outcome: normalise_terminal_text(&card.outcome),
+                    measures: normalise_terminal_text(&card.measures),
+                    message: card
+                        .message
+                        .map(|message| bounded_terminal_text(&message, 4 * 1024)),
+                })
+            }
             Self::Reasoning { markdown } => NormalisedBlock::Reasoning {
                 markdown: normalise_terminal_text(&markdown),
             },
@@ -387,7 +431,10 @@ fn tool_call_text(
         .enumerate()
         .skip(omitted.unwrap_or_default())
     {
-        lines.push(Line::styled(tool_call_label(*call), card_style(background)));
+        lines.push(Line::styled(
+            tool_call_label(call.clone()),
+            card_style(background),
+        ));
         if let Some(preview) = run_previews.get(index).and_then(Option::as_ref) {
             lines.push(Line::styled(
                 format!("╭─ $ {}", preview.command),
@@ -411,6 +458,16 @@ fn tool_call_text(
 }
 
 fn tool_call_label(call: ToolCall) -> String {
+    if let ToolCallSummary::Subagent(id) = call.summary {
+        let label = match call.tool {
+            ToolName::StartSubagent => "Spawned",
+            ToolName::GetSubagent | ToolName::RefreshSubagent => "Refreshed",
+            ToolName::WaitSubagent => "Waiting",
+            ToolName::CancelSubagent => "Cancelled",
+            _ => unreachable!("only subagent tools return subagent summaries"),
+        };
+        return format!("{label} · subagent:{id}");
+    }
     let summary = match call.summary {
         ToolCallSummary::Pending => "pending".to_owned(),
         ToolCallSummary::Failed => "failed".to_owned(),
@@ -422,8 +479,87 @@ fn tool_call_label(call: ToolCall) -> String {
         ToolCallSummary::Created => "created".to_owned(),
         ToolCallSummary::Replaced => "replaced".to_owned(),
         ToolCallSummary::Applied => "applied".to_owned(),
+        ToolCallSummary::Subagent(_) => unreachable!("subagent summaries return above"),
     };
     format!("{} · {summary}", call.tool.label())
+}
+
+fn spawned_subagent_block(record: &TaskRecord) -> TranscriptBlock {
+    TranscriptBlock::SubagentSpawned(SubagentSpawnedCard {
+        id: record.id().to_string(),
+        model: record.parameters().selection().model().id.to_owned(),
+        parent: record.parent().map(ToString::to_string),
+        prompt: record.parameters().prompt().to_owned(),
+    })
+}
+
+fn finished_subagent_block(record: &TaskRecord) -> TranscriptBlock {
+    let observation = record.observation();
+    let (outcome, message) = match record.outcome() {
+        Some(TaskOutcome::Completed(result)) => ("Completed".to_owned(), Some(result.message())),
+        Some(TaskOutcome::Failed(failure)) => ("Failed".to_owned(), Some(failure.message())),
+        Some(TaskOutcome::Cancelled) => ("Cancelled".to_owned(), None),
+        Some(TaskOutcome::TimedOut) => ("Timed out".to_owned(), None),
+        None => (
+            subagent_state_label(observation.state()).to_owned(),
+            (observation.state() == TaskState::Failed)
+                .then(|| observation.error())
+                .flatten(),
+        ),
+    };
+    let mut measures = vec![
+        format_step_count(observation.step_count()),
+        format_elapsed(observation.elapsed()),
+    ];
+    if let Some(cost) = format_subagent_cost(observation.cost()) {
+        measures.push(cost);
+    }
+    TranscriptBlock::SubagentFinished(SubagentFinishedCard {
+        id: record.id().to_string(),
+        outcome,
+        measures: measures.join(" · "),
+        message: message.map(str::to_owned),
+    })
+}
+
+fn subagent_state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Starting => "Starting",
+        TaskState::Running => "Running",
+        TaskState::Stopping => "Stopping",
+        TaskState::Completed => "Completed",
+        TaskState::Failed => "Failed",
+        TaskState::Cancelled => "Cancelled",
+        TaskState::TimedOut => "Timed out",
+    }
+}
+
+fn format_step_count(step_count: u64) -> String {
+    format!(
+        "{step_count} {}",
+        if step_count == 1 { "step" } else { "steps" }
+    )
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn format_subagent_cost(cost: RunCostEstimate) -> Option<String> {
+    match cost {
+        RunCostEstimate::Complete(cost) => Some(format_usd(cost.as_nanos())),
+        RunCostEstimate::LowerBound(cost) => Some(format!("≥{}", format_usd(cost.as_nanos()))),
+        RunCostEstimate::Unavailable => None,
+    }
+}
+
+fn bounded_terminal_text(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    normalise_terminal_text(&text[..end])
 }
 
 struct ExecutionPreviewSection {
@@ -541,6 +677,108 @@ fn literal_execution_text(text: &str, style: Style) -> Text<'static> {
             .map(|line| Line::styled(line.to_owned(), style))
             .collect::<Vec<_>>(),
     )
+}
+
+const SUBAGENT_CARD_HORIZONTAL_PADDING: u16 = 2;
+const SUBAGENT_PREVIEW_ROWS: u16 = 3;
+
+fn subagent_spawned_text(card: &SubagentSpawnedCard, width: u16, expanded: bool) -> Text<'static> {
+    let (left_padding, right_padding) = effective_padding(width, SUBAGENT_CARD_HORIZONTAL_PADDING);
+    let prompt_width = width.saturating_sub(left_padding.saturating_add(right_padding));
+    let (mut prompt, omitted) = subagent_preview(&card.prompt, prompt_width, expanded);
+    let mut lines = vec![
+        Line::raw(format!("Spawned · subagent:{}", card.id)),
+        Line::raw(format!("Model · {}", card.model)),
+    ];
+    if let Some(parent) = &card.parent {
+        lines.push(Line::raw(format!("Parent · subagent:{parent}")));
+    }
+    lines.push(Line::raw("Prompt"));
+    lines.append(&mut prompt);
+    if omitted {
+        lines.push(Line::raw("[prompt omitted · Ctrl-O to expand]"));
+    }
+    Text::from(lines)
+}
+
+fn subagent_preview(text: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, bool) {
+    let full = || {
+        text.split('\n')
+            .map(|line| Line::raw(line.to_owned()))
+            .collect::<Vec<_>>()
+    };
+    if expanded || width == 0 {
+        return (full(), false);
+    }
+
+    let paragraph = Paragraph::new(Text::raw(text.to_owned())).wrap(Wrap { trim: false });
+    if paragraph.line_count(width) <= usize::from(SUBAGENT_PREVIEW_ROWS) {
+        return (full(), false);
+    }
+
+    let area = Rect::new(0, 0, width, SUBAGENT_PREVIEW_ROWS);
+    let mut buffer = Buffer::empty(area);
+    paragraph.render(area, &mut buffer);
+    let rows = (0..SUBAGENT_PREVIEW_ROWS)
+        .map(|row| {
+            let mut text = String::new();
+            let mut column = 0;
+            while column < width {
+                let cell = &buffer[(column, row)];
+                text.push_str(cell.symbol());
+                column = column.saturating_add(cell.cell_width().max(1));
+            }
+            Line::raw(text.trim_end().to_owned())
+        })
+        .collect();
+    (rows, true)
+}
+
+fn subagent_finished_text(
+    card: &SubagentFinishedCard,
+    width: u16,
+    expanded: bool,
+) -> Text<'static> {
+    let (left_padding, right_padding) = effective_padding(width, SUBAGENT_CARD_HORIZONTAL_PADDING);
+    let message_width = width.saturating_sub(left_padding.saturating_add(right_padding));
+    let mut lines = vec![
+        Line::raw(format!("{} · subagent:{}", card.outcome, card.id)),
+        Line::raw(card.measures.clone()),
+    ];
+    if let Some(message) = &card.message {
+        let (mut preview, omitted) = subagent_preview(message, message_width, expanded);
+        lines.append(&mut preview);
+        if omitted {
+            lines.push(Line::raw("[result omitted · Ctrl-O to expand]"));
+        }
+    }
+    Text::from(lines)
+}
+
+#[cfg(test)]
+fn subagent_spawned_plain_text(card: &SubagentSpawnedCard) -> String {
+    let mut lines = vec![
+        format!("Spawned · subagent:{}", card.id),
+        format!("Model · {}", card.model),
+    ];
+    if let Some(parent) = &card.parent {
+        lines.push(format!("Parent · subagent:{parent}"));
+    }
+    lines.push("Prompt".to_owned());
+    lines.push(card.prompt.clone());
+    lines.join("\n")
+}
+
+#[cfg(test)]
+fn subagent_finished_plain_text(card: &SubagentFinishedCard) -> String {
+    let mut lines = vec![
+        format!("{} · subagent:{}", card.outcome, card.id),
+        card.measures.clone(),
+    ];
+    if let Some(message) = &card.message {
+        lines.push(message.clone());
+    }
+    lines.join("\n")
 }
 
 struct VerticalClip {
@@ -1147,6 +1385,8 @@ impl NormalisedBlock {
         match self {
             Self::Startup { lines } | Self::Metadata { lines } => lines.join("\n"),
             Self::User { request } => request.clone(),
+            Self::SubagentSpawned(card) => subagent_spawned_plain_text(card),
+            Self::SubagentFinished(card) => subagent_finished_plain_text(card),
             Self::Arena(arena) => arena.plain_text(),
             Self::Status { text } => text.clone(),
             Self::Accounting { text } => format!("\n{text}"),
@@ -1658,7 +1898,7 @@ fn display_model_id(id: &str) -> &str {
     }
 }
 
-fn truncate_front(text: &str, width: usize) -> String {
+pub(crate) fn truncate_front(text: &str, width: usize) -> String {
     if Line::raw(text).width() <= width {
         return text.to_owned();
     }
@@ -1682,7 +1922,7 @@ fn truncate_front(text: &str, width: usize) -> String {
     format!("…{}", suffix.concat())
 }
 
-fn truncate_end(text: &str, width: usize) -> String {
+pub(crate) fn truncate_end(text: &str, width: usize) -> String {
     if Line::raw(text).width() <= width {
         return text.to_owned();
     }
@@ -1748,8 +1988,13 @@ impl SettledBlock {
         matches!(self.source, NormalisedBlock::Reasoning { .. })
     }
 
-    fn invalidates_for_arena(&self) -> bool {
-        matches!(self.source, NormalisedBlock::Arena(..))
+    fn invalidates_for_expansion(&self) -> bool {
+        matches!(
+            self.source,
+            NormalisedBlock::Arena(..)
+                | NormalisedBlock::SubagentSpawned(..)
+                | NormalisedBlock::SubagentFinished(..)
+        )
     }
 }
 
@@ -1979,6 +2224,8 @@ pub(crate) struct Transcript {
     pending_run_gap: bool,
     status: String,
     records: Vec<DisplayedRecord>,
+    subagent_records: BTreeMap<TaskId, TaskRecord>,
+    subagent_lifecycle_cards: BTreeSet<(TaskId, SubagentCardPhase)>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
     show_reasoning: bool,
@@ -2000,6 +2247,8 @@ impl Default for Transcript {
             pending_run_gap: false,
             status: "idle".to_owned(),
             records: Vec::new(),
+            subagent_records: BTreeMap::new(),
+            subagent_lifecycle_cards: BTreeSet::new(),
             settled_blocks: Vec::new(),
             live_step: None,
             show_reasoning: true,
@@ -2127,7 +2376,7 @@ impl Transcript {
                 token,
                 call,
             } => {
-                let activity = tool_call_label(call);
+                let activity = tool_call_label(call.clone());
                 let mut accepted = false;
                 let mut changed =
                     self.update_live_step(run_id, step_id, gap_before, None, |live| {
@@ -2137,7 +2386,7 @@ impl Transcript {
                             .position(|existing| *existing == token);
                         if index.is_some_and(|index| {
                             !matches!(live.tool_calls[index].summary, ToolCallSummary::Pending)
-                                && matches!(call.summary, ToolCallSummary::Pending)
+                                && matches!(&call.summary, ToolCallSummary::Pending)
                         }) {
                             return;
                         }
@@ -2216,6 +2465,16 @@ impl Transcript {
                 record,
                 progress_gap,
             } => self.append_record(record, progress_gap),
+            RuntimeEvent::SubagentSpawned { record } => {
+                self.append_subagent_card(&record, SubagentCardPhase::Spawned)
+                    | self.replace_subagent_record(record)
+            }
+            RuntimeEvent::SubagentStatus { .. } => false,
+            RuntimeEvent::SubagentRecord { record } => self.replace_subagent_record(record),
+            RuntimeEvent::SubagentFinished { record } => {
+                self.append_subagent_card(&record, SubagentCardPhase::Finished)
+                    | self.replace_subagent_record(record)
+            }
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
             RuntimeEvent::SettingsAccepted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
@@ -2234,6 +2493,36 @@ impl Transcript {
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
             RuntimeEvent::SubmissionRejectedBusy { .. } => false,
         }
+    }
+
+    fn replace_subagent_record(&mut self, record: TaskRecord) -> bool {
+        let id = record.id().clone();
+        let Some(current) = self.subagent_records.get(&id) else {
+            let accounting_changed = !record.attempts().is_empty();
+            self.subagent_records.insert(id, record);
+            return accounting_changed;
+        };
+        if current.revision() >= record.revision() {
+            return false;
+        }
+        let accounting_changed = current.attempts() != record.attempts();
+        self.subagent_records.insert(id, record);
+        accounting_changed
+    }
+
+    fn append_subagent_card(&mut self, record: &TaskRecord, phase: SubagentCardPhase) -> bool {
+        if !self
+            .subagent_lifecycle_cards
+            .insert((record.id().clone(), phase))
+        {
+            return false;
+        }
+        let block = match phase {
+            SubagentCardPhase::Spawned => spawned_subagent_block(record),
+            SubagentCardPhase::Finished => finished_subagent_block(record),
+        };
+        self.append_settled_blocks([block]);
+        true
     }
 
     pub(crate) fn toggle_reasoning(&mut self) -> bool {
@@ -2261,7 +2550,7 @@ impl Transcript {
         let visible = self
             .settled_blocks
             .iter()
-            .any(SettledBlock::invalidates_for_arena)
+            .any(SettledBlock::invalidates_for_expansion)
             || self.live_step.as_ref().is_some_and(|live| {
                 live.phase == LivePhase::Executing
                     || !live.decoded_python.is_empty()
@@ -2270,7 +2559,7 @@ impl Transcript {
             });
         if visible {
             for block in &mut self.settled_blocks {
-                if block.invalidates_for_arena() {
+                if block.invalidates_for_expansion() {
                     block.raster = None;
                 }
             }
@@ -2408,14 +2697,21 @@ impl Transcript {
     }
 
     fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
-        let mut attempts = Vec::new();
+        let mut foreground_attempts = Vec::new();
         for displayed in &self.records {
-            append_record_attempts(&displayed.record.record, &mut attempts);
+            append_record_attempts(&displayed.record.record, &mut foreground_attempts);
         }
         if let Some(live) = &self.live_step {
-            attempts.extend(&live.settled_attempts);
+            foreground_attempts.extend(&live.settled_attempts);
         }
-        session_footer(&attempts, context)
+        let latest_foreground_attempt = foreground_attempts.last().copied();
+        let mut attempts = foreground_attempts;
+        attempts.extend(
+            self.subagent_records
+                .values()
+                .flat_map(|record| record.attempts()),
+        );
+        session_footer(&attempts, latest_foreground_attempt, context)
     }
 
     fn append_settled_blocks(&mut self, blocks: impl IntoIterator<Item = TranscriptBlock>) {
@@ -2670,6 +2966,26 @@ fn build_render_block(
                 style,
                 width,
                 1,
+                1,
+            )
+        }
+        NormalisedBlock::SubagentSpawned(card) => {
+            let style = card_style(IN_PROGRESS_ARENA);
+            RenderBlock::card(
+                subagent_spawned_text(card, width, expand_arenas),
+                style,
+                width,
+                SUBAGENT_CARD_HORIZONTAL_PADDING,
+                1,
+            )
+        }
+        NormalisedBlock::SubagentFinished(card) => {
+            let style = card_style(COMPLETE_ARENA);
+            RenderBlock::card(
+                subagent_finished_text(card, width, expand_arenas),
+                style,
+                width,
+                SUBAGENT_CARD_HORIZONTAL_PADDING,
                 1,
             )
         }
@@ -3222,6 +3538,7 @@ fn latest_cache_hit_field(usage: &ModelUsage) -> Option<FooterField> {
 
 fn session_footer(
     attempts: &[&AttemptAccounting],
+    latest_foreground_attempt: Option<&AttemptAccounting>,
     context: Option<FooterContext>,
 ) -> Option<Footer> {
     let mut accounting = SessionAccounting::default();
@@ -3235,7 +3552,7 @@ fn session_footer(
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
-    ) = attempts.iter().next_back()
+    ) = latest_foreground_attempt
         && let Some(cache_hit) = latest_cache_hit_field(usage)
     {
         statistics.push(cache_hit);
@@ -3246,7 +3563,7 @@ fn session_footer(
     if let Some(
         AttemptAccounting::KnownUsage(usage)
         | AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
-    ) = attempts.iter().next_back()
+    ) = latest_foreground_attempt
         && let Some(context) = latest_context_field(usage)
     {
         statistics.push(context);
@@ -3349,7 +3666,7 @@ fn footer_estimated_cost<'a>(
     }
 }
 
-fn format_footer_usd(nanodollars: u128) -> String {
+pub(crate) fn format_footer_usd(nanodollars: u128) -> String {
     const NANODOLLARS_PER_DOLLAR: u128 = 1_000_000_000;
     let mut decimals = footer_cost_decimals(nanodollars);
     let mut rounded = round_nanodollars(nanodollars, decimals);
@@ -3520,6 +3837,8 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
@@ -3529,24 +3848,27 @@ mod tests {
     use super::{
         ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, Footer, FooterContext,
         FooterField, FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter,
-        NormalisedBlock, RenderBlock, TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER,
-        assistant_text, format_footer_usd, format_token_count, markdown, muted_page_style,
-        normalise_terminal_text, own_styled_text, page_style, tool_call_label,
+        NormalisedBlock, RenderBlock, SubagentFinishedCard, SubagentSpawnedCard, TEXT, Transcript,
+        TranscriptBlock, TranscriptLayout, USER, assistant_text, format_footer_usd,
+        format_token_count, markdown, muted_page_style, normalise_terminal_text, own_styled_text,
+        page_style, subagent_preview, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, RunPreview, ToolCall,
         ToolCallSummary, ToolCallToken, ToolName,
     };
-    use crate::config::models::{SOL, TERRA};
+    use crate::config::models::{LUNA, SOL, TERRA};
     use crate::config::{ModelSelection, ready_snapshot_for_test};
     use crate::highlight::PythonHighlighter;
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
+    use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
         ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
         TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
+    use crate::subagents::TaskRecord;
 
     #[test]
     fn page_uses_terminal_background() {
@@ -3587,7 +3909,406 @@ mod tests {
     }
 
     #[test]
-    fn command_tool_labels_are_path_free() {
+    fn spawned_subagent_card_is_separate_from_a_live_python_tail() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "await start_subagent('review')".to_owned(),
+                },
+            },
+            false,
+        ));
+        let child = TaskRecord::for_test(
+            "c1",
+            1,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+
+        assert!(transcript.apply(RuntimeEvent::SubagentSpawned { record: child }, false));
+
+        let rendered = rendered_layout_text(&mut transcript);
+        let spawned = rendered
+            .find("Spawned · subagent:c1")
+            .expect("spawned card");
+        let live = rendered
+            .find("await start_subagent('review')")
+            .expect("live Python tail");
+        assert!(
+            rendered.contains("Model · openai/gpt-5.6-terra"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Prompt"), "{rendered}");
+        assert!(rendered.contains("test child"), "{rendered}");
+        assert!(spawned < live, "{rendered}");
+    }
+
+    #[test]
+    fn spawned_prompt_uses_three_wrapped_rows_until_ctrl_o_expands_it() {
+        let prompt = "alpha beta gamma delta epsilon zeta eta theta iota";
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([spawned_subagent_card("child1", prompt, None)]);
+
+        let collapsed = copied_text(&mut transcript, 20);
+        assert!(collapsed.contains("alpha beta gamma"), "{collapsed}");
+        assert!(collapsed.contains("delta epsilon"), "{collapsed}");
+        assert!(collapsed.contains("zeta eta theta"), "{collapsed}");
+        assert!(!collapsed.contains("iota"), "{collapsed}");
+        assert!(
+            collapsed.contains("[prompt omitted · Ctrl-O to expand]"),
+            "{collapsed}"
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = copied_text(&mut transcript, 20);
+        assert!(
+            expanded.contains(&format!("Prompt\n{prompt}")),
+            "{expanded}"
+        );
+        assert!(!expanded.contains("prompt omitted"), "{expanded}");
+    }
+
+    #[test]
+    fn finished_subagent_result_uses_three_wrapped_rows_until_ctrl_o_expands_and_recollapses_it() {
+        let message = "alpha beta gamma delta epsilon zeta eta theta iota";
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([finished_subagent_card(
+            "child1",
+            "Completed",
+            "1 step · 00:01",
+            Some(message),
+        )]);
+
+        let collapsed = copied_text(&mut transcript, 20);
+        assert_eq!(
+            collapsed,
+            "Completed · subagent:child1\n1 step · 00:01\nalpha beta gamma\ndelta epsilon\nzeta eta theta\n[result omitted · Ctrl-O to expand]"
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = copied_text(&mut transcript, 20);
+        assert_eq!(
+            expanded,
+            format!("Completed · subagent:child1\n1 step · 00:01\n{message}")
+        );
+
+        assert!(transcript.toggle_arena_expansion());
+        assert_eq!(copied_text(&mut transcript, 20), collapsed);
+    }
+
+    #[test]
+    fn collapsed_spawned_prompt_preserves_wide_graphemes_when_copied() {
+        let prompt = "日本🦀e\u{301}日本🦀e\u{301}日本🦀e\u{301}";
+        let (rows, omitted) = subagent_preview(prompt, 4, false);
+        assert!(omitted);
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["日本", "🦀e\u{301}", "日本"]
+        );
+
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([spawned_subagent_card("child1", prompt, None)]);
+
+        assert_eq!(
+            copied_text(&mut transcript, 8),
+            "Spawned · subagent:child1\nModel · openai/gpt-5.6-sol\nPrompt\n日本\n🦀e\u{301}\n日本\n[prompt omitted · Ctrl-O to expand]"
+        );
+    }
+
+    #[test]
+    fn finished_subagent_card_renders_message_without_exported_data() {
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([
+            spawned_subagent_card("child1", "ignored prompt", None),
+            finished_subagent_card(
+                "child1",
+                "Completed",
+                "3 steps · 02:05 · $0.000052",
+                Some("**literal result**\x1B[31m"),
+            ),
+        ]);
+
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(
+            rendered.contains("Completed · subagent:child1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("3 steps · 02:05 · $0.000052"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("**literal result**\\x1B[31m"),
+            "{rendered}"
+        );
+        for absent in ["secret_value", "42", "attempt"] {
+            assert!(!rendered.contains(absent), "{rendered}");
+        }
+        assert!(
+            !copied_text(&mut transcript, 20).contains("[result omitted · Ctrl-O to expand]"),
+            "short results remain fully visible"
+        );
+    }
+
+    #[test]
+    fn finished_subagent_events_project_record_measures() {
+        let child = TaskRecord::for_test(
+            "c1",
+            2,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            vec![usage(1, 1)],
+        );
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(transcript.apply(RuntimeEvent::SubagentFinished { record: child }, false));
+
+        let copied = copied_text(&mut transcript, 80);
+        assert!(copied.contains("Completed · subagent:c1"), "{copied}");
+        assert!(copied.contains("0 steps · 00:00 · $0.000024"), "{copied}");
+    }
+
+    #[test]
+    fn subagent_cards_normalise_unicode_and_controls_at_narrow_widths() {
+        let prompt = "Café 日本 🦀 e\u{301}\t\r\nnext\u{7}";
+        let diagnostic =
+            "failed \u{1b}日本 🦀 e\u{301} alpha beta gamma delta epsilon zeta eta theta iota";
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([
+            spawned_subagent_card("child1", prompt, None),
+            finished_subagent_card("child1", "Failed", "1 step · 00:01", Some(diagnostic)),
+        ]);
+
+        for width in 1..=20 {
+            let buffer = rendered_buffer(&mut transcript, width);
+            assert_eq!(buffer.area.width, width);
+        }
+        let collapsed = copied_text(&mut transcript, 20);
+        assert!(collapsed.contains("Café 日本 🦀 e\u{301}"), "{collapsed}");
+        assert!(collapsed.contains("next\\x07"), "{collapsed}");
+        assert!(collapsed.contains("\\x1B"), "{collapsed}");
+        assert!(collapsed.contains("日本"), "{collapsed}");
+        assert!(collapsed.contains("🦀 e\u{301}"), "{collapsed}");
+        assert!(
+            collapsed.contains("[result omitted · Ctrl-O to expand]"),
+            "{collapsed}"
+        );
+        assert!(!collapsed.contains("iota"), "{collapsed}");
+        assert!(!collapsed.contains('\u{1b}'), "{collapsed}");
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = copied_text(&mut transcript, 20);
+        assert!(expanded.contains("iota"), "{expanded}");
+        assert!(!expanded.contains("result omitted"), "{expanded}");
+    }
+
+    #[test]
+    fn subagent_card_previews_bound_text_without_splitting_utf8() {
+        let prompt = format!("{}🦀", "a".repeat(64 * 1024 - 1));
+        let message = format!("{}🦀", "b".repeat(4 * 1024 - 1));
+        let NormalisedBlock::SubagentSpawned(spawned) =
+            spawned_subagent_card("child1", &prompt, None).normalise()
+        else {
+            panic!("spawned card normalises to a spawned card");
+        };
+        let NormalisedBlock::SubagentFinished(finished) =
+            finished_subagent_card("child1", "Completed", "1 step · 00:01", Some(&message))
+                .normalise()
+        else {
+            panic!("finished card normalises to a finished card");
+        };
+
+        let expected_prompt = "a".repeat(64 * 1024 - 1);
+        let expected_message = "b".repeat(4 * 1024 - 1);
+        assert_eq!(spawned.prompt, expected_prompt);
+        assert_eq!(finished.message.as_deref(), Some(expected_message.as_str()));
+    }
+
+    #[test]
+    fn subagent_cards_are_immutable_cached_and_not_duplicated() {
+        let child = TaskRecord::for_test(
+            "c1",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let mut transcript = Transcript::default();
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: child.clone(),
+            },
+            false,
+        ));
+        transcript.layout(20);
+        let spawned = transcript.construction_counts();
+        transcript.layout(20);
+        assert_eq!(transcript.construction_counts(), spawned);
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 2,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        transcript.layout(20);
+        assert_eq!(transcript.construction_counts(), spawned);
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert_eq!(transcript.settled_blocks.len(), 1);
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: child.clone(),
+            },
+            false
+        ));
+        transcript.layout(20);
+        let finished = transcript.construction_counts();
+        assert_eq!(finished.rasterisations, spawned.rasterisations + 1);
+        assert_eq!(
+            finished.render_block_builds,
+            spawned.render_block_builds + 1
+        );
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: child.clone()
+            },
+            false
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 2,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        transcript.layout(20);
+        assert_eq!(transcript.construction_counts(), finished);
+        assert_eq!(transcript.settled_blocks.len(), 2);
+
+        assert!(transcript.toggle_arena_expansion());
+        transcript.layout(20);
+        let expanded = transcript.construction_counts();
+        assert_eq!(expanded.rasterisations, finished.rasterisations + 2);
+        assert_eq!(
+            expanded.render_block_builds,
+            finished.render_block_builds + 2
+        );
+    }
+
+    #[test]
+    fn subagent_cards_keep_root_and_descendant_publication_order() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "root before".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        ));
+        transcript.append_settled_blocks([spawned_subagent_card("parent", "parent prompt", None)]);
+        assert!(transcript.apply(
+            completed_execution(1, 1, "root_between()", "", Vec::new()),
+            false,
+        ));
+        transcript.append_settled_blocks([
+            spawned_subagent_card("child1", "child prompt", Some("parent")),
+            finished_subagent_card(
+                "child1",
+                "Completed",
+                "1 step · 00:02",
+                Some("child result"),
+            ),
+            finished_subagent_card(
+                "parent",
+                "Completed",
+                "1 step · 00:01",
+                Some("parent result"),
+            ),
+        ]);
+
+        let copied = copied_text(&mut transcript, 80);
+        let positions = [
+            "root before",
+            "Spawned · subagent:parent",
+            "root_between()",
+            "Spawned · subagent:child1",
+            "Completed · subagent:child1",
+            "Completed · subagent:parent",
+        ]
+        .map(|text| copied.find(text).expect(text));
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{copied}"
+        );
+        assert!(copied.contains("Parent · subagent:parent"), "{copied}");
+    }
+
+    #[test]
+    fn finished_subagent_cards_preserve_lower_bound_and_unavailable_costs() {
+        let mut transcript = Transcript::default();
+        transcript.append_settled_blocks([
+            finished_subagent_card(
+                "lower1",
+                "Failed",
+                "1 step · 00:07 · ≥$0.000024",
+                Some("bad\x1b diagnostic"),
+            ),
+            finished_subagent_card("none01", "Cancelled", "0 steps · 00:09", None),
+            finished_subagent_card("late01", "Timed out", "1 step · 15:00", None),
+        ]);
+
+        let copied = copied_text(&mut transcript, 80);
+        assert!(
+            copied.contains(
+                "Failed · subagent:lower1\n1 step · 00:07 · ≥$0.000024\nbad\\x1B diagnostic"
+            ),
+            "{copied}"
+        );
+        assert!(
+            copied.contains("Cancelled · subagent:none01\n0 steps · 00:09"),
+            "{copied}"
+        );
+        assert!(
+            copied.contains("Timed out · subagent:late01\n1 step · 15:00"),
+            "{copied}"
+        );
+        assert!(!copied.contains("result omitted"), "{copied}");
+        assert!(!copied.contains("unavailable"), "{copied}");
+        assert!(!copied.contains("cancellation requested"), "{copied}");
+    }
+
+    #[test]
+    fn command_and_subagent_tool_labels_are_concise() {
         for (summary, expected) in [
             (ToolCallSummary::Pending, "run · pending"),
             (ToolCallSummary::Exit(7), "run · exit 7"),
@@ -3598,6 +4319,21 @@ mod tests {
                 tool_call_label(ToolCall {
                     tool: ToolName::Run,
                     summary,
+                }),
+                expected
+            );
+        }
+        for (tool, expected) in [
+            (ToolName::StartSubagent, "Spawned · subagent:child1"),
+            (ToolName::GetSubagent, "Refreshed · subagent:child1"),
+            (ToolName::RefreshSubagent, "Refreshed · subagent:child1"),
+            (ToolName::WaitSubagent, "Waiting · subagent:child1"),
+            (ToolName::CancelSubagent, "Cancelled · subagent:child1"),
+        ] {
+            assert_eq!(
+                tool_call_label(ToolCall {
+                    tool,
+                    summary: ToolCallSummary::Subagent("child1".to_owned()),
                 }),
                 expected
             );
@@ -3728,6 +4464,14 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
         layout.render(buffer.area, 0, &mut buffer);
         buffer
+    }
+
+    fn copied_text(transcript: &mut Transcript, width: u16) -> String {
+        let layout = transcript.layout(width);
+        layout.extract_selection(Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(layout.total_height(), 0),
+        ))
     }
 
     fn footer_text(layout: &TranscriptLayout) -> Option<String> {
@@ -3899,8 +4643,28 @@ mod tests {
         reasoning: Option<u64>,
         total: Option<u64>,
     ) -> AttemptAccounting {
+        detailed_usage_for(
+            SOL.id,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            total,
+        )
+    }
+
+    fn detailed_usage_for(
+        model: &str,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+        reasoning: Option<u64>,
+        total: Option<u64>,
+    ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "openai/gpt-5.6-sol".to_owned(),
+            model: model.to_owned(),
             service_tier: Some("default".to_owned()),
             input_tokens: input,
             cached_input_tokens: cache_read,
@@ -4054,6 +4818,29 @@ mod tests {
             },
             progress_gap,
         }
+    }
+
+    fn spawned_subagent_card(id: &str, prompt: &str, parent: Option<&str>) -> TranscriptBlock {
+        TranscriptBlock::SubagentSpawned(SubagentSpawnedCard {
+            id: id.to_owned(),
+            model: SOL.id.to_owned(),
+            parent: parent.map(str::to_owned),
+            prompt: prompt.to_owned(),
+        })
+    }
+
+    fn finished_subagent_card(
+        id: &str,
+        outcome: &str,
+        measures: &str,
+        message: Option<&str>,
+    ) -> TranscriptBlock {
+        TranscriptBlock::SubagentFinished(SubagentFinishedCard {
+            id: id.to_owned(),
+            outcome: outcome.to_owned(),
+            measures: measures.to_owned(),
+            message: message.map(str::to_owned),
+        })
     }
 
     fn cached_transcript() -> Transcript {
@@ -5794,6 +6581,303 @@ truncated"
     }
 
     #[test]
+    fn footer_aggregates_child_records_without_changing_foreground_context() {
+        let root = detailed_usage(Some(100), Some(0), Some(50), Some(0), Some(0), Some(100));
+        let child = detailed_usage(Some(200), Some(10), Some(0), Some(0), Some(0), Some(210));
+        let mut transcript = Transcript::default();
+        transcript.apply(completed_execution(1, 1, "root()", "", vec![root]), false);
+        transcript.apply(RuntimeEvent::RunSettled { run_id: RunId(1) }, false);
+
+        let before = footer_text(&transcript.layout(128)).expect("root footer");
+        assert!(before.contains("CH50.0%"), "{before}");
+        assert!(before.contains("0.0%/272k"), "{before}");
+
+        let child = TaskRecord::for_test(
+            "c1",
+            3,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            vec![child],
+        );
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        let footer = footer_text(&transcript.layout(128)).expect("aggregated footer");
+        assert!(footer.contains("↑300 ↓10 R50 W0"), "{footer}");
+        assert!(footer.contains("CH50.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 4,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentStatus {
+                id: child.id().clone(),
+                revision: 2,
+                observation: child.observation().clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert_eq!(
+            footer_text(&transcript.layout(128)).as_deref(),
+            Some(footer.as_str())
+        );
+    }
+
+    #[test]
+    fn footer_counts_mixed_model_descendants_once_and_keeps_root_context() {
+        let root = detailed_usage_for(
+            LUNA.id,
+            Some(100),
+            Some(10),
+            Some(50),
+            Some(0),
+            Some(0),
+            Some(110),
+        );
+        let child_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(200),
+            Some(20),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(220),
+        );
+        let nested_attempt = detailed_usage_for(
+            SOL.id,
+            Some(300),
+            Some(30),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(330),
+        );
+        let child = TaskRecord::for_test(
+            "c1",
+            2,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            vec![child_attempt.clone()],
+        );
+        let nested = TaskRecord::for_test(
+            "d1",
+            2,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            Some("c1"),
+            2,
+            vec![nested_attempt.clone()],
+        );
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            final_message(1, 1, "root", vec![root.clone()], false),
+            false,
+        );
+        let before = footer_text(&transcript.layout(128)).expect("root footer");
+
+        assert_eq!(child.attempts(), std::slice::from_ref(&child_attempt));
+        assert_eq!(nested.parent(), Some(child.id()));
+        assert_eq!(nested.depth(), 2);
+        assert_eq!(nested.attempts(), std::slice::from_ref(&nested_attempt));
+        assert_eq!(
+            child.observation().cost(),
+            estimate_run_cost([&child_attempt])
+        );
+        assert_eq!(
+            nested.observation().cost(),
+            estimate_run_cost([&nested_attempt])
+        );
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: nested.clone(),
+            },
+            false,
+        ));
+
+        let footer = footer_text(&transcript.layout(128)).expect("mixed-model footer");
+        assert!(footer.contains("↑600 ↓60 R50 W0"), "{footer}");
+        let RunCostEstimate::Complete(cost) =
+            estimate_run_cost([&root, &child_attempt, &nested_attempt])
+        else {
+            panic!("complete mixed-model cost");
+        };
+        assert!(
+            footer.contains(&format_footer_usd(cost.as_nanos())),
+            "{footer}"
+        );
+        assert!(footer.contains("CH50.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+        assert!(before.contains("CH50.0%"), "{before}");
+        assert!(before.contains("0.0%/272k"), "{before}");
+    }
+
+    #[test]
+    fn child_records_replace_live_attempts_and_ignore_equal_or_stale_revisions() {
+        let partial_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(100),
+            Some(10),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(110),
+        );
+        let additional_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(200),
+            Some(20),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(220),
+        );
+        let unexpected_attempt = detailed_usage_for(
+            TERRA.id,
+            Some(300),
+            Some(30),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(330),
+        );
+        let selection = ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap();
+        let partial =
+            TaskRecord::for_test("c1", 2, selection, None, 1, vec![partial_attempt.clone()]);
+        let terminal = TaskRecord::for_test(
+            "c1",
+            4,
+            selection,
+            None,
+            1,
+            vec![partial_attempt.clone(), additional_attempt.clone()],
+        );
+        let equal_projection = terminal
+            .clone()
+            .with_observation_for_test(Duration::from_secs(10), 10_000);
+        let equal_revision = TaskRecord::for_test(
+            "c1",
+            4,
+            selection,
+            None,
+            1,
+            vec![
+                partial_attempt.clone(),
+                additional_attempt.clone(),
+                unexpected_attempt.clone(),
+            ],
+        );
+        let stale = TaskRecord::for_test(
+            "c1",
+            3,
+            selection,
+            None,
+            1,
+            vec![
+                partial_attempt.clone(),
+                additional_attempt.clone(),
+                unexpected_attempt,
+            ],
+        );
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: partial.clone(),
+            },
+            false,
+        ));
+        let partial_footer = footer_text(&transcript.layout(128)).expect("partial footer");
+        assert!(
+            partial_footer.contains("↑100 ↓10 R0 W0"),
+            "{partial_footer}"
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: terminal.clone(),
+            },
+            false,
+        ));
+        let footer = footer_text(&transcript.layout(128)).expect("terminal footer");
+        assert!(footer.contains("↑300 ↓30 R0 W0"), "{footer}");
+        let RunCostEstimate::Complete(cost) =
+            estimate_run_cost([&partial_attempt, &additional_attempt])
+        else {
+            panic!("complete terminal cost");
+        };
+        assert!(
+            footer.contains(&format_footer_usd(cost.as_nanos())),
+            "{footer}"
+        );
+
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: terminal.clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: equal_projection,
+            },
+            false,
+        ));
+        let retained = transcript
+            .subagent_records
+            .get(terminal.id())
+            .expect("retained terminal record")
+            .observation();
+        assert_eq!(retained.elapsed(), Duration::ZERO);
+        assert_eq!(retained.observed_at_ms(), 0);
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentRecord {
+                record: equal_revision.clone(),
+            },
+            false,
+        ));
+        assert!(!transcript.apply(RuntimeEvent::SubagentRecord { record: stale }, false,));
+        assert!(!transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: equal_revision,
+            },
+            false,
+        ));
+        assert_eq!(transcript.subagent_lifecycle_cards.len(), 1);
+        assert_eq!(
+            footer_text(&transcript.layout(128)).as_deref(),
+            Some(footer.as_str())
+        );
+    }
+
+    #[test]
     fn footer_rule_fills_the_terminal_and_truncates_to_latest_metrics() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -6240,6 +7324,8 @@ truncated"
             .map(|block| match block {
                 TranscriptBlock::Startup { .. } => "startup",
                 TranscriptBlock::User { .. } => "user",
+                TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
+                TranscriptBlock::SubagentFinished(..) => "subagent finished",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
@@ -6354,6 +7440,8 @@ truncated"
             .map(|block| match block {
                 TranscriptBlock::Startup { .. } => "startup",
                 TranscriptBlock::User { .. } => "user",
+                TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
+                TranscriptBlock::SubagentFinished(..) => "subagent finished",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",

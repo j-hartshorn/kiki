@@ -1718,9 +1718,9 @@ dependencies = [
 
 [[package]]
 name = "monty-fs"
-version = "0.0.21"
+version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "343097acb29c9bb4e230a5a187a21c50d268f94911bc81db89dab4aa304d4c50"
+checksum = "b1d5cf64525e7d2b49841fea78381fca24bc2816b89064e7c890672e1d87f539"
 dependencies = [
  "ahash",
  "cap-std",
@@ -1730,9 +1730,9 @@ dependencies = [
 
 [[package]]
 name = "monty-macros"
-version = "0.0.21"
+version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ed428288161f63d2bec7929438563fe31390f08e014e58ce20be96d7ef82ee"
+checksum = "017842a9c6539f60ced38edab5b75a3c35223e908e9221c3b5c1a08537e21d2b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1741,9 +1741,9 @@ dependencies = [
 
 [[package]]
 name = "monty-pool"
-version = "0.0.21"
+version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a483cbecc06bf69bdc7a94479e271d4ee7bce6d05e1eb60ef0e199e8ca110df"
+checksum = "0b5ad8c44370f7a9965f0aef7ad5763942a635d2f3356719f7a3657bf75fee78"
 dependencies = [
  "futures-util",
  "monty-fs",
@@ -1756,9 +1756,9 @@ dependencies = [
 
 [[package]]
 name = "monty-proto"
-version = "0.0.21"
+version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8741cb0a667eebd8bf090affd2f5f92bcf1597b9216f7714e9ea6b2ef6ac556"
+checksum = "f08c2cfd327e6fcb45f7e2c4dae9bbe9aa8a2cc99c292798a8a11531b30ebd90"
 dependencies = [
  "monty-types",
  "num-bigint",
@@ -1767,9 +1767,9 @@ dependencies = [
 
 [[package]]
 name = "monty-types"
-version = "0.0.21"
+version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b4b3318107fee36c5eee05c52f16f6565a63aa29d04f8608ebc221e3fe5dd8"
+checksum = "7cde2e299aa36171838b74a67ef7d3fbd116174ccaf2cbdd537a42a9658c024d"
 dependencies = [
  "chrono",
  "monty-macros",
@@ -3079,7 +3079,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -8,6 +8,7 @@ use std::str::Utf8Error;
 use crate::tools::prompt_reference;
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/read_only_agent.md");
+const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
 const BUNDLED_PROMPT_NAME: &str = "read_only_agent";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
 
@@ -18,6 +19,7 @@ pub enum PromptSource {
 }
 
 pub struct ResolvedPrompt {
+    base: String,
     text: String,
     source: PromptSource,
 }
@@ -27,9 +29,25 @@ impl ResolvedPrompt {
         &self.text
     }
 
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
     pub fn source(&self) -> &PromptSource {
         &self.source
     }
+}
+
+pub(crate) fn root_prompt(base: &str) -> String {
+    assemble(base, prompt_reference())
+}
+
+pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
+    assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
+}
+
+fn assemble(base: &str, tool_reference: String) -> String {
+    format!("{base}\n\n{tool_reference}")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,7 +79,8 @@ pub fn resolve() -> Result<ResolvedPrompt, PromptError> {
 fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedPrompt, PromptError> {
     let Some(override_path) = override_path else {
         return Ok(ResolvedPrompt {
-            text: append_tool_reference(BUNDLED_PROMPT),
+            base: BUNDLED_PROMPT.to_owned(),
+            text: root_prompt(BUNDLED_PROMPT),
             source: PromptSource::Bundled {
                 name: BUNDLED_PROMPT_NAME,
             },
@@ -79,22 +98,20 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
     };
 
     Ok(ResolvedPrompt {
-        text: append_tool_reference(&text),
+        text: root_prompt(&text),
+        base: text,
         source: PromptSource::Override { path },
     })
-}
-
-fn append_tool_reference(base: &str) -> String {
-    format!("{base}\n\n{}", prompt_reference())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{PromptError, PromptSource, prompt_reference, resolve_from_override};
+    use super::{PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override};
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/read_only_agent.md");
+    const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
 
     fn assert_concept(terms: &[&str]) {
         let prompt = BUNDLED_PROMPT.to_lowercase();
@@ -115,12 +132,20 @@ mod tests {
             "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:",
             "async def grep(pattern: str, path: str = \".\", file_glob: str | None = None) -> list[GrepMatch]:",
             "async def run(command: str, cwd: str = \".\") -> CommandResult:",
+            "async def start_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> SubagentTask:",
+            "async def run_subagent(prompt: str, model: str | None = None, read_only: bool = False) -> dict:",
+            "async def get_subagent(id: str) -> SubagentTask:",
+            "async def refresh(self) -> SubagentStatus:",
+            "async def wait(self) -> dict:",
+            "async def cancel(self) -> SubagentStatus:",
         ] {
             assert_eq!(reference.matches(signature).count(), 1);
         }
         assert_eq!(reference.matches("class DirectoryEntry:").count(), 1);
         assert_eq!(reference.matches("class GrepMatch:").count(), 1);
         assert_eq!(reference.matches("class CommandResult:").count(), 1);
+        assert_eq!(reference.matches("class SubagentStatus:").count(), 1);
+        assert_eq!(reference.matches("class SubagentTask:").count(), 1);
         for guidance in [
             "Every host call must be awaited.",
             "independent calls expected to succeed",
@@ -129,7 +154,8 @@ mod tests {
             "A gather failure can follow completed host calls",
             "Run project-local, one-shot commands.",
             "Keep model-visible output focused.",
-            "five-minute deadline",
+            "five minutes of chargeable time",
+            "Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.",
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
@@ -147,7 +173,7 @@ mod tests {
         ]);
         assert_concept(&["host access", "tool reference"]);
         assert_concept(&["execution feedback", "python error", "committed"]);
-        for managed_guidance in ["asyncio.gather", "focused", "five-minute deadline"] {
+        for managed_guidance in ["asyncio.gather", "five-minute deadline"] {
             assert!(
                 !BUNDLED_PROMPT.contains(managed_guidance),
                 "bundled prompt must not duplicate managed `{managed_guidance}` guidance"
@@ -158,13 +184,19 @@ mod tests {
         assert_concept(&["untrusted", "files", "output", "instructions"]);
         assert!(!BUNDLED_PROMPT.contains("async def"));
 
+        assert_concept(&[
+            "delegate",
+            "focused",
+            "subagents",
+            "task ids",
+            "do not enter model context",
+        ]);
         for speculative_capability in [
             "resource registry",
             "write(path)",
             "edit(path)",
             "glob(",
             "grep(",
-            "subagent",
         ] {
             assert!(
                 !BUNDLED_PROMPT
@@ -184,6 +216,7 @@ mod tests {
             format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference())
         );
         assert_generated_tool_reference(resolved.text());
+        assert_eq!(resolved.base(), BUNDLED_PROMPT);
         assert!(
             resolved
                 .text()
@@ -217,6 +250,7 @@ mod tests {
             format!("{OVERRIDE}\n\n{}", prompt_reference())
         );
         assert_generated_tool_reference(resolved.text());
+        assert_eq!(resolved.base(), OVERRIDE);
         assert_eq!(
             resolved.source(),
             &PromptSource::Override {
@@ -224,6 +258,46 @@ mod tests {
             }
         );
         assert!(!format!("{:?}", resolved.source()).contains("private override text"));
+    }
+
+    #[test]
+    fn child_prompts_keep_the_canonical_base_and_one_effective_reference() {
+        let base = "canonical base";
+        let full = child_prompt(base, prompt_reference());
+
+        assert_eq!(
+            full,
+            format!("{base}\n\n{BUNDLED_CHILD_PROMPT}\n\n{}", prompt_reference())
+        );
+        assert_eq!(full.matches("## Kiki tool reference").count(), 1);
+        assert!(full.contains("pre-execution checkpoint"));
+        assert!(full.contains("same execution are not included"));
+        assert!(full.contains("result_values"));
+        assert!(full.contains("wait for, refresh"));
+        assert!(full.contains("share the filesystem"));
+        assert!(full.contains("not rolled back"));
+        assert!(full.contains("no implicit merge or context insertion"));
+        assert!(full.contains("frozen for this subagent"));
+        assert!(full.contains("last observed"));
+        assert!(full.contains("may fail"));
+    }
+
+    #[tokio::test]
+    async fn read_only_child_prompt_omits_unavailable_tool_wrappers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let reference = crate::tools::ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .for_child(true)
+            .prompt_reference();
+        let prompt = child_prompt("canonical base", reference);
+
+        assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);
+        assert!(prompt.contains("This Arena is read-only"));
+        assert!(prompt.contains("write, edit, and run are unavailable"));
+        for signature in ["async def write(", "async def edit(", "async def run("] {
+            assert!(!prompt.contains(signature), "unexpected `{signature}`");
+        }
     }
 
     #[test]
