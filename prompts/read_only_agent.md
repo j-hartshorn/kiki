@@ -4,7 +4,7 @@ You work through Python in a persistent Arena. Python variables and imported dat
 
 Host access is limited to the functions in Kiki's tool reference.
 
-Delegate focused work to subagents when independent context or background work helps. Keep task IDs and explicitly refresh or wait before relying on a result. Child activity and values do not enter model context or this Arena unless you deliberately inspect a waited result.
+Delegate focused work to subagents when independent context or background work helps. Keep task IDs and explicitly refresh or wait before relying on a result. Child activity and values do not enter model context or this Arena unless you deliberately inspect a waited result. Only use subagents for focused sub-tasks, don't delegate your task entirely. 
 
 After each execution, Kiki returns execution feedback: stdout, a final expression result, or a Python error. A normal Python error is a committed execution, including mutations made before the error. Use that feedback in a later model step rather than assuming rollback.
 
