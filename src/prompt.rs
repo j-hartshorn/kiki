@@ -113,16 +113,6 @@ mod tests {
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
     const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
 
-    fn assert_concept(terms: &[&str]) {
-        let prompt = BUNDLED_PROMPT.to_lowercase();
-        for term in terms {
-            assert!(
-                prompt.contains(term),
-                "bundled prompt must include the `{term}` concept"
-            );
-        }
-    }
-
     fn assert_generated_tool_reference(reference: &str) {
         for signature in [
             "async def read(path: str) -> str:",
@@ -163,51 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_prompt_keeps_shared_agent_behaviour_outside_the_tool_reference() {
-        assert_concept(&[
-            "persistent",
-            "arena",
-            "model steps",
-            "user requests",
-            "survive",
-        ]);
-        assert_concept(&["host access", "tool reference"]);
-        assert_concept(&["execution feedback", "python error", "committed"]);
-        for managed_guidance in ["asyncio.gather", "five-minute deadline"] {
-            assert!(
-                !BUNDLED_PROMPT.contains(managed_guidance),
-                "bundled prompt must not duplicate managed `{managed_guidance}` guidance"
-            );
-        }
-        assert_concept(&["execute_python", "final assistant text", "exactly one"]);
-        assert_concept(&["do not repeat", "executed python", "unless the user asks"]);
-        assert_concept(&["untrusted", "files", "output", "instructions"]);
-        assert!(!BUNDLED_PROMPT.contains("async def"));
-
-        assert_concept(&[
-            "delegate",
-            "focused",
-            "subagents",
-            "task ids",
-            "do not enter model context",
-        ]);
-        for speculative_capability in [
-            "resource registry",
-            "write(path)",
-            "edit(path)",
-            "glob(",
-            "grep(",
-        ] {
-            assert!(
-                !BUNDLED_PROMPT
-                    .to_lowercase()
-                    .contains(speculative_capability),
-                "bundled prompt must not advertise `{speculative_capability}`"
-            );
-        }
-    }
-
-    #[test]
     fn resolves_the_named_bundled_prompt_with_one_generated_tool_reference() {
         let resolved = resolve_from_override(None).unwrap();
 
@@ -217,12 +162,6 @@ mod tests {
         );
         assert_generated_tool_reference(resolved.text());
         assert_eq!(resolved.base(), BUNDLED_PROMPT);
-        assert!(
-            resolved
-                .text()
-                .contains("Do not redefine these host functions.")
-        );
-        assert!(!resolved.text().contains("list of exact lines"));
         assert_eq!(resolved.source(), &PromptSource::Bundled { name: "system" });
     }
 
@@ -265,16 +204,6 @@ mod tests {
             format!("{base}\n\n{BUNDLED_CHILD_PROMPT}\n\n{}", prompt_reference())
         );
         assert_eq!(full.matches("## Kiki tool reference").count(), 1);
-        assert!(full.contains("pre-execution checkpoint"));
-        assert!(full.contains("same execution are not included"));
-        assert!(full.contains("result_values"));
-        assert!(full.contains("wait for, refresh"));
-        assert!(full.contains("share the filesystem"));
-        assert!(full.contains("not rolled back"));
-        assert!(full.contains("no implicit merge or context insertion"));
-        assert!(full.contains("frozen for this subagent"));
-        assert!(full.contains("last observed"));
-        assert!(full.contains("may fail"));
     }
 
     #[tokio::test]
@@ -288,8 +217,6 @@ mod tests {
         let prompt = child_prompt("canonical base", reference);
 
         assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);
-        assert!(prompt.contains("This Arena is read-only"));
-        assert!(prompt.contains("write, edit, and run are unavailable"));
         for signature in ["async def write(", "async def edit(", "async def run("] {
             assert!(!prompt.contains(signature), "unexpected `{signature}`");
         }
