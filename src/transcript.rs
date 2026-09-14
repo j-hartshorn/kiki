@@ -2354,7 +2354,11 @@ impl Transcript {
                     )
                 }
             }
-            RuntimeEvent::ExecutionStarted { run_id, step_id } => {
+            RuntimeEvent::ExecutionStarted {
+                run_id,
+                step_id,
+                commentary,
+            } => {
                 if self.has_settled_run(run_id, step_id) {
                     false
                 } else {
@@ -2365,6 +2369,7 @@ impl Transcript {
                         Some("running code".to_owned()),
                         |live| {
                             live.phase = LivePhase::Executing;
+                            live.assistant_text = commentary.unwrap_or_default();
                             live.activity = "running code".to_owned();
                         },
                     )
@@ -3154,6 +3159,7 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
         }
         Record::CompletedExecution {
             source,
+            commentary,
             reasoning_summary,
             execution,
             attempts,
@@ -3161,6 +3167,7 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
         } => {
             let mut blocks = Vec::new();
             append_reasoning(&mut blocks, reasoning_summary, "");
+            append_commentary(&mut blocks, commentary.as_deref());
             blocks.push(TranscriptBlock::Arena(ArenaBlock {
                 state: arena_state(execution),
                 heading: None,
@@ -3216,6 +3223,12 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
     }
     append_reasoning(&mut blocks, "", &live.reasoning);
     if has_arena_content {
+        if !live.assistant_text.is_empty() {
+            blocks.push(TranscriptBlock::Assistant {
+                markdown: live.assistant_text.clone(),
+                accounting: None,
+            });
+        }
         let mut content = Vec::new();
         if !live.stdout.is_empty() {
             content.push(ArenaContent {
@@ -3240,12 +3253,6 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
             progress_gap: live.progress_gap,
             accounting,
         }));
-        if !live.assistant_text.is_empty() {
-            blocks.push(TranscriptBlock::Assistant {
-                markdown: live.assistant_text.clone(),
-                accounting: None,
-            });
-        }
         return blocks;
     }
 
@@ -3275,7 +3282,7 @@ fn terminal_blocks(
                 &evidence.reasoning_summary,
                 &evidence.reasoning,
             );
-            blocks.push(TranscriptBlock::Arena(ArenaBlock {
+            let arena = TranscriptBlock::Arena(ArenaBlock {
                 state: ArenaState::Error,
                 heading: Some(diagnostic),
                 status: None,
@@ -3285,14 +3292,16 @@ fn terminal_blocks(
                 content: Vec::new(),
                 progress_gap,
                 accounting: None,
-            }));
+            });
             if evidence.assistant_text.is_empty() {
+                blocks.push(arena);
                 append_accounting(&mut blocks, accounting);
             } else {
                 blocks.push(TranscriptBlock::Assistant {
                     markdown: evidence.assistant_text.clone(),
                     accounting,
                 });
+                blocks.push(arena);
             }
             blocks
         }
@@ -3318,6 +3327,7 @@ fn terminal_blocks(
         Some(TerminalEvidence::Execution(evidence)) => {
             let mut blocks = Vec::new();
             append_reasoning(&mut blocks, &evidence.reasoning_summary, "");
+            append_commentary(&mut blocks, evidence.commentary.as_deref());
             blocks.push(TranscriptBlock::Arena(execution_evidence_block(
                 Some(diagnostic),
                 evidence,
@@ -3332,6 +3342,15 @@ fn terminal_blocks(
             append_accounting(&mut blocks, accounting);
             blocks
         }
+    }
+}
+
+fn append_commentary(blocks: &mut Vec<TranscriptBlock>, commentary: Option<&str>) {
+    if let Some(commentary) = commentary {
+        blocks.push(TranscriptBlock::Assistant {
+            markdown: commentary.to_owned(),
+            accounting: None,
+        });
     }
 }
 
@@ -3374,6 +3393,12 @@ fn terminal_evidence_blocks(
             decoded_python,
         })) => {
             append_reasoning(blocks, reasoning_summary, reasoning);
+            if !assistant_text.is_empty() {
+                blocks.push(TranscriptBlock::Assistant {
+                    markdown: assistant_text.clone(),
+                    accounting: None,
+                });
+            }
             if !decoded_python.is_empty() {
                 blocks.push(TranscriptBlock::Arena(ArenaBlock {
                     state: ArenaState::Error,
@@ -3387,15 +3412,10 @@ fn terminal_evidence_blocks(
                     accounting: None,
                 }));
             }
-            if !assistant_text.is_empty() {
-                blocks.push(TranscriptBlock::Assistant {
-                    markdown: assistant_text.clone(),
-                    accounting: None,
-                });
-            }
         }
         Some(TerminalEvidence::Execution(evidence)) => {
             append_reasoning(blocks, &evidence.reasoning_summary, "");
+            append_commentary(blocks, evidence.commentary.as_deref());
             blocks.push(TranscriptBlock::Arena(execution_evidence_block(
                 None, evidence, false, None,
             )));
@@ -4687,6 +4707,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(step_id),
+                    commentary: None,
                     source: source.to_owned(),
                     reasoning_summary: reasoning_summary.to_owned(),
                     execution: Execution {
@@ -4716,6 +4737,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(step_id),
+                    commentary: None,
                     source: source.to_owned(),
                     reasoning_summary: String::new(),
                     execution: Execution {
@@ -4739,6 +4761,7 @@ mod tests {
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         ));
@@ -5674,6 +5697,7 @@ store: false disables retained Response objects but does not prevent user reques
                         terminal: TerminalDetails {
                             evidence: Some(TerminalEvidence::Execution(Box::new(
                                 ExecutionEvidence {
+                                    commentary: Some("I’ll inspect the failure first.".to_owned()),
                                     source: "failure_code".to_owned(),
                                     reasoning_summary: String::new(),
                                     began: true,
@@ -5705,7 +5729,9 @@ store: false disables retained Response objects but does not prevent user reques
                 DocumentPosition::new(0, 0),
                 DocumentPosition::new(layout.total_height(), 0),
             )),
-            "cancelled
+            "I’ll inspect the failure first.
+
+cancelled
 execution: started
 code
 failure_code
@@ -5757,6 +5783,7 @@ warning body"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "error_code".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -5780,6 +5807,7 @@ warning body"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         );
@@ -7154,6 +7182,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "print('hello')\n2".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -7180,6 +7209,7 @@ truncated"
                         terminal: TerminalDetails {
                             evidence: Some(TerminalEvidence::Execution(Box::new(
                                 ExecutionEvidence {
+                                    commentary: None,
                                     source: "await read(path)".to_owned(),
                                     reasoning_summary: String::new(),
                                     began: true,
@@ -7450,12 +7480,12 @@ truncated"
                 TranscriptBlock::Accounting { .. } => "accounting",
             })
             .collect::<Vec<_>>();
-        assert_eq!(roles, ["reasoning", "arena", "assistant"]);
+        assert_eq!(roles, ["reasoning", "assistant", "arena"]);
 
         let [
             TranscriptBlock::Reasoning { .. },
-            TranscriptBlock::Arena(arena),
             TranscriptBlock::Assistant { .. },
+            TranscriptBlock::Arena(arena),
         ] = blocks.as_slice()
         else {
             unreachable!("live arena roles checked")
@@ -7475,8 +7505,8 @@ truncated"
                 < rendered.find("generating").expect("arena")
         );
         assert!(
-            rendered.find("generating").expect("arena")
-                < rendered.find("live assistant").expect("assistant")
+            rendered.find("live assistant").expect("assistant")
+                < rendered.find("generating").expect("arena")
         );
     }
 
@@ -7544,7 +7574,48 @@ truncated"
                 !code.is_empty(),
                 "mask {mask}"
             );
+            if !assistant.is_empty() && !code.is_empty() {
+                let assistant_index = blocks
+                    .iter()
+                    .position(|block| matches!(block, TranscriptBlock::Assistant { .. }))
+                    .unwrap();
+                let arena_index = blocks
+                    .iter()
+                    .position(|block| matches!(block, TranscriptBlock::Arena(..)))
+                    .unwrap();
+                assert!(assistant_index < arena_index, "mask {mask}");
+            }
         }
+    }
+
+    #[test]
+    fn rendering_settled_commentary_before_its_execution_arena() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        commentary: Some("I’ll inspect the value first.".to_owned()),
+                        source: "print(value)".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation("value\n"),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                            tool_calls: Vec::new(),
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let rendered = rendered_text(&transcript);
+        assert!(rendered.find("I’ll inspect").unwrap() < rendered.find("print(value)").unwrap());
     }
 
     #[test]
@@ -7557,6 +7628,7 @@ truncated"
                 Record::CancelledRun {
                     terminal: TerminalDetails {
                         evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            commentary: None,
                             source: "cancelled_code()".to_owned(),
                             reasoning_summary: String::new(),
                             began: true,
@@ -7722,28 +7794,43 @@ truncated"
     }
 
     #[test]
-    fn rendering_execution_started_without_visible_output_has_an_arena_role() {
+    fn execution_start_replaces_streamed_text_with_authoritative_commentary_before_the_arena() {
         let mut transcript = Transcript::default();
         transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "I’ll inspect".to_owned(),
+                },
+            },
+            false,
+        );
         transcript.apply(
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: Some("I’ll inspect the value first.".to_owned()),
             },
             false,
         );
 
-        assert!(transcript.blocks().iter().any(|block| {
-            matches!(
-                block,
+        let blocks = transcript.blocks();
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                TranscriptBlock::Assistant { markdown, .. },
                 TranscriptBlock::Arena(ArenaBlock {
                     heading: Some(heading),
                     source: None,
                     content,
                     ..
-                }) if heading == "running code" && content.is_empty()
-            )
-        }));
+                })
+            ] if markdown == "I’ll inspect the value first."
+                && heading == "running code"
+                && content.is_empty()
+        ));
     }
 
     #[test]
@@ -7755,6 +7842,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "**literal source**".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -7830,6 +7918,7 @@ truncated"
                     run_id: RunId(2),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: hostile.to_owned(),
                         reasoning_summary: hostile.to_owned(),
                         execution: Execution {
@@ -7900,6 +7989,7 @@ truncated"
                         terminal: TerminalDetails {
                             evidence: Some(TerminalEvidence::Execution(Box::new(
                                 ExecutionEvidence {
+                                    commentary: None,
                                     source: hostile.to_owned(),
                                     reasoning_summary: hostile.to_owned(),
                                     began: true,
@@ -8324,6 +8414,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -8357,6 +8448,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -8431,6 +8523,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -8548,6 +8641,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "source()".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -8615,6 +8709,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -8662,6 +8757,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         );
@@ -8984,6 +9080,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         ));
@@ -9219,6 +9316,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         );
@@ -9286,6 +9384,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         );
@@ -9376,6 +9475,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "XYZ".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -9446,6 +9546,7 @@ truncated"
                     run_id: RunId(2),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "python_error_source".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -9471,6 +9572,7 @@ truncated"
                 Record::CancelledRun {
                     terminal: TerminalDetails {
                         evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            commentary: None,
                             source: "cancelled_source".to_owned(),
                             reasoning_summary: String::new(),
                             began: true,
@@ -9491,6 +9593,7 @@ truncated"
                     message: "failed".to_owned(),
                     terminal: TerminalDetails {
                         evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            commentary: None,
                             source: "failed_source".to_owned(),
                             reasoning_summary: String::new(),
                             began: true,
@@ -9577,6 +9680,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source,
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -9607,6 +9711,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                commentary: None,
             },
             false,
         );
@@ -9624,6 +9729,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -9663,6 +9769,7 @@ truncated"
                         terminal: TerminalDetails {
                             evidence: Some(TerminalEvidence::Execution(Box::new(
                                 ExecutionEvidence {
+                                    commentary: None,
                                     source: "pass".to_owned(),
                                     reasoning_summary: String::new(),
                                     began: true,
@@ -9740,6 +9847,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::CompletedExecution {
                         step_id: ModelStepId(1),
+                        commentary: None,
                         source: "pass".to_owned(),
                         reasoning_summary: String::new(),
                         execution: Execution {
@@ -9925,6 +10033,7 @@ truncated"
             RuntimeEvent::ExecutionStarted {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
+                commentary: None,
             },
             false,
         );

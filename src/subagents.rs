@@ -1178,6 +1178,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                 AgentProgress::ExecutionStarted { .. } => execution_span.started(model_step),
                 AgentProgress::ExecutionCompleted {
                     source,
+                    commentary: _,
                     reasoning_summary,
                     execution,
                     attempts,

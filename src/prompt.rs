@@ -180,6 +180,12 @@ mod tests {
             );
         }
         assert_concept(&["execute_python", "final assistant text", "exactly one"]);
+        assert_concept(&[
+            "one or two sentences",
+            "intent",
+            "commentary",
+            "run continues",
+        ]);
         assert_concept(&["do not repeat", "executed python", "unless the user asks"]);
         assert_concept(&["untrusted", "files", "output", "instructions"]);
         assert!(!BUNDLED_PROMPT.contains("async def"));

@@ -19,6 +19,7 @@ pub enum ModelAction {
     Code {
         source: String,
         call_id: ModelCallId,
+        commentary: Option<String>,
     },
     Message {
         text: String,
@@ -145,6 +146,7 @@ impl CodeResult {
 pub struct CompletedCode {
     source: String,
     call_id: ModelCallId,
+    commentary: Option<String>,
     reasoning_summary: String,
     replay: ProviderReplay,
     result: CodeResult,
@@ -157,6 +159,10 @@ impl CompletedCode {
 
     pub fn call_id(&self) -> &ModelCallId {
         &self.call_id
+    }
+
+    pub fn commentary(&self) -> Option<&str> {
+        self.commentary.as_deref()
     }
 
     pub fn reasoning_summary(&self) -> &str {
@@ -225,6 +231,7 @@ impl ModelHistory {
         &mut self,
         source: String,
         call_id: ModelCallId,
+        commentary: Option<String>,
         reasoning_summary: String,
         replay: ProviderReplay,
         result: CodeResult,
@@ -236,6 +243,7 @@ impl ModelHistory {
             .push(ModelContextEntry::CompletedCode(CompletedCode {
                 source,
                 call_id,
+                commentary,
                 reasoning_summary,
                 replay,
                 result: result.bounded(),
@@ -517,6 +525,7 @@ impl Model for ScriptedModel {
                 ScriptedAction::Code { source } => ModelAction::Code {
                     source,
                     call_id: ModelCallId::new(format!("scripted-{user_requests}-{action_number}")),
+                    commentary: None,
                 },
                 ScriptedAction::Message { text } => ModelAction::Message { text },
             };
@@ -592,6 +601,7 @@ mod tests {
             ModelAction::Code {
                 source: "first".to_owned(),
                 call_id: ModelCallId::new("scripted-1-1"),
+                commentary: None,
             }
         );
         assert_eq!(step.selection, None);
@@ -647,6 +657,7 @@ mod tests {
             ModelAction::Code {
                 source: "first".to_owned(),
                 call_id: ModelCallId::new("scripted-2-1"),
+                commentary: None,
             }
         );
     }
@@ -659,6 +670,7 @@ mod tests {
             .append_completed_code(
                 "print(1)".to_owned(),
                 call_id.clone(),
+                Some("I’ll inspect first.".to_owned()),
                 "checked source".to_owned(),
                 replay("opaque-call"),
                 CodeResult::Execution {
@@ -674,6 +686,7 @@ mod tests {
             .expect("completed code entry");
         assert_eq!(completed.source(), "print(1)");
         assert_eq!(completed.call_id(), &call_id);
+        assert_eq!(completed.commentary(), Some("I’ll inspect first."));
         assert_eq!(completed.reasoning_summary(), "checked source");
         assert_eq!(completed.replay(), &replay("opaque-call"));
         assert_eq!(
@@ -687,6 +700,7 @@ mod tests {
             .append_completed_code(
                 "print(2)".to_owned(),
                 call_id.clone(),
+                None,
                 String::new(),
                 replay("other-call"),
                 CodeResult::Execution {
@@ -733,6 +747,7 @@ mod tests {
                 .append_completed_code(
                     format!("code-{index}"),
                     ModelCallId::new(format!("call-{index}")),
+                    None,
                     String::new(),
                     replay(&format!("opaque-{index}")),
                     result,
@@ -778,6 +793,7 @@ mod tests {
             .append_completed_code(
                 "code".to_owned(),
                 ModelCallId::new("call"),
+                None,
                 String::new(),
                 replay("opaque"),
                 CodeResult::Failure {

@@ -39,6 +39,7 @@ impl GenerationEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionEvidence {
     pub(crate) source: String,
+    pub(crate) commentary: Option<String>,
     pub(crate) reasoning_summary: String,
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
@@ -72,6 +73,7 @@ pub(crate) enum AgentProgress {
     ModelProgress(ModelProgress),
     ExecutionStarted {
         selection: Option<ModelSelection>,
+        commentary: Option<String>,
     },
     ToolUpdated {
         token: ToolCallToken,
@@ -87,6 +89,7 @@ pub(crate) enum AgentProgress {
     StdoutTruncated,
     ExecutionCompleted {
         source: String,
+        commentary: Option<String>,
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
@@ -202,13 +205,24 @@ impl GenerationEvidenceBuilder {
 }
 
 impl ExecutionEvidence {
-    fn cancelled(source: String, reasoning_summary: String, error: Option<&ArenaError>) -> Self {
-        Self::from_error(source, reasoning_summary, error, true)
+    fn cancelled(
+        source: String,
+        commentary: Option<String>,
+        reasoning_summary: String,
+        error: Option<&ArenaError>,
+    ) -> Self {
+        Self::from_error(source, commentary, reasoning_summary, error, true)
     }
 
-    fn failed(source: String, reasoning_summary: String, error: &ArenaError) -> Self {
+    fn failed(
+        source: String,
+        commentary: Option<String>,
+        reasoning_summary: String,
+        error: &ArenaError,
+    ) -> Self {
         Self::from_error(
             source,
+            commentary,
             reasoning_summary,
             Some(error),
             contains_cancellation(error),
@@ -217,6 +231,7 @@ impl ExecutionEvidence {
 
     fn from_error(
         source: String,
+        commentary: Option<String>,
         reasoning_summary: String,
         error: Option<&ArenaError>,
         cancellation_warning: bool,
@@ -227,6 +242,7 @@ impl ExecutionEvidence {
             .unwrap_or_else(empty_interrupted_execution);
         Self {
             source,
+            commentary,
             reasoning_summary,
             began: interrupted.began,
             stdout: interrupted.stdout,
@@ -392,6 +408,7 @@ impl AgentError {
 
 struct PendingCode {
     source: String,
+    commentary: Option<String>,
     selection: Option<ModelSelection>,
     call_id: ModelCallId,
     reasoning_summary: String,
@@ -407,6 +424,7 @@ impl PendingCode {
         history.append_completed_code(
             self.source,
             self.call_id,
+            self.commentary,
             self.reasoning_summary,
             self.replay,
             result,
@@ -542,7 +560,11 @@ impl<M: Model> Agent<M> {
             } = model_step;
             attempts.extend(step_attempts.iter().cloned());
             match action {
-                ModelAction::Code { source, call_id } => {
+                ModelAction::Code {
+                    source,
+                    call_id,
+                    commentary,
+                } => {
                     if self.model_context.contains_call_id(&call_id) {
                         return Err(AgentError::ModelHistory {
                             error: ModelHistoryError::DuplicateCallId(call_id),
@@ -556,6 +578,7 @@ impl<M: Model> Agent<M> {
                     generation.clear();
                     let pending = PendingCode {
                         source,
+                        commentary,
                         selection,
                         call_id,
                         reasoning_summary,
@@ -564,6 +587,7 @@ impl<M: Model> Agent<M> {
                     if cancellation.is_cancelled() {
                         let evidence = Box::new(ExecutionEvidence::cancelled(
                             pending.source.clone(),
+                            pending.commentary.clone(),
                             pending.reasoning_summary.clone(),
                             None,
                         ));
@@ -584,6 +608,7 @@ impl<M: Model> Agent<M> {
                     }
                     progress(AgentProgress::ExecutionStarted {
                         selection: pending.selection,
+                        commentary: pending.commentary.clone(),
                     });
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
@@ -613,6 +638,7 @@ impl<M: Model> Agent<M> {
                     match execution {
                         Ok(execution) => {
                             let source = pending.source.clone();
+                            let commentary = pending.commentary.clone();
                             let reasoning_summary = pending.reasoning_summary.clone();
                             if let Err(error) = pending.append(
                                 &mut self.model_context,
@@ -626,6 +652,7 @@ impl<M: Model> Agent<M> {
                             }
                             progress(AgentProgress::ExecutionCompleted {
                                 source,
+                                commentary,
                                 reasoning_summary,
                                 execution,
                                 attempts: step_attempts,
@@ -636,12 +663,14 @@ impl<M: Model> Agent<M> {
                             let evidence = Box::new(if cancelled {
                                 ExecutionEvidence::cancelled(
                                     pending.source.clone(),
+                                    pending.commentary.clone(),
                                     pending.reasoning_summary.clone(),
                                     Some(&error),
                                 )
                             } else {
                                 ExecutionEvidence::failed(
                                     pending.source.clone(),
+                                    pending.commentary.clone(),
                                     pending.reasoning_summary.clone(),
                                     &error,
                                 )
@@ -1211,6 +1240,7 @@ mod tests {
                         CompletedModelAction::Code {
                             source: "1 + 1".to_owned(),
                             call_id: ModelCallId::new("summary-code"),
+                            commentary: Some("I’ll calculate this first.".to_owned()),
                         },
                         "code summary".to_owned(),
                     ),
@@ -1257,15 +1287,18 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentProgress::ModelProgress(_)))
         );
-        let execution_reasoning_summary = progress
+        let (execution_commentary, execution_reasoning_summary) = progress
             .iter()
             .find_map(|event| match event {
                 AgentProgress::ExecutionCompleted {
-                    reasoning_summary, ..
-                } => Some(reasoning_summary.as_str()),
+                    commentary,
+                    reasoning_summary,
+                    ..
+                } => Some((commentary.as_deref(), reasoning_summary.as_str())),
                 _ => None,
             })
-            .expect("completed execution should carry its summary");
+            .expect("completed execution should carry its model output");
+        assert_eq!(execution_commentary, Some("I’ll calculate this first."));
         assert_eq!(execution_reasoning_summary, "code summary");
         let completed = agent
             .model_context
@@ -1274,6 +1307,7 @@ mod tests {
             .find_map(ModelContextEntry::completed_code)
             .expect("completed code should be admitted with its result");
         assert_eq!(completed.call_id().as_str(), "summary-code");
+        assert_eq!(completed.commentary(), Some("I’ll calculate this first."));
         assert_eq!(completed.reasoning_summary(), "code summary");
         assert!(matches!(completed.result(), CodeResult::Execution { .. }));
         assert!(
@@ -1341,6 +1375,7 @@ mod tests {
                     action: CompletedModelAction::Code {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("summary-code"),
+                        commentary: None,
                     },
                     selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
@@ -1370,6 +1405,7 @@ mod tests {
                     0 => CompletedModelAction::Code {
                         source: "value = 1".to_owned(),
                         call_id: ModelCallId::new("selected-code"),
+                        commentary: None,
                     },
                     1 => CompletedModelAction::Message {
                         text: "done".to_owned(),
@@ -1415,7 +1451,7 @@ mod tests {
             progress
                 .iter()
                 .filter_map(|event| match event {
-                    AgentProgress::ExecutionStarted { selection } => Some(*selection),
+                    AgentProgress::ExecutionStarted { selection, .. } => Some(*selection),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -1777,7 +1813,8 @@ mod tests {
             }),
         };
 
-        let evidence = super::ExecutionEvidence::failed("source".to_owned(), String::new(), &error);
+        let evidence =
+            super::ExecutionEvidence::failed("source".to_owned(), None, String::new(), &error);
 
         assert_eq!(
             evidence.tool_calls,
@@ -1978,6 +2015,7 @@ mod tests {
             CompletedModelAction::Code {
                 source: "boundary_action_ran = True".to_owned(),
                 call_id: ModelCallId::new("boundary-code"),
+                commentary: None,
             },
             CompletedModelAction::Message {
                 text: "must not be admitted".to_owned(),
@@ -2366,12 +2404,16 @@ mod tests {
             progress.as_slice(),
             [
                 AgentProgress::ModelStepStarted,
-                AgentProgress::ExecutionStarted { selection: None },
+                AgentProgress::ExecutionStarted {
+                    selection: None,
+                    commentary: Some(commentary),
+                },
                 AgentProgress::ExecutionCompleted {
                     reasoning_summary,
                     ..
                 },
-            ] if reasoning_summary == "code summary"
+            ] if commentary == "I’ll calculate this first."
+                && reasoning_summary == "code summary"
         ));
         let completed = agent
             .model_context
