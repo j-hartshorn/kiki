@@ -260,6 +260,62 @@ mod tests {
     }
 
     #[test]
+    fn rates_match_the_3_september_2026_research_record() {
+        let expected = [
+            (
+                &SOL,
+                Rates {
+                    uncached_input_nanos: 4_000,
+                    cached_input_nanos: 400,
+                    cache_write_nanos: 5_000,
+                    output_nanos: 20_000,
+                },
+                Rates {
+                    uncached_input_nanos: 8_000,
+                    cached_input_nanos: 800,
+                    cache_write_nanos: 10_000,
+                    output_nanos: 30_000,
+                },
+            ),
+            (
+                &TERRA,
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 2_500,
+                    output_nanos: 12_000,
+                },
+                Rates {
+                    uncached_input_nanos: 4_000,
+                    cached_input_nanos: 400,
+                    cache_write_nanos: 5_000,
+                    output_nanos: 18_000,
+                },
+            ),
+            (
+                &LUNA,
+                Rates {
+                    uncached_input_nanos: 200,
+                    cached_input_nanos: 20,
+                    cache_write_nanos: 250,
+                    output_nanos: 1_200,
+                },
+                Rates {
+                    uncached_input_nanos: 400,
+                    cached_input_nanos: 40,
+                    cache_write_nanos: 500,
+                    output_nanos: 1_800,
+                },
+            ),
+        ];
+
+        for (model, short_context, long_context) in expected {
+            assert_eq!(model.pricing.short_context, short_context);
+            assert_eq!(model.pricing.long_context, long_context);
+        }
+    }
+
+    #[test]
     fn astra_metadata_thinking_and_rates_are_exact() {
         assert_eq!(
             ASTRA.thinking_levels,
