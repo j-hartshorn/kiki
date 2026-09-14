@@ -153,6 +153,20 @@ mod tests {
     }
 
     #[test]
+    fn bundled_prompt_requests_commentary_before_code_execution() {
+        let prompt = BUNDLED_PROMPT.to_lowercase();
+        for guidance in [
+            "one or two sentences",
+            "intent",
+            "execute_python",
+            "commentary",
+            "run continues",
+        ] {
+            assert!(prompt.contains(guidance), "missing `{guidance}`");
+        }
+    }
+
+    #[test]
     fn resolves_the_named_bundled_prompt_with_one_generated_tool_reference() {
         let resolved = resolve_from_override(None).unwrap();
 

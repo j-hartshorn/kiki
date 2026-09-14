@@ -2331,6 +2331,7 @@ mod tests {
                         run_id: RunId(run_id),
                         record: Record::CompletedExecution {
                             step_id: ModelStepId(1),
+                            commentary: None,
                             source,
                             reasoning_summary: format!("settled reasoning {run_id:03}"),
                             execution: Execution {
@@ -6399,6 +6400,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(step_id),
+                    commentary: None,
                     source: source.to_owned(),
                     reasoning_summary: String::new(),
                     execution: Execution {
@@ -6425,6 +6427,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(2),
+                    commentary: None,
                     source: "raise RuntimeError()".to_owned(),
                     reasoning_summary: String::new(),
                     execution: Execution {
@@ -6447,6 +6450,7 @@ mod tests {
                 record: Record::CancelledRun {
                     terminal: terminal(
                         Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                            commentary: None,
                             source: "await read(path)".to_owned(),
                             reasoning_summary: String::new(),
                             began: true,
@@ -7517,6 +7521,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(1),
+                    commentary: None,
                     source: (1..=33)
                         .map(|line| format!("code line {line:02}"))
                         .collect::<Vec<_>>()
@@ -7614,6 +7619,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(1),
+                    commentary: None,
                     source: (1..=33)
                         .map(|line| format!("code {line}"))
                         .collect::<Vec<_>>()
@@ -7643,6 +7649,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::CompletedExecution {
                     step_id: ModelStepId(1),
+                    commentary: None,
                     source: (1..=33)
                         .map(|line| format!("code {line}"))
                         .collect::<Vec<_>>()

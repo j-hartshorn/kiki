@@ -66,6 +66,7 @@ pub(crate) enum Record {
     CompletedExecution {
         step_id: ModelStepId,
         source: String,
+        commentary: Option<String>,
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
@@ -115,6 +116,7 @@ pub(crate) enum RuntimeEvent {
     ExecutionStarted {
         run_id: RunId,
         step_id: ModelStepId,
+        commentary: Option<String>,
     },
     ToolUpdated {
         run_id: RunId,
@@ -271,6 +273,7 @@ enum WorkerMessage<M: Model> {
     ExecutionCompleted {
         step_ordinal: u64,
         source: String,
+        commentary: Option<String>,
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
@@ -327,9 +330,10 @@ fn agent_progress_payload_bytes(progress: &AgentProgress) -> usize {
         }
         AgentProgress::StdoutDelta { text } => text.len(),
         AgentProgress::StdoutTruncated => 0,
-        AgentProgress::ModelStepStarted
-        | AgentProgress::ExecutionStarted { .. }
-        | AgentProgress::ExecutionCompleted { .. } => 0,
+        AgentProgress::ExecutionStarted { commentary, .. } => {
+            commentary.as_ref().map_or(0, String::len)
+        }
+        AgentProgress::ModelStepStarted | AgentProgress::ExecutionCompleted { .. } => 0,
     }
 }
 
@@ -342,9 +346,11 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         }
         RuntimeEvent::StdoutDelta { text, .. } => text.len(),
         RuntimeEvent::StdoutTruncated { .. } => 0,
+        RuntimeEvent::ExecutionStarted { commentary, .. } => {
+            commentary.as_ref().map_or(0, String::len)
+        }
         RuntimeEvent::RunStarted { .. }
         | RuntimeEvent::ModelStepStarted { .. }
-        | RuntimeEvent::ExecutionStarted { .. }
         | RuntimeEvent::RecordAppended { .. }
         | RuntimeEvent::SubagentSpawned { .. }
         | RuntimeEvent::SubagentStatus { .. }
@@ -769,6 +775,7 @@ impl<M: Model> RuntimeController<M> {
                     }
                     AgentProgress::ExecutionCompleted {
                         source,
+                        commentary,
                         reasoning_summary,
                         execution,
                         attempts,
@@ -776,6 +783,7 @@ impl<M: Model> RuntimeController<M> {
                         let _ = completion_sender.send(WorkerMessage::ExecutionCompleted {
                             step_ordinal,
                             source,
+                            commentary,
                             reasoning_summary,
                             execution,
                             attempts,
@@ -871,6 +879,7 @@ impl<M: Model> RuntimeController<M> {
             WorkerMessage::ExecutionCompleted {
                 step_ordinal,
                 source,
+                commentary,
                 reasoning_summary,
                 execution,
                 attempts,
@@ -884,6 +893,7 @@ impl<M: Model> RuntimeController<M> {
                     Record::CompletedExecution {
                         step_id,
                         source,
+                        commentary,
                         reasoning_summary,
                         execution,
                         attempts,
@@ -1056,9 +1066,11 @@ impl<M: Model> RuntimeController<M> {
                 step_id,
                 progress,
             },
-            AgentProgress::ExecutionStarted { .. } => {
-                RuntimeEvent::ExecutionStarted { run_id, step_id }
-            }
+            AgentProgress::ExecutionStarted { commentary, .. } => RuntimeEvent::ExecutionStarted {
+                run_id,
+                step_id,
+                commentary,
+            },
             AgentProgress::ToolUpdated { token, call } => RuntimeEvent::ToolUpdated {
                 run_id,
                 step_id,
@@ -1705,10 +1717,12 @@ mod tests {
                     (1, 0) => CompletedModelAction::Code {
                         source: "handoff = 'before'".to_owned(),
                         call_id: ModelCallId::new("workflow-1-1"),
+                        commentary: None,
                     },
                     (1, 1) => CompletedModelAction::Code {
                         source: "same_execution = 'after'\nrecoverable_id = (await start_subagent('recoverable work', 'openai/gpt-5.6-terra')).id\nfailed_id = (await start_subagent('failing work', 'openai/gpt-5.6-luna')).id\nparent_id = (await start_subagent('cancellable parent')).id".to_owned(),
                         call_id: ModelCallId::new("workflow-1-2"),
+                        commentary: None,
                     },
                     (1, 2) => CompletedModelAction::Message {
                         text: "first foreground final".to_owned(),
@@ -1716,6 +1730,7 @@ mod tests {
                     (2, 0) => CompletedModelAction::Code {
                         source: "recoverable = await get_subagent(recoverable_id)\nawait recoverable.refresh()\nrecoverable_result = await recoverable.wait()\nassert recoverable.status.state == 'completed'\nassert recoverable_result['values']['handoff'] == handoff\nassert set(recoverable_result['values']) == {'handoff', 'same_execution'}\nfailed = await get_subagent(failed_id)\ntry:\n    await failed.wait()\nexcept RuntimeError:\n    pass\nassert failed.status.state == 'failed'\nparent = await get_subagent(parent_id)\nparent_result = await parent.wait()\ndescendant = await get_subagent(parent_result['values']['descendant_id'])\nawait descendant.refresh()\nassert descendant.status.state in ('starting', 'running')\nassert (await parent.cancel()).state == 'completed'\nassert (await descendant.refresh()).state == 'cancelled'\nrecoverable_result['values']['same_execution']".to_owned(),
                         call_id: ModelCallId::new("workflow-2-1"),
+                        commentary: None,
                     },
                     (2, 1) => CompletedModelAction::Message {
                         text: "second foreground final".to_owned(),
@@ -2647,6 +2662,7 @@ mod tests {
                         CompletedModelAction::Code {
                             source: "value = 1".to_owned(),
                             call_id: ModelCallId::new("first"),
+                            commentary: None,
                         }
                     }
                     1 => CompletedModelAction::Message {
@@ -3339,6 +3355,7 @@ mod tests {
                     CompletedModelAction::Code {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("recovery-failure"),
+                        commentary: None,
                     }
                 } else {
                     CompletedModelAction::Message {
@@ -3374,10 +3391,12 @@ mod tests {
                     0 => CompletedModelAction::Code {
                         source: "first = 1".to_owned(),
                         call_id: ModelCallId::new("first-accounting-code"),
+                        commentary: None,
                     },
                     1 => CompletedModelAction::Code {
                         source: "second = first + 1".to_owned(),
                         call_id: ModelCallId::new("second-accounting-code"),
+                        commentary: None,
                     },
                     2 => CompletedModelAction::Message {
                         text: "done".to_owned(),
@@ -3415,6 +3434,7 @@ mod tests {
                         CompletedModelAction::Code {
                             source: "1 + 1".to_owned(),
                             call_id: ModelCallId::new("summary-code"),
+                            commentary: Some("I’ll calculate this first.".to_owned()),
                         },
                         "code summary".to_owned(),
                     ),
@@ -3461,6 +3481,7 @@ mod tests {
                     action: CompletedModelAction::Code {
                         source: self.source.clone(),
                         call_id: ModelCallId::new("summary-code"),
+                        commentary: None,
                     },
                     selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
@@ -3529,6 +3550,7 @@ mod tests {
                             CompletedModelAction::Code {
                                 source: "value = 1".to_owned(),
                                 call_id: ModelCallId::new("first-code"),
+                                commentary: None,
                             },
                             "committed code summary".to_owned(),
                         )
@@ -3544,6 +3566,7 @@ mod tests {
                             CompletedModelAction::Code {
                                 source: "value + 1".to_owned(),
                                 call_id: ModelCallId::new("later-code"),
+                                commentary: None,
                             },
                             String::new(),
                         )
@@ -3584,6 +3607,7 @@ mod tests {
 
     fn failed_execution_evidence(failure: ExecutionFailure) -> ExecutionEvidence {
         ExecutionEvidence {
+            commentary: None,
             source: "failed_code()".to_owned(),
             reasoning_summary: String::new(),
             began: true,
@@ -3930,10 +3954,12 @@ mod tests {
                 CompletedModelAction::Code {
                     source: "first = 1".to_owned(),
                     call_id: ModelCallId::new("first"),
+                    commentary: None,
                 },
                 CompletedModelAction::Code {
                     source: "first + 1".to_owned(),
                     call_id: ModelCallId::new("second"),
+                    commentary: None,
                 },
                 CompletedModelAction::Message {
                     text: "done".to_owned(),
@@ -4005,6 +4031,7 @@ mod tests {
                     source: "import asyncio\nawait asyncio.gather(read('input'), read('missing'))"
                         .to_owned(),
                     call_id: ModelCallId::new("read-input"),
+                    commentary: None,
                 },
                 CompletedModelAction::Message {
                     text: "done".to_owned(),
@@ -4121,6 +4148,7 @@ mod tests {
             vec![CompletedModelAction::Code {
                 source: "while True:\n    pass".to_owned(),
                 call_id: ModelCallId::new("loop"),
+                commentary: None,
             }],
             300,
         );
@@ -5013,6 +5041,13 @@ mod tests {
                 .iter()
                 .any(|envelope| matches!(envelope.item, RuntimeEvent::ModelProgress { .. }))
         );
+        assert!(progress.iter().any(|envelope| matches!(
+            &envelope.item,
+            RuntimeEvent::ExecutionStarted {
+                commentary: Some(commentary),
+                ..
+            } if commentary == "I’ll calculate this first."
+        )));
         let [
             StoredRecord {
                 record: Record::UserRequest { .. },
@@ -5021,6 +5056,7 @@ mod tests {
             StoredRecord {
                 record:
                     Record::CompletedExecution {
+                        commentary: Some(commentary),
                         reasoning_summary: code_summary,
                         ..
                     },
@@ -5038,6 +5074,7 @@ mod tests {
         else {
             panic!("expected user request, completed execution, and final message");
         };
+        assert_eq!(commentary, "I’ll calculate this first.");
         assert_eq!(code_summary, "code summary");
         assert_eq!(message_summary, "message summary");
     }
@@ -5301,6 +5338,7 @@ mod tests {
                 RunId(1),
                 Record::CompletedExecution {
                     step_id: ModelStepId(1),
+                    commentary: None,
                     source: "committed()".to_owned(),
                     reasoning_summary: String::new(),
                     execution: Execution {

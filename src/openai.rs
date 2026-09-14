@@ -178,8 +178,13 @@ impl OpenAiModel {
                 ModelContextEntry::CompletedCode(completed) => {
                     let replay = replay_values(completed.replay())?;
                     match validate_replay_output(&replay)? {
-                        ValidatedAction::Code { source, call_id }
-                            if source == completed.source() && call_id == *completed.call_id() => {}
+                        ValidatedAction::Code {
+                            source,
+                            call_id,
+                            commentary,
+                        } if source == completed.source()
+                            && call_id == *completed.call_id()
+                            && commentary.as_deref() == completed.commentary() => {}
                         _ => {
                             return Err(ModelError::InvalidHistory(
                                 "completed code does not match its OpenAI replay",
@@ -713,13 +718,21 @@ impl OpenAiModel {
         content.account_output(&response.output)?;
         let reasoning_summary = readable_reasoning_summary(&response.output);
         let action = match validated_action {
-            ValidatedAction::Code { source, call_id } => {
+            ValidatedAction::Code {
+                source,
+                call_id,
+                commentary,
+            } => {
                 if history.contains_call_id(&call_id) {
                     return Err(ModelError::InvalidResponse(
                         "function call identifier duplicates model history",
                     ));
                 }
-                ModelAction::Code { source, call_id }
+                ModelAction::Code {
+                    source,
+                    call_id,
+                    commentary,
+                }
             }
             ValidatedAction::Message { text } => ModelAction::Message { text },
         };
@@ -821,10 +834,16 @@ enum ValidatedAction {
     Code {
         source: String,
         call_id: ModelCallId,
+        commentary: Option<String>,
     },
     Message {
         text: String,
     },
+}
+
+struct ValidatedMessage {
+    text: String,
+    commentary: bool,
 }
 
 fn validate_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
@@ -857,7 +876,13 @@ fn validate_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
                         "response contained multiple assistant messages",
                     ));
                 }
-                message = Some(validate_message(object)?);
+                let validated = validate_message(object)?;
+                if code.is_some() && validated.commentary {
+                    return Err(ModelError::InvalidResponse(
+                        "commentary message followed a function call",
+                    ));
+                }
+                message = Some(validated);
             }
             _ => {
                 return Err(ModelError::InvalidResponse(
@@ -868,10 +893,33 @@ fn validate_output(output: &[Value]) -> Result<ValidatedAction, ModelError> {
     }
 
     match (code, message) {
+        (
+            Some(ValidatedAction::Code {
+                source,
+                call_id,
+                commentary: None,
+            }),
+            Some(ValidatedMessage {
+                text,
+                commentary: true,
+            }),
+        ) => Ok(ValidatedAction::Code {
+            source,
+            call_id,
+            commentary: Some(text),
+        }),
         (Some(action), None) => Ok(action),
-        (None, Some(action)) => Ok(action),
+        (
+            None,
+            Some(ValidatedMessage {
+                commentary: true, ..
+            }),
+        ) => Err(ModelError::InvalidResponse(
+            "commentary message did not include a function call",
+        )),
+        (None, Some(ValidatedMessage { text, .. })) => Ok(ValidatedAction::Message { text }),
         (Some(_), Some(_)) => Err(ModelError::InvalidResponse(
-            "response mixed a function call with assistant text",
+            "response mixed a function call with final assistant text",
         )),
         (None, None) => Err(ModelError::InvalidResponse(
             "response did not contain an action",
@@ -962,12 +1010,13 @@ fn validate_function_call(
     Ok(ValidatedAction::Code {
         source: arguments.code,
         call_id: ModelCallId::new(call_id),
+        commentary: None,
     })
 }
 
 fn validate_message(
     object: &serde_json::Map<String, Value>,
-) -> Result<ValidatedAction, ModelError> {
+) -> Result<ValidatedMessage, ModelError> {
     require_completed(object)?;
     required_nonempty_string(object, "id")?;
     if required_string(object, "role")? != "assistant" {
@@ -997,7 +1046,17 @@ fn validate_message(
     if text.is_empty() {
         return Err(ModelError::InvalidResponse("assistant message was empty"));
     }
-    Ok(ValidatedAction::Message { text })
+    let commentary = match object.get("phase") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(phase)) if phase == "commentary" => true,
+        Some(Value::String(phase)) if phase == "final_answer" => false,
+        _ => {
+            return Err(ModelError::InvalidResponse(
+                "assistant message phase was malformed",
+            ));
+        }
+    };
+    Ok(ValidatedMessage { text, commentary })
 }
 
 fn require_completed(object: &serde_json::Map<String, Value>) -> Result<(), ModelError> {
@@ -3492,6 +3551,7 @@ mod tests {
                 ModelAction::Code {
                     source: "print(1)".to_owned(),
                     call_id: ModelCallId::new("call_1"),
+                    commentary: None,
                 }
             );
             assert_eq!(
@@ -3672,6 +3732,7 @@ mod tests {
                 ModelAction::Code {
                     source: "final".to_owned(),
                     call_id: ModelCallId::new("call_1"),
+                    commentary: None,
                 }
             );
             assert_eq!(
@@ -4064,6 +4125,7 @@ mod tests {
                 ModelAction::Code {
                     source: expected.to_owned(),
                     call_id: ModelCallId::new("call_1"),
+                    commentary: None,
                 }
             );
             assert_eq!(
@@ -4105,6 +4167,7 @@ mod tests {
                     ModelAction::Code {
                         source: "final".to_owned(),
                         call_id: ModelCallId::new("call_1"),
+                        commentary: None,
                     }
                 );
                 assert_eq!(
@@ -4473,7 +4536,8 @@ mod tests {
                 completed.action,
                 ModelAction::Code {
                     source: "print(1)".to_owned(),
-                    call_id: ModelCallId::new("call_1")
+                    call_id: ModelCallId::new("call_1"),
+                    commentary: None,
                 }
             );
             assert_eq!(completed.reasoning_summary, "Checking");
@@ -4500,6 +4564,37 @@ mod tests {
                     json!([{"role": "user", "content": "inspect this project"}])
                 )
             );
+        }
+
+        #[tokio::test]
+        async fn accepts_commentary_with_a_completed_code_action() {
+            let mut commentary = message("msg_1", "I’ll inspect the configuration first.");
+            commentary["phase"] = json!("commentary");
+            let output = vec![
+                commentary,
+                function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#),
+            ];
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                output.clone(),
+                Some(usage()),
+            )))
+            .await;
+
+            let completed = step(&fixture, &history("inspect")).await.unwrap();
+
+            assert_eq!(
+                completed.action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("call_1"),
+                    commentary: Some("I’ll inspect the configuration first.".to_owned()),
+                }
+            );
+            assert_eq!(completed.replay.items().len(), 2);
+            for (opaque, expected) in completed.replay.items().iter().zip(output) {
+                assert_eq!(opaque.as_bytes(), serde_json::to_vec(&expected).unwrap());
+            }
         }
 
         #[tokio::test]
@@ -4660,14 +4755,18 @@ mod tests {
                 ModelAction::Code {
                     source: "print(1)".to_owned(),
                     call_id: ModelCallId::new("call_1"),
+                    commentary: None,
                 }
             );
         }
 
         #[tokio::test]
         async fn replays_exact_subsequent_history_and_returns_one_completed_message() {
+            let mut commentary = message("msg_commentary", "I’ll calculate the value first.");
+            commentary["phase"] = json!("commentary");
             let code_output = vec![
                 reasoning("rs_1", "First", "encrypted-first"),
+                commentary,
                 function_call("fc_1", "call_1", "execute_python", r#"{"code":"1 + 1"}"#),
             ];
             let message_output = vec![
@@ -4679,6 +4778,7 @@ mod tests {
                 .append_completed_code(
                     "1 + 1".to_owned(),
                     ModelCallId::new("call_1"),
+                    Some("I’ll calculate the value first.".to_owned()),
                     "First".to_owned(),
                     replay(&code_output),
                     CodeResult::Execution {
@@ -4737,6 +4837,7 @@ mod tests {
                         {"role": "user", "content": "first request"},
                         code_output[0].clone(),
                         code_output[1].clone(),
+                        code_output[2].clone(),
                         {
                             "type": "function_call_output",
                             "call_id": "call_1",
@@ -4754,8 +4855,17 @@ mod tests {
         async fn rejects_mixed_multiple_unknown_malformed_refused_and_unexpected_output() {
             let valid_call =
                 function_call("fc_1", "call_1", "execute_python", r#"{"code":"print(1)"}"#);
+            let mut lone_commentary = message("msg_commentary", "I’ll inspect first.");
+            lone_commentary["phase"] = json!("commentary");
+            let mut late_commentary = message("msg_late", "I’ll inspect first.");
+            late_commentary["phase"] = json!("commentary");
+            let mut final_answer = message("msg_final", "answer");
+            final_answer["phase"] = json!("final_answer");
             let cases = vec![
                 vec![message("msg_1", "answer"), valid_call.clone()],
+                vec![lone_commentary],
+                vec![valid_call.clone(), late_commentary],
+                vec![final_answer, valid_call.clone()],
                 vec![
                     valid_call.clone(),
                     function_call("fc_2", "call_2", "execute_python", r#"{"code":"print(2)"}"#),
@@ -5003,6 +5113,7 @@ mod tests {
                 .append_completed_code(
                     "1".to_owned(),
                     ModelCallId::new("call_duplicate"),
+                    None,
                     String::new(),
                     replay(&prior_output),
                     CodeResult::Execution {
@@ -5181,6 +5292,7 @@ mod tests {
                 .append_completed_code(
                     "2 + 2".to_owned(),
                     ModelCallId::new("call_1"),
+                    None,
                     String::new(),
                     code_replay.clone(),
                     CodeResult::Execution {
@@ -5195,6 +5307,7 @@ mod tests {
                 .append_completed_code(
                     "1 + 1".to_owned(),
                     ModelCallId::new("call_2"),
+                    None,
                     String::new(),
                     code_replay,
                     CodeResult::Execution {
@@ -5366,7 +5479,9 @@ mod tests {
                 RuntimeEvent::ModelProgress {
                     run_id, step_id, ..
                 }
-                | RuntimeEvent::ExecutionStarted { run_id, step_id }
+                | RuntimeEvent::ExecutionStarted {
+                    run_id, step_id, ..
+                }
                 | RuntimeEvent::ToolUpdated {
                     run_id, step_id, ..
                 }
