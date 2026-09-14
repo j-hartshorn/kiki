@@ -1704,7 +1704,7 @@ mod tests {
     use crate::{
         config::{
             ModelSelection,
-            models::{CATALOGUE, SOL, TERRA},
+            models::{ASTRA, CATALOGUE, SOL, TERRA},
         },
         model::{AttemptAccounting, Model, ModelHistory},
     };
@@ -1792,6 +1792,32 @@ mod tests {
                 assert_eq!(request["reasoning"]["effort"], json!(thinking));
             }
         }
+    }
+
+    #[test]
+    fn constructs_astra_request_with_verified_wire_contract() {
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            &ASTRA,
+            ASTRA.default_thinking,
+        );
+        let request = model
+            .request(
+                ModelSelection::new(&ASTRA, ASTRA.default_thinking).unwrap(),
+                &history(),
+            )
+            .unwrap();
+
+        assert_eq!(request["model"], json!("gpt-6-astra"));
+        assert_eq!(request["service_tier"], json!("default"));
+        assert_eq!(request["store"], json!(false));
+        assert_eq!(request["stream"], json!(true));
+        assert_eq!(request["reasoning"]["effort"], json!("low"));
+        assert_eq!(request["reasoning"]["summary"], json!("auto"));
+        assert_eq!(request["reasoning"]["context"], json!("all_turns"));
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(ModelSelection::new(&ASTRA, "none"), None);
     }
 
     #[test]

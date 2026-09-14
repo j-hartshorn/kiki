@@ -21,8 +21,8 @@ use super::{
 const MAX_DOCUMENT_PROBLEMS: usize = 3;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
 const PROJECT_SETTINGS_LABEL: &str = "project settings file `.kiki/config.toml`";
-const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
-const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
+const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
+const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
 
 pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
@@ -562,7 +562,7 @@ fn validate_thinking_table(
     for (key, item) in table.iter() {
         let Some(model) = model_by_id(key) else {
             problems.push(
-                "field `thinking` contains an unknown model key; use openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
+                "field `thinking` contains an unknown model key; use openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
                 "Use only supported qualified model ids as [thinking] keys, then restart Kiki.",
             );
             continue;
@@ -908,10 +908,34 @@ mod tests {
 
     use crate::config::{
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
-        models::{LUNA, SOL, TERRA},
+        models::{ASTRA, LUNA, SOL, TERRA},
     };
 
     use super::{Input, SubagentSettings, resolve};
+
+    #[test]
+    fn astra_uses_low_by_default_and_rejects_none() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let mut selected = input(Some(home.path()), Some(project.path()));
+        selected.model = Some(OsString::from(ASTRA.id));
+        let resolution = resolve(selected);
+
+        assert!(std::ptr::eq(resolution.model(), &ASTRA));
+        assert_eq!(resolution.thinking(), "low");
+        assert!(resolution.problems().is_empty());
+
+        let mut unsupported = input(Some(home.path()), Some(project.path()));
+        unsupported.model = Some(OsString::from(ASTRA.id));
+        unsupported.thinking = Some(OsString::from("none"));
+        let unsupported = resolve(unsupported);
+        assert!(
+            unsupported
+                .problems()
+                .iter()
+                .any(|problem| problem.diagnostic().contains("not supported"))
+        );
+    }
 
     #[test]
     fn project_subagent_limit_overrides_only_matching_user_limits() {

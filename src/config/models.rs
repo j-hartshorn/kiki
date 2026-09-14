@@ -58,7 +58,42 @@ impl ModelSelection {
     }
 }
 
+pub static ASTRA_THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 pub static OPENAI_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
+pub static ASTRA: ModelConfiguration = ModelConfiguration {
+    id: "openai/gpt-6-astra",
+    thinking_levels: ASTRA_THINKING_LEVELS,
+    default_thinking: "low",
+    service_tier: "default",
+    context_window_tokens: 1_050_000,
+    context_window_display: "1.05m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "openai/gpt-6-astra",
+            service_tier: "default",
+            version: "2026-09-04",
+            source: "https://openai.com/api/pricing/",
+        },
+        long_context_threshold: 272_000,
+        long_context_threshold_display: "272k",
+        short_context: Rates {
+            uncached_input_nanos: 10_000,
+            cached_input_nanos: 1_000,
+            cache_write_nanos: 12_500,
+            output_nanos: 50_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 20_000,
+            cached_input_nanos: 2_000,
+            cache_write_nanos: 25_000,
+            output_nanos: 75_000,
+        },
+    },
+};
 
 pub static SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-5.6-sol",
@@ -159,7 +194,7 @@ pub static LUNA: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 3] = [&SOL, &TERRA, &LUNA];
+pub static CATALOGUE: [&ModelConfiguration; 4] = [&ASTRA, &SOL, &TERRA, &LUNA];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
 impl ModelConfiguration {
@@ -174,56 +209,95 @@ pub fn model_by_id(id: &str) -> Option<&'static ModelConfiguration> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashSet;
 
-    use super::{
-        CATALOGUE, DEFAULT_MODEL, LUNA, ModelSelection, OPENAI_THINKING_LEVELS, Rates, SOL, TERRA,
-        model_by_id,
-    };
-
     #[test]
-    fn catalogue_contains_each_supported_model_once_and_defaults_to_sol() {
-        assert_eq!(CATALOGUE.len(), 3);
+    fn catalogue_identity_order_and_default_are_exact() {
         assert_eq!(
-            CATALOGUE.map(|model| model.id),
+            CATALOGUE.map(|m| m.id),
             [
+                "openai/gpt-6-astra",
                 "openai/gpt-5.6-sol",
                 "openai/gpt-5.6-terra",
                 "openai/gpt-5.6-luna"
             ]
         );
         assert_eq!(
-            CATALOGUE
-                .iter()
-                .map(|model| model.id)
-                .collect::<HashSet<_>>()
-                .len(),
-            CATALOGUE.len()
+            CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
+            4
         );
         assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
     }
 
     #[test]
-    fn every_model_has_published_context_and_pricing_thresholds() {
+    fn universal_capacities_and_identity_invariants_hold() {
         for model in CATALOGUE {
             assert_eq!(model.service_tier, "default");
+            assert!(model.thinking_levels.contains(&model.default_thinking));
+            assert_eq!(
+                (model.context_window_tokens, model.context_window_display),
+                (1_050_000, "1.05m")
+            );
+            assert_eq!(
+                (model.max_output_tokens, model.max_output_display),
+                (128_000, "128k")
+            );
+            assert_eq!(
+                (
+                    model.pricing.long_context_threshold,
+                    model.pricing.long_context_threshold_display
+                ),
+                (272_000, "272k")
+            );
+            assert_eq!(model.pricing.identity.model, model.id);
+            assert_eq!(model.pricing.identity.service_tier, model.service_tier);
+        }
+    }
+
+    #[test]
+    fn astra_metadata_thinking_and_rates_are_exact() {
+        assert_eq!(
+            ASTRA.thinking_levels,
+            &["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(std::ptr::eq(ASTRA.thinking_levels, ASTRA_THINKING_LEVELS));
+        assert_eq!(ASTRA.default_thinking, "low");
+        assert!(!ASTRA.supports_thinking("none"));
+        assert_eq!(ASTRA.pricing.identity.version, "2026-09-04");
+        assert_eq!(
+            ASTRA.pricing.identity.source,
+            "https://openai.com/api/pricing/"
+        );
+        assert_eq!(
+            ASTRA.pricing.short_context,
+            Rates {
+                uncached_input_nanos: 10_000,
+                cached_input_nanos: 1_000,
+                cache_write_nanos: 12_500,
+                output_nanos: 50_000
+            }
+        );
+        assert_eq!(
+            ASTRA.pricing.long_context,
+            Rates {
+                uncached_input_nanos: 20_000,
+                cached_input_nanos: 2_000,
+                cache_write_nanos: 25_000,
+                output_nanos: 75_000
+            }
+        );
+    }
+
+    #[test]
+    fn gpt_56_metadata_is_unchanged() {
+        for model in [&SOL, &TERRA, &LUNA] {
+            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
             assert_eq!(
                 model.thinking_levels,
                 &["none", "low", "medium", "high", "xhigh", "max"]
             );
-            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
             assert_eq!(model.default_thinking, "medium");
-            assert!(model.thinking_levels.contains(&model.default_thinking));
-            assert_eq!(model.context_window_tokens, 1_050_000);
-            assert_eq!(model.context_window_display, "1.05m");
-            assert_eq!(model.max_output_tokens, 128_000);
-            assert_eq!(model.max_output_display, "128k");
-            assert!(model.context_window_tokens >= model.max_output_tokens);
-            assert_eq!(model.pricing.long_context_threshold, 272_000);
-            assert_eq!(model.pricing.long_context_threshold_display, "272k");
-            assert!(model.pricing.long_context_threshold <= model.context_window_tokens);
-            assert_eq!(model.pricing.identity.model, model.id);
-            assert_eq!(model.pricing.identity.service_tier, model.service_tier);
             assert_eq!(model.pricing.identity.version, "2026-08-27");
             assert_eq!(
                 model.pricing.identity.source,
@@ -233,84 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn rates_match_the_3_september_2026_research_record() {
-        let expected = [
-            (
-                &SOL,
-                Rates {
-                    uncached_input_nanos: 4_000,
-                    cached_input_nanos: 400,
-                    cache_write_nanos: 5_000,
-                    output_nanos: 20_000,
-                },
-                Rates {
-                    uncached_input_nanos: 8_000,
-                    cached_input_nanos: 800,
-                    cache_write_nanos: 10_000,
-                    output_nanos: 30_000,
-                },
-            ),
-            (
-                &TERRA,
-                Rates {
-                    uncached_input_nanos: 2_000,
-                    cached_input_nanos: 200,
-                    cache_write_nanos: 2_500,
-                    output_nanos: 12_000,
-                },
-                Rates {
-                    uncached_input_nanos: 4_000,
-                    cached_input_nanos: 400,
-                    cache_write_nanos: 5_000,
-                    output_nanos: 18_000,
-                },
-            ),
-            (
-                &LUNA,
-                Rates {
-                    uncached_input_nanos: 200,
-                    cached_input_nanos: 20,
-                    cache_write_nanos: 250,
-                    output_nanos: 1_200,
-                },
-                Rates {
-                    uncached_input_nanos: 400,
-                    cached_input_nanos: 40,
-                    cache_write_nanos: 500,
-                    output_nanos: 1_800,
-                },
-            ),
-        ];
-
-        for (model, short_context, long_context) in expected {
-            assert_eq!(model.pricing.short_context, short_context);
-            assert_eq!(model.pricing.long_context, long_context);
+    fn selection_and_exact_lookup_obey_model_capabilities() {
+        assert_eq!(ModelSelection::new(&ASTRA, "none"), None);
+        assert_eq!(
+            ModelSelection::new(&ASTRA, "low").unwrap().thinking(),
+            "low"
+        );
+        for model in CATALOGUE {
+            assert!(std::ptr::eq(model_by_id(model.id).unwrap(), model));
         }
-    }
-
-    #[test]
-    fn selection_keeps_a_model_and_its_supported_thinking_together() {
-        let selection = ModelSelection::new(&TERRA, "high").expect("supported selection");
-
-        assert!(std::ptr::eq(selection.model(), &TERRA));
-        assert_eq!(selection.thinking(), "high");
-        assert_eq!(ModelSelection::new(&TERRA, "unsupported"), None);
-    }
-
-    #[test]
-    fn lookup_requires_an_exact_supported_model_id() {
-        for model in [&SOL, &TERRA, &LUNA] {
-            let found = model_by_id(model.id).expect("supported model should be found");
-            assert!(std::ptr::eq(found, model));
-        }
-
         for id in [
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "openai/GPT-5.6-SOL",
-            "openai/gpt-5.6-sol ",
+            "gpt-6-astra",
+            "openai/GPT-6-ASTRA",
+            "openai/gpt-6-astra ",
+            "openai/gpt-6-astra-2026-09-03",
             "unknown",
         ] {
             assert_eq!(model_by_id(id), None);

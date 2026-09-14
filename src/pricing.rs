@@ -192,7 +192,7 @@ mod tests {
     use crate::{
         config::{
             DEFAULT_MODEL,
-            models::{LUNA, SOL, TERRA},
+            models::{ASTRA, LUNA, SOL, TERRA},
         },
         model::{AttemptAccounting, ModelUsage},
     };
@@ -292,6 +292,23 @@ mod tests {
             assert_eq!(amount(estimate), expected_amount);
             assert_eq!(estimate.pricing(), pricing);
         }
+    }
+
+    #[test]
+    fn astra_rates_and_long_context_boundary_are_applied_exactly() {
+        let mixed = estimate_usage(&usage_for(
+            ASTRA.id, 200_000, 40_000, 60_000, 100_000, 50_000,
+        ))
+        .unwrap();
+        assert_eq!(amount(mixed), 6_790_000_000);
+        assert_eq!(mixed.pricing(), ASTRA.pricing.identity);
+
+        let threshold =
+            estimate_usage(&usage_for(ASTRA.id, 272_000, 100_000, 100_000, 100_000, 0)).unwrap();
+        let above =
+            estimate_usage(&usage_for(ASTRA.id, 272_001, 100_000, 100_000, 100_000, 0)).unwrap();
+        assert_eq!(amount(threshold), 7_070_000_000);
+        assert_eq!(amount(above), 11_640_020_000);
     }
 
     #[test]

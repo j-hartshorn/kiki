@@ -2028,7 +2028,7 @@ mod tests {
         ToolCallToken, ToolName,
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
-    use crate::config::models::{SOL, TERRA};
+    use crate::config::models::{ASTRA, SOL, TERRA};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
@@ -3331,6 +3331,32 @@ mod tests {
         assert!(screen.contains("Models"));
         assert!(screen.contains("openai/gpt-5.6-terra"));
         assert!(!screen.contains("openai/gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn astra_is_first_and_uses_its_model_owned_thinking_levels() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        assert!(std::ptr::eq(app.settings_selection.model(), &SOL));
+
+        let open = enter_at(&mut app, "/model", now);
+        assert!(open.commands.is_empty());
+        let screen = rendered(&mut app, 80, 15);
+        assert!(screen.find(ASTRA.id).unwrap() < screen.find(SOL.id).unwrap());
+
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let update = enter_at(&mut app, "/model OPENAI/GPT-6-ASTRA", now);
+        let (selection, _) = applied_settings(&update);
+        assert!(std::ptr::eq(selection.model(), &ASTRA));
+        assert_eq!(selection.thinking(), "low");
+
+        let open = enter_at(&mut app, "/thinking", now);
+        assert!(open.commands.is_empty());
+        let screen = rendered(&mut app, 80, 15);
+        for level in ASTRA.thinking_levels {
+            assert!(screen.contains(level));
+        }
+        assert!(!screen.contains("none"));
     }
 
     #[test]
