@@ -1,6 +1,6 @@
 # Kiki
 
-Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), or `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
+Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `openai/gpt-6-astra` (a frontier model for computer/browser use, software engineering, scientific analysis, and document artifacts), `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), or `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
 
 ## Setup
 
@@ -10,7 +10,9 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Export the variables:
+Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-6-astra`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker but does not change the Sol default. All four OpenAI models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, while the GPT-5.6 models default to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
+
+Export the variables:
 
 ```sh
 export OPENAI_API_KEY=...
@@ -38,6 +40,7 @@ User defaults live at `~/.kiki/config.toml`:
 model = "openai/gpt-5.6-terra"
 
 [thinking]
+"openai/gpt-6-astra" = "low"
 "openai/gpt-5.6-sol" = "low"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
@@ -49,6 +52,7 @@ Project settings use the same TOML shape at `.kiki/config.toml` in the exact cur
 model = "openai/gpt-5.6-terra"
 
 [thinking]
+"openai/gpt-6-astra" = "low"
 "openai/gpt-5.6-sol" = "low"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
@@ -109,7 +113,7 @@ A trace is diagnostic only, not authoritative or resumable history: it cannot re
 
 `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
 
-Credentials and opaque provider replay data stay hidden from Kiki records and display. Returned token usage has a versioned `2026-08-27` local direct-API Standard estimate for the reported `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` model. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable.
+Credentials and opaque provider replay data stay hidden from Kiki records and display. Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
 
 ## Controls and availability
 

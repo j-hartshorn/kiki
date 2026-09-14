@@ -6362,7 +6362,7 @@ mod tests {
 
         assert_eq!(accepted.resolve(invoking, None), invoking);
         assert_eq!(
-            accepted.resolve(ModelSelection::new(&LUNA, "none").unwrap(), Some(&SOL)),
+            accepted.resolve(ModelSelection::new(&LUNA, "low").unwrap(), Some(&SOL)),
             invoking
         );
         assert_eq!(

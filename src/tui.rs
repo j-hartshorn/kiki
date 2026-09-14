@@ -2028,7 +2028,7 @@ mod tests {
         ToolCallToken, ToolName,
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
-    use crate::config::models::{SOL, TERRA};
+    use crate::config::models::{ASTRA, SOL, TERRA};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
@@ -2879,20 +2879,17 @@ mod tests {
 
     #[test]
     fn prompt_rules_follow_active_and_preview_thinking_colours() {
-        for (thinking, colour) in ["none", "low", "medium", "high", "xhigh", "max"]
-            .into_iter()
-            .zip(super::THINKING_RULE_COLOURS)
-        {
-            assert_eq!(
-                super::thinking_rule_colour(
-                    &["none", "low", "medium", "high", "xhigh", "max"],
-                    thinking,
-                ),
-                colour,
-            );
-        }
+        let levels = ["low", "medium", "high", "xhigh", "max"];
         assert_eq!(
-            super::thinking_rule_colour(&["none", "medium", "max"], "medium"),
+            super::thinking_rule_colour(&levels, "low"),
+            super::THINKING_RULE_COLOURS[0],
+        );
+        assert_eq!(
+            super::thinking_rule_colour(&levels, "max"),
+            super::THINKING_RULE_COLOURS[5],
+        );
+        assert_eq!(
+            super::thinking_rule_colour(&["low", "medium", "max"], "medium"),
             super::interpolate_colour(
                 super::THINKING_RULE_COLOURS[2],
                 super::THINKING_RULE_COLOURS[3],
@@ -2905,7 +2902,10 @@ mod tests {
         let now = Instant::now();
         assert!(app.cycle_thinking_preview(now).visible_changed);
         let buffer = rendered_buffer(&mut app, 80, 8);
-        assert_eq!(buffer[(0, 7)].fg, super::THINKING_RULE_COLOURS[3]);
+        assert_eq!(
+            buffer[(0, 7)].fg,
+            super::thinking_rule_colour(SOL.thinking_levels, "high")
+        );
     }
 
     #[test]
@@ -3334,6 +3334,32 @@ mod tests {
     }
 
     #[test]
+    fn astra_is_first_and_uses_its_model_owned_thinking_levels() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        assert!(std::ptr::eq(app.settings_selection.model(), &SOL));
+
+        let open = enter_at(&mut app, "/model", now);
+        assert!(open.commands.is_empty());
+        let screen = rendered(&mut app, 80, 15);
+        assert!(screen.find(ASTRA.id).unwrap() < screen.find(SOL.id).unwrap());
+
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let update = enter_at(&mut app, "/model OPENAI/GPT-6-ASTRA", now);
+        let (selection, _) = applied_settings(&update);
+        assert!(std::ptr::eq(selection.model(), &ASTRA));
+        assert_eq!(selection.thinking(), "low");
+
+        let open = enter_at(&mut app, "/thinking", now);
+        assert!(open.commands.is_empty());
+        let screen = rendered(&mut app, 80, 15);
+        for level in ASTRA.thinking_levels {
+            assert!(screen.contains(level));
+        }
+        assert!(!screen.contains("none"));
+    }
+
+    #[test]
     fn direct_settings_commands_apply_exact_values_and_consume_the_draft() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
@@ -3382,7 +3408,7 @@ mod tests {
         assert!(app.prompt.is_empty());
         let notice = app.notice().expect("unsupported level status");
         assert!(notice.contains(SOL.id));
-        assert!(notice.contains("none, low, medium, high, xhigh, max"));
+        assert!(notice.contains("low, medium, high, xhigh, max"));
     }
 
     #[test]
@@ -3503,7 +3529,7 @@ mod tests {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
-        for expected in ["high", "xhigh", "max", "none", "low", "medium"] {
+        for expected in ["high", "xhigh", "max", "low", "medium"] {
             let update = app.handle_key_at(key(KeyCode::BackTab), now);
             assert!(update.commands.is_empty());
             assert_eq!(app.settings_selection.thinking(), expected);
@@ -6905,7 +6931,10 @@ mod tests {
         assert_eq!(rows[1], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 2);
-        assert_eq!(buffer[(0, 1)].fg, super::THINKING_RULE_COLOURS[2]);
+        assert_eq!(
+            buffer[(0, 1)].fg,
+            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+        );
 
         for width in 0..=4 {
             let backend = TestBackend::new(width, 2);
@@ -6927,7 +6956,10 @@ mod tests {
         assert_eq!(rows[2], "─  …t-5.6-sol • thinking medium ─");
 
         let buffer = rendered_buffer(&mut app, 33, 3);
-        assert_eq!(buffer[(0, 2)].fg, super::THINKING_RULE_COLOURS[2]);
+        assert_eq!(
+            buffer[(0, 2)].fg,
+            super::thinking_rule_colour(SOL.thinking_levels, SOL.default_thinking)
+        );
 
         for width in 0..=4 {
             let backend = TestBackend::new(width, 3);
