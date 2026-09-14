@@ -4,7 +4,7 @@
 
 Kiki has a closed model catalogue containing `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, and `openai/gpt-5.6-luna`. Sol remains the default. Every catalogue entry owns its supported thinking levels, context and output limits, Standard-tier pricing, and pricing provenance; the catalogue drives startup/settings validation, the interactive model and thinking pickers, OpenAI request construction, subagent model overrides, context reporting, and local cost estimates.
 
-This change adds the active OpenAI GPT-6 Astra model under the canonical Kiki identity `openai/gpt-6-astra` and provider wire identity `gpt-6-astra`. Astra is a flagship frontier model specialized in computer/browser use, multi-step software engineering, scientific reasoning, and document artifact creation. It has the same 1,050,000-token context window, 128,000-token maximum output, and 272,000-input-token long-context pricing boundary as the existing models, but has its own rates and thinking policy: `low`, `medium`, `high`, `xhigh`, and `max`, defaulting to `low`; `none` is unsupported.
+This change adds the active OpenAI GPT-6 Astra model under the canonical Kiki identity `openai/gpt-6-astra` and provider wire identity `gpt-6-astra`. Astra is a flagship frontier model specialized in computer/browser use, multi-step software engineering, scientific reasoning, and document artifact creation. It has the same 1,050,000-token context window, 128,000-token maximum output, and 272,000-input-token long-context pricing boundary as the existing models, but has its own rates and defaults to `low`. All four OpenAI models share the supported sequence `low`, `medium`, `high`, `xhigh`, and `max`; `none` is unsupported.
 
 A credentialed compatibility probe on 14 September 2026 tested the request shape Kiki already emits. A non-streaming request with `service_tier: "default"`, nested `reasoning.effort: "low"`, `reasoning.summary: "auto"`, `reasoning.context: "all_turns"`, `include: ["reasoning.encrypted_content"]`, `store: false`, and Kiki's function-tool shape completed with HTTP 200. The response reported model `gpt-6-astra`, service tier `default`, and the existing Responses API usage field names `input_tokens_details.cache_write_tokens`, `input_tokens_details.cached_tokens`, and `output_tokens_details.reasoning_tokens`. A smaller probe using the same nested reasoning object without `context` also succeeded. These observations supersede preliminary metadata that described a `standard` returned tier, a dated returned alias, top-level reasoning parameter names, and `cache_creation_input_tokens`.
 
@@ -12,7 +12,7 @@ A credentialed compatibility probe on 14 September 2026 tested the request shape
 
 - Add `openai/gpt-6-astra` above Sol in the authoritative model catalogue without changing `openai/gpt-5.6-sol` as the default.
 - Submit Astra to OpenAI as `gpt-6-astra` using Kiki's existing Responses API request schema and `default` service-tier wire value.
-- Define Astra's exact supported thinking sequence as `low`, `medium`, `high`, `xhigh`, and `max`, with `low` as its default, while preserving `none` for the GPT-5.6 models.
+- Use one shared OpenAI thinking sequence—`low`, `medium`, `high`, `xhigh`, and `max`—for all four models, with Astra defaulting to `low` and GPT-5.6 models retaining `medium` defaults.
 - Price Astra Standard/default-tier token usage with the verified 4 September 2026 short- and long-context schedules and existing integer nanodollar arithmetic.
 - Make Astra available everywhere the shared catalogue is used, including foreground selection, settings, interactive controls, inherited child selection, and explicit subagent model overrides.
 - Preserve exact model lookup, existing usage validation, unavailable-cost behavior, and all Sol, Terra, and Luna behavior.
@@ -52,7 +52,7 @@ A credentialed compatibility probe on 14 September 2026 tested the request shape
 
 ### Catalogue identity and capabilities
 
-Add a dedicated `ASTRA_THINKING_LEVELS` static slice containing `low`, `medium`, `high`, `xhigh`, and `max`. Keep `OPENAI_THINKING_LEVELS` unchanged for Sol, Terra, and Luna so `none` remains valid for those models. Add an `ASTRA` `ModelConfiguration` with qualified ID `openai/gpt-6-astra`, default thinking `low`, service tier `default`, 1,050,000 context tokens, 128,000 maximum output tokens, and the existing lowercase compact labels.
+Use the single `OPENAI_THINKING_LEVELS` static slice containing `low`, `medium`, `high`, `xhigh`, and `max` for Astra, Sol, Terra, and Luna. Remove `none` from the shared OpenAI sequence. Add an `ASTRA` `ModelConfiguration` with qualified ID `openai/gpt-6-astra`, default thinking `low`, service tier `default`, 1,050,000 context tokens, 128,000 maximum output tokens, and the existing lowercase compact labels.
 
 Place `&ASTRA` first in `CATALOGUE`, followed by Sol, Terra, and Luna. Keep `DEFAULT_MODEL` pointing to Sol. Exact lookup accepts only `openai/gpt-6-astra`; the unqualified provider ID, case variants, whitespace variants, and dated aliases remain invalid configuration values.
 
@@ -79,7 +79,7 @@ Kiki's displayed estimate remains a local direct-API Standard/default-tier token
 
 ### Settings, interaction, and documentation
 
-Extend hard-coded supported-model remediation text and settings fixtures to include Astra. Test environment, user TOML, project TOML, picker, direct slash-command, persistence, model switching, and Shift-Tab behavior with Astra's distinct default and lack of `none`. Switching to Astra restores its accepted per-model value or `low`; switching back preserves the other model's independent value, including `none` where supported.
+Extend hard-coded supported-model remediation text and settings fixtures to include Astra. Test environment, user TOML, project TOML, picker, direct slash-command, persistence, model switching, and Shift-Tab behavior with Astra's distinct default and the shared lack of `none`. Switching to Astra restores its accepted per-model value or `low`; switching back preserves the other model's independent accepted value.
 
 Update README catalogue/setup examples, settings tables, cost language, controls, and footer descriptions. State that Astra is first in the picker but Sol remains the default. Explain the account and latency constraints for higher effort levels without turning them into local admission rules.
 
@@ -89,7 +89,7 @@ Update README catalogue/setup examples, settings tables, cost language, controls
 - *Reuse the current reasoning schema*: The exact nested Kiki shape succeeded against Astra, avoiding speculative model-specific request configuration.
 - *No cache-field compatibility branch*: The live response used `cache_write_tokens`; adding an unobserved alias would broaden accounting semantics without evidence. A later real payload can justify an alias with a fixture.
 - *Selected identity controls accounting*: Preserve the current qualified selection as `ModelUsage.model`; do not make a returned stable or dated provider alias part of the user catalogue or pricing lookup.
-- *Separate Astra thinking levels*: Do not remove `none` globally or send it and rely on a provider error. Invalid Astra thinking is rejected by configuration and interaction before a request is built.
+- *One OpenAI thinking slice*: Remove `none` and share `low` through `max` across all four models, avoiding duplicate constants and ensuring unsupported thinking is rejected before a request is built.
 - *Uniform subagent availability*: Keep the catalogue simple. Astra is available for explicit and inherited children just like the other models.
 - *Catalogue order is not default policy*: Put Astra above Sol for visibility while retaining `DEFAULT_MODEL = &SOL`, so existing startup behavior does not change.
 - *Model-specific tests over weakened assertions*: Preserve exact GPT-5.6 expectations and add exact Astra expectations rather than reducing all tests to loose nonempty checks.
@@ -120,7 +120,7 @@ Update README catalogue/setup examples, settings tables, cost language, controls
 
 1. `openai/gpt-6-astra` appears above Sol in the model catalogue and interactive picker, while a fresh Kiki still defaults to `openai/gpt-5.6-sol`.
 2. Selecting Astra submits `gpt-6-astra`, `service_tier: "default"`, and Kiki's existing nested reasoning schema to the Responses API.
-3. Astra supports exactly `low`, `medium`, `high`, `xhigh`, and `max`, defaults to `low`, and rejects `none` locally; GPT-5.6 models retain their existing thinking behavior.
+3. All four OpenAI models support exactly `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, GPT-5.6 models default to `medium`, and all reject `none` locally.
 4. Astra Standard/default token usage is priced using the exact verified rates. Exactly 272,000 input tokens uses short rates; 272,001 uses long rates for the entire request.
 5. Missing usage, missing cache-write data, inconsistent breakdowns, and non-`default` returned tiers retain existing unavailable/error semantics and never become invented zero cost.
 6. Astra is selectable for foreground and subagent work, including explicit child overrides and normal inherited selection.
@@ -150,7 +150,7 @@ Implementation follows the repository worktree policy: create a dedicated `work/
 ### Task 1: Add Astra to the authoritative catalogue
 
 **Changes**
-- Add `ASTRA_THINKING_LEVELS` with `low`, `medium`, `high`, `xhigh`, and `max`.
+- Set shared `OPENAI_THINKING_LEVELS` to `low`, `medium`, `high`, `xhigh`, and `max`, and use it for all four models.
 - Add `ASTRA` with qualified ID, `default` service tier, `low` default thinking, exact token limits, compact labels, pricing provenance, threshold, and rates.
 - Expand and reorder `CATALOGUE` to Astra, Sol, Terra, Luna.
 - Keep `DEFAULT_MODEL` pointing to Sol.
@@ -159,7 +159,7 @@ Implementation follows the repository worktree policy: create a dedicated `work/
 **Tests**
 - Catalogue contains exactly four unique IDs in the required order.
 - Exact Astra lookup succeeds; unqualified, case-changed, whitespace, and dated variants fail.
-- Astra accepts each of its five levels and rejects `none`; existing models still accept their documented sequence.
+- Every model shares the five accepted OpenAI levels and rejects `none`, while retaining its model-specific default.
 - Astra limits, labels, provenance, and all eight rates match this spec.
 
 **Files**
@@ -179,7 +179,7 @@ Implementation follows the repository worktree policy: create a dedicated `work/
 **Tests**
 - Resolve Astra from environment, user settings, and project settings.
 - Validate precedence and Astra's default `low`.
-- Reject Astra `none` with bounded constructive remediation while retaining `none` for GPT-5.6 entries.
+- Reject `none` for every OpenAI model with bounded constructive remediation.
 - Save and reload Astra model and thinking defaults without rewriting unrelated settings.
 - Update exact diagnostic fixtures to list all four IDs without leaking hostile input or credentials.
 
@@ -240,7 +240,7 @@ Implementation follows the repository worktree policy: create a dedicated `work/
 
 **Tests**
 - Picker order, direct case-insensitive selection, persistence, and footer identity for Astra.
-- `none` is absent from Astra's thinking picker and direct `/thinking none` is rejected for Astra.
+- `none` is absent from every thinking picker and direct `/thinking none` is rejected.
 - Cycling wraps across Astra's ordered levels.
 - Switching models restores independent levels.
 - Explicit Astra child override succeeds with accepted Astra thinking; inherited Astra child selection succeeds; existing child overrides remain unchanged.
@@ -255,7 +255,7 @@ Implementation follows the repository worktree policy: create a dedicated `work/
 
 **Changes**
 - Add Astra to README introduction, setup, supported IDs, and TOML examples.
-- Document Astra's purpose, `low` default, unsupported `none`, and higher-effort account/latency caveats.
+- Document Astra's purpose, `low` default, the shared five-level OpenAI sequence, and higher-effort account/latency caveats.
 - Update privacy/cost text for four models, the 4 September 2026 Astra pricing identity, token-only estimate scope, and excluded service modes/action surcharges.
 - Preserve Sol as the documented default and avoid implying that selecting Astra grants provider eligibility.
 

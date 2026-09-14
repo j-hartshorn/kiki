@@ -58,13 +58,11 @@ impl ModelSelection {
     }
 }
 
-pub static ASTRA_THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-
-pub static OPENAI_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+pub static OPENAI_THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 pub static ASTRA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-astra",
-    thinking_levels: ASTRA_THINKING_LEVELS,
+    thinking_levels: OPENAI_THINKING_LEVELS,
     default_thinking: "low",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -234,6 +232,12 @@ mod tests {
     fn universal_capacities_and_identity_invariants_hold() {
         for model in CATALOGUE {
             assert_eq!(model.service_tier, "default");
+            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
+            assert_eq!(
+                model.thinking_levels,
+                &["low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(!model.supports_thinking("none"));
             assert!(model.thinking_levels.contains(&model.default_thinking));
             assert_eq!(
                 (model.context_window_tokens, model.context_window_display),
@@ -261,7 +265,7 @@ mod tests {
             ASTRA.thinking_levels,
             &["low", "medium", "high", "xhigh", "max"]
         );
-        assert!(std::ptr::eq(ASTRA.thinking_levels, ASTRA_THINKING_LEVELS));
+        assert!(std::ptr::eq(ASTRA.thinking_levels, OPENAI_THINKING_LEVELS));
         assert_eq!(ASTRA.default_thinking, "low");
         assert!(!ASTRA.supports_thinking("none"));
         assert_eq!(ASTRA.pricing.identity.version, "2026-09-04");
@@ -290,12 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn gpt_56_metadata_is_unchanged() {
+    fn gpt_56_defaults_and_pricing_are_unchanged() {
         for model in [&SOL, &TERRA, &LUNA] {
             assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
             assert_eq!(
                 model.thinking_levels,
-                &["none", "low", "medium", "high", "xhigh", "max"]
+                &["low", "medium", "high", "xhigh", "max"]
             );
             assert_eq!(model.default_thinking, "medium");
             assert_eq!(model.pricing.identity.version, "2026-08-27");

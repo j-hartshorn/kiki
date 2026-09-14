@@ -914,7 +914,7 @@ mod tests {
     use super::{Input, SubagentSettings, resolve};
 
     #[test]
-    fn astra_uses_low_by_default_and_rejects_none() {
+    fn astra_uses_low_by_default_and_openai_models_reject_none() {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         let mut selected = input(Some(home.path()), Some(project.path()));
@@ -929,12 +929,13 @@ mod tests {
         unsupported.model = Some(OsString::from(ASTRA.id));
         unsupported.thinking = Some(OsString::from("none"));
         let unsupported = resolve(unsupported);
+        let problem = unsupported.problems().first().expect("thinking problem");
         assert!(
-            unsupported
-                .problems()
-                .iter()
-                .any(|problem| problem.diagnostic().contains("not supported"))
+            problem
+                .diagnostic()
+                .contains("low, medium, high, xhigh, max")
         );
+        assert!(!problem.diagnostic().contains("none,"));
     }
 
     #[test]
@@ -1350,7 +1351,7 @@ mod tests {
             assert!(
                 problem
                     .diagnostic()
-                    .contains("none, low, medium, high, xhigh, max")
+                    .contains("low, medium, high, xhigh, max")
             );
             assert!(problem.remediation().contains("KIKI_THINKING"));
         }
