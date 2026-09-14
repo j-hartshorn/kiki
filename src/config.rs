@@ -678,9 +678,7 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
         prompt: PromptResolution::Resolved {
             text: "system instructions".to_owned(),
             base: "system instructions".to_owned(),
-            source: PromptSource::Bundled {
-                name: "read_only_agent",
-            },
+            source: PromptSource::Bundled { name: "system" },
         },
         api_key: Some(OsString::from("test-api-key")),
     })
@@ -729,9 +727,7 @@ mod tests {
         PromptResolution::Resolved {
             text: "system instructions".to_owned(),
             base: "system instructions".to_owned(),
-            source: PromptSource::Bundled {
-                name: "read_only_agent",
-            },
+            source: PromptSource::Bundled { name: "system" },
         }
     }
 
@@ -782,9 +778,7 @@ mod tests {
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
             snapshot.prompt_source(),
-            &PromptProvenance::Bundled {
-                name: "read_only_agent"
-            }
+            &PromptProvenance::Bundled { name: "system" }
         );
         assert_eq!(snapshot.api_key_presence(), ApiKeyPresence::Present);
         assert!(snapshot.problems().is_empty());
@@ -1431,7 +1425,7 @@ mod tests {
 
         let bundled = resolve_startup(ready_input("key"));
         let bundled_rendered = crate::tui::format_startup_configuration(bundled.snapshot());
-        assert!(bundled_rendered.contains("Prompt: bundled read_only_agent"));
+        assert!(bundled_rendered.contains("Prompt: bundled system"));
         assert!(bundled_rendered.contains("Submission: available"));
     }
 }

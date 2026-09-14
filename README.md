@@ -15,7 +15,7 @@ Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally
 ```sh
 export OPENAI_API_KEY=...
 export MONTY_BIN=/tmp/kiki-monty/bin/monty
-export KIKI_SYSTEM_PROMPT=/absolute/path/to/read_only_agent.md
+export KIKI_SYSTEM_PROMPT=/absolute/path/to/system.md
 export KIKI_MODEL=openai/gpt-5.6-terra
 export KIKI_THINKING=high
 ```

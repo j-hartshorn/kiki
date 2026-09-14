@@ -7,9 +7,9 @@ use std::str::Utf8Error;
 
 use crate::tools::prompt_reference;
 
-const BUNDLED_PROMPT: &str = include_str!("../prompts/read_only_agent.md");
+const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
 const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
-const BUNDLED_PROMPT_NAME: &str = "read_only_agent";
+const BUNDLED_PROMPT_NAME: &str = "system";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +110,7 @@ mod tests {
 
     use super::{PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override};
 
-    const BUNDLED_PROMPT: &str = include_str!("../prompts/read_only_agent.md");
+    const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
     const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
 
     fn assert_concept(terms: &[&str]) {
@@ -223,12 +223,7 @@ mod tests {
                 .contains("Do not redefine these host functions.")
         );
         assert!(!resolved.text().contains("list of exact lines"));
-        assert_eq!(
-            resolved.source(),
-            &PromptSource::Bundled {
-                name: "read_only_agent"
-            }
-        );
+        assert_eq!(resolved.source(), &PromptSource::Bundled { name: "system" });
     }
 
     #[test]

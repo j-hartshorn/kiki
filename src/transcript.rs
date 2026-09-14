@@ -5627,7 +5627,7 @@ Worker: /opt/kiki/bin/monty
 Workspace: /workspace/project
 Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
 Thinking: medium
-Prompt: bundled read_only_agent
+Prompt: bundled system
 OpenAI API key: present
 Submission: available
 Problems: none
