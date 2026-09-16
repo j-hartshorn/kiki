@@ -5622,6 +5622,7 @@ mod tests {
                 | RuntimeEvent::SubagentRecord { .. }
                 | RuntimeEvent::SubagentFinished { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
+                | RuntimeEvent::NameAccepted { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
         }

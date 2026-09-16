@@ -3122,7 +3122,7 @@ mod tests {
         let caller = coordinator.root_caller().await;
         (
             AgentInvocationContext::new(caller, coordinator).with_accepted_thinking(
-                AcceptedThinking::new(selection, snapshot.settings().clone()),
+                AcceptedThinking::new(selection, snapshot.settings().clone(), None),
             ),
             receiver,
         )
@@ -3152,6 +3152,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         (context, coordinator, receiver)
     }
@@ -3185,6 +3186,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         (context, coordinator)
     }
@@ -4948,6 +4950,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
@@ -5099,7 +5102,7 @@ mod tests {
             crate::config::DEFAULT_MODEL.default_thinking,
         )
         .unwrap();
-        let accepted = AcceptedThinking::new(invoking, snapshot.settings().clone());
+        let accepted = AcceptedThinking::new(invoking, snapshot.settings().clone(), None);
         let terra =
             crate::config::ModelSelection::new(&crate::config::models::TERRA, "high").unwrap();
         accepted.accept(terra);
@@ -5245,7 +5248,7 @@ mod tests {
         let _sibling_caller = captured.recv().await.expect("sibling caller");
         let context =
             AgentInvocationContext::new(child_caller, coordinator.clone()).with_accepted_thinking(
-                AcceptedThinking::new(selection, snapshot.settings().clone()),
+                AcceptedThinking::new(selection, snapshot.settings().clone(), None),
             );
 
         let execution = execute_with_invocation(

@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 use super::{
-    DEFAULT_MODEL, ModelConfiguration, StartupProblemKind,
+    DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupProblemKind,
     constants::{
         DEFAULT_SUBAGENT_ALLOW_NESTED, DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_DEPTH,
         DEFAULT_SUBAGENT_MAX_STARTS_PER_RUN, DEFAULT_SUBAGENT_TIMEOUT, SUBAGENT_TIMER_HEADROOM,
@@ -27,8 +27,65 @@ const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported quali
 pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
     pub(crate) workspace_root: Option<PathBuf>,
+    pub(crate) session_preferences: Option<SessionPreferences>,
     pub(crate) model: Option<OsString>,
     pub(crate) thinking: Option<OsString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionPreferences {
+    selection: ModelSelection,
+    thinking: BTreeMap<&'static str, &'static str>,
+}
+
+impl SessionPreferences {
+    pub(crate) fn initial(selection: ModelSelection) -> Self {
+        Self {
+            selection,
+            thinking: BTreeMap::from([(selection.model().id, selection.thinking())]),
+        }
+    }
+
+    pub(crate) fn new(
+        selection: ModelSelection,
+        thinking: BTreeMap<&'static str, &'static str>,
+    ) -> Option<Self> {
+        (thinking.get(selection.model().id) == Some(&selection.thinking())
+            && thinking.iter().all(|(model_id, thinking)| {
+                model_by_id(model_id).is_some_and(|model| model.supports_thinking(thinking))
+            }))
+        .then_some(Self {
+            selection,
+            thinking,
+        })
+    }
+
+    pub(crate) fn from_ids(
+        selected_model: &str,
+        thinking: impl IntoIterator<Item = (String, String)>,
+    ) -> Option<Self> {
+        let selected_model = model_by_id(selected_model)?;
+        let mut accepted = BTreeMap::new();
+        for (model_id, thinking) in thinking {
+            let model = model_by_id(&model_id)?;
+            let thinking = model
+                .thinking_levels
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == thinking)?;
+            accepted.insert(model.id, thinking);
+        }
+        let thinking = *accepted.get(selected_model.id)?;
+        Self::new(ModelSelection::new(selected_model, thinking)?, accepted)
+    }
+
+    pub(crate) fn selection(&self) -> ModelSelection {
+        self.selection
+    }
+
+    pub(crate) fn thinking(&self) -> &BTreeMap<&'static str, &'static str> {
+        &self.thinking
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +93,7 @@ pub(crate) enum SettingsOrigin {
     BuiltIn,
     User,
     Project,
+    Session,
     Environment,
 }
 
@@ -45,6 +103,7 @@ impl fmt::Display for SettingsOrigin {
             Self::BuiltIn => "built-in defaults",
             Self::User => "user settings",
             Self::Project => "project settings",
+            Self::Session => "session preferences",
             Self::Environment => "environment variables",
         })
     }
@@ -342,6 +401,24 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut thinking,
         &mut subagents,
     );
+    if let Some(session_preferences) = input.session_preferences {
+        model = session_preferences.selection().model();
+        model_origin = SettingsOrigin::Session;
+        thinking.extend(
+            session_preferences
+                .thinking()
+                .iter()
+                .map(|(model, thinking)| {
+                    (
+                        *model,
+                        PersistedThinking {
+                            value: thinking,
+                            origin: SettingsOrigin::Session,
+                        },
+                    )
+                }),
+        );
+    }
 
     let model_is_valid = match input.model {
         None => true,
@@ -899,6 +976,7 @@ fn write_document(path: &Path, content: &str) -> Result<(), SaveError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
@@ -907,11 +985,12 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::{
+        ModelSelection,
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
         models::{ASTRA, LUNA, SOL, TERRA},
     };
 
-    use super::{Input, SubagentSettings, resolve};
+    use super::{Input, SessionPreferences, SubagentSettings, resolve};
 
     #[test]
     fn astra_uses_low_by_default_and_openai_models_reject_none() {
@@ -980,6 +1059,7 @@ mod tests {
         let resolution = resolve(Input {
             home: Some(home.path().as_os_str().to_os_string()),
             workspace_root: Some(project.path().to_path_buf()),
+            session_preferences: None,
             model: None,
             thinking: None,
         });
@@ -991,10 +1071,61 @@ mod tests {
         assert_eq!(resolution.context().thinking_for(&SOL), None);
     }
 
+    #[test]
+    fn session_preferences_override_files_but_environment_overrides_session() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(
+            home.path(),
+            "model = \"openai/gpt-5.6-sol\"\n\n[thinking]\n\"openai/gpt-5.6-terra\" = \"low\"\n",
+        );
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-luna\"\n\n[thinking]\n\"openai/gpt-5.6-terra\" = \"medium\"\n",
+        );
+        let preferences = SessionPreferences::new(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+            BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid session preferences");
+
+        let mut session = input(Some(home.path()), Some(project.path()));
+        session.session_preferences = Some(preferences.clone());
+        let session = resolve(session);
+        assert!(std::ptr::eq(session.model(), &TERRA));
+        assert_eq!(session.thinking(), "high");
+        assert_eq!(
+            session.context().model_origin(),
+            super::SettingsOrigin::Session
+        );
+        assert_eq!(session.context().thinking_for(&TERRA), Some("high"));
+
+        let mut environment = input(Some(home.path()), Some(project.path()));
+        environment.session_preferences = Some(preferences);
+        environment.model = Some(OsString::from(SOL.id));
+        let environment = resolve(environment);
+        assert!(std::ptr::eq(environment.model(), &SOL));
+        assert_eq!(environment.thinking(), "low");
+        assert_eq!(
+            environment.context().model_origin(),
+            super::SettingsOrigin::Environment
+        );
+
+        let mut environment_thinking = input(Some(home.path()), Some(project.path()));
+        environment_thinking.session_preferences = Some(SessionPreferences::initial(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+        ));
+        environment_thinking.thinking = Some(OsString::from("medium"));
+        let environment_thinking = resolve(environment_thinking);
+        assert!(std::ptr::eq(environment_thinking.model(), &TERRA));
+        assert_eq!(environment_thinking.thinking(), "medium");
+    }
+
     fn input(home: Option<&Path>, workspace_root: Option<&Path>) -> Input {
         Input {
             home: home.map(|path| path.as_os_str().to_os_string()),
             workspace_root: workspace_root.map(Path::to_path_buf),
+            session_preferences: None,
             model: None,
             thinking: None,
         }
@@ -1639,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn saving_reports_project_or_environment_masking() {
+    fn saving_reports_project_environment_or_session_masking() {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         write_settings(
@@ -1682,5 +1813,30 @@ mod tests {
                 by: super::SettingsOrigin::Environment
             })
         ));
+
+        let preferences = SessionPreferences::new(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+            BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid session preferences");
+        let mut session = input(Some(home.path()), Some(project.path()));
+        session.session_preferences = Some(preferences);
+        let session = resolve(session);
+        assert!(matches!(
+            session.context().save_model(&SOL),
+            Ok(super::SaveOutcome::SavedButMasked {
+                by: super::SettingsOrigin::Session
+            })
+        ));
+        assert!(matches!(
+            session.context().save_thinking(&TERRA, "low"),
+            Ok(super::SaveOutcome::SavedButMasked {
+                by: super::SettingsOrigin::Session
+            })
+        ));
+        let user =
+            fs::read_to_string(home.path().join(".kiki/config.toml")).expect("saved user settings");
+        assert!(user.contains("model = \"openai/gpt-5.6-sol\""));
+        assert!(user.contains("\"openai/gpt-5.6-terra\" = \"low\""));
     }
 }

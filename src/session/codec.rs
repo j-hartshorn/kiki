@@ -12,7 +12,7 @@ use crate::arena::{
     Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
     ToolName,
 };
-use crate::config::{ModelSelection, model_by_id};
+use crate::config::{ModelSelection, SessionPreferences, model_by_id};
 use crate::model::{
     AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
 };
@@ -90,6 +90,13 @@ struct StoredCode {
 struct StoredSelection {
     model_id: String,
     thinking: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSessionPreferences {
+    selected_model: String,
+    thinking: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -660,6 +667,26 @@ fn decode_selection(selection: StoredSelection) -> Result<ModelSelection, CodecE
         .ok_or(CodecError::InvalidSelection)
 }
 
+pub(super) fn encode_session_preferences(
+    preferences: &SessionPreferences,
+) -> Result<String, CodecError> {
+    serde_json::to_string(&StoredSessionPreferences {
+        selected_model: preferences.selection().model().id.to_owned(),
+        thinking: preferences
+            .thinking()
+            .iter()
+            .map(|(model, thinking)| ((*model).to_owned(), (*thinking).to_owned()))
+            .collect(),
+    })
+    .map_err(CodecError::from)
+}
+
+pub(super) fn decode_session_preferences(value: &str) -> Result<SessionPreferences, CodecError> {
+    let preferences: StoredSessionPreferences = serde_json::from_str(value)?;
+    SessionPreferences::from_ids(preferences.selected_model.as_str(), preferences.thinking)
+        .ok_or(CodecError::InvalidSelection)
+}
+
 fn encode_code_result(result: &CodeResult) -> StoredCodeResult {
     match result {
         CodeResult::Execution { feedback } => StoredCodeResult::Execution {
@@ -1144,6 +1171,7 @@ fn hex_value(value: u8) -> Result<u8, CodecError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -1152,13 +1180,42 @@ mod tests {
 
     use super::{
         decode_checkpoint, decode_execution_entry, decode_execution_value, decode_path,
-        decode_task_details, decode_terminal_entry, decode_tool_value, encode_checkpoint,
-        encode_execution, encode_execution_value, encode_path, encode_request, encode_task_details,
-        encode_terminal, encode_tool_value, fail_unfinished_task_details,
+        decode_session_preferences, decode_task_details, decode_terminal_entry, decode_tool_value,
+        encode_checkpoint, encode_execution, encode_execution_value, encode_path, encode_request,
+        encode_session_preferences, encode_task_details, encode_terminal, encode_tool_value,
+        fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
+    use crate::config::{
+        ModelSelection, SessionPreferences,
+        models::{SOL, TERRA},
+    };
     use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
+
+    #[test]
+    fn session_preferences_codec_round_trips_and_rejects_invalid_metadata() {
+        let selection = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let preferences = SessionPreferences::new(
+            selection,
+            BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid preferences");
+
+        let encoded = encode_session_preferences(&preferences).expect("encode preferences");
+        assert_eq!(
+            decode_session_preferences(&encoded).expect("decode preferences"),
+            preferences
+        );
+
+        for invalid in [
+            r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"},"extra":true}"#,
+            r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"unsupported"}}"#,
+            r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{}}"#,
+        ] {
+            assert!(decode_session_preferences(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]

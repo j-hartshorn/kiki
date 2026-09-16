@@ -2515,7 +2515,7 @@ impl Transcript {
                     | self.replace_subagent_record(record)
             }
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
-            RuntimeEvent::SettingsAccepted { .. } => false,
+            RuntimeEvent::SettingsAccepted { .. } | RuntimeEvent::NameAccepted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.disabled_reason.is_none()
                     && (self.run_state == RunState::Submitting
@@ -3931,10 +3931,17 @@ mod tests {
     }
 
     #[test]
-    fn settings_acknowledgements_do_not_change_display_history() {
+    fn metadata_acknowledgements_do_not_change_display_history() {
         let mut transcript = Transcript::default();
 
         assert!(!transcript.apply(RuntimeEvent::SettingsAccepted { revision: 1 }, false));
+        assert!(!transcript.apply(
+            RuntimeEvent::NameAccepted {
+                revision: 2,
+                name: "Saved name".to_owned(),
+            },
+            false,
+        ));
         assert!(transcript.blocks().is_empty());
     }
 

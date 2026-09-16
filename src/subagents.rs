@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
 use crate::arena::{ArenaChildSource, Checkpoint, Execution};
 use crate::config::{
-    ModelSelection,
+    ModelSelection, SessionPreferences,
     constants::{MAX_PROMPT_BYTES, SUBAGENT_TIMER_HEADROOM},
     models::{ModelConfiguration, model_by_id},
     settings::{SettingsContext, SubagentSettings},
@@ -692,10 +692,17 @@ struct AcceptedThinkingState {
 }
 
 impl AcceptedThinking {
-    pub(crate) fn new(selection: ModelSelection, persisted: SettingsContext) -> Self {
+    pub(crate) fn new(
+        selection: ModelSelection,
+        persisted: SettingsContext,
+        restored: Option<SessionPreferences>,
+    ) -> Self {
+        let values = restored
+            .map(|preferences| preferences.thinking().clone())
+            .unwrap_or_else(|| BTreeMap::from([(selection.model().id, selection.thinking())]));
         Self(Arc::new(RwLock::new(AcceptedThinkingState {
             persisted,
-            values: BTreeMap::from([(selection.model().id, selection.thinking())]),
+            values,
         })))
     }
 
@@ -705,6 +712,17 @@ impl AcceptedThinking {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values
             .insert(selection.model().id, selection.thinking());
+    }
+
+    pub(crate) fn proposal(&self, selection: ModelSelection) -> SessionPreferences {
+        let state = self
+            .0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut values = state.values.clone();
+        values.insert(selection.model().id, selection.thinking());
+        SessionPreferences::new(selection, values)
+            .expect("accepted thinking values must be supported by their models")
     }
 
     #[cfg(test)]

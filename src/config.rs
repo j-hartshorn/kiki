@@ -14,6 +14,7 @@ pub use models::{
     DEFAULT_MODEL, ModelConfiguration, ModelPricing, ModelSelection, PricingIdentity, Rates,
     model_by_id,
 };
+pub(crate) use settings::SessionPreferences;
 
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
 const KIKI_MODEL_ENV: &str = "KIKI_MODEL";
@@ -417,6 +418,12 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
 }
 
 pub fn load() -> StartupConfiguration {
+    load_with_session_preferences(None)
+}
+
+pub(crate) fn load_with_session_preferences(
+    session_preferences: Option<SessionPreferences>,
+) -> StartupConfiguration {
     let input = StartupInput {
         worker_path: env::var_os(MONTY_BIN_ENV),
         model: env::var_os(KIKI_MODEL_ENV),
@@ -426,10 +433,17 @@ pub fn load() -> StartupConfiguration {
         prompt: PromptResolution::from(prompt::resolve()),
         api_key: env::var_os(OPENAI_API_KEY_ENV),
     };
-    resolve_startup(input)
+    resolve_startup_with_session_preferences(input, session_preferences)
 }
 
 fn resolve_startup(input: StartupInput) -> StartupConfiguration {
+    resolve_startup_with_session_preferences(input, None)
+}
+
+fn resolve_startup_with_session_preferences(
+    input: StartupInput,
+    session_preferences: Option<SessionPreferences>,
+) -> StartupConfiguration {
     let StartupInput {
         worker_path,
         model,
@@ -444,6 +458,7 @@ fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     let settings = settings::resolve(settings::Input {
         home,
         workspace_root: workspace_root.as_ref().ok().cloned(),
+        session_preferences,
         model,
         thinking,
     });
@@ -702,22 +717,23 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{
+        DEFAULT_MODEL, ModelSelection, SessionPreferences,
+        models::{ASTRA, LUNA, SOL, TERRA},
+    };
+    use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
-
-    use crate::config::{
-        DEFAULT_MODEL,
-        models::{ASTRA, LUNA, SOL, TERRA},
-    };
-    use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
     use tempfile::tempdir;
 
     use super::{
         ApiKeyPresence, MAX_STARTUP_DIAGNOSTIC_BYTES, MAX_STARTUP_PATH_BYTES,
         MAX_STARTUP_REMEDIATION_BYTES, PromptProvenance, PromptResolution, StartupInput,
         StartupProblemKind, SubmissionAvailability, resolve_startup,
+        resolve_startup_with_session_preferences,
     };
 
     const WORKER_PATH: &str = "/opt/kiki/bin/monty";
@@ -797,6 +813,51 @@ mod tests {
         assert_eq!(
             configuration.construction.system_prompt.as_deref(),
             Some("system instructions")
+        );
+    }
+
+    #[test]
+    fn restored_environment_effective_preferences_override_files_without_environment() {
+        let home = tempdir().expect("home");
+        let workspace = tempdir().expect("workspace");
+        write_settings(
+            home.path(),
+            "model = \"openai/gpt-5.6-sol\"\n\n[thinking]\n\"openai/gpt-5.6-sol\" = \"max\"\n\"openai/gpt-5.6-terra\" = \"low\"\n",
+        );
+        write_settings(
+            workspace.path(),
+            "model = \"openai/gpt-5.6-luna\"\n\n[thinking]\n\"openai/gpt-5.6-sol\" = \"xhigh\"\n\"openai/gpt-5.6-terra\" = \"medium\"\n",
+        );
+        let environment_effective = ModelSelection::new(&TERRA, "high")
+            .expect("select previous environment-effective Terra");
+        let preferences = SessionPreferences::new(
+            environment_effective,
+            BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid session preferences");
+
+        let restored = resolve_startup_with_session_preferences(
+            ready_input_with_settings(home.path(), workspace.path()),
+            Some(preferences.clone()),
+        );
+        assert_eq!(
+            ModelSelection::new(restored.snapshot().model(), restored.snapshot().thinking()),
+            Some(environment_effective)
+        );
+        assert_eq!(
+            restored.snapshot().settings().thinking_for(&SOL),
+            Some("low")
+        );
+
+        let mut environment = ready_input_with_settings(home.path(), workspace.path());
+        environment.model = Some(OsString::from(SOL.id));
+        environment.thinking = Some(OsString::from("xhigh"));
+        let environment = resolve_startup_with_session_preferences(environment, Some(preferences));
+        assert!(std::ptr::eq(environment.snapshot().model(), &SOL));
+        assert_eq!(environment.snapshot().thinking(), "xhigh");
+        assert_eq!(
+            environment.snapshot().submission_availability(),
+            SubmissionAvailability::Available
         );
     }
 

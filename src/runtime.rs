@@ -16,7 +16,7 @@ use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
     PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session, SessionError,
-    SessionRestore, SessionWriter,
+    SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -41,6 +41,10 @@ pub(crate) enum RuntimeCommand {
     },
     ApplySettings {
         selection: ModelSelection,
+        revision: u64,
+    },
+    SetSessionName {
+        name: String,
         revision: u64,
     },
     Cancel,
@@ -117,6 +121,7 @@ pub(crate) enum RestoredTimelineItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeInitialState {
+    pub(crate) metadata: Option<SessionMetadata>,
     pub(crate) records: Vec<StoredRecord>,
     pub(crate) tasks: Vec<TaskRecord>,
     pub(crate) timeline: Vec<RestoredTimelineItem>,
@@ -127,6 +132,7 @@ pub(crate) struct RuntimeInitialState {
 impl RuntimeInitialState {
     pub(crate) fn empty() -> Self {
         Self {
+            metadata: None,
             records: Vec::new(),
             tasks: Vec::new(),
             timeline: Vec::new(),
@@ -200,6 +206,10 @@ pub(crate) enum RuntimeEvent {
     },
     SettingsAccepted {
         revision: u64,
+    },
+    NameAccepted {
+        revision: u64,
+        name: String,
     },
     SubmissionRejectedBusy {
         active_run_id: RunId,
@@ -399,7 +409,9 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::Cancel => Some(ControlCommand::Cancel),
         RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
-        RuntimeCommand::Submit { .. } | RuntimeCommand::ApplySettings { .. } => None,
+        RuntimeCommand::Submit { .. }
+        | RuntimeCommand::ApplySettings { .. }
+        | RuntimeCommand::SetSessionName { .. } => None,
     }
 }
 
@@ -479,6 +491,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SubagentFinished { .. }
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::SettingsAccepted { .. }
+        | RuntimeEvent::NameAccepted { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
@@ -544,6 +557,7 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(revision, _)| *revision);
     RuntimeInitialState {
+        metadata: restore.metadata.clone(),
         records,
         tasks,
         timeline: ordered.into_iter().map(|(_, item)| item).collect(),
@@ -614,7 +628,7 @@ impl<M: Model> RuntimeController<M> {
         subagents: SessionSubagents,
         session: SessionWriter,
     ) -> Self {
-        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
+        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
         Self {
             agent: Some(agent),
@@ -653,19 +667,48 @@ impl<M: Model> RuntimeController<M> {
         subagents
             .restore_terminal_tasks(restored_tasks, restore.next_task)
             .await;
-        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
+        let accepted_thinking = AcceptedThinking::new(
+            *settings.borrow(),
+            persisted_settings,
+            restore
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.preferences().clone()),
+        );
         let agent = if let Some(state) = restore.executable {
             if model.validate_history(&state.history).is_ok()
                 && arena.restore(state.checkpoint.clone()).await.is_ok()
             {
-                Some(Agent::restored(arena, model, state.history))
+                let selection = *settings.borrow();
+                let preferences = accepted_thinking.proposal(selection);
+                match session
+                    .writer()
+                    .commit_preferences(preferences.clone())
+                    .await
+                {
+                    Ok(revision) => {
+                        accepted_thinking.accept(selection);
+                        initial
+                            .metadata
+                            .as_mut()
+                            .expect("executable session restore must have metadata")
+                            .update_preferences(preferences, revision);
+                        Some(Agent::restored(arena, model, state.history))
+                    }
+                    Err(_) => {
+                        subagents.latch_storage_failure().await;
+                        initial.disabled_reason =
+                            Some(RuntimeDisabledReason::SessionStorageWriteFailed);
+                        None
+                    }
+                }
             } else {
                 None
             }
         } else {
             None
         };
-        if agent.is_none() {
+        if agent.is_none() && initial.disabled_reason.is_none() {
             initial.disabled_reason = Some(RuntimeDisabledReason::SessionRestoreFailed);
         }
         let subagent_events = subagents.take_event_receiver();
@@ -768,6 +811,7 @@ impl<M: Model> RuntimeController<M> {
         self.accepted_thinking = AcceptedThinking::new(
             *settings.borrow(),
             self.accepted_thinking.persisted_settings(),
+            None,
         );
         self.settings = settings;
         self
@@ -917,9 +961,31 @@ impl<M: Model> RuntimeController<M> {
                 selection,
                 revision,
             } => {
+                if self.disabled_reason.is_some() {
+                    return;
+                }
+                let preferences = self.accepted_thinking.proposal(selection);
+                if self.session.commit_preferences(preferences).await.is_err() {
+                    self.subagents.latch_storage_failure().await;
+                    self.disable_session_storage(events).await;
+                    return;
+                }
                 self.accepted_thinking.accept(selection);
                 self.settings.send_replace(selection);
                 self.emit(events, RuntimeEvent::SettingsAccepted { revision });
+            }
+            RuntimeCommand::SetSessionName { name, revision } => {
+                if self.disabled_reason.is_some() {
+                    return;
+                }
+                match self.session.commit_name(name.clone()).await {
+                    Ok(_) => self.emit(events, RuntimeEvent::NameAccepted { revision, name }),
+                    Err(SessionError::EmptyName) => {}
+                    Err(_) => {
+                        self.subagents.latch_storage_failure().await;
+                        self.disable_session_storage(events).await;
+                    }
+                }
             }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
             RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
@@ -1778,7 +1844,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(unix)]
     use tokio::net::UnixListener;
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc, oneshot, watch};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -1797,7 +1863,7 @@ mod tests {
         RuntimeIdentity, ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::{
-        DEFAULT_MODEL, ModelSelection,
+        DEFAULT_MODEL, ModelSelection, SessionPreferences,
         models::{LUNA, SOL, TERRA},
     };
     use crate::model::{
@@ -2134,6 +2200,7 @@ mod tests {
         started: Arc<Notify>,
         cleanup_started: Arc<Notify>,
         release: Arc<Notify>,
+        returned: Arc<Notify>,
     }
 
     impl ChildModelFactory for CleanupGatedChildFactory {
@@ -2144,6 +2211,7 @@ mod tests {
                 started: self.started.clone(),
                 cleanup_started: self.cleanup_started.clone(),
                 release: self.release.clone(),
+                returned: self.returned.clone(),
             }
         }
     }
@@ -2152,6 +2220,7 @@ mod tests {
         started: Arc<Notify>,
         cleanup_started: Arc<Notify>,
         release: Arc<Notify>,
+        returned: Arc<Notify>,
     }
 
     impl Model for CleanupGatedChildModel {
@@ -2169,6 +2238,7 @@ mod tests {
                 cancellation.cancelled().await;
                 self.cleanup_started.notify_one();
                 self.release.notified().await;
+                self.returned.notify_one();
                 Err(ModelFailure::new(
                     ModelError::Cancelled,
                     vec![AttemptAccounting::UsageUnavailable],
@@ -3234,7 +3304,7 @@ mod tests {
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
                 )
                 .unwrap(),
-            (1, 0, 0, 1)
+            (1, 0, 0, 2)
         );
         session.close().unwrap();
     }
@@ -4100,6 +4170,7 @@ mod tests {
             }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
+            RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
@@ -4700,6 +4771,7 @@ mod tests {
             started: Arc::new(Notify::new()),
             cleanup_started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
+            returned: Arc::new(Notify::new()),
         };
         let coordinator = complete_child_coordinator(factory.clone());
         let caller = coordinator.root_caller().await;
@@ -4750,6 +4822,7 @@ mod tests {
             started: Arc::new(Notify::new()),
             cleanup_started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
+            returned: Arc::new(Notify::new()),
         };
         let coordinator = complete_child_coordinator(factory.clone());
         let caller = coordinator.root_caller().await;
@@ -5023,7 +5096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_settings_update_applies_to_the_next_model_step_only() {
+    async fn settings_committed_during_a_started_step_apply_to_the_later_step() {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
@@ -5123,6 +5196,691 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[tokio::test]
+    async fn settings_ack_follows_preference_commit() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection_a = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let selection_b = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let gate = SessionWriteGate::new(SessionWriteKind::Preferences);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection_a,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let metadata_before: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read initial metadata");
+        let (settings, selection_receiver) = watch::channel(selection_a);
+        let settings_observer = settings.subscribe();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                SelectionMessageModel {
+                    selection: selection_receiver,
+                    observed: observed.clone(),
+                    contexts,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let accepted_thinking = controller.accepted_thinking.clone();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 3,
+            })
+            .await
+            .expect("send settings");
+        gate.wait_until_started().await;
+        assert_eq!(*settings_observer.borrow(), selection_a);
+        assert_eq!(
+            accepted_thinking
+                .resolve(selection_a, Some(&TERRA))
+                .thinking(),
+            TERRA.default_thinking
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT preferences_json, updated_at_ms, revision FROM session",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read blocked metadata"),
+            metadata_before
+        );
+        assert!(events.try_recv().is_err());
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "use saved settings".to_owned(),
+            })
+            .await
+            .expect("queue submission");
+        assert!(observed.lock().expect("observed selections").is_empty());
+
+        gate.release();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 3 }
+        );
+        let settled = events_until_settled(&mut events).await;
+        assert_eq!(*settings_observer.borrow(), selection_b);
+        assert_eq!(
+            accepted_thinking
+                .resolve(selection_a, Some(&TERRA))
+                .thinking(),
+            "high"
+        );
+        assert_eq!(
+            *observed.lock().expect("observed selections"),
+            [selection_b]
+        );
+        assert!(matches!(
+            settled.as_slice(),
+            [
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::RunSettled { .. },
+            ]
+        ));
+        let metadata_after: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read committed metadata");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata_after.0).expect("decode metadata"),
+            serde_json::json!({
+                "selected_model": TERRA.id,
+                "thinking": {
+                    SOL.id: "low",
+                    TERRA.id: "high",
+                },
+            })
+        );
+        assert!(metadata_after.1 >= metadata_before.1);
+        assert!(metadata_after.2 > metadata_before.2);
+
+        shutdown_controller(commands, task).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn name_acknowledgement_follows_the_name_commit() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let gate = SessionWriteGate::new(SessionWriteKind::Name);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, ScriptedModel::default()),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::SetSessionName {
+                name: "Saved name".to_owned(),
+                revision: 4,
+            })
+            .await
+            .expect("set session name");
+        gate.wait_until_started().await;
+        assert_eq!(session.metadata().expect("read metadata").name(), None);
+        assert!(events.try_recv().is_err());
+
+        gate.release();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::NameAccepted {
+                revision: 4,
+                name: "Saved name".to_owned(),
+            }
+        );
+        assert_eq!(
+            session.metadata().expect("read metadata").name(),
+            Some("Saved name")
+        );
+        shutdown_controller(commands, task).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn failed_name_commit_cancels_persisted_background_work_without_acknowledgement() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(&SOL, "medium").expect("select Sol");
+        let factory = CleanupGatedChildFactory {
+            started: Arc::new(Notify::new()),
+            cleanup_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            returned: Arc::new(Notify::new()),
+        };
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let coordinator = complete_child_coordinator(factory.clone());
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                SelectedScriptedModel {
+                    model: ScriptedModel::new(vec![
+                        ModelAction::Code {
+                            source: "task = await start_subagent('background work')".to_owned(),
+                        },
+                        ModelAction::Message {
+                            text: "foreground complete".to_owned(),
+                        },
+                    ]),
+                    selection,
+                    message_waiting: None,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            coordinator.clone(),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start background work".to_owned(),
+            })
+            .await
+            .expect("submit root request");
+        factory.started.notified().await;
+        let root_events = events_until_settled(&mut events).await;
+        assert!(root_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::FinalMessage { text, .. },
+                    ..
+                },
+                ..
+            } if text == "foreground complete"
+        )));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT COUNT(*), COUNT(terminal_revision) FROM subagent_tasks",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("read admitted child"),
+            (1, 0)
+        );
+        let metadata_before: (Option<String>, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT name, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata before rejected name");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_name BEFORE UPDATE OF name ON session BEGIN SELECT RAISE(ABORT, 'reject name'); END;",
+            )
+            .expect("reject name writes");
+
+        commands
+            .send(RuntimeCommand::SetSessionName {
+                name: "Unsaved name".to_owned(),
+                revision: 1,
+            })
+            .await
+            .expect("set name");
+        let metadata_events = events_until_disabled(&mut events).await;
+        factory.cleanup_started.notified().await;
+        assert!(coordinator.storage_failure_token().is_cancelled());
+        assert_eq!(coordinator.active_count().await, 0);
+        let metadata_after: (Option<String>, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT name, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata after rejected name");
+        assert_eq!(metadata_after, metadata_before);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT COUNT(*), COUNT(terminal_revision) FROM subagent_tasks",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("read unfinished child after storage failure"),
+            (1, 0)
+        );
+        assert!(
+            !metadata_events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::NameAccepted { .. }))
+        );
+        assert_eq!(
+            metadata_events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::RuntimeDisabled { .. }))
+                .count(),
+            1
+        );
+
+        factory.release.notify_one();
+        factory.returned.notified().await;
+        shutdown_controller(commands, task).await;
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT COUNT(*), COUNT(terminal_revision) FROM subagent_tasks",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("preserve unfinished child for recovery"),
+            (1, 0)
+        );
+        drop(coordinator);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn failed_preference_commit_cancels_active_work_and_withholds_acknowledgement() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection_a = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let selection_b = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let provider_called = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let closure_gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection_a,
+            arena.checkpoint(),
+            closure_gate.clone(),
+        )
+        .expect("create session");
+        let (settings, _) = watch::channel(selection_a);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                AdmissionGatedModel {
+                    calls: calls.clone(),
+                    provider_called: provider_called.clone(),
+                },
+            ),
+            settings.clone(),
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let accepted_thinking = controller.accepted_thinking.clone();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "keep running".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        provider_called.notified().await;
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let metadata_before: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata before rejected preferences");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_preferences BEFORE UPDATE OF preferences_json ON session BEGIN SELECT RAISE(ABORT, 'reject preferences'); END;",
+            )
+            .expect("reject preference writes");
+
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .expect("apply settings");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(*settings.borrow(), selection_a);
+        assert_eq!(
+            accepted_thinking
+                .resolve(selection_a, Some(&TERRA))
+                .thinking(),
+            TERRA.default_thinking
+        );
+        closure_gate.wait_until_started().await;
+        let metadata_after: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata after rejected preferences");
+        assert_eq!(metadata_after, metadata_before);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must be rejected".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        closure_gate.release();
+        let settled = events_until_settled(&mut events).await;
+        assert!(settled.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CancelledRun { .. },
+                    ..
+                },
+                ..
+            }
+        )));
+        shutdown_controller(commands, task).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn restore_waits_for_and_reports_the_effective_startup_preferences() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Preferences);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let saved = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let effective = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let session = Arc::new(
+            Session::create_with_write_gate(
+                home.path(),
+                workspace.path(),
+                saved,
+                arena.checkpoint(),
+                gate.clone(),
+            )
+            .expect("create session"),
+        );
+        session
+            .writer()
+            .commit_name("Saved session".to_owned())
+            .await
+            .expect("save session name");
+        let (settings, _) = watch::channel(effective);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let restore_session = Arc::clone(&session);
+        let (returned, mut returned_receiver) = oneshot::channel();
+        let restore = tokio::spawn(async move {
+            let restored = RuntimeController::restore(
+                &restore_session,
+                arena,
+                ScriptedModel::default(),
+                settings,
+                snapshot.settings().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+            )
+            .await;
+            let _ = returned.send(());
+            restored
+        });
+
+        gate.wait_until_started().await;
+        assert!(returned_receiver.try_recv().is_err());
+        gate.release();
+        let (controller, initial) = timeout(TEST_TIMEOUT, restore)
+            .await
+            .expect("restore should finish after preference commit")
+            .expect("restore task should not panic")
+            .expect("restore runtime");
+
+        assert_eq!(initial.disabled_reason, None);
+        let metadata = session.metadata().expect("read committed metadata");
+        assert_eq!(initial.metadata.as_ref(), Some(&metadata));
+        assert_eq!(metadata.name(), Some("Saved session"));
+        assert_eq!(metadata.preferences().selection(), effective);
+        assert_eq!(metadata.preferences().thinking().get(SOL.id), Some(&"low"));
+        assert_eq!(
+            metadata.preferences().thinking().get(TERRA.id),
+            Some(&"high")
+        );
+        drop(controller);
+        Arc::try_unwrap(session)
+            .unwrap_or_else(|_| panic!("restore should release session handles"))
+            .close()
+            .expect("close session");
+    }
+
+    #[tokio::test]
+    async fn failed_startup_preference_commit_disables_the_restored_runtime() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        session
+            .writer()
+            .commit_request("readable saved request".to_owned())
+            .await
+            .expect("commit readable request");
+        let saved_metadata = session.metadata().expect("read saved metadata");
+        let metadata_before: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata before rejected startup preferences");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_startup_preferences BEFORE UPDATE OF preferences_json ON session BEGIN SELECT RAISE(ABORT, 'reject startup preferences'); END;",
+            )
+            .expect("reject startup preference writes");
+        let effective = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let (settings, _) = watch::channel(effective);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            CountingMessageModel {
+                calls: Arc::clone(&calls),
+            },
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+        )
+        .await
+        .expect("return disabled restored runtime");
+
+        assert_eq!(
+            initial.disabled_reason,
+            Some(RuntimeDisabledReason::SessionStorageWriteFailed)
+        );
+        assert_eq!(
+            initial.records,
+            [StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "readable saved request".to_owned(),
+                },
+            }]
+        );
+        assert_eq!(initial.metadata.as_ref(), Some(&saved_metadata));
+        let metadata_after: (String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata after rejected startup preferences");
+        assert_eq!(metadata_after, metadata_before);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must stay disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, task).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        session.close().expect("close session");
     }
 
     #[derive(Clone)]
@@ -9101,7 +9859,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let invoking = ModelSelection::new(&SOL, "high").unwrap();
-        let accepted = AcceptedThinking::new(invoking, persisted_settings(&home, workspace.path()));
+        let accepted =
+            AcceptedThinking::new(invoking, persisted_settings(&home, workspace.path()), None);
 
         assert_eq!(accepted.resolve(invoking, None), invoking);
         assert_eq!(
@@ -9124,12 +9883,40 @@ mod tests {
     }
 
     #[test]
+    fn restored_accepted_thinking_overrides_current_settings_context() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let invoking = ModelSelection::new(&SOL, "high").unwrap();
+        let project_settings = workspace.path().join(".kiki/config.toml");
+        fs::create_dir_all(project_settings.parent().expect("project settings parent")).unwrap();
+        fs::write(
+            &project_settings,
+            "[thinking]\n\"openai/gpt-5.6-terra\" = \"medium\"\n",
+        )
+        .unwrap();
+        let settings = persisted_settings(&home, workspace.path());
+        assert_eq!(settings.thinking_for(&TERRA), Some("medium"));
+        let restored = SessionPreferences::new(
+            invoking,
+            BTreeMap::from([(SOL.id, "high"), (TERRA.id, "max")]),
+        )
+        .expect("valid restored preferences");
+        let accepted = AcceptedThinking::new(invoking, settings, Some(restored));
+
+        assert_eq!(
+            accepted.resolve(invoking, Some(&TERRA)),
+            ModelSelection::new(&TERRA, "max").unwrap()
+        );
+    }
+
+    #[test]
     fn grandchild_without_an_override_inherits_its_invoking_child_selection() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let root = ModelSelection::new(&SOL, "low").unwrap();
         let child = ModelSelection::new(&LUNA, "max").unwrap();
-        let accepted = AcceptedThinking::new(root, persisted_settings(&home, workspace.path()));
+        let accepted =
+            AcceptedThinking::new(root, persisted_settings(&home, workspace.path()), None);
 
         assert_eq!(accepted.resolve(child, None), child);
     }
@@ -9847,6 +10634,7 @@ mod tests {
             Vec::new(),
         );
         let initial = restored_initial_state(&SessionRestore {
+            metadata: None,
             records: vec![
                 RestoredRecord {
                     revision: 2,

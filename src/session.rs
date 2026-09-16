@@ -19,7 +19,7 @@ use tokio::task;
 
 use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
-use crate::config::ModelSelection;
+use crate::config::{ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelHistory};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
@@ -68,6 +68,8 @@ pub(crate) enum SessionError {
     IdOverflow,
     #[error("session lifecycle transition was no longer valid")]
     InvalidTransition,
+    #[error("session name must not be empty")]
+    EmptyName,
     #[error("subagent task provenance does not identify a stored model step")]
     InvalidTaskProvenance,
 }
@@ -219,8 +221,47 @@ pub(crate) struct RestoredExecutableState {
     pub(crate) history: ModelHistory,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionMetadata {
+    name: Option<String>,
+    preferences: SessionPreferences,
+    revision: u64,
+}
+
+impl SessionMetadata {
+    pub(crate) fn new(
+        name: Option<String>,
+        preferences: SessionPreferences,
+        revision: i64,
+    ) -> Result<Self, SessionError> {
+        Ok(Self {
+            name,
+            preferences,
+            revision: u64::try_from(revision).map_err(|_| SessionError::IdOverflow)?,
+        })
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(crate) fn preferences(&self) -> &SessionPreferences {
+        &self.preferences
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn update_preferences(&mut self, preferences: SessionPreferences, revision: u64) {
+        self.preferences = preferences;
+        self.revision = revision;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionRestore {
+    pub(crate) metadata: Option<SessionMetadata>,
     pub(crate) records: Vec<RestoredRecord>,
     pub(crate) tasks: Vec<RestoredTask>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
@@ -235,6 +276,8 @@ pub(crate) struct SessionWriter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionWriteKind {
+    Preferences,
+    Name,
     Request,
     Step,
     Settlement,
@@ -556,6 +599,11 @@ impl Session {
         load_session_restore(&mut connection)
     }
 
+    pub(crate) fn metadata(&self) -> Result<SessionMetadata, SessionError> {
+        let connection = self.connection()?;
+        load_session_metadata(&connection)
+    }
+
     pub(crate) fn writer(&self) -> SessionWriter {
         SessionWriter {
             state: Arc::clone(&self.state),
@@ -595,6 +643,28 @@ impl Session {
 }
 
 impl SessionWriter {
+    pub(crate) async fn commit_preferences(
+        &self,
+        preferences: SessionPreferences,
+    ) -> Result<u64, SessionError> {
+        let preferences_json = codec::encode_session_preferences(&preferences)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        self.write(SessionWriteKind::Preferences, move |connection| {
+            commit_preferences(connection, &preferences_json)
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_name(&self, name: String) -> Result<u64, SessionError> {
+        if name.is_empty() {
+            return Err(SessionError::EmptyName);
+        }
+        self.write(SessionWriteKind::Name, move |connection| {
+            commit_name(connection, &name)
+        })
+        .await
+    }
+
     pub(crate) async fn commit_request(&self, request: String) -> Result<u64, SessionError> {
         self.write(SessionWriteKind::Request, move |connection| {
             commit_request(connection, &request)
@@ -705,6 +775,49 @@ impl SessionWriter {
         .await
         .map_err(|_| SessionError::WriterUnavailable)?
     }
+}
+
+fn commit_preferences(
+    connection: &mut Connection,
+    preferences_json: &str,
+) -> Result<u64, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE session SET preferences_json = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![preferences_json, now, next_revision],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+}
+
+fn commit_name(connection: &mut Connection, name: &str) -> Result<u64, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE session SET name = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![name, now, next_revision],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
 }
 
 fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, SessionError> {
@@ -1120,7 +1233,9 @@ fn initialise(
     let now = now_ms()?;
     let stored_checkpoint = codec::encode_checkpoint(&checkpoint)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
-    let preferences_json = initial_preferences(selection)?;
+    let preferences_json =
+        codec::encode_session_preferences(&SessionPreferences::initial(selection))
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(include_str!("session/schema.sql"))?;
     transaction.execute(
@@ -1152,19 +1267,6 @@ fn initialise(
             write_gate,
         }),
     })
-}
-
-fn initial_preferences(selection: ModelSelection) -> Result<String, SessionError> {
-    let mut thinking = serde_json::Map::new();
-    thinking.insert(
-        selection.model().id.to_owned(),
-        serde_json::Value::String(selection.thinking().to_owned()),
-    );
-    serde_json::to_string(&serde_json::json!({
-        "selected_model": selection.model().id,
-        "thinking": thinking,
-    }))
-    .map_err(|error| SessionError::Codec(error.to_string()))
 }
 
 fn sessions_directory(home: &Path) -> Result<PathBuf, SessionError> {
@@ -1327,6 +1429,7 @@ struct RestoreTaskRow {
 struct RestoreSnapshot {
     active_entry_id: i64,
     session_revision: i64,
+    metadata: Option<SessionMetadata>,
     entries: Vec<RestoreEntryRow>,
     runs: Vec<RestoreRunRow>,
     steps: Vec<RestoreStepRow>,
@@ -1334,13 +1437,38 @@ struct RestoreSnapshot {
     checkpoint: Option<(String, Vec<u8>, String)>,
 }
 
+fn load_session_metadata(connection: &Connection) -> Result<SessionMetadata, SessionError> {
+    let (name, preferences_json, revision): (Option<String>, String, i64) = connection.query_row(
+        "SELECT name, preferences_json, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    session_metadata(name, preferences_json, revision)
+}
+
+fn session_metadata(
+    name: Option<String>,
+    preferences_json: String,
+    revision: i64,
+) -> Result<SessionMetadata, SessionError> {
+    let preferences = codec::decode_session_preferences(&preferences_json)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    SessionMetadata::new(name, preferences, revision)
+}
+
 fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    let (active_entry_id, session_revision): (i64, i64) = transaction.query_row(
-        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+    let (active_entry_id, name, preferences_json, session_revision): (
+        i64,
+        Option<String>,
+        String,
+        i64,
+    ) = transaction.query_row(
+        "SELECT active_entry_id, name, preferences_json, revision FROM session WHERE singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
+    let metadata = session_metadata(name, preferences_json, session_revision).ok();
     let entries = {
         let mut statement = transaction.prepare(
             "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
@@ -1415,6 +1543,7 @@ fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, S
     Ok(restore_projection(RestoreSnapshot {
         active_entry_id,
         session_revision,
+        metadata,
         entries,
         runs,
         steps,
@@ -1424,6 +1553,7 @@ fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, S
 }
 
 fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
+    let metadata = snapshot.metadata.clone();
     let next_task = next_task_after(
         snapshot
             .tasks
@@ -1457,9 +1587,9 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
         .collect::<BTreeMap<_, _>>();
     let ancestry = selected_ancestry(&entries, snapshot.active_entry_id);
     if ancestry.entries.is_empty() {
-        return empty_restore(snapshot.tasks);
+        return empty_restore(snapshot.tasks, metadata);
     }
-    let mut executable = ancestry.intact && valid_timeline(&snapshot);
+    let mut executable = metadata.is_some() && ancestry.intact && valid_timeline(&snapshot);
     let mut verified = Vec::new();
     let mut records = Vec::new();
     for entry in ancestry.entries {
@@ -1633,6 +1763,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             history,
         });
     SessionRestore {
+        metadata,
         records,
         tasks,
         footer_adjustment,
@@ -1645,7 +1776,7 @@ fn next_task_after(maximum: Option<u64>) -> Option<u64> {
     maximum.map_or(Some(0), |maximum| maximum.checked_add(1))
 }
 
-fn empty_restore(tasks: Vec<RestoreTaskRow>) -> SessionRestore {
+fn empty_restore(tasks: Vec<RestoreTaskRow>, metadata: Option<SessionMetadata>) -> SessionRestore {
     let next_task = next_task_after(
         tasks
             .into_iter()
@@ -1653,6 +1784,7 @@ fn empty_restore(tasks: Vec<RestoreTaskRow>) -> SessionRestore {
             .max(),
     );
     SessionRestore {
+        metadata,
         records: Vec::new(),
         tasks: Vec::new(),
         footer_adjustment: Vec::new(),
@@ -2140,7 +2272,7 @@ mod tests {
         TaskSnapshot, TaskStepCommit, TaskTerminal,
     };
     use crate::arena::{Arena, Checkpoint, ExecutionOutcome, RuntimeIdentity};
-    use crate::config::{DEFAULT_MODEL, ModelSelection};
+    use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
 
@@ -2284,6 +2416,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 4,
             session_revision: 4,
+            metadata: None,
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request("first"), 2),
@@ -2330,6 +2463,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 2,
             session_revision: 2,
+            metadata: None,
             entries: vec![restore_entry(1, None, None, "{}".to_owned(), 1), child],
             runs: vec![super::RestoreRunRow {
                 id: 1,
@@ -2353,6 +2487,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 3,
             session_revision: 3,
+            metadata: None,
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request("invalid"), 1),
@@ -2386,6 +2521,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 2,
             session_revision: 2,
+            metadata: None,
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request("selected"), 2),
@@ -2425,6 +2561,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 2,
             session_revision: 3,
+            metadata: None,
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request("selected"), 2),
@@ -2450,6 +2587,7 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 999,
             session_revision: 1,
+            metadata: None,
             entries: Vec::new(),
             runs: Vec::new(),
             steps: Vec::new(),
@@ -2512,6 +2650,14 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 3,
             session_revision: 5,
+            metadata: Some(
+                super::SessionMetadata::new(
+                    None,
+                    crate::config::SessionPreferences::initial(selection()),
+                    5,
+                )
+                .expect("metadata"),
+            ),
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request, 2),
@@ -2773,6 +2919,98 @@ mod tests {
             })
         );
         assert!(!preferences.contains("sk-configured-credential"));
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn metadata_commits_preserve_user_and_project_configuration() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let user_settings = home.path().join(".kiki/config.toml");
+        let project_settings = workspace.path().join(".kiki/config.toml");
+        fs::create_dir_all(user_settings.parent().expect("user settings parent"))
+            .expect("create user settings directory");
+        fs::create_dir_all(project_settings.parent().expect("project settings parent"))
+            .expect("create project settings directory");
+        fs::write(
+            &user_settings,
+            "model = \"openai/gpt-5.6-sol\"\n[thinking]\n\"openai/gpt-5.6-sol\" = \"low\"\n",
+        )
+        .expect("write user settings");
+        fs::write(
+            &project_settings,
+            "model = \"openai/gpt-5.6-terra\"\n[thinking]\n\"openai/gpt-5.6-terra\" = \"high\"\n",
+        )
+        .expect("write project settings");
+        let user_before = fs::read(&user_settings).expect("read user settings");
+        let project_before = fs::read(&project_settings).expect("read project settings");
+        let session = create_session(&home, &workspace).await;
+        let preferences = SessionPreferences::new(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+            BTreeMap::from([(DEFAULT_MODEL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid preferences");
+
+        let name_revision = session
+            .writer()
+            .commit_name("Saved session".to_owned())
+            .await
+            .expect("commit name");
+        let preferences_revision = session
+            .writer()
+            .commit_preferences(preferences.clone())
+            .await
+            .expect("commit preferences");
+        let metadata = session.metadata().expect("load metadata");
+        let restore = session.restore().expect("restore session");
+
+        assert_eq!(name_revision, 2);
+        assert_eq!(preferences_revision, 3);
+        assert_eq!(metadata.name(), Some("Saved session"));
+        assert_eq!(metadata.preferences(), &preferences);
+        assert_eq!(metadata.revision(), preferences_revision);
+        assert_eq!(restore.metadata.as_ref(), Some(&metadata));
+        assert_eq!(
+            fs::read(&user_settings).expect("read user settings"),
+            user_before
+        );
+        assert_eq!(
+            fs::read(&project_settings).expect("read project settings"),
+            project_before
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn corrupt_preferences_disable_restore_but_keep_readable_history() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        session
+            .writer()
+            .commit_request("readable request".to_owned())
+            .await
+            .expect("commit request");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE session SET preferences_json = '{\"selected_model\":\"openai/gpt-5.6-sol\",\"thinking\":{\"openai/gpt-5.6-sol\":\"medium\"},\"unexpected\":true}', revision = revision + 1",
+                [],
+            )
+            .expect("corrupt preferences");
+
+        assert!(matches!(session.metadata(), Err(SessionError::Codec(_))));
+        let restore = session.restore().expect("read restore");
+        assert!(restore.metadata.is_none());
+        assert!(restore.executable.is_none());
+        assert!(matches!(
+            restore.records.as_slice(),
+            [super::RestoredRecord {
+                kind: super::RestoredRecordKind::UserRequest { request },
+                ..
+            }] if request == "readable request"
+        ));
         session.close().expect("close session");
     }
 

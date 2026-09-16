@@ -1519,6 +1519,7 @@ mod tests {
             .with_accepted_thinking(AcceptedThinking::new(
                 selection,
                 snapshot.settings().clone(),
+                None,
             ));
         let mut agent = agent_with_model(
             &workspace,
