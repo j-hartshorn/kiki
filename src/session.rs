@@ -18,6 +18,7 @@ use tokio::task;
 
 use crate::arena::Checkpoint;
 use crate::config::ModelSelection;
+use crate::subagents::TaskRecord;
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
 const LOCK_SUFFIX: &str = ".lock";
@@ -63,6 +64,8 @@ pub(crate) enum SessionError {
     IdOverflow,
     #[error("session lifecycle transition was no longer valid")]
     InvalidTransition,
+    #[error("subagent task provenance does not identify a stored model step")]
+    InvalidTaskProvenance,
 }
 
 struct SessionId(String);
@@ -147,6 +150,61 @@ pub(crate) enum SessionWriteKind {
     Step,
     Settlement,
     Closure,
+    TaskAdmission,
+    TaskTerminal,
+}
+
+pub(crate) struct TaskAdmission {
+    task_id: i64,
+    parent_task_id: Option<i64>,
+    origin_step_id: i64,
+    task_revision: i64,
+    details_json: String,
+}
+
+impl TaskAdmission {
+    pub(crate) fn from_record(
+        record: &TaskRecord,
+        origin_step_id: u64,
+    ) -> Result<Self, SessionError> {
+        Ok(Self {
+            task_id: task_sql_id(record.id().as_str())?,
+            parent_task_id: record
+                .parent()
+                .map(|parent| task_sql_id(parent.as_str()))
+                .transpose()?,
+            origin_step_id: i64::try_from(origin_step_id)
+                .map_err(|_| SessionError::InvalidTaskProvenance)?,
+            task_revision: i64::try_from(record.revision())
+                .map_err(|_| SessionError::IdOverflow)?,
+            details_json: codec::encode_task_details(record)
+                .map_err(|error| SessionError::Codec(error.to_string()))?,
+        })
+    }
+}
+
+pub(crate) struct TaskTerminal {
+    task_id: i64,
+    state: &'static str,
+    task_revision: i64,
+    details_json: String,
+}
+
+impl TaskTerminal {
+    pub(crate) fn from_record(record: &TaskRecord) -> Result<Self, SessionError> {
+        let state = record.observation().state();
+        if !state.is_terminal() {
+            return Err(SessionError::InvalidTransition);
+        }
+        Ok(Self {
+            task_id: task_sql_id(record.id().as_str())?,
+            state: state.storage_name(),
+            task_revision: i64::try_from(record.revision())
+                .map_err(|_| SessionError::IdOverflow)?,
+            details_json: codec::encode_task_details(record)
+                .map_err(|error| SessionError::Codec(error.to_string()))?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +516,31 @@ impl SessionWriter {
         .await
     }
 
+    pub(crate) async fn admit_subagent_task(
+        &self,
+        admission: TaskAdmission,
+        reject: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<Option<u64>, SessionError> {
+        self.write(SessionWriteKind::TaskAdmission, move |connection| {
+            if reject() {
+                Ok(None)
+            } else {
+                admit_subagent_task(connection, &admission).map(Some)
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn terminal_subagent_task(
+        &self,
+        terminal: TaskTerminal,
+    ) -> Result<u64, SessionError> {
+        self.write(SessionWriteKind::TaskTerminal, move |connection| {
+            terminal_subagent_task(connection, &terminal)
+        })
+        .await
+    }
+
     async fn write<T: Send + 'static>(
         &self,
         kind: SessionWriteKind,
@@ -467,14 +550,14 @@ impl SessionWriter {
         task::spawn_blocking(move || {
             #[cfg(not(test))]
             let _ = kind;
-            let mut connection = state
-                .connection
-                .lock()
-                .map_err(|_| SessionError::WriterUnavailable)?;
             #[cfg(test)]
             if let Some(gate) = &state.write_gate {
                 gate.wait(kind);
             }
+            let mut connection = state
+                .connection
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
             operation(&mut connection)
         })
         .await
@@ -650,6 +733,85 @@ fn close_run(
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn admit_subagent_task(
+    connection: &mut Connection,
+    admission: &TaskAdmission,
+) -> Result<u64, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let origin_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_steps WHERE id = ?1)",
+        params![admission.origin_step_id],
+        |row| row.get(0),
+    )?;
+    if !origin_exists {
+        return Err(SessionError::InvalidTaskProvenance);
+    }
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO subagent_tasks (id, parent_task_id, origin_step_id, state, admitted_revision, terminal_revision, task_revision, details_json) VALUES (?1, ?2, ?3, 'starting', ?4, NULL, ?5, ?6)",
+        params![
+            admission.task_id,
+            admission.parent_task_id,
+            admission.origin_step_id,
+            next_revision,
+            admission.task_revision,
+            admission.details_json,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE session SET updated_at_ms = ?1, revision = ?2 WHERE singleton = 1",
+        params![now, next_revision],
+    )?;
+    transaction.commit()?;
+    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+}
+
+fn terminal_subagent_task(
+    connection: &mut Connection,
+    terminal: &TaskTerminal,
+) -> Result<u64, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE subagent_tasks SET state = ?1, terminal_revision = ?2, task_revision = ?3, details_json = ?4 WHERE id = ?5 AND terminal_revision IS NULL",
+        params![
+            terminal.state,
+            next_revision,
+            terminal.task_revision,
+            terminal.details_json,
+            terminal.task_id,
+        ],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.execute(
+        "UPDATE session SET updated_at_ms = ?1, revision = ?2 WHERE singleton = 1",
+        params![now, next_revision],
+    )?;
+    transaction.commit()?;
+    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+}
+
+fn task_sql_id(value: &str) -> Result<i64, SessionError> {
+    u64::from_str_radix(value, 16)
+        .ok()
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(SessionError::IdOverflow)
 }
 
 fn initialise(

@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex as SyncMutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,7 @@ use crate::config::{
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
+use crate::session::{SessionError, SessionWriter, TaskAdmission, TaskTerminal};
 use crate::telemetry::{ChildStopCause, CoordinatorOperation, Settlement, Trace, TraceEvent};
 use crate::tools::{ToolError, ToolValue};
 
@@ -101,11 +102,23 @@ pub(crate) enum TaskState {
 }
 
 impl TaskState {
-    fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut
         )
+    }
+
+    pub(crate) fn storage_name(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
     }
 }
 
@@ -157,7 +170,6 @@ impl ChildResult {
         &self.message
     }
 
-    #[cfg(test)]
     pub(crate) fn values(&self) -> &BTreeMap<String, ToolValue> {
         &self.values
     }
@@ -185,6 +197,18 @@ pub(crate) struct Caller {
     session: u64,
     owner: CallerOwner,
     origin: OriginId,
+    origin_step_id: Option<u64>,
+}
+
+impl Caller {
+    fn with_child_owner(&self, owner: TaskId) -> Self {
+        Self {
+            session: self.session,
+            owner: CallerOwner::Child(owner),
+            origin: self.origin,
+            origin_step_id: self.origin_step_id,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -275,7 +299,6 @@ pub(crate) struct TaskAttempt {
 }
 
 impl TaskAttempt {
-    #[cfg(test)]
     pub(crate) fn model_step(&self) -> u64 {
         self.model_step
     }
@@ -284,9 +307,21 @@ impl TaskAttempt {
         self.provider_attempt
     }
 
-    #[cfg(test)]
     pub(crate) fn accounting(&self) -> Option<&AttemptAccounting> {
         self.accounting.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_step: u64,
+        provider_attempt: u32,
+        accounting: Option<AttemptAccounting>,
+    ) -> Self {
+        Self {
+            model_step,
+            provider_attempt,
+            accounting,
+        }
     }
 }
 
@@ -299,7 +334,6 @@ pub(crate) struct TaskExecution {
     attempts: Vec<AttemptAccounting>,
 }
 
-#[cfg(test)]
 impl TaskExecution {
     pub(crate) fn model_step(&self) -> u64 {
         self.model_step
@@ -320,6 +354,23 @@ impl TaskExecution {
     pub(crate) fn attempts(&self) -> &[AttemptAccounting] {
         &self.attempts
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_step: u64,
+        source: String,
+        reasoning_summary: String,
+        execution: Execution,
+        attempts: Vec<AttemptAccounting>,
+    ) -> Self {
+        Self {
+            model_step,
+            source,
+            reasoning_summary,
+            execution,
+            attempts,
+        }
+    }
 }
 
 struct TaskMetrics {
@@ -337,6 +388,7 @@ struct TaskMetricState {
     attempts_by_key: BTreeMap<(u64, u32), Option<AttemptAccounting>>,
     attempts: Vec<AttemptAccounting>,
     executions: Vec<TaskExecution>,
+    terminal_claimed: bool,
     settled: bool,
 }
 
@@ -371,7 +423,7 @@ impl TaskMetrics {
     fn update(&self, update: impl FnOnce(&mut TaskMetricState)) -> Option<u64> {
         let revision = {
             let mut state = self.state.lock().expect("task metrics lock");
-            if state.settled {
+            if state.terminal_claimed {
                 return None;
             }
             update(&mut state);
@@ -389,20 +441,52 @@ impl TaskMetrics {
         self.update(|_| {})
     }
 
-    fn settle(&self) -> Option<u64> {
+    fn claim_terminal(&self) -> Option<TaskMetricSnapshot> {
         let mut state = self.state.lock().expect("task metrics lock");
-        if state.settled {
+        if state.terminal_claimed {
             return None;
         }
-        state.settled = true;
-        state.revision = state
+        state.terminal_claimed = true;
+        let revision = state
             .revision
             .checked_add(1)
             .expect("subagent task revision overflowed");
-        let revision = state.revision;
-        drop(state);
+        Some(TaskMetricSnapshot {
+            revision,
+            step_count: state.step_count,
+            attempt_evidence: state
+                .attempts_by_key
+                .iter()
+                .map(
+                    |(&(model_step, provider_attempt), accounting)| TaskAttempt {
+                        model_step,
+                        provider_attempt,
+                        accounting: accounting.clone(),
+                    },
+                )
+                .collect(),
+            attempts: state.attempts.clone(),
+            executions: state.executions.clone(),
+        })
+    }
+
+    fn publish_terminal(&self, revision: u64) {
+        {
+            let mut state = self.state.lock().expect("task metrics lock");
+            assert!(state.terminal_claimed, "terminal revision must be claimed");
+            assert!(!state.settled, "terminal revision must be published once");
+            assert_eq!(
+                revision,
+                state
+                    .revision
+                    .checked_add(1)
+                    .expect("subagent task revision overflowed"),
+                "terminal revision must follow the live revision"
+            );
+            state.revision = revision;
+            state.settled = true;
+        }
         self.notify(revision);
-        Some(revision)
     }
 
     fn publish_changed(&self, revision: u64) {
@@ -643,11 +727,16 @@ impl AgentInvocationContext {
         self
     }
 
+    pub(crate) fn set_origin_step_id(&mut self, origin_step_id: u64) {
+        self.caller.origin_step_id = Some(origin_step_id);
+    }
+
     pub(crate) fn execution(
         &self,
         source: ArenaChildSource,
         selection: Option<ModelSelection>,
         checkpoint: Checkpoint,
+        cancellation: CancellationToken,
     ) -> TrustedExecutionContext {
         TrustedExecutionContext {
             caller: self.caller.clone(),
@@ -656,6 +745,7 @@ impl AgentInvocationContext {
             source,
             coordinator: self.coordinator.clone(),
             accepted_thinking: self.accepted_thinking.clone(),
+            cancellation,
         }
     }
 }
@@ -668,6 +758,7 @@ pub(crate) struct TrustedExecutionContext {
     source: ArenaChildSource,
     coordinator: SessionSubagents,
     accepted_thinking: Option<AcceptedThinking>,
+    cancellation: CancellationToken,
 }
 
 impl TrustedExecutionContext {
@@ -702,6 +793,10 @@ impl TrustedExecutionContext {
 
     pub(crate) fn coordinator(&self) -> &SessionSubagents {
         &self.coordinator
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
@@ -768,10 +863,11 @@ pub(crate) async fn invoke(
             let selection = context.resolve_selection(model.as_deref())?;
             let observation = context
                 .coordinator()
-                .start(
+                .start_with_cancellation(
                     context.caller(),
                     ChildParameters::new(prompt, selection, read_only),
                     context.payload(),
+                    context.cancellation(),
                 )
                 .await
                 .map_err(|error| ToolError::runtime(error.to_string()))?;
@@ -809,6 +905,9 @@ pub(crate) async fn invoke(
                     None,
                 )),
                 Err(WaitError::Access(error)) => Err(access_error(error)),
+                Err(WaitError::StorageUnavailable) => {
+                    Err(ToolError::runtime("session storage is unavailable"))
+                }
                 Err(error) => {
                     let message = error.to_string();
                     let observation = error
@@ -826,11 +925,20 @@ pub(crate) async fn invoke(
         }
         InvocationOperation::Cancel => {
             let id = task_id_argument(arguments, "cancel_subagent")?;
-            let observation = context
+            let observation = match context
                 .coordinator()
                 .cancel_with_phase(context.caller(), &id, wait_phase.as_ref())
                 .await
-                .map_err(access_error)?;
+            {
+                Ok(observation) => observation,
+                Err(WaitError::Access(error)) => return Err(access_error(error)),
+                Err(WaitError::StorageUnavailable) => {
+                    return Err(ToolError::runtime("session storage is unavailable"));
+                }
+                Err(error) => {
+                    unreachable!("cancellation only waits for durable terminal results: {error}")
+                }
+            };
             Ok(observation_value(&observation))
         }
     }
@@ -1328,7 +1436,10 @@ pub(crate) struct TaskRecord {
     revision: u64,
     parent: Option<TaskId>,
     origin: OriginId,
+    origin_step_id: Option<u64>,
     depth: usize,
+    admitted_at_ms: i64,
+    terminal_at_ms: Option<i64>,
     parameters: ChildParameters,
     observation: TaskObservation,
     attempt_evidence: Vec<TaskAttempt>,
@@ -1355,9 +1466,20 @@ impl TaskRecord {
         self.origin.0
     }
 
-    #[cfg(test)]
+    pub(crate) fn origin_step_id(&self) -> Option<u64> {
+        self.origin_step_id
+    }
+
     pub(crate) fn depth(&self) -> usize {
         self.depth
+    }
+
+    pub(crate) fn admitted_at_ms(&self) -> i64 {
+        self.admitted_at_ms
+    }
+
+    pub(crate) fn terminal_at_ms(&self) -> Option<i64> {
+        self.terminal_at_ms
     }
 
     pub(crate) fn parameters(&self) -> &ChildParameters {
@@ -1376,7 +1498,6 @@ impl TaskRecord {
         &self.attempt_evidence
     }
 
-    #[cfg(test)]
     pub(crate) fn executions(&self) -> &[TaskExecution] {
         &self.executions
     }
@@ -1402,7 +1523,10 @@ impl TaskRecord {
             revision,
             parent,
             origin: OriginId(0),
+            origin_step_id: None,
             depth,
+            admitted_at_ms: 0,
+            terminal_at_ms: None,
             parameters: ChildParameters::new("test child".to_owned(), selection, false),
             observation: TaskObservation {
                 id,
@@ -1429,6 +1553,49 @@ impl TaskRecord {
     ) -> Self {
         self.observation.elapsed = elapsed;
         self.observation.observed_at_ms = observed_at_ms;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_parameters_for_test(
+        mut self,
+        prompt: String,
+        selection: ModelSelection,
+        read_only: bool,
+    ) -> Self {
+        self.parameters = ChildParameters::new(prompt, selection, read_only);
+        self.observation.selection = selection;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_persisted_details_for_test(
+        mut self,
+        admitted_at_ms: i64,
+        terminal_at_ms: Option<i64>,
+        state: TaskState,
+        step_count: u64,
+        elapsed: Duration,
+        observed_at_ms: i64,
+        attempt_evidence: Vec<TaskAttempt>,
+        executions: Vec<TaskExecution>,
+        outcome: Option<TaskOutcome>,
+    ) -> Self {
+        self.admitted_at_ms = admitted_at_ms;
+        self.terminal_at_ms = terminal_at_ms;
+        self.observation.state = state;
+        self.observation.step_count = step_count;
+        self.observation.elapsed = elapsed;
+        self.observation.observed_at_ms = observed_at_ms;
+        self.observation.error = match &outcome {
+            Some(TaskOutcome::Failed(error)) => Some(error.message().to_owned()),
+            Some(TaskOutcome::Cancelled) => Some("cancelled".to_owned()),
+            Some(TaskOutcome::TimedOut) => Some("timed out".to_owned()),
+            _ => None,
+        };
+        self.attempt_evidence = attempt_evidence;
+        self.executions = executions;
+        self.outcome = outcome;
         self
     }
 }
@@ -1474,6 +1641,14 @@ pub(crate) enum AdmissionError {
     DeadlineUnrepresentable,
     #[error("subagent task identifier space is exhausted")]
     IdentifierSpaceExhausted,
+    #[error("subagent admission was cancelled before persistence")]
+    Cancelled,
+    #[error("subagent task has no originating model step")]
+    MissingProvenance,
+    #[error("subagent task provenance is not a stored model step")]
+    InvalidProvenance,
+    #[error("session storage is unavailable")]
+    StorageUnavailable,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1490,6 +1665,8 @@ pub(crate) enum AccessError {
 pub(crate) enum WaitError {
     #[error(transparent)]
     Access(#[from] AccessError),
+    #[error("session storage is unavailable")]
+    StorageUnavailable,
     #[error("subagent `{id}` failed: {message}")]
     Failed {
         id: TaskId,
@@ -1511,7 +1688,7 @@ pub(crate) enum WaitError {
 impl WaitError {
     pub(crate) fn observation(&self) -> Option<&TaskObservation> {
         match self {
-            Self::Access(_) => None,
+            Self::Access(_) | Self::StorageUnavailable => None,
             Self::Failed { observation, .. }
             | Self::Cancelled { observation, .. }
             | Self::TimedOut { observation, .. } => Some(observation),
@@ -1645,11 +1822,52 @@ impl RunChildTestGate {
     }
 }
 
+struct TrackedOperations {
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl TrackedOperations {
+    fn begin(self: &Arc<Self>) -> OperationGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        OperationGuard {
+            operations: Arc::clone(self),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct OperationGuard {
+    operations: Arc<TrackedOperations>,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if self.operations.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.operations.idle.notify_waiters();
+        }
+    }
+}
+
 pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     inner: Arc<Mutex<Inner>>,
     publication: Arc<SyncMutex<CoordinatorPublication>>,
     policy: SubagentPolicy,
     runner: Arc<dyn ChildRunner<P>>,
+    writer: Option<SessionWriter>,
+    storage_failure: CancellationToken,
+    operations: Arc<TrackedOperations>,
     clock: Arc<dyn Clock>,
     trace: Trace,
     #[cfg(test)]
@@ -1665,6 +1883,9 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             publication: self.publication.clone(),
             policy: self.policy,
             runner: self.runner.clone(),
+            writer: self.writer.clone(),
+            storage_failure: self.storage_failure.clone(),
+            operations: self.operations.clone(),
             clock: self.clock.clone(),
             trace: self.trace.clone(),
             #[cfg(test)]
@@ -1711,9 +1932,11 @@ struct Inner {
     next_task: Option<u64>,
     active_slots: usize,
     shutting_down: bool,
+    storage_failed: bool,
     blocked_origins: BTreeSet<OriginId>,
     origin_starts: BTreeMap<OriginId, usize>,
     notifications: watch::Sender<u64>,
+    pending: BTreeMap<TaskId, Task>,
     tasks: BTreeMap<TaskId, Task>,
 }
 
@@ -1728,16 +1951,33 @@ struct Task {
     id: TaskId,
     parent: Option<TaskId>,
     origin: OriginId,
+    origin_step_id: Option<u64>,
     depth: usize,
     parameters: ChildParameters,
     admitted_at: Instant,
+    admitted_at_ms: i64,
     deadline: Instant,
     settled_at: Option<Instant>,
+    terminal_at_ms: Option<i64>,
     metrics: Arc<TaskMetrics>,
     state: TaskState,
     stop: Option<StopReason>,
     outcome: Option<TaskOutcome>,
+    terminal_claim: Option<TerminalClaim>,
+    holds_slot: bool,
     cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+struct TerminalClaim {
+    outcome: TaskOutcome,
+    metrics: TaskMetricSnapshot,
+}
+
+struct TerminalSettlement {
+    settled_at: Instant,
+    terminal_at_ms: i64,
+    record: TaskRecord,
 }
 
 #[derive(Clone)]
@@ -1799,19 +2039,63 @@ impl Task {
     }
 
     fn record(&self, now: Instant, observed_at_ms: i64) -> TaskRecord {
-        let metrics = self.metrics.snapshot();
+        self.record_from_snapshot(now, observed_at_ms, self.metrics.snapshot())
+    }
+
+    fn record_from_snapshot(
+        &self,
+        now: Instant,
+        observed_at_ms: i64,
+        metrics: TaskMetricSnapshot,
+    ) -> TaskRecord {
         TaskRecord {
             id: self.id.clone(),
             revision: metrics.revision,
             parent: self.parent.clone(),
             origin: self.origin,
+            origin_step_id: self.origin_step_id,
             depth: self.depth,
+            admitted_at_ms: self.admitted_at_ms,
+            terminal_at_ms: self.terminal_at_ms,
             parameters: self.parameters.clone(),
             observation: self.observation_with_metrics(now, observed_at_ms, metrics.clone()),
             attempt_evidence: metrics.attempt_evidence,
             attempts: metrics.attempts,
             executions: metrics.executions,
             outcome: self.outcome.clone(),
+        }
+    }
+
+    fn claim_terminal(&mut self, outcome: TaskOutcome) -> Option<TerminalClaim> {
+        let claim = TerminalClaim {
+            outcome,
+            metrics: self.metrics.claim_terminal()?,
+        };
+        self.terminal_claim = Some(claim.clone());
+        Some(claim)
+    }
+
+    fn terminal_settlement(
+        &self,
+        claim: &TerminalClaim,
+        settled_at: Instant,
+        terminal_at_ms: i64,
+    ) -> TerminalSettlement {
+        let mut record =
+            self.record_from_snapshot(settled_at, terminal_at_ms, claim.metrics.clone());
+        record.revision = claim.metrics.revision;
+        record.terminal_at_ms = Some(terminal_at_ms);
+        record.observation.state = terminal_state(&claim.outcome);
+        record.observation.elapsed = settled_at.saturating_duration_since(self.admitted_at);
+        record.observation.error = match &claim.outcome {
+            TaskOutcome::Failed(failure) => Some(failure.message().to_owned()),
+            TaskOutcome::Completed(_) | TaskOutcome::Cancelled | TaskOutcome::TimedOut => None,
+        };
+        record.outcome = Some(claim.outcome.clone());
+        TerminalSettlement {
+            settled_at,
+            terminal_at_ms,
+            record,
         }
     }
 
@@ -1833,14 +2117,22 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 next_task: Some(0),
                 active_slots: 0,
                 shutting_down: false,
+                storage_failed: false,
                 blocked_origins: BTreeSet::new(),
                 origin_starts: BTreeMap::new(),
                 notifications: watch::channel(0).0,
+                pending: BTreeMap::new(),
                 tasks: BTreeMap::new(),
             })),
             publication: Arc::new(SyncMutex::new(CoordinatorPublication::default())),
             policy,
             runner,
+            writer: None,
+            storage_failure: CancellationToken::new(),
+            operations: Arc::new(TrackedOperations {
+                active: AtomicUsize::new(0),
+                idle: tokio::sync::Notify::new(),
+            }),
             clock: Arc::new(SystemClock),
             trace: Trace::disabled(),
             #[cfg(test)]
@@ -1848,6 +2140,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             #[cfg(test)]
             run_child_test_gate: None,
         }
+    }
+
+    pub(crate) fn with_session(mut self, writer: SessionWriter) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    pub(crate) fn storage_failure_token(&self) -> CancellationToken {
+        self.storage_failure.clone()
     }
 
     #[cfg(test)]
@@ -1950,20 +2251,34 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             session: inner.session,
             owner: CallerOwner::Root,
             origin,
+            origin_step_id: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn start(
+        &self,
+        caller: &Caller,
+        parameters: ChildParameters,
+        payload: P,
+    ) -> Result<TaskObservation, AdmissionError> {
+        self.start_with_cancellation(caller, parameters, payload, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn start_with_cancellation(
         &self,
         caller: &Caller,
         mut parameters: ChildParameters,
         payload: P,
+        invocation_cancellation: CancellationToken,
     ) -> Result<TaskObservation, AdmissionError> {
+        let operation = self.operations.begin();
         #[cfg(test)]
         if let Some(start_test_gate) = &self.start_test_gate {
             start_test_gate.note_start_attempt();
         }
-        let (child, observation, spawned) = {
+        let (id, spawned) = {
             let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
             #[cfg(test)]
             if let Some(start_test_gate) = &self.start_test_gate {
@@ -1971,11 +2286,17 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             }
             let now = self.now();
             let observed_at_ms = self.unix_time_ms();
+            if inner.storage_failed {
+                return Err(AdmissionError::StorageUnavailable);
+            }
             if inner.shutting_down {
                 return Err(AdmissionError::ShuttingDown);
             }
             if caller.session != inner.session {
                 return Err(AdmissionError::InvalidCaller);
+            }
+            if self.writer.is_some() && caller.origin_step_id.is_none() {
+                return Err(AdmissionError::MissingProvenance);
             }
             if inner.blocked_origins.contains(&caller.origin) {
                 return Err(AdmissionError::CallerStopped);
@@ -1987,7 +2308,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     let Some(task) = inner.tasks.get(parent) else {
                         return Err(AdmissionError::InvalidCaller);
                     };
-                    if task.origin != caller.origin {
+                    if task.origin != caller.origin || task.origin_step_id != caller.origin_step_id
+                    {
                         return Err(AdmissionError::InvalidCaller);
                     }
                     if task.state.is_terminal() || task.stop.is_some() || task.deadline <= now {
@@ -2026,9 +2348,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             let sequence = inner
                 .next_task
                 .ok_or(AdmissionError::IdentifierSpaceExhausted)?;
+            if self.writer.is_some() && sequence > i64::MAX as u64 {
+                return Err(AdmissionError::IdentifierSpaceExhausted);
+            }
             let id = task_id(sequence);
             parameters.read_only |= inherited_read_only;
-            let cancellation = CancellationToken::new();
+            let cancellation = self.storage_failure.child_token();
             let metrics = Arc::new(TaskMetrics::new(
                 id.clone(),
                 inner.notifications.clone(),
@@ -2036,49 +2361,226 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             ));
             let task = Task {
                 id: id.clone(),
-                parent: parent.clone(),
+                parent,
                 origin: caller.origin,
+                origin_step_id: caller.origin_step_id,
                 depth,
-                parameters: parameters.clone(),
+                parameters,
                 admitted_at: now,
+                admitted_at_ms: observed_at_ms,
                 deadline,
                 settled_at: None,
-                metrics: metrics.clone(),
+                terminal_at_ms: None,
+                metrics,
                 state: TaskState::Starting,
                 stop: None,
                 outcome: None,
-                cancellation: cancellation.clone(),
+                terminal_claim: None,
+                holds_slot: true,
+                cancellation,
             };
-            let observation = task.observation(now, observed_at_ms);
             let spawned = task.record(now, observed_at_ms);
             inner.next_task = sequence.checked_add(1);
             inner.active_slots += 1;
             *inner.origin_starts.entry(caller.origin).or_default() += 1;
-            inner.tasks.insert(id.clone(), task);
-            inner
-                .notifications
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-            (
-                ChildRun {
-                    id,
-                    caller: Caller {
-                        session: caller.session,
-                        owner: CallerOwner::Child(observation.id.clone()),
-                        origin: caller.origin,
-                    },
-                    parent,
-                    depth,
-                    parameters,
+            inner.pending.insert(id.clone(), task);
+            inner.notify();
+            if self.writer.is_none() {
+                if invocation_cancellation.is_cancelled() {
+                    let task = inner
+                        .pending
+                        .remove(&id)
+                        .expect("in-memory admission remains reserved");
+                    release_pending_task(&mut inner, task);
+                    inner.notify();
+                    return Err(AdmissionError::Cancelled);
+                }
+                let task = inner
+                    .pending
+                    .remove(&id)
+                    .expect("in-memory admission remains reserved");
+                let child = ChildRun {
+                    id: id.clone(),
+                    caller: caller.with_child_owner(id.clone()),
+                    parent: task.parent.clone(),
+                    depth: task.depth,
+                    parameters: task.parameters.clone(),
                     payload,
-                    reporter: TaskReporter { metrics },
+                    reporter: TaskReporter {
+                        metrics: task.metrics.clone(),
+                    },
                     coordinator: self.clone(),
                     trace: self.trace.clone(),
-                },
-                observation,
-                spawned,
-            )
+                };
+                let observation = spawned.observation().clone();
+                inner.tasks.insert(id.clone(), task);
+                inner.notify();
+                drop(inner);
+                self.trace.emit(|| {
+                    TraceEvent::child_admitted(
+                        &child.id,
+                        child.parent.as_ref(),
+                        child.parameters.selection(),
+                    )
+                });
+                self.publish_event(CoordinatorEvent::Spawned { record: spawned });
+                let coordinator = self.clone();
+                tokio::spawn(async move {
+                    let _operation = operation;
+                    coordinator.run_child(child).await;
+                });
+                return Ok(observation);
+            }
+            (id, spawned)
         };
 
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let coordinator = self.clone();
+        let caller = caller.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            coordinator
+                .complete_admission(
+                    id,
+                    spawned,
+                    payload,
+                    caller,
+                    invocation_cancellation,
+                    sender,
+                )
+                .await;
+        });
+        receiver
+            .await
+            .unwrap_or(Err(AdmissionError::StorageUnavailable))
+    }
+
+    async fn complete_admission(
+        &self,
+        id: TaskId,
+        spawned: TaskRecord,
+        payload: P,
+        caller: Caller,
+        invocation_cancellation: CancellationToken,
+        sender: tokio::sync::oneshot::Sender<Result<TaskObservation, AdmissionError>>,
+    ) {
+        let (writer, admission_cancellation) = {
+            let inner = self.lock_inner(CoordinatorOperation::Start).await;
+            let Some(task) = inner.pending.get(&id) else {
+                let error = if self.storage_failure.is_cancelled() {
+                    AdmissionError::StorageUnavailable
+                } else {
+                    AdmissionError::Cancelled
+                };
+                let _ = sender.send(Err(error));
+                return;
+            };
+            (self.writer.clone(), task.cancellation.clone())
+        };
+        let admission = match (writer.as_ref(), spawned.origin_step_id()) {
+            (Some(_), Some(origin_step_id)) => {
+                match TaskAdmission::from_record(&spawned, origin_step_id) {
+                    Ok(admission) => Some(admission),
+                    Err(SessionError::InvalidTaskProvenance) => {
+                        self.discard_pending(&id).await;
+                        let _ = sender.send(Err(AdmissionError::InvalidProvenance));
+                        return;
+                    }
+                    Err(SessionError::IdOverflow) => {
+                        self.discard_pending(&id).await;
+                        let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
+                        return;
+                    }
+                    Err(_) => {
+                        self.discard_pending(&id).await;
+                        self.latch_storage_failure().await;
+                        let _ = sender.send(Err(AdmissionError::StorageUnavailable));
+                        return;
+                    }
+                }
+            }
+            (Some(_), None) => {
+                self.discard_pending(&id).await;
+                let _ = sender.send(Err(AdmissionError::MissingProvenance));
+                return;
+            }
+            (None, _) => None,
+        };
+        let committed = match (writer, admission) {
+            (Some(writer), Some(admission)) => {
+                let failure = self.storage_failure.clone();
+                let admission_invocation_cancellation = invocation_cancellation.clone();
+                writer
+                    .admit_subagent_task(admission, move || {
+                        admission_invocation_cancellation.is_cancelled()
+                            || admission_cancellation.is_cancelled()
+                            || failure.is_cancelled()
+                    })
+                    .await
+            }
+            (None, _) => Ok((!invocation_cancellation.is_cancelled()
+                && !admission_cancellation.is_cancelled())
+            .then_some(0)),
+            (Some(_), None) => unreachable!("persistent admission requires provenance"),
+        };
+        match committed {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.discard_pending(&id).await;
+                let error = if self.storage_failure.is_cancelled() {
+                    AdmissionError::StorageUnavailable
+                } else {
+                    AdmissionError::Cancelled
+                };
+                let _ = sender.send(Err(error));
+                return;
+            }
+            Err(SessionError::InvalidTaskProvenance) => {
+                self.discard_pending(&id).await;
+                let _ = sender.send(Err(AdmissionError::InvalidProvenance));
+                return;
+            }
+            Err(SessionError::IdOverflow) => {
+                self.discard_pending(&id).await;
+                let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
+                return;
+            }
+            Err(_) => {
+                self.discard_pending(&id).await;
+                self.latch_storage_failure().await;
+                let _ = sender.send(Err(AdmissionError::StorageUnavailable));
+                return;
+            }
+        }
+
+        let child = {
+            let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
+            let Some(task) = inner.pending.remove(&id) else {
+                let error = if self.storage_failure.is_cancelled() {
+                    AdmissionError::StorageUnavailable
+                } else {
+                    AdmissionError::Cancelled
+                };
+                let _ = sender.send(Err(error));
+                return;
+            };
+            let child = ChildRun {
+                id: id.clone(),
+                caller: caller.with_child_owner(id.clone()),
+                parent: task.parent.clone(),
+                depth: task.depth,
+                parameters: task.parameters.clone(),
+                payload,
+                reporter: TaskReporter {
+                    metrics: task.metrics.clone(),
+                },
+                coordinator: self.clone(),
+                trace: self.trace.clone(),
+            };
+            inner.tasks.insert(id.clone(), task);
+            inner.notify();
+            child
+        };
         self.trace.emit(|| {
             TraceEvent::child_admitted(
                 &child.id,
@@ -2086,12 +2588,50 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 child.parameters.selection(),
             )
         });
-        self.publish_event(CoordinatorEvent::Spawned { record: spawned });
-        let coordinator = self.clone();
-        tokio::spawn(async move {
-            coordinator.run_child(child).await;
+        self.publish_event(CoordinatorEvent::Spawned {
+            record: spawned.clone(),
         });
-        Ok(observation)
+        let _ = sender.send(Ok(spawned.observation().clone()));
+        self.run_child(child).await;
+    }
+
+    async fn discard_pending(&self, id: &TaskId) {
+        let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
+        if let Some(task) = inner.pending.remove(id) {
+            release_pending_task(&mut inner, task);
+            inner.notify();
+        }
+    }
+
+    pub(crate) async fn latch_storage_failure(&self) {
+        self.storage_failure.cancel();
+        let mut inner = self.lock_inner(CoordinatorOperation::Shutdown).await;
+        if inner.storage_failed {
+            return;
+        }
+        inner.storage_failed = true;
+        inner.shutting_down = true;
+        let mut origins = inner
+            .tasks
+            .values()
+            .chain(inner.pending.values())
+            .map(|task| task.origin)
+            .collect::<BTreeSet<_>>();
+        inner.blocked_origins.append(&mut origins);
+        let pending = std::mem::take(&mut inner.pending);
+        for (_, task) in pending {
+            task.cancellation.cancel();
+            release_pending_task(&mut inner, task);
+        }
+        for task in inner.tasks.values_mut() {
+            if !task.state.is_terminal() {
+                task.stop.get_or_insert(StopReason::Shutdown);
+                task.cancellation.cancel();
+                task.holds_slot = false;
+            }
+        }
+        inner.active_slots = 0;
+        inner.notify();
     }
 
     pub(crate) async fn subscribe(&self) -> watch::Receiver<u64> {
@@ -2151,7 +2691,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         &self,
         caller: &Caller,
         id: &TaskId,
-    ) -> Result<TaskObservation, AccessError> {
+    ) -> Result<TaskObservation, WaitError> {
         self.cancel_with_phase(caller, id, None).await
     }
 
@@ -2160,19 +2700,19 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         caller: &Caller,
         id: &TaskId,
         wait_phase: Option<&WaitPhaseSignal>,
-    ) -> Result<TaskObservation, AccessError> {
+    ) -> Result<TaskObservation, WaitError> {
         {
             let inner = self.lock_inner(CoordinatorOperation::Cancel).await;
-            ensure_access(&inner, caller, id)?;
+            ensure_access(&inner, caller, id).map_err(WaitError::Access)?;
         }
         let stopping = self.request_stop_subtree(id, StopReason::Cancelled).await;
         if !stopping.is_empty() {
             if let Some(wait_phase) = wait_phase {
                 wait_phase.notify();
             }
-            self.wait_for_all(stopping).await;
+            self.wait_for_all(stopping).await?;
         }
-        self.get(caller, id).await
+        self.get(caller, id).await.map_err(WaitError::Access)
     }
 
     pub(crate) async fn request_background_cancellation(&self, active: Option<&Caller>) {
@@ -2188,7 +2728,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|task| !task.state.is_terminal())
             .map(|task| task.id.clone())
             .collect();
-        self.wait_for_all(active).await;
+        let _ = self.wait_for_all(active).await;
     }
 
     #[cfg(test)]
@@ -2200,7 +2740,13 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) async fn service(&self) {
         let now = self.now();
         let mut expired = {
-            let inner = self.lock_inner(CoordinatorOperation::Service).await;
+            let mut inner = self.lock_inner(CoordinatorOperation::Service).await;
+            for task in inner.pending.values_mut() {
+                if task.stop.is_none() && task.deadline <= now {
+                    task.stop = Some(StopReason::TimedOut);
+                    task.cancellation.cancel();
+                }
+            }
             inner
                 .tasks
                 .values()
@@ -2217,10 +2763,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     pub(crate) async fn next_deadline(&self) -> Option<Instant> {
-        self.lock_inner(CoordinatorOperation::NextDeadline)
-            .await
+        let inner = self.lock_inner(CoordinatorOperation::NextDeadline).await;
+        inner
             .tasks
             .values()
+            .chain(inner.pending.values())
             .filter(|task| !task.state.is_terminal() && task.stop.is_none())
             .map(|task| task.deadline)
             .min()
@@ -2234,6 +2781,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         }
         self.request_stop_all(StopReason::Shutdown, None).await;
         self.join_active().await;
+        self.operations.wait().await;
     }
 
     #[cfg(test)]
@@ -2278,6 +2826,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .tasks
                 .get_mut(&id)
                 .expect("admitted child must remain retained");
+            if task.cancellation.is_cancelled() && task.stop.is_none() {
+                task.stop = Some(StopReason::Cancelled);
+            }
             if task.state == TaskState::Starting && task.stop.is_none() {
                 task.transition(TaskState::Running);
             }
@@ -2320,63 +2871,120 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     async fn finish_child(&self, id: &TaskId, result: Result<ChildResult, ChildFailure>) {
-        let now = self.now();
-        let outcome = {
+        let (claim, stop_descendants) = {
             let mut inner = self.lock_inner(CoordinatorOperation::FinishChild).await;
             let task = inner
                 .tasks
                 .get_mut(id)
                 .expect("admitted child must remain retained");
-            if task.state.is_terminal() {
+            if task.state.is_terminal() || task.terminal_claim.is_some() {
                 return;
             }
-            if let Some(stop) = task.stop.clone() {
-                stop.outcome()
+            let (outcome, stop_descendants) = if let Some(stop) = task.stop.clone() {
+                (stop.outcome(), true)
             } else {
                 match result {
-                    Ok(result) => {
-                        let record = settle_task(
-                            &mut inner,
-                            id,
-                            TaskOutcome::Completed(result),
-                            now,
-                            self.unix_time_ms(),
-                            &self.trace,
-                        );
-                        drop(inner);
-                        if let Some(record) = record {
-                            self.publish_event(CoordinatorEvent::Finished { record });
-                        }
-                        return;
-                    }
+                    Ok(result) => (TaskOutcome::Completed(result), false),
                     Err(failure) => {
                         task.stop = Some(StopReason::RunnerFailed(failure.clone()));
                         task.transition(TaskState::Stopping);
-                        TaskOutcome::Failed(failure)
+                        (TaskOutcome::Failed(failure), true)
                     }
                 }
-            }
+            };
+            (task.claim_terminal(outcome), stop_descendants)
         };
-        let descendants = self
-            .request_stop_descendants(id, StopReason::AncestorStopped)
-            .await;
-        self.wait_for_all(descendants).await;
-        let record = {
-            let mut inner = self
-                .lock_inner(CoordinatorOperation::FinishChildSettlement)
+        let Some(claim) = claim else {
+            return;
+        };
+        if stop_descendants {
+            let descendants = self
+                .request_stop_descendants(id, StopReason::AncestorStopped)
                 .await;
-            settle_task(
-                &mut inner,
-                id,
-                outcome,
-                self.now(),
-                self.unix_time_ms(),
-                &self.trace,
-            )
-        };
-        if let Some(record) = record {
-            self.publish_event(CoordinatorEvent::Finished { record });
+            let _ = self.wait_for_all(descendants).await;
         }
+        let Some(settlement) = self.prepare_terminal_settlement(id, &claim).await else {
+            return;
+        };
+        self.persist_terminal(id, settlement).await;
+    }
+
+    async fn prepare_terminal_settlement(
+        &self,
+        id: &TaskId,
+        claim: &TerminalClaim,
+    ) -> Option<TerminalSettlement> {
+        let inner = self
+            .lock_inner(CoordinatorOperation::FinishChildSettlement)
+            .await;
+        if inner.storage_failed {
+            return None;
+        }
+        let task = inner.tasks.get(id)?;
+        let stored_claim = task.terminal_claim.as_ref()?;
+        if stored_claim.metrics.revision != claim.metrics.revision {
+            return None;
+        }
+        Some(task.terminal_settlement(stored_claim, self.now(), self.unix_time_ms()))
+    }
+
+    async fn persist_terminal(&self, id: &TaskId, terminal_settlement: TerminalSettlement) {
+        let writer = self.writer.clone();
+        let persisted = match writer {
+            Some(writer) => match TaskTerminal::from_record(&terminal_settlement.record) {
+                Ok(terminal) => writer.terminal_subagent_task(terminal).await,
+                Err(error) => Err(error),
+            },
+            None => Ok(0),
+        };
+        if persisted.is_err() {
+            self.latch_storage_failure().await;
+            return;
+        }
+        let record =
+            {
+                let mut inner = self
+                    .lock_inner(CoordinatorOperation::FinishChildSettlement)
+                    .await;
+                if inner.storage_failed {
+                    return;
+                }
+                let Some(task) = inner.tasks.get_mut(id) else {
+                    return;
+                };
+                if task.terminal_claim.as_ref().is_none_or(|claim| {
+                    claim.metrics.revision != terminal_settlement.record.revision()
+                }) {
+                    return;
+                }
+                let stored_claim = task
+                    .terminal_claim
+                    .take()
+                    .expect("matching terminal claim remains present");
+                task.state = terminal_state(&stored_claim.outcome);
+                task.outcome = Some(stored_claim.outcome);
+                task.settled_at = Some(terminal_settlement.settled_at);
+                task.terminal_at_ms = Some(terminal_settlement.terminal_at_ms);
+                let metrics = task.metrics.clone();
+                let revision = terminal_settlement.record.revision();
+                let record = terminal_settlement.record;
+                let releases_slot = task.holds_slot;
+                task.holds_slot = false;
+                if releases_slot {
+                    inner.active_slots = inner
+                        .active_slots
+                        .checked_sub(1)
+                        .expect("every active task owns exactly one slot");
+                }
+                metrics.publish_terminal(revision);
+                inner.notify();
+                self.trace.emit(|| TraceEvent::ChildSettled {
+                    child_id: id.clone(),
+                    outcome: settlement(record.outcome().expect("terminal record has outcome")),
+                });
+                record
+            };
+        self.publish_event(CoordinatorEvent::Finished { record });
     }
 
     async fn request_stop_subtree(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
@@ -2389,6 +2997,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|candidate| is_in_subtree(&inner.tasks, candidate, id))
             .cloned()
             .collect::<Vec<_>>();
+        stop_pending_tasks(&mut inner, id, &reason);
         stop_tasks(&mut inner, &ids, reason, &self.trace)
     }
 
@@ -2402,6 +3011,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .filter(|candidate| *candidate != id && is_in_subtree(&inner.tasks, candidate, id))
             .cloned()
             .collect::<Vec<_>>();
+        stop_pending_tasks(&mut inner, id, &reason);
         stop_tasks(&mut inner, &ids, reason, &self.trace)
     }
 
@@ -2439,6 +3049,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let mut origins = inner
             .tasks
             .values()
+            .chain(inner.pending.values())
             .filter(|task| !task.state.is_terminal())
             .map(|task| task.origin)
             .collect::<BTreeSet<_>>();
@@ -2446,6 +3057,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             origins.insert(caller.origin);
         }
         inner.blocked_origins.extend(origins);
+        for task in inner.pending.values_mut() {
+            if task.stop.is_none() {
+                task.stop = Some(reason.clone());
+                task.cancellation.cancel();
+            }
+        }
         let ids = inner
             .tasks
             .values()
@@ -2456,13 +3073,14 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         inner.notify();
     }
 
-    async fn wait_for_all(&self, ids: Vec<TaskId>) {
+    async fn wait_for_all(&self, ids: Vec<TaskId>) -> Result<(), WaitError> {
         for id in ids {
-            self.wait_for_terminal(&id).await;
+            self.wait_for_terminal(&id).await?;
         }
+        Ok(())
     }
 
-    async fn wait_for_terminal(&self, id: &TaskId) -> TaskOutcome {
+    async fn wait_for_terminal(&self, id: &TaskId) -> Result<TaskOutcome, WaitError> {
         let updates = {
             let inner = self
                 .lock_inner(CoordinatorOperation::WaitForTerminalSubscribe)
@@ -2484,12 +3102,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .and_then(|task| task.state.is_terminal().then(|| task.outcome.clone()))
                 .flatten()
             {
-                return outcome;
+                return Ok(outcome);
             }
-            updates
-                .changed()
-                .await
-                .expect("retained task update channel remains open");
+            tokio::select! {
+                _ = self.storage_failure.cancelled() => return Err(WaitError::StorageUnavailable),
+                result = updates.changed() => result.expect("retained task update channel remains open"),
+            };
         }
     }
 
@@ -2532,10 +3150,10 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     }),
                 };
             }
-            updates
-                .changed()
-                .await
-                .expect("retained task update channel remains open");
+            tokio::select! {
+                _ = self.storage_failure.cancelled() => return Err(WaitError::StorageUnavailable),
+                result = updates.changed() => result.expect("retained task update channel remains open"),
+            };
         }
     }
 
@@ -2599,6 +3217,20 @@ fn is_in_subtree(tasks: &BTreeMap<TaskId, Task>, candidate: &TaskId, ancestor: &
     candidate == ancestor || is_proper_descendant(tasks, candidate, ancestor)
 }
 
+fn stop_pending_tasks(inner: &mut Inner, ancestor: &TaskId, reason: &StopReason) {
+    for task in inner.pending.values_mut() {
+        if task
+            .parent
+            .as_ref()
+            .is_some_and(|parent| is_in_subtree(&inner.tasks, parent, ancestor))
+            && task.stop.is_none()
+        {
+            task.stop = Some(reason.clone());
+            task.cancellation.cancel();
+        }
+    }
+}
+
 fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason, trace: &Trace) -> Vec<TaskId> {
     let mut stopping = Vec::new();
     for id in ids {
@@ -2606,6 +3238,10 @@ fn stop_tasks(inner: &mut Inner, ids: &[TaskId], reason: StopReason, trace: &Tra
             continue;
         };
         if task.state.is_terminal() {
+            continue;
+        }
+        if task.terminal_claim.is_some() {
+            stopping.push(id.clone());
             continue;
         }
         if task.stop.is_none() {
@@ -2632,6 +3268,15 @@ fn stop_cause(reason: &StopReason) -> ChildStopCause {
     }
 }
 
+fn terminal_state(outcome: &TaskOutcome) -> TaskState {
+    match outcome {
+        TaskOutcome::Completed(_) => TaskState::Completed,
+        TaskOutcome::Failed(_) => TaskState::Failed,
+        TaskOutcome::Cancelled => TaskState::Cancelled,
+        TaskOutcome::TimedOut => TaskState::TimedOut,
+    }
+}
+
 fn settlement(outcome: &TaskOutcome) -> Settlement {
     match outcome {
         TaskOutcome::Completed(_) => Settlement::Succeeded,
@@ -2640,40 +3285,26 @@ fn settlement(outcome: &TaskOutcome) -> Settlement {
     }
 }
 
-fn settle_task(
-    inner: &mut Inner,
-    id: &TaskId,
-    outcome: TaskOutcome,
-    now: Instant,
-    observed_at_ms: i64,
-    trace: &Trace,
-) -> Option<TaskRecord> {
-    let outcome_classification = settlement(&outcome);
-    let record = {
-        let task = inner
-            .tasks
-            .get_mut(id)
-            .expect("admitted child must remain retained");
-        task.metrics.settle()?;
-        task.state = match outcome {
-            TaskOutcome::Completed(_) => TaskState::Completed,
-            TaskOutcome::Failed(_) => TaskState::Failed,
-            TaskOutcome::Cancelled => TaskState::Cancelled,
-            TaskOutcome::TimedOut => TaskState::TimedOut,
-        };
-        task.outcome = Some(outcome);
-        task.settled_at = Some(now);
-        task.record(now, observed_at_ms)
-    };
-    inner.active_slots = inner
-        .active_slots
-        .checked_sub(1)
-        .expect("every settled task owns exactly one active slot");
-    trace.emit(|| TraceEvent::ChildSettled {
-        child_id: id.clone(),
-        outcome: outcome_classification,
-    });
-    Some(record)
+fn release_pending_task(inner: &mut Inner, mut task: Task) {
+    release_task_slot(inner, &mut task);
+    let starts = inner
+        .origin_starts
+        .get_mut(&task.origin)
+        .expect("pending task reserves an origin start");
+    *starts = starts.checked_sub(1).expect("pending start is reserved");
+    if *starts == 0 {
+        inner.origin_starts.remove(&task.origin);
+    }
+}
+
+fn release_task_slot(inner: &mut Inner, task: &mut Task) {
+    if task.holds_slot {
+        inner.active_slots = inner
+            .active_slots
+            .checked_sub(1)
+            .expect("every active task owns exactly one slot");
+        task.holds_slot = false;
+    }
 }
 
 fn task_id(sequence: u64) -> TaskId {
@@ -2703,7 +3334,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use futures::FutureExt;
-    use tokio::sync::{Notify, mpsc, oneshot};
+    use tokio::sync::{Notify, mpsc, oneshot, watch};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
@@ -2722,6 +3353,7 @@ mod tests {
         AttemptAccounting, Model, ModelAction, ModelContextEntry, ModelFailure, ModelHistory,
         ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
+    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
 
@@ -2943,6 +3575,51 @@ mod tests {
         })
     }
 
+    async fn persisted_origin(
+        gate: Option<SessionWriteGate>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Session,
+        crate::session::SessionWriter,
+        u64,
+        u64,
+    ) {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let session = match gate {
+            Some(gate) => Session::create_with_write_gate(
+                home.path(),
+                workspace.path(),
+                selection,
+                arena.checkpoint(),
+                gate,
+            ),
+            None => Session::create(home.path(), workspace.path(), selection, arena.checkpoint()),
+        }
+        .expect("create session");
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("parent".to_owned())
+            .await
+            .expect("start parent run");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start parent model step");
+        (home, workspace, session, writer, run_id, origin_step_id)
+    }
+
     fn assert_failed(error: WaitError, id: &TaskId, message: &str) {
         let observation = error.observation().expect("terminal observation");
         assert_eq!(observation.id(), id);
@@ -2993,6 +3670,982 @@ mod tests {
 
     async fn seed_next_task(coordinator: &SubagentCoordinator<()>, sequence: u64) {
         coordinator.inner.lock().await.next_task = Some(sequence);
+    }
+
+    #[test]
+    fn terminal_metric_claim_freezes_without_publishing_a_revision() {
+        let (notifications, _) = watch::channel(0);
+        let metrics = super::TaskMetrics::new(
+            TaskId::parse("00").expect("valid task ID"),
+            notifications,
+            Arc::new(std::sync::Mutex::new(
+                super::CoordinatorPublication::default(),
+            )),
+        );
+
+        let claim = metrics.claim_terminal().expect("claim terminal revision");
+
+        assert_eq!(claim.revision, 2);
+        assert_eq!(metrics.snapshot().revision, 1);
+        assert!(metrics.update(|_| {}).is_none());
+        metrics.publish_terminal(claim.revision);
+        assert_eq!(metrics.snapshot().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn task_admission_commit_precedes_runner_start() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select default model"),
+            arena.checkpoint(),
+            admission_gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("parent".to_owned())
+            .await
+            .expect("start parent run");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start parent model step");
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            async move { coordinator.start(&caller, parameters(), ()).await }
+        });
+        admission_gate.wait_until_started().await;
+        assert!(
+            started.try_recv().is_err(),
+            "runner started before admission committed"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "spawn published before admission committed"
+        );
+        admission_gate.release();
+        let admitted = start.await.expect("start task").expect("admit child");
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { .. })
+        ));
+        let running = started.recv().await.expect("runner starts");
+        let task_id = i64::from_str_radix(admitted.id().as_str(), 16).expect("task SQL ID");
+        let rows: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .expect("read admitted task");
+
+        assert_eq!(
+            rows, 1,
+            "runner must not start before task admission commits"
+        );
+        let Started { child, finish } = running;
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        coordinator.shutdown().await;
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn task_terminal_commit_precedes_waiter_event_and_foreground_settlement() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select default model"),
+            arena.checkpoint(),
+            terminal_gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("parent".to_owned())
+            .await
+            .expect("start parent run");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start parent model step");
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit child");
+        let running = started.recv().await.expect("runner starts");
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Changed { .. })
+        ));
+        let Started { child, finish } = running;
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        terminal_gate.wait_until_started().await;
+
+        let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(7, phase_sender);
+        let (wait_sender, mut wait_receiver) = oneshot::channel();
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let id = admitted.id().clone();
+            async move {
+                wait_sender
+                    .send(
+                        coordinator
+                            .wait_with_phase(&caller, &id, Some(&signal))
+                            .await,
+                    )
+                    .expect("return waiter result");
+            }
+        });
+        assert_eq!(phase_receiver.recv().await, Some(7));
+        assert!(wait_receiver.try_recv().is_err());
+        assert!(events.try_recv().is_err());
+
+        let (step_settled, entry_count, checkpoint_count): (Option<i64>, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT model_steps.settled_entry_id, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints) FROM model_steps WHERE id = ?1",
+                [i64::try_from(origin_step_id).expect("step ID fits SQL")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read unsettled parent step");
+        assert_eq!(step_settled, None);
+        assert_eq!(entry_count, 2);
+        assert_eq!(checkpoint_count, 1);
+
+        terminal_gate.release();
+        let (result, observation) = wait_receiver
+            .await
+            .expect("waiter completes")
+            .expect("read committed result");
+        waiter.await.expect("join waiter");
+        assert_eq!(result.message(), "done");
+        assert_eq!(observation.state(), TaskState::Completed);
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Finished { .. })
+        ));
+        let (admitted_revision, terminal_revision): (i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT admitted_revision, terminal_revision FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(admitted.id().as_str(), 16).expect("task SQL ID")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, Option<i64>>(1)?.expect("terminal revision"),
+                    ))
+                },
+            )
+            .expect("read completed task");
+
+        writer
+            .close_run(
+                run_id,
+                Some(origin_step_id),
+                move || crate::session::PersistedTerminal::Final {
+                    step_id: origin_step_id,
+                    text: "parent done".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("settle foreground run");
+        let foreground_revision: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT entries.revision FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?1",
+                [i64::try_from(origin_step_id).expect("step ID fits SQL")],
+                |row| row.get(0),
+            )
+            .expect("read foreground settlement revision");
+        assert!(admitted_revision < terminal_revision);
+        assert!(terminal_revision < foreground_revision);
+
+        coordinator.shutdown().await;
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn result_claim_wins_over_concurrent_cancellation_after_terminal_commit() {
+        let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(terminal_gate.clone())).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit child");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Changed { .. })
+        ));
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        terminal_gate.wait_until_started().await;
+
+        let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(8, phase_sender);
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+        let cancel = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let id = admitted.id().clone();
+            async move {
+                cancel_sender
+                    .send(
+                        coordinator
+                            .cancel_with_phase(&caller, &id, Some(&signal))
+                            .await,
+                    )
+                    .expect("return cancellation result");
+            }
+        });
+        assert_eq!(phase_receiver.recv().await, Some(8));
+        assert!(cancel_receiver.try_recv().is_err());
+        terminal_gate.release();
+
+        let observation = cancel_receiver
+            .await
+            .expect("cancellation completes")
+            .expect("claimed result remains durable");
+        cancel.await.expect("join cancellation");
+        assert_eq!(observation.state(), TaskState::Completed);
+        let (waited, waited_observation) = coordinator
+            .wait(&caller, admitted.id())
+            .await
+            .expect("completed result remains available");
+        assert_eq!(waited.message(), "done");
+        assert_eq!(waited_observation.state(), TaskState::Completed);
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Finished { .. })
+        ));
+        assert!(events.try_recv().is_err());
+        let state: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(admitted.id().as_str(), 16).expect("task SQL ID")],
+                |row| row.get(0),
+            )
+            .expect("read terminal state");
+        assert_eq!(state, "completed");
+
+        coordinator.shutdown().await;
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_claim_wins_before_runner_result_and_publishes_once() {
+        let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(terminal_gate.clone())).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit child");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        drop(child);
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Changed { .. })
+        ));
+
+        let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(9, phase_sender);
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+        let cancel = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let id = admitted.id().clone();
+            async move {
+                cancel_sender
+                    .send(
+                        coordinator
+                            .cancel_with_phase(&caller, &id, Some(&signal))
+                            .await,
+                    )
+                    .expect("return cancellation result");
+            }
+        });
+        assert_eq!(phase_receiver.recv().await, Some(9));
+        drop(finish);
+        terminal_gate.wait_until_started().await;
+        assert!(cancel_receiver.try_recv().is_err());
+        terminal_gate.release();
+
+        let observation = cancel_receiver
+            .await
+            .expect("cancellation completes")
+            .expect("cancelled result is durable");
+        cancel.await.expect("join cancellation");
+        assert_eq!(observation.state(), TaskState::Cancelled);
+        assert_cancelled(
+            coordinator.wait(&caller, admitted.id()).await.unwrap_err(),
+            admitted.id(),
+        );
+        loop {
+            match events.recv().await {
+                Some(CoordinatorEvent::Changed { .. }) => {}
+                Some(CoordinatorEvent::Finished { .. }) => break,
+                Some(CoordinatorEvent::Spawned { .. }) => panic!("spawn is emitted exactly once"),
+                None => panic!("coordinator event sender remains live"),
+            }
+        }
+        assert!(events.try_recv().is_err());
+        let state: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(admitted.id().as_str(), 16).expect("task SQL ID")],
+                |row| row.get(0),
+            )
+            .expect("read terminal state");
+        assert_eq!(state, "cancelled");
+
+        coordinator.shutdown().await;
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn storage_failure_clears_pending_admission_as_storage_unavailable() {
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(admission_gate.clone())).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            async move { coordinator.start(&caller, parameters(), ()).await }
+        });
+        admission_gate.wait_until_started().await;
+        coordinator.latch_storage_failure().await;
+        admission_gate.release();
+
+        assert_eq!(
+            start.await.expect("join failed admission"),
+            Err(AdmissionError::StorageUnavailable)
+        );
+        assert!(events.try_recv().is_err());
+        assert!(started.try_recv().is_err());
+        assert_eq!(coordinator.active_count().await, 0);
+        assert!(
+            !coordinator
+                .inner
+                .lock()
+                .await
+                .origin_starts
+                .contains_key(&caller.origin)
+        );
+        let rows: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT COUNT(*) FROM subagent_tasks", [], |row| row.get(0))
+            .expect("count task rows");
+        assert_eq!(rows, 0);
+        coordinator.shutdown().await;
+
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_admission_linearisation_leaves_no_task_and_releases_budget() {
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(admission_gate.clone())).await;
+        let mut limited_policy = policy();
+        limited_policy.max_starts_per_run = 1;
+        let (coordinator, mut started) = coordinator(limited_policy);
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let cancellation = CancellationToken::new();
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                coordinator
+                    .start_with_cancellation(&caller, parameters(), (), cancellation)
+                    .await
+            }
+        });
+        admission_gate.wait_until_started().await;
+        cancellation.cancel();
+        admission_gate.release();
+        assert_eq!(
+            start.await.expect("join cancelled start"),
+            Err(AdmissionError::Cancelled)
+        );
+        assert!(events.try_recv().is_err());
+        assert!(started.try_recv().is_err());
+        assert_eq!(coordinator.active_count().await, 0);
+        let rows: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT COUNT(*) FROM subagent_tasks", [], |row| row.get(0))
+            .expect("count task rows");
+        assert_eq!(rows, 0);
+
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit after cancelled reservation");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        coordinator.shutdown().await;
+        drop(events);
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn start_budget_remains_scoped_to_root_across_originating_steps() {
+        let (_home, _workspace, session, writer, run_id, first_step_id) =
+            persisted_origin(None).await;
+        let second_step_id = {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute(
+                    "INSERT INTO model_steps(run_id) VALUES (?1)",
+                    [i64::try_from(run_id).expect("run ID fits SQL")],
+                )
+                .expect("insert second model step");
+            u64::try_from(connection.last_insert_rowid()).expect("model step ID is non-negative")
+        };
+        let mut limited_policy = policy();
+        limited_policy.max_starts_per_run = 2;
+        let (coordinator, mut started) = coordinator(limited_policy);
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(first_step_id);
+        let first = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit first task");
+        let Started {
+            child: first_child,
+            finish: first_finish,
+        } = started.recv().await.expect("first child starts");
+        drop(first_child);
+        caller.origin_step_id = Some(second_step_id);
+        let second = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit second task");
+        let Started {
+            child: second_child,
+            finish: second_finish,
+        } = started.recv().await.expect("second child starts");
+        drop(second_child);
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::StartBudget)
+        );
+
+        first_finish
+            .send(Ok(result("first done")))
+            .expect("finish first child");
+        second_finish
+            .send(Ok(result("second done")))
+            .expect("finish second child");
+        coordinator.shutdown().await;
+
+        drop(started);
+        drop(caller);
+        drop(first);
+        drop(second);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn provenance_admission_errors_do_not_latch_storage_failure() {
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(None).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::MissingProvenance)
+        );
+        caller.origin_step_id = Some(origin_step_id + 1);
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::InvalidProvenance)
+        );
+        assert!(!coordinator.storage_failure_token().is_cancelled());
+        assert_eq!(coordinator.active_count().await, 0);
+        assert!(started.try_recv().is_err());
+
+        caller.origin_step_id = Some(origin_step_id);
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("valid provenance remains admissible");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        coordinator.shutdown().await;
+
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn descendant_admission_keeps_closed_root_step_provenance_and_budget() {
+        let (_home, _workspace, session, writer, run_id, origin_step_id) =
+            persisted_origin(None).await;
+        let mut limited_policy = policy();
+        limited_policy.max_starts_per_run = 2;
+        let (coordinator, mut started) = coordinator(limited_policy);
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut root = coordinator.root_caller().await;
+        root.origin_step_id = Some(origin_step_id);
+        let parent = coordinator
+            .start(&root, parameters(), ())
+            .await
+            .expect("admit parent child");
+        let Started {
+            child: parent_child,
+            finish: parent_finish,
+        } = started.recv().await.expect("parent starts");
+        let descendant_caller = parent_child.caller().clone();
+        drop(parent_child);
+
+        writer
+            .close_run(
+                run_id,
+                Some(origin_step_id),
+                move || crate::session::PersistedTerminal::Final {
+                    step_id: origin_step_id,
+                    text: "root done".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close originating foreground run");
+        let descendant = coordinator
+            .start(&descendant_caller, parameters(), ())
+            .await
+            .expect("admit descendant after root closes");
+        let Started {
+            child: descendant_child,
+            finish: descendant_finish,
+        } = started.recv().await.expect("descendant starts");
+        drop(descendant_child);
+        assert_eq!(
+            coordinator
+                .start(&descendant_caller, parameters(), ())
+                .await,
+            Err(AdmissionError::StartBudget)
+        );
+        let (parent_id, origin_id): (Option<i64>, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT parent_task_id, origin_step_id FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(descendant.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read descendant provenance");
+        assert_eq!(
+            parent_id,
+            Some(i64::from_str_radix(parent.id().as_str(), 16).expect("task SQL ID"))
+        );
+        assert_eq!(
+            origin_id,
+            i64::try_from(origin_step_id).expect("step ID fits SQL")
+        );
+
+        descendant_finish
+            .send(Ok(result("descendant done")))
+            .expect("finish descendant");
+        parent_finish
+            .send(Ok(result("parent done")))
+            .expect("finish parent");
+        coordinator.shutdown().await;
+
+        drop(started);
+        drop(descendant_caller);
+        drop(root);
+        drop(parent);
+        drop(descendant);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_pending_admission_without_draining_events() {
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(admission_gate.clone())).await;
+        let (coordinator, _started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            async move { coordinator.start(&caller, parameters(), ()).await }
+        });
+        admission_gate.wait_until_started().await;
+        let mut updates = coordinator.subscribe().await;
+        let shutdown = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.shutdown().await }
+        });
+        updates
+            .changed()
+            .await
+            .expect("shutdown updates coordinator");
+        admission_gate.release();
+        assert_eq!(
+            start.await.expect("join pending start"),
+            Err(AdmissionError::Cancelled)
+        );
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown finishes after admission release")
+            .expect("join shutdown");
+
+        drop(events);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn persistent_task_ids_outside_sqlite_range_reject_without_latching_storage() {
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(None).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        seed_next_task(&coordinator, i64::MAX as u64 + 1).await;
+
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::IdentifierSpaceExhausted)
+        );
+        assert!(!coordinator.storage_failure_token().is_cancelled());
+        assert_eq!(coordinator.active_count().await, 0);
+        let rows: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT COUNT(*) FROM subagent_tasks", [], |row| row.get(0))
+            .expect("count task rows");
+        assert_eq!(rows, 0);
+
+        seed_next_task(&coordinator, i64::MAX as u64).await;
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit largest SQLite task ID");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+        coordinator.shutdown().await;
+
+        drop(started);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn terminal_storage_failure_exposes_no_uncommitted_terminal_result() {
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(None).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_task_terminal BEFORE UPDATE ON subagent_tasks WHEN NEW.terminal_revision IS NOT NULL BEGIN SELECT RAISE(ABORT, 'reject terminal'); END;",
+            )
+            .expect("reject task terminals");
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let admitted = coordinator
+            .start(&caller, parameters(), ())
+            .await
+            .expect("admit child");
+        let Started { child, finish } = started.recv().await.expect("child starts");
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { .. })
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Changed { .. })
+        ));
+        let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(10, phase_sender);
+        let (wait_sender, wait_receiver) = oneshot::channel();
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let id = admitted.id().clone();
+            async move {
+                wait_sender
+                    .send(
+                        coordinator
+                            .wait_with_phase(&caller, &id, Some(&signal))
+                            .await,
+                    )
+                    .expect("return waiter result");
+            }
+        });
+        assert_eq!(phase_receiver.recv().await, Some(10));
+        finish.send(Ok(result("done"))).expect("finish child");
+        drop(child);
+
+        assert!(matches!(
+            wait_receiver.await.expect("waiter completes"),
+            Err(WaitError::StorageUnavailable)
+        ));
+        waiter.await.expect("join waiter");
+        assert!(coordinator.storage_failure_token().is_cancelled());
+        assert_eq!(coordinator.active_count().await, 0);
+        let record = coordinator
+            .record(admitted.id())
+            .await
+            .expect("retain task after storage failure");
+        assert!(!record.observation().state().is_terminal());
+        assert_eq!(record.outcome(), None);
+        assert!(events.try_recv().is_err());
+        let (state, terminal_revision): (String, Option<i64>) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(admitted.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read unfinished task row");
+        assert_eq!(state, "starting");
+        assert_eq!(terminal_revision, None);
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::StorageUnavailable)
+        );
+        timeout(Duration::from_secs(1), coordinator.shutdown())
+            .await
+            .expect("shutdown finishes after terminal write failure");
+
+        drop(events);
+        drop(started);
+        drop(record);
+        drop(caller);
+        drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn admission_storage_failure_cancels_work_and_releases_capacity() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select default model"),
+            arena.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("parent".to_owned())
+            .await
+            .expect("start parent run");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start parent model step");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_task_admission BEFORE INSERT ON subagent_tasks BEGIN SELECT RAISE(ABORT, 'reject task'); END;",
+            )
+            .expect("reject task admissions");
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer);
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::StorageUnavailable)
+        );
+        assert!(coordinator.storage_failure_token().is_cancelled());
+        assert!(started.try_recv().is_err());
+        assert_eq!(coordinator.active_count().await, 0);
+        assert_eq!(
+            coordinator.start(&caller, parameters(), ()).await,
+            Err(AdmissionError::StorageUnavailable)
+        );
+        timeout(Duration::from_secs(1), coordinator.shutdown())
+            .await
+            .expect("shutdown should not wait for failed storage");
     }
 
     #[derive(Clone, Copy)]
@@ -3059,6 +4712,43 @@ mod tests {
                 cancellation.cancelled().await;
                 cleanup.await.expect("test releases runner cleanup");
                 Err(ChildFailure::new("runner cancelled"))
+            })
+        }
+    }
+
+    struct FailureCleanupStarted {
+        child: ChildRun<()>,
+        finish: oneshot::Sender<Result<ChildResult, ChildFailure>>,
+    }
+
+    struct FailureCleanupRunner {
+        started: mpsc::UnboundedSender<FailureCleanupStarted>,
+        descendant_started: Arc<Notify>,
+        cleanup_started: Arc<Notify>,
+        cleanup_released: Arc<Notify>,
+    }
+
+    impl ChildRunner<()> for FailureCleanupRunner {
+        fn run(
+            &self,
+            child: ChildRun<()>,
+            cancellation: tokio_util::sync::CancellationToken,
+        ) -> RunnerFuture {
+            if child.depth() == 1 {
+                let (finish, result) = oneshot::channel();
+                self.started
+                    .send(FailureCleanupStarted { child, finish })
+                    .expect("test receives parent start");
+                return Box::pin(async move { result.await.expect("test settles parent runner") });
+            }
+            self.descendant_started.notify_one();
+            let cleanup_started = self.cleanup_started.clone();
+            let cleanup_released = self.cleanup_released.clone();
+            Box::pin(async move {
+                cancellation.cancelled().await;
+                cleanup_started.notify_one();
+                cleanup_released.notified().await;
+                Err(ChildFailure::new("descendant cancelled"))
             })
         }
     }
@@ -3677,6 +5367,97 @@ mod tests {
         );
         assert_eq!(coordinator.active_count().await, 0);
         drop(child);
+    }
+
+    #[tokio::test]
+    async fn failed_parent_terminal_timing_includes_descendant_teardown() {
+        let clock = Arc::new(ManualClock::new(1_000));
+        let (started_sender, mut started) = mpsc::unbounded_channel();
+        let descendant_started = Arc::new(Notify::new());
+        let cleanup_started = Arc::new(Notify::new());
+        let cleanup_released = Arc::new(Notify::new());
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                max_concurrent: 2,
+                ..policy()
+            },
+            Arc::new(FailureCleanupRunner {
+                started: started_sender,
+                descendant_started: descendant_started.clone(),
+                cleanup_started: cleanup_started.clone(),
+                cleanup_released: cleanup_released.clone(),
+            }),
+            clock.clone(),
+        );
+        let root = coordinator.root_caller().await;
+        let parent = coordinator.start(&root, parameters(), ()).await.unwrap();
+        let parent_running = started.recv().await.expect("parent starts");
+        let child = coordinator
+            .start(parent_running.child.caller(), parameters(), ())
+            .await
+            .expect("admit descendant");
+        descendant_started.notified().await;
+
+        clock.advance(Duration::from_secs(1));
+        parent_running
+            .finish
+            .send(Err(ChildFailure::new("parent failed")))
+            .unwrap();
+        cleanup_started.notified().await;
+        let stopping = coordinator.get(&root, parent.id()).await.unwrap();
+        assert_eq!(stopping.state(), TaskState::Stopping);
+        assert_eq!(stopping.error(), Some("parent failed"));
+
+        clock.advance(Duration::from_secs(5));
+        cleanup_released.notify_one();
+        assert_failed(
+            coordinator.wait(&root, parent.id()).await.unwrap_err(),
+            parent.id(),
+            "parent failed",
+        );
+        assert_cancelled(
+            coordinator.wait(&root, child.id()).await.unwrap_err(),
+            child.id(),
+        );
+        let record = coordinator.record(parent.id()).await.unwrap();
+        assert_eq!(record.observation().elapsed(), Duration::from_secs(6));
+        assert_eq!(record.terminal_at_ms(), Some(7_000));
+    }
+
+    #[tokio::test]
+    async fn finished_failed_record_matches_coordinator_records() {
+        let (coordinator, mut started) = coordinator(policy());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let root = coordinator.root_caller().await;
+        let admitted = coordinator.start(&root, parameters(), ()).await.unwrap();
+        let running = started.recv().await.expect("child starts");
+        running
+            .finish
+            .send(Err(ChildFailure::new("child failed")))
+            .unwrap();
+        assert_failed(
+            coordinator.wait(&root, admitted.id()).await.unwrap_err(),
+            admitted.id(),
+            "child failed",
+        );
+
+        let finished = loop {
+            match events.recv().await.expect("coordinator event") {
+                CoordinatorEvent::Finished { record } => break record,
+                CoordinatorEvent::Spawned { .. } | CoordinatorEvent::Changed { .. } => {}
+            }
+        };
+        let record = coordinator.record(admitted.id()).await.unwrap();
+        let observation = coordinator.get(&root, admitted.id()).await.unwrap();
+        assert_eq!(finished.observation().state(), TaskState::Failed);
+        assert_eq!(finished.observation().error(), Some("child failed"));
+        assert_eq!(finished.observation().state(), record.observation().state());
+        assert_eq!(finished.observation().error(), record.observation().error());
+        assert_eq!(finished.observation().state(), observation.state());
+        assert_eq!(finished.observation().error(), observation.error());
+        assert_eq!(finished.outcome(), record.outcome());
     }
 
     #[tokio::test]

@@ -359,6 +359,7 @@ enum ControllerInput<M: Model> {
     SubagentsChanged,
     CoordinatorEvent(Option<CoordinatorEvent>),
     SubagentDeadline,
+    StorageFailure,
 }
 
 pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand> {
@@ -483,6 +484,7 @@ impl<M: Model> RuntimeController<M> {
         session: SessionWriter,
     ) -> Self {
         let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
+        let subagents = subagents.with_session(session.clone());
         Self {
             agent: Some(agent),
             disabled_reason: None,
@@ -594,6 +596,7 @@ impl<M: Model> RuntimeController<M> {
         let mut commands_open = true;
         let mut shutdown_requested = false;
         let mut subagent_updates = self.subagents.subscribe().await;
+        let storage_failure = self.subagents.storage_failure_token();
 
         loop {
             if shutdown_requested && self.active.is_none() {
@@ -615,6 +618,7 @@ impl<M: Model> RuntimeController<M> {
                 let subagent_events = &mut self.subagent_events;
                 tokio::select! {
                     biased;
+                    _ = storage_failure.cancelled(), if self.disabled_reason != Some(RuntimeDisabledReason::SessionStorageWriteFailed) => ControllerInput::StorageFailure,
                     command = commands.recv(), if commands_open => ControllerInput::Command(command),
                     message = active.worker.recv() => ControllerInput::Worker(message),
                     worker_progress = active.progress.recv(), if active.progress_open => ControllerInput::Progress(worker_progress),
@@ -626,6 +630,7 @@ impl<M: Model> RuntimeController<M> {
                 let subagent_events = &mut self.subagent_events;
                 tokio::select! {
                     biased;
+                    _ = storage_failure.cancelled(), if self.disabled_reason != Some(RuntimeDisabledReason::SessionStorageWriteFailed) => ControllerInput::StorageFailure,
                     command = commands.recv(), if commands_open => ControllerInput::Command(command),
                     event = Self::next_coordinator_event(subagent_events) => ControllerInput::CoordinatorEvent(event),
                     _ = subagent_updates.changed() => ControllerInput::SubagentsChanged,
@@ -668,6 +673,7 @@ impl<M: Model> RuntimeController<M> {
                 }
                 ControllerInput::CoordinatorEvent(None) => self.subagent_events = None,
                 ControllerInput::SubagentDeadline => self.subagents.service().await,
+                ControllerInput::StorageFailure => self.disable_session_storage(&events).await,
             }
             self.subagents.service().await;
         }
@@ -695,7 +701,17 @@ impl<M: Model> RuntimeController<M> {
         }
         match command {
             RuntimeCommand::Submit { request } => {
-                if let Some(active) = &mut self.active {
+                if self.subagents.storage_failure_token().is_cancelled() {
+                    self.disable_session_storage(events).await;
+                }
+                if let Some(reason) = &self.disabled_reason {
+                    self.emit(
+                        events,
+                        RuntimeEvent::SubmissionRejectedDisabled {
+                            reason: reason.clone(),
+                        },
+                    );
+                } else if let Some(active) = &mut self.active {
                     if let Some(run_id) = active.run_id {
                         self.emit(
                             events,
@@ -706,13 +722,6 @@ impl<M: Model> RuntimeController<M> {
                     } else {
                         active.pending_busy_submissions += 1;
                     }
-                } else if let Some(reason) = &self.disabled_reason {
-                    self.emit(
-                        events,
-                        RuntimeEvent::SubmissionRejectedDisabled {
-                            reason: reason.clone(),
-                        },
-                    );
                 } else {
                     self.start_run(request, events, progress).await;
                 }
@@ -863,7 +872,7 @@ impl<M: Model> RuntimeController<M> {
             AgentInvocationContext::new(caller.clone(), self.subagents.clone())
                 .with_accepted_thinking(self.accepted_thinking.clone()),
         );
-        let cancellation = CancellationToken::new();
+        let cancellation = self.subagents.storage_failure_token().child_token();
         let cancellation_for_worker = cancellation.clone();
         let writer = self.session.clone();
         let (sender, worker) = mpsc::unbounded_channel();
@@ -1214,16 +1223,8 @@ impl<M: Model> RuntimeController<M> {
                     }
                     Err(_error) => {
                         self.agent = Some(agent);
-                        self.disabled_reason =
-                            Some(RuntimeDisabledReason::SessionStorageWriteFailed);
-                        self.request_background_cancellation().await;
-                        self.emit(
-                            events,
-                            RuntimeEvent::RuntimeDisabled {
-                                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
-                            },
-                        );
-                        self.reject_pending_submissions(events);
+                        self.subagents.latch_storage_failure().await;
+                        self.disable_session_storage(events).await;
                         self.active = None;
                     }
                 }
@@ -1328,6 +1329,22 @@ impl<M: Model> RuntimeController<M> {
         }
     }
 
+    async fn disable_session_storage(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+        if self.disabled_reason == Some(RuntimeDisabledReason::SessionStorageWriteFailed) {
+            return;
+        }
+        self.disabled_reason = Some(RuntimeDisabledReason::SessionStorageWriteFailed);
+        self.request_active_cancellation();
+        self.request_background_cancellation().await;
+        self.emit(
+            events,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+        );
+        self.reject_pending_submissions(events);
+    }
+
     fn reject_pending_submissions(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
         let pending_busy_submissions = self.active.as_mut().map_or(0, |active| {
             std::mem::take(&mut active.pending_busy_submissions)
@@ -1348,15 +1365,8 @@ impl<M: Model> RuntimeController<M> {
         progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
         let _ = progress.take_pending_gap();
-        self.disabled_reason = Some(RuntimeDisabledReason::SessionStorageWriteFailed);
-        self.request_background_cancellation().await;
-        self.emit(
-            events,
-            RuntimeEvent::RuntimeDisabled {
-                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
-            },
-        );
-        self.reject_pending_submissions(events);
+        self.subagents.latch_storage_failure().await;
+        self.disable_session_storage(events).await;
         self.active = None;
     }
 
@@ -2957,6 +2967,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latched_coordinator_storage_failure_beats_submit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        let controller = controller_with_subagents(
+            &workspace,
+            CountingMessageModel {
+                calls: calls.clone(),
+            },
+            coordinator.clone(),
+        )
+        .await;
+        coordinator.latch_storage_failure().await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must not start".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(shutdown_controller(commands, controller).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn step_allocation_storage_failure_stops_before_provider_work() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -3265,6 +3317,245 @@ mod tests {
                 .unwrap(),
             (2, 1, 0, 3)
         );
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_admission_storage_failure_disables_runtime_without_spawning_a_child() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        session
+            .connection_for_test()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_task_admission BEFORE INSERT ON subagent_tasks BEGIN SELECT RAISE(ABORT, 'reject task'); END;",
+            )
+            .unwrap();
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                SelectedScriptedModel {
+                    model: ScriptedModel::new(vec![ModelAction::Code {
+                        source: "await start_subagent('background work')".to_owned(),
+                    }]),
+                    selection,
+                    message_waiting: None,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start a child".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut lifecycle = Vec::new();
+        let mut disabled = false;
+        let mut settled = false;
+        while !disabled || !settled {
+            let event = next_event(&mut events).await;
+            disabled |= matches!(
+                event,
+                RuntimeEvent::RuntimeDisabled {
+                    reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                }
+            );
+            settled |= matches!(event, RuntimeEvent::RunSettled { .. });
+            lifecycle.push(event);
+        }
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(lifecycle.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CancelledRun { .. },
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(lifecycle.iter().all(|event| !matches!(
+            event,
+            RuntimeEvent::SubagentSpawned { .. } | RuntimeEvent::SubagentFinished { .. }
+        )));
+        let task_rows: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM subagent_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_rows, 0);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "still disabled".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_terminal_storage_failure_disables_after_root_settles() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        session
+            .connection_for_test()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_task_terminal BEFORE UPDATE ON subagent_tasks WHEN NEW.terminal_revision IS NOT NULL BEGIN SELECT RAISE(ABORT, 'reject terminal'); END;",
+            )
+            .unwrap();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: Vec::new(),
+        };
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                SelectedScriptedModel {
+                    model: ScriptedModel::new(vec![
+                        ModelAction::Code {
+                            source: "await start_subagent('background work')".to_owned(),
+                        },
+                        ModelAction::Message {
+                            text: "root complete".to_owned(),
+                        },
+                    ]),
+                    selection,
+                    message_waiting: None,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            complete_child_coordinator(factory.clone()),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start a child".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut root_events = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            let settled = matches!(event, RuntimeEvent::RunSettled { .. });
+            root_events.push(event);
+            if settled {
+                break;
+            }
+        }
+        assert!(
+            root_events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SubagentSpawned { .. }))
+        );
+        assert!(root_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::FinalMessage { text, .. },
+                    ..
+                },
+                ..
+            } if text == "root complete"
+        )));
+        factory.started.notified().await;
+        factory.release.notify_one();
+
+        let disabled = events_until_disabled(&mut events).await;
+        assert_eq!(
+            disabled
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            disabled
+                .iter()
+                .all(|event| !matches!(event, RuntimeEvent::SubagentFinished { .. }))
+        );
+        let (rows, terminal_rows): (i64, i64) = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), COUNT(terminal_revision) FROM subagent_tasks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, terminal_rows), (1, 0));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "still disabled".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
         session.close().unwrap();
     }
 

@@ -587,6 +587,9 @@ impl<M: Model> Agent<M> {
 
             let step_id = writer.start_model_step(run_id).await?;
             pending_step_id = Some(step_id);
+            if let Some(context) = &mut self.invocation_context {
+                context.set_origin_step_id(step_id);
+            }
             event(PersistedAgentEvent::ModelStepStarted { run_id, step_id });
             if cancellation.is_cancelled() {
                 let terminal = PersistedTerminal::Cancelled {

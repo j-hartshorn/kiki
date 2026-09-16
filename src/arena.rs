@@ -972,7 +972,12 @@ impl Arena {
             }
         }
         let context = invocation.map(|invocation| {
-            invocation.execution(self.child_source(), selection, self.checkpoint())
+            invocation.execution(
+                self.child_source(),
+                selection,
+                self.checkpoint(),
+                cancellation.clone(),
+            )
         });
         let mut checkout = self
             .checkout

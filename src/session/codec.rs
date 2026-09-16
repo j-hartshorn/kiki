@@ -16,6 +16,7 @@ use crate::config::{ModelSelection, model_by_id};
 use crate::model::{
     AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
 };
+use crate::subagents::{TaskOutcome, TaskRecord};
 use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
 #[derive(Debug, Error)]
@@ -247,6 +248,58 @@ enum StoredToolValue {
     Dictionary(BTreeMap<String, StoredToolValue>),
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredTaskDetails {
+    prompt: String,
+    selection: StoredSelection,
+    read_only: bool,
+    depth: usize,
+    admitted_at_ms: i64,
+    terminal_at_ms: Option<i64>,
+    observation: StoredTaskObservation,
+    attempt_evidence: Vec<StoredTaskAttempt>,
+    attempts: Vec<StoredAttemptAccounting>,
+    executions: Vec<StoredTaskExecution>,
+    outcome: Option<StoredTaskOutcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTaskObservation {
+    step_count: u64,
+    elapsed_seconds: u64,
+    elapsed_subsec_nanos: u32,
+    observed_at_ms: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTaskAttempt {
+    model_step: u64,
+    provider_attempt: u32,
+    accounting: Option<StoredAttemptAccounting>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTaskExecution {
+    model_step: u64,
+    source: String,
+    reasoning_summary: String,
+    execution: StoredExecution,
+    attempts: Vec<StoredAttemptAccounting>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredTaskOutcome {
+    Completed {
+        message: String,
+        values: BTreeMap<String, StoredToolValue>,
+    },
+    Failed {
+        message: String,
+    },
+    Cancelled,
+    TimedOut,
+}
+
 pub(super) fn encode_checkpoint(checkpoint: &Checkpoint) -> Result<StoredCheckpoint, CodecError> {
     let (identity, state, authorisations) = checkpoint.session_parts();
     let authorisations = authorisations
@@ -289,6 +342,67 @@ pub(super) fn encode_request(request: &str) -> Result<String, CodecError> {
         request: request.to_owned(),
     })
     .map_err(CodecError::from)
+}
+
+pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecError> {
+    let parameters = record.parameters();
+    let observation = record.observation();
+    serde_json::to_string(&StoredTaskDetails {
+        prompt: parameters.prompt().to_owned(),
+        selection: encode_selection(parameters.selection()),
+        read_only: parameters.read_only(),
+        depth: record.depth(),
+        admitted_at_ms: record.admitted_at_ms(),
+        terminal_at_ms: record.terminal_at_ms(),
+        observation: StoredTaskObservation {
+            step_count: observation.step_count(),
+            elapsed_seconds: observation.elapsed().as_secs(),
+            elapsed_subsec_nanos: observation.elapsed().subsec_nanos(),
+            observed_at_ms: observation.observed_at_ms(),
+        },
+        attempt_evidence: record
+            .attempt_evidence()
+            .iter()
+            .map(|attempt| StoredTaskAttempt {
+                model_step: attempt.model_step(),
+                provider_attempt: attempt.provider_attempt(),
+                accounting: attempt.accounting().map(encode_attempt),
+            })
+            .collect(),
+        attempts: record.attempts().iter().map(encode_attempt).collect(),
+        executions: record
+            .executions()
+            .iter()
+            .map(|execution| StoredTaskExecution {
+                model_step: execution.model_step(),
+                source: execution.source().to_owned(),
+                reasoning_summary: execution.reasoning_summary().to_owned(),
+                execution: encode_execution_value(execution.execution()),
+                attempts: execution.attempts().iter().map(encode_attempt).collect(),
+            })
+            .collect(),
+        outcome: record.outcome().map(|outcome| match outcome {
+            TaskOutcome::Completed(result) => StoredTaskOutcome::Completed {
+                message: result.message().to_owned(),
+                values: result
+                    .values()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), encode_tool_value(value)))
+                    .collect(),
+            },
+            TaskOutcome::Failed(failure) => StoredTaskOutcome::Failed {
+                message: failure.message().to_owned(),
+            },
+            TaskOutcome::Cancelled => StoredTaskOutcome::Cancelled,
+            TaskOutcome::TimedOut => StoredTaskOutcome::TimedOut,
+        }),
+    })
+    .map_err(CodecError::from)
+}
+
+#[cfg(test)]
+fn decode_task_details(value: &str) -> Result<StoredTaskDetails, CodecError> {
+    serde_json::from_str(value).map_err(CodecError::from)
 }
 
 pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, CodecError> {
@@ -885,8 +999,9 @@ mod tests {
 
     use super::{
         decode_checkpoint, decode_execution_entry, decode_execution_value, decode_path,
-        decode_terminal_entry, decode_tool_value, encode_checkpoint, encode_execution,
-        encode_execution_value, encode_path, encode_request, encode_terminal, encode_tool_value,
+        decode_task_details, decode_terminal_entry, decode_tool_value, encode_checkpoint,
+        encode_execution, encode_execution_value, encode_path, encode_request, encode_task_details,
+        encode_terminal, encode_tool_value,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
@@ -1086,6 +1201,360 @@ mod tests {
         assert_eq!(
             decode_terminal_entry(&stored.payload_json, stored.provider_replay.as_deref()).unwrap(),
             (terminal, Some(stored_terminal_code))
+        );
+    }
+
+    #[test]
+    fn task_details_codec_preserves_parameters_and_timing() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let record =
+            crate::subagents::TaskRecord::for_test("0a", 4, selection, Some("01"), 2, Vec::new())
+                .with_observation_for_test(
+                    std::time::Duration::new(1, 234_567_890),
+                    1_789_578_356_296,
+                );
+
+        let details = decode_task_details(&encode_task_details(&record).expect("encode task"))
+            .expect("decode task");
+
+        assert_eq!(details.prompt, "test child");
+        assert_eq!(details.selection.model_id, crate::config::DEFAULT_MODEL.id);
+        assert_eq!(
+            details.selection.thinking,
+            crate::config::DEFAULT_MODEL.default_thinking
+        );
+        assert!(!details.read_only);
+        assert_eq!(details.depth, 2);
+        assert_eq!(details.admitted_at_ms, 0);
+        assert_eq!(details.terminal_at_ms, None);
+        assert_eq!(details.observation.elapsed_seconds, 1);
+        assert_eq!(details.observation.elapsed_subsec_nanos, 234_567_890);
+        assert_eq!(details.observation.observed_at_ms, 1_789_578_356_296);
+        assert!(details.outcome.is_none());
+    }
+
+    fn task_usage() -> crate::model::AttemptAccounting {
+        crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+            model: crate::config::DEFAULT_MODEL.id.to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(1),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(0),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(1),
+        })
+    }
+
+    fn task_execution() -> Execution {
+        Execution {
+            stdout: Observation {
+                head: "stdout".to_owned(),
+                tail: None,
+                head_lines: 1,
+                tail_lines: 0,
+                total_lines: 1,
+                total_bytes: 6,
+                omitted_lines: 0,
+                omitted_bytes: 0,
+                head_ends_mid_line: false,
+                tail_starts_mid_line: false,
+                partial_lines: false,
+            },
+            stderr: Observation {
+                head: String::new(),
+                tail: None,
+                head_lines: 0,
+                tail_lines: 0,
+                total_lines: 0,
+                total_bytes: 0,
+                omitted_lines: 0,
+                omitted_bytes: 0,
+                head_ends_mid_line: false,
+                tail_starts_mid_line: false,
+                partial_lines: false,
+            },
+            outcome: ExecutionOutcome::Complete { result: None },
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn task_details_codec_round_trips_completed_history_and_values() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let values = std::collections::BTreeMap::from([
+            ("none".to_owned(), ToolValue::None),
+            ("bool".to_owned(), ToolValue::Bool(true)),
+            ("string".to_owned(), ToolValue::String("value".to_owned())),
+            ("integer".to_owned(), ToolValue::Integer(-7)),
+            ("nan".to_owned(), ToolValue::Float(f64::NAN)),
+            (
+                "positive_infinity".to_owned(),
+                ToolValue::Float(f64::INFINITY),
+            ),
+            (
+                "negative_infinity".to_owned(),
+                ToolValue::Float(f64::NEG_INFINITY),
+            ),
+            ("negative_zero".to_owned(), ToolValue::Float(-0.0)),
+            (
+                "list".to_owned(),
+                ToolValue::List(vec![ToolValue::None, ToolValue::Bool(false)]),
+            ),
+            (
+                "dictionary".to_owned(),
+                ToolValue::Dictionary(std::collections::BTreeMap::from([(
+                    "nested".to_owned(),
+                    ToolValue::String("value".to_owned()),
+                )])),
+            ),
+        ]);
+        let record = crate::subagents::TaskRecord::for_test(
+            "0a",
+            9,
+            selection,
+            Some("01"),
+            2,
+            vec![task_usage()],
+        )
+        .with_parameters_for_test("investigate".to_owned(), selection, true)
+        .with_persisted_details_for_test(
+            100,
+            Some(200),
+            crate::subagents::TaskState::Completed,
+            3,
+            std::time::Duration::new(4, 5),
+            200,
+            vec![
+                crate::subagents::TaskAttempt::for_test(1, 1, Some(task_usage())),
+                crate::subagents::TaskAttempt::for_test(1, 2, None),
+            ],
+            vec![crate::subagents::TaskExecution::for_test(
+                2,
+                "value = 1".to_owned(),
+                "reasoning".to_owned(),
+                task_execution(),
+                vec![crate::model::AttemptAccounting::UsageUnavailable],
+            )],
+            Some(crate::subagents::TaskOutcome::Completed(
+                crate::subagents::ChildResult::new("done".to_owned(), values),
+            )),
+        );
+
+        let details = decode_task_details(&encode_task_details(&record).expect("encode task"))
+            .expect("decode task");
+
+        assert_eq!(details.prompt, "investigate");
+        assert_eq!(details.selection.model_id, crate::config::DEFAULT_MODEL.id);
+        assert_eq!(details.depth, 2);
+        assert!(details.read_only);
+        assert_eq!(details.admitted_at_ms, 100);
+        assert_eq!(details.terminal_at_ms, Some(200));
+        assert_eq!(details.observation.step_count, 3);
+        assert_eq!(details.observation.elapsed_seconds, 4);
+        assert_eq!(details.observation.elapsed_subsec_nanos, 5);
+        assert_eq!(details.observation.observed_at_ms, 200);
+        assert_eq!(details.attempt_evidence.len(), 2);
+        assert_eq!(details.attempt_evidence[0].model_step, 1);
+        assert_eq!(details.attempt_evidence[0].provider_attempt, 1);
+        assert!(matches!(
+            details.attempt_evidence[0].accounting,
+            Some(super::StoredAttemptAccounting::KnownUsage(_))
+        ));
+        assert_eq!(details.attempt_evidence[1].model_step, 1);
+        assert_eq!(details.attempt_evidence[1].provider_attempt, 2);
+        assert!(details.attempt_evidence[1].accounting.is_none());
+        assert_eq!(details.executions.len(), 1);
+        assert_eq!(details.executions[0].model_step, 2);
+        assert_eq!(details.executions[0].source, "value = 1");
+        assert_eq!(details.executions[0].reasoning_summary, "reasoning");
+        assert_eq!(details.executions[0].execution.stdout.head, "stdout");
+        assert!(matches!(
+            details.executions[0].execution.outcome,
+            super::StoredExecutionOutcome::Complete { result: None }
+        ));
+        assert!(matches!(
+            details.executions[0].attempts.as_slice(),
+            [super::StoredAttemptAccounting::UsageUnavailable]
+        ));
+        let attempts = details
+            .attempts
+            .into_iter()
+            .map(super::decode_attempt)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::pricing::estimate_run_cost(&attempts),
+            record.observation().cost()
+        );
+        let Some(super::StoredTaskOutcome::Completed { message, values }) = details.outcome else {
+            panic!("completed outcome must round trip");
+        };
+        assert_eq!(message, "done");
+        assert!(matches!(
+            values.get("none"),
+            Some(super::StoredToolValue::None)
+        ));
+        assert!(matches!(
+            values.get("bool"),
+            Some(super::StoredToolValue::Bool(true))
+        ));
+        assert!(matches!(
+            values.get("string"),
+            Some(super::StoredToolValue::String(value)) if value == "value"
+        ));
+        assert!(matches!(
+            values.get("integer"),
+            Some(super::StoredToolValue::Integer(-7))
+        ));
+        for (key, expected) in [
+            ("nan", f64::NAN.to_bits()),
+            ("positive_infinity", f64::INFINITY.to_bits()),
+            ("negative_infinity", f64::NEG_INFINITY.to_bits()),
+            ("negative_zero", (-0.0_f64).to_bits()),
+        ] {
+            assert_eq!(
+                match values.get(key).expect("float result") {
+                    super::StoredToolValue::FloatBits(bits) => *bits,
+                    _ => panic!("{key} result must preserve float bits"),
+                },
+                expected
+            );
+        }
+        assert!(matches!(
+            values.get("list"),
+            Some(super::StoredToolValue::List(values))
+                if matches!(values.as_slice(), [
+                    super::StoredToolValue::None,
+                    super::StoredToolValue::Bool(false),
+                ])
+        ));
+        let super::StoredToolValue::Dictionary(dictionary) =
+            values.get("dictionary").expect("dictionary result")
+        else {
+            panic!("dictionary result must round trip");
+        };
+        assert!(matches!(
+            dictionary.get("nested"),
+            Some(super::StoredToolValue::String(value)) if value == "value"
+        ));
+    }
+
+    #[test]
+    fn task_details_codec_maps_failed_cancelled_and_timed_out_outcomes() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let cases = [
+            (
+                crate::subagents::TaskState::Failed,
+                crate::subagents::TaskOutcome::Failed(crate::subagents::ChildFailure::new(
+                    "failed",
+                )),
+                "Failed",
+            ),
+            (
+                crate::subagents::TaskState::Cancelled,
+                crate::subagents::TaskOutcome::Cancelled,
+                "Cancelled",
+            ),
+            (
+                crate::subagents::TaskState::TimedOut,
+                crate::subagents::TaskOutcome::TimedOut,
+                "TimedOut",
+            ),
+        ];
+        for (state, outcome, expected) in cases {
+            let record =
+                crate::subagents::TaskRecord::for_test("0a", 2, selection, None, 1, Vec::new())
+                    .with_persisted_details_for_test(
+                        10,
+                        Some(20),
+                        state,
+                        0,
+                        std::time::Duration::ZERO,
+                        20,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(outcome),
+                    );
+            let details = decode_task_details(&encode_task_details(&record).expect("encode task"))
+                .expect("decode task");
+            let actual = match details.outcome.expect("terminal outcome") {
+                super::StoredTaskOutcome::Failed { message } => {
+                    assert_eq!(message, "failed");
+                    "Failed"
+                }
+                super::StoredTaskOutcome::Cancelled => "Cancelled",
+                super::StoredTaskOutcome::TimedOut => "TimedOut",
+                super::StoredTaskOutcome::Completed { .. } => "Completed",
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn task_details_codec_excludes_structural_and_derived_fields() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let record = crate::subagents::TaskRecord::for_test(
+            "0a",
+            9,
+            selection,
+            Some("01"),
+            2,
+            vec![task_usage()],
+        )
+        .with_persisted_details_for_test(
+            10,
+            Some(20),
+            crate::subagents::TaskState::Failed,
+            1,
+            std::time::Duration::ZERO,
+            20,
+            Vec::new(),
+            Vec::new(),
+            Some(crate::subagents::TaskOutcome::Failed(
+                crate::subagents::ChildFailure::new("not stored here"),
+            )),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&encode_task_details(&record).expect("encode task details"))
+                .expect("decode JSON");
+        let object = json.as_object().expect("task details object");
+        for key in [
+            "cost",
+            "id",
+            "parent",
+            "origin",
+            "origin_step",
+            "state",
+            "revision",
+            "checkpoint",
+            "arena",
+            "error",
+        ] {
+            assert!(!object.contains_key(key), "details must not store `{key}`");
+        }
+        assert!(
+            !object
+                .get("observation")
+                .expect("observation")
+                .as_object()
+                .expect("observation object")
+                .contains_key("error")
         );
     }
 
