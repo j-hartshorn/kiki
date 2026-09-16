@@ -10,6 +10,7 @@ pub mod prompt;
 mod prompt_editor;
 pub mod runtime;
 mod selection;
+mod session;
 mod subagents;
 mod telemetry;
 pub mod tools;
@@ -17,6 +18,8 @@ mod transcript;
 pub mod tui;
 
 use std::error::Error;
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::runtime::Builder;
@@ -29,6 +32,7 @@ use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
+use crate::session::Session;
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -69,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model = production_model(&ready, model_settings);
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-    let tool_host = match runtime.block_on(ToolHost::new(workspace_root)) {
+    let tool_host = match runtime.block_on(ToolHost::new(&workspace_root)) {
         Ok(tool_host) => tool_host,
         Err(error) => {
             let configuration = configuration.with_workspace_construction_failure(error);
@@ -83,6 +87,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unset"))?;
+    let session = Session::create(&home, &workspace_root, selection, arena.checkpoint())?;
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
         Arc::new(CompleteChildRunner::new(
@@ -113,10 +121,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let _ = command_sender.blocking_send(RuntimeCommand::Shutdown);
     let controller_result = runtime.block_on(controller);
+    let session_result = session.close();
     let trace_result = trace_owner.shutdown();
 
     tui_result?;
     controller_result?;
+    session_result?;
     trace_result?;
     Ok(())
 }

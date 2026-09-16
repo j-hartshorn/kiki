@@ -818,6 +818,17 @@ impl ToolDefinition {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentFingerprint([u8; 32]);
 
+impl ContentFingerprint {
+    pub(crate) fn session_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_session_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl fmt::Debug for ContentFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ContentFingerprint(..)")
@@ -921,6 +932,10 @@ impl WholeFileAuthorisations {
 
     pub(crate) fn remove(&mut self, path: &Path) {
         self.fingerprints.remove(path);
+    }
+
+    pub(crate) fn session_entries(&self) -> impl Iterator<Item = (&PathBuf, &ContentFingerprint)> {
+        self.fingerprints.iter()
     }
 }
 

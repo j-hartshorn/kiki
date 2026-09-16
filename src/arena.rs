@@ -62,11 +62,41 @@ const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity(String);
 
+impl RuntimeIdentity {
+    pub(crate) fn session_value(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_session_value(value: String) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     identity: RuntimeIdentity,
     state: Vec<u8>,
     authorisations: WholeFileAuthorisations,
+}
+
+impl Checkpoint {
+    pub(crate) fn session_parts(&self) -> (&RuntimeIdentity, &[u8], &WholeFileAuthorisations) {
+        (&self.identity, &self.state, &self.authorisations)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_session_parts(
+        identity: RuntimeIdentity,
+        state: Vec<u8>,
+        authorisations: WholeFileAuthorisations,
+    ) -> Self {
+        Self {
+            identity,
+            state,
+            authorisations,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
