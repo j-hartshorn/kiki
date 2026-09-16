@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -5,8 +6,17 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use thiserror::Error;
 
-use crate::arena::{Checkpoint, RuntimeIdentity};
-use crate::tools::{ContentFingerprint, WholeFileAuthorisations};
+use super::{PersistedCode, PersistedTerminal};
+use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
+use crate::arena::{
+    Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
+    ToolName,
+};
+use crate::config::{ModelSelection, model_by_id};
+use crate::model::{
+    AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
+};
+use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
 #[derive(Debug, Error)]
 pub(super) enum CodecError {
@@ -16,6 +26,14 @@ pub(super) enum CodecError {
     InvalidPath,
     #[error("stored content fingerprint is not a 32-byte hexadecimal value")]
     InvalidFingerprint,
+    #[error("stored session model selection is invalid")]
+    InvalidSelection,
+    #[error("stored session execution is missing")]
+    MissingExecution,
+    #[error("stored session payload has unexpected kind")]
+    InvalidPayload,
+    #[error("stored session replay is missing")]
+    MissingReplay,
     #[cfg(not(unix))]
     #[error("session paths are supported only on Unix")]
     UnsupportedPath,
@@ -31,6 +49,202 @@ pub(super) struct StoredCheckpoint {
     pub(super) runtime_identity: String,
     pub(super) arena_state: Vec<u8>,
     pub(super) authorisations_json: String,
+}
+
+pub(super) struct StoredEntry {
+    pub(super) kind: &'static str,
+    pub(super) payload_json: String,
+    pub(super) provider_replay: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredPayload {
+    UserRequest {
+        request: String,
+    },
+    Execution {
+        code: StoredCode,
+        execution: StoredExecution,
+    },
+    Terminal {
+        terminal: StoredTerminal,
+        code: Option<StoredCode>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredCode {
+    source: String,
+    call_id: String,
+    commentary: Option<String>,
+    reasoning_summary: String,
+    selection: Option<StoredSelection>,
+    result: StoredCodeResult,
+    attempts: Vec<StoredAttemptAccounting>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredSelection {
+    model_id: String,
+    thinking: String,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredCodeResult {
+    Execution { feedback: String },
+    Cancelled { feedback: String },
+    Failure { feedback: String },
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredExecution {
+    stdout: StoredObservation,
+    stderr: StoredObservation,
+    outcome: StoredExecutionOutcome,
+    tool_calls: Vec<StoredToolCall>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredExecutionOutcome {
+    Complete { result: Option<StoredObservation> },
+    PythonError { text: String, omitted_bytes: usize },
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredObservation {
+    head: String,
+    tail: Option<String>,
+    head_lines: usize,
+    tail_lines: usize,
+    total_lines: usize,
+    total_bytes: usize,
+    omitted_lines: usize,
+    omitted_bytes: usize,
+    head_ends_mid_line: bool,
+    tail_starts_mid_line: bool,
+    partial_lines: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredToolCall {
+    tool: StoredToolName,
+    summary: StoredToolCallSummary,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredToolName {
+    Read,
+    Write,
+    Edit,
+    ListDir,
+    Glob,
+    Grep,
+    Run,
+    StartSubagent,
+    GetSubagent,
+    RefreshSubagent,
+    WaitSubagent,
+    CancelSubagent,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredToolCallSummary {
+    Pending,
+    Failed,
+    Exit(i64),
+    Signal,
+    Count(usize),
+    Created,
+    Replaced,
+    Applied,
+    Subagent(String),
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredTerminal {
+    Final {
+        text: String,
+        reasoning_summary: String,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Cancelled {
+        evidence: Option<StoredTerminalEvidence>,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Failed {
+        message: String,
+        evidence: Option<StoredTerminalEvidence>,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredTerminalEvidence {
+    Generation(StoredGenerationEvidence),
+    Execution(Box<StoredExecutionEvidence>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredGenerationEvidence {
+    reasoning_summary: String,
+    reasoning: String,
+    assistant_text: String,
+    decoded_python: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredExecutionEvidence {
+    source: String,
+    commentary: Option<String>,
+    reasoning_summary: String,
+    began: bool,
+    stdout: StoredObservation,
+    stderr: StoredObservation,
+    tool_calls: Vec<StoredToolCall>,
+    cancellation_warning: Option<String>,
+    failure: Option<StoredExecutionFailure>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredExecutionFailure {
+    Arena { message: String },
+    RecoveryFailed { original: String, recovery: String },
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredAttemptAccounting {
+    KnownUsage(StoredModelUsage),
+    KnownUsageWithUntrackedRetries(StoredModelUsage),
+    UsageUnavailable,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredModelUsage {
+    model: String,
+    service_tier: Option<String>,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredReplay {
+    provider: String,
+    items: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredToolValue {
+    None,
+    Bool(bool),
+    Integer(i64),
+    FloatBits(u64),
+    String(String),
+    List(Vec<StoredToolValue>),
+    Dictionary(BTreeMap<String, StoredToolValue>),
 }
 
 pub(super) fn encode_checkpoint(checkpoint: &Checkpoint) -> Result<StoredCheckpoint, CodecError> {
@@ -64,10 +278,538 @@ pub(super) fn decode_checkpoint(
         authorisations.authorise(path, fingerprint);
     }
     Ok(Checkpoint::from_session_parts(
-        RuntimeIdentity::from_session_value(runtime_identity),
+        crate::arena::RuntimeIdentity::from_session_value(runtime_identity),
         arena_state,
         authorisations,
     ))
+}
+
+pub(super) fn encode_request(request: &str) -> Result<String, CodecError> {
+    serde_json::to_string(&StoredPayload::UserRequest {
+        request: request.to_owned(),
+    })
+    .map_err(CodecError::from)
+}
+
+pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, CodecError> {
+    let execution = code
+        .execution
+        .as_ref()
+        .ok_or(CodecError::MissingExecution)?;
+    Ok(StoredEntry {
+        kind: "execution",
+        payload_json: serde_json::to_string(&StoredPayload::Execution {
+            code: encode_code(code),
+            execution: encode_execution_value(execution),
+        })?,
+        provider_replay: Some(encode_replay(&code.replay)?),
+    })
+}
+
+pub(super) fn encode_terminal(
+    terminal: &PersistedTerminal,
+    code: Option<&PersistedCode>,
+) -> Result<StoredEntry, CodecError> {
+    let (kind, replay) = match terminal {
+        PersistedTerminal::Final { replay, .. } => ("final_reply", Some(encode_replay(replay)?)),
+        PersistedTerminal::Cancelled { .. } => (
+            "cancelled",
+            code.map(|code| encode_replay(&code.replay)).transpose()?,
+        ),
+        PersistedTerminal::Failed { .. } => (
+            "failed",
+            code.map(|code| encode_replay(&code.replay)).transpose()?,
+        ),
+    };
+    Ok(StoredEntry {
+        kind,
+        payload_json: serde_json::to_string(&StoredPayload::Terminal {
+            terminal: encode_terminal_value(terminal),
+            code: code.map(|code| {
+                let mut code = encode_code(code);
+                code.attempts.clear();
+                code
+            }),
+        })?,
+        provider_replay: replay,
+    })
+}
+
+#[cfg(test)]
+fn decode_execution_entry(
+    payload_json: &str,
+    provider_replay: Option<&[u8]>,
+) -> Result<PersistedCode, CodecError> {
+    let StoredPayload::Execution { code, execution } = serde_json::from_str(payload_json)? else {
+        return Err(CodecError::InvalidPayload);
+    };
+    let mut code = decode_code(code, decode_replay(provider_replay)?)?;
+    code.execution = Some(decode_execution_value(execution));
+    Ok(code)
+}
+
+#[cfg(test)]
+fn decode_terminal_entry(
+    payload_json: &str,
+    provider_replay: Option<&[u8]>,
+) -> Result<(PersistedTerminal, Option<PersistedCode>), CodecError> {
+    let StoredPayload::Terminal { terminal, code } = serde_json::from_str(payload_json)? else {
+        return Err(CodecError::InvalidPayload);
+    };
+    let replay = provider_replay
+        .map(|replay| decode_replay(Some(replay)))
+        .transpose()?;
+    let code = code
+        .map(|code| decode_code(code, replay.clone().ok_or(CodecError::MissingReplay)?))
+        .transpose()?;
+    Ok((decode_terminal_value(terminal, replay)?, code))
+}
+
+fn encode_code(code: &PersistedCode) -> StoredCode {
+    StoredCode {
+        source: code.source.clone(),
+        call_id: code.call_id.as_str().to_owned(),
+        commentary: code.commentary.clone(),
+        reasoning_summary: code.reasoning_summary.clone(),
+        selection: code.selection.map(encode_selection),
+        result: encode_code_result(&code.result),
+        attempts: code.attempts.iter().map(encode_attempt).collect(),
+    }
+}
+
+fn decode_code(code: StoredCode, replay: ProviderReplay) -> Result<PersistedCode, CodecError> {
+    Ok(PersistedCode {
+        source: code.source,
+        call_id: ModelCallId::new(code.call_id),
+        commentary: code.commentary,
+        reasoning_summary: code.reasoning_summary,
+        selection: code.selection.map(decode_selection).transpose()?,
+        replay,
+        result: decode_code_result(code.result),
+        execution: None,
+        attempts: code.attempts.into_iter().map(decode_attempt).collect(),
+    })
+}
+
+fn encode_selection(selection: ModelSelection) -> StoredSelection {
+    StoredSelection {
+        model_id: selection.model().id.to_owned(),
+        thinking: selection.thinking().to_owned(),
+    }
+}
+
+fn decode_selection(selection: StoredSelection) -> Result<ModelSelection, CodecError> {
+    model_by_id(&selection.model_id)
+        .and_then(|model| {
+            model
+                .thinking_levels
+                .iter()
+                .copied()
+                .find(|thinking| *thinking == selection.thinking)
+                .and_then(|thinking| ModelSelection::new(model, thinking))
+        })
+        .ok_or(CodecError::InvalidSelection)
+}
+
+fn encode_code_result(result: &CodeResult) -> StoredCodeResult {
+    match result {
+        CodeResult::Execution { feedback } => StoredCodeResult::Execution {
+            feedback: feedback.clone(),
+        },
+        CodeResult::Cancelled { feedback } => StoredCodeResult::Cancelled {
+            feedback: feedback.clone(),
+        },
+        CodeResult::Failure { feedback } => StoredCodeResult::Failure {
+            feedback: feedback.clone(),
+        },
+    }
+}
+
+fn decode_code_result(result: StoredCodeResult) -> CodeResult {
+    match result {
+        StoredCodeResult::Execution { feedback } => CodeResult::Execution { feedback },
+        StoredCodeResult::Cancelled { feedback } => CodeResult::Cancelled { feedback },
+        StoredCodeResult::Failure { feedback } => CodeResult::Failure { feedback },
+    }
+}
+
+fn encode_execution_value(execution: &Execution) -> StoredExecution {
+    StoredExecution {
+        stdout: encode_observation(&execution.stdout),
+        stderr: encode_observation(&execution.stderr),
+        outcome: match &execution.outcome {
+            ExecutionOutcome::Complete { result } => StoredExecutionOutcome::Complete {
+                result: result.as_ref().map(encode_observation),
+            },
+            ExecutionOutcome::PythonError(error) => StoredExecutionOutcome::PythonError {
+                text: error.text.clone(),
+                omitted_bytes: error.omitted_bytes,
+            },
+        },
+        tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
+    }
+}
+
+fn decode_execution_value(execution: StoredExecution) -> Execution {
+    Execution {
+        stdout: decode_observation(execution.stdout),
+        stderr: decode_observation(execution.stderr),
+        outcome: match execution.outcome {
+            StoredExecutionOutcome::Complete { result } => ExecutionOutcome::Complete {
+                result: result.map(decode_observation),
+            },
+            StoredExecutionOutcome::PythonError {
+                text,
+                omitted_bytes,
+            } => ExecutionOutcome::PythonError(PythonError {
+                text,
+                omitted_bytes,
+            }),
+        },
+        tool_calls: execution
+            .tool_calls
+            .into_iter()
+            .map(decode_tool_call)
+            .collect(),
+    }
+}
+
+fn encode_observation(observation: &Observation) -> StoredObservation {
+    StoredObservation {
+        head: observation.head.clone(),
+        tail: observation.tail.clone(),
+        head_lines: observation.head_lines,
+        tail_lines: observation.tail_lines,
+        total_lines: observation.total_lines,
+        total_bytes: observation.total_bytes,
+        omitted_lines: observation.omitted_lines,
+        omitted_bytes: observation.omitted_bytes,
+        head_ends_mid_line: observation.head_ends_mid_line,
+        tail_starts_mid_line: observation.tail_starts_mid_line,
+        partial_lines: observation.partial_lines,
+    }
+}
+
+fn decode_observation(observation: StoredObservation) -> Observation {
+    Observation {
+        head: observation.head,
+        tail: observation.tail,
+        head_lines: observation.head_lines,
+        tail_lines: observation.tail_lines,
+        total_lines: observation.total_lines,
+        total_bytes: observation.total_bytes,
+        omitted_lines: observation.omitted_lines,
+        omitted_bytes: observation.omitted_bytes,
+        head_ends_mid_line: observation.head_ends_mid_line,
+        tail_starts_mid_line: observation.tail_starts_mid_line,
+        partial_lines: observation.partial_lines,
+    }
+}
+
+fn encode_tool_call(call: &ToolCall) -> StoredToolCall {
+    StoredToolCall {
+        tool: match call.tool {
+            ToolName::Read => StoredToolName::Read,
+            ToolName::Write => StoredToolName::Write,
+            ToolName::Edit => StoredToolName::Edit,
+            ToolName::ListDir => StoredToolName::ListDir,
+            ToolName::Glob => StoredToolName::Glob,
+            ToolName::Grep => StoredToolName::Grep,
+            ToolName::Run => StoredToolName::Run,
+            ToolName::StartSubagent => StoredToolName::StartSubagent,
+            ToolName::GetSubagent => StoredToolName::GetSubagent,
+            ToolName::RefreshSubagent => StoredToolName::RefreshSubagent,
+            ToolName::WaitSubagent => StoredToolName::WaitSubagent,
+            ToolName::CancelSubagent => StoredToolName::CancelSubagent,
+        },
+        summary: match &call.summary {
+            ToolCallSummary::Pending => StoredToolCallSummary::Pending,
+            ToolCallSummary::Failed => StoredToolCallSummary::Failed,
+            ToolCallSummary::Exit(code) => StoredToolCallSummary::Exit(*code),
+            ToolCallSummary::Signal => StoredToolCallSummary::Signal,
+            ToolCallSummary::Count(count) => StoredToolCallSummary::Count(*count),
+            ToolCallSummary::Created => StoredToolCallSummary::Created,
+            ToolCallSummary::Replaced => StoredToolCallSummary::Replaced,
+            ToolCallSummary::Applied => StoredToolCallSummary::Applied,
+            ToolCallSummary::Subagent(id) => StoredToolCallSummary::Subagent(id.clone()),
+        },
+    }
+}
+
+fn decode_tool_call(call: StoredToolCall) -> ToolCall {
+    ToolCall {
+        tool: match call.tool {
+            StoredToolName::Read => ToolName::Read,
+            StoredToolName::Write => ToolName::Write,
+            StoredToolName::Edit => ToolName::Edit,
+            StoredToolName::ListDir => ToolName::ListDir,
+            StoredToolName::Glob => ToolName::Glob,
+            StoredToolName::Grep => ToolName::Grep,
+            StoredToolName::Run => ToolName::Run,
+            StoredToolName::StartSubagent => ToolName::StartSubagent,
+            StoredToolName::GetSubagent => ToolName::GetSubagent,
+            StoredToolName::RefreshSubagent => ToolName::RefreshSubagent,
+            StoredToolName::WaitSubagent => ToolName::WaitSubagent,
+            StoredToolName::CancelSubagent => ToolName::CancelSubagent,
+        },
+        summary: match call.summary {
+            StoredToolCallSummary::Pending => ToolCallSummary::Pending,
+            StoredToolCallSummary::Failed => ToolCallSummary::Failed,
+            StoredToolCallSummary::Exit(code) => ToolCallSummary::Exit(code),
+            StoredToolCallSummary::Signal => ToolCallSummary::Signal,
+            StoredToolCallSummary::Count(count) => ToolCallSummary::Count(count),
+            StoredToolCallSummary::Created => ToolCallSummary::Created,
+            StoredToolCallSummary::Replaced => ToolCallSummary::Replaced,
+            StoredToolCallSummary::Applied => ToolCallSummary::Applied,
+            StoredToolCallSummary::Subagent(id) => ToolCallSummary::Subagent(id),
+        },
+    }
+}
+
+#[cfg(test)]
+fn decode_terminal_value(
+    terminal: StoredTerminal,
+    replay: Option<ProviderReplay>,
+) -> Result<PersistedTerminal, CodecError> {
+    Ok(match terminal {
+        StoredTerminal::Final {
+            text,
+            reasoning_summary,
+            attempts,
+        } => PersistedTerminal::Final {
+            step_id: 0,
+            text,
+            reasoning_summary,
+            replay: replay.ok_or(CodecError::MissingReplay)?,
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+        StoredTerminal::Cancelled { evidence, attempts } => PersistedTerminal::Cancelled {
+            evidence: evidence.map(decode_evidence),
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+        StoredTerminal::Failed {
+            message,
+            evidence,
+            attempts,
+        } => PersistedTerminal::Failed {
+            message,
+            evidence: evidence.map(decode_evidence),
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+    })
+}
+
+fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
+    match terminal {
+        PersistedTerminal::Final {
+            text,
+            reasoning_summary,
+            attempts,
+            ..
+        } => StoredTerminal::Final {
+            text: text.clone(),
+            reasoning_summary: reasoning_summary.clone(),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        PersistedTerminal::Cancelled { evidence, attempts } => StoredTerminal::Cancelled {
+            evidence: evidence.as_ref().map(encode_evidence),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        PersistedTerminal::Failed {
+            message,
+            evidence,
+            attempts,
+        } => StoredTerminal::Failed {
+            message: message.clone(),
+            evidence: evidence.as_ref().map(encode_evidence),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+    }
+}
+
+fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
+    match evidence {
+        TerminalEvidence::Generation(evidence) => {
+            StoredTerminalEvidence::Generation(StoredGenerationEvidence {
+                reasoning_summary: evidence.reasoning_summary.clone(),
+                reasoning: evidence.reasoning.clone(),
+                assistant_text: evidence.assistant_text.clone(),
+                decoded_python: evidence.decoded_python.clone(),
+            })
+        }
+        TerminalEvidence::Execution(evidence) => {
+            StoredTerminalEvidence::Execution(Box::new(StoredExecutionEvidence {
+                source: evidence.source.clone(),
+                commentary: evidence.commentary.clone(),
+                reasoning_summary: evidence.reasoning_summary.clone(),
+                began: evidence.began,
+                stdout: encode_observation(&evidence.stdout),
+                stderr: encode_observation(&evidence.stderr),
+                tool_calls: evidence.tool_calls.iter().map(encode_tool_call).collect(),
+                cancellation_warning: evidence.cancellation_warning.clone(),
+                failure: evidence.failure.as_ref().map(|failure| match failure {
+                    ExecutionFailure::Arena { message } => StoredExecutionFailure::Arena {
+                        message: message.clone(),
+                    },
+                    ExecutionFailure::RecoveryFailed { original, recovery } => {
+                        StoredExecutionFailure::RecoveryFailed {
+                            original: original.clone(),
+                            recovery: recovery.clone(),
+                        }
+                    }
+                }),
+            }))
+        }
+    }
+}
+
+fn decode_evidence(evidence: StoredTerminalEvidence) -> TerminalEvidence {
+    match evidence {
+        StoredTerminalEvidence::Generation(evidence) => {
+            TerminalEvidence::Generation(GenerationEvidence {
+                reasoning_summary: evidence.reasoning_summary,
+                reasoning: evidence.reasoning,
+                assistant_text: evidence.assistant_text,
+                decoded_python: evidence.decoded_python,
+            })
+        }
+        StoredTerminalEvidence::Execution(evidence) => {
+            TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                source: evidence.source,
+                commentary: evidence.commentary,
+                reasoning_summary: evidence.reasoning_summary,
+                began: evidence.began,
+                stdout: decode_observation(evidence.stdout),
+                stderr: decode_observation(evidence.stderr),
+                tool_calls: evidence
+                    .tool_calls
+                    .into_iter()
+                    .map(decode_tool_call)
+                    .collect(),
+                cancellation_warning: evidence.cancellation_warning,
+                failure: evidence.failure.map(|failure| match failure {
+                    StoredExecutionFailure::Arena { message } => {
+                        ExecutionFailure::Arena { message }
+                    }
+                    StoredExecutionFailure::RecoveryFailed { original, recovery } => {
+                        ExecutionFailure::RecoveryFailed { original, recovery }
+                    }
+                }),
+            }))
+        }
+    }
+}
+
+fn encode_attempt(accounting: &AttemptAccounting) -> StoredAttemptAccounting {
+    match accounting {
+        AttemptAccounting::KnownUsage(usage) => {
+            StoredAttemptAccounting::KnownUsage(encode_usage(usage))
+        }
+        AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
+            StoredAttemptAccounting::KnownUsageWithUntrackedRetries(encode_usage(usage))
+        }
+        AttemptAccounting::UsageUnavailable => StoredAttemptAccounting::UsageUnavailable,
+    }
+}
+
+fn decode_attempt(accounting: StoredAttemptAccounting) -> AttemptAccounting {
+    match accounting {
+        StoredAttemptAccounting::KnownUsage(usage) => {
+            AttemptAccounting::KnownUsage(decode_usage(usage))
+        }
+        StoredAttemptAccounting::KnownUsageWithUntrackedRetries(usage) => {
+            AttemptAccounting::KnownUsageWithUntrackedRetries(decode_usage(usage))
+        }
+        StoredAttemptAccounting::UsageUnavailable => AttemptAccounting::UsageUnavailable,
+    }
+}
+
+fn encode_usage(usage: &ModelUsage) -> StoredModelUsage {
+    StoredModelUsage {
+        model: usage.model.clone(),
+        service_tier: usage.service_tier.clone(),
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        total_tokens: usage.total_tokens,
+    }
+}
+
+fn decode_usage(usage: StoredModelUsage) -> ModelUsage {
+    ModelUsage {
+        model: usage.model,
+        service_tier: usage.service_tier,
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+        total_tokens: usage.total_tokens,
+    }
+}
+
+fn encode_replay(replay: &ProviderReplay) -> Result<Vec<u8>, CodecError> {
+    Ok(serde_json::to_vec(&StoredReplay {
+        provider: replay.provider().to_owned(),
+        items: replay
+            .items()
+            .iter()
+            .map(|item| encode_hex(item.as_bytes()))
+            .collect(),
+    })?)
+}
+
+fn decode_replay(replay: Option<&[u8]>) -> Result<ProviderReplay, CodecError> {
+    let replay = replay.ok_or(CodecError::MissingReplay)?;
+    let replay: StoredReplay = serde_json::from_slice(replay)?;
+    Ok(ProviderReplay::new(
+        replay.provider,
+        replay
+            .items
+            .iter()
+            .map(|item| decode_hex(item).map(OpaqueReplayItem::new))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn encode_tool_value(value: &ToolValue) -> StoredToolValue {
+    match value {
+        ToolValue::None => StoredToolValue::None,
+        ToolValue::Bool(value) => StoredToolValue::Bool(*value),
+        ToolValue::Integer(value) => StoredToolValue::Integer(*value),
+        ToolValue::Float(value) => StoredToolValue::FloatBits(value.to_bits()),
+        ToolValue::String(value) => StoredToolValue::String(value.clone()),
+        ToolValue::List(values) => {
+            StoredToolValue::List(values.iter().map(encode_tool_value).collect())
+        }
+        ToolValue::Dictionary(values) => StoredToolValue::Dictionary(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), encode_tool_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn decode_tool_value(value: StoredToolValue) -> ToolValue {
+    match value {
+        StoredToolValue::None => ToolValue::None,
+        StoredToolValue::Bool(value) => ToolValue::Bool(value),
+        StoredToolValue::Integer(value) => ToolValue::Integer(value),
+        StoredToolValue::FloatBits(bits) => ToolValue::Float(f64::from_bits(bits)),
+        StoredToolValue::String(value) => ToolValue::String(value),
+        StoredToolValue::List(values) => {
+            ToolValue::List(values.into_iter().map(decode_tool_value).collect())
+        }
+        StoredToolValue::Dictionary(values) => ToolValue::Dictionary(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, decode_tool_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 pub(super) fn encode_path(path: &Path) -> Result<String, CodecError> {
@@ -115,13 +857,13 @@ pub(super) fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, CodecError> {
-    if value.len() % 2 != 0 {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(CodecError::InvalidPath);
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Ok((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+    pairs
+        .iter()
+        .map(|[high, low]| Ok((hex_value(*high)? << 4) | hex_value(*low)?))
         .collect()
 }
 
@@ -141,9 +883,13 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
 
-    use super::{decode_checkpoint, decode_path, encode_checkpoint, encode_path};
-    use crate::arena::{Checkpoint, RuntimeIdentity};
-    use crate::tools::{ContentFingerprint, WholeFileAuthorisations};
+    use super::{
+        decode_checkpoint, decode_execution_entry, decode_execution_value, decode_path,
+        decode_terminal_entry, decode_tool_value, encode_checkpoint, encode_execution,
+        encode_execution_value, encode_path, encode_request, encode_terminal, encode_tool_value,
+    };
+    use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
+    use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
     #[test]
     #[cfg(unix)]
@@ -168,5 +914,224 @@ mod tests {
 
         assert_eq!(decoded, checkpoint);
         assert_eq!(decode_path(&encode_path(&path).unwrap()).unwrap(), path);
+    }
+
+    #[test]
+    fn execution_codec_preserves_observations_and_python_errors() {
+        let observation = |head: &str| Observation {
+            head: head.to_owned(),
+            tail: Some("tail".to_owned()),
+            head_lines: 1,
+            tail_lines: 1,
+            total_lines: 3,
+            total_bytes: 12,
+            omitted_lines: 1,
+            omitted_bytes: 4,
+            head_ends_mid_line: true,
+            tail_starts_mid_line: true,
+            partial_lines: true,
+        };
+        let execution = Execution {
+            stdout: observation("stdout"),
+            stderr: observation("stderr"),
+            outcome: ExecutionOutcome::PythonError(crate::arena::PythonError {
+                text: "ValueError".to_owned(),
+                omitted_bytes: 9,
+            }),
+            tool_calls: Vec::new(),
+        };
+
+        assert_eq!(
+            decode_execution_value(encode_execution_value(&execution)),
+            execution
+        );
+    }
+
+    #[test]
+    fn foreground_codec_preserves_code_replay_and_terminal_evidence() {
+        let execution = Execution {
+            stdout: Observation {
+                head: "stdout".to_owned(),
+                tail: Some("tail".to_owned()),
+                head_lines: 1,
+                tail_lines: 1,
+                total_lines: 3,
+                total_bytes: 12,
+                omitted_lines: 1,
+                omitted_bytes: 4,
+                head_ends_mid_line: true,
+                tail_starts_mid_line: true,
+                partial_lines: true,
+            },
+            stderr: Observation {
+                head: "stderr".to_owned(),
+                tail: None,
+                head_lines: 1,
+                tail_lines: 0,
+                total_lines: 1,
+                total_bytes: 6,
+                omitted_lines: 0,
+                omitted_bytes: 0,
+                head_ends_mid_line: false,
+                tail_starts_mid_line: false,
+                partial_lines: false,
+            },
+            outcome: ExecutionOutcome::Complete { result: None },
+            tool_calls: vec![crate::arena::ToolCall {
+                tool: crate::arena::ToolName::Run,
+                summary: crate::arena::ToolCallSummary::Exit(7),
+            }],
+        };
+        let attempts = vec![
+            crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(
+                crate::model::ModelUsage {
+                    model: "openai/gpt-5.6-sol".to_owned(),
+                    service_tier: Some("tier".to_owned()),
+                    input_tokens: Some(1),
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: Some(3),
+                    output_tokens: Some(4),
+                    reasoning_output_tokens: None,
+                    total_tokens: Some(8),
+                },
+            ),
+        ];
+        let code = crate::session::PersistedCode {
+            source: "value = 1".to_owned(),
+            call_id: crate::model::ModelCallId::new("call-id"),
+            commentary: Some("commentary".to_owned()),
+            reasoning_summary: "reasoning".to_owned(),
+            selection: Some(
+                crate::config::ModelSelection::new(
+                    crate::config::DEFAULT_MODEL,
+                    crate::config::DEFAULT_MODEL.default_thinking,
+                )
+                .unwrap(),
+            ),
+            replay: crate::model::ProviderReplay::new(
+                "provider",
+                vec![crate::model::OpaqueReplayItem::new(vec![0, 255, 1])],
+            ),
+            result: crate::model::CodeResult::Execution {
+                feedback: "feedback".to_owned(),
+            },
+            execution: Some(execution.clone()),
+            attempts: attempts.clone(),
+        };
+        let missing_execution = crate::session::PersistedCode {
+            execution: None,
+            ..code.clone()
+        };
+        assert_eq!(
+            encode_execution(&missing_execution)
+                .err()
+                .expect("missing execution should be rejected")
+                .to_string(),
+            "stored session execution is missing"
+        );
+        let invalid_payload = encode_request("unexpected payload").unwrap();
+        assert_eq!(
+            decode_execution_entry(&invalid_payload, None)
+                .unwrap_err()
+                .to_string(),
+            "stored session payload has unexpected kind"
+        );
+        assert_eq!(
+            decode_terminal_entry(&invalid_payload, None)
+                .unwrap_err()
+                .to_string(),
+            "stored session payload has unexpected kind"
+        );
+
+        let stored = encode_execution(&code).unwrap();
+        assert_eq!(
+            decode_execution_entry(&stored.payload_json, stored.provider_replay.as_deref())
+                .unwrap(),
+            code
+        );
+
+        let terminal = crate::session::PersistedTerminal::Cancelled {
+            evidence: Some(crate::agent::TerminalEvidence::Execution(Box::new(
+                crate::agent::ExecutionEvidence {
+                    source: "value = 1".to_owned(),
+                    commentary: Some("commentary".to_owned()),
+                    reasoning_summary: "reasoning".to_owned(),
+                    began: true,
+                    stdout: execution.stdout.clone(),
+                    stderr: execution.stderr.clone(),
+                    tool_calls: execution.tool_calls.clone(),
+                    cancellation_warning: Some("cancelled".to_owned()),
+                    failure: Some(crate::agent::ExecutionFailure::RecoveryFailed {
+                        original: "original".to_owned(),
+                        recovery: "recovery".to_owned(),
+                    }),
+                },
+            ))),
+            attempts,
+        };
+        let terminal_code = crate::session::PersistedCode {
+            execution: None,
+            ..code.clone()
+        };
+        let stored = encode_terminal(&terminal, Some(&terminal_code)).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        assert_eq!(
+            payload["Terminal"]["code"]["attempts"],
+            serde_json::json!([])
+        );
+        let stored_terminal_code = crate::session::PersistedCode {
+            attempts: Vec::new(),
+            ..terminal_code.clone()
+        };
+        assert_eq!(
+            decode_terminal_entry(&stored.payload_json, stored.provider_replay.as_deref()).unwrap(),
+            (terminal, Some(stored_terminal_code))
+        );
+    }
+
+    #[test]
+    fn tool_value_codec_preserves_nonfinite_values_and_signed_zero() {
+        let values = ToolValue::List(vec![
+            ToolValue::Float(f64::NAN),
+            ToolValue::Float(f64::INFINITY),
+            ToolValue::Float(f64::NEG_INFINITY),
+            ToolValue::Float(-0.0),
+            ToolValue::Dictionary(std::collections::BTreeMap::from([(
+                "nested".to_owned(),
+                ToolValue::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+            )])),
+        ]);
+        let encoded = serde_json::to_string(&encode_tool_value(&values)).unwrap();
+        let decoded = decode_tool_value(serde_json::from_str(&encoded).unwrap());
+        let ToolValue::List(decoded) = decoded else {
+            panic!("decoded tool value should be a list");
+        };
+        let bits = decoded
+            .iter()
+            .filter_map(|value| match value {
+                ToolValue::Float(value) => Some(value.to_bits()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            bits,
+            [
+                f64::NAN.to_bits(),
+                f64::INFINITY.to_bits(),
+                f64::NEG_INFINITY.to_bits(),
+                (-0.0_f64).to_bits()
+            ]
+        );
+        let ToolValue::Dictionary(nested) = &decoded[4] else {
+            panic!("nested tool value should be a dictionary");
+        };
+        assert_eq!(
+            match nested.get("nested").unwrap() {
+                ToolValue::Float(value) => value.to_bits(),
+                _ => panic!("nested tool value should be a float"),
+            },
+            0x7ff8_0000_0000_0001
+        );
     }
 }

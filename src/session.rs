@@ -5,12 +5,16 @@ use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 use thiserror::Error;
+use tokio::task;
 
 use crate::arena::Checkpoint;
 use crate::config::ModelSelection;
@@ -51,6 +55,14 @@ pub(crate) enum SessionError {
     Io(#[from] io::Error),
     #[error("session database operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("session writer is unavailable")]
+    WriterUnavailable,
+    #[error("session still has active write handles")]
+    ActiveWriteHandles,
+    #[error("session database identifier overflowed")]
+    IdOverflow,
+    #[error("session lifecycle transition was no longer valid")]
+    InvalidTransition,
 }
 
 struct SessionId(String);
@@ -91,10 +103,122 @@ impl SessionPaths {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PersistedCode {
+    pub(crate) source: String,
+    pub(crate) call_id: crate::model::ModelCallId,
+    pub(crate) commentary: Option<String>,
+    pub(crate) reasoning_summary: String,
+    pub(crate) selection: Option<ModelSelection>,
+    pub(crate) replay: crate::model::ProviderReplay,
+    pub(crate) result: crate::model::CodeResult,
+    pub(crate) execution: Option<crate::arena::Execution>,
+    pub(crate) attempts: Vec<crate::model::AttemptAccounting>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PersistedTerminal {
+    Final {
+        step_id: u64,
+        text: String,
+        reasoning_summary: String,
+        replay: crate::model::ProviderReplay,
+        attempts: Vec<crate::model::AttemptAccounting>,
+    },
+    Cancelled {
+        evidence: Option<crate::agent::TerminalEvidence>,
+        attempts: Vec<crate::model::AttemptAccounting>,
+    },
+    Failed {
+        message: String,
+        evidence: Option<crate::agent::TerminalEvidence>,
+        attempts: Vec<crate::model::AttemptAccounting>,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionWriter {
+    state: Arc<SessionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionWriteKind {
+    Request,
+    Step,
+    Settlement,
+    Closure,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SessionWriteGate {
+    state: Arc<(Mutex<SessionWriteGateState>, Condvar)>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+struct SessionWriteGateState {
+    kind: SessionWriteKind,
+    started: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl SessionWriteGate {
+    pub(crate) fn new(kind: SessionWriteKind) -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(SessionWriteGateState {
+                    kind,
+                    started: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            )),
+            started: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_started(&self) {
+        loop {
+            let notified = self.started.notified();
+            if self.state.0.lock().expect("write gate lock").started {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let (state, wake) = &*self.state;
+        state.lock().expect("write gate lock").released = true;
+        wake.notify_all();
+    }
+
+    fn wait(&self, kind: SessionWriteKind) {
+        let (state, wake) = &*self.state;
+        let mut state = state.lock().expect("write gate lock");
+        if state.kind != kind {
+            return;
+        }
+        state.started = true;
+        self.started.notify_one();
+        while !state.released {
+            state = wake.wait(state).expect("write gate lock");
+        }
+    }
+}
+
+struct SessionState {
+    connection: Mutex<Connection>,
+    _writer_lock: File,
+    #[cfg(test)]
+    write_gate: Option<SessionWriteGate>,
+}
+
 pub(crate) struct Session {
     id: SessionId,
-    connection: Connection,
-    writer_lock: File,
+    state: Arc<SessionState>,
 }
 
 impl Session {
@@ -104,7 +228,25 @@ impl Session {
         selection: ModelSelection,
         checkpoint: Checkpoint,
     ) -> Result<Self, SessionError> {
-        Self::create_with_id_source(home, cwd, selection, checkpoint, SessionId::generate)
+        Self::create_with_id_source(home, cwd, selection, checkpoint, SessionId::generate, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_write_gate(
+        home: &Path,
+        cwd: &Path,
+        selection: ModelSelection,
+        checkpoint: Checkpoint,
+        gate: SessionWriteGate,
+    ) -> Result<Self, SessionError> {
+        Self::create_with_id_source(
+            home,
+            cwd,
+            selection,
+            checkpoint,
+            SessionId::generate,
+            Some(gate),
+        )
     }
 
     #[cfg(test)]
@@ -116,11 +258,18 @@ impl Session {
         ids: impl IntoIterator<Item = String>,
     ) -> Result<Self, SessionError> {
         let mut ids = ids.into_iter();
-        Self::create_with_id_source(home, cwd, selection, checkpoint, || {
-            ids.next()
-                .ok_or(SessionError::Random)
-                .and_then(|id| SessionId::parse(&id))
-        })
+        Self::create_with_id_source(
+            home,
+            cwd,
+            selection,
+            checkpoint,
+            || {
+                ids.next()
+                    .ok_or(SessionError::Random)
+                    .and_then(|id| SessionId::parse(&id))
+            },
+            None,
+        )
     }
 
     fn create_with_id_source(
@@ -129,6 +278,8 @@ impl Session {
         selection: ModelSelection,
         checkpoint: Checkpoint,
         mut next_id: impl FnMut() -> Result<SessionId, SessionError>,
+        #[cfg(test)] write_gate: Option<SessionWriteGate>,
+        #[cfg(not(test))] write_gate: Option<()>,
     ) -> Result<Self, SessionError> {
         sessions_directory(home)?;
         loop {
@@ -140,7 +291,17 @@ impl Session {
                 Err(error) => return Err(error.into()),
             };
             match create_database(&paths.database) {
-                Ok(()) => return initialise(id, paths, writer_lock, cwd, selection, checkpoint),
+                Ok(()) => {
+                    return initialise(
+                        id,
+                        paths,
+                        writer_lock,
+                        cwd,
+                        selection,
+                        checkpoint,
+                        write_gate,
+                    );
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     drop(writer_lock);
                 }
@@ -180,8 +341,12 @@ impl Session {
         }
         Ok(Self {
             id,
-            connection,
-            writer_lock,
+            state: Arc::new(SessionState {
+                connection: Mutex::new(connection),
+                _writer_lock: writer_lock,
+                #[cfg(test)]
+                write_gate: None,
+            }),
         })
     }
 
@@ -202,27 +367,289 @@ impl Session {
     }
 
     pub(crate) fn initial_checkpoint(&self) -> Result<Checkpoint, SessionError> {
-        load_initial_checkpoint(&self.connection)
+        let connection = self.connection()?;
+        load_initial_checkpoint(&connection)
+    }
+
+    pub(crate) fn writer(&self) -> SessionWriter {
+        SessionWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&self) -> Result<MutexGuard<'_, Connection>, SessionError> {
+        self.connection()
+    }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>, SessionError> {
+        self.state
+            .connection
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)
     }
 
     pub(crate) fn close(self) -> Result<(), SessionError> {
-        let Self {
+        let Session { state, .. } = self;
+        let SessionState {
             connection,
-            writer_lock,
+            _writer_lock,
             ..
-        } = self;
+        } = Arc::try_unwrap(state).map_err(|_| SessionError::ActiveWriteHandles)?;
+        let connection = connection
+            .into_inner()
+            .map_err(|_| SessionError::WriterUnavailable)?;
         match connection.close() {
-            Ok(()) => {
-                drop(writer_lock);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err((connection, error)) => {
                 drop(connection);
-                drop(writer_lock);
                 Err(SessionError::Sqlite(error))
             }
         }
     }
+}
+
+impl SessionWriter {
+    pub(crate) async fn commit_request(&self, request: String) -> Result<u64, SessionError> {
+        self.write(SessionWriteKind::Request, move |connection| {
+            commit_request(connection, &request)
+        })
+        .await
+    }
+
+    pub(crate) async fn start_model_step(&self, run_id: u64) -> Result<u64, SessionError> {
+        self.write(SessionWriteKind::Step, move |connection| {
+            start_model_step(connection, run_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn settle_execution(
+        &self,
+        run_id: u64,
+        step_id: u64,
+        code: PersistedCode,
+        checkpoint: Checkpoint,
+    ) -> Result<(), SessionError> {
+        self.write(SessionWriteKind::Settlement, move |connection| {
+            settle_execution(connection, run_id, step_id, &code, &checkpoint)
+        })
+        .await
+    }
+
+    pub(crate) async fn close_run(
+        &self,
+        run_id: u64,
+        pending_step_id: Option<u64>,
+        terminal: impl FnOnce() -> PersistedTerminal + Send + 'static,
+        code: Option<PersistedCode>,
+    ) -> Result<PersistedTerminal, SessionError> {
+        self.write(SessionWriteKind::Closure, move |connection| {
+            let terminal = terminal();
+            close_run(
+                connection,
+                run_id,
+                pending_step_id,
+                &terminal,
+                code.as_ref(),
+            )?;
+            Ok(terminal)
+        })
+        .await
+    }
+
+    async fn write<T: Send + 'static>(
+        &self,
+        kind: SessionWriteKind,
+        operation: impl FnOnce(&mut Connection) -> Result<T, SessionError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let state = Arc::clone(&self.state);
+        task::spawn_blocking(move || {
+            #[cfg(not(test))]
+            let _ = kind;
+            let mut connection = state
+                .connection
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            #[cfg(test)]
+            if let Some(gate) = &state.write_gate {
+                gate.wait(kind);
+            }
+            operation(&mut connection)
+        })
+        .await
+        .map_err(|_| SessionError::WriterUnavailable)?
+    }
+}
+
+fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, SessionError> {
+    let payload =
+        codec::encode_request(request).map_err(|error| SessionError::Codec(error.to_string()))?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (parent_id, revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let checkpoint_id: i64 = transaction.query_row(
+        "SELECT checkpoint_id FROM entries WHERE id = ?1",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute("INSERT INTO runs DEFAULT VALUES", [])?;
+    let run_id = transaction.last_insert_rowid();
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'user_request', ?3, ?4, NULL, ?5, ?6)",
+        params![parent_id, run_id, checkpoint_id, payload, now, next_revision],
+    )?;
+    let entry_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![entry_id, now, next_revision],
+    )?;
+    transaction.commit()?;
+    u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)
+}
+
+fn start_model_step(connection: &mut Connection, run_id: u64) -> Result<u64, SessionError> {
+    let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO model_steps (run_id) VALUES (?1)",
+        params![run_id],
+    )?;
+    let step_id = transaction.last_insert_rowid();
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "UPDATE session SET updated_at_ms = ?1, revision = ?2 WHERE singleton = 1",
+        params![now, next_revision],
+    )?;
+    transaction.commit()?;
+    u64::try_from(step_id).map_err(|_| SessionError::IdOverflow)
+}
+
+fn settle_execution(
+    connection: &mut Connection,
+    run_id: u64,
+    step_id: u64,
+    code: &PersistedCode,
+    checkpoint: &Checkpoint,
+) -> Result<(), SessionError> {
+    let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
+    let step_id = i64::try_from(step_id).map_err(|_| SessionError::IdOverflow)?;
+    let stored_code =
+        codec::encode_execution(code).map_err(|error| SessionError::Codec(error.to_string()))?;
+    let stored_checkpoint = codec::encode_checkpoint(checkpoint)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (parent_id, revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO checkpoints (runtime_identity, arena_state, authorisations_json) VALUES (?1, ?2, ?3)",
+        params![
+            stored_checkpoint.runtime_identity,
+            stored_checkpoint.arena_state,
+            stored_checkpoint.authorisations_json,
+        ],
+    )?;
+    let checkpoint_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'execution', ?3, ?4, ?5, ?6, ?7)",
+        params![
+            parent_id,
+            run_id,
+            checkpoint_id,
+            stored_code.payload_json,
+            stored_code.provider_replay,
+            now,
+            next_revision,
+        ],
+    )?;
+    let entry_id = transaction.last_insert_rowid();
+    if transaction.execute(
+        "UPDATE model_steps SET settled_entry_id = ?1 WHERE id = ?2 AND run_id = ?3 AND settled_entry_id IS NULL",
+        params![entry_id, step_id, run_id],
+    )? != 1 {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![entry_id, now, next_revision],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn close_run(
+    connection: &mut Connection,
+    run_id: u64,
+    pending_step_id: Option<u64>,
+    terminal: &PersistedTerminal,
+    code: Option<&PersistedCode>,
+) -> Result<(), SessionError> {
+    let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
+    let pending_step_id = pending_step_id
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| SessionError::IdOverflow)?;
+    let stored_terminal = codec::encode_terminal(terminal, code)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (parent_id, checkpoint_id, revision): (i64, i64, i64) = transaction.query_row(
+        "SELECT session.active_entry_id, entries.checkpoint_id, session.revision FROM session JOIN entries ON entries.id = session.active_entry_id WHERE session.singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            parent_id,
+            run_id,
+            stored_terminal.kind,
+            checkpoint_id,
+            stored_terminal.payload_json,
+            stored_terminal.provider_replay,
+            now,
+            next_revision,
+        ],
+    )?;
+    let entry_id = transaction.last_insert_rowid();
+    if let Some(step_id) = pending_step_id
+        && transaction.execute(
+            "UPDATE model_steps SET settled_entry_id = ?1 WHERE id = ?2 AND run_id = ?3 AND settled_entry_id IS NULL",
+            params![entry_id, step_id, run_id],
+        )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    if transaction.execute(
+        "UPDATE runs SET terminal_entry_id = ?1 WHERE id = ?2 AND terminal_entry_id IS NULL",
+        params![entry_id, run_id],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![entry_id, now, next_revision],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn initialise(
@@ -232,6 +659,8 @@ fn initialise(
     cwd: &Path,
     selection: ModelSelection,
     checkpoint: Checkpoint,
+    #[cfg(test)] write_gate: Option<SessionWriteGate>,
+    #[cfg(not(test))] _write_gate: Option<()>,
 ) -> Result<Session, SessionError> {
     let mut connection = open_writable_database(&paths.database)?;
     let now = now_ms()?;
@@ -262,8 +691,12 @@ fn initialise(
     transaction.commit()?;
     Ok(Session {
         id,
-        connection,
-        writer_lock,
+        state: Arc::new(SessionState {
+            connection: Mutex::new(connection),
+            _writer_lock: writer_lock,
+            #[cfg(test)]
+            write_gate,
+        }),
     })
 }
 
@@ -431,7 +864,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{Session, SessionError, SessionId};
+    use super::{PersistedCode, PersistedTerminal, Session, SessionError, SessionId};
     use crate::arena::{Arena, Checkpoint, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::tools::ToolHost;
@@ -478,6 +911,22 @@ mod tests {
 
     fn lock_path(home: &Path, id: &str) -> PathBuf {
         home.join(".kiki/sessions").join(format!("{id}.lock"))
+    }
+
+    fn empty_observation() -> crate::arena::Observation {
+        crate::arena::Observation {
+            head: String::new(),
+            tail: None,
+            head_lines: 0,
+            tail_lines: 0,
+            total_lines: 0,
+            total_bytes: 0,
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        }
     }
 
     fn insert_entry(
@@ -675,7 +1124,8 @@ mod tests {
             i64,
             String,
         ) = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .query_row(
                 "SELECT id, created_at_ms, updated_at_ms, cwd, name, active_entry_id, revision, preferences_json FROM session",
                 [],
@@ -696,7 +1146,8 @@ mod tests {
         let preference_value: serde_json::Value =
             serde_json::from_str(&preferences).expect("decode preferences");
         let active_kind: String = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .query_row(
                 "SELECT kind FROM entries WHERE id = ?1",
                 params![active_entry_id],
@@ -734,7 +1185,8 @@ mod tests {
         let session = Session::create(home.path(), &cwd, selection(), checkpoint(&workspace).await)
             .expect("create session");
         let stored_cwd: String = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .query_row("SELECT cwd FROM session", [], |row| row.get(0))
             .expect("read stored cwd");
 
@@ -747,7 +1199,9 @@ mod tests {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
         let session = create_session(&home, &workspace).await;
-        let connection = &session.connection;
+        let connection = session
+            .connection_for_test()
+            .expect("lock session connection");
         let tables = {
             let mut statement = connection
                 .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -867,7 +1321,7 @@ mod tests {
                 params![first_run],
             )
             .is_err());
-        let first_request = insert_entry(connection, 1, first_run, "user_request", 2);
+        let first_request = insert_entry(&connection, 1, first_run, "user_request", 2);
         assert!(
             connection
                 .execute(
@@ -902,7 +1356,7 @@ mod tests {
             )
             .expect("create another first-run model step");
         let another_first_step = connection.last_insert_rowid();
-        let first_terminal = insert_entry(connection, first_request, first_run, "final_reply", 3);
+        let first_terminal = insert_entry(&connection, first_request, first_run, "final_reply", 3);
         assert!(
             connection
                 .execute(
@@ -958,7 +1412,7 @@ mod tests {
             .execute("INSERT INTO runs DEFAULT VALUES", [])
             .expect("create second run");
         let second_run = connection.last_insert_rowid();
-        let second_request = insert_entry(connection, 1, second_run, "user_request", 4);
+        let second_request = insert_entry(&connection, 1, second_run, "user_request", 4);
         connection
             .execute(
                 "INSERT INTO model_steps (run_id) VALUES (?1)",
@@ -967,7 +1421,7 @@ mod tests {
             .expect("create second model step");
         let second_step = connection.last_insert_rowid();
         let second_terminal =
-            insert_entry(connection, second_request, second_run, "final_reply", 5);
+            insert_entry(&connection, second_request, second_run, "final_reply", 5);
         assert!(
             connection
                 .execute(
@@ -1003,7 +1457,7 @@ mod tests {
                 params![first_step],
             )
             .is_err());
-        let first_task = insert_task(connection, None, first_step);
+        let first_task = insert_task(&connection, None, first_step);
         assert!(connection
             .execute(
                 "INSERT INTO subagent_tasks (parent_task_id, origin_step_id, state, admitted_revision, terminal_revision, task_revision, details_json) VALUES (?1, ?2, 'starting', 2, NULL, 1, '{}')",
@@ -1080,6 +1534,7 @@ mod tests {
                 params![first_task, second_step],
             )
             .is_err());
+        drop(connection);
         session.close().expect("close session");
     }
 
@@ -1090,15 +1545,18 @@ mod tests {
         let session = create_session(&home, &workspace).await;
 
         let journal_mode: String = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("read journal mode");
         let synchronous: i64 = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .expect("read synchronous mode");
         let foreign_keys: i64 = session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("read foreign key setting");
 
@@ -1131,7 +1589,8 @@ mod tests {
         let journal = database.with_file_name(format!("{}.sqlite3-journal", session.id()));
 
         session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO runs DEFAULT VALUES;")
             .expect("begin write transaction");
 
@@ -1149,7 +1608,8 @@ mod tests {
         }
 
         session
-            .connection
+            .connection_for_test()
+            .expect("lock session connection")
             .execute_batch("ROLLBACK")
             .expect("rollback write transaction");
         session.close().expect("close session");
@@ -1303,6 +1763,201 @@ mod tests {
         stream.read_exact(&mut result).expect("read child result");
         assert!(child.wait().expect("wait for child").success());
         result
+    }
+
+    #[tokio::test]
+    async fn foreground_writes_settle_entries_and_runs_atomically() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("persist this request".to_owned())
+            .await
+            .expect("commit request");
+        let code_step = writer
+            .start_model_step(run_id)
+            .await
+            .expect("allocate code step");
+        let code = PersistedCode {
+            source: "value = 1".to_owned(),
+            call_id: crate::model::ModelCallId::new("call-1"),
+            commentary: Some("setting a value".to_owned()),
+            reasoning_summary: "set the value".to_owned(),
+            selection: Some(selection()),
+            replay: crate::model::ProviderReplay::new(
+                "test",
+                vec![crate::model::OpaqueReplayItem::new(vec![0, 255])],
+            ),
+            result: crate::model::CodeResult::Execution {
+                feedback: "value set".to_owned(),
+            },
+            execution: Some(crate::arena::Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: crate::arena::ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+            }),
+            attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+        };
+        writer
+            .settle_execution(
+                run_id,
+                code_step,
+                code,
+                session.initial_checkpoint().unwrap(),
+            )
+            .await
+            .expect("settle code step");
+        let final_step = writer
+            .start_model_step(run_id)
+            .await
+            .expect("allocate final step");
+        writer
+            .close_run(
+                run_id,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "done".to_owned(),
+                    reasoning_summary: "answer".to_owned(),
+                    replay: crate::model::ProviderReplay::new(
+                        "test",
+                        vec![crate::model::OpaqueReplayItem::new(vec![1, 2, 3])],
+                    ),
+                    attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                },
+                None,
+            )
+            .await
+            .expect("close run");
+        let connection = session
+            .connection_for_test()
+            .expect("lock session connection");
+        let (entries, checkpoints, pending_steps, closed_runs, revision):
+            (i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read persisted lifecycle");
+        assert_eq!(
+            (entries, checkpoints, pending_steps, closed_runs, revision),
+            (4, 2, 0, 1, 6)
+        );
+        drop(connection);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn step_allocation_rollback_does_not_advance_revision() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("rollback allocation".to_owned())
+            .await
+            .expect("commit request");
+        writer
+            .start_model_step(run_id)
+            .await
+            .expect("allocate first step");
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT revision FROM session", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read session revision"),
+            3
+        );
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_step BEFORE INSERT ON model_steps BEGIN SELECT RAISE(ABORT, 'reject step'); END;",
+            )
+            .expect("install rollback trigger");
+
+        assert!(writer.start_model_step(run_id).await.is_err());
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT revision FROM session", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read session revision"),
+            3
+        );
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn settled_execution_rollback_keeps_the_preceding_state() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("rollback".to_owned())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("allocate step");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_execution BEFORE INSERT ON entries WHEN NEW.kind = 'execution' BEGIN SELECT RAISE(ABORT, 'reject execution'); END;",
+            )
+            .expect("install rollback trigger");
+        let code = PersistedCode {
+            source: "value = 1".to_owned(),
+            call_id: crate::model::ModelCallId::new("call-rollback"),
+            commentary: None,
+            reasoning_summary: String::new(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(crate::arena::Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: crate::arena::ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+            }),
+            attempts: Vec::new(),
+        };
+        assert!(
+            writer
+                .settle_execution(run_id, step_id, code, session.initial_checkpoint().unwrap())
+                .await
+                .is_err()
+        );
+        let connection = session
+            .connection_for_test()
+            .expect("lock session connection");
+        let (entries, checkpoints, revision, pending_steps): (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), revision, (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL) FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read rolled back state");
+        assert_eq!(
+            (entries, checkpoints, revision, pending_steps),
+            (2, 1, 3, 1)
+        );
+        drop(connection);
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]

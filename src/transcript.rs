@@ -117,6 +117,7 @@ fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
         RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
             "Arena recovery failed; restart Kiki"
         }
+        RuntimeDisabledReason::SessionStorageWriteFailed => "Session save failed; restart Kiki",
     }
 }
 

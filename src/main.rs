@@ -99,11 +99,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         )),
     )
     .with_trace(trace.clone());
-    let controller = RuntimeController::new(
+    let controller = RuntimeController::with_session(
         Agent::new(arena, model),
         settings,
         startup.settings().clone(),
         subagents,
+        session.writer(),
     )
     .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
