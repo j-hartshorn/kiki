@@ -74,6 +74,15 @@ pub(crate) enum SessionError {
     InvalidTaskProvenance,
 }
 
+impl SessionError {
+    pub(crate) fn requires_writable_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(error) if error.sqlite_extended_error_code() == Some(776)
+        )
+    }
+}
+
 struct SessionId(String);
 
 impl SessionId {
@@ -249,6 +258,7 @@ impl SessionMetadata {
         &self.preferences
     }
 
+    #[cfg(test)]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
@@ -277,6 +287,7 @@ pub(crate) struct SessionWriter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionWriteKind {
     Preferences,
+    Relocation,
     Name,
     Request,
     Step,
@@ -417,6 +428,10 @@ impl SessionWriteGate {
         wake.notify_all();
     }
 
+    pub(crate) fn has_started(&self) -> bool {
+        self.state.0.lock().expect("write gate lock").started
+    }
+
     fn wait(&self, kind: SessionWriteKind) {
         let (state, wake) = &*self.state;
         let mut state = state.lock().expect("write gate lock");
@@ -441,6 +456,58 @@ struct SessionState {
 pub(crate) struct Session {
     id: SessionId,
     state: Arc<SessionState>,
+}
+
+pub(crate) struct SessionListRow {
+    id: String,
+    updated_at_ms: i64,
+    cwd: PathBuf,
+    name: Option<String>,
+    first_request: Option<String>,
+}
+
+impl SessionListRow {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn updated_at_ms(&self) -> i64 {
+        self.updated_at_ms
+    }
+
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(crate) fn first_request(&self) -> Option<&str> {
+        self.first_request.as_deref()
+    }
+}
+
+pub(crate) struct SessionListWarning {
+    id: String,
+}
+
+impl SessionListWarning {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SessionListing {
+    rows: Vec<SessionListRow>,
+    warnings: Vec<SessionListWarning>,
+}
+
+impl SessionListing {
+    pub(crate) fn into_parts(self) -> (Vec<SessionListRow>, Vec<SessionListWarning>) {
+        (self.rows, self.warnings)
+    }
 }
 
 impl Session {
@@ -532,6 +599,58 @@ impl Session {
         }
     }
 
+    pub(crate) fn list(home: &Path) -> Result<SessionListing, SessionError> {
+        let directory = home.join(".kiki/sessions");
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SessionListing::default());
+            }
+            Err(error) => return Err(SessionError::Io(error)),
+        };
+        let mut listing = SessionListing::default();
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_suffix(DATABASE_SUFFIX)
+                .and_then(|value| SessionId::parse(value).ok())
+            else {
+                continue;
+            };
+            let is_file = match entry.file_type() {
+                Ok(file_type) => file_type.is_file(),
+                Err(_) => {
+                    listing.warnings.push(SessionListWarning {
+                        id: id.as_str().to_owned(),
+                    });
+                    continue;
+                }
+            };
+            if !is_file {
+                continue;
+            }
+            match read_list_row(&entry.path(), &id) {
+                Ok(row) => listing.rows.push(row),
+                Err(_) => listing.warnings.push(SessionListWarning {
+                    id: id.as_str().to_owned(),
+                }),
+            }
+        }
+        Ok(listing)
+    }
+
+    pub(crate) fn read_cwd(home: &Path, value: &str) -> Result<PathBuf, SessionError> {
+        let id = SessionId::parse(value)?;
+        let paths = SessionPaths::for_id(home, &id);
+        existing_database(&paths.database)?;
+        preflight_existing_database(&paths.database)?;
+        let connection = open_read_only_database(&paths.database)?;
+        read_stored_cwd(&connection, &id)
+    }
+
     pub(crate) fn open(home: &Path, value: &str) -> Result<Self, SessionError> {
         let id = SessionId::parse(value)?;
         let paths = SessionPaths::for_id(home, &id);
@@ -556,11 +675,7 @@ impl Session {
         )?;
         set_owner_only(&paths.database, 0o600)?;
         let mut connection = open_writable_database(&paths.database)?;
-        let stored_id: String =
-            connection.query_row("SELECT id FROM session", [], |row| row.get(0))?;
-        if stored_id != id.as_str() {
-            return Err(SessionError::StoredIdMismatch);
-        }
+        read_stored_cwd(&connection, &id)?;
         recover_interrupted_operations(&mut connection)?;
         Ok(Self {
             id,
@@ -573,6 +688,7 @@ impl Session {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn read_initial_checkpoint(
         home: &Path,
         value: &str,
@@ -589,9 +705,15 @@ impl Session {
         self.id.as_str()
     }
 
+    #[cfg(test)]
     pub(crate) fn initial_checkpoint(&self) -> Result<Checkpoint, SessionError> {
         let connection = self.connection()?;
         load_initial_checkpoint(&connection)
+    }
+
+    pub(crate) fn cwd(&self) -> Result<PathBuf, SessionError> {
+        let connection = self.connection()?;
+        read_stored_cwd(&connection, &self.id)
     }
 
     pub(crate) fn restore(&self) -> Result<SessionRestore, SessionError> {
@@ -647,10 +769,32 @@ impl SessionWriter {
         &self,
         preferences: SessionPreferences,
     ) -> Result<u64, SessionError> {
+        self.commit_startup_preferences(preferences, None).await
+    }
+
+    pub(crate) async fn commit_startup_preferences(
+        &self,
+        preferences: SessionPreferences,
+        relocated_cwd: Option<PathBuf>,
+    ) -> Result<u64, SessionError> {
         let preferences_json = codec::encode_session_preferences(&preferences)
             .map_err(|error| SessionError::Codec(error.to_string()))?;
-        self.write(SessionWriteKind::Preferences, move |connection| {
-            commit_preferences(connection, &preferences_json)
+        let relocated_cwd = relocated_cwd
+            .as_deref()
+            .map(codec::encode_path)
+            .transpose()
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let kind = if relocated_cwd.is_some() {
+            SessionWriteKind::Relocation
+        } else {
+            SessionWriteKind::Preferences
+        };
+        self.write(kind, move |connection| {
+            if let Some(cwd) = relocated_cwd.as_deref() {
+                commit_preferences_and_cwd(connection, &preferences_json, cwd)
+            } else {
+                commit_preferences(connection, &preferences_json)
+            }
         })
         .await
     }
@@ -792,6 +936,30 @@ fn commit_preferences(
     if transaction.execute(
         "UPDATE session SET preferences_json = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
         params![preferences_json, now, next_revision],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+}
+
+fn commit_preferences_and_cwd(
+    connection: &mut Connection,
+    preferences_json: &str,
+    cwd: &str,
+) -> Result<u64, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE session SET preferences_json = ?1, cwd = ?2, updated_at_ms = ?3, revision = ?4 WHERE singleton = 1",
+        params![preferences_json, cwd, now, next_revision],
     )? != 1
     {
         return Err(SessionError::InvalidTransition);
@@ -1349,6 +1517,69 @@ fn preflight_existing_database(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn existing_database(path: &Path) -> Result<(), SessionError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            SessionError::Missing
+        } else {
+            SessionError::Io(error)
+        }
+    })?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(SessionError::NotAFile)
+    }
+}
+
+fn open_read_only_database(path: &Path) -> Result<Connection, SessionError> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(SessionError::from)
+}
+
+fn read_stored_cwd(connection: &Connection, id: &SessionId) -> Result<PathBuf, SessionError> {
+    let (stored_id, cwd): (String, String) = connection.query_row(
+        "SELECT id, cwd FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if stored_id != id.as_str() {
+        return Err(SessionError::StoredIdMismatch);
+    }
+    codec::decode_path(&cwd).map_err(|error| SessionError::Codec(error.to_string()))
+}
+
+fn read_list_row(path: &Path, id: &SessionId) -> Result<SessionListRow, SessionError> {
+    preflight_existing_database(path)?;
+    let connection = open_read_only_database(path)?;
+    let (stored_id, updated_at_ms, cwd, name): (String, i64, String, Option<String>) = connection
+        .query_row(
+        "SELECT id, updated_at_ms, cwd, name FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if stored_id != id.as_str() {
+        return Err(SessionError::StoredIdMismatch);
+    }
+    let cwd = codec::decode_path(&cwd).map_err(|error| SessionError::Codec(error.to_string()))?;
+    let first_request = connection
+        .query_row(
+            "SELECT payload_json FROM entries WHERE kind = 'user_request' ORDER BY revision, id LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|payload| codec::decode_request(&payload))
+        .transpose()
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    Ok(SessionListRow {
+        id: id.as_str().to_owned(),
+        updated_at_ms,
+        cwd,
+        name,
+        first_request,
+    })
+}
+
 fn open_writable_database(path: &Path) -> Result<Connection, SessionError> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let journal_mode: String =
@@ -1376,6 +1607,7 @@ fn open_writable_database(path: &Path) -> Result<Connection, SessionError> {
     Ok(connection)
 }
 
+#[cfg(test)]
 fn load_initial_checkpoint(connection: &Connection) -> Result<Checkpoint, SessionError> {
     let (runtime_identity, arena_state, authorisations_json) = connection.query_row(
         "SELECT checkpoints.runtime_identity, checkpoints.arena_state, checkpoints.authorisations_json FROM entries JOIN checkpoints ON checkpoints.id = entries.checkpoint_id WHERE entries.kind = 'session_start'",
@@ -2978,6 +3210,79 @@ mod tests {
             fs::read(&project_settings).expect("read project settings"),
             project_before
         );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn startup_preferences_and_relocation_share_one_transaction() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let relocated = tempfile::tempdir().expect("create relocated workspace");
+        let session = create_session(&home, &workspace).await;
+        let preferences = SessionPreferences::new(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+            BTreeMap::from([(DEFAULT_MODEL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid preferences");
+        let before: (String, String, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata before relocation");
+
+        let revision = session
+            .writer()
+            .commit_startup_preferences(preferences.clone(), Some(relocated.path().to_path_buf()))
+            .await
+            .expect("commit relocation");
+        let after: (String, String, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read metadata after relocation");
+
+        assert_ne!(after.0, before.0);
+        assert_eq!(
+            super::codec::decode_path(&after.1).unwrap(),
+            relocated.path()
+        );
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(u64::try_from(after.2).unwrap(), revision);
+        assert_eq!(
+            super::codec::decode_session_preferences(&after.0).unwrap(),
+            preferences
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn read_cwd_ignores_corrupt_preferences_and_writer_ownership() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE session SET preferences_json = '{}', revision = revision + 1",
+                [],
+            )
+            .expect("corrupt preferences");
+
+        assert_eq!(
+            Session::read_cwd(home.path(), &id).unwrap(),
+            workspace.path()
+        );
+        assert!(matches!(session.metadata(), Err(SessionError::Codec(_))));
         session.close().expect("close session");
     }
 
@@ -5400,12 +5705,40 @@ mod tests {
         assert!(journal_before.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]));
         assert!(journal_before.len() > 512);
         assert!(journal_before.len() < 1_000_000);
+        let error = Session::read_cwd(home.path(), &id)
+            .expect_err("read-only access must reject a hot rollback journal");
+        assert!(error.requires_writable_recovery());
+        let SessionError::Sqlite(error) = error else {
+            panic!("read-only hot-journal error must come from SQLite");
+        };
+        assert_eq!(error.sqlite_extended_error_code(), Some(776));
         let error = Session::read_initial_checkpoint(home.path(), &id)
             .expect_err("read-only access must reject a hot rollback journal");
         let SessionError::Sqlite(error) = error else {
             panic!("read-only hot-journal error must come from SQLite");
         };
         assert_eq!(error.sqlite_extended_error_code(), Some(776));
+        let healthy = create_session(&home, &workspace).await;
+        let healthy_id = healthy.id().to_owned();
+        healthy.close().expect("close healthy session");
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        let (rows, warnings) = Session::list(home.path())
+            .expect("listing should retain healthy candidates despite a hot journal")
+            .into_parts();
+        assert_eq!(
+            rows.iter()
+                .map(super::SessionListRow::id)
+                .collect::<Vec<_>>(),
+            [healthy_id.as_str()]
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .map(super::SessionListWarning::id)
+                .collect::<Vec<_>>(),
+            [id.as_str()]
+        );
         assert_eq!(fs::read(&database).unwrap(), database_before);
         assert_eq!(fs::read(&journal).unwrap(), journal_before);
         assert_eq!(
@@ -5433,6 +5766,10 @@ mod tests {
                 .initial_checkpoint()
                 .expect("read recovered checkpoint"),
             initial
+        );
+        assert_eq!(
+            recovered.cwd().expect("read recovered workspace"),
+            workspace.path()
         );
         assert!(!journal.exists() || fs::metadata(&journal).unwrap().len() == 0);
         assert_eq!(

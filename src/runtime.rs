@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, watch};
@@ -659,6 +660,7 @@ impl<M: Model> RuntimeController<M> {
         settings: watch::Sender<ModelSelection>,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
+        relocated_cwd: Option<PathBuf>,
     ) -> Result<(Self, RuntimeInitialState), SessionError> {
         let restore = session.restore()?;
         let mut initial = restored_initial_state(&restore);
@@ -683,7 +685,7 @@ impl<M: Model> RuntimeController<M> {
                 let preferences = accepted_thinking.proposal(selection);
                 match session
                     .writer()
-                    .commit_preferences(preferences.clone())
+                    .commit_startup_preferences(preferences.clone(), relocated_cwd)
                     .await
                 {
                     Ok(revision) => {
@@ -5751,6 +5753,7 @@ mod tests {
                     SubagentPolicy::from(snapshot.subagents()),
                     Arc::new(super::UnavailableChildRunner),
                 ),
+                None,
             )
             .await;
             let _ = returned.send(());
@@ -5837,6 +5840,7 @@ mod tests {
                 SubagentPolicy::from(snapshot.subagents()),
                 Arc::new(super::UnavailableChildRunner),
             ),
+            None,
         )
         .await
         .expect("return disabled restored runtime");
@@ -5864,6 +5868,119 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read metadata after rejected startup preferences");
+        assert_eq!(metadata_after, metadata_before);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must stay disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, task).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn failed_startup_relocation_rolls_back_preferences_and_cwd() {
+        let home = tempfile::tempdir().expect("create home");
+        let saved_workspace = tempfile::tempdir().expect("create saved workspace");
+        let relocated_workspace = tempfile::tempdir().expect("create relocated workspace");
+        let saved_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(saved_workspace.path())
+                .await
+                .expect("open saved tool host"),
+        )
+        .await
+        .expect("create saved arena");
+        let saved_selection = ModelSelection::new(&SOL, "low").expect("select Sol");
+        let session = Session::create(
+            home.path(),
+            saved_workspace.path(),
+            saved_selection,
+            saved_arena.checkpoint(),
+        )
+        .expect("create session");
+        drop(saved_arena);
+        session
+            .writer()
+            .commit_request("readable saved request".to_owned())
+            .await
+            .expect("commit readable request");
+        let metadata_before: (String, String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read metadata before failed relocation");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_relocation BEFORE UPDATE OF cwd ON session BEGIN SELECT RAISE(ABORT, 'reject relocation'); END;",
+            )
+            .expect("reject relocation writes");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(relocated_workspace.path())
+                .await
+                .expect("open relocated tool host"),
+        )
+        .await
+        .expect("create relocated arena");
+        let effective = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        let (settings, _) = watch::channel(effective);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            CountingMessageModel {
+                calls: Arc::clone(&calls),
+            },
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            Some(relocated_workspace.path().to_path_buf()),
+        )
+        .await
+        .expect("return disabled restored runtime");
+
+        assert_eq!(
+            initial.disabled_reason,
+            Some(RuntimeDisabledReason::SessionStorageWriteFailed)
+        );
+        assert!(matches!(
+            initial.records.as_slice(),
+            [StoredRecord {
+                record: Record::UserRequest { request },
+                ..
+            }] if request == "readable saved request"
+        ));
+        assert!(initial.metadata.is_some());
+        let metadata_after: (String, String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read metadata after failed relocation");
         assert_eq!(metadata_after, metadata_before);
         let (commands, mut events, _progress, task) = start_controller(controller);
         commands
@@ -10689,6 +10806,8 @@ mod tests {
     async fn incompatible_active_checkpoint_keeps_records_readable_and_disables_runtime() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
+        let relocated = tempfile::tempdir().expect("create relocated workspace");
+        let relocation_gate = SessionWriteGate::new(SessionWriteKind::Relocation);
         let mut arena = Arena::new(
             worker_path(),
             ToolHost::new(workspace.path())
@@ -10698,8 +10817,14 @@ mod tests {
         .await
         .expect("create arena");
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
-        let session =
-            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            relocation_gate.clone(),
+        )
+        .expect("create session");
         let writer = session.writer();
         let run_id = writer
             .commit_request("readable saved request".to_owned())
@@ -10739,13 +10864,30 @@ mod tests {
             )
             .await
             .expect("persist incompatible checkpoint");
+        let metadata_before: (String, String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("snapshot session metadata");
         drop(writer);
+        let restored_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(relocated.path())
+                .await
+                .expect("create relocated tool host"),
+        )
+        .await
+        .expect("create relocated arena");
         let calls = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
         let (settings, selection_receiver) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
-            arena,
+            restored_arena,
             RestoredStateModel {
                 selection: selection_receiver,
                 observed: Arc::new(Mutex::new(Vec::new())),
@@ -10763,6 +10905,7 @@ mod tests {
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
                 Arc::new(CountingChildRunner(starts.clone())),
             ),
+            Some(relocated.path().to_path_buf()),
         )
         .await
         .expect("return disabled restored runtime");
@@ -10784,6 +10927,17 @@ mod tests {
             initial.disabled_reason,
             Some(RuntimeDisabledReason::SessionRestoreFailed)
         );
+        assert!(!relocation_gate.has_started());
+        let metadata_after: (String, String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT preferences_json, cwd, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read session metadata");
+        assert_eq!(metadata_after, metadata_before);
         let (commands, mut events, _progress, controller) = start_controller(controller);
         commands
             .send(RuntimeCommand::Submit {
@@ -11272,6 +11426,7 @@ mod tests {
                 Arc::new(CountingChildRunner(starts.clone())),
             )
             .with_start_test_gate(start_gate.clone()),
+            None,
         )
         .await
         .expect("restore runtime");

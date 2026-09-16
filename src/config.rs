@@ -436,6 +436,7 @@ pub(crate) fn load_with_session_preferences(
     resolve_startup_with_session_preferences(input, session_preferences)
 }
 
+#[cfg(test)]
 fn resolve_startup(input: StartupInput) -> StartupConfiguration {
     resolve_startup_with_session_preferences(input, None)
 }
