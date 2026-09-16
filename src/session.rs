@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, fcntl_lock};
 use rustix::io::Errno;
 use thiserror::Error;
 use tokio::task;
@@ -25,6 +25,7 @@ const LOCK_SUFFIX: &str = ".lock";
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_SIGNATURE: &[u8] = b"SQLite format 3\0";
 const FORMAT_VERSION: u32 = 1;
+const INTERRUPTION_MESSAGE: &str = "Interrupted by previous process exit";
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
@@ -423,12 +424,13 @@ impl Session {
             0o700,
         )?;
         set_owner_only(&paths.database, 0o600)?;
-        let connection = open_writable_database(&paths.database)?;
+        let mut connection = open_writable_database(&paths.database)?;
         let stored_id: String =
             connection.query_row("SELECT id FROM session", [], |row| row.get(0))?;
         if stored_id != id.as_str() {
             return Err(SessionError::StoredIdMismatch);
         }
+        recover_interrupted_operations(&mut connection)?;
         Ok(Self {
             id,
             state: Arc::new(SessionState {
@@ -896,6 +898,114 @@ fn terminal_subagent_task(
     u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
 }
 
+fn recover_interrupted_operations(connection: &mut Connection) -> Result<(), SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let open_runs = {
+        let mut statement =
+            transaction.prepare("SELECT id FROM runs WHERE terminal_entry_id IS NULL")?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let run_id = match open_runs.as_slice() {
+        [] => None,
+        [run_id] => Some(*run_id),
+        _ => return Err(SessionError::InvalidTransition),
+    };
+    let unfinished_tasks = {
+        let mut statement = transaction.prepare(
+            "SELECT id, task_revision, details_json FROM subagent_tasks WHERE terminal_revision IS NULL ORDER BY admitted_revision, id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if run_id.is_none() && unfinished_tasks.is_empty() {
+        return Ok(());
+    }
+    let detection = now_ms()?;
+    let (mut active_entry_id, checkpoint_id, mut revision): (i64, i64, i64) = transaction
+        .query_row(
+            "SELECT session.active_entry_id, entries.checkpoint_id, session.revision FROM session JOIN entries ON entries.id = session.active_entry_id WHERE session.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if let Some(run_id) = run_id {
+        let terminal = PersistedTerminal::Failed {
+            message: INTERRUPTION_MESSAGE.to_owned(),
+            evidence: None,
+            attempts: Vec::new(),
+        };
+        let stored_terminal = codec::encode_terminal(&terminal, None)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+        transaction.execute(
+            "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                active_entry_id,
+                run_id,
+                stored_terminal.kind,
+                checkpoint_id,
+                stored_terminal.payload_json,
+                stored_terminal.provider_replay,
+                detection,
+                revision,
+            ],
+        )?;
+        let entry_id = transaction.last_insert_rowid();
+        let pending_steps: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM model_steps WHERE run_id = ?1 AND settled_entry_id IS NULL",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if transaction.execute(
+            "UPDATE model_steps SET settled_entry_id = ?1 WHERE run_id = ?2 AND settled_entry_id IS NULL",
+            params![entry_id, run_id],
+        )? != usize::try_from(pending_steps).map_err(|_| SessionError::InvalidTransition)?
+        {
+            return Err(SessionError::InvalidTransition);
+        }
+        if transaction.execute(
+            "UPDATE runs SET terminal_entry_id = ?1 WHERE id = ?2 AND terminal_entry_id IS NULL",
+            params![entry_id, run_id],
+        )? != 1
+        {
+            return Err(SessionError::InvalidTransition);
+        }
+        active_entry_id = entry_id;
+    }
+    for (task_id, task_revision, details_json) in unfinished_tasks {
+        let details_json = codec::fail_unfinished_task_details(&details_json, detection)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let next_task_revision = task_revision
+            .checked_add(1)
+            .ok_or(SessionError::IdOverflow)?;
+        revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+        if transaction.execute(
+            "UPDATE subagent_tasks SET state = 'failed', terminal_revision = ?1, task_revision = ?2, details_json = ?3 WHERE id = ?4 AND terminal_revision IS NULL AND task_revision = ?5 AND state IN ('starting', 'running', 'stopping')",
+            params![revision, next_task_revision, details_json, task_id, task_revision],
+        )? != 1
+        {
+            return Err(SessionError::InvalidTransition);
+        }
+    }
+    if transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![active_entry_id, detection, revision],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn task_sql_id(value: &str) -> Result<i64, SessionError> {
     u64::from_str_radix(value, 16)
         .ok()
@@ -984,10 +1094,10 @@ fn create_lock(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options.mode(0o600).custom_flags(libc::O_CLOEXEC);
     let file = options.open(path)?;
     set_owner_only(path, 0o600)?;
-    flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io::Error::from)?;
+    fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive).map_err(io::Error::from)?;
     Ok(file)
 }
 
@@ -995,12 +1105,14 @@ fn open_lock(path: &Path) -> Result<File, SessionError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options.mode(0o600).custom_flags(libc::O_CLOEXEC);
     let file = options.open(path)?;
     set_owner_only(path, 0o600)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+    match fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(file),
-        Err(error) if error == Errno::AGAIN || error == Errno::WOULDBLOCK => {
+        Err(error)
+            if error == Errno::ACCESS || error == Errno::AGAIN || error == Errno::WOULDBLOCK =>
+        {
             Err(SessionError::Owned)
         }
         Err(error) => Err(SessionError::Io(error.into())),
@@ -1123,7 +1235,7 @@ mod tests {
     use crate::arena::{Arena, Checkpoint, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::subagents::TaskPersistedDetails;
-    use crate::tools::ToolHost;
+    use crate::tools::{ToolHost, ToolValue};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -1967,10 +2079,299 @@ mod tests {
             fs::write(&database, &contents).expect("write invalid database");
             fs::write(&journal, b"journal bytes").expect("write journal");
 
+            assert!(Session::read_initial_checkpoint(home.path(), id).is_err());
+            assert_eq!(fs::read(&database).unwrap(), contents);
+            assert_eq!(fs::read(&journal).unwrap(), b"journal bytes");
             assert!(Session::open(home.path(), id).is_err());
             assert_eq!(fs::read(&database).unwrap(), contents);
             assert_eq!(fs::read(&journal).unwrap(), b"journal bytes");
         }
+    }
+
+    #[cfg(unix)]
+    fn persisted_execution(source: &str, execution: crate::arena::Execution) -> PersistedCode {
+        PersistedCode {
+            source: source.to_owned(),
+            call_id: crate::model::ModelCallId::new("committed-step"),
+            commentary: None,
+            reasoning_summary: "commit execution checkpoint".to_owned(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(execution),
+            attempts: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn restored_arena(session: &Session, workspace: &Path) -> Arena {
+        let mut arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace).await.expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        arena
+            .restore(
+                session
+                    .initial_checkpoint()
+                    .expect("load initial checkpoint"),
+            )
+            .await
+            .expect("restore initial checkpoint");
+        arena
+    }
+
+    #[cfg(unix)]
+    fn signal_and_block(stream: &mut UnixStream, signal: u8) {
+        stream.write_all(&[signal]).expect("signal parent");
+        let mut release = [0];
+        stream.read_exact(&mut release).expect("wait for parent");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_process() {
+        let Some(endpoint) = env::var_os("KIKI_SESSION_TEST_SOCKET").map(PathBuf::from) else {
+            return;
+        };
+        let home = env::var_os("KIKI_SESSION_TEST_HOME")
+            .map(PathBuf::from)
+            .expect("recovery process requires a home path");
+        let id = env::var("KIKI_SESSION_TEST_ID").expect("recovery process requires a session ID");
+        let milestone = env::var("KIKI_SESSION_RECOVERY_MILESTONE")
+            .expect("recovery process requires a milestone");
+        let workspace = env::var_os("KIKI_SESSION_TEST_WORKSPACE")
+            .map(PathBuf::from)
+            .expect("recovery process requires a workspace path");
+        let mut stream = UnixStream::connect(endpoint).expect("connect to test parent");
+        tokio::runtime::Runtime::new()
+            .expect("create test runtime")
+            .block_on(async {
+                let session = Session::open(&home, &id).expect("open session in recovery process");
+                let writer = session.writer();
+                let signal =
+                    match milestone.as_str() {
+                        "generation" => {
+                            let run_id = writer
+                                .commit_request("generation interruption".to_owned())
+                                .await
+                                .expect("commit request");
+                            writer
+                                .start_model_step(run_id)
+                                .await
+                                .expect("start generation step");
+                            b'G'
+                        }
+                        "execution" => {
+                            let run_id = writer
+                                .commit_request("execution interruption".to_owned())
+                                .await
+                                .expect("commit request");
+                            writer
+                                .start_model_step(run_id)
+                                .await
+                                .expect("start execution step");
+                            let mut arena = restored_arena(&session, &workspace).await;
+                            let cancellation = CancellationToken::new();
+                            let execution = arena
+                                .execute(
+                                    "uncommitted_value = 1\nresult_values = {'uncommitted': 1}",
+                                    &cancellation,
+                                )
+                                .await
+                                .expect("execute uncommitted Python");
+                            assert!(matches!(
+                                execution.outcome,
+                                ExecutionOutcome::Complete { result: None }
+                            ));
+                            b'E'
+                        }
+                        "committed-step" => {
+                            let run_id = writer
+                                .commit_request("committed step interruption".to_owned())
+                                .await
+                                .expect("commit request");
+                            let settled_step = writer
+                                .start_model_step(run_id)
+                                .await
+                                .expect("start settled step");
+                            let mut arena = restored_arena(&session, &workspace).await;
+                            let cancellation = CancellationToken::new();
+                            let source = "committed_value = 1\nresult_values = {'committed': 1}";
+                            let execution = arena
+                                .execute(source, &cancellation)
+                                .await
+                                .expect("execute committed Python");
+                            assert!(matches!(
+                                &execution.outcome,
+                                ExecutionOutcome::Complete { result: None }
+                            ));
+                            writer
+                                .settle_execution(
+                                    run_id,
+                                    settled_step,
+                                    persisted_execution(source, execution),
+                                    arena.checkpoint(),
+                                )
+                                .await
+                                .expect("commit settled step");
+                            writer
+                                .start_model_step(run_id)
+                                .await
+                                .expect("start pending step");
+                            let execution = arena
+                                .execute(
+                                    "uncommitted_value = 2\nresult_values = {'uncommitted': 2}",
+                                    &cancellation,
+                                )
+                                .await
+                                .expect("execute uncommitted Python");
+                            assert!(matches!(
+                                execution.outcome,
+                                ExecutionOutcome::Complete { result: None }
+                            ));
+                            b'C'
+                        }
+                        "background-only" => {
+                            let run_id = writer
+                                .commit_request("closed foreground".to_owned())
+                                .await
+                                .expect("commit request");
+                            let origin_step_id = writer
+                                .start_model_step(run_id)
+                                .await
+                                .expect("start origin step");
+                            writer
+                                .close_run(
+                                    run_id,
+                                    Some(origin_step_id),
+                                    || PersistedTerminal::Failed {
+                                        message: "closed before interruption".to_owned(),
+                                        evidence: None,
+                                        attempts: Vec::new(),
+                                    },
+                                    None,
+                                )
+                                .await
+                                .expect("close foreground");
+                            let task = crate::subagents::TaskRecord::for_test(
+                                "00",
+                                1,
+                                selection(),
+                                None,
+                                1,
+                                Vec::new(),
+                            )
+                            .with_persisted_details_for_test(TaskPersistedDetails {
+                                admitted_at_ms: 100,
+                                terminal_at_ms: None,
+                                state: crate::subagents::TaskState::Running,
+                                step_count: 1,
+                                elapsed: Duration::new(2, 3),
+                                observed_at_ms: 200,
+                                attempt_evidence: Vec::new(),
+                                executions: Vec::new(),
+                                outcome: None,
+                            });
+                            writer
+                                .admit_subagent_task(
+                                    TaskAdmission::from_record(&task, origin_step_id)
+                                        .expect("encode background task"),
+                                    || false,
+                                )
+                                .await
+                                .expect("admit background task")
+                                .expect("commit background task");
+                            b'B'
+                        }
+                        _ => panic!("unknown recovery milestone"),
+                    };
+                signal_and_block(&mut stream, signal);
+            });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hot_rollback_process() {
+        let Some(endpoint) = env::var_os("KIKI_SESSION_TEST_SOCKET").map(PathBuf::from) else {
+            return;
+        };
+        let home = env::var_os("KIKI_SESSION_TEST_HOME")
+            .map(PathBuf::from)
+            .expect("rollback process requires a home path");
+        let id = env::var("KIKI_SESSION_TEST_ID").expect("rollback process requires a session ID");
+        let mut stream = UnixStream::connect(endpoint).expect("connect to test parent");
+        let session = Session::open(&home, &id).expect("open session in rollback process");
+        let connection = session
+            .connection_for_test()
+            .expect("lock rollback process connection");
+        connection
+            .execute_batch("PRAGMA cache_size = 10; PRAGMA cache_spill = ON; BEGIN IMMEDIATE;")
+            .expect("begin spilling rollback transaction");
+        let revision: i64 = connection
+            .query_row("SELECT revision FROM session", [], |row| row.get(0))
+            .expect("read session revision");
+        connection
+            .execute(
+                "UPDATE session SET updated_at_ms = ?1, revision = ?2 WHERE singleton = 1",
+                params![super::now_ms().expect("read time"), revision + 1],
+            )
+            .expect("dirty session page");
+        for page in 0_u8..32 {
+            connection
+                .execute(
+                    "INSERT INTO checkpoints (runtime_identity, arena_state, authorisations_json) VALUES (?1, ?2, '[]')",
+                    params![
+                        format!("rollback page {page}"),
+                        vec![page; 12 * 1024],
+                    ],
+                )
+                .expect("dirty checkpoint page");
+        }
+        let database = database_path(&home, &id);
+        let journal = database.with_file_name(format!("{id}.sqlite3-journal"));
+        let journal_bytes = fs::read(&journal).expect("read hot journal");
+        assert!(
+            journal_bytes.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]),
+            "rollback journal header is missing"
+        );
+        assert!(journal_bytes.len() > 512, "rollback journal did not spill");
+        assert!(
+            journal_bytes.len() < 1_000_000,
+            "rollback fixture is unbounded"
+        );
+        signal_and_block(&mut stream, b'J');
+    }
+
+    #[cfg(unix)]
+    fn recovery_process_result(
+        home: &Path,
+        id: &str,
+        workspace: &Path,
+        socket: &Path,
+        milestone: &str,
+    ) -> (std::process::Child, UnixStream, u8) {
+        let listener = UnixListener::bind(socket).expect("bind parent socket");
+        let child = Command::new(env::current_exe().expect("locate test executable"))
+            .arg("session::tests::recovery_process")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("KIKI_SESSION_TEST_SOCKET", socket)
+            .env("KIKI_SESSION_TEST_HOME", home)
+            .env("KIKI_SESSION_TEST_ID", id)
+            .env("KIKI_SESSION_TEST_WORKSPACE", workspace)
+            .env("KIKI_SESSION_RECOVERY_MILESTONE", milestone)
+            .spawn()
+            .expect("start recovery process");
+        let (mut stream, _) = listener.accept().expect("accept recovery process");
+        let mut signal = [0];
+        stream
+            .read_exact(&mut signal)
+            .expect("read recovery milestone");
+        (child, stream, signal[0])
     }
 
     #[test]
@@ -1997,6 +2398,10 @@ mod tests {
                 b'O'
             }])
             .expect("report writer result");
+        if env::var_os("KIKI_SESSION_TEST_BLOCK").is_some() {
+            let mut release = [0];
+            stream.read_exact(&mut release).expect("wait for parent");
+        }
         if let Ok(writer) = writer {
             writer.close().expect("close child writer");
         }
@@ -2019,6 +2424,774 @@ mod tests {
         stream.read_exact(&mut result).expect("read child result");
         assert!(child.wait().expect("wait for child").success());
         result
+    }
+
+    #[tokio::test]
+    async fn recovery_closes_pending_run_and_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("interrupted request".to_owned())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start pending step");
+        let run_id = i64::try_from(run_id).expect("run ID fits SQLite");
+        let step_id = i64::try_from(step_id).expect("step ID fits SQLite");
+        let (previous_active, previous_checkpoint, previous_revision): (i64, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT session.active_entry_id, entries.checkpoint_id, session.revision FROM session JOIN entries ON entries.id = session.active_entry_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read preceding active entry");
+        drop(writer);
+        session.close().expect("close interrupted session");
+
+        let recovered = Session::open(home.path(), &id).expect("open recovered session");
+        let connection = recovered
+            .connection_for_test()
+            .expect("lock recovered session connection");
+        let (entries, checkpoints, pending_steps, closed_runs, revision): (i64, i64, i64, i64, i64) =
+            connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), revision FROM session",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .expect("read recovered lifecycle");
+        assert_eq!(
+            (entries, checkpoints, pending_steps, closed_runs, revision),
+            (3, 1, 0, 1, previous_revision + 1)
+        );
+        let (
+            entry_id,
+            parent_id,
+            entry_run_id,
+            checkpoint_id,
+            payload_json,
+            replay,
+            created_at_ms,
+            entry_revision,
+        ): (i64, i64, i64, i64, String, Option<Vec<u8>>, i64, i64) = connection
+            .query_row(
+                "SELECT entries.id, entries.parent_id, entries.run_id, entries.checkpoint_id, entries.payload_json, entries.provider_replay, entries.created_at_ms, entries.revision FROM runs JOIN entries ON entries.id = runs.terminal_entry_id WHERE runs.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+            )
+            .expect("read interruption entry");
+        assert_eq!(parent_id, previous_active);
+        assert_eq!(entry_run_id, run_id);
+        assert_eq!(checkpoint_id, previous_checkpoint);
+        assert_eq!(entry_revision, previous_revision + 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT updated_at_ms FROM session", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read recovery timestamp"),
+            created_at_ms
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload_json).expect("decode interruption"),
+            serde_json::json!({
+                "Terminal": {
+                    "terminal": {
+                        "Failed": {
+                            "message": "Interrupted by previous process exit",
+                            "evidence": null,
+                            "attempts": [],
+                        }
+                    },
+                    "code": null,
+                }
+            })
+        );
+        assert_eq!(replay, None);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT settled_entry_id FROM model_steps WHERE id = ?1 AND run_id = ?2",
+                    params![step_id, run_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .expect("read recovered step"),
+            Some(entry_id)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT active_entry_id FROM session", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read active entry"),
+            entry_id
+        );
+        drop(connection);
+        recovered.close().expect("close recovered session");
+    }
+
+    #[tokio::test]
+    async fn recovery_closes_pending_background_tasks_in_admission_order() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("closed foreground".to_owned())
+            .await
+            .expect("commit request");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start origin step");
+        writer
+            .close_run(
+                run_id,
+                Some(origin_step_id),
+                || PersistedTerminal::Failed {
+                    message: "already closed".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close foreground");
+        let first = crate::subagents::TaskRecord::for_test(
+            "00",
+            7,
+            selection(),
+            None,
+            1,
+            vec![crate::model::AttemptAccounting::UsageUnavailable],
+        )
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 100,
+            terminal_at_ms: None,
+            state: crate::subagents::TaskState::Running,
+            step_count: 3,
+            elapsed: Duration::new(4, 5),
+            observed_at_ms: 200,
+            attempt_evidence: vec![crate::subagents::TaskAttempt::for_test(
+                2,
+                1,
+                Some(crate::model::AttemptAccounting::UsageUnavailable),
+            )],
+            executions: vec![crate::subagents::TaskExecution::for_test(
+                2,
+                "value = 1".to_owned(),
+                "reasoning".to_owned(),
+                crate::arena::Execution {
+                    stdout: empty_observation(),
+                    stderr: empty_observation(),
+                    outcome: crate::arena::ExecutionOutcome::Complete { result: None },
+                    tool_calls: Vec::new(),
+                },
+                vec![crate::model::AttemptAccounting::UsageUnavailable],
+            )],
+            outcome: None,
+        });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&first, origin_step_id).expect("encode first task"),
+                || false,
+            )
+            .await
+            .expect("admit first task")
+            .expect("commit first task");
+        let second = crate::subagents::TaskRecord::for_test(
+            "01",
+            9,
+            selection(),
+            Some("00"),
+            2,
+            vec![
+                crate::model::AttemptAccounting::UsageUnavailable,
+                crate::model::AttemptAccounting::UsageUnavailable,
+            ],
+        )
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 101,
+            terminal_at_ms: None,
+            state: crate::subagents::TaskState::Stopping,
+            step_count: 4,
+            elapsed: Duration::new(5, 6),
+            observed_at_ms: 201,
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: None,
+        });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&second, origin_step_id).expect("encode second task"),
+                || false,
+            )
+            .await
+            .expect("admit second task")
+            .expect("commit second task");
+        let completed_admission =
+            crate::subagents::TaskRecord::for_test("02", 1, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 102,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Starting,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 102,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&completed_admission, origin_step_id)
+                    .expect("encode completed task admission"),
+                || false,
+            )
+            .await
+            .expect("admit completed task")
+            .expect("commit completed task");
+        let completed =
+            crate::subagents::TaskRecord::for_test("02", 2, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 102,
+                    terminal_at_ms: Some(202),
+                    state: crate::subagents::TaskState::Completed,
+                    step_count: 1,
+                    elapsed: Duration::new(6, 7),
+                    observed_at_ms: 202,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: Some(crate::subagents::TaskOutcome::Completed(
+                        crate::subagents::ChildResult::new("done".to_owned(), BTreeMap::new()),
+                    )),
+                });
+        writer
+            .terminal_subagent_task(TaskTerminal::from_record(&completed).expect("encode result"))
+            .await
+            .expect("commit completed task");
+        let (previous_active, entries, checkpoints, previous_revision): (i64, i64, i64, i64) =
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT active_entry_id, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), revision FROM session",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read preceding session state");
+        let original_first: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT details_json FROM subagent_tasks WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read first task details");
+        let original_second: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT details_json FROM subagent_tasks WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read second task details");
+        let completed_before: (String, Option<i64>, i64, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, task_revision, details_json FROM subagent_tasks WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read completed task");
+        drop(writer);
+        session.close().expect("close interrupted session");
+
+        let recovered = Session::open(home.path(), &id).expect("open recovered session");
+        let connection = recovered
+            .connection_for_test()
+            .expect("lock recovered session connection");
+        let (active_entry_id, recovered_entries, recovered_checkpoints, updated_at_ms, revision):
+            (i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT active_entry_id, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read recovered session state");
+        assert_eq!(active_entry_id, previous_active);
+        assert_eq!(
+            (recovered_entries, recovered_checkpoints),
+            (entries, checkpoints)
+        );
+        assert_eq!(revision, previous_revision + 2);
+        let tasks = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, state, terminal_revision, task_revision, details_json FROM subagent_tasks ORDER BY id",
+                )
+                .expect("prepare task query");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .expect("query tasks")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read tasks")
+        };
+        let provenance = connection
+            .prepare(
+                "SELECT id, parent_task_id, origin_step_id, admitted_revision FROM subagent_tasks ORDER BY id",
+            )
+            .expect("prepare provenance query")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query task provenance")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read task provenance");
+        assert_eq!(
+            provenance,
+            [
+                (0, None, i64::try_from(origin_step_id).unwrap(), 5),
+                (1, Some(0), i64::try_from(origin_step_id).unwrap(), 6),
+                (2, None, i64::try_from(origin_step_id).unwrap(), 7),
+            ]
+        );
+        assert_eq!(tasks[0].0, 0);
+        assert_eq!(
+            (&tasks[0].1, tasks[0].2, tasks[0].3),
+            (&"failed".to_owned(), Some(previous_revision + 1), 8)
+        );
+        assert_eq!(tasks[1].0, 1);
+        assert_eq!(
+            (&tasks[1].1, tasks[1].2, tasks[1].3),
+            (&"failed".to_owned(), Some(previous_revision + 2), 10)
+        );
+        assert_eq!(
+            tasks[2],
+            (
+                2,
+                completed_before.0.clone(),
+                completed_before.1,
+                completed_before.2,
+                completed_before.3.clone()
+            )
+        );
+        let mut original_first: serde_json::Value =
+            serde_json::from_str(&original_first).expect("decode original first task");
+        let mut recovered_first: serde_json::Value =
+            serde_json::from_str(&tasks[0].4).expect("decode recovered first task");
+        assert_eq!(
+            recovered_first["terminal_at_ms"],
+            serde_json::json!(updated_at_ms)
+        );
+        assert_eq!(
+            recovered_first["outcome"],
+            serde_json::json!({ "Failed": { "message": "Interrupted by previous process exit" } })
+        );
+        let mut original_second: serde_json::Value =
+            serde_json::from_str(&original_second).expect("decode original second task");
+        let mut recovered_second: serde_json::Value =
+            serde_json::from_str(&tasks[1].4).expect("decode recovered second task");
+        assert_eq!(
+            recovered_second["terminal_at_ms"],
+            serde_json::json!(updated_at_ms)
+        );
+        for details in [
+            &mut original_first,
+            &mut recovered_first,
+            &mut original_second,
+            &mut recovered_second,
+        ] {
+            let object = details.as_object_mut().expect("task details object");
+            object.remove("terminal_at_ms");
+            object.remove("outcome");
+        }
+        assert_eq!(recovered_first, original_first);
+        assert_eq!(recovered_second, original_second);
+        drop(connection);
+        recovered.close().expect("close recovered session");
+    }
+
+    #[tokio::test]
+    async fn recovery_orders_foreground_before_tasks_and_is_idempotent() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("combined interruption".to_owned())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start pending step");
+        let step_sql_id = i64::try_from(step_id).expect("step ID fits SQLite");
+        let completed_admission =
+            crate::subagents::TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Starting,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 100,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&completed_admission, step_id)
+                    .expect("encode completed task admission"),
+                || false,
+            )
+            .await
+            .expect("admit completed task")
+            .expect("commit completed task");
+        let completed =
+            crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: Some(200),
+                    state: crate::subagents::TaskState::Completed,
+                    step_count: 1,
+                    elapsed: Duration::new(1, 2),
+                    observed_at_ms: 200,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: Some(crate::subagents::TaskOutcome::Completed(
+                        crate::subagents::ChildResult::new("done".to_owned(), BTreeMap::new()),
+                    )),
+                });
+        writer
+            .terminal_subagent_task(TaskTerminal::from_record(&completed).expect("encode result"))
+            .await
+            .expect("commit completed task");
+        let pending = crate::subagents::TaskRecord::for_test(
+            "01",
+            4,
+            selection(),
+            None,
+            1,
+            vec![crate::model::AttemptAccounting::UsageUnavailable],
+        )
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 101,
+            terminal_at_ms: None,
+            state: crate::subagents::TaskState::Running,
+            step_count: 2,
+            elapsed: Duration::new(3, 4),
+            observed_at_ms: 201,
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: None,
+        });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&pending, step_id).expect("encode pending task"),
+                || false,
+            )
+            .await
+            .expect("admit pending task")
+            .expect("commit pending task");
+        let previous_revision: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT revision FROM session", [], |row| row.get(0))
+            .expect("read preceding revision");
+        let completed_details: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT details_json FROM subagent_tasks WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read completed task details");
+        drop(writer);
+        session.close().expect("close interrupted session");
+
+        let recovered = Session::open(home.path(), &id).expect("open recovered session");
+        let connection = recovered
+            .connection_for_test()
+            .expect("lock recovered session connection");
+        let foreground: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT entries.id, entries.revision, entries.checkpoint_id, entries.created_at_ms FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read recovered foreground terminal");
+        let pending_task: (String, Option<i64>, i64, String, i64) = connection
+            .query_row(
+                "SELECT state, terminal_revision, task_revision, details_json, origin_step_id FROM subagent_tasks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read recovered child");
+        assert_eq!(foreground.1, previous_revision + 1);
+        assert_eq!(pending_task.1, Some(previous_revision + 2));
+        assert_eq!(pending_task.0, "failed");
+        assert_eq!(pending_task.2, 5);
+        assert_eq!(pending_task.4, step_sql_id);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT settled_entry_id FROM model_steps WHERE id = ?1",
+                    params![step_sql_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .expect("read settled origin step"),
+            Some(foreground.0)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT active_entry_id FROM session", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read active entry"),
+            foreground.0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT details_json FROM subagent_tasks WHERE id = 0",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read completed task details"),
+            completed_details
+        );
+        let first_snapshot = {
+            let session: (i64, i64, i64) = connection
+                .query_row(
+                    "SELECT active_entry_id, updated_at_ms, revision FROM session",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read session snapshot");
+            let steps = connection
+                .prepare("SELECT id, settled_entry_id FROM model_steps ORDER BY id")
+                .expect("prepare step snapshot")
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                })
+                .expect("query step snapshot")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read step snapshot");
+            let tasks = connection
+                .prepare(
+                    "SELECT id, state, terminal_revision, task_revision, details_json FROM subagent_tasks ORDER BY id",
+                )
+                .expect("prepare task snapshot")
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .expect("query task snapshot")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read task snapshot");
+            let counts: (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read entry snapshot");
+            (session, foreground, steps, tasks, counts)
+        };
+        drop(connection);
+        recovered.close().expect("close recovered session");
+
+        let reopened = Session::open(home.path(), &id).expect("open settled session");
+        let connection = reopened
+            .connection_for_test()
+            .expect("lock settled session connection");
+        let second_session: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT active_entry_id, updated_at_ms, revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read settled session snapshot");
+        let second_foreground: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT entries.id, entries.revision, entries.checkpoint_id, entries.created_at_ms FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read settled foreground snapshot");
+        let second_steps = connection
+            .prepare("SELECT id, settled_entry_id FROM model_steps ORDER BY id")
+            .expect("prepare settled step snapshot")
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query settled step snapshot")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read settled step snapshot");
+        let second_tasks = connection
+            .prepare(
+                "SELECT id, state, terminal_revision, task_revision, details_json FROM subagent_tasks ORDER BY id",
+            )
+            .expect("prepare settled task snapshot")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("query settled task snapshot")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read settled task snapshot");
+        let second_counts: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read settled entry snapshot");
+        assert_eq!(
+            (
+                second_session,
+                second_foreground,
+                second_steps,
+                second_tasks,
+                second_counts
+            ),
+            first_snapshot
+        );
+        drop(connection);
+        reopened.close().expect("close settled session");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_terminal_task_details_atomically() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("interrupted request".to_owned())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start pending step");
+        let admission =
+            crate::subagents::TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Starting,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 100,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&admission, step_id).expect("encode task admission"),
+                || false,
+            )
+            .await
+            .expect("admit task")
+            .expect("commit task");
+        let invalid =
+            crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: Some(200),
+                    state: crate::subagents::TaskState::Failed,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 100,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: Some(crate::subagents::TaskOutcome::Failed(
+                        crate::subagents::ChildFailure::new("already terminal"),
+                    )),
+                });
+        let invalid_details = TaskAdmission::from_record(&invalid, step_id)
+            .expect("encode invalid task details")
+            .details_json;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE subagent_tasks SET task_revision = 2, details_json = ?1 WHERE id = 0",
+                params![invalid_details],
+            )
+            .expect("store invalid task details");
+        let before: (i64, i64, i64, i64, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), session.revision, (SELECT details_json FROM subagent_tasks WHERE id = 0) FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read preceding state");
+        drop(writer);
+        session.close().expect("close interrupted session");
+
+        match Session::open(home.path(), &id) {
+            Err(SessionError::Codec(_)) => {}
+            Err(error) => panic!("unexpected recovery error: {error}"),
+            Ok(session) => {
+                session
+                    .close()
+                    .expect("close unexpectedly recovered session");
+                panic!("recovery accepted terminal task details");
+            }
+        }
+        let connection = Connection::open(database_path(home.path(), &id)).expect("open database");
+        let after: (i64, i64, i64, i64, String) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), session.revision, (SELECT details_json FROM subagent_tasks WHERE id = 0) FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read rolled back state");
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
@@ -2458,6 +3631,313 @@ mod tests {
 
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn child_process_does_not_inherit_writer_locks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let socket = home.path().join("inherited-lock.sock");
+        let listener = UnixListener::bind(&socket).expect("bind parent socket");
+        let mut child = Command::new(env::current_exe().expect("locate test executable"))
+            .arg("session::tests::writer_process")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("KIKI_SESSION_TEST_SOCKET", &socket)
+            .env("KIKI_SESSION_TEST_HOME", home.path())
+            .env("KIKI_SESSION_TEST_ID", &id)
+            .env("KIKI_SESSION_TEST_BLOCK", "1")
+            .spawn()
+            .expect("start writer process");
+        let (mut stream, _) = listener.accept().expect("accept writer process");
+        let mut result = [0; 2];
+        stream.read_exact(&mut result).expect("read writer result");
+        session.close().expect("close parent session");
+        let reopened = Session::open(home.path(), &id);
+        stream.write_all(&[b'X']).expect("release writer process");
+        assert!(child.wait().expect("wait for writer process").success());
+        assert_eq!(result, [b'R', b'C']);
+        reopened
+            .expect("writer lock must not leak through exec")
+            .close()
+            .expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn subprocess_death_recovers_only_committed_operations() {
+        for (milestone, signal) in [
+            ("generation", b'G'),
+            ("execution", b'E'),
+            ("committed-step", b'C'),
+            ("background-only", b'B'),
+        ] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let session = create_session(&home, &workspace).await;
+            let id = session.id().to_owned();
+            let initial_checkpoint = session
+                .initial_checkpoint()
+                .expect("load initial checkpoint");
+            let initial_checkpoint_id: i64 = session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT checkpoint_id FROM entries WHERE kind = 'session_start'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read initial checkpoint ID");
+            let lock = lock_path(home.path(), &id);
+            let lock_inode = fs::metadata(&lock).expect("read lock metadata").ino();
+            session.close().expect("close parent session");
+            let socket = home.path().join(format!("{milestone}.sock"));
+            let (mut child, _stream, ready) =
+                recovery_process_result(home.path(), &id, workspace.path(), &socket, milestone);
+            let killed = child.kill();
+            let status = child.wait().expect("wait for killed recovery process");
+            assert_eq!(ready, signal);
+            killed.expect("kill blocked recovery process");
+            assert!(!status.success());
+            assert_eq!(
+                fs::metadata(&lock)
+                    .expect("read retained lock metadata")
+                    .ino(),
+                lock_inode
+            );
+
+            let recovered = Session::open(home.path(), &id).expect("recover interrupted session");
+            let connection = recovered
+                .connection_for_test()
+                .expect("lock recovered session connection");
+            let committed_checkpoint = match milestone {
+                "generation" | "execution" => {
+                    let (entries, checkpoints, pending_steps, closed_runs, active_entry_id):
+                        (i64, i64, i64, i64, i64) = connection
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), active_entry_id FROM session",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        )
+                        .expect("read recovered generation state");
+                    let (terminal_entry_id, terminal_checkpoint_id): (i64, i64) = connection
+                        .query_row(
+                            "SELECT terminal_entry_id, entries.checkpoint_id FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .expect("read recovered terminal");
+                    assert_eq!(
+                        (entries, checkpoints, pending_steps, closed_runs),
+                        (3, 1, 0, 1)
+                    );
+                    assert_eq!(active_entry_id, terminal_entry_id);
+                    assert_eq!(terminal_checkpoint_id, initial_checkpoint_id);
+                    None
+                }
+                "committed-step" => {
+                    let (entries, checkpoints, active_entry_id): (i64, i64, i64) = connection
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), active_entry_id FROM session",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .expect("read recovered committed-step state");
+                    let (terminal_entry_id, parent_id, terminal_checkpoint_id): (i64, i64, i64) =
+                        connection
+                            .query_row(
+                                "SELECT terminal_entry_id, entries.parent_id, entries.checkpoint_id FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .expect("read recovered terminal");
+                    let execution: (i64, i64) = connection
+                        .query_row(
+                            "SELECT id, checkpoint_id FROM entries WHERE kind = 'execution'",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .expect("read committed execution");
+                    let settled_entries = connection
+                        .prepare("SELECT settled_entry_id FROM model_steps ORDER BY id")
+                        .expect("prepare settled-step query")
+                        .query_map([], |row| row.get::<_, Option<i64>>(0))
+                        .expect("query settled steps")
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("read settled steps");
+                    assert_eq!((entries, checkpoints), (4, 2));
+                    assert_eq!(active_entry_id, terminal_entry_id);
+                    assert_eq!(parent_id, execution.0);
+                    assert_eq!(terminal_checkpoint_id, execution.1);
+                    assert_eq!(
+                        settled_entries,
+                        [Some(execution.0), Some(terminal_entry_id)]
+                    );
+                    let (runtime_identity, arena_state, authorisations_json): (
+                        String,
+                        Vec<u8>,
+                        String,
+                    ) = connection
+                        .query_row(
+                            "SELECT runtime_identity, arena_state, authorisations_json FROM checkpoints WHERE id = ?1",
+                            params![execution.1],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .expect("read committed checkpoint");
+                    let committed_checkpoint = super::codec::decode_checkpoint(
+                        runtime_identity,
+                        arena_state,
+                        &authorisations_json,
+                    )
+                    .expect("decode committed checkpoint");
+                    assert_ne!(
+                        committed_checkpoint.session_parts().1,
+                        initial_checkpoint.session_parts().1
+                    );
+                    Some(committed_checkpoint)
+                }
+                "background-only" => {
+                    let (entries, checkpoints, active_entry_id, terminal_entry_id):
+                        (i64, i64, i64, i64) = connection
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), session.active_entry_id, runs.terminal_entry_id FROM session JOIN runs",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .expect("read recovered background state");
+                    let (state, terminal_revision, details_json): (String, Option<i64>, String) =
+                        connection
+                            .query_row(
+                                "SELECT state, terminal_revision, details_json FROM subagent_tasks",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .expect("read recovered background task");
+                    assert_eq!((entries, checkpoints), (3, 1));
+                    assert_eq!(active_entry_id, terminal_entry_id);
+                    assert_eq!(state, "failed");
+                    assert!(terminal_revision.is_some());
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&details_json)
+                            .expect("decode recovered task details")["outcome"],
+                        serde_json::json!({ "Failed": { "message": "Interrupted by previous process exit" } })
+                    );
+                    None
+                }
+                _ => unreachable!(),
+            };
+            drop(connection);
+            if let Some(committed_checkpoint) = committed_checkpoint {
+                let mut restored_arena = arena(&workspace).await;
+                restored_arena
+                    .restore(committed_checkpoint)
+                    .await
+                    .expect("restore committed checkpoint");
+                assert_eq!(
+                    restored_arena
+                        .collect_result_values()
+                        .await
+                        .expect("collect committed result values"),
+                    BTreeMap::from([("committed".to_owned(), ToolValue::Integer(1))])
+                );
+            }
+            recovered.close().expect("close recovered session");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hot_delete_rollback_journal_requires_writable_recovery() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let initial = session
+            .initial_checkpoint()
+            .expect("load initial checkpoint");
+        let lock = lock_path(home.path(), &id);
+        let lock_inode = fs::metadata(&lock).expect("read lock metadata").ino();
+        let original_database_len = usize::try_from(
+            fs::metadata(database_path(home.path(), &id))
+                .expect("read initial database metadata")
+                .len(),
+        )
+        .expect("initial database size fits usize");
+        session.close().expect("close parent session");
+        let socket = home.path().join("hot-journal.sock");
+        let listener = UnixListener::bind(&socket).expect("bind parent socket");
+        let mut child = Command::new(env::current_exe().expect("locate test executable"))
+            .arg("session::tests::hot_rollback_process")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("KIKI_SESSION_TEST_SOCKET", &socket)
+            .env("KIKI_SESSION_TEST_HOME", home.path())
+            .env("KIKI_SESSION_TEST_ID", &id)
+            .spawn()
+            .expect("start rollback process");
+        let (mut stream, _) = listener.accept().expect("accept rollback process");
+        let mut ready = [0];
+        stream
+            .read_exact(&mut ready)
+            .expect("read rollback milestone");
+        let killed = child.kill();
+        let status = child.wait().expect("wait for killed rollback process");
+        assert_eq!(ready, [b'J']);
+        killed.expect("kill blocked rollback process");
+        assert!(!status.success());
+        let database = database_path(home.path(), &id);
+        let journal = database.with_file_name(format!("{id}.sqlite3-journal"));
+        let database_before = fs::read(&database).expect("snapshot hot database");
+        let journal_before = fs::read(&journal).expect("snapshot hot journal");
+        assert!(database_before.len() > original_database_len);
+        assert!(journal_before.starts_with(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]));
+        assert!(journal_before.len() > 512);
+        assert!(journal_before.len() < 1_000_000);
+        let error = Session::read_initial_checkpoint(home.path(), &id)
+            .expect_err("read-only access must reject a hot rollback journal");
+        let SessionError::Sqlite(error) = error else {
+            panic!("read-only hot-journal error must come from SQLite");
+        };
+        assert_eq!(error.sqlite_extended_error_code(), Some(776));
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(
+            fs::metadata(&lock)
+                .expect("read retained lock metadata")
+                .ino(),
+            lock_inode
+        );
+
+        let recovered = Session::open(home.path(), &id).expect("recover hot rollback journal");
+        let connection = recovered
+            .connection_for_test()
+            .expect("lock recovered session connection");
+        let state: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM runs), revision FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read recovered database state");
+        assert_eq!(state, (1, 1, 0, 1));
+        drop(connection);
+        assert_eq!(
+            recovered
+                .initial_checkpoint()
+                .expect("read recovered checkpoint"),
+            initial
+        );
+        assert!(!journal.exists() || fs::metadata(&journal).unwrap().len() == 0);
+        assert_eq!(
+            fs::metadata(&lock)
+                .expect("read retained lock metadata")
+                .ino(),
+            lock_inode
+        );
+        recovered.close().expect("close recovered session");
     }
 
     #[tokio::test]

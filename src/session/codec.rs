@@ -33,6 +33,8 @@ pub(super) enum CodecError {
     MissingExecution,
     #[error("stored session payload has unexpected kind")]
     InvalidPayload,
+    #[error("stored unfinished subagent task has terminal details")]
+    TerminalTaskDetails,
     #[error("stored session replay is missing")]
     MissingReplay,
     #[cfg(not(unix))]
@@ -398,6 +400,21 @@ pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecEr
         }),
     })
     .map_err(CodecError::from)
+}
+
+pub(super) fn fail_unfinished_task_details(
+    value: &str,
+    terminal_at_ms: i64,
+) -> Result<String, CodecError> {
+    let mut details: StoredTaskDetails = serde_json::from_str(value)?;
+    if details.terminal_at_ms.is_some() || details.outcome.is_some() {
+        return Err(CodecError::TerminalTaskDetails);
+    }
+    details.terminal_at_ms = Some(terminal_at_ms);
+    details.outcome = Some(StoredTaskOutcome::Failed {
+        message: super::INTERRUPTION_MESSAGE.to_owned(),
+    });
+    serde_json::to_string(&details).map_err(CodecError::from)
 }
 
 #[cfg(test)]
@@ -1001,7 +1018,7 @@ mod tests {
         decode_checkpoint, decode_execution_entry, decode_execution_value, decode_path,
         decode_task_details, decode_terminal_entry, decode_tool_value, encode_checkpoint,
         encode_execution, encode_execution_value, encode_path, encode_request, encode_task_details,
-        encode_terminal, encode_tool_value,
+        encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::subagents::TaskPersistedDetails;
@@ -1446,6 +1463,79 @@ mod tests {
             dictionary.get("nested"),
             Some(super::StoredToolValue::String(value)) if value == "value"
         ));
+    }
+
+    #[test]
+    fn interrupted_task_details_codec_preserves_unfinished_history() {
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let record = crate::subagents::TaskRecord::for_test(
+            "0a",
+            9,
+            selection,
+            Some("01"),
+            2,
+            vec![task_usage(), task_usage()],
+        )
+        .with_parameters_for_test("investigate".to_owned(), selection, true)
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 100,
+            terminal_at_ms: None,
+            state: crate::subagents::TaskState::Running,
+            step_count: 3,
+            elapsed: std::time::Duration::new(4, 567_890_123),
+            observed_at_ms: 200,
+            attempt_evidence: vec![
+                crate::subagents::TaskAttempt::for_test(1, 1, Some(task_usage())),
+                crate::subagents::TaskAttempt::for_test(1, 2, None),
+            ],
+            executions: vec![crate::subagents::TaskExecution::for_test(
+                2,
+                "value = 1".to_owned(),
+                "reasoning".to_owned(),
+                task_execution(),
+                vec![task_usage(), task_usage()],
+            )],
+            outcome: None,
+        });
+        let original = encode_task_details(&record).expect("encode task details");
+        let recovered =
+            fail_unfinished_task_details(&original, 300).expect("fail unfinished task details");
+        let mut original: serde_json::Value =
+            serde_json::from_str(&original).expect("decode original task details");
+        let mut recovered: serde_json::Value =
+            serde_json::from_str(&recovered).expect("decode recovered task details");
+        assert_eq!(recovered["terminal_at_ms"], serde_json::json!(300));
+        assert_eq!(
+            recovered["outcome"],
+            serde_json::json!({ "Failed": { "message": "Interrupted by previous process exit" } })
+        );
+        for details in [&mut original, &mut recovered] {
+            let object = details.as_object_mut().expect("task details object");
+            object.remove("terminal_at_ms");
+            object.remove("outcome");
+        }
+        assert_eq!(recovered, original);
+        let object = recovered.as_object().expect("task details object");
+        assert!(!object.contains_key("cost"));
+        assert!(!object.contains_key("offline"));
+
+        for (terminal_at_ms, outcome) in [
+            (serde_json::json!(200), serde_json::Value::Null),
+            (
+                serde_json::Value::Null,
+                serde_json::json!({ "Failed": { "message": "already terminal" } }),
+            ),
+        ] {
+            let mut invalid = original.clone();
+            let object = invalid.as_object_mut().expect("task details object");
+            object.insert("terminal_at_ms".to_owned(), terminal_at_ms);
+            object.insert("outcome".to_owned(), outcome);
+            assert!(fail_unfinished_task_details(&invalid.to_string(), 300).is_err());
+        }
     }
 
     #[test]
