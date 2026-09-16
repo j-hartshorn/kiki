@@ -10,7 +10,7 @@ use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 use thiserror::Error;
@@ -151,6 +151,7 @@ pub(crate) enum SessionWriteKind {
     Settlement,
     Closure,
     TaskAdmission,
+    TaskStep,
     TaskTerminal,
 }
 
@@ -181,6 +182,37 @@ impl TaskAdmission {
                 .map_err(|error| SessionError::Codec(error.to_string()))?,
         })
     }
+}
+
+pub(crate) struct TaskSnapshot {
+    task_id: i64,
+    state: &'static str,
+    task_revision: i64,
+    details_json: String,
+}
+
+impl TaskSnapshot {
+    pub(crate) fn from_record(record: &TaskRecord) -> Result<Self, SessionError> {
+        let state = record.observation().state();
+        if state.is_terminal() || record.terminal_at_ms().is_some() || record.outcome().is_some() {
+            return Err(SessionError::InvalidTransition);
+        }
+        Ok(Self {
+            task_id: task_sql_id(record.id().as_str())?,
+            state: state.storage_name(),
+            task_revision: i64::try_from(record.revision())
+                .map_err(|_| SessionError::IdOverflow)?,
+            details_json: codec::encode_task_details(record)
+                .map_err(|error| SessionError::Codec(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskStepCommit {
+    Committed(u64),
+    Superseded,
+    Rejected,
 }
 
 pub(crate) struct TaskTerminal {
@@ -531,6 +563,21 @@ impl SessionWriter {
         .await
     }
 
+    pub(crate) async fn task_step(
+        &self,
+        step: TaskSnapshot,
+        reject: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<TaskStepCommit, SessionError> {
+        self.write(SessionWriteKind::TaskStep, move |connection| {
+            if reject() {
+                Ok(TaskStepCommit::Rejected)
+            } else {
+                task_step(connection, &step)
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn terminal_subagent_task(
         &self,
         terminal: TaskTerminal,
@@ -774,6 +821,48 @@ fn admit_subagent_task(
     u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
 }
 
+fn task_step(
+    connection: &mut Connection,
+    step: &TaskSnapshot,
+) -> Result<TaskStepCommit, SessionError> {
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let task = transaction
+        .query_row(
+            "SELECT terminal_revision, task_revision FROM subagent_tasks WHERE id = ?1",
+            params![step.task_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((terminal_revision, task_revision)) = task else {
+        return Err(SessionError::InvalidTransition);
+    };
+    if terminal_revision.is_some() || task_revision >= step.task_revision {
+        return Ok(TaskStepCommit::Superseded);
+    }
+    if transaction.execute(
+        "UPDATE subagent_tasks SET state = ?1, task_revision = ?2, details_json = ?3 WHERE id = ?4 AND terminal_revision IS NULL AND task_revision < ?2",
+        params![step.state, step.task_revision, step.details_json, step.task_id],
+    )? != 1
+    {
+        return Ok(TaskStepCommit::Superseded);
+    }
+    let revision: i64 = transaction.query_row(
+        "SELECT revision FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "UPDATE session SET updated_at_ms = ?1, revision = ?2 WHERE singleton = 1",
+        params![now, next_revision],
+    )?;
+    transaction.commit()?;
+    Ok(TaskStepCommit::Committed(
+        u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)?,
+    ))
+}
+
 fn terminal_subagent_task(
     connection: &mut Connection,
     terminal: &TaskTerminal,
@@ -1009,7 +1098,7 @@ fn now_ms() -> Result<i64, SessionError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::env;
     use std::fs;
     #[cfg(unix)]
@@ -1017,6 +1106,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::Command;
+    use std::time::Duration;
 
     use rusqlite::{Connection, params};
     #[cfg(unix)]
@@ -1026,9 +1116,13 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{PersistedCode, PersistedTerminal, Session, SessionError, SessionId};
+    use super::{
+        PersistedCode, PersistedTerminal, Session, SessionError, SessionId, TaskAdmission,
+        TaskSnapshot, TaskStepCommit, TaskTerminal,
+    };
     use crate::arena::{Arena, Checkpoint, ExecutionOutcome};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
+    use crate::subagents::TaskPersistedDetails;
     use crate::tools::ToolHost;
 
     fn worker_path() -> PathBuf {
@@ -2118,6 +2212,250 @@ mod tests {
             (2, 1, 3, 1)
         );
         drop(connection);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn task_step_commit_advances_only_newer_nonterminal_snapshots() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("parent".to_owned())
+            .await
+            .expect("start parent run");
+        let origin_step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start parent model step");
+        let admitted =
+            crate::subagents::TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Starting,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 100,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&admitted, origin_step_id).expect("encode admission"),
+                || false,
+            )
+            .await
+            .expect("admit task")
+            .expect("commit task admission");
+        let newer =
+            crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Running,
+                    step_count: 1,
+                    elapsed: Duration::from_millis(25),
+                    observed_at_ms: 125,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        assert_eq!(
+            writer
+                .task_step(
+                    TaskSnapshot::from_record(&newer).expect("encode newer snapshot"),
+                    || false,
+                )
+                .await
+                .expect("commit newer snapshot"),
+            TaskStepCommit::Committed(5)
+        );
+        let persisted_after_newer: (String, Option<i64>, i64, String, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, task_revision, details_json, (SELECT revision FROM session) FROM subagent_tasks WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read newer task snapshot");
+        assert_eq!(persisted_after_newer.0, "running");
+        assert_eq!(persisted_after_newer.1, None);
+        assert_eq!(persisted_after_newer.2, 2);
+        assert_eq!(persisted_after_newer.4, 5);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&persisted_after_newer.3)
+                .expect("decode newer task details")["observation"]["step_count"],
+            1
+        );
+
+        let rejected =
+            crate::subagents::TaskRecord::for_test("00", 3, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Running,
+                    step_count: 2,
+                    elapsed: Duration::from_millis(50),
+                    observed_at_ms: 150,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        assert_eq!(
+            writer
+                .task_step(
+                    TaskSnapshot::from_record(&rejected).expect("encode rejected snapshot"),
+                    || true,
+                )
+                .await
+                .expect("reject cancelled snapshot"),
+            TaskStepCommit::Rejected
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT state, terminal_revision, task_revision, details_json, (SELECT revision FROM session) FROM subagent_tasks WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .expect("read unchanged rejected task"),
+            persisted_after_newer
+        );
+
+        for snapshot in [&newer, &admitted] {
+            assert_eq!(
+                writer
+                    .task_step(
+                        TaskSnapshot::from_record(snapshot).expect("encode stale snapshot"),
+                        || false,
+                    )
+                    .await
+                    .expect("reject stale snapshot"),
+                TaskStepCommit::Superseded
+            );
+        }
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT state, terminal_revision, task_revision, details_json, (SELECT revision FROM session) FROM subagent_tasks WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .expect("read unchanged stale task"),
+            persisted_after_newer
+        );
+
+        let terminal =
+            crate::subagents::TaskRecord::for_test("00", 3, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: Some(300),
+                    state: crate::subagents::TaskState::Completed,
+                    step_count: 1,
+                    elapsed: Duration::from_millis(200),
+                    observed_at_ms: 300,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: Some(crate::subagents::TaskOutcome::Completed(
+                        crate::subagents::ChildResult::new("done".to_owned(), BTreeMap::new()),
+                    )),
+                });
+        writer
+            .terminal_subagent_task(TaskTerminal::from_record(&terminal).expect("encode terminal"))
+            .await
+            .expect("commit terminal task");
+        let terminal_state: (String, Option<i64>, i64, String, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, task_revision, details_json, (SELECT revision FROM session) FROM subagent_tasks WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read terminal task");
+        assert_eq!(terminal_state.0, "completed");
+        assert_eq!(terminal_state.1, Some(6));
+        assert_eq!(terminal_state.2, 3);
+        assert_eq!(terminal_state.4, 6);
+
+        let late =
+            crate::subagents::TaskRecord::for_test("00", 99, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Running,
+                    step_count: 99,
+                    elapsed: Duration::from_secs(99),
+                    observed_at_ms: 99_000,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        assert_eq!(
+            writer
+                .task_step(
+                    TaskSnapshot::from_record(&late).expect("encode late snapshot"),
+                    || false,
+                )
+                .await
+                .expect("reject late snapshot"),
+            TaskStepCommit::Superseded
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT state, terminal_revision, task_revision, details_json, (SELECT revision FROM session) FROM subagent_tasks WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .expect("read unchanged terminal task"),
+            terminal_state
+        );
+
+        let unknown =
+            crate::subagents::TaskRecord::for_test("01", 2, selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 0,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Running,
+                    step_count: 0,
+                    elapsed: Duration::ZERO,
+                    observed_at_ms: 0,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: None,
+                });
+        assert!(matches!(
+            writer
+                .task_step(
+                    TaskSnapshot::from_record(&unknown).expect("encode unknown snapshot"),
+                    || false,
+                )
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        let (entries, checkpoints): (i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count immutable session rows");
+        assert_eq!((entries, checkpoints), (2, 1));
+
         drop(writer);
         session.close().expect("close session");
     }

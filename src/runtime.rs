@@ -1767,6 +1767,57 @@ mod tests {
         attempts: Vec<AttemptAccounting>,
     }
 
+    #[derive(Clone)]
+    struct TaskStepFailureChildFactory {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct TaskStepFailureChildModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ChildModelFactory for TaskStepFailureChildFactory {
+        type Model = TaskStepFailureChildModel;
+
+        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+            TaskStepFailureChildModel {
+                calls: self.calls.clone(),
+            }
+        }
+    }
+
+    impl Model for TaskStepFailureChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => CompletedModelAction::Code {
+                        source: "child_value = 1".to_owned(),
+                        call_id: ModelCallId::new("child-task-step"),
+                        commentary: None,
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "child complete".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
     impl Model for GatedChildModel {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
@@ -3855,6 +3906,131 @@ mod tests {
             ToolCallSummary::Applied => format!("{}:applied", call.tool.label()),
             ToolCallSummary::Subagent(id) => format!("{}:{id}", call.tool.label()),
         }
+    }
+
+    #[tokio::test]
+    async fn child_task_step_storage_failure_disables_runtime_without_event_acknowledgement() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_task_step BEFORE UPDATE ON subagent_tasks WHEN NEW.terminal_revision IS NULL BEGIN SELECT RAISE(ABORT, 'reject task step'); END;",
+            )
+            .expect("reject child task-step writes");
+        let child_factory = TaskStepFailureChildFactory {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                child_factory.clone(),
+            )),
+        );
+        let mut child_events = coordinator
+            .take_event_receiver()
+            .expect("reserve undrained child event receiver");
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                SelectedScriptedModel {
+                    model: ScriptedModel::new(vec![
+                        ModelAction::Code {
+                            source: "task = await start_subagent('child work')\nawait task.wait()"
+                                .to_owned(),
+                        },
+                        ModelAction::Message {
+                            text: "must not run".to_owned(),
+                        },
+                    ]),
+                    selection,
+                    message_waiting: None,
+                },
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            coordinator.clone(),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "wait for child".to_owned(),
+            })
+            .await
+            .expect("submit foreground request");
+
+        let mut runtime_events = events_until_disabled(&mut events).await;
+        assert_eq!(child_factory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                    }
+                ))
+                .count(),
+            1
+        );
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must be rejected".to_owned(),
+            })
+            .await
+            .expect("submit after storage failure");
+        let mut foreground_settled = false;
+        let mut later_submission_rejected = false;
+        while !foreground_settled || !later_submission_rejected {
+            let event = next_event(&mut events).await;
+            foreground_settled |= matches!(event, RuntimeEvent::RunSettled { run_id: RunId(1) });
+            later_submission_rejected |= matches!(
+                event,
+                RuntimeEvent::SubmissionRejectedDisabled {
+                    reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                }
+            );
+            runtime_events.push(event);
+        }
+        assert!(runtime_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CancelledRun { .. },
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(coordinator.storage_failure_token().is_cancelled());
+        assert_eq!(coordinator.active_count().await, 0);
+
+        shutdown_controller(commands, controller).await;
+        while let Ok(event) = child_events.try_recv() {
+            assert!(
+                !matches!(event, CoordinatorEvent::Finished { .. }),
+                "storage failure must not publish an uncommitted terminal result"
+            );
+        }
+        drop(child_events);
+        drop(coordinator);
+        session.close().expect("close session");
     }
 
     #[tokio::test]

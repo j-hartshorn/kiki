@@ -28,7 +28,9 @@ use crate::config::{
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::prompt::child_prompt;
-use crate::session::{SessionError, SessionWriter, TaskAdmission, TaskTerminal};
+use crate::session::{
+    SessionError, SessionWriter, TaskAdmission, TaskSnapshot, TaskStepCommit, TaskTerminal,
+};
 use crate::telemetry::{ChildStopCause, CoordinatorOperation, Settlement, Trace, TraceEvent};
 use crate::tools::{ToolError, ToolValue};
 
@@ -729,6 +731,10 @@ impl AgentInvocationContext {
 
     pub(crate) fn set_origin_step_id(&mut self, origin_step_id: u64) {
         self.caller.origin_step_id = Some(origin_step_id);
+    }
+
+    pub(crate) async fn persist_child_step(&self) -> bool {
+        self.coordinator.persist_child_step(&self.caller).await
     }
 
     pub(crate) fn execution(
@@ -1569,35 +1575,37 @@ impl TaskRecord {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_persisted_details_for_test(
-        mut self,
-        admitted_at_ms: i64,
-        terminal_at_ms: Option<i64>,
-        state: TaskState,
-        step_count: u64,
-        elapsed: Duration,
-        observed_at_ms: i64,
-        attempt_evidence: Vec<TaskAttempt>,
-        executions: Vec<TaskExecution>,
-        outcome: Option<TaskOutcome>,
-    ) -> Self {
-        self.admitted_at_ms = admitted_at_ms;
-        self.terminal_at_ms = terminal_at_ms;
-        self.observation.state = state;
-        self.observation.step_count = step_count;
-        self.observation.elapsed = elapsed;
-        self.observation.observed_at_ms = observed_at_ms;
-        self.observation.error = match &outcome {
+    pub(crate) fn with_persisted_details_for_test(mut self, details: TaskPersistedDetails) -> Self {
+        self.admitted_at_ms = details.admitted_at_ms;
+        self.terminal_at_ms = details.terminal_at_ms;
+        self.observation.state = details.state;
+        self.observation.step_count = details.step_count;
+        self.observation.elapsed = details.elapsed;
+        self.observation.observed_at_ms = details.observed_at_ms;
+        self.observation.error = match &details.outcome {
             Some(TaskOutcome::Failed(error)) => Some(error.message().to_owned()),
             Some(TaskOutcome::Cancelled) => Some("cancelled".to_owned()),
             Some(TaskOutcome::TimedOut) => Some("timed out".to_owned()),
             _ => None,
         };
-        self.attempt_evidence = attempt_evidence;
-        self.executions = executions;
-        self.outcome = outcome;
+        self.attempt_evidence = details.attempt_evidence;
+        self.executions = details.executions;
+        self.outcome = details.outcome;
         self
     }
+}
+
+#[cfg(test)]
+pub(crate) struct TaskPersistedDetails {
+    pub(crate) admitted_at_ms: i64,
+    pub(crate) terminal_at_ms: Option<i64>,
+    pub(crate) state: TaskState,
+    pub(crate) step_count: u64,
+    pub(crate) elapsed: Duration,
+    pub(crate) observed_at_ms: i64,
+    pub(crate) attempt_evidence: Vec<TaskAttempt>,
+    pub(crate) executions: Vec<TaskExecution>,
+    pub(crate) outcome: Option<TaskOutcome>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2806,6 +2814,53 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .map(|task| task.record(now, observed_at_ms))
     }
 
+    async fn persist_child_step(&self, caller: &Caller) -> bool {
+        let (writer, record, task_cancellation) = {
+            let inner = self.lock_inner(CoordinatorOperation::Record).await;
+            let CallerOwner::Child(id) = &caller.owner else {
+                return true;
+            };
+            if caller.session != inner.session || inner.storage_failed {
+                return false;
+            }
+            let Some(writer) = self.writer.clone() else {
+                return true;
+            };
+            let Some(task) = inner.tasks.get(id) else {
+                return false;
+            };
+            (
+                writer,
+                task.record(self.now(), self.unix_time_ms()),
+                task.cancellation.clone(),
+            )
+        };
+        let snapshot = match TaskSnapshot::from_record(&record) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                self.latch_storage_failure().await;
+                return false;
+            }
+        };
+        let failure = self.storage_failure.clone();
+        match writer
+            .task_step(snapshot, move || {
+                task_cancellation.is_cancelled() || failure.is_cancelled()
+            })
+            .await
+        {
+            Ok(TaskStepCommit::Committed(revision)) => {
+                debug_assert!(revision > 0);
+                true
+            }
+            Ok(TaskStepCommit::Superseded | TaskStepCommit::Rejected) => false,
+            Err(_) => {
+                self.latch_storage_failure().await;
+                false
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn active_count(&self) -> usize {
         self.inner.lock().await.active_slots
@@ -3330,7 +3385,10 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::{Duration, Instant};
 
     use futures::FutureExt;
@@ -3350,8 +3408,8 @@ mod tests {
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
     };
     use crate::model::{
-        AttemptAccounting, Model, ModelAction, ModelContextEntry, ModelFailure, ModelHistory,
-        ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
+        AttemptAccounting, Model, ModelAction, ModelCallId, ModelContextEntry, ModelFailure,
+        ModelHistory, ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
     use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::telemetry::TraceOwner;
@@ -3419,6 +3477,112 @@ mod tests {
                         .expect("test configures one child script"),
                 ),
                 histories: self.histories.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TaskStepGatedChildFactory {
+        calls: Arc<AtomicUsize>,
+        histories: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        second_call_started: Arc<Notify>,
+        allow_second_call: Arc<Notify>,
+        step_attempts: Vec<Vec<AttemptAccounting>>,
+    }
+
+    struct TaskStepGatedChildModel {
+        calls: Arc<AtomicUsize>,
+        histories: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        second_call_started: Arc<Notify>,
+        allow_second_call: Arc<Notify>,
+        step_attempts: Vec<Vec<AttemptAccounting>>,
+    }
+
+    impl TaskStepGatedChildFactory {
+        fn new() -> Self {
+            Self::with_attempts(vec![
+                vec![AttemptAccounting::UsageUnavailable],
+                vec![AttemptAccounting::UsageUnavailable],
+                vec![AttemptAccounting::UsageUnavailable],
+            ])
+        }
+
+        fn with_attempts(step_attempts: Vec<Vec<AttemptAccounting>>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                histories: Arc::new(Mutex::new(Vec::new())),
+                second_call_started: Arc::new(Notify::new()),
+                allow_second_call: Arc::new(Notify::new()),
+                step_attempts,
+            }
+        }
+    }
+
+    impl super::ChildModelFactory for TaskStepGatedChildFactory {
+        type Model = TaskStepGatedChildModel;
+
+        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+            TaskStepGatedChildModel {
+                calls: self.calls.clone(),
+                histories: self.histories.clone(),
+                second_call_started: self.second_call_started.clone(),
+                allow_second_call: self.allow_second_call.clone(),
+                step_attempts: self.step_attempts.clone(),
+            }
+        }
+    }
+
+    impl Model for TaskStepGatedChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.histories
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let attempts = self.step_attempts.get(call).cloned().unwrap_or_default();
+                for (index, accounting) in attempts.iter().cloned().enumerate() {
+                    let attempt = u32::try_from(index + 1).expect("attempt ordinal");
+                    progress(ModelProgress::AttemptStarted { attempt });
+                    progress(ModelProgress::AttemptSettled {
+                        attempt,
+                        accounting,
+                    });
+                }
+                let action = match call {
+                    0 => ModelAction::Code {
+                        source: "first = 1".to_owned(),
+                        call_id: ModelCallId::new("task-step-first"),
+                        commentary: None,
+                    },
+                    1 => {
+                        self.second_call_started.notify_one();
+                        self.allow_second_call.notified().await;
+                        ModelAction::Code {
+                            source: "second = first + 1".to_owned(),
+                            call_id: ModelCallId::new("task-step-second"),
+                            commentary: None,
+                        }
+                    }
+                    2 => ModelAction::Message {
+                        text: "child complete".to_owned(),
+                    },
+                    _ => return Err(crate::model::ModelError::Exhausted.into()),
+                };
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts,
+                })
             }
         }
     }
@@ -3775,6 +3939,593 @@ mod tests {
         drop(started);
         drop(caller);
         drop(admitted);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn child_step_commit_precedes_next_model_call() {
+        let task_step_gate = SessionWriteGate::new(SessionWriteKind::TaskStep);
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(task_step_gate.clone())).await;
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let factory = TaskStepGatedChildFactory::new();
+        let trace_file = workspace.path().join("trace.jsonl");
+        let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+        )
+        .with_session(writer.clone())
+        .with_trace(trace_owner.handle());
+        let _events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        tokio::select! {
+            () = task_step_gate.wait_until_started() => {}
+            () = factory.second_call_started.notified() => {
+                panic!("next model call began before the child step committed");
+            }
+        }
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.histories.lock().unwrap().len(), 1);
+        assert_eq!(
+            coordinator
+                .record(child.id())
+                .await
+                .expect("child record")
+                .executions()
+                .len(),
+            1
+        );
+
+        task_step_gate.release();
+        factory.second_call_started.notified().await;
+        factory.allow_second_call.notify_one();
+        let (result, observation) = coordinator
+            .wait(&caller, child.id())
+            .await
+            .expect("child completes");
+        assert_eq!(result.message(), "child complete");
+        assert_eq!(observation.state(), TaskState::Completed);
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(factory.histories.lock().unwrap().len(), 3);
+
+        let (state, task_revision, details_json, entries, checkpoints): (String, i64, String, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, task_revision, details_json, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints) FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read persisted child");
+        let details: serde_json::Value =
+            serde_json::from_str(&details_json).expect("decode task details");
+        assert_eq!(state, "completed");
+        assert!(task_revision > 1);
+        assert_eq!(
+            details["executions"]
+                .as_array()
+                .expect("stored executions")
+                .iter()
+                .map(|execution| execution["source"].as_str().expect("execution source"))
+                .collect::<Vec<_>>(),
+            ["first = 1", "second = first + 1"]
+        );
+        assert_eq!((entries, checkpoints), (2, 1));
+
+        coordinator.shutdown().await;
+        trace_owner.shutdown().expect("trace shutdown");
+        let terminal_settlement_lock_acquisitions = fs::read_to_string(&trace_file)
+            .expect("trace file")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace event"))
+            .filter(|event| {
+                event["event"] == "coordinator_lock_acquired"
+                    && event["operation"] == "finish_child_settlement"
+            })
+            .count();
+        assert_eq!(terminal_settlement_lock_acquisitions, 2);
+
+        drop(child);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn identical_attempts_remain_distinct_in_child_step_and_terminal_snapshots() {
+        let task_step_gate = SessionWriteGate::new(SessionWriteKind::TaskStep);
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(task_step_gate.clone())).await;
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let accounting = known_usage();
+        let factory = TaskStepGatedChildFactory::with_attempts(vec![
+            vec![accounting.clone(), accounting.clone()],
+            Vec::new(),
+            Vec::new(),
+        ]);
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+        )
+        .with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        task_step_gate.wait_until_started().await;
+        task_step_gate.release();
+        factory.second_call_started.notified().await;
+        let step_details: serde_json::Value = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT details_json FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read child-step snapshot")
+            .parse()
+            .expect("decode child-step details");
+        assert_eq!(step_details["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            step_details["attempt_evidence"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            step_details["attempt_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|attempt| (
+                    attempt["model_step"].as_u64().unwrap(),
+                    attempt["provider_attempt"].as_u64().unwrap(),
+                ))
+                .collect::<Vec<_>>(),
+            [(1, 1), (1, 2)]
+        );
+        assert_eq!(step_details["executions"].as_array().unwrap().len(), 1);
+
+        factory.allow_second_call.notify_one();
+        coordinator
+            .wait(&caller, child.id())
+            .await
+            .expect("child completes");
+        let terminal_details: serde_json::Value = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT details_json FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read terminal task")
+            .parse()
+            .expect("decode terminal details");
+        assert_eq!(terminal_details["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            terminal_details["attempt_evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let record = coordinator
+            .record(child.id())
+            .await
+            .expect("terminal record");
+        assert_eq!(record.attempts(), [accounting.clone(), accounting]);
+        assert_eq!(
+            record.observation().cost(),
+            crate::pricing::estimate_run_cost(record.attempts())
+        );
+
+        coordinator.shutdown().await;
+        drop(child);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_task_step_commit_stops_later_child_work() {
+        let task_step_gate = SessionWriteGate::new(SessionWriteKind::TaskStep);
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(task_step_gate.clone())).await;
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let factory = TaskStepGatedChildFactory::new();
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+        )
+        .with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        task_step_gate.wait_until_started().await;
+        let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
+        let signal = WaitPhaseSignal::new(1, phase_sender);
+        let cancellation = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let caller = caller.clone();
+            let id = child.id().clone();
+            async move {
+                coordinator
+                    .cancel_with_phase(&caller, &id, Some(&signal))
+                    .await
+            }
+        });
+        assert_eq!(phase_receiver.recv().await, Some(1));
+        let stopping = coordinator
+            .get(&caller, child.id())
+            .await
+            .expect("read stopping task");
+        assert_eq!(stopping.state(), TaskState::Stopping);
+        assert_eq!(stopping.error(), Some("cancellation requested"));
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+
+        task_step_gate.release();
+        assert_eq!(
+            cancellation
+                .await
+                .expect("join cancellation")
+                .expect("durably cancel child")
+                .state(),
+            TaskState::Cancelled
+        );
+        assert_cancelled(
+            coordinator
+                .wait(&caller, child.id())
+                .await
+                .expect_err("cancelled child cannot return a result"),
+            child.id(),
+        );
+        let (state, terminal_revision, details_json): (String, Option<i64>, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, details_json FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read cancelled task");
+        let details: serde_json::Value =
+            serde_json::from_str(&details_json).expect("decode task details");
+        assert_eq!(state, "cancelled");
+        assert!(terminal_revision.is_some());
+        assert_eq!(details["executions"].as_array().unwrap().len(), 1);
+        assert_eq!(details["executions"][0]["source"], "first = 1");
+
+        coordinator.shutdown().await;
+        drop(child);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn deadline_during_task_step_commit_stops_later_child_work() {
+        let task_step_gate = SessionWriteGate::new(SessionWriteKind::TaskStep);
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(task_step_gate.clone())).await;
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let factory = TaskStepGatedChildFactory::new();
+        let coordinator = SubagentCoordinator::with_clock(
+            SubagentPolicy {
+                timeout: Duration::from_secs(1),
+                ..policy()
+            },
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+            clock.clone(),
+        )
+        .with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        task_step_gate.wait_until_started().await;
+        clock.advance(Duration::from_secs(1));
+        coordinator.service().await;
+        let stopping = coordinator
+            .get(&caller, child.id())
+            .await
+            .expect("read stopping task");
+        assert_eq!(stopping.state(), TaskState::Stopping);
+        assert_eq!(stopping.error(), Some("deadline expired"));
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+
+        task_step_gate.release();
+        assert_timed_out(
+            coordinator
+                .wait(&caller, child.id())
+                .await
+                .expect_err("timed-out child cannot return a result"),
+            child.id(),
+        );
+        let (state, terminal_revision, executions): (String, Option<i64>, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, details_json FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read timed-out task");
+        assert_eq!(state, "timed_out");
+        assert!(terminal_revision.is_some());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&executions)
+                .expect("decode task details")["executions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        coordinator.shutdown().await;
+        drop(child);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn task_step_storage_failure_stops_children_without_a_terminal_result() {
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(None).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_task_step BEFORE UPDATE ON subagent_tasks WHEN NEW.terminal_revision IS NULL BEGIN SELECT RAISE(ABORT, 'reject task step'); END;",
+            )
+            .expect("reject task steps");
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let factory = TaskStepGatedChildFactory::new();
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+        )
+        .with_session(writer.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        coordinator.storage_failure_token().cancelled().await;
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.active_count().await, 0);
+        assert_eq!(
+            coordinator
+                .start(
+                    &caller,
+                    parameters(),
+                    super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+                )
+                .await,
+            Err(AdmissionError::StorageUnavailable)
+        );
+        assert_eq!(
+            coordinator.wait(&caller, child.id()).await,
+            Err(WaitError::StorageUnavailable)
+        );
+        let (state, terminal_revision, task_revision, details_json):
+            (String, Option<i64>, i64, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state, terminal_revision, task_revision, details_json FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read last committed task");
+        assert_eq!(state, "starting");
+        assert_eq!(terminal_revision, None);
+        assert_eq!(task_revision, 1);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&details_json)
+                .expect("decode admitted task details")["executions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, CoordinatorEvent::Finished { .. }),
+                "storage failure must not publish an uncommitted terminal result"
+            );
+        }
+        timeout(Duration::from_secs(1), coordinator.shutdown())
+            .await
+            .expect("shutdown completes after task-step failure");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, CoordinatorEvent::Finished { .. }),
+                "storage failure must not publish an uncommitted terminal result"
+            );
+        }
+
+        drop(events);
+        drop(child);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_task_step_commit_without_event_acknowledgement() {
+        let task_step_gate = SessionWriteGate::new(SessionWriteKind::TaskStep);
+        let (_home, workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(Some(task_step_gate.clone())).await;
+        let parent = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open parent tool host"),
+        )
+        .await
+        .expect("create parent arena");
+        let factory = TaskStepGatedChildFactory::new();
+        let coordinator = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "child system prompt".to_owned(),
+                factory.clone(),
+            )),
+        )
+        .with_session(writer.clone());
+        let events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator event receiver");
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        let child = coordinator
+            .start(
+                &caller,
+                parameters(),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .expect("admit child");
+
+        task_step_gate.wait_until_started().await;
+        let mut updates = coordinator.subscribe().await;
+        let shutdown = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.shutdown().await }
+        });
+        updates
+            .changed()
+            .await
+            .expect("shutdown requests task cancellation");
+        let stopping = coordinator
+            .get(&caller, child.id())
+            .await
+            .expect("read stopping task");
+        assert_eq!(stopping.state(), TaskState::Stopping);
+        assert_eq!(stopping.error(), Some("session shutdown requested"));
+        assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+
+        task_step_gate.release();
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown completes after task-step save releases")
+            .expect("join shutdown");
+        let state: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT state FROM subagent_tasks WHERE id = ?1",
+                [i64::from_str_radix(child.id().as_str(), 16).expect("task SQL ID")],
+                |row| row.get(0),
+            )
+            .expect("read shutdown terminal");
+        assert_eq!(state, "cancelled");
+
+        drop(events);
+        drop(child);
+        drop(caller);
         drop(coordinator);
         drop(writer);
         session.close().expect("close session");

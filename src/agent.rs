@@ -1106,6 +1106,14 @@ impl<M: Model> Agent<M> {
                                 execution,
                                 attempts: step_attempts,
                             });
+                            if let Some(context) = &self.invocation_context
+                                && !context.persist_child_step().await
+                            {
+                                return Err(AgentError::Cancelled {
+                                    attempts,
+                                    evidence: None,
+                                });
+                            }
                         }
                         Err(error) => {
                             let cancelled = matches!(&error, ArenaError::Cancelled { .. });

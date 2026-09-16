@@ -1004,6 +1004,7 @@ mod tests {
         encode_terminal, encode_tool_value,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
+    use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
     #[test]
@@ -1326,28 +1327,28 @@ mod tests {
             vec![task_usage()],
         )
         .with_parameters_for_test("investigate".to_owned(), selection, true)
-        .with_persisted_details_for_test(
-            100,
-            Some(200),
-            crate::subagents::TaskState::Completed,
-            3,
-            std::time::Duration::new(4, 5),
-            200,
-            vec![
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 100,
+            terminal_at_ms: Some(200),
+            state: crate::subagents::TaskState::Completed,
+            step_count: 3,
+            elapsed: std::time::Duration::new(4, 5),
+            observed_at_ms: 200,
+            attempt_evidence: vec![
                 crate::subagents::TaskAttempt::for_test(1, 1, Some(task_usage())),
                 crate::subagents::TaskAttempt::for_test(1, 2, None),
             ],
-            vec![crate::subagents::TaskExecution::for_test(
+            executions: vec![crate::subagents::TaskExecution::for_test(
                 2,
                 "value = 1".to_owned(),
                 "reasoning".to_owned(),
                 task_execution(),
                 vec![crate::model::AttemptAccounting::UsageUnavailable],
             )],
-            Some(crate::subagents::TaskOutcome::Completed(
+            outcome: Some(crate::subagents::TaskOutcome::Completed(
                 crate::subagents::ChildResult::new("done".to_owned(), values),
             )),
-        );
+        });
 
         let details = decode_task_details(&encode_task_details(&record).expect("encode task"))
             .expect("decode task");
@@ -1476,17 +1477,17 @@ mod tests {
         for (state, outcome, expected) in cases {
             let record =
                 crate::subagents::TaskRecord::for_test("0a", 2, selection, None, 1, Vec::new())
-                    .with_persisted_details_for_test(
-                        10,
-                        Some(20),
+                    .with_persisted_details_for_test(TaskPersistedDetails {
+                        admitted_at_ms: 10,
+                        terminal_at_ms: Some(20),
                         state,
-                        0,
-                        std::time::Duration::ZERO,
-                        20,
-                        Vec::new(),
-                        Vec::new(),
-                        Some(outcome),
-                    );
+                        step_count: 0,
+                        elapsed: std::time::Duration::ZERO,
+                        observed_at_ms: 20,
+                        attempt_evidence: Vec::new(),
+                        executions: Vec::new(),
+                        outcome: Some(outcome),
+                    });
             let details = decode_task_details(&encode_task_details(&record).expect("encode task"))
                 .expect("decode task");
             let actual = match details.outcome.expect("terminal outcome") {
@@ -1517,19 +1518,19 @@ mod tests {
             2,
             vec![task_usage()],
         )
-        .with_persisted_details_for_test(
-            10,
-            Some(20),
-            crate::subagents::TaskState::Failed,
-            1,
-            std::time::Duration::ZERO,
-            20,
-            Vec::new(),
-            Vec::new(),
-            Some(crate::subagents::TaskOutcome::Failed(
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 10,
+            terminal_at_ms: Some(20),
+            state: crate::subagents::TaskState::Failed,
+            step_count: 1,
+            elapsed: std::time::Duration::ZERO,
+            observed_at_ms: 20,
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: Some(crate::subagents::TaskOutcome::Failed(
                 crate::subagents::ChildFailure::new("not stored here"),
             )),
-        );
+        });
         let json: serde_json::Value =
             serde_json::from_str(&encode_task_details(&record).expect("encode task details"))
                 .expect("decode JSON");
