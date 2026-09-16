@@ -30,7 +30,8 @@ use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
-    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver, control_command,
+    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState, RuntimeProgressReceiver,
+    control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
 use crate::telemetry::{Trace, TraceEvent};
@@ -264,6 +265,13 @@ impl App {
             )]),
             ..Self::default()
         }
+    }
+
+    fn restored(startup: StartupSnapshot, initial: &RuntimeInitialState) -> Self {
+        let mut app = Self::configured(startup.clone());
+        app.transcript = Transcript::restored(startup, initial);
+        app.subagent_monitor = subagents::SubagentMonitor::restored(&initial.timeline);
+        app
     }
 
     fn configuration(startup: StartupSnapshot) -> Self {
@@ -1299,11 +1307,29 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
 pub(crate) fn run(
     startup: StartupSnapshot,
     commands: mpsc::Sender<RuntimeCommand>,
+    events: mpsc::UnboundedReceiver<RuntimeEvent>,
+    progress: RuntimeProgressReceiver,
+    trace: Trace,
+) -> Result<(), TuiError> {
+    run_restored(
+        startup,
+        RuntimeInitialState::empty(),
+        commands,
+        events,
+        progress,
+        trace,
+    )
+}
+
+pub(crate) fn run_restored(
+    startup: StartupSnapshot,
+    initial: RuntimeInitialState,
+    commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app = App::configured(startup);
+    let mut app = App::restored(startup, &initial);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
     let mut titles = TerminalTitlePublisher;
@@ -2032,8 +2058,8 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        ModelStepId, Record, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
-        StoredRecord, TerminalDetails,
+        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason,
+        RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
     };
     use crate::subagents::TaskState;
     use crate::telemetry::{Trace, TraceOwner};
@@ -5155,6 +5181,119 @@ mod tests {
         let shutdown = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(shutdown.commands, [RuntimeCommand::Shutdown]);
         assert!(shutdown.quit);
+    }
+
+    #[test]
+    fn restored_disabled_session_keeps_history_scrollable_and_expandable() {
+        let mut records = (1..=8)
+            .map(|run_id| StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: format!("saved request {run_id}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        records.push(StoredRecord {
+            run_id: RunId(9),
+            record: Record::CompletedExecution {
+                step_id: ModelStepId(9),
+                commentary: Some("saved arena commentary".to_owned()),
+                source: (1..=33)
+                    .map(|line| format!("saved arena line {line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                reasoning_summary: String::new(),
+                execution: Execution {
+                    stdout: observation(""),
+                    stderr: observation(""),
+                    outcome: ExecutionOutcome::Complete { result: None },
+                    tool_calls: (1..=20)
+                        .map(|count| ToolCall {
+                            tool: ToolName::Read,
+                            summary: ToolCallSummary::Count(count),
+                        })
+                        .collect(),
+                },
+                attempts: Vec::new(),
+            },
+        });
+        let initial = RuntimeInitialState {
+            records: records.clone(),
+            tasks: Vec::new(),
+            timeline: records
+                .into_iter()
+                .map(RestoredTimelineItem::Record)
+                .collect(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: Some(RuntimeDisabledReason::SessionRestoreFailed),
+        };
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+
+        let screen = rendered(&mut app, 60, 7);
+        assert!(screen.contains("Session restore failed; restart Kiki"));
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        app.handle_key(history_end());
+        let expanded = rendered(&mut app, 60, 200);
+        assert!(expanded.contains("saved arena line 01"));
+        assert!(expanded.contains("read · 20 bytes"));
+        set_prompt(&mut app, "draft");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+    }
+
+    #[test]
+    fn restored_transcript_projects_timeline_and_footer_accounting() {
+        let request = StoredRecord {
+            run_id: RunId(1),
+            record: Record::UserRequest {
+                request: "saved request".to_owned(),
+            },
+        };
+        let final_message = StoredRecord {
+            run_id: RunId(1),
+            record: Record::FinalMessage {
+                step_id: ModelStepId(1),
+                text: "saved answer".to_owned(),
+                reasoning_summary: String::new(),
+                terminal: TerminalDetails::empty(),
+            },
+        };
+        let task = crate::subagents::TaskRecord::for_test(
+            "00",
+            2,
+            crate::config::ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let initial = RuntimeInitialState {
+            records: vec![request.clone(), final_message.clone()],
+            tasks: vec![task.clone()],
+            timeline: vec![
+                RestoredTimelineItem::Record(request),
+                RestoredTimelineItem::SubagentSpawned(task.clone()),
+                RestoredTimelineItem::SubagentFinished(task),
+                RestoredTimelineItem::Record(final_message),
+            ],
+            footer_adjustment: vec![usage(3, 2)],
+            disabled_reason: None,
+        };
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+
+        let screen = rendered(&mut app, 120, 40);
+        assert!(screen.find("saved request").unwrap() < screen.find("saved answer").unwrap());
+        assert!(screen.contains("↑3 ↓2"), "{screen}");
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(rendered(&mut app, 120, 40).contains("✓ subagent:00"));
     }
 
     #[test]

@@ -518,6 +518,16 @@ impl<M: Model> Agent<M> {
         }
     }
 
+    pub(crate) fn restored(arena: Arena, model: M, model_context: ModelHistory) -> Self {
+        Self {
+            arena,
+            model,
+            model_context,
+            staged_final_message: None,
+            invocation_context: None,
+        }
+    }
+
     pub(crate) fn set_invocation_context(&mut self, context: AgentInvocationContext) {
         self.invocation_context = Some(context);
     }

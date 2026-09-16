@@ -25,7 +25,8 @@ use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
 use crate::runtime::{
-    ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord, TerminalDetails,
+    ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent,
+    RuntimeInitialState, StoredRecord, TerminalDetails,
 };
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
@@ -118,6 +119,7 @@ fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
             "Arena recovery failed; restart Kiki"
         }
         RuntimeDisabledReason::SessionStorageWriteFailed => "Session save failed; restart Kiki",
+        RuntimeDisabledReason::SessionRestoreFailed => "Session restore failed; restart Kiki",
     }
 }
 
@@ -2227,6 +2229,7 @@ pub(crate) struct Transcript {
     records: Vec<DisplayedRecord>,
     subagent_records: BTreeMap<TaskId, TaskRecord>,
     subagent_lifecycle_cards: BTreeSet<(TaskId, SubagentCardPhase)>,
+    footer_adjustment: Vec<AttemptAccounting>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
     show_reasoning: bool,
@@ -2250,6 +2253,7 @@ impl Default for Transcript {
             records: Vec::new(),
             subagent_records: BTreeMap::new(),
             subagent_lifecycle_cards: BTreeSet::new(),
+            footer_adjustment: Vec::new(),
             settled_blocks: Vec::new(),
             live_step: None,
             show_reasoning: true,
@@ -2269,6 +2273,35 @@ impl Transcript {
         };
         let block = startup_block(transcript.startup.as_ref().expect("startup was set"));
         transcript.append_settled_blocks([block]);
+        transcript
+    }
+
+    pub(crate) fn restored(startup: StartupSnapshot, initial: &RuntimeInitialState) -> Self {
+        let mut transcript = Self::configured(startup);
+        for item in &initial.timeline {
+            let event = match item {
+                RestoredTimelineItem::Record(record) => RuntimeEvent::RecordAppended {
+                    record: record.clone(),
+                    progress_gap: false,
+                },
+                RestoredTimelineItem::SubagentSpawned(record) => RuntimeEvent::SubagentSpawned {
+                    record: record.clone(),
+                },
+                RestoredTimelineItem::SubagentFinished(record) => RuntimeEvent::SubagentFinished {
+                    record: record.clone(),
+                },
+            };
+            transcript.apply(event, false);
+        }
+        transcript.footer_adjustment = initial.footer_adjustment.clone();
+        if let Some(reason) = &initial.disabled_reason {
+            transcript.apply(
+                RuntimeEvent::RuntimeDisabled {
+                    reason: reason.clone(),
+                },
+                false,
+            );
+        }
         transcript
     }
 
@@ -2717,6 +2750,7 @@ impl Transcript {
                 .values()
                 .flat_map(|record| record.attempts()),
         );
+        attempts.extend(&self.footer_adjustment);
         session_footer(&attempts, latest_foreground_attempt, context)
     }
 

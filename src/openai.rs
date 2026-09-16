@@ -755,6 +755,10 @@ impl OpenAiModel {
 }
 
 impl Model for OpenAiModel {
+    fn validate_history(&self, history: &ModelHistory) -> Result<(), ModelError> {
+        self.request(*self.settings.borrow(), history).map(|_| ())
+    }
+
     fn step<'a>(
         &'a mut self,
         history: &'a ModelHistory,
@@ -5369,6 +5373,46 @@ mod tests {
                 assert_eq!(fixture.request_count(), 0, "{case}");
                 assert_eq!(failure.error(), &expected, "{case}");
             }
+        }
+
+        #[tokio::test]
+        async fn validate_history_accepts_valid_replay_and_rejects_invalid_replay_without_http() {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
+                "completed",
+                vec![message("msg_1", "answer")],
+                Some(usage()),
+            )))
+            .await;
+            let model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let valid = history("first request");
+            let mut foreign = history("first request");
+            foreign.append_final_message(
+                "answer".to_owned(),
+                String::new(),
+                ProviderReplay::new("other-provider", Vec::new()),
+            );
+            let mut mismatched = history("first request");
+            mismatched.append_final_message(
+                "different answer".to_owned(),
+                String::new(),
+                replay(&[message("msg_1", "answer")]),
+            );
+
+            assert_eq!(model.validate_history(&valid), Ok(()));
+            assert_eq!(
+                model.validate_history(&foreign),
+                Err(ModelError::InvalidHistory(
+                    "opaque replay belongs to another provider"
+                ))
+            );
+            assert_eq!(
+                model.validate_history(&mismatched),
+                Err(ModelError::InvalidHistory(
+                    "final message does not match its OpenAI replay"
+                ))
+            );
+            assert_eq!(fixture.request_count(), 0);
         }
     }
 

@@ -47,7 +47,7 @@ impl TaskId {
         &self.0
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         (value.len() >= 2
             && (value.len() == 2 || !value.starts_with('0'))
             && value
@@ -109,6 +109,19 @@ impl TaskState {
             self,
             Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut
         )
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "stopping" => Some(Self::Stopping),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
     }
 
     pub(crate) fn storage_name(self) -> &'static str {
@@ -313,8 +326,7 @@ impl TaskAttempt {
         self.accounting.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    pub(crate) fn for_persisted(
         model_step: u64,
         provider_attempt: u32,
         accounting: Option<AttemptAccounting>,
@@ -324,6 +336,15 @@ impl TaskAttempt {
             provider_attempt,
             accounting,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_step: u64,
+        provider_attempt: u32,
+        accounting: Option<AttemptAccounting>,
+    ) -> Self {
+        Self::for_persisted(model_step, provider_attempt, accounting)
     }
 }
 
@@ -357,8 +378,7 @@ impl TaskExecution {
         &self.attempts
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    pub(crate) fn for_persisted(
         model_step: u64,
         source: String,
         reasoning_summary: String,
@@ -372,6 +392,17 @@ impl TaskExecution {
             execution,
             attempts,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_step: u64,
+        source: String,
+        reasoning_summary: String,
+        execution: Execution,
+        attempts: Vec<AttemptAccounting>,
+    ) -> Self {
+        Self::for_persisted(model_step, source, reasoning_summary, execution, attempts)
     }
 }
 
@@ -1574,6 +1605,53 @@ impl TaskRecord {
         self
     }
 
+    pub(crate) fn from_persisted(restored: RestoredTaskRecord) -> Self {
+        let RestoredTaskRecord {
+            id,
+            revision,
+            parent,
+            origin_step_id,
+            depth,
+            parameters,
+            attempts,
+            details,
+        } = restored;
+        let cost = estimate_run_cost(&attempts);
+        let selection = parameters.selection();
+        let error = match &details.outcome {
+            Some(TaskOutcome::Failed(error)) => Some(error.message().to_owned()),
+            Some(TaskOutcome::Completed(_))
+            | Some(TaskOutcome::Cancelled)
+            | Some(TaskOutcome::TimedOut)
+            | None => None,
+        };
+        Self {
+            id: id.clone(),
+            revision,
+            parent,
+            origin: OriginId(origin_step_id),
+            origin_step_id: Some(origin_step_id),
+            depth,
+            admitted_at_ms: details.admitted_at_ms,
+            terminal_at_ms: details.terminal_at_ms,
+            parameters,
+            observation: TaskObservation {
+                id,
+                state: details.state,
+                selection,
+                step_count: details.step_count,
+                elapsed: details.elapsed,
+                observed_at_ms: details.observed_at_ms,
+                cost,
+                error,
+            },
+            attempt_evidence: details.attempt_evidence,
+            attempts,
+            executions: details.executions,
+            outcome: details.outcome,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_persisted_details_for_test(mut self, details: TaskPersistedDetails) -> Self {
         self.admitted_at_ms = details.admitted_at_ms;
@@ -1584,9 +1662,10 @@ impl TaskRecord {
         self.observation.observed_at_ms = details.observed_at_ms;
         self.observation.error = match &details.outcome {
             Some(TaskOutcome::Failed(error)) => Some(error.message().to_owned()),
-            Some(TaskOutcome::Cancelled) => Some("cancelled".to_owned()),
-            Some(TaskOutcome::TimedOut) => Some("timed out".to_owned()),
-            _ => None,
+            Some(TaskOutcome::Completed(_))
+            | Some(TaskOutcome::Cancelled)
+            | Some(TaskOutcome::TimedOut)
+            | None => None,
         };
         self.attempt_evidence = details.attempt_evidence;
         self.executions = details.executions;
@@ -1595,7 +1674,17 @@ impl TaskRecord {
     }
 }
 
-#[cfg(test)]
+pub(crate) struct RestoredTaskRecord {
+    pub(crate) id: TaskId,
+    pub(crate) revision: u64,
+    pub(crate) parent: Option<TaskId>,
+    pub(crate) origin_step_id: u64,
+    pub(crate) depth: usize,
+    pub(crate) parameters: ChildParameters,
+    pub(crate) attempts: Vec<AttemptAccounting>,
+    pub(crate) details: TaskPersistedDetails,
+}
+
 pub(crate) struct TaskPersistedDetails {
     pub(crate) admitted_at_ms: i64,
     pub(crate) terminal_at_ms: Option<i64>,
@@ -1972,6 +2061,7 @@ struct Task {
     stop: Option<StopReason>,
     outcome: Option<TaskOutcome>,
     terminal_claim: Option<TerminalClaim>,
+    restored_record: Option<TaskRecord>,
     holds_slot: bool,
     cancellation: CancellationToken,
 }
@@ -2018,8 +2108,43 @@ impl StopReason {
 }
 
 impl Task {
+    fn restored(record: TaskRecord, notifications: watch::Sender<u64>) -> Self {
+        let now = Instant::now();
+        let admitted_at = now.checked_sub(record.observation.elapsed()).unwrap_or(now);
+        Self {
+            id: record.id.clone(),
+            parent: record.parent.clone(),
+            origin: record.origin,
+            origin_step_id: record.origin_step_id,
+            depth: record.depth,
+            parameters: record.parameters.clone(),
+            admitted_at,
+            admitted_at_ms: record.admitted_at_ms,
+            deadline: now,
+            settled_at: Some(now),
+            terminal_at_ms: record.terminal_at_ms,
+            metrics: Arc::new(TaskMetrics::new(
+                record.id.clone(),
+                notifications,
+                Arc::new(SyncMutex::new(CoordinatorPublication::default())),
+            )),
+            state: record.observation.state(),
+            stop: None,
+            outcome: record.outcome.clone(),
+            terminal_claim: None,
+            restored_record: Some(record),
+            holds_slot: false,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
     fn observation(&self, now: Instant, observed_at_ms: i64) -> TaskObservation {
-        self.observation_with_metrics(now, observed_at_ms, self.metrics.snapshot())
+        self.restored_record
+            .as_ref()
+            .map(|record| record.observation.clone())
+            .unwrap_or_else(|| {
+                self.observation_with_metrics(now, observed_at_ms, self.metrics.snapshot())
+            })
     }
 
     fn observation_with_metrics(
@@ -2047,7 +2172,9 @@ impl Task {
     }
 
     fn record(&self, now: Instant, observed_at_ms: i64) -> TaskRecord {
-        self.record_from_snapshot(now, observed_at_ms, self.metrics.snapshot())
+        self.restored_record.clone().unwrap_or_else(|| {
+            self.record_from_snapshot(now, observed_at_ms, self.metrics.snapshot())
+        })
     }
 
     fn record_from_snapshot(
@@ -2153,6 +2280,22 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     pub(crate) fn with_session(mut self, writer: SessionWriter) -> Self {
         self.writer = Some(writer);
         self
+    }
+
+    pub(crate) async fn restore_terminal_tasks(
+        &self,
+        tasks: impl IntoIterator<Item = TaskRecord>,
+        next_task: Option<u64>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner.next_task = next_task;
+        let notifications = inner.notifications.clone();
+        for record in tasks {
+            let id = record.id.clone();
+            inner
+                .tasks
+                .insert(id, Task::restored(record, notifications.clone()));
+        }
     }
 
     pub(crate) fn storage_failure_token(&self) -> CancellationToken {
@@ -2384,6 +2527,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 stop: None,
                 outcome: None,
                 terminal_claim: None,
+                restored_record: None,
                 holds_slot: true,
                 cancellation,
             };
@@ -3398,9 +3542,10 @@ mod tests {
 
     use super::{
         AccessError, AdmissionError, ChildFailure, ChildParameters, ChildResult, ChildRun,
-        ChildRunner, Clock, CoordinatorEvent, CostStatus, FAILURE_MESSAGE_LIMIT, RunnerFuture,
-        SubagentCoordinator, SubagentPolicy, TaskId, TaskOutcome, TaskState, WaitError,
-        WaitPhaseSignal, task_id, task_id_argument,
+        ChildRunner, Clock, CoordinatorEvent, CostStatus, FAILURE_MESSAGE_LIMIT,
+        RestoredTaskRecord, RunnerFuture, SubagentCoordinator, SubagentPolicy, TaskId, TaskOutcome,
+        TaskPersistedDetails, TaskRecord, TaskState, WaitError, WaitPhaseSignal, task_id,
+        task_id_argument,
     };
     use crate::arena::{Arena, ChildConstructionTestGate, CollectionTestGate, ExecutionOutcome};
     use crate::config::{
@@ -3697,6 +3842,56 @@ mod tests {
         ChildResult::new(message.to_owned(), BTreeMap::new())
     }
 
+    #[test]
+    fn restored_terminal_observations_match_live_settlement() {
+        let details = |state, outcome| TaskPersistedDetails {
+            admitted_at_ms: 100,
+            terminal_at_ms: Some(200),
+            state,
+            step_count: 3,
+            elapsed: Duration::new(4, 5),
+            observed_at_ms: 200,
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: Some(outcome),
+        };
+        let record = |details| {
+            TaskRecord::from_persisted(RestoredTaskRecord {
+                id: TaskId::parse("00").expect("valid task ID"),
+                revision: 4,
+                parent: None,
+                origin_step_id: 1,
+                depth: 1,
+                parameters: parameters(),
+                attempts: Vec::new(),
+                details,
+            })
+        };
+
+        let completed = record(details(
+            TaskState::Completed,
+            TaskOutcome::Completed(result("saved")),
+        ));
+        assert_eq!(completed.observation().error(), None);
+        assert_eq!(completed.observation().elapsed(), Duration::new(4, 5));
+        assert_eq!(completed.observation().observed_at_ms(), 200);
+
+        for (state, outcome) in [
+            (TaskState::Cancelled, TaskOutcome::Cancelled),
+            (TaskState::TimedOut, TaskOutcome::TimedOut),
+        ] {
+            assert_eq!(record(details(state, outcome)).observation().error(), None);
+        }
+
+        let failed = record(details(
+            TaskState::Failed,
+            TaskOutcome::Failed(ChildFailure::new("interrupted diagnostic")),
+        ));
+        assert_eq!(failed.observation().error(), Some("interrupted diagnostic"));
+        assert_eq!(failed.observation().elapsed(), Duration::new(4, 5));
+        assert_eq!(failed.observation().observed_at_ms(), 200);
+    }
+
     fn child_execution_events(trace: &str) -> Vec<serde_json::Value> {
         trace
             .lines()
@@ -3834,6 +4029,114 @@ mod tests {
 
     async fn seed_next_task(coordinator: &SubagentCoordinator<()>, sequence: u64) {
         coordinator.inner.lock().await.next_task = Some(sequence);
+    }
+
+    #[tokio::test]
+    async fn restore_without_tasks_allocates_the_first_child_as_zero() {
+        let (coordinator, mut started) = coordinator(policy());
+        coordinator
+            .restore_terminal_tasks(Vec::new(), Some(0))
+            .await;
+        let caller = coordinator.root_caller().await;
+
+        let (id, child) = start(&coordinator, &mut started, &caller).await;
+
+        assert_eq!(id.as_str(), "00");
+        drop(child);
+        coordinator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restored_terminal_tasks_wait_without_runner_or_events() {
+        let (coordinator, mut started) = coordinator(policy());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator events");
+        let completed =
+            TaskRecord::for_test("00", 7, parameters().selection(), None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 100,
+                    terminal_at_ms: Some(200),
+                    state: TaskState::Completed,
+                    step_count: 3,
+                    elapsed: Duration::new(4, 5),
+                    observed_at_ms: 200,
+                    attempt_evidence: Vec::new(),
+                    executions: Vec::new(),
+                    outcome: Some(TaskOutcome::Completed(ChildResult::new(
+                        "stored result".to_owned(),
+                        BTreeMap::from([(
+                            "nested".to_owned(),
+                            ToolValue::Dictionary(BTreeMap::from([(
+                                "answer".to_owned(),
+                                ToolValue::Integer(7),
+                            )])),
+                        )]),
+                    ))),
+                });
+        let failed = TaskRecord::for_test("01", 8, parameters().selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 300,
+                terminal_at_ms: Some(400),
+                state: TaskState::Failed,
+                step_count: 5,
+                elapsed: Duration::new(6, 7),
+                observed_at_ms: 400,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: Some(TaskOutcome::Failed(ChildFailure::new("stored diagnostic"))),
+            });
+        let completed_id = completed.id().clone();
+        let failed_id = failed.id().clone();
+        coordinator
+            .restore_terminal_tasks([completed, failed], Some(2))
+            .await;
+        let caller = coordinator.root_caller().await;
+
+        let (result, observation) = coordinator
+            .wait(&caller, &completed_id)
+            .await
+            .expect("return stored completed result");
+        assert_eq!(result.message(), "stored result");
+        assert_eq!(
+            result.values(),
+            &BTreeMap::from([(
+                "nested".to_owned(),
+                ToolValue::Dictionary(BTreeMap::from([(
+                    "answer".to_owned(),
+                    ToolValue::Integer(7),
+                )])),
+            )])
+        );
+        assert_eq!(observation.elapsed(), Duration::new(4, 5));
+        assert_eq!(observation.observed_at_ms(), 200);
+
+        let error = coordinator
+            .wait(&caller, &failed_id)
+            .await
+            .expect_err("reraises stored failure");
+        let failed_observation = error
+            .observation()
+            .expect("wait returns stored observation");
+        assert_eq!(failed_observation.elapsed(), Duration::new(6, 7));
+        assert_eq!(failed_observation.observed_at_ms(), 400);
+        assert_failed(error, &failed_id, "stored diagnostic");
+        let observation = coordinator
+            .get(&caller, &failed_id)
+            .await
+            .expect("get stored failure observation");
+        assert_eq!(observation.elapsed(), Duration::new(6, 7));
+        assert_eq!(observation.observed_at_ms(), 400);
+        assert_eq!(coordinator.active_count().await, 0);
+        assert!(coordinator.next_deadline().await.is_none());
+        assert!(
+            started.try_recv().is_err(),
+            "restoration must not start a runner"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "restoration must not publish lifecycle events"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod codec;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 #[cfg(unix)]
@@ -16,9 +17,11 @@ use rustix::io::Errno;
 use thiserror::Error;
 use tokio::task;
 
-use crate::arena::Checkpoint;
+use crate::agent::TerminalEvidence;
+use crate::arena::{Checkpoint, Execution};
 use crate::config::ModelSelection;
-use crate::subagents::TaskRecord;
+use crate::model::{AttemptAccounting, ModelHistory};
+use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
 const LOCK_SUFFIX: &str = ".lock";
@@ -138,6 +141,91 @@ pub(crate) enum PersistedTerminal {
         evidence: Option<crate::agent::TerminalEvidence>,
         attempts: Vec<crate::model::AttemptAccounting>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadableCode {
+    source: String,
+    commentary: Option<String>,
+    reasoning_summary: String,
+    result: crate::model::CodeResult,
+    attempts: Vec<AttemptAccounting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadableTerminal {
+    Final {
+        text: String,
+        reasoning_summary: String,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Cancelled {
+        evidence: Option<TerminalEvidence>,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Failed {
+        message: String,
+        evidence: Option<TerminalEvidence>,
+        attempts: Vec<AttemptAccounting>,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoredRecordKind {
+    UserRequest {
+        request: String,
+    },
+    CompletedExecution {
+        step_id: u64,
+        source: String,
+        commentary: Option<String>,
+        reasoning_summary: String,
+        execution: Execution,
+        attempts: Vec<AttemptAccounting>,
+    },
+    FinalMessage {
+        step_id: u64,
+        text: String,
+        reasoning_summary: String,
+        terminal: ReadableTerminal,
+    },
+    CancelledRun {
+        terminal: ReadableTerminal,
+    },
+    FailedRun {
+        message: String,
+        terminal: ReadableTerminal,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoredRecord {
+    pub(crate) revision: u64,
+    pub(crate) run_id: u64,
+    pub(crate) kind: RestoredRecordKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RestoredTask {
+    pub(crate) record: TaskRecord,
+    pub(crate) admitted_revision: u64,
+    pub(crate) terminal_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RestoredExecutableState {
+    pub(crate) checkpoint: Checkpoint,
+    pub(crate) history: ModelHistory,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionRestore {
+    pub(crate) records: Vec<RestoredRecord>,
+    pub(crate) tasks: Vec<RestoredTask>,
+    pub(crate) footer_adjustment: Vec<AttemptAccounting>,
+    pub(crate) next_task: Option<u64>,
+    pub(crate) executable: Option<RestoredExecutableState>,
 }
 
 #[derive(Clone)]
@@ -461,6 +549,11 @@ impl Session {
     pub(crate) fn initial_checkpoint(&self) -> Result<Checkpoint, SessionError> {
         let connection = self.connection()?;
         load_initial_checkpoint(&connection)
+    }
+
+    pub(crate) fn restore(&self) -> Result<SessionRestore, SessionError> {
+        let mut connection = self.connection()?;
+        load_session_restore(&mut connection)
     }
 
     pub(crate) fn writer(&self) -> SessionWriter {
@@ -1197,6 +1290,820 @@ fn load_initial_checkpoint(connection: &Connection) -> Result<Checkpoint, Sessio
         .map_err(|error| SessionError::Codec(error.to_string()))
 }
 
+#[derive(Clone)]
+struct RestoreEntryRow {
+    id: i64,
+    parent_id: Option<i64>,
+    run_id: Option<i64>,
+    checkpoint_id: i64,
+    kind: String,
+    payload_json: String,
+    provider_replay: Option<Vec<u8>>,
+    revision: i64,
+}
+
+struct RestoreRunRow {
+    id: i64,
+    terminal_entry_id: Option<i64>,
+}
+
+struct RestoreStepRow {
+    id: i64,
+    run_id: i64,
+    settled_entry_id: Option<i64>,
+}
+
+struct RestoreTaskRow {
+    id: i64,
+    parent_task_id: Option<i64>,
+    origin_step_id: i64,
+    state: String,
+    admitted_revision: i64,
+    terminal_revision: Option<i64>,
+    task_revision: i64,
+    details_json: String,
+}
+
+struct RestoreSnapshot {
+    active_entry_id: i64,
+    session_revision: i64,
+    entries: Vec<RestoreEntryRow>,
+    runs: Vec<RestoreRunRow>,
+    steps: Vec<RestoreStepRow>,
+    tasks: Vec<RestoreTaskRow>,
+    checkpoint: Option<(String, Vec<u8>, String)>,
+}
+
+fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let (active_entry_id, session_revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let entries = {
+        let mut statement = transaction.prepare(
+            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreEntryRow {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    checkpoint_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    provider_replay: row.get(6)?,
+                    revision: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let runs = {
+        let mut statement =
+            transaction.prepare("SELECT id, terminal_entry_id FROM runs ORDER BY id")?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreRunRow {
+                    id: row.get(0)?,
+                    terminal_entry_id: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let steps = {
+        let mut statement = transaction
+            .prepare("SELECT id, run_id, settled_entry_id FROM model_steps ORDER BY id")?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreStepRow {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    settled_entry_id: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let tasks = {
+        let mut statement = transaction.prepare(
+            "SELECT id, parent_task_id, origin_step_id, state, admitted_revision, terminal_revision, task_revision, details_json FROM subagent_tasks ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreTaskRow {
+                    id: row.get(0)?,
+                    parent_task_id: row.get(1)?,
+                    origin_step_id: row.get(2)?,
+                    state: row.get(3)?,
+                    admitted_revision: row.get(4)?,
+                    terminal_revision: row.get(5)?,
+                    task_revision: row.get(6)?,
+                    details_json: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let checkpoint = transaction
+        .query_row(
+            "SELECT checkpoints.runtime_identity, checkpoints.arena_state, checkpoints.authorisations_json FROM entries JOIN checkpoints ON checkpoints.id = entries.checkpoint_id WHERE entries.id = ?1",
+            params![active_entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    transaction.commit()?;
+    Ok(restore_projection(RestoreSnapshot {
+        active_entry_id,
+        session_revision,
+        entries,
+        runs,
+        steps,
+        tasks,
+        checkpoint,
+    }))
+}
+
+fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
+    let next_task = next_task_after(
+        snapshot
+            .tasks
+            .iter()
+            .filter_map(|task| u64::try_from(task.id).ok())
+            .max(),
+    );
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let runs = snapshot
+        .runs
+        .iter()
+        .map(|run| (run.id, run.terminal_entry_id))
+        .collect::<BTreeMap<_, _>>();
+    let task_provenance = snapshot
+        .tasks
+        .iter()
+        .map(|task| {
+            (
+                task.id,
+                (
+                    task.parent_task_id,
+                    task.origin_step_id,
+                    task.admitted_revision,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let ancestry = selected_ancestry(&entries, snapshot.active_entry_id);
+    if ancestry.entries.is_empty() {
+        return empty_restore(snapshot.tasks);
+    }
+    let mut executable = ancestry.intact && valid_timeline(&snapshot);
+    let mut verified = Vec::new();
+    let mut records = Vec::new();
+    for entry in ancestry.entries {
+        if !entry_reuses_parent_checkpoint(&entry, verified.last()) {
+            executable = false;
+            break;
+        }
+        match readable_record(&entry, &snapshot.entries, &snapshot.steps, &runs) {
+            Ok(Some(record)) => {
+                verified.push(entry);
+                records.push(record);
+            }
+            Ok(None) => verified.push(entry),
+            Err(()) => {
+                executable = false;
+                break;
+            }
+        }
+    }
+    let selected_ids = verified
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<BTreeSet<_>>();
+
+    let mut footer_adjustment = Vec::new();
+    for entry in entries.values() {
+        let attempts = match entry.kind.as_str() {
+            "execution" => {
+                codec::decode_readable_execution(&entry.payload_json).map(|(code, _)| code.attempts)
+            }
+            "final_reply" | "cancelled" | "failed" => {
+                codec::decode_readable_terminal(&entry.payload_json)
+                    .map(|(terminal, _)| terminal_attempts(&terminal).to_vec())
+            }
+            "session_start" | "user_request" => Ok(Vec::new()),
+            _ => Err(codec::CodecError::InvalidPayload),
+        };
+        match attempts {
+            Ok(attempts) if !selected_ids.contains(&entry.id) => footer_adjustment.extend(attempts),
+            Ok(_) => {}
+            Err(_) => executable = false,
+        }
+    }
+
+    let mut tasks = Vec::new();
+    let mut visible_task_ids = BTreeSet::new();
+    for task in snapshot.tasks {
+        let Ok(task_id) = u64::try_from(task.id) else {
+            executable = false;
+            continue;
+        };
+        let decoded = match codec::decode_task_record_details(&task.details_json) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                executable = false;
+                continue;
+            }
+        };
+        let Some(state) = TaskState::from_storage_name(&task.state) else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let (
+            Ok(admitted_revision),
+            Some(terminal_revision),
+            Ok(record_revision),
+            Ok(origin_step_id),
+        ) = (
+            u64::try_from(task.admitted_revision),
+            task.terminal_revision
+                .and_then(|revision| u64::try_from(revision).ok()),
+            u64::try_from(task.task_revision),
+            u64::try_from(task.origin_step_id),
+        )
+        else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let origin_steps = snapshot
+            .steps
+            .iter()
+            .filter(|step| step.id == task.origin_step_id)
+            .collect::<Vec<_>>();
+        let [origin_step] = origin_steps.as_slice() else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let parent = match task.parent_task_id {
+            Some(parent_id) if parent_id < task.id => TaskId::parse(&format!("{parent_id:02x}")),
+            Some(_) => None,
+            None => None,
+        };
+        let parent_is_causal = task.parent_task_id.is_none_or(|parent_id| {
+            task_provenance.get(&parent_id).is_some_and(
+                |(_, parent_origin_step_id, parent_admitted_revision)| {
+                    *parent_origin_step_id == task.origin_step_id
+                        && *parent_admitted_revision < task.admitted_revision
+                },
+            )
+        });
+        if task.parent_task_id.is_some() && (parent.is_none() || !parent_is_causal) {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        }
+        let mut details = decoded.details;
+        details.state = state;
+        if !state.is_terminal()
+            || details.terminal_at_ms.is_none()
+            || details.outcome.is_none()
+            || !task_outcome_matches_state(details.outcome.as_ref(), state)
+        {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        }
+        let Some(id) = TaskId::parse(&format!("{task_id:02x}")) else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let record = TaskRecord::from_persisted(RestoredTaskRecord {
+            id: id.clone(),
+            revision: record_revision,
+            parent: parent.clone(),
+            origin_step_id,
+            depth: decoded.depth,
+            parameters: decoded.parameters,
+            attempts: decoded.attempts.clone(),
+            details,
+        });
+        let origin_is_selected = origin_step.settled_entry_id.is_some_and(|entry_id| {
+            selected_ids.contains(&entry_id)
+                && entries
+                    .get(&entry_id)
+                    .is_some_and(|entry| entry.run_id == Some(origin_step.run_id))
+        });
+        let parent_is_visible = parent
+            .as_ref()
+            .is_none_or(|parent| visible_task_ids.contains(parent));
+        if origin_is_selected && parent_is_visible {
+            visible_task_ids.insert(id);
+            tasks.push(RestoredTask {
+                record,
+                admitted_revision,
+                terminal_revision,
+            });
+        } else {
+            if origin_is_selected && parent.is_some() {
+                executable = false;
+            }
+            footer_adjustment.extend(decoded.attempts);
+        }
+    }
+
+    let history = executable
+        .then(|| restored_history(&verified, &snapshot.steps, &runs))
+        .flatten();
+    let checkpoint = snapshot
+        .checkpoint
+        .and_then(|(identity, state, authorisations)| {
+            codec::decode_checkpoint(identity, state, &authorisations).ok()
+        });
+    let executable = history
+        .zip(checkpoint)
+        .map(|(history, checkpoint)| RestoredExecutableState {
+            checkpoint,
+            history,
+        });
+    SessionRestore {
+        records,
+        tasks,
+        footer_adjustment,
+        next_task,
+        executable,
+    }
+}
+
+fn next_task_after(maximum: Option<u64>) -> Option<u64> {
+    maximum.map_or(Some(0), |maximum| maximum.checked_add(1))
+}
+
+fn empty_restore(tasks: Vec<RestoreTaskRow>) -> SessionRestore {
+    let next_task = next_task_after(
+        tasks
+            .into_iter()
+            .filter_map(|task| u64::try_from(task.id).ok())
+            .max(),
+    );
+    SessionRestore {
+        records: Vec::new(),
+        tasks: Vec::new(),
+        footer_adjustment: Vec::new(),
+        next_task,
+        executable: None,
+    }
+}
+
+struct SelectedAncestry {
+    entries: Vec<RestoreEntryRow>,
+    intact: bool,
+}
+
+fn selected_ancestry(
+    entries: &BTreeMap<i64, RestoreEntryRow>,
+    active_entry_id: i64,
+) -> SelectedAncestry {
+    let mut selected = Vec::new();
+    let mut current = active_entry_id;
+    let mut seen = BTreeSet::new();
+    while seen.insert(current) {
+        let Some(entry) = entries.get(&current).cloned() else {
+            return SelectedAncestry {
+                entries: Vec::new(),
+                intact: false,
+            };
+        };
+        let parent = entry.parent_id;
+        selected.push(entry);
+        let Some(parent) = parent else {
+            break;
+        };
+        current = parent;
+    }
+    if seen.contains(&current)
+        && selected
+            .last()
+            .is_some_and(|entry| entry.parent_id.is_some())
+    {
+        return SelectedAncestry {
+            entries: Vec::new(),
+            intact: false,
+        };
+    }
+    let Some(root) = selected.last() else {
+        return SelectedAncestry {
+            entries: Vec::new(),
+            intact: false,
+        };
+    };
+    if root.kind != "session_start" || root.run_id.is_some() || root.parent_id.is_some() {
+        return SelectedAncestry {
+            entries: Vec::new(),
+            intact: false,
+        };
+    }
+    selected.reverse();
+    let first_invalid = selected.windows(2).position(|pair| {
+        let [parent, child] = pair else {
+            unreachable!("fixed windows have two entries")
+        };
+        parent.id >= child.id || parent.revision >= child.revision
+    });
+    let intact = first_invalid.is_none();
+    if let Some(index) = first_invalid {
+        selected.truncate(index + 1);
+    }
+    SelectedAncestry {
+        entries: selected,
+        intact,
+    }
+}
+
+fn entry_reuses_parent_checkpoint(
+    entry: &RestoreEntryRow,
+    parent: Option<&RestoreEntryRow>,
+) -> bool {
+    match parent {
+        None => entry.kind == "session_start",
+        Some(parent) => entry.kind == "execution" || entry.checkpoint_id == parent.checkpoint_id,
+    }
+}
+
+fn valid_timeline(snapshot: &RestoreSnapshot) -> bool {
+    if snapshot.session_revision <= 0 || !valid_snapshot_ids(snapshot) {
+        return false;
+    }
+    let mut revisions = BTreeSet::new();
+    let mut unique_revision = |revision: i64| {
+        revision > 0 && revision <= snapshot.session_revision && revisions.insert(revision)
+    };
+    snapshot
+        .entries
+        .iter()
+        .all(|entry| unique_revision(entry.revision))
+        && snapshot.tasks.iter().all(|task| {
+            let Some(terminal_revision) = task.terminal_revision else {
+                return false;
+            };
+            unique_revision(task.admitted_revision)
+                && terminal_revision > task.admitted_revision
+                && unique_revision(terminal_revision)
+        })
+        && valid_entry_ancestry(snapshot)
+        && valid_run_membership(snapshot)
+}
+
+fn valid_snapshot_ids(snapshot: &RestoreSnapshot) -> bool {
+    snapshot.active_entry_id > 0
+        && snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.id > 0 && entry.checkpoint_id > 0)
+        && snapshot.runs.iter().all(|run| run.id > 0)
+        && snapshot
+            .steps
+            .iter()
+            .all(|step| step.id > 0 && step.run_id > 0)
+        && snapshot.tasks.iter().all(|task| {
+            task.id >= 0
+                && task.origin_step_id > 0
+                && task.parent_task_id.is_none_or(|parent_id| parent_id >= 0)
+        })
+}
+
+fn valid_entry_ancestry(snapshot: &RestoreSnapshot) -> bool {
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<BTreeMap<_, _>>();
+    snapshot.entries.iter().all(|entry| match entry.parent_id {
+        None => entry.kind == "session_start" && entry.run_id.is_none(),
+        Some(parent_id) => {
+            entry.kind != "session_start"
+                && entry.run_id.is_some()
+                && entries.get(&parent_id).is_some_and(|parent| {
+                    parent.id < entry.id
+                        && parent.revision < entry.revision
+                        && (entry.kind == "execution"
+                            || entry.checkpoint_id == parent.checkpoint_id)
+                })
+        }
+    })
+}
+
+fn valid_run_membership(snapshot: &RestoreSnapshot) -> bool {
+    let run_ids = snapshot
+        .runs
+        .iter()
+        .map(|run| run.id)
+        .collect::<BTreeSet<_>>();
+    let entries = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<BTreeMap<_, _>>();
+    snapshot.entries.iter().all(|entry| {
+        entry.kind == "session_start"
+            || entry.run_id.is_some_and(|run_id| run_ids.contains(&run_id))
+    }) && snapshot.runs.iter().all(|run| {
+        let terminal_is_valid = run.terminal_entry_id.is_none_or(|entry_id| {
+            entries.get(&entry_id).is_some_and(|entry| {
+                entry.run_id == Some(run.id)
+                    && matches!(entry.kind.as_str(), "final_reply" | "cancelled" | "failed")
+            })
+        });
+        terminal_is_valid
+            && snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.run_id == Some(run.id) && entry.kind == "user_request")
+                .count()
+                == 1
+    }) && snapshot.steps.iter().all(|step| {
+        run_ids.contains(&step.run_id)
+            && step.settled_entry_id.is_some_and(|entry_id| {
+                entries
+                    .get(&entry_id)
+                    .is_some_and(|entry| entry.run_id == Some(step.run_id))
+            })
+    })
+}
+
+fn readable_record(
+    entry: &RestoreEntryRow,
+    entries: &[RestoreEntryRow],
+    steps: &[RestoreStepRow],
+    runs: &BTreeMap<i64, Option<i64>>,
+) -> Result<Option<RestoredRecord>, ()> {
+    if entry.kind == "session_start" {
+        return (entry.run_id.is_none()
+            && entry.parent_id.is_none()
+            && entry.provider_replay.is_none()
+            && entry.payload_json == "{}")
+            .then_some(None)
+            .ok_or(());
+    }
+    let run_id = entry
+        .run_id
+        .and_then(|id| u64::try_from(id).ok())
+        .ok_or(())?;
+    let revision = u64::try_from(entry.revision).map_err(|_| ())?;
+    if entry.parent_id.is_none()
+        || !runs.contains_key(&entry.run_id.unwrap_or_default())
+        || !run_has_one_request(entries, entry.run_id.unwrap_or_default())
+    {
+        return Err(());
+    }
+    let kind = match entry.kind.as_str() {
+        "user_request" => {
+            if entry.provider_replay.is_some() {
+                return Err(());
+            }
+            RestoredRecordKind::UserRequest {
+                request: codec::decode_request(&entry.payload_json).map_err(|_| ())?,
+            }
+        }
+        "execution" => {
+            let step_id = settled_step_id(entry, steps)?;
+            let (code, execution) =
+                codec::decode_readable_execution(&entry.payload_json).map_err(|_| ())?;
+            if !matches!(code.result, crate::model::CodeResult::Execution { .. }) {
+                return Err(());
+            }
+            RestoredRecordKind::CompletedExecution {
+                step_id,
+                source: code.source,
+                commentary: code.commentary,
+                reasoning_summary: code.reasoning_summary,
+                execution,
+                attempts: code.attempts,
+            }
+        }
+        "final_reply" => {
+            let step_id = settled_step_id(entry, steps)?;
+            let (terminal, code) =
+                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            let ReadableTerminal::Final {
+                text,
+                reasoning_summary,
+                ..
+            } = &terminal
+            else {
+                return Err(());
+            };
+            if code.is_some()
+                || runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
+            {
+                return Err(());
+            }
+            RestoredRecordKind::FinalMessage {
+                step_id,
+                text: text.clone(),
+                reasoning_summary: reasoning_summary.clone(),
+                terminal,
+            }
+        }
+        "cancelled" => {
+            let (terminal, code) =
+                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            if !matches!(terminal, ReadableTerminal::Cancelled { .. })
+                || runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
+                || code.as_ref().is_some_and(|code| {
+                    !matches!(code.result, crate::model::CodeResult::Cancelled { .. })
+                })
+            {
+                return Err(());
+            }
+            if code.is_some() {
+                settled_step_id(entry, steps)?;
+            }
+            RestoredRecordKind::CancelledRun { terminal }
+        }
+        "failed" => {
+            let (terminal, code) =
+                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            let ReadableTerminal::Failed { message, .. } = &terminal else {
+                return Err(());
+            };
+            if runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
+                || code.as_ref().is_some_and(|code| {
+                    !matches!(code.result, crate::model::CodeResult::Failure { .. })
+                })
+            {
+                return Err(());
+            }
+            if code.is_some() {
+                settled_step_id(entry, steps)?;
+            }
+            RestoredRecordKind::FailedRun {
+                message: message.clone(),
+                terminal,
+            }
+        }
+        _ => return Err(()),
+    };
+    Ok(Some(RestoredRecord {
+        revision,
+        run_id,
+        kind,
+    }))
+}
+
+fn run_has_one_request(entries: &[RestoreEntryRow], run_id: i64) -> bool {
+    entries
+        .iter()
+        .filter(|entry| entry.run_id == Some(run_id) && entry.kind == "user_request")
+        .count()
+        == 1
+}
+
+fn settled_step_id(entry: &RestoreEntryRow, steps: &[RestoreStepRow]) -> Result<u64, ()> {
+    let matches = steps
+        .iter()
+        .filter(|step| {
+            step.run_id == entry.run_id.unwrap_or_default()
+                && step.settled_entry_id == Some(entry.id)
+        })
+        .collect::<Vec<_>>();
+    let [step] = matches.as_slice() else {
+        return Err(());
+    };
+    u64::try_from(step.id).map_err(|_| ())
+}
+
+fn restored_history(
+    selected: &[RestoreEntryRow],
+    steps: &[RestoreStepRow],
+    runs: &BTreeMap<i64, Option<i64>>,
+) -> Option<ModelHistory> {
+    let mut history = ModelHistory::new();
+    for entry in selected {
+        match entry.kind.as_str() {
+            "session_start" => {
+                if readable_record(entry, selected, steps, runs).is_err() {
+                    return None;
+                }
+            }
+            "user_request" => {
+                let request = codec::decode_request(&entry.payload_json).ok()?;
+                if entry.provider_replay.is_some() {
+                    return None;
+                }
+                history.append_user_request(request);
+            }
+            "execution" => {
+                settled_step_id(entry, steps).ok()?;
+                let code = codec::decode_execution_entry(
+                    &entry.payload_json,
+                    entry.provider_replay.as_deref(),
+                )
+                .ok()?;
+                if code.execution.is_none()
+                    || !matches!(code.result, crate::model::CodeResult::Execution { .. })
+                    || append_history_code(&mut history, code).is_err()
+                {
+                    return None;
+                }
+            }
+            "final_reply" | "cancelled" | "failed" => {
+                let (terminal, code) = codec::decode_terminal_entry(
+                    &entry.payload_json,
+                    entry.provider_replay.as_deref(),
+                )
+                .ok()?;
+                match (entry.kind.as_str(), terminal, code) {
+                    (
+                        "final_reply",
+                        PersistedTerminal::Final {
+                            text,
+                            reasoning_summary,
+                            replay,
+                            ..
+                        },
+                        None,
+                    ) => {
+                        settled_step_id(entry, steps).ok()?;
+                        history.append_final_message(text, reasoning_summary, replay);
+                    }
+                    ("cancelled", PersistedTerminal::Cancelled { .. }, Some(code))
+                        if code.execution.is_none()
+                            && matches!(
+                                code.result,
+                                crate::model::CodeResult::Cancelled { .. }
+                            ) =>
+                    {
+                        settled_step_id(entry, steps).ok()?;
+                        append_history_code(&mut history, code).ok()?;
+                    }
+                    ("failed", PersistedTerminal::Failed { .. }, Some(code))
+                        if code.execution.is_none()
+                            && matches!(code.result, crate::model::CodeResult::Failure { .. }) =>
+                    {
+                        settled_step_id(entry, steps).ok()?;
+                        append_history_code(&mut history, code).ok()?;
+                    }
+                    ("cancelled", PersistedTerminal::Cancelled { .. }, None)
+                    | ("failed", PersistedTerminal::Failed { .. }, None) => {}
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(history)
+}
+
+fn append_history_code(history: &mut ModelHistory, code: PersistedCode) -> Result<(), ()> {
+    history
+        .append_completed_code(
+            code.source,
+            code.call_id,
+            code.commentary,
+            code.reasoning_summary,
+            code.replay,
+            code.result,
+        )
+        .map_err(|_| ())
+}
+
+fn terminal_attempts(terminal: &ReadableTerminal) -> &[AttemptAccounting] {
+    match terminal {
+        ReadableTerminal::Final { attempts, .. }
+        | ReadableTerminal::Cancelled { attempts, .. }
+        | ReadableTerminal::Failed { attempts, .. } => attempts,
+    }
+}
+
+fn task_outcome_matches_state(
+    outcome: Option<&crate::subagents::TaskOutcome>,
+    state: TaskState,
+) -> bool {
+    matches!(
+        (outcome, state),
+        (
+            Some(crate::subagents::TaskOutcome::Completed(_)),
+            TaskState::Completed
+        ) | (
+            Some(crate::subagents::TaskOutcome::Failed(_)),
+            TaskState::Failed
+        ) | (
+            Some(crate::subagents::TaskOutcome::Cancelled),
+            TaskState::Cancelled
+        ) | (
+            Some(crate::subagents::TaskOutcome::TimedOut),
+            TaskState::TimedOut
+        )
+    )
+}
+
 fn now_ms() -> Result<i64, SessionError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1232,10 +2139,10 @@ mod tests {
         PersistedCode, PersistedTerminal, Session, SessionError, SessionId, TaskAdmission,
         TaskSnapshot, TaskStepCommit, TaskTerminal,
     };
-    use crate::arena::{Arena, Checkpoint, ExecutionOutcome};
+    use crate::arena::{Arena, Checkpoint, ExecutionOutcome, RuntimeIdentity};
     use crate::config::{DEFAULT_MODEL, ModelSelection};
-    use crate::subagents::TaskPersistedDetails;
-    use crate::tools::{ToolHost, ToolValue};
+    use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
+    use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
@@ -1327,6 +2234,320 @@ mod tests {
         connection.last_insert_rowid()
     }
 
+    fn valid_checkpoint_tuple() -> Option<(String, Vec<u8>, String)> {
+        let checkpoint = Checkpoint::from_session_parts(
+            RuntimeIdentity::from_session_value("test-runtime".to_owned()),
+            Vec::new(),
+            WholeFileAuthorisations::default(),
+        );
+        let checkpoint = super::codec::encode_checkpoint(&checkpoint).expect("encode checkpoint");
+        Some((
+            checkpoint.runtime_identity,
+            checkpoint.arena_state,
+            checkpoint.authorisations_json,
+        ))
+    }
+
+    fn restore_entry(
+        id: i64,
+        parent_id: Option<i64>,
+        run_id: Option<i64>,
+        payload_json: String,
+        revision: i64,
+    ) -> super::RestoreEntryRow {
+        super::RestoreEntryRow {
+            id,
+            parent_id,
+            run_id,
+            checkpoint_id: 1,
+            kind: if parent_id.is_none() {
+                "session_start".to_owned()
+            } else {
+                "user_request".to_owned()
+            },
+            payload_json,
+            provider_replay: None,
+            revision,
+        }
+    }
+
+    #[test]
+    fn task_allocation_starts_at_zero_and_exhausts_only_at_u64_max() {
+        assert_eq!(super::next_task_after(None), Some(0));
+        assert_eq!(super::next_task_after(Some(u64::MAX - 1)), Some(u64::MAX));
+        assert_eq!(super::next_task_after(Some(u64::MAX)), None);
+    }
+
+    #[test]
+    fn restore_truncates_selected_history_at_the_first_unreadable_entry() {
+        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 4,
+            session_revision: 4,
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request("first"), 2),
+                restore_entry(3, Some(2), Some(2), "{}".to_owned(), 3),
+                restore_entry(4, Some(3), Some(3), request("must be hidden"), 4),
+            ],
+            runs: vec![
+                super::RestoreRunRow {
+                    id: 1,
+                    terminal_entry_id: None,
+                },
+                super::RestoreRunRow {
+                    id: 2,
+                    terminal_entry_id: None,
+                },
+                super::RestoreRunRow {
+                    id: 3,
+                    terminal_entry_id: None,
+                },
+            ],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(
+            restore.executable.is_none(),
+            "the selected entry is unreadable"
+        );
+        assert!(matches!(
+            restore.records.as_slice(),
+            [super::RestoredRecord {
+                kind: super::RestoredRecordKind::UserRequest { request },
+                ..
+            }] if request == "first"
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_selected_entry_with_a_different_parent_checkpoint() {
+        let request = super::codec::encode_request("invalid checkpoint").expect("encode request");
+        let mut child = restore_entry(2, Some(1), Some(1), request, 2);
+        child.checkpoint_id = 2;
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 2,
+            session_revision: 2,
+            entries: vec![restore_entry(1, None, None, "{}".to_owned(), 1), child],
+            runs: vec![super::RestoreRunRow {
+                id: 1,
+                terminal_entry_id: None,
+            }],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(
+            restore.executable.is_none(),
+            "the selected checkpoint changes without execution"
+        );
+        assert!(restore.records.is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_selected_parent_with_a_non_older_revision() {
+        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 3,
+            session_revision: 3,
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request("invalid"), 1),
+                restore_entry(3, Some(2), Some(2), request("must be hidden"), 3),
+            ],
+            runs: vec![
+                super::RestoreRunRow {
+                    id: 1,
+                    terminal_entry_id: None,
+                },
+                super::RestoreRunRow {
+                    id: 2,
+                    terminal_entry_id: None,
+                },
+            ],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(
+            restore.executable.is_none(),
+            "the selected parent revision is not older"
+        );
+        assert!(restore.records.is_empty());
+    }
+
+    #[test]
+    fn restore_disables_duplicate_global_timeline_revisions_without_hiding_valid_history() {
+        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 2,
+            session_revision: 2,
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request("selected"), 2),
+                restore_entry(3, Some(1), Some(2), request("sibling"), 2),
+            ],
+            runs: vec![
+                super::RestoreRunRow {
+                    id: 1,
+                    terminal_entry_id: None,
+                },
+                super::RestoreRunRow {
+                    id: 2,
+                    terminal_entry_id: None,
+                },
+            ],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(
+            restore.executable.is_none(),
+            "duplicate revisions disable execution"
+        );
+        assert!(matches!(
+            restore.records.as_slice(),
+            [super::RestoredRecord {
+                kind: super::RestoredRecordKind::UserRequest { request },
+                ..
+            }] if request == "selected"
+        ));
+    }
+
+    #[test]
+    fn restore_disables_multiple_requests_in_a_run() {
+        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 2,
+            session_revision: 3,
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request("selected"), 2),
+                restore_entry(3, Some(1), Some(1), request("duplicate"), 3),
+            ],
+            runs: vec![super::RestoreRunRow {
+                id: 1,
+                terminal_entry_id: None,
+            }],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(
+            restore.executable.is_none(),
+            "multiple requests in one run disable execution"
+        );
+    }
+
+    #[test]
+    fn missing_active_entry_preserves_task_identifier_exhaustion_boundary() {
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 999,
+            session_revision: 1,
+            entries: Vec::new(),
+            runs: Vec::new(),
+            steps: Vec::new(),
+            tasks: vec![super::RestoreTaskRow {
+                id: i64::MAX,
+                parent_task_id: None,
+                origin_step_id: 1,
+                state: "completed".to_owned(),
+                admitted_revision: 1,
+                terminal_revision: Some(2),
+                task_revision: 1,
+                details_json: "{}".to_owned(),
+            }],
+            checkpoint: None,
+        });
+
+        assert_eq!(restore.next_task, Some(i64::MAX as u64 + 1));
+        assert!(
+            restore.records.is_empty(),
+            "the active entry is intentionally missing"
+        );
+        assert!(
+            restore.executable.is_none(),
+            "a missing active entry has no checkpoint"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_late_visible_task_after_selected_terminal() {
+        let request = super::codec::encode_request("selected request").expect("encode request");
+        let terminal = super::codec::encode_terminal(
+            &PersistedTerminal::Final {
+                step_id: 1,
+                text: "selected final".to_owned(),
+                reasoning_summary: String::new(),
+                replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                attempts: Vec::new(),
+            },
+            None,
+        )
+        .expect("encode terminal");
+        let mut final_entry = restore_entry(3, Some(2), Some(1), terminal.payload_json, 3);
+        final_entry.kind = terminal.kind.to_owned();
+        final_entry.provider_replay = terminal.provider_replay;
+        let task = TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 4,
+                terminal_at_ms: Some(5),
+                state: TaskState::Completed,
+                step_count: 1,
+                elapsed: Duration::from_secs(2),
+                observed_at_ms: 5,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: Some(TaskOutcome::Completed(ChildResult::new(
+                    "late selected result".to_owned(),
+                    BTreeMap::from([("value".to_owned(), ToolValue::Integer(7))]),
+                ))),
+            });
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 3,
+            session_revision: 5,
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request, 2),
+                final_entry,
+            ],
+            runs: vec![super::RestoreRunRow {
+                id: 1,
+                terminal_entry_id: Some(3),
+            }],
+            steps: vec![super::RestoreStepRow {
+                id: 1,
+                run_id: 1,
+                settled_entry_id: Some(3),
+            }],
+            tasks: vec![super::RestoreTaskRow {
+                id: 0,
+                parent_task_id: None,
+                origin_step_id: 1,
+                state: "completed".to_owned(),
+                admitted_revision: 4,
+                terminal_revision: Some(5),
+                task_revision: 2,
+                details_json: super::codec::encode_task_details(&task).expect("encode late task"),
+            }],
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(restore.executable.is_some());
+        assert!(matches!(
+            restore.tasks.as_slice(),
+            [task] if matches!(task.record.outcome(), Some(TaskOutcome::Completed(result))
+                if result.message() == "late selected result"
+                    && result.values().get("value") == Some(&ToolValue::Integer(7)))
+        ));
+    }
+
     #[tokio::test]
     async fn reopen_restores_initial_checkpoint() {
         let home = tempfile::tempdir().expect("create home");
@@ -1378,6 +2599,20 @@ mod tests {
             "replacement"
         );
         session.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    async fn restore_starts_child_ids_at_zero_without_stored_tasks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+
+        assert_eq!(
+            session.restore().expect("restore session").next_task,
+            Some(0)
+        );
+
+        session.close().expect("close session");
     }
 
     #[test]
@@ -3276,6 +4511,33 @@ mod tests {
             (4, 2, 0, 1, 6)
         );
         drop(connection);
+        let restored = session.restore().expect("restore session projection");
+        assert_eq!(restored.records.len(), 3);
+        assert_eq!(
+            restored
+                .executable
+                .expect("valid persisted state")
+                .history
+                .entries()
+                .len(),
+            3
+        );
+        let connection = session
+            .connection_for_test()
+            .expect("lock session connection");
+        connection
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        connection
+            .execute(
+                "UPDATE entries SET provider_replay = X'00' WHERE kind = 'execution'",
+                [],
+            )
+            .expect("corrupt replay");
+        drop(connection);
+        let restored = session.restore().expect("restore readable projection");
+        assert_eq!(restored.records.len(), 3);
+        assert!(restored.executable.is_none());
         drop(writer);
         session.close().expect("close session");
     }
@@ -3657,7 +4919,7 @@ mod tests {
         stream.read_exact(&mut result).expect("read writer result");
         session.close().expect("close parent session");
         let reopened = Session::open(home.path(), &id);
-        stream.write_all(&[b'X']).expect("release writer process");
+        stream.write_all(b"X").expect("release writer process");
         assert!(child.wait().expect("wait for writer process").success());
         assert_eq!(result, [b'R', b'C']);
         reopened
@@ -3710,12 +4972,13 @@ mod tests {
             );
 
             let recovered = Session::open(home.path(), &id).expect("recover interrupted session");
-            let connection = recovered
-                .connection_for_test()
-                .expect("lock recovered session connection");
-            let committed_checkpoint = match milestone {
-                "generation" | "execution" => {
-                    let (entries, checkpoints, pending_steps, closed_runs, active_entry_id):
+            let committed_checkpoint = {
+                let connection = recovered
+                    .connection_for_test()
+                    .expect("lock recovered session connection");
+                match milestone {
+                    "generation" | "execution" => {
+                        let (entries, checkpoints, pending_steps, closed_runs, active_entry_id):
                         (i64, i64, i64, i64, i64) = connection
                         .query_row(
                             "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NOT NULL), active_entry_id FROM session",
@@ -3723,30 +4986,30 @@ mod tests {
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                         )
                         .expect("read recovered generation state");
-                    let (terminal_entry_id, terminal_checkpoint_id): (i64, i64) = connection
+                        let (terminal_entry_id, terminal_checkpoint_id): (i64, i64) = connection
                         .query_row(
                             "SELECT terminal_entry_id, entries.checkpoint_id FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
                             [],
                             |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .expect("read recovered terminal");
-                    assert_eq!(
-                        (entries, checkpoints, pending_steps, closed_runs),
-                        (3, 1, 0, 1)
-                    );
-                    assert_eq!(active_entry_id, terminal_entry_id);
-                    assert_eq!(terminal_checkpoint_id, initial_checkpoint_id);
-                    None
-                }
-                "committed-step" => {
-                    let (entries, checkpoints, active_entry_id): (i64, i64, i64) = connection
+                        assert_eq!(
+                            (entries, checkpoints, pending_steps, closed_runs),
+                            (3, 1, 0, 1)
+                        );
+                        assert_eq!(active_entry_id, terminal_entry_id);
+                        assert_eq!(terminal_checkpoint_id, initial_checkpoint_id);
+                        None
+                    }
+                    "committed-step" => {
+                        let (entries, checkpoints, active_entry_id): (i64, i64, i64) = connection
                         .query_row(
                             "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), active_entry_id FROM session",
                             [],
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .expect("read recovered committed-step state");
-                    let (terminal_entry_id, parent_id, terminal_checkpoint_id): (i64, i64, i64) =
+                        let (terminal_entry_id, parent_id, terminal_checkpoint_id): (i64, i64, i64) =
                         connection
                             .query_row(
                                 "SELECT terminal_entry_id, entries.parent_id, entries.checkpoint_id FROM runs JOIN entries ON entries.id = runs.terminal_entry_id",
@@ -3754,29 +5017,29 @@ mod tests {
                                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                             )
                             .expect("read recovered terminal");
-                    let execution: (i64, i64) = connection
-                        .query_row(
-                            "SELECT id, checkpoint_id FROM entries WHERE kind = 'execution'",
-                            [],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .expect("read committed execution");
-                    let settled_entries = connection
-                        .prepare("SELECT settled_entry_id FROM model_steps ORDER BY id")
-                        .expect("prepare settled-step query")
-                        .query_map([], |row| row.get::<_, Option<i64>>(0))
-                        .expect("query settled steps")
-                        .collect::<Result<Vec<_>, _>>()
-                        .expect("read settled steps");
-                    assert_eq!((entries, checkpoints), (4, 2));
-                    assert_eq!(active_entry_id, terminal_entry_id);
-                    assert_eq!(parent_id, execution.0);
-                    assert_eq!(terminal_checkpoint_id, execution.1);
-                    assert_eq!(
-                        settled_entries,
-                        [Some(execution.0), Some(terminal_entry_id)]
-                    );
-                    let (runtime_identity, arena_state, authorisations_json): (
+                        let execution: (i64, i64) = connection
+                            .query_row(
+                                "SELECT id, checkpoint_id FROM entries WHERE kind = 'execution'",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .expect("read committed execution");
+                        let settled_entries = connection
+                            .prepare("SELECT settled_entry_id FROM model_steps ORDER BY id")
+                            .expect("prepare settled-step query")
+                            .query_map([], |row| row.get::<_, Option<i64>>(0))
+                            .expect("query settled steps")
+                            .collect::<Result<Vec<_>, _>>()
+                            .expect("read settled steps");
+                        assert_eq!((entries, checkpoints), (4, 2));
+                        assert_eq!(active_entry_id, terminal_entry_id);
+                        assert_eq!(parent_id, execution.0);
+                        assert_eq!(terminal_checkpoint_id, execution.1);
+                        assert_eq!(
+                            settled_entries,
+                            [Some(execution.0), Some(terminal_entry_id)]
+                        );
+                        let (runtime_identity, arena_state, authorisations_json): (
                         String,
                         Vec<u8>,
                         String,
@@ -3787,20 +5050,20 @@ mod tests {
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .expect("read committed checkpoint");
-                    let committed_checkpoint = super::codec::decode_checkpoint(
-                        runtime_identity,
-                        arena_state,
-                        &authorisations_json,
-                    )
-                    .expect("decode committed checkpoint");
-                    assert_ne!(
-                        committed_checkpoint.session_parts().1,
-                        initial_checkpoint.session_parts().1
-                    );
-                    Some(committed_checkpoint)
-                }
-                "background-only" => {
-                    let (entries, checkpoints, active_entry_id, terminal_entry_id):
+                        let committed_checkpoint = super::codec::decode_checkpoint(
+                            runtime_identity,
+                            arena_state,
+                            &authorisations_json,
+                        )
+                        .expect("decode committed checkpoint");
+                        assert_ne!(
+                            committed_checkpoint.session_parts().1,
+                            initial_checkpoint.session_parts().1
+                        );
+                        Some(committed_checkpoint)
+                    }
+                    "background-only" => {
+                        let (entries, checkpoints, active_entry_id, terminal_entry_id):
                         (i64, i64, i64, i64) = connection
                         .query_row(
                             "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), session.active_entry_id, runs.terminal_entry_id FROM session JOIN runs",
@@ -3808,28 +5071,31 @@ mod tests {
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                         )
                         .expect("read recovered background state");
-                    let (state, terminal_revision, details_json): (String, Option<i64>, String) =
-                        connection
+                        let (state, terminal_revision, details_json): (
+                            String,
+                            Option<i64>,
+                            String,
+                        ) = connection
                             .query_row(
                                 "SELECT state, terminal_revision, details_json FROM subagent_tasks",
                                 [],
                                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                             )
                             .expect("read recovered background task");
-                    assert_eq!((entries, checkpoints), (3, 1));
-                    assert_eq!(active_entry_id, terminal_entry_id);
-                    assert_eq!(state, "failed");
-                    assert!(terminal_revision.is_some());
-                    assert_eq!(
-                        serde_json::from_str::<serde_json::Value>(&details_json)
-                            .expect("decode recovered task details")["outcome"],
-                        serde_json::json!({ "Failed": { "message": "Interrupted by previous process exit" } })
-                    );
-                    None
+                        assert_eq!((entries, checkpoints), (3, 1));
+                        assert_eq!(active_entry_id, terminal_entry_id);
+                        assert_eq!(state, "failed");
+                        assert!(terminal_revision.is_some());
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&details_json)
+                                .expect("decode recovered task details")["outcome"],
+                            serde_json::json!({ "Failed": { "message": "Interrupted by previous process exit" } })
+                        );
+                        None
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             };
-            drop(connection);
             if let Some(committed_checkpoint) = committed_checkpoint {
                 let mut restored_arena = arena(&workspace).await;
                 restored_arena

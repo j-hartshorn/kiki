@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use thiserror::Error;
 
-use super::{PersistedCode, PersistedTerminal};
+use super::{PersistedCode, PersistedTerminal, ReadableCode, ReadableTerminal};
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{
     Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -16,7 +16,7 @@ use crate::config::{ModelSelection, model_by_id};
 use crate::model::{
     AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
 };
-use crate::subagents::{TaskOutcome, TaskRecord};
+use crate::subagents::{ChildParameters, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
 use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
 #[derive(Debug, Error)]
@@ -302,6 +302,13 @@ enum StoredTaskOutcome {
     TimedOut,
 }
 
+pub(super) struct DecodedTaskDetails {
+    pub(super) parameters: ChildParameters,
+    pub(super) depth: usize,
+    pub(super) details: TaskPersistedDetails,
+    pub(super) attempts: Vec<AttemptAccounting>,
+}
+
 pub(super) fn encode_checkpoint(checkpoint: &Checkpoint) -> Result<StoredCheckpoint, CodecError> {
     let (identity, state, authorisations) = checkpoint.session_parts();
     let authorisations = authorisations
@@ -344,6 +351,13 @@ pub(super) fn encode_request(request: &str) -> Result<String, CodecError> {
         request: request.to_owned(),
     })
     .map_err(CodecError::from)
+}
+
+pub(super) fn decode_request(payload_json: &str) -> Result<String, CodecError> {
+    let StoredPayload::UserRequest { request } = serde_json::from_str(payload_json)? else {
+        return Err(CodecError::InvalidPayload);
+    };
+    Ok(request)
 }
 
 pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecError> {
@@ -417,6 +431,57 @@ pub(super) fn fail_unfinished_task_details(
     serde_json::to_string(&details).map_err(CodecError::from)
 }
 
+pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetails, CodecError> {
+    let details: StoredTaskDetails = serde_json::from_str(value)?;
+    let parameters = ChildParameters::new(
+        details.prompt,
+        decode_selection(details.selection)?,
+        details.read_only,
+    );
+    let outcome = details.outcome.map(decode_task_outcome);
+    Ok(DecodedTaskDetails {
+        parameters,
+        depth: details.depth,
+        attempts: details.attempts.into_iter().map(decode_attempt).collect(),
+        details: TaskPersistedDetails {
+            admitted_at_ms: details.admitted_at_ms,
+            terminal_at_ms: details.terminal_at_ms,
+            state: TaskState::Starting,
+            step_count: details.observation.step_count,
+            elapsed: std::time::Duration::new(
+                details.observation.elapsed_seconds,
+                details.observation.elapsed_subsec_nanos,
+            ),
+            observed_at_ms: details.observation.observed_at_ms,
+            attempt_evidence: details
+                .attempt_evidence
+                .into_iter()
+                .map(|attempt| {
+                    crate::subagents::TaskAttempt::for_persisted(
+                        attempt.model_step,
+                        attempt.provider_attempt,
+                        attempt.accounting.map(decode_attempt),
+                    )
+                })
+                .collect(),
+            executions: details
+                .executions
+                .into_iter()
+                .map(|execution| {
+                    crate::subagents::TaskExecution::for_persisted(
+                        execution.model_step,
+                        execution.source,
+                        execution.reasoning_summary,
+                        decode_execution_value(execution.execution),
+                        execution.attempts.into_iter().map(decode_attempt).collect(),
+                    )
+                })
+                .collect(),
+            outcome,
+        },
+    })
+}
+
 #[cfg(test)]
 fn decode_task_details(value: &str) -> Result<StoredTaskDetails, CodecError> {
     serde_json::from_str(value).map_err(CodecError::from)
@@ -466,8 +531,7 @@ pub(super) fn encode_terminal(
     })
 }
 
-#[cfg(test)]
-fn decode_execution_entry(
+pub(super) fn decode_execution_entry(
     payload_json: &str,
     provider_replay: Option<&[u8]>,
 ) -> Result<PersistedCode, CodecError> {
@@ -479,8 +543,7 @@ fn decode_execution_entry(
     Ok(code)
 }
 
-#[cfg(test)]
-fn decode_terminal_entry(
+pub(super) fn decode_terminal_entry(
     payload_json: &str,
     provider_replay: Option<&[u8]>,
 ) -> Result<(PersistedTerminal, Option<PersistedCode>), CodecError> {
@@ -494,6 +557,61 @@ fn decode_terminal_entry(
         .map(|code| decode_code(code, replay.clone().ok_or(CodecError::MissingReplay)?))
         .transpose()?;
     Ok((decode_terminal_value(terminal, replay)?, code))
+}
+
+pub(super) fn decode_readable_execution(
+    payload_json: &str,
+) -> Result<(ReadableCode, Execution), CodecError> {
+    let StoredPayload::Execution { code, execution } = serde_json::from_str(payload_json)? else {
+        return Err(CodecError::InvalidPayload);
+    };
+    Ok((
+        decode_readable_code(code),
+        decode_execution_value(execution),
+    ))
+}
+
+pub(super) fn decode_readable_terminal(
+    payload_json: &str,
+) -> Result<(ReadableTerminal, Option<ReadableCode>), CodecError> {
+    let StoredPayload::Terminal { terminal, code } = serde_json::from_str(payload_json)? else {
+        return Err(CodecError::InvalidPayload);
+    };
+    let terminal = match terminal {
+        StoredTerminal::Final {
+            text,
+            reasoning_summary,
+            attempts,
+        } => ReadableTerminal::Final {
+            text,
+            reasoning_summary,
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+        StoredTerminal::Cancelled { evidence, attempts } => ReadableTerminal::Cancelled {
+            evidence: evidence.map(decode_evidence),
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+        StoredTerminal::Failed {
+            message,
+            evidence,
+            attempts,
+        } => ReadableTerminal::Failed {
+            message,
+            evidence: evidence.map(decode_evidence),
+            attempts: attempts.into_iter().map(decode_attempt).collect(),
+        },
+    };
+    Ok((terminal, code.map(decode_readable_code)))
+}
+
+fn decode_readable_code(code: StoredCode) -> ReadableCode {
+    ReadableCode {
+        source: code.source,
+        commentary: code.commentary,
+        reasoning_summary: code.reasoning_summary,
+        result: decode_code_result(code.result),
+        attempts: code.attempts.into_iter().map(decode_attempt).collect(),
+    }
 }
 
 fn encode_code(code: &PersistedCode) -> StoredCode {
@@ -697,7 +815,6 @@ fn decode_tool_call(call: StoredToolCall) -> ToolCall {
     }
 }
 
-#[cfg(test)]
 fn decode_terminal_value(
     terminal: StoredTerminal,
     replay: Option<ProviderReplay>,
@@ -921,6 +1038,25 @@ fn encode_tool_value(value: &ToolValue) -> StoredToolValue {
                 .map(|(key, value)| (key.clone(), encode_tool_value(value)))
                 .collect(),
         ),
+    }
+}
+
+fn decode_task_outcome(outcome: StoredTaskOutcome) -> TaskOutcome {
+    match outcome {
+        StoredTaskOutcome::Completed { message, values } => {
+            TaskOutcome::Completed(crate::subagents::ChildResult::new(
+                message,
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, decode_tool_value(value)))
+                    .collect(),
+            ))
+        }
+        StoredTaskOutcome::Failed { message } => {
+            TaskOutcome::Failed(crate::subagents::ChildFailure::new(message))
+        }
+        StoredTaskOutcome::Cancelled => TaskOutcome::Cancelled,
+        StoredTaskOutcome::TimedOut => TaskOutcome::TimedOut,
     }
 }
 

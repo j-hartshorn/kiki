@@ -14,7 +14,10 @@ use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallTok
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
-use crate::session::{PersistedTerminal, SessionError, SessionWriter};
+use crate::session::{
+    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session, SessionError,
+    SessionRestore, SessionWriter,
+};
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
     TaskObservation, TaskRecord,
@@ -96,12 +99,41 @@ pub(crate) enum RuntimeDisabledReason {
     OpenAiAuthentication,
     ArenaCheckpointRecoveryFailed,
     SessionStorageWriteFailed,
+    SessionRestoreFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredRecord {
     pub(crate) run_id: RunId,
     pub(crate) record: Record,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RestoredTimelineItem {
+    Record(StoredRecord),
+    SubagentSpawned(TaskRecord),
+    SubagentFinished(TaskRecord),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeInitialState {
+    pub(crate) records: Vec<StoredRecord>,
+    pub(crate) tasks: Vec<TaskRecord>,
+    pub(crate) timeline: Vec<RestoredTimelineItem>,
+    pub(crate) footer_adjustment: Vec<AttemptAccounting>,
+    pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
+}
+
+impl RuntimeInitialState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            records: Vec::new(),
+            tasks: Vec::new(),
+            timeline: Vec::new(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -475,6 +507,105 @@ fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting
     }
 }
 
+fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
+    let records = restore
+        .records
+        .iter()
+        .cloned()
+        .map(restored_stored_record)
+        .collect::<Vec<_>>();
+    let tasks = restore
+        .tasks
+        .iter()
+        .map(|task| task.record.clone())
+        .collect::<Vec<_>>();
+    let mut ordered = restore
+        .records
+        .iter()
+        .cloned()
+        .map(|record| {
+            (
+                record.revision,
+                RestoredTimelineItem::Record(restored_stored_record(record)),
+            )
+        })
+        .chain(restore.tasks.iter().flat_map(|task| {
+            [
+                (
+                    task.admitted_revision,
+                    RestoredTimelineItem::SubagentSpawned(task.record.clone()),
+                ),
+                (
+                    task.terminal_revision,
+                    RestoredTimelineItem::SubagentFinished(task.record.clone()),
+                ),
+            ]
+        }))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(revision, _)| *revision);
+    RuntimeInitialState {
+        records,
+        tasks,
+        timeline: ordered.into_iter().map(|(_, item)| item).collect(),
+        footer_adjustment: restore.footer_adjustment.clone(),
+        disabled_reason: restore
+            .executable
+            .is_none()
+            .then_some(RuntimeDisabledReason::SessionRestoreFailed),
+    }
+}
+
+fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
+    let run_id = record.run_id;
+    let terminal_details = |terminal: ReadableTerminal| match terminal {
+        ReadableTerminal::Final { attempts, .. } => TerminalDetails::new(None, attempts),
+        ReadableTerminal::Cancelled { evidence, attempts }
+        | ReadableTerminal::Failed {
+            evidence, attempts, ..
+        } => TerminalDetails::new(evidence, attempts),
+    };
+    let record = match record.kind {
+        RestoredRecordKind::UserRequest { request } => Record::UserRequest { request },
+        RestoredRecordKind::CompletedExecution {
+            step_id,
+            source,
+            commentary,
+            reasoning_summary,
+            execution,
+            attempts,
+        } => Record::CompletedExecution {
+            step_id: ModelStepId(step_id),
+            source,
+            commentary,
+            reasoning_summary,
+            execution,
+            attempts,
+        },
+        RestoredRecordKind::FinalMessage {
+            step_id,
+            text,
+            reasoning_summary,
+            terminal,
+        } => Record::FinalMessage {
+            step_id: ModelStepId(step_id),
+            text,
+            reasoning_summary,
+            terminal: terminal_details(terminal),
+        },
+        RestoredRecordKind::CancelledRun { terminal } => Record::CancelledRun {
+            terminal: terminal_details(terminal),
+        },
+        RestoredRecordKind::FailedRun { message, terminal } => Record::FailedRun {
+            message,
+            terminal: terminal_details(terminal),
+        },
+    };
+    StoredRecord {
+        run_id: RunId(run_id),
+        record,
+    }
+}
+
 impl<M: Model> RuntimeController<M> {
     pub(crate) fn with_session(
         agent: Agent<M>,
@@ -505,6 +636,62 @@ impl<M: Model> RuntimeController<M> {
             #[cfg(test)]
             test_home: None,
         }
+    }
+
+    pub(crate) async fn restore(
+        session: &Session,
+        mut arena: crate::arena::Arena,
+        model: M,
+        settings: watch::Sender<ModelSelection>,
+        persisted_settings: SettingsContext,
+        subagents: SessionSubagents,
+    ) -> Result<(Self, RuntimeInitialState), SessionError> {
+        let restore = session.restore()?;
+        let mut initial = restored_initial_state(&restore);
+        let restored_tasks = initial.tasks.clone();
+        let subagents = subagents.with_session(session.writer());
+        subagents
+            .restore_terminal_tasks(restored_tasks, restore.next_task)
+            .await;
+        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings);
+        let agent = if let Some(state) = restore.executable {
+            if model.validate_history(&state.history).is_ok()
+                && arena.restore(state.checkpoint.clone()).await.is_ok()
+            {
+                Some(Agent::restored(arena, model, state.history))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if agent.is_none() {
+            initial.disabled_reason = Some(RuntimeDisabledReason::SessionRestoreFailed);
+        }
+        let subagent_events = subagents.take_event_receiver();
+        Ok((
+            Self {
+                agent,
+                disabled_reason: initial.disabled_reason.clone(),
+                records: initial.records.clone(),
+                #[cfg(test)]
+                next_model_step_id: 1,
+                session: session.writer(),
+                settings,
+                accepted_thinking,
+                subagents,
+                subagent_events,
+                subagent_record_revisions: BTreeMap::new(),
+                subagent_status_revisions: BTreeMap::new(),
+                active: None,
+                trace: Trace::disabled(),
+                #[cfg(test)]
+                test_session: None,
+                #[cfg(test)]
+                test_home: None,
+            },
+            initial,
+        ))
     }
 
     #[cfg(test)]
@@ -1573,29 +1760,41 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::Command;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
+    use rusqlite::{Connection, OpenFlags, params};
+    #[cfg(unix)]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
     use tokio::sync::{Notify, mpsc, watch};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     use super::{
         AcceptedThinking, ActiveRun, CoordinatorEvent, ModelStepId, PROGRESS_CHANNEL_CAPACITY,
-        ProgressEnvelope, ProgressPublisher, Record, RunId, RuntimeCommand, RuntimeController,
-        RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord,
-        TerminalDetails, WorkerMessage, runtime_event_payload_bytes,
+        ProgressEnvelope, ProgressPublisher, Record, RestoredTimelineItem, RunId, RuntimeCommand,
+        RuntimeController, RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver,
+        StoredRecord, TerminalDetails, WorkerMessage, restored_initial_state,
+        runtime_event_payload_bytes,
     };
     use crate::agent::{
         Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
     };
     use crate::arena::{
-        Arena, ArenaError, Execution, ExecutionOutcome, Observation, RecoveryTestGate, ToolCall,
-        ToolCallSummary, ToolName,
+        Arena, ArenaError, Checkpoint, Execution, ExecutionOutcome, Observation, RecoveryTestGate,
+        RuntimeIdentity, ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::{
         DEFAULT_MODEL, ModelSelection,
@@ -1604,13 +1803,18 @@ mod tests {
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ModelUsage, ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
+        ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
+        ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
+    use crate::session::{
+        PersistedCode, PersistedTerminal, RestoredRecord, RestoredRecordKind, RestoredTask,
+        Session, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission, TaskTerminal,
+    };
     use crate::subagents::{
-        ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildRunner,
+        ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
         CompleteChildRunner, RunnerFuture, SessionSubagents, StartSubagentTestGate,
-        SubagentCoordinator, SubagentPolicy, TaskOutcome, TaskState,
+        SubagentCoordinator, SubagentPolicy, TaskAttempt, TaskExecution, TaskOutcome,
+        TaskPersistedDetails, TaskRecord, TaskState,
     };
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
@@ -1630,6 +1834,24 @@ mod tests {
             Box::pin(async move {
                 cancellation.cancelled().await;
                 Err(ChildFailure::new("child cancelled"))
+            })
+        }
+    }
+
+    struct CountingChildRunner(Arc<AtomicUsize>);
+
+    impl ChildRunner<ChildPayload> for CountingChildRunner {
+        fn run(
+            &self,
+            _child: crate::subagents::ChildRun<ChildPayload>,
+            _cancellation: CancellationToken,
+        ) -> RunnerFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ChildResult::new(
+                    "saved child".to_owned(),
+                    BTreeMap::from([("answer".to_owned(), ToolValue::Integer(7))]),
+                ))
             })
         }
     }
@@ -4898,6 +5120,103 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    enum RestoredModelAction {
+        Code {
+            source: String,
+            commentary: Option<String>,
+            attempts: Vec<AttemptAccounting>,
+            cancel_before_execution: bool,
+        },
+        Message {
+            text: String,
+            attempts: Vec<AttemptAccounting>,
+        },
+    }
+
+    struct RestoredStateModel {
+        selection: watch::Receiver<ModelSelection>,
+        observed: Arc<Mutex<Vec<ModelSelection>>>,
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        calls: Arc<AtomicUsize>,
+        actions: Vec<RestoredModelAction>,
+        call_prefix: &'static str,
+        runner_starts: Option<Arc<AtomicUsize>>,
+        expected_runner_starts: Vec<usize>,
+        step: usize,
+    }
+
+    impl Model for RestoredStateModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(*self.selection.borrow_and_update());
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                if let Some(starts) = &self.runner_starts {
+                    assert_eq!(
+                        starts.load(Ordering::SeqCst),
+                        self.expected_runner_starts[self.step],
+                        "unexpected child runner start before restored model step {}",
+                        self.step
+                    );
+                }
+                let (action, attempts) = match self.actions.get(self.step).cloned() {
+                    Some(RestoredModelAction::Code {
+                        source,
+                        commentary,
+                        attempts,
+                        cancel_before_execution,
+                    }) => {
+                        if cancel_before_execution {
+                            cancellation.cancel();
+                        }
+                        (
+                            CompletedModelAction::Code {
+                                source,
+                                call_id: ModelCallId::new(format!(
+                                    "{}-{}",
+                                    self.call_prefix, self.step
+                                )),
+                                commentary,
+                            },
+                            attempts,
+                        )
+                    }
+                    Some(RestoredModelAction::Message { text, attempts }) => {
+                        (CompletedModelAction::Message { text }, attempts)
+                    }
+                    None => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: Some(*self.selection.borrow_and_update()),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new(
+                        "fixture",
+                        vec![OpaqueReplayItem::new(
+                            format!("{} replay {}", self.call_prefix, self.step).into_bytes(),
+                        )],
+                    ),
+                    attempts,
                 })
             }
         }
@@ -9515,6 +9834,937 @@ mod tests {
         assert!(footer.contains("CH20.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
         assert!(footer.contains('$'), "{footer}");
+    }
+
+    #[test]
+    fn restored_timeline_orders_records_and_terminal_task_lifecycle_by_revision() {
+        let task = crate::subagents::TaskRecord::for_test(
+            "00",
+            2,
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let initial = restored_initial_state(&SessionRestore {
+            records: vec![
+                RestoredRecord {
+                    revision: 2,
+                    run_id: 1,
+                    kind: RestoredRecordKind::UserRequest {
+                        request: "saved request".to_owned(),
+                    },
+                },
+                RestoredRecord {
+                    revision: 5,
+                    run_id: 1,
+                    kind: RestoredRecordKind::FinalMessage {
+                        step_id: 1,
+                        text: "saved answer".to_owned(),
+                        reasoning_summary: String::new(),
+                        terminal: crate::session::ReadableTerminal::Final {
+                            text: "saved answer".to_owned(),
+                            reasoning_summary: String::new(),
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+            ],
+            tasks: vec![RestoredTask {
+                record: task,
+                admitted_revision: 3,
+                terminal_revision: 4,
+            }],
+            footer_adjustment: Vec::new(),
+            next_task: Some(1),
+            executable: None,
+        });
+
+        assert!(matches!(
+            initial.timeline.as_slice(),
+            [
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                }),
+                RestoredTimelineItem::SubagentSpawned(_),
+                RestoredTimelineItem::SubagentFinished(_),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::FinalMessage { .. },
+                    ..
+                }),
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn incompatible_active_checkpoint_keeps_records_readable_and_disables_runtime() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request("readable saved request".to_owned())
+            .await
+            .expect("commit readable request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start readable model step");
+        let execution = arena
+            .execute("checkpoint_value = 1", &CancellationToken::new())
+            .await
+            .expect("execute readable model step");
+        let compatible = arena.checkpoint();
+        let (_, state, authorisations) = compatible.session_parts();
+        let incompatible = Checkpoint::from_session_parts(
+            RuntimeIdentity::from_session_value("incompatible test runtime".to_owned()),
+            state.to_vec(),
+            authorisations.clone(),
+        );
+        writer
+            .settle_execution(
+                run_id,
+                step_id,
+                PersistedCode {
+                    source: "checkpoint_value = 1".to_owned(),
+                    call_id: ModelCallId::new("incompatible-checkpoint"),
+                    commentary: None,
+                    reasoning_summary: String::new(),
+                    selection: Some(selection),
+                    replay: fixture_replay("incompatible checkpoint replay"),
+                    result: CodeResult::execution(String::new()),
+                    execution: Some(execution),
+                    attempts: Vec::new(),
+                },
+                incompatible,
+            )
+            .await
+            .expect("persist incompatible checkpoint");
+        drop(writer);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (settings, selection_receiver) = watch::channel(selection);
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            RestoredStateModel {
+                selection: selection_receiver,
+                observed: Arc::new(Mutex::new(Vec::new())),
+                contexts: Arc::new(Mutex::new(Vec::new())),
+                calls: calls.clone(),
+                actions: Vec::new(),
+                call_prefix: "incompatible",
+                runner_starts: None,
+                expected_runner_starts: Vec::new(),
+                step: 0,
+            },
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+        )
+        .await
+        .expect("return disabled restored runtime");
+
+        assert!(matches!(
+            initial.records.as_slice(),
+            [
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest { request },
+                },
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution { source, .. },
+                },
+            ] if request == "readable saved request" && source == "checkpoint_value = 1"
+        ));
+        assert_eq!(
+            initial.disabled_reason,
+            Some(RuntimeDisabledReason::SessionRestoreFailed)
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must not run".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionRestoreFailed
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        session.close().expect("close session");
+    }
+
+    fn fixture_replay(label: &str) -> ProviderReplay {
+        ProviderReplay::new(
+            "fixture",
+            vec![OpaqueReplayItem::new(label.as_bytes().to_vec())],
+        )
+    }
+
+    #[cfg(unix)]
+    fn active_entry_id(session: &Session) -> i64 {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT active_entry_id FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read active entry")
+    }
+
+    #[cfg(unix)]
+    fn set_active_entry_for_fixture(session: &Session, entry_id: i64) {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1 WHERE singleton = 1",
+                params![entry_id],
+            )
+            .expect("move fixture active entry");
+    }
+
+    #[cfg(unix)]
+    fn completed_fixture_task(
+        id: &str,
+        parent: Option<&str>,
+        attempts: Vec<AttemptAccounting>,
+        result: ChildResult,
+    ) -> TaskRecord {
+        TaskRecord::for_test(
+            id,
+            2,
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            parent,
+            2,
+            attempts,
+        )
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 100,
+            terminal_at_ms: Some(200),
+            state: TaskState::Completed,
+            step_count: 2,
+            elapsed: Duration::from_secs(3),
+            observed_at_ms: 200,
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: Some(TaskOutcome::Completed(result)),
+        })
+    }
+
+    #[cfg(unix)]
+    async fn persist_fixture_task(
+        writer: &crate::session::SessionWriter,
+        origin_step_id: u64,
+        terminal: TaskRecord,
+    ) {
+        let admitted = TaskRecord::for_test(
+            terminal.id().as_str(),
+            1,
+            terminal.parameters().selection(),
+            terminal.parent().map(|parent| parent.as_str()),
+            terminal.depth(),
+            Vec::new(),
+        )
+        .with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: terminal.admitted_at_ms(),
+            terminal_at_ms: None,
+            state: TaskState::Starting,
+            step_count: 0,
+            elapsed: Duration::ZERO,
+            observed_at_ms: terminal.admitted_at_ms(),
+            attempt_evidence: Vec::new(),
+            executions: Vec::new(),
+            outcome: None,
+        });
+        writer
+            .admit_subagent_task(
+                TaskAdmission::from_record(&admitted, origin_step_id)
+                    .expect("encode task admission"),
+                || false,
+            )
+            .await
+            .expect("persist task admission")
+            .expect("accept fixture task admission");
+        writer
+            .terminal_subagent_task(
+                TaskTerminal::from_record(&terminal).expect("encode task terminal"),
+            )
+            .await
+            .expect("persist task terminal");
+    }
+
+    #[cfg(unix)]
+    async fn append_branched_resume_fixture(
+        session: &Session,
+        workspace: &Path,
+    ) -> Vec<AttemptAccounting> {
+        let writer = session.writer();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let selected_origin_step = u64::try_from(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT model_steps.id FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE entries.kind = 'execution' ORDER BY model_steps.id LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read selected origin step"),
+        )
+        .expect("selected origin step fits u64");
+        persist_fixture_task(
+            &writer,
+            selected_origin_step,
+            completed_fixture_task(
+                "62",
+                Some("00"),
+                Vec::new(),
+                ChildResult::new(
+                    "late selected result".to_owned(),
+                    BTreeMap::from([("visible".to_owned(), ToolValue::Integer(62))]),
+                ),
+            ),
+        )
+        .await;
+        let selected_leaf = active_entry_id(session);
+        let (origin_revision, selected_terminal_revision, late_task_revision): (i64, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT (SELECT entries.revision FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?1), (SELECT revision FROM entries WHERE id = ?2), (SELECT terminal_revision FROM subagent_tasks WHERE id = 98)",
+                params![
+                    i64::try_from(selected_origin_step).expect("selected origin fits SQLite"),
+                    selected_leaf
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read selected task chronology");
+        assert!(late_task_revision > origin_revision);
+        assert!(late_task_revision > selected_terminal_revision);
+        let selected_checkpoint = session
+            .restore()
+            .expect("restore selected checkpoint")
+            .executable
+            .expect("selected history is executable")
+            .checkpoint;
+        let root_entry: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT id FROM entries WHERE kind = 'session_start'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read session root");
+        set_active_entry_for_fixture(session, root_entry);
+
+        let sibling_run = writer
+            .commit_request("sibling request".to_owned())
+            .await
+            .expect("commit sibling request");
+        let sibling_step = writer
+            .start_model_step(sibling_run)
+            .await
+            .expect("start sibling execution");
+        let mut sibling_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace)
+                .await
+                .expect("create sibling tool host"),
+        )
+        .await
+        .expect("create sibling arena");
+        sibling_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore root checkpoint");
+        let source = "sibling_value = 99\nresult_values = {'sibling': sibling_value}";
+        let execution = sibling_arena
+            .execute(source, &CancellationToken::new())
+            .await
+            .expect("execute sibling branch");
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::Complete { result: None }
+        ));
+        let sibling_execution_attempt = known_usage(DEFAULT_MODEL, 33, 3, 30);
+        let sibling_checkpoint = sibling_arena.checkpoint();
+        assert_ne!(sibling_checkpoint, selected_checkpoint);
+        writer
+            .settle_execution(
+                sibling_run,
+                sibling_step,
+                PersistedCode {
+                    source: source.to_owned(),
+                    call_id: ModelCallId::new("sibling-execution"),
+                    commentary: Some("sibling commentary".to_owned()),
+                    reasoning_summary: "sibling reasoning".to_owned(),
+                    selection: Some(selection),
+                    replay: fixture_replay("sibling execution replay"),
+                    result: CodeResult::execution("sibling execution feedback".to_owned()),
+                    execution: Some(execution.clone()),
+                    attempts: vec![sibling_execution_attempt.clone()],
+                },
+                sibling_checkpoint,
+            )
+            .await
+            .expect("settle sibling execution");
+        let sibling_terminal_step = writer
+            .start_model_step(sibling_run)
+            .await
+            .expect("start sibling terminal step");
+        let sibling_terminal_attempt = known_usage(DEFAULT_MODEL, 44, 4, 40);
+        writer
+            .close_run(
+                sibling_run,
+                Some(sibling_terminal_step),
+                {
+                    let sibling_terminal_attempt = sibling_terminal_attempt.clone();
+                    move || PersistedTerminal::Failed {
+                        message: "sibling terminal failure".to_owned(),
+                        evidence: None,
+                        attempts: vec![sibling_terminal_attempt],
+                    }
+                },
+                Some(PersistedCode {
+                    source: "unreachable sibling failure".to_owned(),
+                    call_id: ModelCallId::new("sibling-terminal"),
+                    commentary: None,
+                    reasoning_summary: "sibling terminal reasoning".to_owned(),
+                    selection: Some(selection),
+                    replay: fixture_replay("sibling terminal replay"),
+                    result: CodeResult::failure("sibling terminal feedback".to_owned()),
+                    execution: None,
+                    attempts: Vec::new(),
+                }),
+            )
+            .await
+            .expect("close sibling run");
+
+        let hidden_attempt = known_usage(DEFAULT_MODEL, 55, 5, 50);
+        let mut hidden = completed_fixture_task(
+            "63",
+            None,
+            vec![hidden_attempt.clone(), hidden_attempt.clone()],
+            ChildResult::new(
+                "hidden high result".to_owned(),
+                BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(63))]),
+            ),
+        );
+        hidden = hidden.with_persisted_details_for_test(TaskPersistedDetails {
+            admitted_at_ms: 300,
+            terminal_at_ms: Some(400),
+            state: TaskState::Completed,
+            step_count: 2,
+            elapsed: Duration::from_secs(4),
+            observed_at_ms: 400,
+            attempt_evidence: vec![
+                TaskAttempt::for_test(1, 1, Some(hidden_attempt.clone())),
+                TaskAttempt::for_test(1, 2, Some(hidden_attempt.clone())),
+            ],
+            executions: vec![TaskExecution::for_test(
+                sibling_step,
+                "hidden execution copy".to_owned(),
+                String::new(),
+                execution,
+                vec![hidden_attempt.clone(), hidden_attempt.clone()],
+            )],
+            outcome: Some(TaskOutcome::Completed(ChildResult::new(
+                "hidden high result".to_owned(),
+                BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(63))]),
+            ))),
+        });
+        persist_fixture_task(&writer, sibling_step, hidden).await;
+        let (origin_revision, hidden_task_revision): (i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT (SELECT entries.revision FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?1), (SELECT terminal_revision FROM subagent_tasks WHERE id = 99)",
+                params![i64::try_from(sibling_step).expect("sibling step fits SQLite")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read hidden task chronology");
+        assert!(hidden_task_revision > origin_revision);
+        set_active_entry_for_fixture(session, selected_leaf);
+
+        vec![
+            sibling_execution_attempt,
+            sibling_terminal_attempt,
+            hidden_attempt.clone(),
+            hidden_attempt,
+        ]
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct StoredIdBounds {
+        maximum: i64,
+        count: i64,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct ResumeIdBounds {
+        runs: StoredIdBounds,
+        entries: StoredIdBounds,
+        checkpoints: StoredIdBounds,
+        model_steps: StoredIdBounds,
+        tasks: StoredIdBounds,
+    }
+
+    #[cfg(unix)]
+    fn stored_id_bounds(home: &Path, id: &str) -> ResumeIdBounds {
+        let connection = Connection::open_with_flags(
+            home.join(".kiki/sessions").join(format!("{id}.sqlite3")),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open read-only session database");
+        let bounds = |table: &str| {
+            connection
+                .query_row(
+                    &format!("SELECT COALESCE(MAX(id), -1), COUNT(*) FROM {table}"),
+                    [],
+                    |row| {
+                        Ok(StoredIdBounds {
+                            maximum: row.get(0)?,
+                            count: row.get::<_, i64>(1)?,
+                        })
+                    },
+                )
+                .expect("read stored identifiers")
+        };
+        ResumeIdBounds {
+            runs: bounds("runs"),
+            entries: bounds("entries"),
+            checkpoints: bounds("checkpoints"),
+            model_steps: bounds("model_steps"),
+            tasks: bounds("subagent_tasks"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_new_ids_follow_bounds(home: &Path, id: &str, before: &ResumeIdBounds) {
+        let after = stored_id_bounds(home, id);
+        let connection = Connection::open_with_flags(
+            home.join(".kiki/sessions").join(format!("{id}.sqlite3")),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("reopen read-only session database");
+        for (table, before, after, expected_new) in [
+            ("runs", &before.runs, &after.runs, 1),
+            ("entries", &before.entries, &after.entries, 3),
+            ("checkpoints", &before.checkpoints, &after.checkpoints, 1),
+            ("model_steps", &before.model_steps, &after.model_steps, 2),
+            ("subagent_tasks", &before.tasks, &after.tasks, 1),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("SELECT id FROM {table} ORDER BY id"))
+                .expect("query stored identifiers");
+            let ids = statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("iterate stored identifiers")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read stored identifiers");
+            let new_ids = ids
+                .iter()
+                .copied()
+                .filter(|id| *id > before.maximum)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                new_ids.len(),
+                expected_new,
+                "unexpected resumed {table} count"
+            );
+            assert_eq!(
+                i64::try_from(ids.len()).expect("identifier count fits i64"),
+                before.count + i64::try_from(expected_new).expect("new identifier count fits i64"),
+                "{table} reused an identifier at or below its pre-resume maximum"
+            );
+            assert!(
+                new_ids.iter().all(|id| *id > before.maximum),
+                "{table} allocated an identifier at or below its pre-resume maximum"
+            );
+            assert!(
+                after.maximum > before.maximum,
+                "{table} did not allocate an identifier"
+            );
+        }
+        let task_ids = connection
+            .prepare("SELECT id FROM subagent_tasks WHERE id > ?1 ORDER BY id")
+            .expect("query resumed task")
+            .query_map(params![before.tasks.maximum], |row| row.get::<_, i64>(0))
+            .expect("iterate resumed task")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read resumed task");
+        assert_eq!(task_ids, [100]);
+    }
+
+    #[cfg(unix)]
+    async fn resume_in_fresh_process_child() {
+        let home = PathBuf::from(env::var("KIKI_RESUME_HOME").expect("resume home"));
+        let workspace = PathBuf::from(env::var("KIKI_RESUME_WORKSPACE").expect("resume workspace"));
+        let session_id = env::var("KIKI_RESUME_SESSION").expect("resume session ID");
+        let socket_path = env::var("KIKI_RESUME_SOCKET").expect("resume socket");
+        let mut socket = UnixStream::connect(socket_path).expect("connect to parent");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::open(&home, &session_id).expect("open session through normal path");
+        let mut expected_history = session
+            .restore()
+            .expect("restore session")
+            .executable
+            .expect("executable restore")
+            .history;
+        expected_history.append_user_request("continue");
+        let expected_context = expected_history.entries().to_vec();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(&workspace).await.expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let start_gate = StartSubagentTestGate::new();
+        let (settings, selection_receiver) = watch::channel(selection);
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            RestoredStateModel {
+                selection: selection_receiver,
+                observed: Arc::new(Mutex::new(Vec::new())),
+                contexts: contexts.clone(),
+                calls: calls.clone(),
+                actions: vec![
+                    RestoredModelAction::Code {
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'unknown subagent `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '64'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                            .to_owned(),
+                        commentary: None,
+                        attempts: Vec::new(),
+                        cancel_before_execution: false,
+                    },
+                    RestoredModelAction::Message {
+                        text: "restored response".to_owned(),
+                        attempts: Vec::new(),
+                    },
+                ],
+                call_prefix: "continued",
+                runner_starts: Some(starts.clone()),
+                expected_runner_starts: vec![0, 1],
+                step: 0,
+            },
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            )
+            .with_start_test_gate(start_gate.clone()),
+        )
+        .await
+        .expect("restore runtime");
+        assert!(initial.disabled_reason.is_none());
+        assert_eq!(
+            initial
+                .tasks
+                .iter()
+                .map(|task| task.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00", "62"]
+        );
+        assert!(matches!(
+            initial.tasks[0].outcome(),
+            Some(TaskOutcome::Completed(result)) if result.values().get("answer") == Some(&ToolValue::Integer(7))
+        ));
+        assert!(matches!(
+            initial.tasks[1].outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.message() == "late selected result"
+                    && result.values().get("visible") == Some(&ToolValue::Integer(62))
+        ));
+        let (commands, mut events, mut progress, controller) = start_controller(controller);
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            progress.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        socket.write_all(b"R").expect("signal readiness");
+        let mut start = [0];
+        socket.read_exact(&mut start).expect("read parent start");
+        assert_eq!(start, *b"S");
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue".to_owned(),
+            })
+            .await
+            .expect("submit continued request");
+        start_gate.wait_until_start_attempts(1).await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "waiting on the restored task must not start a runner"
+        );
+        start_gate.allow_first_start();
+        let resumed_events = events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(resumed_events.iter().all(|event| match event {
+            RuntimeEvent::RunStarted { run_id } | RuntimeEvent::RunSettled { run_id } => {
+                *run_id == RunId(3)
+            }
+            RuntimeEvent::ModelStepStarted { run_id, .. }
+            | RuntimeEvent::RecordAppended {
+                record: StoredRecord { run_id, .. },
+                ..
+            } => *run_id == RunId(3),
+            RuntimeEvent::SubagentSpawned { record }
+            | RuntimeEvent::SubagentRecord { record }
+            | RuntimeEvent::SubagentFinished { record } => record.id().as_str() == "64",
+            _ => true,
+        }));
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts[0], expected_context);
+        assert_eq!(contexts.len(), 2);
+        assert!(resumed_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { request },
+                    ..
+                },
+                ..
+            } if request == "continue"
+        )));
+        session.close().expect("close restored session");
+        socket.write_all(b"O").expect("signal success");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_restores_context_arena_and_task_handles() {
+        if env::var_os("KIKI_RESUME_CHILD").is_some() {
+            resume_in_fresh_process_child().await;
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        fs::write(workspace.path().join("authorised"), "original").expect("write fixture");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let (settings, selection_receiver) = watch::channel(selection);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                RestoredStateModel {
+                    selection: selection_receiver,
+                    observed: Arc::new(Mutex::new(Vec::new())),
+                    contexts: Arc::new(Mutex::new(Vec::new())),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    actions: vec![
+                        RestoredModelAction::Code {
+                            source: "saved_value = 41\nsaved_task = await start_subagent('saved child', None, True)\nsaved_child_result = await saved_task.wait()\nawait read('authorised')".to_owned(),
+                            commentary: Some("selected completed-code commentary".to_owned()),
+                            attempts: vec![known_usage(DEFAULT_MODEL, 11, 1, 0)],
+                            cancel_before_execution: false,
+                        },
+                        RestoredModelAction::Code {
+                            source: "selected cancellation feedback source".to_owned(),
+                            commentary: None,
+                            attempts: vec![known_usage(DEFAULT_MODEL, 22, 2, 0)],
+                            cancel_before_execution: true,
+                        },
+                    ],
+                    call_prefix: "saved",
+                    runner_starts: None,
+                    expected_runner_starts: Vec::new(),
+                    step: 0,
+                },
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "save this state".to_owned(),
+            })
+            .await
+            .expect("submit saved request");
+        let saved_events = events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "{saved_events:?}");
+
+        let expected_footer_adjustment =
+            append_branched_resume_fixture(&session, workspace.path()).await;
+        let (sibling_payload, sibling_replay): (String, Vec<u8>) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT payload_json, provider_replay FROM entries WHERE kind = 'failed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read sibling terminal");
+        assert!(sibling_payload.contains("sibling terminal feedback"));
+        assert!(!sibling_replay.is_empty());
+        let restore = session.restore().expect("restore branched session");
+        let executable = restore
+            .executable
+            .as_ref()
+            .expect("selected branch remains executable");
+        let [
+            ModelContextEntry::UserRequest { text },
+            ModelContextEntry::CompletedCode(selected_code),
+            ModelContextEntry::CompletedCode(cancelled_code),
+        ] = executable.history.entries()
+        else {
+            panic!(
+                "unexpected selected model context: {:#?}",
+                executable.history.entries()
+            );
+        };
+        assert_eq!(text, "save this state");
+        assert!(
+            !format!("{:#?}", executable.history.entries()).contains("sibling_value"),
+            "selected context must not contain sibling Python"
+        );
+        assert_eq!(
+            selected_code.commentary(),
+            Some("selected completed-code commentary")
+        );
+        let CodeResult::Cancelled { feedback } = cancelled_code.result() else {
+            panic!("selected terminal did not retain cancelled code feedback");
+        };
+        assert_eq!(
+            feedback,
+            "<kiki_execution state=\"cancelled\" began=\"false\">\nExecution did not begin.\nExecution was cancelled and its Python arena changes were discarded. External side effects completed before cancellation may remain even though pending actions were cancelled.\n</kiki_execution>"
+        );
+        assert!(matches!(
+            restore.records.last().map(|record| &record.kind),
+            Some(crate::session::RestoredRecordKind::CancelledRun {
+                terminal: crate::session::ReadableTerminal::Cancelled {
+                    evidence: Some(TerminalEvidence::Execution(evidence)),
+                    ..
+                }
+            }) if evidence.source == "selected cancellation feedback source"
+                && evidence.commentary.is_none()
+        ));
+        assert_eq!(restore.footer_adjustment, expected_footer_adjustment);
+        assert_eq!(
+            restore
+                .tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00", "62"]
+        );
+        assert!(matches!(
+            restore.tasks[1].record.outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.message() == "late selected result"
+                    && result.values().get("visible") == Some(&ToolValue::Integer(62))
+        ));
+        assert_eq!(restore.next_task, Some(100));
+        let initial = restored_initial_state(&restore);
+        let mut transcript =
+            Transcript::restored(crate::config::ready_snapshot_for_test(), &initial);
+        let footer = transcript.layout(160).footer_rule(160).to_string();
+        assert!(footer.contains("↑220 ↓20"), "{footer}");
+        assert!(footer.contains("CH0.0%"), "{footer}");
+        assert!(footer.contains("0.0%/272k"), "{footer}");
+
+        let session_id = session.id().to_owned();
+        let id_bounds = stored_id_bounds(home.path(), &session_id);
+        session.close().expect("close original session");
+        let socket_path = home.path().join("resume.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind resume socket");
+        let mut child = Command::new(env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("runtime::tests::resume_restores_context_arena_and_task_handles")
+            .arg("--nocapture")
+            .env("KIKI_RESUME_CHILD", "1")
+            .env("KIKI_RESUME_HOME", home.path())
+            .env("KIKI_RESUME_WORKSPACE", workspace.path())
+            .env("KIKI_RESUME_SESSION", &session_id)
+            .env("KIKI_RESUME_SOCKET", &socket_path)
+            .spawn()
+            .expect("spawn fresh process");
+        let result = timeout(TEST_TIMEOUT, async {
+            let (mut socket, _) = listener.accept().await?;
+            let mut ready = [0];
+            socket.read_exact(&mut ready).await?;
+            if ready != *b"R" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fresh process did not signal readiness",
+                ));
+            }
+            socket.write_all(b"S").await?;
+            let mut complete = [0];
+            socket.read_exact(&mut complete).await?;
+            Ok(complete)
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "fresh process timed out"))
+        .and_then(|result| result);
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait().expect("reap fresh process");
+        assert!(status.success(), "fresh process failed: {status}");
+        assert_eq!(result.expect("fresh process result"), *b"O");
+        assert_new_ids_follow_bounds(home.path(), &session_id, &id_bounds);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("authorised")).expect("read restored write"),
+            "changed without reread"
+        );
     }
 
     #[tokio::test]
