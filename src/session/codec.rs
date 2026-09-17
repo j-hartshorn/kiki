@@ -75,6 +75,54 @@ enum StoredPayload {
     },
 }
 
+pub(super) struct DecodedEntry(DecodedEntryPayload);
+
+enum DecodedEntryPayload {
+    SessionStart,
+    UserRequest {
+        request: String,
+    },
+    Execution {
+        code: StoredCode,
+        execution: StoredExecution,
+    },
+    Terminal {
+        terminal: StoredTerminal,
+        code: Option<StoredCode>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DecodedEntryKind {
+    SessionStart,
+    UserRequest,
+    Execution,
+    FinalReply,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DecodedCodeResult {
+    Execution,
+    Cancelled,
+    Failure,
+}
+
+pub(super) enum DecodedTerminalHistory {
+    Final {
+        text: String,
+        reasoning_summary: String,
+        replay: ProviderReplay,
+    },
+    Cancelled {
+        code: Option<PersistedCode>,
+    },
+    Failed {
+        code: Option<PersistedCode>,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredCode {
     source: String,
@@ -367,6 +415,203 @@ pub(super) fn decode_request(payload_json: &str) -> Result<String, CodecError> {
     Ok(request)
 }
 
+pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntry, CodecError> {
+    if kind == "session_start" {
+        return (payload_json == "{}")
+            .then_some(DecodedEntry(DecodedEntryPayload::SessionStart))
+            .ok_or(CodecError::InvalidPayload);
+    }
+    let payload: StoredPayload = serde_json::from_str(payload_json)?;
+    match (kind, payload) {
+        ("user_request", StoredPayload::UserRequest { request }) => {
+            Ok(DecodedEntry(DecodedEntryPayload::UserRequest { request }))
+        }
+        ("execution", StoredPayload::Execution { code, execution }) => {
+            Ok(DecodedEntry(DecodedEntryPayload::Execution {
+                code,
+                execution,
+            }))
+        }
+        ("final_reply", StoredPayload::Terminal { terminal, code })
+            if matches!(terminal, StoredTerminal::Final { .. }) =>
+        {
+            Ok(DecodedEntry(DecodedEntryPayload::Terminal {
+                terminal,
+                code,
+            }))
+        }
+        ("cancelled", StoredPayload::Terminal { terminal, code })
+            if matches!(terminal, StoredTerminal::Cancelled { .. }) =>
+        {
+            Ok(DecodedEntry(DecodedEntryPayload::Terminal {
+                terminal,
+                code,
+            }))
+        }
+        ("failed", StoredPayload::Terminal { terminal, code })
+            if matches!(terminal, StoredTerminal::Failed { .. }) =>
+        {
+            Ok(DecodedEntry(DecodedEntryPayload::Terminal {
+                terminal,
+                code,
+            }))
+        }
+        _ => Err(CodecError::InvalidPayload),
+    }
+}
+
+pub(super) fn decoded_entry_kind(entry: &DecodedEntry) -> DecodedEntryKind {
+    match &entry.0 {
+        DecodedEntryPayload::SessionStart => DecodedEntryKind::SessionStart,
+        DecodedEntryPayload::UserRequest { .. } => DecodedEntryKind::UserRequest,
+        DecodedEntryPayload::Execution { .. } => DecodedEntryKind::Execution,
+        DecodedEntryPayload::Terminal { terminal, .. } => match terminal {
+            StoredTerminal::Final { .. } => DecodedEntryKind::FinalReply,
+            StoredTerminal::Cancelled { .. } => DecodedEntryKind::Cancelled,
+            StoredTerminal::Failed { .. } => DecodedEntryKind::Failed,
+        },
+    }
+}
+
+pub(super) fn decoded_request(entry: &DecodedEntry) -> Option<&str> {
+    let DecodedEntryPayload::UserRequest { request } = &entry.0 else {
+        return None;
+    };
+    Some(request)
+}
+
+pub(super) fn decoded_execution_catalogue(
+    entry: &DecodedEntry,
+) -> Option<(Option<&str>, Vec<ToolCallSummary>)> {
+    let DecodedEntryPayload::Execution { code, execution } = &entry.0 else {
+        return None;
+    };
+    matches!(code.result, StoredCodeResult::Execution { .. }).then(|| {
+        (
+            code.commentary.as_deref(),
+            execution
+                .tool_calls
+                .iter()
+                .map(|call| decode_tool_call_summary(&call.summary))
+                .collect(),
+        )
+    })
+}
+
+pub(super) fn decoded_final_text(entry: &DecodedEntry) -> Option<&str> {
+    let DecodedEntryPayload::Terminal {
+        terminal: StoredTerminal::Final { text, .. },
+        code: None,
+    } = &entry.0
+    else {
+        return None;
+    };
+    Some(text)
+}
+
+pub(super) fn decoded_terminal_code_result(
+    entry: &DecodedEntry,
+) -> Option<Option<DecodedCodeResult>> {
+    let DecodedEntryPayload::Terminal { code, .. } = &entry.0 else {
+        return None;
+    };
+    Some(
+        code.as_ref()
+            .map(|code| decoded_code_result_kind(&code.result)),
+    )
+}
+
+pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
+    match &entry.0 {
+        DecodedEntryPayload::SessionStart | DecodedEntryPayload::UserRequest { .. } => Vec::new(),
+        DecodedEntryPayload::Execution { code, .. } => {
+            code.attempts.iter().map(decode_attempt).collect()
+        }
+        DecodedEntryPayload::Terminal { terminal, .. } => match terminal {
+            StoredTerminal::Final { attempts, .. }
+            | StoredTerminal::Cancelled { attempts, .. }
+            | StoredTerminal::Failed { attempts, .. } => {
+                attempts.iter().map(decode_attempt).collect()
+            }
+        },
+    }
+}
+
+pub(super) fn decoded_readable_execution(
+    entry: &DecodedEntry,
+) -> Option<(ReadableCode, Execution)> {
+    let DecodedEntryPayload::Execution { code, execution } = &entry.0 else {
+        return None;
+    };
+    Some((
+        decode_readable_code(code),
+        decode_execution_value(execution),
+    ))
+}
+
+pub(super) fn decoded_readable_terminal(entry: &DecodedEntry) -> Option<ReadableTerminal> {
+    let DecodedEntryPayload::Terminal { terminal, .. } = &entry.0 else {
+        return None;
+    };
+    Some(decode_readable_terminal_value(terminal))
+}
+
+pub(super) fn decoded_execution_history(
+    entry: &DecodedEntry,
+    provider_replay: Option<&[u8]>,
+) -> Result<PersistedCode, CodecError> {
+    let DecodedEntryPayload::Execution { code, .. } = &entry.0 else {
+        return Err(CodecError::InvalidPayload);
+    };
+    decode_code(code, decode_replay(provider_replay)?)
+}
+
+pub(super) fn decoded_terminal_history(
+    entry: &DecodedEntry,
+    provider_replay: Option<&[u8]>,
+) -> Result<DecodedTerminalHistory, CodecError> {
+    let DecodedEntryPayload::Terminal { terminal, code } = &entry.0 else {
+        return Err(CodecError::InvalidPayload);
+    };
+    match terminal {
+        StoredTerminal::Final {
+            text,
+            reasoning_summary,
+            ..
+        } if code.is_none() => Ok(DecodedTerminalHistory::Final {
+            text: text.clone(),
+            reasoning_summary: reasoning_summary.clone(),
+            replay: decode_replay(provider_replay)?,
+        }),
+        StoredTerminal::Cancelled { .. } => Ok(DecodedTerminalHistory::Cancelled {
+            code: decoded_terminal_code(code.as_ref(), provider_replay)?,
+        }),
+        StoredTerminal::Failed { .. } => Ok(DecodedTerminalHistory::Failed {
+            code: decoded_terminal_code(code.as_ref(), provider_replay)?,
+        }),
+        StoredTerminal::Final { .. } => Err(CodecError::InvalidPayload),
+    }
+}
+
+fn decoded_terminal_code(
+    code: Option<&StoredCode>,
+    provider_replay: Option<&[u8]>,
+) -> Result<Option<PersistedCode>, CodecError> {
+    let replay = provider_replay
+        .map(|replay| decode_replay(Some(replay)))
+        .transpose()?;
+    code.map(|code| decode_code(code, replay.clone().ok_or(CodecError::MissingReplay)?))
+        .transpose()
+}
+
+fn decoded_code_result_kind(result: &StoredCodeResult) -> DecodedCodeResult {
+    match result {
+        StoredCodeResult::Execution { .. } => DecodedCodeResult::Execution,
+        StoredCodeResult::Cancelled { .. } => DecodedCodeResult::Cancelled,
+        StoredCodeResult::Failure { .. } => DecodedCodeResult::Failure,
+    }
+}
+
 pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecError> {
     let parameters = record.parameters();
     let observation = record.observation();
@@ -442,14 +687,18 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
     let details: StoredTaskDetails = serde_json::from_str(value)?;
     let parameters = ChildParameters::new(
         details.prompt,
-        decode_selection(details.selection)?,
+        decode_selection(&details.selection)?,
         details.read_only,
     );
     let outcome = details.outcome.map(decode_task_outcome);
     Ok(DecodedTaskDetails {
         parameters,
         depth: details.depth,
-        attempts: details.attempts.into_iter().map(decode_attempt).collect(),
+        attempts: details
+            .attempts
+            .into_iter()
+            .map(|attempt| decode_attempt(&attempt))
+            .collect(),
         details: TaskPersistedDetails {
             admitted_at_ms: details.admitted_at_ms,
             terminal_at_ms: details.terminal_at_ms,
@@ -467,7 +716,7 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
                     crate::subagents::TaskAttempt::for_persisted(
                         attempt.model_step,
                         attempt.provider_attempt,
-                        attempt.accounting.map(decode_attempt),
+                        attempt.accounting.as_ref().map(decode_attempt),
                     )
                 })
                 .collect(),
@@ -479,8 +728,12 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
                         execution.model_step,
                         execution.source,
                         execution.reasoning_summary,
-                        decode_execution_value(execution.execution),
-                        execution.attempts.into_iter().map(decode_attempt).collect(),
+                        decode_execution_value(&execution.execution),
+                        execution
+                            .attempts
+                            .into_iter()
+                            .map(|attempt| decode_attempt(&attempt))
+                            .collect(),
                     )
                 })
                 .collect(),
@@ -538,86 +791,40 @@ pub(super) fn encode_terminal(
     })
 }
 
-pub(super) fn decode_execution_entry(
-    payload_json: &str,
-    provider_replay: Option<&[u8]>,
-) -> Result<PersistedCode, CodecError> {
-    let StoredPayload::Execution { code, execution } = serde_json::from_str(payload_json)? else {
-        return Err(CodecError::InvalidPayload);
-    };
-    let mut code = decode_code(code, decode_replay(provider_replay)?)?;
-    code.execution = Some(decode_execution_value(execution));
-    Ok(code)
-}
-
-pub(super) fn decode_terminal_entry(
-    payload_json: &str,
-    provider_replay: Option<&[u8]>,
-) -> Result<(PersistedTerminal, Option<PersistedCode>), CodecError> {
-    let StoredPayload::Terminal { terminal, code } = serde_json::from_str(payload_json)? else {
-        return Err(CodecError::InvalidPayload);
-    };
-    let replay = provider_replay
-        .map(|replay| decode_replay(Some(replay)))
-        .transpose()?;
-    let code = code
-        .map(|code| decode_code(code, replay.clone().ok_or(CodecError::MissingReplay)?))
-        .transpose()?;
-    Ok((decode_terminal_value(terminal, replay)?, code))
-}
-
-pub(super) fn decode_readable_execution(
-    payload_json: &str,
-) -> Result<(ReadableCode, Execution), CodecError> {
-    let StoredPayload::Execution { code, execution } = serde_json::from_str(payload_json)? else {
-        return Err(CodecError::InvalidPayload);
-    };
-    Ok((
-        decode_readable_code(code),
-        decode_execution_value(execution),
-    ))
-}
-
-pub(super) fn decode_readable_terminal(
-    payload_json: &str,
-) -> Result<(ReadableTerminal, Option<ReadableCode>), CodecError> {
-    let StoredPayload::Terminal { terminal, code } = serde_json::from_str(payload_json)? else {
-        return Err(CodecError::InvalidPayload);
-    };
-    let terminal = match terminal {
+fn decode_readable_terminal_value(terminal: &StoredTerminal) -> ReadableTerminal {
+    match terminal {
         StoredTerminal::Final {
             text,
             reasoning_summary,
             attempts,
         } => ReadableTerminal::Final {
-            text,
-            reasoning_summary,
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
+            text: text.clone(),
+            reasoning_summary: reasoning_summary.clone(),
+            attempts: attempts.iter().map(decode_attempt).collect(),
         },
         StoredTerminal::Cancelled { evidence, attempts } => ReadableTerminal::Cancelled {
-            evidence: evidence.map(decode_evidence),
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
+            evidence: evidence.as_ref().map(decode_evidence),
+            attempts: attempts.iter().map(decode_attempt).collect(),
         },
         StoredTerminal::Failed {
             message,
             evidence,
             attempts,
         } => ReadableTerminal::Failed {
-            message,
-            evidence: evidence.map(decode_evidence),
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
+            message: message.clone(),
+            evidence: evidence.as_ref().map(decode_evidence),
+            attempts: attempts.iter().map(decode_attempt).collect(),
         },
-    };
-    Ok((terminal, code.map(decode_readable_code)))
+    }
 }
 
-fn decode_readable_code(code: StoredCode) -> ReadableCode {
+fn decode_readable_code(code: &StoredCode) -> ReadableCode {
     ReadableCode {
-        source: code.source,
-        commentary: code.commentary,
-        reasoning_summary: code.reasoning_summary,
-        result: decode_code_result(code.result),
-        attempts: code.attempts.into_iter().map(decode_attempt).collect(),
+        source: code.source.clone(),
+        commentary: code.commentary.clone(),
+        reasoning_summary: code.reasoning_summary.clone(),
+        result: decode_code_result(&code.result),
+        attempts: code.attempts.iter().map(decode_attempt).collect(),
     }
 }
 
@@ -633,17 +840,17 @@ fn encode_code(code: &PersistedCode) -> StoredCode {
     }
 }
 
-fn decode_code(code: StoredCode, replay: ProviderReplay) -> Result<PersistedCode, CodecError> {
+fn decode_code(code: &StoredCode, replay: ProviderReplay) -> Result<PersistedCode, CodecError> {
     Ok(PersistedCode {
-        source: code.source,
-        call_id: ModelCallId::new(code.call_id),
-        commentary: code.commentary,
-        reasoning_summary: code.reasoning_summary,
-        selection: code.selection.map(decode_selection).transpose()?,
+        source: code.source.clone(),
+        call_id: ModelCallId::new(code.call_id.clone()),
+        commentary: code.commentary.clone(),
+        reasoning_summary: code.reasoning_summary.clone(),
+        selection: code.selection.as_ref().map(decode_selection).transpose()?,
         replay,
-        result: decode_code_result(code.result),
+        result: decode_code_result(&code.result),
         execution: None,
-        attempts: code.attempts.into_iter().map(decode_attempt).collect(),
+        attempts: code.attempts.iter().map(decode_attempt).collect(),
     })
 }
 
@@ -654,7 +861,7 @@ fn encode_selection(selection: ModelSelection) -> StoredSelection {
     }
 }
 
-fn decode_selection(selection: StoredSelection) -> Result<ModelSelection, CodecError> {
+fn decode_selection(selection: &StoredSelection) -> Result<ModelSelection, CodecError> {
     model_by_id(&selection.model_id)
         .and_then(|model| {
             model
@@ -701,11 +908,17 @@ fn encode_code_result(result: &CodeResult) -> StoredCodeResult {
     }
 }
 
-fn decode_code_result(result: StoredCodeResult) -> CodeResult {
+fn decode_code_result(result: &StoredCodeResult) -> CodeResult {
     match result {
-        StoredCodeResult::Execution { feedback } => CodeResult::Execution { feedback },
-        StoredCodeResult::Cancelled { feedback } => CodeResult::Cancelled { feedback },
-        StoredCodeResult::Failure { feedback } => CodeResult::Failure { feedback },
+        StoredCodeResult::Execution { feedback } => CodeResult::Execution {
+            feedback: feedback.clone(),
+        },
+        StoredCodeResult::Cancelled { feedback } => CodeResult::Cancelled {
+            feedback: feedback.clone(),
+        },
+        StoredCodeResult::Failure { feedback } => CodeResult::Failure {
+            feedback: feedback.clone(),
+        },
     }
 }
 
@@ -726,27 +939,23 @@ fn encode_execution_value(execution: &Execution) -> StoredExecution {
     }
 }
 
-fn decode_execution_value(execution: StoredExecution) -> Execution {
+fn decode_execution_value(execution: &StoredExecution) -> Execution {
     Execution {
-        stdout: decode_observation(execution.stdout),
-        stderr: decode_observation(execution.stderr),
-        outcome: match execution.outcome {
+        stdout: decode_observation(&execution.stdout),
+        stderr: decode_observation(&execution.stderr),
+        outcome: match &execution.outcome {
             StoredExecutionOutcome::Complete { result } => ExecutionOutcome::Complete {
-                result: result.map(decode_observation),
+                result: result.as_ref().map(decode_observation),
             },
             StoredExecutionOutcome::PythonError {
                 text,
                 omitted_bytes,
             } => ExecutionOutcome::PythonError(PythonError {
-                text,
-                omitted_bytes,
+                text: text.clone(),
+                omitted_bytes: *omitted_bytes,
             }),
         },
-        tool_calls: execution
-            .tool_calls
-            .into_iter()
-            .map(decode_tool_call)
-            .collect(),
+        tool_calls: execution.tool_calls.iter().map(decode_tool_call).collect(),
     }
 }
 
@@ -766,10 +975,10 @@ fn encode_observation(observation: &Observation) -> StoredObservation {
     }
 }
 
-fn decode_observation(observation: StoredObservation) -> Observation {
+fn decode_observation(observation: &StoredObservation) -> Observation {
     Observation {
-        head: observation.head,
-        tail: observation.tail,
+        head: observation.head.clone(),
+        tail: observation.tail.clone(),
         head_lines: observation.head_lines,
         tail_lines: observation.tail_lines,
         total_lines: observation.total_lines,
@@ -812,7 +1021,7 @@ fn encode_tool_call(call: &ToolCall) -> StoredToolCall {
     }
 }
 
-fn decode_tool_call(call: StoredToolCall) -> ToolCall {
+fn decode_tool_call(call: &StoredToolCall) -> ToolCall {
     ToolCall {
         tool: match call.tool {
             StoredToolName::Read => ToolName::Read,
@@ -828,50 +1037,22 @@ fn decode_tool_call(call: StoredToolCall) -> ToolCall {
             StoredToolName::WaitSubagent => ToolName::WaitSubagent,
             StoredToolName::CancelSubagent => ToolName::CancelSubagent,
         },
-        summary: match call.summary {
-            StoredToolCallSummary::Pending => ToolCallSummary::Pending,
-            StoredToolCallSummary::Failed => ToolCallSummary::Failed,
-            StoredToolCallSummary::Exit(code) => ToolCallSummary::Exit(code),
-            StoredToolCallSummary::Signal => ToolCallSummary::Signal,
-            StoredToolCallSummary::Count(count) => ToolCallSummary::Count(count),
-            StoredToolCallSummary::Created => ToolCallSummary::Created,
-            StoredToolCallSummary::Replaced => ToolCallSummary::Replaced,
-            StoredToolCallSummary::Applied => ToolCallSummary::Applied,
-            StoredToolCallSummary::Subagent(id) => ToolCallSummary::Subagent(id),
-        },
+        summary: decode_tool_call_summary(&call.summary),
     }
 }
 
-fn decode_terminal_value(
-    terminal: StoredTerminal,
-    replay: Option<ProviderReplay>,
-) -> Result<PersistedTerminal, CodecError> {
-    Ok(match terminal {
-        StoredTerminal::Final {
-            text,
-            reasoning_summary,
-            attempts,
-        } => PersistedTerminal::Final {
-            step_id: 0,
-            text,
-            reasoning_summary,
-            replay: replay.ok_or(CodecError::MissingReplay)?,
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
-        },
-        StoredTerminal::Cancelled { evidence, attempts } => PersistedTerminal::Cancelled {
-            evidence: evidence.map(decode_evidence),
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
-        },
-        StoredTerminal::Failed {
-            message,
-            evidence,
-            attempts,
-        } => PersistedTerminal::Failed {
-            message,
-            evidence: evidence.map(decode_evidence),
-            attempts: attempts.into_iter().map(decode_attempt).collect(),
-        },
-    })
+fn decode_tool_call_summary(summary: &StoredToolCallSummary) -> ToolCallSummary {
+    match summary {
+        StoredToolCallSummary::Pending => ToolCallSummary::Pending,
+        StoredToolCallSummary::Failed => ToolCallSummary::Failed,
+        StoredToolCallSummary::Exit(code) => ToolCallSummary::Exit(*code),
+        StoredToolCallSummary::Signal => ToolCallSummary::Signal,
+        StoredToolCallSummary::Count(count) => ToolCallSummary::Count(*count),
+        StoredToolCallSummary::Created => ToolCallSummary::Created,
+        StoredToolCallSummary::Replaced => ToolCallSummary::Replaced,
+        StoredToolCallSummary::Applied => ToolCallSummary::Applied,
+        StoredToolCallSummary::Subagent(id) => ToolCallSummary::Subagent(id.clone()),
+    }
 }
 
 fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
@@ -938,36 +1119,35 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
     }
 }
 
-fn decode_evidence(evidence: StoredTerminalEvidence) -> TerminalEvidence {
+fn decode_evidence(evidence: &StoredTerminalEvidence) -> TerminalEvidence {
     match evidence {
         StoredTerminalEvidence::Generation(evidence) => {
             TerminalEvidence::Generation(GenerationEvidence {
-                reasoning_summary: evidence.reasoning_summary,
-                reasoning: evidence.reasoning,
-                assistant_text: evidence.assistant_text,
-                decoded_python: evidence.decoded_python,
+                reasoning_summary: evidence.reasoning_summary.clone(),
+                reasoning: evidence.reasoning.clone(),
+                assistant_text: evidence.assistant_text.clone(),
+                decoded_python: evidence.decoded_python.clone(),
             })
         }
         StoredTerminalEvidence::Execution(evidence) => {
             TerminalEvidence::Execution(Box::new(ExecutionEvidence {
-                source: evidence.source,
-                commentary: evidence.commentary,
-                reasoning_summary: evidence.reasoning_summary,
+                source: evidence.source.clone(),
+                commentary: evidence.commentary.clone(),
+                reasoning_summary: evidence.reasoning_summary.clone(),
                 began: evidence.began,
-                stdout: decode_observation(evidence.stdout),
-                stderr: decode_observation(evidence.stderr),
-                tool_calls: evidence
-                    .tool_calls
-                    .into_iter()
-                    .map(decode_tool_call)
-                    .collect(),
-                cancellation_warning: evidence.cancellation_warning,
-                failure: evidence.failure.map(|failure| match failure {
-                    StoredExecutionFailure::Arena { message } => {
-                        ExecutionFailure::Arena { message }
-                    }
+                stdout: decode_observation(&evidence.stdout),
+                stderr: decode_observation(&evidence.stderr),
+                tool_calls: evidence.tool_calls.iter().map(decode_tool_call).collect(),
+                cancellation_warning: evidence.cancellation_warning.clone(),
+                failure: evidence.failure.as_ref().map(|failure| match failure {
+                    StoredExecutionFailure::Arena { message } => ExecutionFailure::Arena {
+                        message: message.clone(),
+                    },
                     StoredExecutionFailure::RecoveryFailed { original, recovery } => {
-                        ExecutionFailure::RecoveryFailed { original, recovery }
+                        ExecutionFailure::RecoveryFailed {
+                            original: original.clone(),
+                            recovery: recovery.clone(),
+                        }
                     }
                 }),
             }))
@@ -987,7 +1167,7 @@ fn encode_attempt(accounting: &AttemptAccounting) -> StoredAttemptAccounting {
     }
 }
 
-fn decode_attempt(accounting: StoredAttemptAccounting) -> AttemptAccounting {
+fn decode_attempt(accounting: &StoredAttemptAccounting) -> AttemptAccounting {
     match accounting {
         StoredAttemptAccounting::KnownUsage(usage) => {
             AttemptAccounting::KnownUsage(decode_usage(usage))
@@ -1012,10 +1192,10 @@ fn encode_usage(usage: &ModelUsage) -> StoredModelUsage {
     }
 }
 
-fn decode_usage(usage: StoredModelUsage) -> ModelUsage {
+fn decode_usage(usage: &StoredModelUsage) -> ModelUsage {
     ModelUsage {
-        model: usage.model,
-        service_tier: usage.service_tier,
+        model: usage.model.clone(),
+        service_tier: usage.service_tier.clone(),
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
@@ -1179,11 +1359,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        decode_checkpoint, decode_execution_entry, decode_execution_value, decode_path,
-        decode_session_preferences, decode_task_details, decode_terminal_entry, decode_tool_value,
-        encode_checkpoint, encode_execution, encode_execution_value, encode_path, encode_request,
-        encode_session_preferences, encode_task_details, encode_terminal, encode_tool_value,
-        fail_unfinished_task_details,
+        DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
+        decode_path, decode_session_preferences, decode_task_details, decode_tool_value,
+        decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
+        decoded_terminal_history, encode_checkpoint, encode_execution, encode_execution_value,
+        encode_path, encode_request, encode_session_preferences, encode_task_details,
+        encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
@@ -1268,7 +1449,7 @@ mod tests {
         };
 
         assert_eq!(
-            decode_execution_value(encode_execution_value(&execution)),
+            decode_execution_value(&encode_execution_value(&execution)),
             execution
         );
     }
@@ -1357,23 +1538,41 @@ mod tests {
         );
         let invalid_payload = encode_request("unexpected payload").unwrap();
         assert_eq!(
-            decode_execution_entry(&invalid_payload, None)
-                .unwrap_err()
+            decode_entry("execution", &invalid_payload)
+                .err()
+                .expect("execution payload must be rejected")
                 .to_string(),
             "stored session payload has unexpected kind"
         );
         assert_eq!(
-            decode_terminal_entry(&invalid_payload, None)
-                .unwrap_err()
+            decode_entry("cancelled", &invalid_payload)
+                .err()
+                .expect("terminal payload must be rejected")
                 .to_string(),
             "stored session payload has unexpected kind"
         );
 
         let stored = encode_execution(&code).unwrap();
+        let decoded = decode_entry(stored.kind, &stored.payload_json).unwrap();
         assert_eq!(
-            decode_execution_entry(&stored.payload_json, stored.provider_replay.as_deref())
-                .unwrap(),
-            code
+            decoded_execution_history(&decoded, stored.provider_replay.as_deref()).unwrap(),
+            crate::session::PersistedCode {
+                execution: None,
+                ..code.clone()
+            }
+        );
+        assert_eq!(
+            decoded_readable_execution(&decoded),
+            Some((
+                crate::session::ReadableCode {
+                    source: code.source.clone(),
+                    commentary: code.commentary.clone(),
+                    reasoning_summary: code.reasoning_summary.clone(),
+                    result: code.result.clone(),
+                    attempts: code.attempts.clone(),
+                },
+                execution.clone(),
+            ))
         );
 
         let terminal = crate::session::PersistedTerminal::Cancelled {
@@ -1409,10 +1608,33 @@ mod tests {
             attempts: Vec::new(),
             ..terminal_code.clone()
         };
+        let decoded = decode_entry(stored.kind, &stored.payload_json).unwrap();
+        assert!(matches!(
+            decoded_terminal_history(&decoded, stored.provider_replay.as_deref()).unwrap(),
+            DecodedTerminalHistory::Cancelled { code: Some(code) } if code == stored_terminal_code
+        ));
+        let crate::session::PersistedTerminal::Cancelled { evidence, attempts } = terminal else {
+            unreachable!("test terminal is cancelled");
+        };
         assert_eq!(
-            decode_terminal_entry(&stored.payload_json, stored.provider_replay.as_deref()).unwrap(),
-            (terminal, Some(stored_terminal_code))
+            decoded_readable_terminal(&decoded),
+            Some(crate::session::ReadableTerminal::Cancelled { evidence, attempts })
         );
+
+        let stored = encode_terminal(
+            &crate::session::PersistedTerminal::Cancelled {
+                evidence: None,
+                attempts: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let decoded = decode_entry(stored.kind, &stored.payload_json).unwrap();
+        assert!(matches!(
+            decoded_terminal_history(&decoded, None).unwrap(),
+            DecodedTerminalHistory::Cancelled { code: None }
+        ));
+        assert!(decoded_terminal_history(&decoded, Some(&[0])).is_err());
     }
 
     #[test]
@@ -1599,7 +1821,7 @@ mod tests {
         let attempts = details
             .attempts
             .into_iter()
-            .map(super::decode_attempt)
+            .map(|attempt| super::decode_attempt(&attempt))
             .collect::<Vec<_>>();
         assert_eq!(
             crate::pricing::estimate_run_cost(&attempts),

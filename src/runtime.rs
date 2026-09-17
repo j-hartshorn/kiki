@@ -1643,7 +1643,8 @@ mod tests {
     };
     use crate::session::{
         PersistedCode, PersistedTerminal, RestoredRecord, RestoredRecordKind, RestoredTask,
-        Session, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission, TaskTerminal,
+        Session, SessionEntryId, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission,
+        TaskTerminal,
     };
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -10003,6 +10004,10 @@ mod tests {
             Vec::new(),
         );
         let initial = restored_initial_state(&SessionRestore {
+            requested_entry: SessionEntryId(1),
+            effective_entry: SessionEntryId(1),
+            observed_active_entry: SessionEntryId(1),
+            request_prefill: None,
             metadata: None,
             records: vec![
                 RestoredRecord {
@@ -10028,6 +10033,11 @@ mod tests {
                 },
             ],
             tasks: vec![RestoredTask {
+                record: task.clone(),
+                admitted_revision: 3,
+                terminal_revision: 4,
+            }],
+            all_tasks: vec![RestoredTask {
                 record: task,
                 admitted_revision: 3,
                 terminal_revision: 4,

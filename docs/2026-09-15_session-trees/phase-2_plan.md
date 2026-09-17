@@ -113,7 +113,7 @@ First red: `session::tests::restore_at_projects_selected_history_checkpoint_and_
 
 **Files**
 
-- Modify: `src/session.rs`, `src/runtime.rs`.
+- Modify: `src/session.rs`, `src/session/codec.rs`, `src/runtime.rs`.
 
 **Verification**
 
