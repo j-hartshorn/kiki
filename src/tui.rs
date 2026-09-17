@@ -5417,7 +5417,7 @@ mod tests {
         let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
 
         let screen = rendered(&mut app, 60, 7);
-        assert!(screen.contains("Session restore failed; restart Kiki"));
+        assert!(screen.contains("Session restore failed; session is read-only"));
         assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
         assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
         assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
