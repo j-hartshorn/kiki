@@ -1383,6 +1383,7 @@ mod tests {
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
+    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -2792,6 +2793,96 @@ mod tests {
         assert_eq!(completed[0].reasoning_summary(), "failed code summary");
         assert_eq!(feedback, &evidence.feedback());
         assert!(!feedback.contains("failed code summary"));
+    }
+
+    #[tokio::test]
+    async fn persisted_cancelled_timeout_restores_failure_code_result() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let arena = Arena::with_limits(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::ZERO,
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![ModelAction::Code {
+                source: "value = 1".to_owned(),
+            }]),
+        );
+        let cancellation = CancellationToken::new();
+        let writer = session.writer();
+        let outcome = {
+            let mut event = |_| {};
+            let run = agent.run_persisted(
+                "time out then cancel".to_owned(),
+                &cancellation,
+                &writer,
+                &mut event,
+            );
+            tokio::pin!(run);
+            let cancel_at_closure = async {
+                gate.wait_until_started().await;
+                cancellation.cancel();
+                gate.release();
+            };
+            let (outcome, ()) = tokio::join!(run, cancel_at_closure);
+            outcome.unwrap()
+        };
+        assert!(matches!(
+            outcome.terminal,
+            crate::session::PersistedTerminal::Cancelled { .. }
+        ));
+        assert!(matches!(
+            agent
+                .model_context
+                .entries()
+                .last()
+                .and_then(ModelContextEntry::completed_code)
+                .map(|code| code.result()),
+            Some(CodeResult::Failure { .. })
+        ));
+
+        let restore = session.restore().unwrap();
+        assert!(restore.executable.is_some());
+        assert!(matches!(
+            restore.records.as_slice(),
+            [
+                crate::session::RestoredRecord {
+                    kind: crate::session::RestoredRecordKind::UserRequest { .. },
+                    ..
+                },
+                crate::session::RestoredRecord {
+                    kind: crate::session::RestoredRecordKind::CancelledRun { .. },
+                    ..
+                }
+            ]
+        ));
+        assert!(matches!(
+            restore
+                .executable
+                .as_ref()
+                .and_then(|state| state.history.entries().last())
+                .and_then(ModelContextEntry::completed_code)
+                .map(|code| code.result()),
+            Some(CodeResult::Failure { .. })
+        ));
+
+        drop(writer);
+        session.close().unwrap();
     }
 
     #[tokio::test]

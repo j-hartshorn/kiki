@@ -2281,7 +2281,11 @@ fn readable_record(
             if !matches!(terminal, ReadableTerminal::Cancelled { .. })
                 || runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
                 || code.as_ref().is_some_and(|code| {
-                    !matches!(code.result, crate::model::CodeResult::Cancelled { .. })
+                    !matches!(
+                        code.result,
+                        crate::model::CodeResult::Cancelled { .. }
+                            | crate::model::CodeResult::Failure { .. }
+                    )
                 })
             {
                 return Err(());
@@ -2402,6 +2406,7 @@ fn restored_history(
                             && matches!(
                                 code.result,
                                 crate::model::CodeResult::Cancelled { .. }
+                                    | crate::model::CodeResult::Failure { .. }
                             ) =>
                     {
                         settled_step_id(entry, steps).ok()?;
