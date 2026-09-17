@@ -67,7 +67,6 @@ impl RuntimeIdentity {
         &self.0
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_session_value(value: String) -> Self {
         Self(value)
     }
@@ -85,7 +84,6 @@ impl Checkpoint {
         (&self.identity, &self.state, &self.authorisations)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_session_parts(
         identity: RuntimeIdentity,
         state: Vec<u8>,

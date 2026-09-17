@@ -823,7 +823,6 @@ impl ContentFingerprint {
         self.0
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_session_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
