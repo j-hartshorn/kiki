@@ -124,7 +124,7 @@ impl TaskState {
         }
     }
 
-    pub(crate) fn storage_name(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
             Self::Running => "running",
@@ -1082,7 +1082,7 @@ fn observation_value(observation: &TaskObservation) -> ToolValue {
         ),
         (
             "state".to_owned(),
-            ToolValue::String(task_state_name(observation.state()).to_owned()),
+            ToolValue::String(observation.state().as_str().to_owned()),
         ),
         (
             "model".to_owned(),
@@ -1149,18 +1149,6 @@ fn wait_value(
             error.map_or(ToolValue::None, ToolValue::String),
         ),
     ]))
-}
-
-fn task_state_name(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Starting => "starting",
-        TaskState::Running => "running",
-        TaskState::Stopping => "stopping",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
-        TaskState::TimedOut => "timed_out",
-    }
 }
 
 fn cost_status_name(status: CostStatus) -> &'static str {

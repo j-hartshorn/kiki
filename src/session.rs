@@ -327,7 +327,7 @@ impl TaskSnapshot {
         }
         Ok(Self {
             task_id: task_sql_id(record.id().as_str())?,
-            state: state.storage_name(),
+            state: state.as_str(),
             task_revision: i64::try_from(record.revision())
                 .map_err(|_| SessionError::IdOverflow)?,
             details_json: codec::encode_task_details(record)
@@ -358,7 +358,7 @@ impl TaskTerminal {
         }
         Ok(Self {
             task_id: task_sql_id(record.id().as_str())?,
-            state: state.storage_name(),
+            state: state.as_str(),
             task_revision: i64::try_from(record.revision())
                 .map_err(|_| SessionError::IdOverflow)?,
             details_json: codec::encode_task_details(record)
