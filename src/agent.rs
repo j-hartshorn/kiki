@@ -13,6 +13,7 @@ use crate::model::{
 use crate::session::{PersistedCode, PersistedTerminal, SessionError, SessionWriter};
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
+const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvidence {
@@ -180,11 +181,6 @@ impl FinalMessage {
 
     pub(crate) fn reasoning_summary(&self) -> &str {
         &self.generation.reasoning_summary
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation_evidence(&self) -> TerminalEvidence {
-        TerminalEvidence::Generation(self.generation.clone())
     }
 }
 
@@ -419,35 +415,8 @@ pub enum AgentError {
 
 impl AgentError {
     #[cfg(test)]
-    pub(crate) fn is_recovery_failed(&self) -> bool {
-        matches!(
-            self,
-            Self::Arena {
-                error: ArenaError::RecoveryFailed { .. },
-                ..
-            }
-        )
-    }
-
-    #[cfg(test)]
     pub(crate) fn is_authentication(&self) -> bool {
         matches!(self, Self::Model { failure, .. } if failure.is_authentication())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Cancelled { .. } => true,
-            Self::Model { failure, .. } => failure.is_cancelled(),
-            Self::Arena {
-                error: ArenaError::Cancelled { .. },
-                ..
-            } => true,
-            Self::ModelHistory { .. }
-            | Self::Arena { .. }
-            | Self::NoStagedFinalMessage
-            | Self::StagedFinalMessageUnresolved => false,
-        }
     }
 
     pub fn attempts(&self) -> &[AttemptAccounting] {
@@ -457,17 +426,6 @@ impl AgentError {
             | Self::ModelHistory { attempts, .. }
             | Self::Arena { attempts, .. } => attempts,
             Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => &[],
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn terminal_evidence(&self) -> Option<TerminalEvidence> {
-        match self {
-            Self::Cancelled { evidence, .. }
-            | Self::Model { evidence, .. }
-            | Self::ModelHistory { evidence, .. } => evidence.as_deref().cloned(),
-            Self::Arena { evidence, .. } => Some(TerminalEvidence::Execution(evidence.clone())),
-            Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => None,
         }
     }
 }
@@ -635,7 +593,7 @@ impl<M: Model> Agent<M> {
                     attempts.extend(failure.attempts().iter().cloned());
                     let failure_is_cancelled = failure.is_cancelled();
                     let authentication_failure = failure.is_authentication();
-                    let message = failure.to_string();
+                    let message = bounded_utf8(failure.to_string(), FAILED_RUN_MESSAGE_LIMIT);
                     let evidence = generation.evidence().map(TerminalEvidence::Generation);
                     let attempts = attempts[committed_attempts..].to_vec();
                     let cancellation = cancellation.clone();
@@ -683,7 +641,10 @@ impl<M: Model> Agent<M> {
                     commentary,
                 } => {
                     if self.model_context.contains_call_id(&call_id) {
-                        let message = ModelHistoryError::DuplicateCallId(call_id).to_string();
+                        let message = bounded_utf8(
+                            ModelHistoryError::DuplicateCallId(call_id).to_string(),
+                            FAILED_RUN_MESSAGE_LIMIT,
+                        );
                         let evidence = generation.evidence().map(TerminalEvidence::Generation);
                         let attempts = attempts[committed_attempts..].to_vec();
                         let cancellation = cancellation.clone();
@@ -847,7 +808,7 @@ impl<M: Model> Agent<M> {
                                 persisted_code(&pending, result, None, step_attempts.clone());
                             let is_recovery_failure =
                                 matches!(&error, ArenaError::RecoveryFailed { .. });
-                            let message = error.to_string();
+                            let message = bounded_utf8(error.to_string(), FAILED_RUN_MESSAGE_LIMIT);
                             let evidence = Some(TerminalEvidence::Execution(Box::new(evidence)));
                             let attempts = attempts[committed_attempts..].to_vec();
                             let cancellation = cancellation.clone();

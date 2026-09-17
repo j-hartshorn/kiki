@@ -8,8 +8,6 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{
     Agent, AgentProgress, PersistedAgentEvent, PersistedRunOutcome, TerminalEvidence,
 };
-#[cfg(test)]
-use crate::agent::{AgentError, AgentRunOutcome};
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
@@ -225,8 +223,6 @@ pub(crate) enum RuntimeEvent {
 
 pub(crate) const PROGRESS_CHANNEL_CAPACITY: usize = 256;
 const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
-#[cfg(test)]
-const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProgressEnvelope<T> {
@@ -290,8 +286,6 @@ pub(crate) struct RuntimeController<M: Model> {
     agent: Option<Agent<M>>,
     disabled_reason: Option<RuntimeDisabledReason>,
     records: Vec<StoredRecord>,
-    #[cfg(test)]
-    next_model_step_id: u64,
     session: SessionWriter,
     settings: watch::Sender<ModelSelection>,
     accepted_thinking: AcceptedThinking,
@@ -316,19 +310,10 @@ struct ActiveRun<M: Model> {
     progress: mpsc::Receiver<ProgressEnvelope<WorkerProgress>>,
     progress_open: bool,
     cancellation_requested: bool,
-    #[cfg(test)]
-    step_ids: Vec<ModelStepId>,
 }
 
 #[allow(clippy::large_enum_variant)]
 enum WorkerMessage<M: Model> {
-    #[cfg(test)]
-    Finished {
-        agent: Agent<M>,
-        result: Result<AgentRunOutcome, AgentError>,
-        final_step_ordinal: u64,
-        progress_gap: bool,
-    },
     RequestCommitted {
         run_id: u64,
         request: String,
@@ -635,8 +620,6 @@ impl<M: Model> RuntimeController<M> {
             agent: Some(agent),
             disabled_reason: None,
             records: Vec::new(),
-            #[cfg(test)]
-            next_model_step_id: 1,
             session,
             settings,
             accepted_thinking,
@@ -719,8 +702,6 @@ impl<M: Model> RuntimeController<M> {
                 agent,
                 disabled_reason: initial.disabled_reason.clone(),
                 records: initial.records.clone(),
-                #[cfg(test)]
-                next_model_step_id: 1,
                 session: session.writer(),
                 settings,
                 accepted_thinking,
@@ -1315,8 +1296,6 @@ impl<M: Model> RuntimeController<M> {
             progress: worker_progress,
             progress_open: true,
             cancellation_requested: false,
-            #[cfg(test)]
-            step_ids: Vec::new(),
         });
     }
 
@@ -1484,103 +1463,6 @@ impl<M: Model> RuntimeController<M> {
                     }
                 }
             }
-            #[cfg(test)]
-            WorkerMessage::Finished {
-                mut agent,
-                result,
-                final_step_ordinal,
-                progress_gap,
-            } => {
-                self.drain_worker_progress(progress);
-                let run_id = self.active_run_id();
-                let cancellation_requested = self
-                    .active
-                    .as_ref()
-                    .expect("worker finish requires an active run")
-                    .cancellation_requested;
-                let disabled_reason = match &result {
-                    Err(error) if error.is_recovery_failed() => {
-                        Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed)
-                    }
-                    Err(error) if !cancellation_requested && error.is_authentication() => {
-                        Some(RuntimeDisabledReason::OpenAiAuthentication)
-                    }
-                    _ => None,
-                };
-                let record = match result {
-                    Err(error) if error.is_recovery_failed() => Record::FailedRun {
-                        message: error.to_string(),
-                        terminal: TerminalDetails::new(
-                            error.terminal_evidence(),
-                            error.attempts().to_vec(),
-                        ),
-                    },
-                    Ok(AgentRunOutcome::FinalMessageStaged) if cancellation_requested => {
-                        let final_message = agent
-                            .discard_staged_final_message()
-                            .expect("cancelled staged final message must be discarded");
-                        Record::CancelledRun {
-                            terminal: TerminalDetails::new(
-                                Some(final_message.generation_evidence()),
-                                final_message.attempts().to_vec(),
-                            ),
-                        }
-                    }
-                    Err(error) if cancellation_requested || error.is_cancelled() => {
-                        Record::CancelledRun {
-                            terminal: TerminalDetails::new(
-                                error.terminal_evidence(),
-                                error.attempts().to_vec(),
-                            ),
-                        }
-                    }
-                    Ok(AgentRunOutcome::FinalMessageStaged) => {
-                        let final_message = agent
-                            .admit_staged_final_message()
-                            .expect("successful agent outcome must stage a final message");
-                        Record::FinalMessage {
-                            step_id: self
-                                .step_id_for(final_step_ordinal)
-                                .expect("a final message requires a model step"),
-                            text: final_message.text().to_owned(),
-                            reasoning_summary: final_message.reasoning_summary().to_owned(),
-                            terminal: TerminalDetails::new(None, final_message.attempts().to_vec()),
-                        }
-                    }
-                    Err(error) => Record::FailedRun {
-                        message: error.to_string(),
-                        terminal: TerminalDetails::new(
-                            error.terminal_evidence(),
-                            error.attempts().to_vec(),
-                        ),
-                    },
-                };
-                let settlement = root_settlement(&record);
-                if let Some(reason) = disabled_reason {
-                    self.disabled_reason = Some(reason.clone());
-                    self.append_record(
-                        events,
-                        run_id,
-                        record,
-                        progress_gap || progress.take_pending_gap(),
-                    );
-                    self.emit(events, RuntimeEvent::RuntimeDisabled { reason });
-                } else {
-                    self.agent = Some(agent);
-                    self.append_record(
-                        events,
-                        run_id,
-                        record,
-                        progress_gap || progress.take_pending_gap(),
-                    );
-                }
-                self.trace.emit(|| TraceEvent::RootRunSettled {
-                    run_id: run_id.0,
-                    outcome: settlement,
-                });
-                self.emit(events, RuntimeEvent::RunSettled { run_id });
-                self.active = None;
-            }
         }
     }
 
@@ -1697,51 +1579,6 @@ impl<M: Model> RuntimeController<M> {
         progress.publish(event, upstream_gap, payload_bytes);
     }
 
-    #[cfg(test)]
-    fn step_id_for(&mut self, step_ordinal: u64) -> Option<ModelStepId> {
-        let required_steps = usize::try_from(step_ordinal).ok()?;
-        if required_steps == 0 {
-            return None;
-        }
-        let current_steps = self
-            .active
-            .as_ref()
-            .expect("worker message requires an active run")
-            .step_ids
-            .len();
-        for _ in current_steps..required_steps {
-            let step_id = self.next_model_step_id();
-            self.active
-                .as_mut()
-                .expect("worker message requires an active run")
-                .step_ids
-                .push(step_id);
-        }
-        self.active
-            .as_ref()
-            .and_then(|active| active.step_ids.get(required_steps - 1))
-            .copied()
-    }
-
-    #[cfg(test)]
-    fn active_run_id(&self) -> RunId {
-        self.active
-            .as_ref()
-            .expect("worker message requires an active run")
-            .run_id
-            .expect("legacy worker message requires a committed run")
-    }
-
-    #[cfg(test)]
-    fn next_model_step_id(&mut self) -> ModelStepId {
-        let step_id = ModelStepId(self.next_model_step_id);
-        self.next_model_step_id = self
-            .next_model_step_id
-            .checked_add(1)
-            .expect("model step identifier counter overflowed");
-        step_id
-    }
-
     fn append_committed_record(
         &mut self,
         events: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -1760,67 +1597,9 @@ impl<M: Model> RuntimeController<M> {
         );
     }
 
-    #[cfg(test)]
-    fn append_record(
-        &mut self,
-        events: &mpsc::UnboundedSender<RuntimeEvent>,
-        run_id: RunId,
-        mut record: Record,
-        progress_gap: bool,
-    ) {
-        let completed_attempt_count = self
-            .records
-            .iter()
-            .filter(|stored| stored.run_id == run_id)
-            .filter_map(|stored| match &stored.record {
-                Record::CompletedExecution { attempts, .. } => Some(attempts.len()),
-                _ => None,
-            })
-            .sum();
-        match &mut record {
-            Record::FinalMessage { terminal, .. }
-            | Record::CancelledRun { terminal }
-            | Record::FailedRun { terminal, .. } => {
-                terminal.attempts = terminal
-                    .attempts
-                    .get(completed_attempt_count..)
-                    .unwrap_or_default()
-                    .to_vec();
-            }
-            Record::UserRequest { .. } | Record::CompletedExecution { .. } => {}
-        }
-        if let Record::FailedRun { message, .. } = &mut record {
-            *message = bounded_utf8(std::mem::take(message), FAILED_RUN_MESSAGE_LIMIT);
-        }
-        let record = StoredRecord { run_id, record };
-        self.records.push(record.clone());
-        self.emit(
-            events,
-            RuntimeEvent::RecordAppended {
-                record,
-                progress_gap,
-            },
-        );
-    }
-
     fn emit(&self, events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) {
         let _ = events.send(event);
     }
-}
-
-#[cfg(test)]
-fn bounded_utf8(mut value: String, limit: usize) -> String {
-    value.truncate(utf8_prefix_len(&value, limit));
-    value
-}
-
-#[cfg(test)]
-fn utf8_prefix_len(value: &str, limit: usize) -> usize {
-    let mut end = value.len().min(limit);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
 }
 
 #[cfg(test)]
@@ -1857,12 +1636,10 @@ mod tests {
         StoredRecord, TerminalDetails, WorkerMessage, restored_initial_state,
         runtime_event_payload_bytes,
     };
-    use crate::agent::{
-        Agent, ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence,
-    };
+    use crate::agent::{Agent, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
-        Arena, ArenaError, Checkpoint, Execution, ExecutionOutcome, Observation, RecoveryTestGate,
-        RuntimeIdentity, ToolCall, ToolCallSummary, ToolName,
+        Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
+        ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
@@ -3082,6 +2859,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_failed_run_messages_are_bounded_at_utf8_boundaries() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, OversizedProviderFailureModel),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "trigger oversized failure".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+        let expected = format!(
+            "model provider failed: provider failure (HTTP 500) [oversize]: {}",
+            "é".repeat(2016)
+        );
+
+        let Record::FailedRun { message, .. } = &committed_records(&events)[1].record else {
+            panic!("expected emitted failed run");
+        };
+        assert_eq!(message, &expected);
+        assert!(message.len() <= 4 * 1024);
+        assert!(message.is_char_boundary(message.len()));
+        let Record::FailedRun { message, .. } = &records[1].record else {
+            panic!("expected readable failed run");
+        };
+        assert_eq!(message, &expected);
+        assert!(message.len() <= 4 * 1024);
+        assert!(message.is_char_boundary(message.len()));
+
+        let restore = session.restore().unwrap();
+        let RestoredRecordKind::FailedRun { message, .. } = &restore.records[1].kind else {
+            panic!("expected restored failed run");
+        };
+        assert_eq!(message, &expected);
+        assert!(message.len() <= 4 * 1024);
+        assert!(message.is_char_boundary(message.len()));
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn closure_commit_arbitrates_shutdown_at_storage_linearisation() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -4017,7 +3857,6 @@ mod tests {
             progress: worker_progress,
             progress_open: false,
             cancellation_requested: false,
-            step_ids: Vec::new(),
         });
         let (commands, mut events, _progress, controller) = start_controller(controller);
 
@@ -6613,6 +6452,30 @@ mod tests {
         }
     }
 
+    struct OversizedProviderFailureModel;
+
+    impl Model for OversizedProviderFailureModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async {
+                Err(ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        Some(500),
+                        Some("oversize".to_owned()),
+                        "é".repeat(2_048),
+                    ))),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     struct ClosureCommitProviderFailureModel {
         steps: u8,
     }
@@ -6853,34 +6716,6 @@ mod tests {
         }
     }
 
-    struct SummaryMessageModel {
-        text: String,
-        reasoning_summary: String,
-    }
-
-    impl Model for SummaryMessageModel {
-        #[allow(clippy::manual_async_fn)]
-        fn step<'a>(
-            &'a mut self,
-            _history: &'a ModelHistory,
-            _cancellation: &'a CancellationToken,
-            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
-        {
-            async {
-                Ok(ModelStep {
-                    action: CompletedModelAction::Message {
-                        text: self.text.clone(),
-                    },
-                    selection: None,
-                    reasoning_summary: self.reasoning_summary.clone(),
-                    replay: ProviderReplay::new("test", Vec::new()),
-                    attempts: Vec::new(),
-                })
-            }
-        }
-    }
-
     struct CodeThenCancellationModel {
         first_request_step: u8,
         later_request_step: u8,
@@ -6947,36 +6782,6 @@ mod tests {
                     attempts: vec![AttemptAccounting::UsageUnavailable],
                 })
             }
-        }
-    }
-
-    fn empty_observation() -> Observation {
-        Observation {
-            head: String::new(),
-            tail: None,
-            head_lines: 0,
-            tail_lines: 0,
-            total_lines: 0,
-            total_bytes: 0,
-            omitted_lines: 0,
-            omitted_bytes: 0,
-            head_ends_mid_line: false,
-            tail_starts_mid_line: false,
-            partial_lines: false,
-        }
-    }
-
-    fn failed_execution_evidence(failure: ExecutionFailure) -> ExecutionEvidence {
-        ExecutionEvidence {
-            commentary: None,
-            source: "failed_code()".to_owned(),
-            reasoning_summary: String::new(),
-            began: true,
-            stdout: empty_observation(),
-            stderr: empty_observation(),
-            tool_calls: Vec::new(),
-            cancellation_warning: None,
-            failure: Some(failure),
         }
     }
 
@@ -7495,7 +7300,6 @@ mod tests {
             progress: worker_progress,
             progress_open: false,
             cancellation_requested: false,
-            step_ids: Vec::new(),
         });
         let (event_sender, mut events) = mpsc::unbounded_channel();
         let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
@@ -7503,13 +7307,17 @@ mod tests {
 
         controller
             .handle_worker_message(
-                WorkerMessage::Finished {
+                WorkerMessage::PersistedFinished {
                     agent,
-                    result: Err(crate::agent::AgentError::Cancelled {
-                        attempts: Vec::new(),
-                        evidence: None,
+                    result: Ok(crate::agent::PersistedRunOutcome {
+                        run_id: 1,
+                        terminal: PersistedTerminal::Cancelled {
+                            evidence: None,
+                            attempts: Vec::new(),
+                        },
+                        authentication_failure: false,
+                        recovery_failure: false,
                     }),
-                    final_step_ordinal: 0,
                     progress_gap: true,
                 },
                 &event_sender,
@@ -8629,435 +8437,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_failure_retains_the_non_cancellation_arena_evidence() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller(&workspace, Vec::new()).await;
-        let agent = controller
-            .agent
-            .take()
-            .expect("idle controller should own its agent");
-        let (worker_sender, worker) = mpsc::unbounded_channel();
-        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        controller.active = Some(ActiveRun {
-            run_id: Some(RunId(1)),
-            pending_busy_submissions: 0,
-            caller: controller.subagents.root_caller().await,
-            cancellation: CancellationToken::new(),
-            worker,
-            progress: worker_progress,
-            progress_open: false,
-            cancellation_requested: false,
-            step_ids: Vec::new(),
-        });
-        worker_sender
-            .send(WorkerMessage::Finished {
-                agent,
-                result: Err(crate::agent::AgentError::Arena {
-                    error: ArenaError::Infrastructure {
-                        message: "arena failed".to_owned(),
-                        execution: None,
-                    },
-                    attempts: vec![AttemptAccounting::UsageUnavailable],
-                    evidence: Box::new(failed_execution_evidence(ExecutionFailure::Arena {
-                        message: "arena failed".to_owned(),
-                    })),
-                }),
-                final_step_ordinal: 0,
-                progress_gap: false,
-            })
-            .unwrap();
-        let (commands, command_receiver) = mpsc::channel(1);
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-        let events = events_until_settled(&mut events).await;
-        let records = shutdown_controller(commands, task).await;
-
-        assert_eq!(
-            events.iter().map(event_label).collect::<Vec<_>>(),
-            [
-                "record:1:failed:arena infrastructure failed: arena failed",
-                "settled:1"
-            ]
-        );
-        let Record::FailedRun { terminal, .. } = &records[0].record else {
-            panic!("expected failed terminal record");
-        };
-        assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
-        let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
-            panic!("expected failed execution evidence");
-        };
-        assert_eq!(evidence.source, "failed_code()");
-        assert!(matches!(
-            &evidence.failure,
-            Some(ExecutionFailure::Arena { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn terminal_failures_scope_residual_attempts_and_cancellation_precedence() {
-        #[derive(Clone, Copy)]
-        enum FailureKind {
-            Provider,
-            Arena,
-            Recovery,
-        }
-
-        for (kind, cancellation_queued) in [
-            (FailureKind::Provider, true),
-            (FailureKind::Arena, true),
-            (FailureKind::Recovery, true),
-            (FailureKind::Provider, false),
-            (FailureKind::Arena, false),
-        ] {
-            let workspace = tempfile::tempdir().unwrap();
-            let mut controller = controller(&workspace, Vec::new()).await;
-            let agent = controller
-                .agent
-                .take()
-                .expect("idle controller should own its agent");
-            let attempts = vec![
-                AttemptAccounting::UsageUnavailable,
-                AttemptAccounting::UsageUnavailable,
-            ];
-            let (event_sender, mut events) = mpsc::unbounded_channel();
-            controller.append_record(
-                &event_sender,
-                RunId(1),
-                Record::CompletedExecution {
-                    step_id: ModelStepId(1),
-                    commentary: None,
-                    source: "committed()".to_owned(),
-                    reasoning_summary: String::new(),
-                    execution: Execution {
-                        stdout: empty_observation(),
-                        stderr: empty_observation(),
-                        outcome: ExecutionOutcome::Complete { result: None },
-                        tool_calls: Vec::new(),
-                    },
-                    attempts: vec![AttemptAccounting::UsageUnavailable],
-                },
-                false,
-            );
-            let result = match kind {
-                FailureKind::Provider => Err(crate::agent::AgentError::Model {
-                    failure: ModelFailure::new(
-                        ModelError::Provider(Box::new(ProviderFailure::new(
-                            Some(500),
-                            Some("provider_error".to_owned()),
-                            "provider failed".to_owned(),
-                        ))),
-                        attempts.clone(),
-                    ),
-                    attempts: attempts.clone(),
-                    evidence: Some(Box::new(TerminalEvidence::Generation(GenerationEvidence {
-                        reasoning_summary: String::new(),
-                        reasoning: "thinking".to_owned(),
-                        assistant_text: "partial".to_owned(),
-                        decoded_python: String::new(),
-                    }))),
-                }),
-                FailureKind::Arena => Err(crate::agent::AgentError::Arena {
-                    error: ArenaError::Infrastructure {
-                        message: "arena failed".to_owned(),
-                        execution: None,
-                    },
-                    attempts: attempts.clone(),
-                    evidence: Box::new(failed_execution_evidence(ExecutionFailure::Arena {
-                        message: "arena failed".to_owned(),
-                    })),
-                }),
-                FailureKind::Recovery => Err(crate::agent::AgentError::Arena {
-                    error: ArenaError::RecoveryFailed {
-                        original: Box::new(ArenaError::Infrastructure {
-                            message: "arena failed".to_owned(),
-                            execution: None,
-                        }),
-                        recovery: Box::new(ArenaError::Infrastructure {
-                            message: "recovery failed".to_owned(),
-                            execution: None,
-                        }),
-                    },
-                    attempts: attempts.clone(),
-                    evidence: Box::new(failed_execution_evidence(
-                        ExecutionFailure::RecoveryFailed {
-                            original: "arena failed".to_owned(),
-                            recovery: "recovery failed".to_owned(),
-                        },
-                    )),
-                }),
-            };
-            let (worker_sender, worker) = mpsc::unbounded_channel();
-            let (_worker_progress_sender, worker_progress) =
-                mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-            controller.active = Some(ActiveRun {
-                run_id: Some(RunId(1)),
-                pending_busy_submissions: 0,
-                caller: controller.subagents.root_caller().await,
-                cancellation: CancellationToken::new(),
-                worker,
-                progress: worker_progress,
-                progress_open: false,
-                cancellation_requested: false,
-                step_ids: Vec::new(),
-            });
-            worker_sender
-                .send(WorkerMessage::Finished {
-                    agent,
-                    result,
-                    final_step_ordinal: 0,
-                    progress_gap: false,
-                })
-                .unwrap();
-            let (commands, command_receiver) = mpsc::channel(1);
-            if cancellation_queued {
-                commands.send(RuntimeCommand::Cancel).await.unwrap();
-            }
-            let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-            let task =
-                tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-            let events = events_until_settled(&mut events).await;
-            let records = shutdown_controller(commands, task).await;
-            assert_eq!(records, committed_records(&events));
-            let terminal = records.last().expect("terminal record");
-            assert!(matches!(
-                &records[0].record,
-                Record::CompletedExecution { attempts, .. }
-                    if attempts == &[AttemptAccounting::UsageUnavailable]
-            ));
-            assert!(matches!(
-                events.first(),
-                Some(RuntimeEvent::RecordAppended {
-                    record: StoredRecord {
-                        run_id: RunId(1),
-                        record: Record::CompletedExecution { .. },
-                    },
-                    ..
-                })
-            ));
-            match (kind, cancellation_queued) {
-                (FailureKind::Provider | FailureKind::Arena, true) => {
-                    assert!(matches!(
-                        events.as_slice(),
-                        [
-                            _,
-                            RuntimeEvent::RecordAppended {
-                                record: StoredRecord {
-                                    run_id: RunId(1),
-                                    record: Record::CancelledRun { .. },
-                                },
-                                ..
-                            },
-                            RuntimeEvent::RunSettled { run_id: RunId(1) },
-                        ]
-                    ));
-                    let Record::CancelledRun { terminal } = &terminal.record else {
-                        panic!("accepted cancellation should win");
-                    };
-                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
-                    assert!(terminal.evidence.is_some());
-                }
-                (FailureKind::Provider | FailureKind::Arena, false) => {
-                    assert!(matches!(
-                        events.as_slice(),
-                        [
-                            _,
-                            RuntimeEvent::RecordAppended {
-                                record: StoredRecord {
-                                    run_id: RunId(1),
-                                    record: Record::FailedRun { .. },
-                                },
-                                ..
-                            },
-                            RuntimeEvent::RunSettled { run_id: RunId(1) },
-                        ]
-                    ));
-                    let Record::FailedRun { terminal, .. } = &terminal.record else {
-                        panic!("ordinary failures should remain failed runs");
-                    };
-                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
-                    assert!(terminal.evidence.is_some());
-                }
-                (FailureKind::Recovery, true) => {
-                    assert!(matches!(
-                        events.as_slice(),
-                        [
-                            _,
-                            RuntimeEvent::RecordAppended {
-                                record: StoredRecord {
-                                    run_id: RunId(1),
-                                    record: Record::FailedRun { .. },
-                                },
-                                ..
-                            },
-                            RuntimeEvent::RuntimeDisabled {
-                                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
-                            },
-                            RuntimeEvent::RunSettled { run_id: RunId(1) },
-                        ]
-                    ));
-                    let Record::FailedRun { terminal, .. } = &terminal.record else {
-                        panic!("recovery failure should override cancellation");
-                    };
-                    assert_eq!(terminal.attempts, [AttemptAccounting::UsageUnavailable]);
-                    let Some(TerminalEvidence::Execution(evidence)) = &terminal.evidence else {
-                        panic!("expected recovery execution evidence");
-                    };
-                    assert!(matches!(
-                        &evidence.failure,
-                        Some(ExecutionFailure::RecoveryFailed { .. })
-                    ));
-                }
-                (FailureKind::Recovery, false) => unreachable!(),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_shutdown_wins_over_an_already_queued_final_message() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller(
-            &workspace,
-            vec![ModelAction::Message {
-                text: "must not be admitted".to_owned(),
-            }],
-        )
-        .await;
-        let mut agent = controller
-            .agent
-            .take()
-            .expect("idle controller should own its agent");
-        let model_cancellation = CancellationToken::new();
-        agent.run("first", &model_cancellation).await.unwrap();
-
-        let (worker_sender, worker) = mpsc::unbounded_channel();
-        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let cancellation = CancellationToken::new();
-        controller.active = Some(ActiveRun {
-            run_id: Some(RunId(1)),
-            pending_busy_submissions: 0,
-            caller: controller.subagents.root_caller().await,
-            cancellation: cancellation.clone(),
-            worker,
-            progress: worker_progress,
-            progress_open: false,
-            cancellation_requested: false,
-            step_ids: Vec::new(),
-        });
-        worker_sender
-            .send(WorkerMessage::Finished {
-                agent,
-                result: Ok(crate::agent::AgentRunOutcome::FinalMessageStaged),
-                final_step_ordinal: 1,
-                progress_gap: false,
-            })
-            .unwrap();
-        let (commands, command_receiver) = mpsc::channel(1);
-        commands.send(RuntimeCommand::Shutdown).await.unwrap();
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-        let events = events_until_settled(&mut events).await;
-        let records = timeout(TEST_TIMEOUT, task)
-            .await
-            .expect("shutdown should settle the active run")
-            .expect("controller task should not panic");
-
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            events.iter().map(event_label).collect::<Vec<_>>(),
-            ["record:1:cancelled", "settled:1"]
-        );
-        assert!(matches!(
-            records.as_slice(),
-            [StoredRecord {
-                record: Record::CancelledRun { .. },
-                ..
-            }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn terminal_cancellation_wins_over_an_already_queued_final_message() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller_with_model(
-            &workspace,
-            SummaryMessageModel {
-                text: "must not be admitted".to_owned(),
-                reasoning_summary: "final summary".to_owned(),
-            },
-        )
-        .await;
-        let mut agent = controller
-            .agent
-            .take()
-            .expect("idle controller should own its agent");
-        let model_cancellation = CancellationToken::new();
-        assert_eq!(
-            agent.run("first", &model_cancellation).await.unwrap(),
-            crate::agent::AgentRunOutcome::FinalMessageStaged
-        );
-
-        let (worker_sender, worker) = mpsc::unbounded_channel();
-        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let cancellation = CancellationToken::new();
-        controller.active = Some(ActiveRun {
-            run_id: Some(RunId(1)),
-            pending_busy_submissions: 0,
-            caller: controller.subagents.root_caller().await,
-            cancellation: cancellation.clone(),
-            worker,
-            progress: worker_progress,
-            progress_open: false,
-            cancellation_requested: false,
-            step_ids: Vec::new(),
-        });
-        worker_sender
-            .send(WorkerMessage::Finished {
-                agent,
-                result: Ok(crate::agent::AgentRunOutcome::FinalMessageStaged),
-                final_step_ordinal: 1,
-                progress_gap: false,
-            })
-            .unwrap();
-
-        let (commands, command_receiver) = mpsc::channel(1);
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-        let events = events_until_settled(&mut events).await;
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            events.iter().map(event_label).collect::<Vec<_>>(),
-            ["record:1:cancelled", "settled:1"]
-        );
-
-        let records = shutdown_controller(commands, task).await;
-        let [
-            StoredRecord {
-                record: Record::CancelledRun { terminal },
-                ..
-            },
-        ] = records.as_slice()
-        else {
-            panic!("the queued final should be replaced by one cancelled terminal record");
-        };
-        let Some(TerminalEvidence::Generation(evidence)) = &terminal.evidence else {
-            panic!("the lost final should be retained as generation evidence");
-        };
-        assert_eq!(evidence.assistant_text, "must not be admitted");
-        assert_eq!(evidence.reasoning_summary, "final summary");
-        assert!(evidence.reasoning.is_empty());
-        assert!(evidence.decoded_python.is_empty());
-        assert!(terminal.attempts.is_empty());
-    }
-
-    #[tokio::test]
     async fn disabled_recovery_failure_after_cancellation_drops_the_uncertain_agent() {
         let workspace = tempfile::tempdir().unwrap();
         let gate = ReadTestGate::new();
@@ -9536,181 +8915,6 @@ mod tests {
             ]
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        shutdown_controller(commands, task).await;
-    }
-
-    #[tokio::test]
-    async fn disabled_recovery_failure_overrides_accepted_cancellation_and_settles_once() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller(&workspace, Vec::new()).await;
-        let agent = controller
-            .agent
-            .take()
-            .expect("idle controller should own its agent");
-        let (worker_sender, worker) = mpsc::unbounded_channel();
-        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        controller.active = Some(ActiveRun {
-            run_id: Some(RunId(1)),
-            pending_busy_submissions: 0,
-            caller: controller.subagents.root_caller().await,
-            cancellation: CancellationToken::new(),
-            worker,
-            progress: worker_progress,
-            progress_open: false,
-            cancellation_requested: false,
-            step_ids: Vec::new(),
-        });
-        worker_sender
-            .send(WorkerMessage::Finished {
-                agent,
-                result: Err(crate::agent::AgentError::Arena {
-                    error: ArenaError::RecoveryFailed {
-                        original: Box::new(ArenaError::Cancelled {
-                            execution: Box::new(crate::arena::InterruptedExecution {
-                                began: true,
-                                stdout: empty_observation(),
-                                stderr: empty_observation(),
-                                tool_calls: Vec::new(),
-                            }),
-                        }),
-                        recovery: Box::new(ArenaError::Infrastructure {
-                            message: "recovery failed".to_owned(),
-                            execution: None,
-                        }),
-                    },
-                    attempts: Vec::new(),
-                    evidence: Box::new(failed_execution_evidence(
-                        ExecutionFailure::RecoveryFailed {
-                            original: "arena execution was cancelled".to_owned(),
-                            recovery: "arena infrastructure failed: recovery failed".to_owned(),
-                        },
-                    )),
-                }),
-                final_step_ordinal: 0,
-                progress_gap: false,
-            })
-            .unwrap();
-        let (commands, command_receiver) = mpsc::channel(2);
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (progress_sender, mut progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-        let terminal_events = events_until_settled(&mut events).await;
-        assert!(matches!(
-            terminal_events.as_slice(),
-            [
-                RuntimeEvent::RecordAppended {
-                    record: StoredRecord {
-                        record: Record::FailedRun { .. },
-                        ..
-                    },
-                    ..
-                },
-                RuntimeEvent::RuntimeDisabled {
-                    reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
-                },
-                RuntimeEvent::RunSettled { run_id: RunId(1) },
-            ]
-        ));
-        assert_eq!(
-            terminal_events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    RuntimeEvent::RecordAppended {
-                        record: StoredRecord {
-                            record: Record::FailedRun { .. },
-                            ..
-                        },
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-
-        commands
-            .send(RuntimeCommand::Submit {
-                request: "later".to_owned(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            next_event(&mut events).await,
-            RuntimeEvent::SubmissionRejectedDisabled {
-                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
-            }
-        );
-        assert!(progress.try_recv().is_err());
-        let records = shutdown_controller(commands, task).await;
-        assert_eq!(records.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn disabled_recovery_failure_bounds_its_display_message_at_a_utf8_boundary() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut controller = controller(&workspace, Vec::new()).await;
-        let agent = controller
-            .agent
-            .take()
-            .expect("idle controller should own its agent");
-        let (worker_sender, worker) = mpsc::unbounded_channel();
-        let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let diagnostic = "é".repeat(4 * 1024);
-        controller.active = Some(ActiveRun {
-            run_id: Some(RunId(1)),
-            pending_busy_submissions: 0,
-            caller: controller.subagents.root_caller().await,
-            cancellation: CancellationToken::new(),
-            worker,
-            progress: worker_progress,
-            progress_open: false,
-            cancellation_requested: false,
-            step_ids: Vec::new(),
-        });
-        worker_sender
-            .send(WorkerMessage::Finished {
-                agent,
-                result: Err(crate::agent::AgentError::Arena {
-                    error: ArenaError::RecoveryFailed {
-                        original: Box::new(ArenaError::Infrastructure {
-                            message: diagnostic.clone(),
-                            execution: None,
-                        }),
-                        recovery: Box::new(ArenaError::Infrastructure {
-                            message: diagnostic.clone(),
-                            execution: None,
-                        }),
-                    },
-                    attempts: Vec::new(),
-                    evidence: Box::new(failed_execution_evidence(
-                        ExecutionFailure::RecoveryFailed {
-                            original: diagnostic.clone(),
-                            recovery: diagnostic,
-                        },
-                    )),
-                }),
-                final_step_ordinal: 0,
-                progress_gap: false,
-            })
-            .unwrap();
-        let (commands, command_receiver) = mpsc::channel(1);
-        let (event_sender, mut events) = mpsc::unbounded_channel();
-        let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
-        let task = tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
-
-        let events = events_until_settled(&mut events).await;
-        let Record::FailedRun { message, terminal } = &committed_records(&events)[0].record else {
-            panic!("expected failed terminal record");
-        };
-
-        assert!(message.len() <= 4 * 1024);
-        assert!(message.is_char_boundary(message.len()));
-        assert!(matches!(
-            terminal.evidence,
-            Some(TerminalEvidence::Execution(_))
-        ));
         shutdown_controller(commands, task).await;
     }
 
