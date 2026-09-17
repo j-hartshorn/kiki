@@ -30,9 +30,36 @@ cargo run
 
 Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
 
+## Sessions
+
+Kiki keeps each session in local SQLite storage under `~/.kiki/sessions`. Its four CLI forms are:
+
+```sh
+kiki
+kiki sessions
+kiki --resume <32-lowercase-hex-id>
+kiki --resume <32-lowercase-hex-id> --here
+```
+
+`kiki sessions` is a read-only, current-directory-scoped listing sorted by saved activity, newest first, then by ascending ID. Each line contains the full ID, a UTC timestamp, and the session name, falling back to its first request or `(empty session)`. It shows only sessions whose saved workspace resolves to the current workspace, so equivalent symlink spellings match. It needs neither credentials nor Monty and does not modify sessions. Normal resume has the same resolved-directory guard and resumes the saved active leaf. Only one Kiki process can write a session; another resume fails while it is owned.
+
+Use `--here` only to deliberately relocate a session: it binds tools to the current directory. Only after successful executable restoration does Kiki save that directory and print:
+
+```text
+Warning: session relocated; retained paths, data, and external effects were not rewritten.
+```
+
+It does not rewrite retained paths, Arena data, or external effects. On normal exit or a handled runtime failure after a session opens, Kiki restores the terminal and completes session cleanup before printing `Session: <id>`. A failure before opening the session and forced termination cannot guarantee that output.
+
+On resume, unfinished foreground work and children are settled from committed state; unfinished work is never replayed. Terminal child results are retained, but no child execution resumes. Required malformed or incompatible executable state is not reconstructed; if its history remains readable, Kiki shows it in the disabled TUI. Unsupported session-format versions are rejected without migration. Kiki never undoes external effects already completed by commands or other tools.
+
+Each session persists its `/name`, selected model, and accepted thinking values per model. Saved session preferences override ordinary user and project settings on resume, while explicit `KIKI_MODEL` and `KIKI_THINKING` still win. After a successful executable restore, Kiki saves the effective choice, including an environment override, for a later resume. `Ctrl-S` in a picker saves a user default separately from the active session's accepted setting.
+
+Phase 1 excludes interactive tree navigation, correction or rewind, in-client session switching, forks, clones, export, sharing, compaction, branch summaries, merging, bookmarks, automatic Monty installation, checkpoint migration, unsent-draft retention, automatic history pruning, filesystem sandboxing, and external-effect reversal.
+
 ## Model and thinking settings
 
-Settings use this precedence: built-in defaults < user settings < project settings < `KIKI_MODEL` / `KIKI_THINKING`. Model IDs are qualified; thinking values are stored per model.
+Settings use this precedence: built-in defaults < user settings < project settings < saved session settings when resuming < `KIKI_MODEL` / `KIKI_THINKING`. Model IDs are qualified; thinking values are stored per model.
 
 User defaults live at `~/.kiki/config.toml`:
 
@@ -58,7 +85,7 @@ model = "openai/gpt-5.6-terra"
 "openai/gpt-5.6-luna" = "medium"
 ```
 
-`Ctrl-S` in either model or thinking picker writes only the user default. If project settings or environment variables mask it, Kiki reports that override.
+`Ctrl-S` in either model or thinking picker writes the user default separately from the active session setting. If project settings or environment variables mask it, Kiki reports that override.
 
 ## Subagents
 
@@ -113,7 +140,9 @@ A trace is diagnostic only, not authoritative or resumable history: it cannot re
 
 `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
 
-Credentials and opaque provider replay data stay hidden from Kiki records and display. Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
+Session storage is local and unencrypted. It includes prompts, outputs, provider replay, Arena contents, and potentially sensitive project data. On Unix, Kiki restricts session directories to `0700` and session files to `0600`; this is not a portable permission guarantee. Configured API credentials are not saved as session configuration or shown in Kiki's display, but credentials included in a prompt, output, or Arena value are ordinary session content. Local persistence does not protect against disk loss.
+
+Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
 
 ## Controls and availability
 
