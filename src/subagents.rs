@@ -2447,7 +2447,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         if let Some(start_test_gate) = &self.start_test_gate {
             start_test_gate.note_start_attempt();
         }
-        let (id, spawned) = {
+        let (spawned, writer) = {
             let mut inner = self.lock_inner(CoordinatorOperation::Start).await;
             #[cfg(test)]
             if let Some(start_test_gate) = &self.start_test_gate {
@@ -2602,7 +2602,12 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 });
                 return Ok(observation);
             }
-            (id, spawned)
+            (
+                spawned,
+                self.writer
+                    .clone()
+                    .expect("persistent admission requires a session writer"),
+            )
         };
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -2611,7 +2616,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         tokio::spawn(async move {
             coordinator
                 .complete_admission(
-                    id,
+                    writer,
                     spawned,
                     payload,
                     caller,
@@ -2629,14 +2634,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
 
     async fn complete_admission(
         &self,
-        id: TaskId,
+        writer: SessionWriter,
         spawned: TaskRecord,
         payload: P,
         caller: Caller,
         invocation_cancellation: CancellationToken,
         sender: tokio::sync::oneshot::Sender<Result<TaskObservation, AdmissionError>>,
     ) {
-        let (writer, admission_cancellation) = {
+        let id = spawned.id().clone();
+        let admission_cancellation = {
             let inner = self.lock_inner(CoordinatorOperation::Start).await;
             let Some(task) = inner.pending.get(&id) else {
                 let error = if self.storage_failure.is_cancelled() {
@@ -2647,54 +2653,41 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 let _ = sender.send(Err(error));
                 return;
             };
-            (self.writer.clone(), task.cancellation.clone())
+            task.cancellation.clone()
         };
-        let admission = match (writer.as_ref(), spawned.origin_step_id()) {
-            (Some(_), Some(origin_step_id)) => {
-                match TaskAdmission::from_record(&spawned, origin_step_id) {
-                    Ok(admission) => Some(admission),
-                    Err(SessionError::InvalidTaskProvenance) => {
-                        self.discard_pending(&id).await;
-                        let _ = sender.send(Err(AdmissionError::InvalidProvenance));
-                        return;
-                    }
-                    Err(SessionError::IdOverflow) => {
-                        self.discard_pending(&id).await;
-                        let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
-                        return;
-                    }
-                    Err(_) => {
-                        self.discard_pending(&id).await;
-                        self.latch_storage_failure().await;
-                        let _ = sender.send(Err(AdmissionError::StorageUnavailable));
-                        return;
-                    }
-                }
-            }
-            (Some(_), None) => {
+        let Some(origin_step_id) = spawned.origin_step_id() else {
+            self.discard_pending(&id).await;
+            let _ = sender.send(Err(AdmissionError::MissingProvenance));
+            return;
+        };
+        let admission = match TaskAdmission::from_record(&spawned, origin_step_id) {
+            Ok(admission) => admission,
+            Err(SessionError::InvalidTaskProvenance) => {
                 self.discard_pending(&id).await;
-                let _ = sender.send(Err(AdmissionError::MissingProvenance));
+                let _ = sender.send(Err(AdmissionError::InvalidProvenance));
                 return;
             }
-            (None, _) => None,
+            Err(SessionError::IdOverflow) => {
+                self.discard_pending(&id).await;
+                let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
+                return;
+            }
+            Err(_) => {
+                self.discard_pending(&id).await;
+                self.latch_storage_failure().await;
+                let _ = sender.send(Err(AdmissionError::StorageUnavailable));
+                return;
+            }
         };
-        let committed =
-            match (writer, admission) {
-                (Some(writer), Some(admission)) => {
-                    let failure = self.storage_failure.clone();
-                    let admission_invocation_cancellation = invocation_cancellation.clone();
-                    writer
-                        .admit_subagent_task(admission, move || {
-                            admission_invocation_cancellation.is_cancelled()
-                                || admission_cancellation.is_cancelled()
-                                || failure.is_cancelled()
-                        })
-                        .await
-                }
-                (None, _) => Ok(!invocation_cancellation.is_cancelled()
-                    && !admission_cancellation.is_cancelled()),
-                (Some(_), None) => unreachable!("persistent admission requires provenance"),
-            };
+        let failure = self.storage_failure.clone();
+        let admission_invocation_cancellation = invocation_cancellation.clone();
+        let committed = writer
+            .admit_subagent_task(admission, move || {
+                admission_invocation_cancellation.is_cancelled()
+                    || admission_cancellation.is_cancelled()
+                    || failure.is_cancelled()
+            })
+            .await;
         match committed {
             Ok(true) => {}
             Ok(false) => {
