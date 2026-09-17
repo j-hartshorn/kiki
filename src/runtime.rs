@@ -1280,6 +1280,7 @@ impl<M: Model> RuntimeController<M> {
                 );
             }
             let progress_gap = progress_sender.take_pending_gap();
+            drop(writer);
             let _ = sender.send(WorkerMessage::PersistedFinished {
                 agent,
                 result,
@@ -7930,6 +7931,64 @@ mod tests {
             ["record:1:user:stop", "record:1:cancelled", "settled:1",]
         );
         assert_eq!(records, committed_records(&reliable_events));
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_foreground_session_writer_before_session_close() {
+        let home = tempfile::tempdir().expect("create session home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let ready = Arc::new(Notify::new());
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                WaitingCancellationModel {
+                    ready: ready.clone(),
+                    partial: false,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, _events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "stop".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        ready.notified().await;
+        commands
+            .send(RuntimeCommand::Shutdown)
+            .await
+            .expect("request shutdown");
+        timeout(TEST_TIMEOUT, controller)
+            .await
+            .expect("shutdown completes")
+            .expect("controller task should not panic");
+
+        session
+            .close()
+            .expect("shutdown releases foreground session writer");
     }
 
     #[tokio::test]

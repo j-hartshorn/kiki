@@ -2596,8 +2596,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 self.publish_event(CoordinatorEvent::Spawned { record: spawned });
                 let coordinator = self.clone();
                 tokio::spawn(async move {
-                    let _operation = operation;
                     coordinator.run_child(child).await;
+                    drop(coordinator);
+                    drop(operation);
                 });
                 return Ok(observation);
             }
@@ -2608,7 +2609,6 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let coordinator = self.clone();
         let caller = caller.clone();
         tokio::spawn(async move {
-            let _operation = operation;
             coordinator
                 .complete_admission(
                     id,
@@ -2619,6 +2619,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     sender,
                 )
                 .await;
+            drop(coordinator);
+            drop(operation);
         });
         receiver
             .await
