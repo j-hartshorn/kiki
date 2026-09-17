@@ -320,6 +320,7 @@ pub(crate) enum SessionWriteKind {
     TaskAdmission,
     TaskStep,
     TaskTerminal,
+    Selection,
 }
 
 pub(crate) struct TaskAdmission {
@@ -801,6 +802,20 @@ impl SessionWriter {
         self.read(load_session_catalogue).await
     }
 
+    pub(crate) async fn select_active_entry(
+        &self,
+        effective_entry: SessionEntryId,
+        observed_active_entry: SessionEntryId,
+    ) -> Result<(), SessionError> {
+        if effective_entry == observed_active_entry {
+            return Ok(());
+        }
+        self.write(SessionWriteKind::Selection, move |connection| {
+            select_active_entry(connection, effective_entry, observed_active_entry)
+        })
+        .await
+    }
+
     pub(crate) async fn commit_preferences(
         &self,
         preferences: SessionPreferences,
@@ -1011,6 +1026,55 @@ fn commit_name(connection: &mut Connection, name: &str) -> Result<(), SessionErr
     if transaction.execute(
         "UPDATE session SET name = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
         params![name, now, next_revision],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn select_active_entry(
+    connection: &mut Connection,
+    effective_entry: SessionEntryId,
+    observed_active_entry: SessionEntryId,
+) -> Result<(), SessionError> {
+    if effective_entry == observed_active_entry {
+        return Ok(());
+    }
+    let effective_entry = i64::try_from(effective_entry.0).map_err(|_| SessionError::IdOverflow)?;
+    let observed_active_entry =
+        i64::try_from(observed_active_entry.0).map_err(|_| SessionError::IdOverflow)?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (active_entry, revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if active_entry != observed_active_entry {
+        return Err(SessionError::InvalidTransition);
+    }
+    let target_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)",
+        params![effective_entry],
+        |row| row.get(0),
+    )?;
+    if !target_exists {
+        return Err(SessionError::InvalidTransition);
+    }
+    let has_unfinished_work: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE terminal_entry_id IS NULL) OR EXISTS(SELECT 1 FROM model_steps WHERE settled_entry_id IS NULL) OR EXISTS(SELECT 1 FROM subagent_tasks WHERE terminal_revision IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_unfinished_work {
+        return Err(SessionError::InvalidTransition);
+    }
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1 AND active_entry_id = ?4",
+        params![effective_entry, now, next_revision, observed_active_entry],
     )? != 1
     {
         return Err(SessionError::InvalidTransition);
@@ -2720,7 +2784,8 @@ mod tests {
 
     use super::{
         PersistedCode, PersistedTerminal, Session, SessionEntryId, SessionError, SessionId,
-        TaskAdmission, TaskSnapshot, TaskStepCommit, TaskTerminal,
+        SessionWriteGate, SessionWriteKind, TaskAdmission, TaskSnapshot, TaskStepCommit,
+        TaskTerminal,
     };
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity, ToolCall, ToolCallSummary,
@@ -2876,6 +2941,58 @@ mod tests {
                 params![entry_id],
             )
             .expect("set fixture active entry");
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct SelectionSnapshot {
+        id: String,
+        created_at_ms: i64,
+        cwd: String,
+        name: Option<String>,
+        preferences_json: String,
+        active_entry_id: i64,
+        updated_at_ms: i64,
+        revision: i64,
+        entries: i64,
+        checkpoints: i64,
+        runs: i64,
+        steps: i64,
+        tasks: i64,
+    }
+
+    #[cfg(unix)]
+    fn selection_snapshot(session: &Session) -> SelectionSnapshot {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT id, created_at_ms, cwd, name, preferences_json, active_entry_id, updated_at_ms, revision, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps), (SELECT COUNT(*) FROM subagent_tasks) FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(SelectionSnapshot {
+                        id: row.get(0)?,
+                        created_at_ms: row.get(1)?,
+                        cwd: row.get(2)?,
+                        name: row.get(3)?,
+                        preferences_json: row.get(4)?,
+                        active_entry_id: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                        revision: row.get(7)?,
+                        entries: row.get(8)?,
+                        checkpoints: row.get(9)?,
+                        runs: row.get(10)?,
+                        steps: row.get(11)?,
+                        tasks: row.get(12)?,
+                    })
+                },
+            )
+            .expect("read selection snapshot")
+    }
+
+    #[cfg(unix)]
+    fn selection_database_bytes(home: &Path, session: &Session) -> Vec<u8> {
+        fs::read(database_path(home, session.id())).expect("read selection database")
     }
 
     #[cfg(unix)]
@@ -3472,6 +3589,616 @@ mod tests {
 
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_persists_and_next_request_branches_from_it() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run = writer
+            .commit_request("original request".to_owned())
+            .await
+            .expect("commit original request");
+        let (_, execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            run,
+            "original_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        let final_step = writer
+            .start_model_step(run)
+            .await
+            .expect("start original terminal step");
+        writer
+            .close_run(
+                run,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "original future".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close original run");
+        let original_future = active_entry_id(&session);
+        let restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("project older execution");
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET updated_at_ms = 0, revision = revision + 1",
+                [],
+            )
+            .expect("rewind fixture timestamp");
+        let before_selection = selection_snapshot(&session);
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select older execution");
+        let after_selection = selection_snapshot(&session);
+        assert_eq!(after_selection.active_entry_id, execution);
+        assert_eq!(after_selection.revision, before_selection.revision + 1);
+        assert!(after_selection.updated_at_ms > before_selection.updated_at_ms);
+        assert_eq!(after_selection.id, before_selection.id);
+        assert_eq!(
+            after_selection.created_at_ms,
+            before_selection.created_at_ms
+        );
+        assert_eq!(after_selection.cwd, before_selection.cwd);
+        assert_eq!(after_selection.name, before_selection.name);
+        assert_eq!(
+            after_selection.preferences_json,
+            before_selection.preferences_json
+        );
+        assert_eq!(after_selection.entries, before_selection.entries);
+        assert_eq!(after_selection.checkpoints, before_selection.checkpoints);
+        assert_eq!(after_selection.runs, before_selection.runs);
+        assert_eq!(after_selection.steps, before_selection.steps);
+        assert_eq!(after_selection.tasks, before_selection.tasks);
+
+        drop(writer);
+        session.close().expect("close selected session");
+        let session = Session::open(home.path(), &id).expect("reopen selected session");
+        assert_eq!(selection_snapshot(&session), after_selection);
+        let writer = session.writer();
+        writer
+            .commit_request("branched request".to_owned())
+            .await
+            .expect("commit branched request");
+        let connection = session
+            .connection_for_test()
+            .expect("lock selected session connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read branched request parent"),
+            execution
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = ?1",
+                    params![original_future],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read original future parent"),
+            execution
+        );
+        drop(connection);
+        drop(writer);
+        session.close().expect("close branched session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_selects_a_requests_projected_parent() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("request to correct".to_owned())
+            .await
+            .expect("commit request");
+        let request = active_entry_id(&session);
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request run");
+        let restore = writer
+            .restore_at(SessionEntryId(request as u64))
+            .await
+            .expect("project request parent");
+        assert_eq!(restore.effective_entry, SessionEntryId(root as u64));
+
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select request parent");
+        let selected = session.restore().expect("restore selected parent");
+        assert_eq!(selected.effective_entry, SessionEntryId(root as u64));
+        assert!(selected.records.is_empty());
+        writer
+            .commit_request("corrected request".to_owned())
+            .await
+            .expect("commit corrected request");
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock selected session connection")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read corrected request parent"),
+            root
+        );
+
+        drop(writer);
+        session.close().expect("close selected session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_no_op_bypasses_the_write_gate() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection(),
+            checkpoint(&workspace).await,
+            gate.clone(),
+        )
+        .expect("create gated session");
+        let writer = session.writer();
+        let active = SessionEntryId(active_entry_id(&session) as u64);
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        super::select_active_entry(
+            &mut session
+                .connection_for_test()
+                .expect("lock session connection"),
+            SessionEntryId(u64::MAX),
+            SessionEntryId(u64::MAX),
+        )
+        .expect("short-circuit equivalent private selection");
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        writer
+            .select_active_entry(active, active)
+            .await
+            .expect("select current entry");
+
+        assert!(!gate.has_started());
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        drop(writer);
+        session.close().expect("close gated session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_stale_unknown_overflow_and_open_runs() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let completed_run = writer
+            .commit_request("completed request".to_owned())
+            .await
+            .expect("commit completed request");
+        writer
+            .close_run(
+                completed_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close completed request");
+        let stale = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root before stale selection");
+        writer
+            .select_active_entry(stale.effective_entry, stale.observed_active_entry)
+            .await
+            .expect("move active leaf to root");
+        let before_stale = selection_snapshot(&session);
+        let before_stale_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(stale.effective_entry, stale.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_stale);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_stale_database
+        );
+
+        let active = SessionEntryId(active_entry_id(&session) as u64);
+        let before_unknown = selection_snapshot(&session);
+        let before_unknown_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(SessionEntryId(999), active)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_unknown);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_unknown_database
+        );
+        assert!(matches!(
+            writer
+                .select_active_entry(SessionEntryId(u64::MAX), active)
+                .await,
+            Err(SessionError::IdOverflow)
+        ));
+        assert_eq!(selection_snapshot(&session), before_unknown);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_unknown_database
+        );
+
+        let open_run = writer
+            .commit_request("open request".to_owned())
+            .await
+            .expect("commit open request");
+        let open = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with open run");
+        let before_open = selection_snapshot(&session);
+        let before_open_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(open.effective_entry, open.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_open);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_open_database
+        );
+        writer
+            .close_run(
+                open_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close open request");
+
+        drop(writer);
+        session.close().expect("close rejection session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_pending_model_steps() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("pending step request".to_owned())
+            .await
+            .expect("commit pending step request");
+        writer
+            .start_model_step(run)
+            .await
+            .expect("start pending step");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER runs_cannot_close_with_pending_steps")
+            .expect("allow unreachable pending-step fixture");
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "closed with a pending step".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close pending-step fixture");
+        let connection = session
+            .connection_for_test()
+            .expect("lock pending-step session connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("read pending-step fixture"),
+            (0, 1)
+        );
+        drop(connection);
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with pending step");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close pending-step session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_unfinished_subagent_tasks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("task request".to_owned())
+            .await
+            .expect("commit task request");
+        let (step, _) =
+            settle_fixture_execution(&session, &writer, run, "task_value = 1", None, Vec::new())
+                .await;
+        let task = TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: None,
+                state: TaskState::Starting,
+                step_count: 0,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 1,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: None,
+            });
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&task, step).expect("encode unfinished task"),
+                    || false,
+                )
+                .await
+                .expect("admit unfinished task")
+        );
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close task run");
+        let connection = session
+            .connection_for_test()
+            .expect("lock unfinished-task session connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM subagent_tasks WHERE terminal_revision IS NULL)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .expect("read unfinished-task fixture"),
+            (0, 0, 1)
+        );
+        drop(connection);
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with unfinished task");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close unfinished-task session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_uses_its_own_write_gate() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection(),
+            checkpoint(&workspace).await,
+            gate.clone(),
+        )
+        .expect("create gated session");
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("gated request".to_owned())
+            .await
+            .expect("commit gated request");
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close gated request");
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project gated selection");
+        let before = selection_snapshot(&session);
+        let selection = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                writer
+                    .select_active_entry(
+                        projection.effective_entry,
+                        projection.observed_active_entry,
+                    )
+                    .await
+            }
+        });
+
+        gate.wait_until_started().await;
+        assert_eq!(selection_snapshot(&session), before);
+        gate.release();
+        selection
+            .await
+            .expect("join gated selection")
+            .expect("persist gated selection");
+        assert_eq!(active_entry_id(&session), root);
+
+        drop(writer);
+        session.close().expect("close gated session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rolls_back_a_failed_transaction() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("failing selection request".to_owned())
+            .await
+            .expect("commit failing selection request");
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selection failure fixture".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close failing selection request");
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project failed selection target");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_active_entry_selection BEFORE UPDATE OF active_entry_id ON session BEGIN SELECT RAISE(ABORT, 'reject active-entry selection'); END;",
+            )
+            .expect("install selection rollback trigger");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::Sqlite(_))
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close rollback session");
     }
 
     #[tokio::test]
