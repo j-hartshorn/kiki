@@ -10,8 +10,10 @@ use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
     ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
+use crate::session::{PersistedCode, PersistedTerminal, SessionError, SessionWriter};
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
+const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvidence {
@@ -101,6 +103,66 @@ pub enum AgentRunOutcome {
     FinalMessageStaged,
 }
 
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PersistedAgentEvent {
+    RequestCommitted {
+        run_id: u64,
+        request: String,
+    },
+    ModelStepStarted {
+        run_id: u64,
+        step_id: u64,
+    },
+    ModelProgress {
+        run_id: u64,
+        step_id: u64,
+        progress: ModelProgress,
+    },
+    ExecutionStarted {
+        run_id: u64,
+        step_id: u64,
+        commentary: Option<String>,
+    },
+    ToolUpdated {
+        run_id: u64,
+        step_id: u64,
+        token: ToolCallToken,
+        call: ToolCall,
+    },
+    RunPreviewUpdated {
+        run_id: u64,
+        step_id: u64,
+        token: ToolCallToken,
+        preview: RunPreview,
+    },
+    StdoutDelta {
+        run_id: u64,
+        step_id: u64,
+        text: String,
+    },
+    StdoutTruncated {
+        run_id: u64,
+        step_id: u64,
+    },
+    ExecutionCommitted {
+        run_id: u64,
+        step_id: u64,
+        source: String,
+        commentary: Option<String>,
+        reasoning_summary: String,
+        execution: Execution,
+        attempts: Vec<AttemptAccounting>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PersistedRunOutcome {
+    pub(crate) run_id: u64,
+    pub(crate) terminal: PersistedTerminal,
+    pub(crate) authentication_failure: bool,
+    pub(crate) recovery_failure: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalMessage {
     text: String,
@@ -119,10 +181,6 @@ impl FinalMessage {
 
     pub(crate) fn reasoning_summary(&self) -> &str {
         &self.generation.reasoning_summary
-    }
-
-    pub(crate) fn generation_evidence(&self) -> TerminalEvidence {
-        TerminalEvidence::Generation(self.generation.clone())
     }
 }
 
@@ -356,33 +414,9 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    pub(crate) fn is_recovery_failed(&self) -> bool {
-        matches!(
-            self,
-            Self::Arena {
-                error: ArenaError::RecoveryFailed { .. },
-                ..
-            }
-        )
-    }
-
+    #[cfg(test)]
     pub(crate) fn is_authentication(&self) -> bool {
         matches!(self, Self::Model { failure, .. } if failure.is_authentication())
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Cancelled { .. } => true,
-            Self::Model { failure, .. } => failure.is_cancelled(),
-            Self::Arena {
-                error: ArenaError::Cancelled { .. },
-                ..
-            } => true,
-            Self::ModelHistory { .. }
-            | Self::Arena { .. }
-            | Self::NoStagedFinalMessage
-            | Self::StagedFinalMessageUnresolved => false,
-        }
     }
 
     pub fn attempts(&self) -> &[AttemptAccounting] {
@@ -394,18 +428,9 @@ impl AgentError {
             Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => &[],
         }
     }
-
-    pub(crate) fn terminal_evidence(&self) -> Option<TerminalEvidence> {
-        match self {
-            Self::Cancelled { evidence, .. }
-            | Self::Model { evidence, .. }
-            | Self::ModelHistory { evidence, .. } => evidence.as_deref().cloned(),
-            Self::Arena { evidence, .. } => Some(TerminalEvidence::Execution(evidence.clone())),
-            Self::NoStagedFinalMessage | Self::StagedFinalMessageUnresolved => None,
-        }
-    }
 }
 
+#[derive(Clone)]
 struct PendingCode {
     source: String,
     commentary: Option<String>,
@@ -451,8 +476,23 @@ impl<M: Model> Agent<M> {
         }
     }
 
+    pub(crate) fn restored(arena: Arena, model: M, model_context: ModelHistory) -> Self {
+        Self {
+            arena,
+            model,
+            model_context,
+            staged_final_message: None,
+            invocation_context: None,
+        }
+    }
+
     pub(crate) fn set_invocation_context(&mut self, context: AgentInvocationContext) {
         self.invocation_context = Some(context);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_for_test(&self) -> crate::arena::Checkpoint {
+        self.arena.checkpoint()
     }
 
     pub(crate) async fn collect_child_result_values(
@@ -475,6 +515,386 @@ impl<M: Model> Agent<M> {
         let mut progress = |_| {};
         self.run_with_progress(request, cancellation, &mut progress)
             .await
+    }
+
+    pub(crate) async fn run_persisted(
+        &mut self,
+        request: String,
+        cancellation: &CancellationToken,
+        writer: &SessionWriter,
+        event: &mut (impl FnMut(PersistedAgentEvent) + Send),
+    ) -> Result<PersistedRunOutcome, SessionError> {
+        if self.staged_final_message.is_some() {
+            return Err(SessionError::InvalidTransition);
+        }
+        let run_id = writer.commit_request(request.clone()).await?;
+        self.model_context.append_user_request(request.clone());
+        event(PersistedAgentEvent::RequestCommitted { run_id, request });
+
+        let mut attempts = Vec::new();
+        let mut committed_attempts = 0;
+        let mut generation = GenerationEvidenceBuilder::default();
+        let mut pending_step_id = None;
+
+        loop {
+            if cancellation.is_cancelled() {
+                let terminal = PersistedTerminal::Cancelled {
+                    evidence: generation.evidence().map(TerminalEvidence::Generation),
+                    attempts: attempts[committed_attempts..].to_vec(),
+                };
+                let terminal = writer
+                    .close_run(run_id, pending_step_id, move || terminal, None)
+                    .await?;
+                return Ok(PersistedRunOutcome {
+                    run_id,
+                    terminal,
+                    authentication_failure: false,
+                    recovery_failure: false,
+                });
+            }
+
+            let step_id = writer.start_model_step(run_id).await?;
+            pending_step_id = Some(step_id);
+            if let Some(context) = &mut self.invocation_context {
+                context.set_origin_step_id(step_id);
+            }
+            event(PersistedAgentEvent::ModelStepStarted { run_id, step_id });
+            if cancellation.is_cancelled() {
+                let terminal = PersistedTerminal::Cancelled {
+                    evidence: generation.evidence().map(TerminalEvidence::Generation),
+                    attempts: attempts[committed_attempts..].to_vec(),
+                };
+                let terminal = writer
+                    .close_run(run_id, pending_step_id, move || terminal, None)
+                    .await?;
+                return Ok(PersistedRunOutcome {
+                    run_id,
+                    terminal,
+                    authentication_failure: false,
+                    recovery_failure: false,
+                });
+            }
+
+            let mut model_progress = |progress: ModelProgress| {
+                generation.capture(&progress);
+                event(PersistedAgentEvent::ModelProgress {
+                    run_id,
+                    step_id,
+                    progress,
+                });
+            };
+            let model_step = match self
+                .model
+                .step(&self.model_context, cancellation, &mut model_progress)
+                .await
+            {
+                Ok(step) => step,
+                Err(failure) => {
+                    attempts.extend(failure.attempts().iter().cloned());
+                    let failure_is_cancelled = failure.is_cancelled();
+                    let authentication_failure = failure.is_authentication();
+                    let message = bounded_utf8(failure.to_string(), FAILED_RUN_MESSAGE_LIMIT);
+                    let evidence = generation.evidence().map(TerminalEvidence::Generation);
+                    let attempts = attempts[committed_attempts..].to_vec();
+                    let cancellation = cancellation.clone();
+                    let terminal = writer
+                        .close_run(
+                            run_id,
+                            pending_step_id,
+                            move || {
+                                if cancellation.is_cancelled() || failure_is_cancelled {
+                                    PersistedTerminal::Cancelled { evidence, attempts }
+                                } else {
+                                    PersistedTerminal::Failed {
+                                        message,
+                                        evidence,
+                                        attempts,
+                                    }
+                                }
+                            },
+                            None,
+                        )
+                        .await?;
+                    return Ok(PersistedRunOutcome {
+                        run_id,
+                        authentication_failure: matches!(
+                            &terminal,
+                            PersistedTerminal::Failed { .. }
+                        ) && authentication_failure,
+                        terminal,
+                        recovery_failure: false,
+                    });
+                }
+            };
+            let ModelStep {
+                action,
+                selection,
+                reasoning_summary,
+                replay,
+                attempts: step_attempts,
+            } = model_step;
+            attempts.extend(step_attempts.iter().cloned());
+            match action {
+                ModelAction::Code {
+                    source,
+                    call_id,
+                    commentary,
+                } => {
+                    if self.model_context.contains_call_id(&call_id) {
+                        let message = bounded_utf8(
+                            ModelHistoryError::DuplicateCallId(call_id).to_string(),
+                            FAILED_RUN_MESSAGE_LIMIT,
+                        );
+                        let evidence = generation.evidence().map(TerminalEvidence::Generation);
+                        let attempts = attempts[committed_attempts..].to_vec();
+                        let cancellation = cancellation.clone();
+                        let terminal = writer
+                            .close_run(
+                                run_id,
+                                pending_step_id,
+                                move || {
+                                    if cancellation.is_cancelled() {
+                                        PersistedTerminal::Cancelled { evidence, attempts }
+                                    } else {
+                                        PersistedTerminal::Failed {
+                                            message,
+                                            evidence,
+                                            attempts,
+                                        }
+                                    }
+                                },
+                                None,
+                            )
+                            .await?;
+                        return Ok(PersistedRunOutcome {
+                            run_id,
+                            terminal,
+                            authentication_failure: false,
+                            recovery_failure: false,
+                        });
+                    }
+                    generation.clear();
+                    let pending = PendingCode {
+                        source,
+                        commentary,
+                        selection,
+                        call_id,
+                        reasoning_summary,
+                        replay,
+                    };
+                    if cancellation.is_cancelled() {
+                        let evidence = ExecutionEvidence::cancelled(
+                            pending.source.clone(),
+                            pending.commentary.clone(),
+                            pending.reasoning_summary.clone(),
+                            None,
+                        );
+                        let result = CodeResult::cancelled(evidence.feedback());
+                        let mut proposed = self.model_context.clone();
+                        append_persisted_code(&pending, &mut proposed, result.clone())?;
+                        let code = persisted_code(&pending, result, None, step_attempts.clone());
+                        let terminal = PersistedTerminal::Cancelled {
+                            evidence: Some(TerminalEvidence::Execution(Box::new(evidence))),
+                            attempts: attempts[committed_attempts..].to_vec(),
+                        };
+                        let terminal = writer
+                            .close_run(run_id, pending_step_id, move || terminal, Some(code))
+                            .await?;
+                        self.model_context = proposed;
+                        return Ok(PersistedRunOutcome {
+                            run_id,
+                            terminal,
+                            authentication_failure: false,
+                            recovery_failure: false,
+                        });
+                    }
+                    event(PersistedAgentEvent::ExecutionStarted {
+                        run_id,
+                        step_id,
+                        commentary: pending.commentary.clone(),
+                    });
+                    let execution = {
+                        let mut arena_progress = |arena_progress| match arena_progress {
+                            ArenaProgress::ToolUpdated { token, call } => {
+                                event(PersistedAgentEvent::ToolUpdated {
+                                    run_id,
+                                    step_id,
+                                    token,
+                                    call,
+                                });
+                            }
+                            ArenaProgress::RunPreviewUpdated { token, preview } => {
+                                event(PersistedAgentEvent::RunPreviewUpdated {
+                                    run_id,
+                                    step_id,
+                                    token,
+                                    preview,
+                                });
+                            }
+                            ArenaProgress::StdoutDelta { text } => {
+                                event(PersistedAgentEvent::StdoutDelta {
+                                    run_id,
+                                    step_id,
+                                    text,
+                                });
+                            }
+                            ArenaProgress::StdoutTruncated => {
+                                event(PersistedAgentEvent::StdoutTruncated { run_id, step_id });
+                            }
+                        };
+                        self.arena
+                            .execute_with_progress_and_context(
+                                &pending.source,
+                                cancellation,
+                                &mut arena_progress,
+                                self.invocation_context.as_ref(),
+                                pending.selection,
+                            )
+                            .await
+                    };
+                    match execution {
+                        Ok(execution) => {
+                            let result = CodeResult::execution(execution_feedback(&execution));
+                            let mut proposed = self.model_context.clone();
+                            append_persisted_code(&pending, &mut proposed, result.clone())?;
+                            let code = persisted_code(
+                                &pending,
+                                result,
+                                Some(execution.clone()),
+                                step_attempts.clone(),
+                            );
+                            let checkpoint = self.arena.checkpoint();
+                            writer
+                                .settle_execution(run_id, step_id, code, checkpoint)
+                                .await?;
+                            self.model_context = proposed;
+                            pending_step_id = None;
+                            committed_attempts += step_attempts.len();
+                            event(PersistedAgentEvent::ExecutionCommitted {
+                                run_id,
+                                step_id,
+                                source: pending.source,
+                                commentary: pending.commentary,
+                                reasoning_summary: pending.reasoning_summary,
+                                execution,
+                                attempts: step_attempts,
+                            });
+                        }
+                        Err(error) => {
+                            let arena_cancelled = matches!(&error, ArenaError::Cancelled { .. });
+                            let evidence = if arena_cancelled {
+                                ExecutionEvidence::cancelled(
+                                    pending.source.clone(),
+                                    pending.commentary.clone(),
+                                    pending.reasoning_summary.clone(),
+                                    Some(&error),
+                                )
+                            } else {
+                                ExecutionEvidence::failed(
+                                    pending.source.clone(),
+                                    pending.commentary.clone(),
+                                    pending.reasoning_summary.clone(),
+                                    &error,
+                                )
+                            };
+                            let result = if arena_cancelled {
+                                CodeResult::cancelled(evidence.feedback())
+                            } else {
+                                CodeResult::failure(evidence.feedback())
+                            };
+                            let mut proposed = self.model_context.clone();
+                            append_persisted_code(&pending, &mut proposed, result.clone())?;
+                            let code =
+                                persisted_code(&pending, result, None, step_attempts.clone());
+                            let is_recovery_failure =
+                                matches!(&error, ArenaError::RecoveryFailed { .. });
+                            let message = bounded_utf8(error.to_string(), FAILED_RUN_MESSAGE_LIMIT);
+                            let evidence = Some(TerminalEvidence::Execution(Box::new(evidence)));
+                            let attempts = attempts[committed_attempts..].to_vec();
+                            let cancellation = cancellation.clone();
+                            let terminal = writer
+                                .close_run(
+                                    run_id,
+                                    pending_step_id,
+                                    move || {
+                                        if !is_recovery_failure
+                                            && (cancellation.is_cancelled() || arena_cancelled)
+                                        {
+                                            PersistedTerminal::Cancelled { evidence, attempts }
+                                        } else {
+                                            PersistedTerminal::Failed {
+                                                message,
+                                                evidence,
+                                                attempts,
+                                            }
+                                        }
+                                    },
+                                    Some(code),
+                                )
+                                .await?;
+                            self.model_context = proposed;
+                            return Ok(PersistedRunOutcome {
+                                run_id,
+                                recovery_failure: matches!(
+                                    &terminal,
+                                    PersistedTerminal::Failed { .. }
+                                ) && is_recovery_failure,
+                                terminal,
+                                authentication_failure: false,
+                            });
+                        }
+                    }
+                }
+                ModelAction::Message { text } => {
+                    let generation =
+                        generation.with_final_message(text.clone(), reasoning_summary.clone());
+                    let attempts = attempts[committed_attempts..].to_vec();
+                    let cancellation = cancellation.clone();
+                    let terminal = writer
+                        .close_run(
+                            run_id,
+                            pending_step_id,
+                            move || {
+                                if cancellation.is_cancelled() {
+                                    PersistedTerminal::Cancelled {
+                                        evidence: Some(TerminalEvidence::Generation(generation)),
+                                        attempts,
+                                    }
+                                } else {
+                                    PersistedTerminal::Final {
+                                        step_id,
+                                        text,
+                                        reasoning_summary,
+                                        replay,
+                                        attempts,
+                                    }
+                                }
+                            },
+                            None,
+                        )
+                        .await?;
+                    if let PersistedTerminal::Final {
+                        text,
+                        reasoning_summary,
+                        replay,
+                        ..
+                    } = &terminal
+                    {
+                        self.model_context.append_final_message(
+                            text.clone(),
+                            reasoning_summary.clone(),
+                            replay.clone(),
+                        );
+                    }
+                    return Ok(PersistedRunOutcome {
+                        run_id,
+                        terminal,
+                        authentication_failure: false,
+                        recovery_failure: false,
+                    });
+                }
+            }
+        }
     }
 
     pub fn admit_staged_final_message(&mut self) -> Result<FinalMessage, AgentError> {
@@ -657,6 +1077,14 @@ impl<M: Model> Agent<M> {
                                 execution,
                                 attempts: step_attempts,
                             });
+                            if let Some(context) = &self.invocation_context
+                                && !context.persist_child_step().await
+                            {
+                                return Err(AgentError::Cancelled {
+                                    attempts,
+                                    evidence: None,
+                                });
+                            }
                         }
                         Err(error) => {
                             let cancelled = matches!(&error, ArenaError::Cancelled { .. });
@@ -711,6 +1139,36 @@ impl<M: Model> Agent<M> {
                 }
             }
         }
+    }
+}
+
+fn append_persisted_code(
+    pending: &PendingCode,
+    history: &mut ModelHistory,
+    result: CodeResult,
+) -> Result<(), SessionError> {
+    pending
+        .clone()
+        .append(history, result)
+        .map_err(|error| SessionError::Codec(error.to_string()))
+}
+
+fn persisted_code(
+    pending: &PendingCode,
+    result: CodeResult,
+    execution: Option<Execution>,
+    attempts: Vec<AttemptAccounting>,
+) -> PersistedCode {
+    PersistedCode {
+        source: pending.source.clone(),
+        call_id: pending.call_id.clone(),
+        commentary: pending.commentary.clone(),
+        reasoning_summary: pending.reasoning_summary.clone(),
+        selection: pending.selection,
+        replay: pending.replay.clone(),
+        result,
+        execution,
+        attempts,
     }
 }
 
@@ -886,6 +1344,7 @@ mod tests {
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
+    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -1022,6 +1481,7 @@ mod tests {
             .with_accepted_thinking(AcceptedThinking::new(
                 selection,
                 snapshot.settings().clone(),
+                None,
             ));
         let mut agent = agent_with_model(
             &workspace,
@@ -2294,6 +2754,96 @@ mod tests {
         assert_eq!(completed[0].reasoning_summary(), "failed code summary");
         assert_eq!(feedback, &evidence.feedback());
         assert!(!feedback.contains("failed code summary"));
+    }
+
+    #[tokio::test]
+    async fn persisted_cancelled_timeout_restores_failure_code_result() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let arena = Arena::with_limits(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+            Duration::ZERO,
+            Some(64 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![ModelAction::Code {
+                source: "value = 1".to_owned(),
+            }]),
+        );
+        let cancellation = CancellationToken::new();
+        let writer = session.writer();
+        let outcome = {
+            let mut event = |_| {};
+            let run = agent.run_persisted(
+                "time out then cancel".to_owned(),
+                &cancellation,
+                &writer,
+                &mut event,
+            );
+            tokio::pin!(run);
+            let cancel_at_closure = async {
+                gate.wait_until_started().await;
+                cancellation.cancel();
+                gate.release();
+            };
+            let (outcome, ()) = tokio::join!(run, cancel_at_closure);
+            outcome.unwrap()
+        };
+        assert!(matches!(
+            outcome.terminal,
+            crate::session::PersistedTerminal::Cancelled { .. }
+        ));
+        assert!(matches!(
+            agent
+                .model_context
+                .entries()
+                .last()
+                .and_then(ModelContextEntry::completed_code)
+                .map(|code| code.result()),
+            Some(CodeResult::Failure { .. })
+        ));
+
+        let restore = session.restore().unwrap();
+        assert!(restore.executable.is_some());
+        assert!(matches!(
+            restore.records.as_slice(),
+            [
+                crate::session::RestoredRecord {
+                    kind: crate::session::RestoredRecordKind::UserRequest { .. },
+                    ..
+                },
+                crate::session::RestoredRecord {
+                    kind: crate::session::RestoredRecordKind::CancelledRun { .. },
+                    ..
+                }
+            ]
+        ));
+        assert!(matches!(
+            restore
+                .executable
+                .as_ref()
+                .and_then(|state| state.history.entries().last())
+                .and_then(ModelContextEntry::completed_code)
+                .map(|code| code.result()),
+            Some(CodeResult::Failure { .. })
+        ));
+
+        drop(writer);
+        session.close().unwrap();
     }
 
     #[tokio::test]

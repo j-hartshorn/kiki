@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::pricing::RunCostEstimate;
-use crate::runtime::{Record, RuntimeEvent};
+use crate::runtime::{Record, RestoredTimelineItem, RuntimeEvent};
 use crate::subagents::{TaskId, TaskObservation, TaskRecord, TaskState};
 use crate::transcript::{format_footer_usd, muted_page_style, normalise_terminal_text};
 use ratatui::style::Style;
@@ -92,6 +92,31 @@ impl MonitorLayout {
 }
 
 impl SubagentMonitor {
+    pub(super) fn restored(timeline: &[RestoredTimelineItem]) -> Self {
+        let mut monitor = Self::default();
+        let now = Instant::now();
+        for item in timeline {
+            match item {
+                RestoredTimelineItem::Record(record) => {
+                    monitor.apply(
+                        &RuntimeEvent::RecordAppended {
+                            record: record.clone(),
+                            progress_gap: false,
+                        },
+                        now,
+                    );
+                }
+                RestoredTimelineItem::SubagentSpawned(record) => {
+                    monitor.apply_record(record, now);
+                }
+                RestoredTimelineItem::SubagentFinished(record) => {
+                    monitor.apply_record(record, now);
+                }
+            }
+        }
+        monitor
+    }
+
     pub(super) fn apply(&mut self, event: &RuntimeEvent, now: Instant) -> bool {
         match event {
             RuntimeEvent::SubagentSpawned { record }
@@ -861,7 +886,7 @@ mod tests {
     use crate::config::{ModelSelection, models::SOL};
     use crate::model::{AttemptAccounting, ModelUsage};
     use crate::pricing::{RunCostEstimate, estimate_run_cost};
-    use crate::runtime::{Record, RuntimeEvent, StoredRecord};
+    use crate::runtime::{Record, RestoredTimelineItem, RunId, RuntimeEvent, StoredRecord};
     use crate::subagents::{TaskRecord, TaskState};
 
     fn entry(state: TaskState, cost: RunCostEstimate, now: Instant) -> Entry {
@@ -898,6 +923,45 @@ mod tests {
         } else {
             estimate_run_cost([&attempt])
         }
+    }
+
+    #[test]
+    fn restored_monitor_honours_later_user_request_boundaries() {
+        let first = TaskRecord::for_test(
+            "00",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let second = TaskRecord::for_test(
+            "01",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let request = |run_id| {
+            RestoredTimelineItem::Record(StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: "saved request".to_owned(),
+                },
+            })
+        };
+
+        let monitor = SubagentMonitor::restored(&[
+            request(1),
+            RestoredTimelineItem::SubagentSpawned(first.clone()),
+            RestoredTimelineItem::SubagentFinished(first),
+            request(2),
+            RestoredTimelineItem::SubagentSpawned(second),
+        ]);
+
+        assert!(!monitor.entries.contains_key("00"));
+        assert!(monitor.entries.contains_key("01"));
     }
 
     fn insert(monitor: &mut SubagentMonitor, id: &str, entry: Entry) {

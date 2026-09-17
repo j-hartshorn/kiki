@@ -431,6 +431,10 @@ pub enum ModelProgress {
 }
 
 pub trait Model: Send + 'static {
+    fn validate_history(&self, _history: &ModelHistory) -> Result<(), ModelError> {
+        Ok(())
+    }
+
     fn step<'a>(
         &'a mut self,
         history: &'a ModelHistory,

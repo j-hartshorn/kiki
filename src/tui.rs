@@ -30,7 +30,8 @@ use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
-    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeProgressReceiver, control_command,
+    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState, RuntimeProgressReceiver,
+    control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
 use crate::telemetry::{Trace, TraceEvent};
@@ -181,7 +182,9 @@ struct App {
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
-    pending_settings_revision: Option<u64>,
+    pending_settings: BTreeMap<u64, ModelSelection>,
+    next_name_revision: u64,
+    pending_name: Option<(u64, String)>,
 }
 
 impl Default for App {
@@ -216,7 +219,9 @@ impl Default for App {
             slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
-            pending_settings_revision: None,
+            pending_settings: BTreeMap::new(),
+            next_name_revision: 0,
+            pending_name: None,
         }
     }
 }
@@ -264,6 +269,17 @@ impl App {
             )]),
             ..Self::default()
         }
+    }
+
+    fn restored(startup: StartupSnapshot, initial: &RuntimeInitialState) -> Self {
+        let mut app = Self::configured(startup.clone());
+        if let Some(metadata) = &initial.metadata {
+            app.session_name = metadata.name().map(str::to_owned);
+            app.session_thinking = metadata.preferences().thinking().clone();
+        }
+        app.transcript = Transcript::restored(startup, initial);
+        app.subagent_monitor = subagents::SubagentMonitor::restored(&initial.timeline);
+        app
     }
 
     fn configuration(startup: StartupSnapshot) -> Self {
@@ -713,9 +729,9 @@ impl App {
             .checked_add(1)
             .expect("settings revision overflowed");
         let revision = self.next_settings_revision;
-        self.session_thinking
-            .insert(selection.model().id, selection.thinking());
-        self.pending_settings_revision = Some(revision);
+        self.pending_settings
+            .retain(|_, pending| pending.model() != selection.model());
+        self.pending_settings.insert(revision, selection);
         RuntimeCommand::ApplySettings {
             selection,
             revision,
@@ -762,9 +778,14 @@ impl App {
                 quit: false,
             };
         }
-        self.session_name = Some(name);
+        self.next_name_revision = self
+            .next_name_revision
+            .checked_add(1)
+            .expect("name revision overflowed");
+        let revision = self.next_name_revision;
+        self.pending_name = Some((revision, name.clone()));
         Update {
-            commands: Vec::new(),
+            commands: vec![RuntimeCommand::SetSessionName { name, revision }],
             visible_changed: true,
             quit: false,
         }
@@ -1126,34 +1147,44 @@ impl App {
         if matches!(&event, RuntimeEvent::RunSettled { .. }) {
             self.foreground_cancellation_requested = false;
         }
-        if let RuntimeEvent::SettingsAccepted { revision } = &event {
-            self.reconcile_settings(*revision);
-        }
+        let metadata_changed = match &event {
+            RuntimeEvent::SettingsAccepted { revision } => self.reconcile_settings(*revision),
+            RuntimeEvent::NameAccepted { revision, name } => self.reconcile_name(*revision, name),
+            _ => false,
+        };
         let monitor_changed = self.subagent_monitor.apply(&event, now);
         let transcript_changed = self.transcript.apply(event, gap_before);
         if transcript_changed {
             self.invalidate_selection();
         }
-        monitor_changed || transcript_changed
+        metadata_changed || monitor_changed || transcript_changed
     }
 
-    fn reconcile_settings(&mut self, revision: u64) {
-        if self.pending_settings_revision != Some(revision) {
-            return;
-        }
-        if self
-            .preview
-            .is_some_and(|preview| preview.sent_revision != Some(revision))
-        {
-            return;
-        }
-        self.pending_settings_revision = None;
+    fn reconcile_settings(&mut self, revision: u64) -> bool {
+        let Some(selection) = self.pending_settings.remove(&revision) else {
+            return false;
+        };
+        self.session_thinking
+            .insert(selection.model().id, selection.thinking());
         if self
             .preview
             .is_some_and(|preview| preview.sent_revision == Some(revision))
         {
             self.preview = None;
         }
+        true
+    }
+
+    fn reconcile_name(&mut self, revision: u64, name: &str) -> bool {
+        let Some((pending_revision, pending_name)) = &self.pending_name else {
+            return false;
+        };
+        if *pending_revision != revision || pending_name != name {
+            return false;
+        }
+        self.session_name = Some(name.to_owned());
+        self.pending_name = None;
+        true
     }
 
     fn scroll_older(&mut self, rows: usize) -> Update {
@@ -1299,11 +1330,29 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
 pub(crate) fn run(
     startup: StartupSnapshot,
     commands: mpsc::Sender<RuntimeCommand>,
+    events: mpsc::UnboundedReceiver<RuntimeEvent>,
+    progress: RuntimeProgressReceiver,
+    trace: Trace,
+) -> Result<(), TuiError> {
+    run_restored(
+        startup,
+        RuntimeInitialState::empty(),
+        commands,
+        events,
+        progress,
+        trace,
+    )
+}
+
+pub(crate) fn run_restored(
+    startup: StartupSnapshot,
+    initial: RuntimeInitialState,
+    commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app = App::configured(startup);
+    let mut app = App::restored(startup, &initial);
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
     let mut titles = TerminalTitlePublisher;
@@ -1577,7 +1626,13 @@ fn run_loop_with_titles<B: Backend>(
 
         loop {
             match events.try_recv() {
-                Ok(event) => dirty |= app.handle_event(event),
+                Ok(event) => {
+                    let previous_title = app.title();
+                    dirty |= app.handle_event(event);
+                    if previous_title != app.title() {
+                        dirty |= publish_title(app, titles);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) if quit => return Ok(redraws),
                 Err(TryRecvError::Disconnected) => return Err(TuiError::RuntimeClosed),
@@ -2005,7 +2060,7 @@ fn render_rule(frame: &mut Frame, area: Rect, style: Style) {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2029,12 +2084,14 @@ mod tests {
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
     use crate::config::models::{ASTRA, SOL, TERRA};
+    use crate::config::{ModelSelection, SessionPreferences};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        ModelStepId, Record, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
-        StoredRecord, TerminalDetails,
+        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason,
+        RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
     };
+    use crate::session::SessionMetadata;
     use crate::subagents::TaskState;
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
@@ -2713,14 +2770,20 @@ mod tests {
             Some(home.path()),
             &workspace,
         ));
-        let mut input = FakeInput::new([
-            Some(Event::Paste("/name Refactor auth".to_owned())),
-            Some(Event::Key(key(KeyCode::Enter))),
-            Some(quit_event()),
-        ]);
+        let update = app.name_session("Refactor auth");
+        let [RuntimeCommand::SetSessionName { revision, .. }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        let mut input = FakeInput::new([Some(quit_event())]);
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).expect("terminal");
         let (commands, _command_receiver) = mpsc::channel(8);
-        let (_event_sender, mut events) = mpsc::unbounded_channel();
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        event_sender
+            .send(RuntimeEvent::NameAccepted {
+                revision: *revision,
+                name: "Refactor auth".to_owned(),
+            })
+            .expect("send name acknowledgement");
         let (_progress_sender, mut progress) = mpsc::channel(8);
         let mut clipboard = FakeClipboard::available();
         let mut titles = RecordingTitles::available();
@@ -2798,14 +2861,22 @@ mod tests {
         assert!(app.handle_paste("/name  Refactor\t auth").visible_changed);
         let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
 
-        assert!(update.commands.is_empty());
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        assert_eq!(name, "Refactor auth");
         assert!(app.prompt.is_empty());
+        assert_eq!(app.title(), "✷ - kiki");
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         assert_eq!(app.title(), "✷ - Refactor auth");
         assert!(rendered(&mut app, 80, 4).contains("~/…/kiki (Refactor auth)"));
     }
 
     #[test]
-    fn session_name_is_ephemeral_and_title_failure_is_visible() {
+    fn session_name_waits_for_acknowledgement_and_title_failure_is_visible() {
         let home = tempdir().expect("home");
         let workspace = home.path().join("kiki");
         let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
@@ -2813,7 +2884,15 @@ mod tests {
             &workspace,
         ));
         let update = app.name_session("  Refactor\t auth  ");
-        assert!(update.commands.is_empty());
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        assert_eq!(name, "Refactor auth");
+        assert_eq!(app.title(), "✷ - kiki");
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         assert_eq!(app.title(), "✷ - Refactor auth");
 
         let mut titles = RecordingTitles::failing();
@@ -2826,9 +2905,99 @@ mod tests {
         assert!(app.transcript.begin_submission());
         assert!(app.handle_paste("/name Active name").visible_changed);
         let update = app.handle_key_at(key(KeyCode::Enter), Instant::now());
-        assert!(update.commands.is_empty());
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
         assert!(app.prompt.is_empty());
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         assert_eq!(app.title(), "✷ - Active name");
+    }
+
+    #[test]
+    fn only_the_latest_matching_name_acknowledgement_changes_the_title() {
+        let mut app = App::default();
+        let first = app.name_session("First");
+        let [
+            RuntimeCommand::SetSessionName {
+                revision: first_revision,
+                name: first_name,
+            },
+        ] = first.commands.as_slice()
+        else {
+            panic!("expected first name command");
+        };
+        let second = app.name_session("Second");
+        let [
+            RuntimeCommand::SetSessionName {
+                revision: second_revision,
+                name: second_name,
+            },
+        ] = second.commands.as_slice()
+        else {
+            panic!("expected second name command");
+        };
+
+        assert!(!app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *first_revision,
+            name: first_name.clone(),
+        }));
+        assert_eq!(app.title(), "✷ - kiki");
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *second_revision,
+            name: second_name.clone(),
+        }));
+        assert_eq!(app.title(), "✷ - Second");
+    }
+
+    #[test]
+    fn restored_session_thinking_wins_over_changed_defaults_when_switching_models() {
+        let home = tempdir().expect("home");
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(home.path().join(".kiki")).expect("user settings directory");
+        fs::write(
+            home.path().join(".kiki/config.toml"),
+            "[thinking]\n\"openai/gpt-5.6-terra\" = \"low\"\n\"openai/gpt-5.6-sol\" = \"max\"\n",
+        )
+        .expect("user settings");
+        fs::create_dir_all(workspace.path().join(".kiki")).expect("project settings directory");
+        fs::write(
+            workspace.path().join(".kiki/config.toml"),
+            "[thinking]\n\"openai/gpt-5.6-terra\" = \"medium\"\n\"openai/gpt-5.6-sol\" = \"xhigh\"\n",
+        )
+        .expect("project settings");
+        let preferences = SessionPreferences::new(
+            ModelSelection::new(&TERRA, "high").expect("select Terra"),
+            BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
+        )
+        .expect("valid preferences");
+        let metadata = SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone());
+        let initial = RuntimeInitialState {
+            metadata: Some(metadata.clone()),
+            timeline: Vec::new(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+        let mut app = App::restored(
+            crate::config::ready_snapshot_with_settings_for_test(
+                Some(home.path()),
+                workspace.path(),
+            ),
+            &initial,
+        );
+        let now = Instant::now();
+
+        assert_eq!(initial.metadata.as_ref(), Some(&metadata));
+        assert_eq!(app.title(), "✷ - Saved name");
+        assert_eq!(&app.session_thinking, preferences.thinking());
+        let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        assert_eq!(terra.thinking(), "high");
+        let (sol, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        assert_eq!(sol.thinking(), "low");
+        let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        assert_eq!(terra.thinking(), "high");
     }
 
     #[test]
@@ -2844,7 +3013,15 @@ mod tests {
         assert_eq!(app.notice(), Some("Usage: /name <name>"));
 
         let accepted = "a".repeat(80);
-        assert!(app.name_session(&accepted).visible_changed);
+        let update = app.name_session(&accepted);
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        assert_eq!(app.title(), "✷ - kiki");
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         assert_eq!(app.title(), format!("✷ - {accepted}"));
         let rejected = "b".repeat(81);
         assert!(app.name_session(&rejected).visible_changed);
@@ -2855,7 +3032,14 @@ mod tests {
         );
 
         let wide = "界".repeat(40);
-        assert!(app.name_session(&wide).visible_changed);
+        let update = app.name_session(&wide);
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         assert_eq!(app.title(), format!("✷ - {wide}"));
         assert!(app.name_session(&"界".repeat(41)).visible_changed);
         assert_eq!(app.title(), format!("✷ - {wide}"));
@@ -3483,13 +3667,13 @@ mod tests {
     }
 
     #[test]
-    fn model_switch_restores_sent_thinking_before_acknowledgements() {
+    fn model_switch_ignores_unacknowledged_thinking() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
         let (selection, _) = applied_settings(&enter_at(&mut app, "/thinking high", now));
         assert!(std::ptr::eq(selection.model(), &SOL));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
 
         let (selection, _) =
             applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
@@ -3498,7 +3682,7 @@ mod tests {
         let (selection, _) =
             applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
         assert!(std::ptr::eq(selection.model(), &SOL));
-        assert_eq!(selection.thinking(), "high");
+        assert_eq!(selection.thinking(), "medium");
     }
 
     #[test]
@@ -3623,6 +3807,8 @@ mod tests {
         let (selection, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
         assert_eq!(selection.thinking(), "high");
         assert_eq!(revision, 1);
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
 
         app.handle_key_at(key(KeyCode::BackTab), now + Duration::from_secs(3));
@@ -3637,43 +3823,68 @@ mod tests {
     }
 
     #[test]
-    fn stale_acknowledgements_do_not_overwrite_locally_retained_session_thinking() {
+    fn same_model_stale_acknowledgements_do_not_publish_an_obsolete_choice() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
-        let (_, stale) = applied_settings(&enter_at(&mut app, "/thinking high", now));
-        let (_, latest) = applied_settings(&enter_at(&mut app, "/thinking low", now));
+        let (_, first) = applied_settings(&enter_at(&mut app, "/thinking high", now));
+        let (_, second) = applied_settings(&enter_at(&mut app, "/thinking low", now));
 
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"low"));
-        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: stale }));
         assert_eq!(app.settings_selection.thinking(), "low");
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"low"));
-        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: latest }));
-        assert!(app.pending_settings_revision.is_none());
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: first }));
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
+        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision: first }));
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision: second }));
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"low"));
     }
 
     #[test]
-    fn acknowledgement_retains_pending_settings_for_a_newer_unsent_preview() {
+    fn cross_model_acknowledgements_are_retained_when_switching_back() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let (_, sol_revision) = applied_settings(&enter_at(&mut app, "/thinking high", now));
+        let (terra, terra_revision) =
+            applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        assert_eq!(terra.thinking(), TERRA.default_thinking);
+
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
+            revision: sol_revision,
+        }));
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
+            revision: terra_revision,
+        }));
+        assert_eq!(
+            app.session_thinking.get(TERRA.id),
+            Some(&TERRA.default_thinking)
+        );
+
+        let (sol, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        assert_eq!(sol.thinking(), "high");
+    }
+
+    #[test]
+    fn sent_acknowledgement_applies_while_newer_preview_remains_unsent() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         app.handle_key_at(key(KeyCode::BackTab), now);
         let (_, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
         app.handle_key_at(key(KeyCode::BackTab), now + Duration::from_secs(2));
 
-        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
 
         assert_eq!(app.settings_selection.thinking(), "xhigh");
         assert!(app.preview.is_some());
-        assert_eq!(app.pending_settings_revision, Some(revision));
+        assert!(app.pending_settings.is_empty());
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
 
         let (_, preview_revision) = applied_settings(&app.tick(now + Duration::from_secs(4)));
-        assert!(!app.handle_event(RuntimeEvent::SettingsAccepted {
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted {
             revision: preview_revision,
         }));
 
-        assert!(app.pending_settings_revision.is_none());
+        assert!(app.pending_settings.is_empty());
         assert!(app.preview.is_none());
         assert_eq!(app.session_thinking.get(SOL.id), Some(&"xhigh"));
     }
@@ -3748,7 +3959,7 @@ mod tests {
         assert_eq!(*revision, 1);
         assert_eq!(request, "use the visible setting");
         assert!(app.preview.is_none());
-        assert_eq!(app.session_thinking.get(SOL.id), Some(&"high"));
+        assert_eq!(app.session_thinking.get(SOL.id), Some(&"medium"));
 
         let (sender, mut receiver) = mpsc::channel(2);
         super::dispatch_commands(&sender, &update, &Trace::disabled()).expect("dispatch commands");
@@ -3816,11 +4027,10 @@ mod tests {
         );
 
         fs::create_dir_all(workspace.path().join(".kiki")).expect("project settings directory");
-        fs::write(
-            workspace.path().join(".kiki/config.toml"),
-            "model = \"openai/gpt-5.6-terra\"\n",
-        )
-        .expect("project settings");
+        let project_settings = workspace.path().join(".kiki/config.toml");
+        fs::write(&project_settings, "model = \"openai/gpt-5.6-terra\"\n")
+            .expect("project settings");
+        let project_before = fs::read(&project_settings).expect("read project settings");
         let mut masked = App::configured(crate::config::ready_snapshot_with_settings_for_test(
             Some(home.path()),
             workspace.path(),
@@ -3835,6 +4045,10 @@ mod tests {
             masked
                 .notice()
                 .is_some_and(|notice| notice.contains("overridden by project settings"))
+        );
+        assert_eq!(
+            fs::read(&project_settings).expect("read project settings"),
+            project_before
         );
     }
 
@@ -5155,6 +5369,117 @@ mod tests {
         let shutdown = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(shutdown.commands, [RuntimeCommand::Shutdown]);
         assert!(shutdown.quit);
+    }
+
+    #[test]
+    fn restored_disabled_session_keeps_history_scrollable_and_expandable() {
+        let mut records = (1..=8)
+            .map(|run_id| StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: format!("saved request {run_id}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        records.push(StoredRecord {
+            run_id: RunId(9),
+            record: Record::CompletedExecution {
+                step_id: ModelStepId(9),
+                commentary: Some("saved arena commentary".to_owned()),
+                source: (1..=33)
+                    .map(|line| format!("saved arena line {line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                reasoning_summary: String::new(),
+                execution: Execution {
+                    stdout: observation(""),
+                    stderr: observation(""),
+                    outcome: ExecutionOutcome::Complete { result: None },
+                    tool_calls: (1..=20)
+                        .map(|count| ToolCall {
+                            tool: ToolName::Read,
+                            summary: ToolCallSummary::Count(count),
+                        })
+                        .collect(),
+                },
+                attempts: Vec::new(),
+            },
+        });
+        let initial = RuntimeInitialState {
+            metadata: None,
+            timeline: records
+                .into_iter()
+                .map(RestoredTimelineItem::Record)
+                .collect(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: Some(RuntimeDisabledReason::SessionRestoreFailed),
+        };
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+
+        let screen = rendered(&mut app, 60, 7);
+        assert!(screen.contains("Session restore failed; session is read-only"));
+        assert!(app.handle_key(key(KeyCode::PageUp)).visible_changed);
+        assert!(matches!(app.history_position, HistoryPosition::Anchored(_)));
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert_eq!(app.history_position, HistoryPosition::Anchored(0));
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        app.handle_key(history_end());
+        let expanded = rendered(&mut app, 60, 200);
+        assert!(expanded.contains("saved arena line 01"));
+        assert!(expanded.contains("read · 20 bytes"));
+        set_prompt(&mut app, "draft");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+    }
+
+    #[test]
+    fn restored_transcript_projects_timeline_and_footer_accounting() {
+        let request = StoredRecord {
+            run_id: RunId(1),
+            record: Record::UserRequest {
+                request: "saved request".to_owned(),
+            },
+        };
+        let final_message = StoredRecord {
+            run_id: RunId(1),
+            record: Record::FinalMessage {
+                step_id: ModelStepId(1),
+                text: "saved answer".to_owned(),
+                reasoning_summary: String::new(),
+                terminal: TerminalDetails::empty(),
+            },
+        };
+        let task = crate::subagents::TaskRecord::for_test(
+            "00",
+            2,
+            crate::config::ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let initial = RuntimeInitialState {
+            metadata: None,
+            timeline: vec![
+                RestoredTimelineItem::Record(request),
+                RestoredTimelineItem::SubagentSpawned(task.clone()),
+                RestoredTimelineItem::SubagentFinished(task),
+                RestoredTimelineItem::Record(final_message),
+            ],
+            footer_adjustment: vec![usage(3, 2)],
+            disabled_reason: None,
+        };
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+
+        let screen = rendered(&mut app, 120, 40);
+        assert!(screen.find("saved request").unwrap() < screen.find("saved answer").unwrap());
+        assert!(screen.contains("↑3 ↓2"), "{screen}");
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(rendered(&mut app, 120, 40).contains("✓ subagent:00"));
     }
 
     #[test]
@@ -7138,7 +7463,14 @@ mod tests {
             Some(home.path()),
             &workspace,
         ));
-        assert!(app.name_session("Refactor auth").visible_changed);
+        let update = app.name_session("Refactor auth");
+        let [RuntimeCommand::SetSessionName { revision, name }] = update.commands.as_slice() else {
+            panic!("expected name command");
+        };
+        assert!(app.handle_event(RuntimeEvent::NameAccepted {
+            revision: *revision,
+            name: name.clone(),
+        }));
         app.handle_event(completed_record(
             1,
             1,

@@ -62,11 +62,39 @@ const OBSERVATION_LIMITS: ObservationLimits = ObservationLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity(String);
 
+impl RuntimeIdentity {
+    pub(crate) fn session_value(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn from_session_value(value: String) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     identity: RuntimeIdentity,
     state: Vec<u8>,
     authorisations: WholeFileAuthorisations,
+}
+
+impl Checkpoint {
+    pub(crate) fn session_parts(&self) -> (&RuntimeIdentity, &[u8], &WholeFileAuthorisations) {
+        (&self.identity, &self.state, &self.authorisations)
+    }
+
+    pub(crate) fn from_session_parts(
+        identity: RuntimeIdentity,
+        state: Vec<u8>,
+        authorisations: WholeFileAuthorisations,
+    ) -> Self {
+        Self {
+            identity,
+            state,
+            authorisations,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,7 +970,12 @@ impl Arena {
             }
         }
         let context = invocation.map(|invocation| {
-            invocation.execution(self.child_source(), selection, self.checkpoint())
+            invocation.execution(
+                self.child_source(),
+                selection,
+                self.checkpoint(),
+                cancellation.clone(),
+            )
         });
         let mut checkout = self
             .checkout
@@ -3087,7 +3120,7 @@ mod tests {
         let caller = coordinator.root_caller().await;
         (
             AgentInvocationContext::new(caller, coordinator).with_accepted_thinking(
-                AcceptedThinking::new(selection, snapshot.settings().clone()),
+                AcceptedThinking::new(selection, snapshot.settings().clone(), None),
             ),
             receiver,
         )
@@ -3117,6 +3150,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         (context, coordinator, receiver)
     }
@@ -3150,6 +3184,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         (context, coordinator)
     }
@@ -4913,6 +4948,7 @@ mod tests {
                 .with_accepted_thinking(AcceptedThinking::new(
                     selection,
                     snapshot.settings().clone(),
+                    None,
                 ));
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
@@ -5064,7 +5100,7 @@ mod tests {
             crate::config::DEFAULT_MODEL.default_thinking,
         )
         .unwrap();
-        let accepted = AcceptedThinking::new(invoking, snapshot.settings().clone());
+        let accepted = AcceptedThinking::new(invoking, snapshot.settings().clone(), None);
         let terra =
             crate::config::ModelSelection::new(&crate::config::models::TERRA, "high").unwrap();
         accepted.accept(terra);
@@ -5210,7 +5246,7 @@ mod tests {
         let _sibling_caller = captured.recv().await.expect("sibling caller");
         let context =
             AgentInvocationContext::new(child_caller, coordinator.clone()).with_accepted_thinking(
-                AcceptedThinking::new(selection, snapshot.settings().clone()),
+                AcceptedThinking::new(selection, snapshot.settings().clone(), None),
             );
 
         let execution = execute_with_invocation(
