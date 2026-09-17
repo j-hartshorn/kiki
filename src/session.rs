@@ -234,20 +234,11 @@ pub(crate) struct RestoredExecutableState {
 pub(crate) struct SessionMetadata {
     name: Option<String>,
     preferences: SessionPreferences,
-    revision: u64,
 }
 
 impl SessionMetadata {
-    pub(crate) fn new(
-        name: Option<String>,
-        preferences: SessionPreferences,
-        revision: i64,
-    ) -> Result<Self, SessionError> {
-        Ok(Self {
-            name,
-            preferences,
-            revision: u64::try_from(revision).map_err(|_| SessionError::IdOverflow)?,
-        })
+    pub(crate) fn new(name: Option<String>, preferences: SessionPreferences) -> Self {
+        Self { name, preferences }
     }
 
     pub(crate) fn name(&self) -> Option<&str> {
@@ -258,14 +249,8 @@ impl SessionMetadata {
         &self.preferences
     }
 
-    #[cfg(test)]
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    pub(crate) fn update_preferences(&mut self, preferences: SessionPreferences, revision: u64) {
+    pub(crate) fn update_preferences(&mut self, preferences: SessionPreferences) {
         self.preferences = preferences;
-        self.revision = revision;
     }
 }
 
@@ -353,7 +338,7 @@ impl TaskSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStepCommit {
-    Committed(u64),
+    Committed,
     Superseded,
     Rejected,
 }
@@ -768,7 +753,7 @@ impl SessionWriter {
     pub(crate) async fn commit_preferences(
         &self,
         preferences: SessionPreferences,
-    ) -> Result<u64, SessionError> {
+    ) -> Result<(), SessionError> {
         self.commit_startup_preferences(preferences, None).await
     }
 
@@ -776,7 +761,7 @@ impl SessionWriter {
         &self,
         preferences: SessionPreferences,
         relocated_cwd: Option<PathBuf>,
-    ) -> Result<u64, SessionError> {
+    ) -> Result<(), SessionError> {
         let preferences_json = codec::encode_session_preferences(&preferences)
             .map_err(|error| SessionError::Codec(error.to_string()))?;
         let relocated_cwd = relocated_cwd
@@ -790,16 +775,12 @@ impl SessionWriter {
             SessionWriteKind::Preferences
         };
         self.write(kind, move |connection| {
-            if let Some(cwd) = relocated_cwd.as_deref() {
-                commit_preferences_and_cwd(connection, &preferences_json, cwd)
-            } else {
-                commit_preferences(connection, &preferences_json)
-            }
+            commit_preferences(connection, &preferences_json, relocated_cwd.as_deref())
         })
         .await
     }
 
-    pub(crate) async fn commit_name(&self, name: String) -> Result<u64, SessionError> {
+    pub(crate) async fn commit_name(&self, name: String) -> Result<(), SessionError> {
         if name.is_empty() {
             return Err(SessionError::EmptyName);
         }
@@ -861,12 +842,12 @@ impl SessionWriter {
         &self,
         admission: TaskAdmission,
         reject: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<Option<u64>, SessionError> {
+    ) -> Result<bool, SessionError> {
         self.write(SessionWriteKind::TaskAdmission, move |connection| {
             if reject() {
-                Ok(None)
+                Ok(false)
             } else {
-                admit_subagent_task(connection, &admission).map(Some)
+                admit_subagent_task(connection, &admission).map(|()| true)
             }
         })
         .await
@@ -890,7 +871,7 @@ impl SessionWriter {
     pub(crate) async fn terminal_subagent_task(
         &self,
         terminal: TaskTerminal,
-    ) -> Result<u64, SessionError> {
+    ) -> Result<(), SessionError> {
         self.write(SessionWriteKind::TaskTerminal, move |connection| {
             terminal_subagent_task(connection, &terminal)
         })
@@ -924,7 +905,8 @@ impl SessionWriter {
 fn commit_preferences(
     connection: &mut Connection,
     preferences_json: &str,
-) -> Result<u64, SessionError> {
+    cwd: Option<&str>,
+) -> Result<(), SessionError> {
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let revision: i64 = transaction.query_row(
@@ -933,42 +915,24 @@ fn commit_preferences(
         |row| row.get(0),
     )?;
     let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
-    if transaction.execute(
-        "UPDATE session SET preferences_json = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![preferences_json, now, next_revision],
-    )? != 1
-    {
+    let updated = match cwd {
+        Some(cwd) => transaction.execute(
+            "UPDATE session SET preferences_json = ?1, cwd = ?2, updated_at_ms = ?3, revision = ?4 WHERE singleton = 1",
+            params![preferences_json, cwd, now, next_revision],
+        ),
+        None => transaction.execute(
+            "UPDATE session SET preferences_json = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+            params![preferences_json, now, next_revision],
+        ),
+    }?;
+    if updated != 1 {
         return Err(SessionError::InvalidTransition);
     }
     transaction.commit()?;
-    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+    Ok(())
 }
 
-fn commit_preferences_and_cwd(
-    connection: &mut Connection,
-    preferences_json: &str,
-    cwd: &str,
-) -> Result<u64, SessionError> {
-    let now = now_ms()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let revision: i64 = transaction.query_row(
-        "SELECT revision FROM session WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
-    if transaction.execute(
-        "UPDATE session SET preferences_json = ?1, cwd = ?2, updated_at_ms = ?3, revision = ?4 WHERE singleton = 1",
-        params![preferences_json, cwd, now, next_revision],
-    )? != 1
-    {
-        return Err(SessionError::InvalidTransition);
-    }
-    transaction.commit()?;
-    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
-}
-
-fn commit_name(connection: &mut Connection, name: &str) -> Result<u64, SessionError> {
+fn commit_name(connection: &mut Connection, name: &str) -> Result<(), SessionError> {
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let revision: i64 = transaction.query_row(
@@ -985,7 +949,7 @@ fn commit_name(connection: &mut Connection, name: &str) -> Result<u64, SessionEr
         return Err(SessionError::InvalidTransition);
     }
     transaction.commit()?;
-    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+    Ok(())
 }
 
 fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, SessionError> {
@@ -1161,7 +1125,7 @@ fn close_run(
 fn admit_subagent_task(
     connection: &mut Connection,
     admission: &TaskAdmission,
-) -> Result<u64, SessionError> {
+) -> Result<(), SessionError> {
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let revision: i64 = transaction.query_row(
@@ -1194,7 +1158,7 @@ fn admit_subagent_task(
         params![now, next_revision],
     )?;
     transaction.commit()?;
-    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+    Ok(())
 }
 
 fn task_step(
@@ -1234,15 +1198,13 @@ fn task_step(
         params![now, next_revision],
     )?;
     transaction.commit()?;
-    Ok(TaskStepCommit::Committed(
-        u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)?,
-    ))
+    Ok(TaskStepCommit::Committed)
 }
 
 fn terminal_subagent_task(
     connection: &mut Connection,
     terminal: &TaskTerminal,
-) -> Result<u64, SessionError> {
+) -> Result<(), SessionError> {
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let revision: i64 = transaction.query_row(
@@ -1269,7 +1231,7 @@ fn terminal_subagent_task(
         params![now, next_revision],
     )?;
     transaction.commit()?;
-    u64::try_from(next_revision).map_err(|_| SessionError::IdOverflow)
+    Ok(())
 }
 
 fn recover_interrupted_operations(connection: &mut Connection) -> Result<(), SessionError> {
@@ -1670,22 +1632,21 @@ struct RestoreSnapshot {
 }
 
 fn load_session_metadata(connection: &Connection) -> Result<SessionMetadata, SessionError> {
-    let (name, preferences_json, revision): (Option<String>, String, i64) = connection.query_row(
-        "SELECT name, preferences_json, revision FROM session WHERE singleton = 1",
+    let (name, preferences_json): (Option<String>, String) = connection.query_row(
+        "SELECT name, preferences_json FROM session WHERE singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    session_metadata(name, preferences_json, revision)
+    session_metadata(name, preferences_json)
 }
 
 fn session_metadata(
     name: Option<String>,
     preferences_json: String,
-    revision: i64,
 ) -> Result<SessionMetadata, SessionError> {
     let preferences = codec::decode_session_preferences(&preferences_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
-    SessionMetadata::new(name, preferences, revision)
+    Ok(SessionMetadata::new(name, preferences))
 }
 
 fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
@@ -1700,7 +1661,7 @@ fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, S
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let metadata = session_metadata(name, preferences_json, session_revision).ok();
+    let metadata = session_metadata(name, preferences_json).ok();
     let entries = {
         let mut statement = transaction.prepare(
             "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
@@ -2887,14 +2848,10 @@ mod tests {
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 3,
             session_revision: 5,
-            metadata: Some(
-                super::SessionMetadata::new(
-                    None,
-                    crate::config::SessionPreferences::initial(selection()),
-                    5,
-                )
-                .expect("metadata"),
-            ),
+            metadata: Some(super::SessionMetadata::new(
+                None,
+                crate::config::SessionPreferences::initial(selection()),
+            )),
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
                 restore_entry(2, Some(1), Some(1), request, 2),
@@ -3188,12 +3145,12 @@ mod tests {
         )
         .expect("valid preferences");
 
-        let name_revision = session
+        session
             .writer()
             .commit_name("Saved session".to_owned())
             .await
             .expect("commit name");
-        let preferences_revision = session
+        session
             .writer()
             .commit_preferences(preferences.clone())
             .await
@@ -3201,11 +3158,17 @@ mod tests {
         let metadata = session.metadata().expect("load metadata");
         let restore = session.restore().expect("restore session");
 
-        assert_eq!(name_revision, 2);
-        assert_eq!(preferences_revision, 3);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT revision FROM session", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read session revision"),
+            3
+        );
         assert_eq!(metadata.name(), Some("Saved session"));
         assert_eq!(metadata.preferences(), &preferences);
-        assert_eq!(metadata.revision(), preferences_revision);
         assert_eq!(restore.metadata.as_ref(), Some(&metadata));
         assert_eq!(
             fs::read(&user_settings).expect("read user settings"),
@@ -3239,7 +3202,7 @@ mod tests {
             )
             .expect("read metadata before relocation");
 
-        let revision = session
+        session
             .writer()
             .commit_startup_preferences(preferences.clone(), Some(relocated.path().to_path_buf()))
             .await
@@ -3260,7 +3223,6 @@ mod tests {
             relocated.path()
         );
         assert_eq!(after.2, before.2 + 1);
-        assert_eq!(u64::try_from(after.2).unwrap(), revision);
         assert_eq!(
             super::codec::decode_session_preferences(&after.0).unwrap(),
             preferences
@@ -4059,15 +4021,17 @@ mod tests {
                                 executions: Vec::new(),
                                 outcome: None,
                             });
-                            writer
-                                .admit_subagent_task(
-                                    TaskAdmission::from_record(&task, origin_step_id)
-                                        .expect("encode background task"),
-                                    || false,
-                                )
-                                .await
-                                .expect("admit background task")
-                                .expect("commit background task");
+                            assert!(
+                                writer
+                                    .admit_subagent_task(
+                                        TaskAdmission::from_record(&task, origin_step_id)
+                                            .expect("encode background task"),
+                                        || false,
+                                    )
+                                    .await
+                                    .expect("admit background task"),
+                                "commit background task"
+                            );
                             b'B'
                         }
                         _ => panic!("unknown recovery milestone"),
@@ -4382,14 +4346,16 @@ mod tests {
             )],
             outcome: None,
         });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&first, origin_step_id).expect("encode first task"),
-                || false,
-            )
-            .await
-            .expect("admit first task")
-            .expect("commit first task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&first, origin_step_id).expect("encode first task"),
+                    || false,
+                )
+                .await
+                .expect("admit first task"),
+            "commit first task"
+        );
         let second = crate::subagents::TaskRecord::for_test(
             "01",
             9,
@@ -4412,14 +4378,17 @@ mod tests {
             executions: Vec::new(),
             outcome: None,
         });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&second, origin_step_id).expect("encode second task"),
-                || false,
-            )
-            .await
-            .expect("admit second task")
-            .expect("commit second task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&second, origin_step_id)
+                        .expect("encode second task"),
+                    || false,
+                )
+                .await
+                .expect("admit second task"),
+            "commit second task"
+        );
         let completed_admission =
             crate::subagents::TaskRecord::for_test("02", 1, selection(), None, 1, Vec::new())
                 .with_persisted_details_for_test(TaskPersistedDetails {
@@ -4433,15 +4402,17 @@ mod tests {
                     executions: Vec::new(),
                     outcome: None,
                 });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&completed_admission, origin_step_id)
-                    .expect("encode completed task admission"),
-                || false,
-            )
-            .await
-            .expect("admit completed task")
-            .expect("commit completed task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&completed_admission, origin_step_id)
+                        .expect("encode completed task admission"),
+                    || false,
+                )
+                .await
+                .expect("admit completed task"),
+            "commit completed task"
+        );
         let completed =
             crate::subagents::TaskRecord::for_test("02", 2, selection(), None, 1, Vec::new())
                 .with_persisted_details_for_test(TaskPersistedDetails {
@@ -4648,15 +4619,17 @@ mod tests {
                     executions: Vec::new(),
                     outcome: None,
                 });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&completed_admission, step_id)
-                    .expect("encode completed task admission"),
-                || false,
-            )
-            .await
-            .expect("admit completed task")
-            .expect("commit completed task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&completed_admission, step_id)
+                        .expect("encode completed task admission"),
+                    || false,
+                )
+                .await
+                .expect("admit completed task"),
+            "commit completed task"
+        );
         let completed =
             crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
                 .with_persisted_details_for_test(TaskPersistedDetails {
@@ -4695,14 +4668,16 @@ mod tests {
             executions: Vec::new(),
             outcome: None,
         });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&pending, step_id).expect("encode pending task"),
-                || false,
-            )
-            .await
-            .expect("admit pending task")
-            .expect("commit pending task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&pending, step_id).expect("encode pending task"),
+                    || false,
+                )
+                .await
+                .expect("admit pending task"),
+            "commit pending task"
+        );
         let previous_revision: i64 = session
             .connection_for_test()
             .expect("lock session connection")
@@ -4910,14 +4885,16 @@ mod tests {
                     executions: Vec::new(),
                     outcome: None,
                 });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&admission, step_id).expect("encode task admission"),
-                || false,
-            )
-            .await
-            .expect("admit task")
-            .expect("commit task");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&admission, step_id).expect("encode task admission"),
+                    || false,
+                )
+                .await
+                .expect("admit task"),
+            "commit task"
+        );
         let invalid =
             crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
                 .with_persisted_details_for_test(TaskPersistedDetails {
@@ -5226,14 +5203,17 @@ mod tests {
                     executions: Vec::new(),
                     outcome: None,
                 });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&admitted, origin_step_id).expect("encode admission"),
-                || false,
-            )
-            .await
-            .expect("admit task")
-            .expect("commit task admission");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&admitted, origin_step_id)
+                        .expect("encode admission"),
+                    || false,
+                )
+                .await
+                .expect("admit task"),
+            "commit task admission"
+        );
         let newer =
             crate::subagents::TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
                 .with_persisted_details_for_test(TaskPersistedDetails {
@@ -5255,7 +5235,7 @@ mod tests {
                 )
                 .await
                 .expect("commit newer snapshot"),
-            TaskStepCommit::Committed(5)
+            TaskStepCommit::Committed
         );
         let persisted_after_newer: (String, Option<i64>, i64, String, i64) = session
             .connection_for_test()

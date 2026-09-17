@@ -2678,26 +2678,26 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             }
             (None, _) => None,
         };
-        let committed = match (writer, admission) {
-            (Some(writer), Some(admission)) => {
-                let failure = self.storage_failure.clone();
-                let admission_invocation_cancellation = invocation_cancellation.clone();
-                writer
-                    .admit_subagent_task(admission, move || {
-                        admission_invocation_cancellation.is_cancelled()
-                            || admission_cancellation.is_cancelled()
-                            || failure.is_cancelled()
-                    })
-                    .await
-            }
-            (None, _) => Ok((!invocation_cancellation.is_cancelled()
-                && !admission_cancellation.is_cancelled())
-            .then_some(0)),
-            (Some(_), None) => unreachable!("persistent admission requires provenance"),
-        };
+        let committed =
+            match (writer, admission) {
+                (Some(writer), Some(admission)) => {
+                    let failure = self.storage_failure.clone();
+                    let admission_invocation_cancellation = invocation_cancellation.clone();
+                    writer
+                        .admit_subagent_task(admission, move || {
+                            admission_invocation_cancellation.is_cancelled()
+                                || admission_cancellation.is_cancelled()
+                                || failure.is_cancelled()
+                        })
+                        .await
+                }
+                (None, _) => Ok(!invocation_cancellation.is_cancelled()
+                    && !admission_cancellation.is_cancelled()),
+                (Some(_), None) => unreachable!("persistent admission requires provenance"),
+            };
         match committed {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+            Ok(true) => {}
+            Ok(false) => {
                 self.discard_pending(&id).await;
                 let error = if self.storage_failure.is_cancelled() {
                     AdmissionError::StorageUnavailable
@@ -3013,10 +3013,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             })
             .await
         {
-            Ok(TaskStepCommit::Committed(revision)) => {
-                debug_assert!(revision > 0);
-                true
-            }
+            Ok(TaskStepCommit::Committed) => true,
             Ok(TaskStepCommit::Superseded | TaskStepCommit::Rejected) => false,
             Err(_) => {
                 self.latch_storage_failure().await;
@@ -3154,7 +3151,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 Ok(terminal) => writer.terminal_subagent_task(terminal).await,
                 Err(error) => Err(error),
             },
-            None => Ok(0),
+            None => Ok(()),
         };
         if persisted.is_err() {
             self.latch_storage_failure().await;

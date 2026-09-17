@@ -2973,8 +2973,7 @@ mod tests {
             BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
         )
         .expect("valid preferences");
-        let metadata = SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone(), 3)
-            .expect("session metadata");
+        let metadata = SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone());
         let initial = RuntimeInitialState {
             metadata: Some(metadata.clone()),
             timeline: Vec::new(),
@@ -2991,7 +2990,6 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(initial.metadata.as_ref(), Some(&metadata));
-        assert_eq!(metadata.revision(), 3);
         assert_eq!(app.title(), "✷ - Saved name");
         assert_eq!(&app.session_thinking, preferences.thinking());
         let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));

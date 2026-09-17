@@ -660,13 +660,13 @@ impl<M: Model> RuntimeController<M> {
                     .commit_startup_preferences(preferences.clone(), relocated_cwd)
                     .await
                 {
-                    Ok(revision) => {
+                    Ok(()) => {
                         accepted_thinking.accept(selection);
                         initial
                             .metadata
                             .as_mut()
                             .expect("executable session restore must have metadata")
-                            .update_preferences(preferences, revision);
+                            .update_preferences(preferences);
                         Some(Agent::restored(arena, model, state.history))
                     }
                     Err(_) => {
@@ -951,7 +951,7 @@ impl<M: Model> RuntimeController<M> {
                     return;
                 }
                 match self.session.commit_name(name.clone()).await {
-                    Ok(_) => self.emit(events, RuntimeEvent::NameAccepted { revision, name }),
+                    Ok(()) => self.emit(events, RuntimeEvent::NameAccepted { revision, name }),
                     Err(SessionError::EmptyName) => {}
                     Err(_) => {
                         self.subagents.latch_storage_failure().await;
@@ -10294,15 +10294,17 @@ mod tests {
             executions: Vec::new(),
             outcome: None,
         });
-        writer
-            .admit_subagent_task(
-                TaskAdmission::from_record(&admitted, origin_step_id)
-                    .expect("encode task admission"),
-                || false,
-            )
-            .await
-            .expect("persist task admission")
-            .expect("accept fixture task admission");
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&admitted, origin_step_id)
+                        .expect("encode task admission"),
+                    || false,
+                )
+                .await
+                .expect("persist task admission"),
+            "accept fixture task admission"
+        );
         writer
             .terminal_subagent_task(
                 TaskTerminal::from_record(&terminal).expect("encode task terminal"),
