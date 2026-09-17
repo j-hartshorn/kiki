@@ -2977,8 +2977,6 @@ mod tests {
             .expect("session metadata");
         let initial = RuntimeInitialState {
             metadata: Some(metadata.clone()),
-            records: Vec::new(),
-            tasks: Vec::new(),
             timeline: Vec::new(),
             footer_adjustment: Vec::new(),
             disabled_reason: None,
@@ -5411,8 +5409,6 @@ mod tests {
         });
         let initial = RuntimeInitialState {
             metadata: None,
-            records: records.clone(),
-            tasks: Vec::new(),
             timeline: records
                 .into_iter()
                 .map(RestoredTimelineItem::Record)
@@ -5467,8 +5463,6 @@ mod tests {
         );
         let initial = RuntimeInitialState {
             metadata: None,
-            records: vec![request.clone(), final_message.clone()],
-            tasks: vec![task.clone()],
             timeline: vec![
                 RestoredTimelineItem::Record(request),
                 RestoredTimelineItem::SubagentSpawned(task.clone()),

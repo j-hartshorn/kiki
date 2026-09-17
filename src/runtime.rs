@@ -121,8 +121,6 @@ pub(crate) enum RestoredTimelineItem {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeInitialState {
     pub(crate) metadata: Option<SessionMetadata>,
-    pub(crate) records: Vec<StoredRecord>,
-    pub(crate) tasks: Vec<TaskRecord>,
     pub(crate) timeline: Vec<RestoredTimelineItem>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
     pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
@@ -132,8 +130,6 @@ impl RuntimeInitialState {
     pub(crate) fn empty() -> Self {
         Self {
             metadata: None,
-            records: Vec::new(),
-            tasks: Vec::new(),
             timeline: Vec::new(),
             footer_adjustment: Vec::new(),
             disabled_reason: None,
@@ -507,17 +503,6 @@ fn attempt_accounting_payload_bytes(accounting: &crate::model::AttemptAccounting
 }
 
 fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
-    let records = restore
-        .records
-        .iter()
-        .cloned()
-        .map(restored_stored_record)
-        .collect::<Vec<_>>();
-    let tasks = restore
-        .tasks
-        .iter()
-        .map(|task| task.record.clone())
-        .collect::<Vec<_>>();
     let mut ordered = restore
         .records
         .iter()
@@ -544,8 +529,6 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
     ordered.sort_by_key(|(revision, _)| *revision);
     RuntimeInitialState {
         metadata: restore.metadata.clone(),
-        records,
-        tasks,
         timeline: ordered.into_iter().map(|(_, item)| item).collect(),
         footer_adjustment: restore.footer_adjustment.clone(),
         disabled_reason: restore
@@ -647,7 +630,13 @@ impl<M: Model> RuntimeController<M> {
     ) -> Result<(Self, RuntimeInitialState), SessionError> {
         let restore = session.restore()?;
         let mut initial = restored_initial_state(&restore);
-        let restored_tasks = initial.tasks.clone();
+        let records = restore
+            .records
+            .iter()
+            .cloned()
+            .map(restored_stored_record)
+            .collect();
+        let restored_tasks = restore.tasks.iter().map(|task| task.record.clone());
         let subagents = subagents.with_session(session.writer());
         subagents
             .restore_terminal_tasks(restored_tasks, restore.next_task)
@@ -701,7 +690,7 @@ impl<M: Model> RuntimeController<M> {
             Self {
                 agent,
                 disabled_reason: initial.disabled_reason.clone(),
-                records: initial.records.clone(),
+                records,
                 session: session.writer(),
                 settings,
                 accepted_thinking,
@@ -5690,7 +5679,7 @@ mod tests {
             Some(RuntimeDisabledReason::SessionStorageWriteFailed)
         );
         assert_eq!(
-            initial.records,
+            controller.records,
             [StoredRecord {
                 run_id: RunId(1),
                 record: Record::UserRequest {
@@ -5805,7 +5794,7 @@ mod tests {
             Some(RuntimeDisabledReason::SessionStorageWriteFailed)
         );
         assert!(matches!(
-            initial.records.as_slice(),
+            controller.records.as_slice(),
             [StoredRecord {
                 record: Record::UserRequest { request },
                 ..
@@ -10174,16 +10163,16 @@ mod tests {
         .expect("return disabled restored runtime");
 
         assert!(matches!(
-            initial.records.as_slice(),
+            initial.timeline.as_slice(),
             [
-                StoredRecord {
+                RestoredTimelineItem::Record(StoredRecord {
                     run_id: RunId(1),
                     record: Record::UserRequest { request },
-                },
-                StoredRecord {
+                }),
+                RestoredTimelineItem::Record(StoredRecord {
                     run_id: RunId(1),
                     record: Record::CompletedExecution { source, .. },
-                },
+                }),
             ] if request == "readable saved request" && source == "checkpoint_value = 1"
         ));
         assert_eq!(
@@ -10694,20 +10683,20 @@ mod tests {
         .await
         .expect("restore runtime");
         assert!(initial.disabled_reason.is_none());
+        let restored_tasks = controller.subagents.records().await;
         assert_eq!(
-            initial
-                .tasks
+            restored_tasks
                 .iter()
                 .map(|task| task.id().as_str())
                 .collect::<Vec<_>>(),
             ["00", "62"]
         );
         assert!(matches!(
-            initial.tasks[0].outcome(),
+            restored_tasks[0].outcome(),
             Some(TaskOutcome::Completed(result)) if result.values().get("answer") == Some(&ToolValue::Integer(7))
         ));
         assert!(matches!(
-            initial.tasks[1].outcome(),
+            restored_tasks[1].outcome(),
             Some(TaskOutcome::Completed(result))
                 if result.message() == "late selected result"
                     && result.values().get("visible") == Some(&ToolValue::Integer(62))
