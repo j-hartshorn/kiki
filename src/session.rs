@@ -1780,7 +1780,14 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
         .collect::<BTreeMap<_, _>>();
     let ancestry = selected_ancestry(&entries, snapshot.active_entry_id);
     if ancestry.entries.is_empty() {
-        return empty_restore(snapshot.tasks, metadata);
+        return SessionRestore {
+            metadata,
+            records: Vec::new(),
+            tasks: Vec::new(),
+            footer_adjustment: Vec::new(),
+            next_task,
+            executable: None,
+        };
     }
     let mut executable = metadata.is_some() && ancestry.intact && valid_timeline(&snapshot);
     let mut verified = Vec::new();
@@ -1967,23 +1974,6 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
 
 fn next_task_after(maximum: Option<u64>) -> Option<u64> {
     maximum.map_or(Some(0), |maximum| maximum.checked_add(1))
-}
-
-fn empty_restore(tasks: Vec<RestoreTaskRow>, metadata: Option<SessionMetadata>) -> SessionRestore {
-    let next_task = next_task_after(
-        tasks
-            .into_iter()
-            .filter_map(|task| u64::try_from(task.id).ok())
-            .max(),
-    );
-    SessionRestore {
-        metadata,
-        records: Vec::new(),
-        tasks: Vec::new(),
-        footer_adjustment: Vec::new(),
-        next_task,
-        executable: None,
-    }
 }
 
 struct SelectedAncestry {
