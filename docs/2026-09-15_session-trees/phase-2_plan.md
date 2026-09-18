@@ -243,7 +243,7 @@ First red: `tui::picker::tests::dynamic_matches_keep_non_focusable_context_rows`
 
 **Files**
 
-- Modify: `src/tui/picker.rs`, `src/tui.rs`.
+- Modify: `src/tui/picker.rs`.
 
 **Verification**
 
