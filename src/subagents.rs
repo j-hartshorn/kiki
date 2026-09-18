@@ -1869,6 +1869,46 @@ impl StartSubagentTestGate {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OperationTestGate {
+    terminal_published: Arc<Semaphore>,
+    allow_settlement: Arc<Semaphore>,
+    settled: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl OperationTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            terminal_published: Arc::new(Semaphore::new(0)),
+            allow_settlement: Arc::new(Semaphore::new(0)),
+            settled: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) async fn wait_until_terminal_published(&self) {
+        take_test_permit(&self.terminal_published).await;
+    }
+
+    pub(crate) fn allow_settlement(&self) {
+        self.allow_settlement.add_permits(1);
+    }
+
+    pub(crate) async fn wait_until_settled(&self) {
+        take_test_permit(&self.settled).await;
+    }
+
+    async fn wait_after_terminal_published(&self) {
+        self.terminal_published.add_permits(1);
+        take_test_permit(&self.allow_settlement).await;
+    }
+
+    fn operation_dropped(&self) {
+        self.settled.add_permits(1);
+    }
+}
+
+#[cfg(test)]
 async fn take_test_permit(semaphore: &Arc<Semaphore>) {
     semaphore
         .clone()
@@ -1938,6 +1978,10 @@ impl TrackedOperations {
         }
     }
 
+    fn count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
     async fn wait(&self) {
         loop {
             let notified = self.idle.notified();
@@ -1977,6 +2021,8 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     start_test_gate: Option<StartSubagentTestGate>,
     #[cfg(test)]
     run_child_test_gate: Option<RunChildTestGate>,
+    #[cfg(test)]
+    operation_test_gate: Option<OperationTestGate>,
 }
 
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
@@ -1995,6 +2041,8 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             start_test_gate: self.start_test_gate.clone(),
             #[cfg(test)]
             run_child_test_gate: self.run_child_test_gate.clone(),
+            #[cfg(test)]
+            operation_test_gate: self.operation_test_gate.clone(),
         }
     }
 }
@@ -2037,6 +2085,8 @@ struct Inner {
     shutting_down: bool,
     storage_failed: bool,
     blocked_origins: BTreeSet<OriginId>,
+    active_root_origins: BTreeSet<OriginId>,
+    selected_origins: Option<BTreeSet<u64>>,
     origin_starts: BTreeMap<OriginId, usize>,
     notifications: watch::Sender<u64>,
     pending: BTreeMap<TaskId, Task>,
@@ -2260,6 +2310,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 shutting_down: false,
                 storage_failed: false,
                 blocked_origins: BTreeSet::new(),
+                active_root_origins: BTreeSet::new(),
+                selected_origins: None,
                 origin_starts: BTreeMap::new(),
                 notifications: watch::channel(0).0,
                 pending: BTreeMap::new(),
@@ -2280,6 +2332,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             start_test_gate: None,
             #[cfg(test)]
             run_child_test_gate: None,
+            #[cfg(test)]
+            operation_test_gate: None,
         }
     }
 
@@ -2297,11 +2351,61 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         inner.next_task = next_task;
         let notifications = inner.notifications.clone();
         for record in tasks {
+            if let Some(origin_step_id) = record.origin_step_id {
+                inner.next_origin = inner.next_origin.max(
+                    origin_step_id
+                        .checked_add(1)
+                        .expect("stored origin step identifier must leave a root origin"),
+                );
+            }
             let id = record.id.clone();
             inner
                 .tasks
                 .insert(id, Task::restored(record, notifications.clone()));
         }
+    }
+
+    pub(crate) fn operation_count(&self) -> usize {
+        self.operations.count()
+    }
+
+    pub(crate) async fn replace_selected_origins(
+        &self,
+        origins: impl IntoIterator<Item = u64>,
+    ) -> bool {
+        if self.operation_count() != 0 {
+            return false;
+        }
+        let mut inner = self.lock_inner(CoordinatorOperation::Record).await;
+        if self.operation_count() != 0 {
+            return false;
+        }
+        inner.selected_origins = Some(origins.into_iter().collect());
+        true
+    }
+
+    pub(crate) async fn settle_root_run(
+        &self,
+        caller: &Caller,
+        origins: impl IntoIterator<Item = u64>,
+    ) {
+        let mut inner = self.lock_inner(CoordinatorOperation::RootCaller).await;
+        assert!(
+            caller.session == inner.session,
+            "root caller belongs to this session"
+        );
+        assert!(
+            matches!(caller.owner, CallerOwner::Root),
+            "caller is a root"
+        );
+        assert!(
+            inner.active_root_origins.remove(&caller.origin),
+            "root caller remains active until settlement"
+        );
+        inner
+            .selected_origins
+            .get_or_insert_default()
+            .extend(origins);
     }
 
     pub(crate) fn storage_failure_token(&self) -> CancellationToken {
@@ -2320,6 +2424,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         run_child_test_gate: RunChildTestGate,
     ) -> Self {
         self.run_child_test_gate = Some(run_child_test_gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_operation_test_gate(
+        mut self,
+        operation_test_gate: OperationTestGate,
+    ) -> Self {
+        self.operation_test_gate = Some(operation_test_gate);
         self
     }
 
@@ -2404,6 +2517,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             .next_origin
             .checked_add(1)
             .expect("subagent origin identifier space is exhausted");
+        inner.active_root_origins.insert(origin);
         Caller {
             session: inner.session,
             owner: CallerOwner::Root,
@@ -2583,10 +2697,20 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 });
                 self.publish_event(CoordinatorEvent::Spawned { record: spawned });
                 let coordinator = self.clone();
+                #[cfg(test)]
+                let operation_test_gate = self.operation_test_gate.clone();
                 tokio::spawn(async move {
                     coordinator.run_child(child).await;
+                    #[cfg(test)]
+                    if let Some(gate) = &operation_test_gate {
+                        gate.wait_after_terminal_published().await;
+                    }
                     drop(coordinator);
                     drop(operation);
+                    #[cfg(test)]
+                    if let Some(gate) = operation_test_gate {
+                        gate.operation_dropped();
+                    }
                 });
                 return Ok(observation);
             }
@@ -2601,6 +2725,8 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let coordinator = self.clone();
         let caller = caller.clone();
+        #[cfg(test)]
+        let operation_test_gate = self.operation_test_gate.clone();
         tokio::spawn(async move {
             coordinator
                 .complete_admission(
@@ -2612,8 +2738,16 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     sender,
                 )
                 .await;
+            #[cfg(test)]
+            if let Some(gate) = &operation_test_gate {
+                gate.wait_after_terminal_published().await;
+            }
             drop(coordinator);
             drop(operation);
+            #[cfg(test)]
+            if let Some(gate) = operation_test_gate {
+                gate.operation_dropped();
+            }
         });
         receiver
             .await
@@ -3378,6 +3512,16 @@ fn ensure_access(inner: &Inner, caller: &Caller, id: &TaskId) -> Result<(), Acce
     let Some(target) = inner.tasks.get(id) else {
         return Err(AccessError::UnknownTask(id.clone()));
     };
+    let visible = inner.selected_origins.as_ref().is_none_or(|origins| {
+        target
+            .origin_step_id
+            .is_some_and(|origin| origins.contains(&origin))
+            || (inner.active_root_origins.contains(&caller.origin)
+                && target.origin == caller.origin)
+    });
+    if !visible {
+        return Err(AccessError::Denied(id.clone()));
+    }
     match &caller.owner {
         CallerOwner::Root => Ok(()),
         CallerOwner::Child(owner) => {
@@ -3840,6 +3984,34 @@ mod tests {
         ChildResult::new(message.to_owned(), BTreeMap::new())
     }
 
+    fn restored_task(
+        id: &str,
+        parent: Option<&str>,
+        origin_step_id: u64,
+        message: &str,
+    ) -> TaskRecord {
+        TaskRecord::from_persisted(RestoredTaskRecord {
+            id: TaskId::parse(id).expect("valid task ID"),
+            revision: 2,
+            parent: parent.map(|id| TaskId::parse(id).expect("valid parent task ID")),
+            origin_step_id,
+            depth: 1,
+            parameters: parameters(),
+            attempts: Vec::new(),
+            details: TaskPersistedDetails {
+                admitted_at_ms: 100,
+                terminal_at_ms: Some(200),
+                state: TaskState::Completed,
+                step_count: 1,
+                elapsed: Duration::from_secs(1),
+                observed_at_ms: 200,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: Some(TaskOutcome::Completed(result(message))),
+            },
+        })
+    }
+
     #[test]
     fn restored_terminal_observations_match_live_settlement() {
         let details = |state, outcome| TaskPersistedDetails {
@@ -4137,6 +4309,181 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn root_access_is_limited_to_selected_origin_steps() {
+        let (coordinator, mut started) = coordinator(policy());
+        let selected = restored_task("00", None, 11, "selected");
+        let sibling = restored_task("01", None, 12, "sibling");
+        let selected_id = selected.id().clone();
+        let sibling_id = sibling.id().clone();
+        coordinator
+            .restore_terminal_tasks([selected, sibling], Some(2))
+            .await;
+        assert!(coordinator.replace_selected_origins([11]).await);
+        let root = coordinator.root_caller().await;
+
+        assert_eq!(
+            coordinator.get(&root, &selected_id).await.unwrap().state(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            coordinator.get(&root, &sibling_id).await,
+            Err(AccessError::Denied(sibling_id.clone()))
+        );
+        assert_eq!(
+            coordinator.wait(&root, &sibling_id).await,
+            Err(WaitError::Access(AccessError::Denied(sibling_id.clone())))
+        );
+        assert_eq!(
+            coordinator.cancel(&root, &sibling_id).await,
+            Err(WaitError::Access(AccessError::Denied(sibling_id.clone())))
+        );
+
+        assert!(coordinator.replace_selected_origins([12]).await);
+        assert_eq!(
+            coordinator
+                .wait(&root, &sibling_id)
+                .await
+                .unwrap()
+                .0
+                .message(),
+            "sibling"
+        );
+        assert_eq!(
+            coordinator.get(&root, &selected_id).await,
+            Err(AccessError::Denied(selected_id))
+        );
+        assert_eq!(
+            coordinator
+                .records()
+                .await
+                .iter()
+                .map(|record| record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00", "01"]
+        );
+        assert_eq!(coordinator.inner.lock().await.next_task, Some(2));
+        assert!(
+            started.try_recv().is_err(),
+            "restoration must not start a runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_access_uses_active_origin_until_durable_settlement() {
+        let (coordinator, mut started) = coordinator(policy());
+        assert!(coordinator.replace_selected_origins([]).await);
+        let mut root = coordinator.root_caller().await;
+        root.origin_step_id = Some(11);
+        let (id, running) = start(&coordinator, &mut started, &root).await;
+
+        root.origin_step_id = Some(12);
+        assert_eq!(
+            coordinator.get(&root, &id).await.unwrap().state(),
+            TaskState::Running
+        );
+        coordinator.settle_root_run(&root, [11, 12]).await;
+        let later_root = coordinator.root_caller().await;
+        assert_eq!(
+            coordinator.get(&later_root, &id).await.unwrap().state(),
+            TaskState::Running
+        );
+
+        running.finish.send(Ok(result("done"))).unwrap();
+        assert_eq!(
+            coordinator
+                .wait(&later_root, &id)
+                .await
+                .unwrap()
+                .0
+                .message(),
+            "done"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_origins_cannot_collide_with_live_root_origins() {
+        let (coordinator, _) = coordinator(policy());
+        let hidden = restored_task("00", None, 1, "hidden");
+        let id = hidden.id().clone();
+        coordinator.restore_terminal_tasks([hidden], Some(1)).await;
+        assert!(coordinator.replace_selected_origins([]).await);
+        let root = coordinator.root_caller().await;
+
+        assert!(root.origin.0 > 1);
+        assert_eq!(
+            coordinator.get(&root, &id).await,
+            Err(AccessError::Denied(id.clone()))
+        );
+        assert!(coordinator.replace_selected_origins([1]).await);
+        assert_eq!(
+            coordinator.wait(&root, &id).await.unwrap().0.message(),
+            "hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_terminal_parents_cannot_expose_descendants() {
+        let (coordinator, mut started) = coordinator(policy());
+        assert!(coordinator.replace_selected_origins([]).await);
+        let mut root = coordinator.root_caller().await;
+        root.origin_step_id = Some(11);
+        let (parent_id, parent) = start(&coordinator, &mut started, &root).await;
+        let parent_caller = parent.child.caller().clone();
+        let (child_id, child) = start(&coordinator, &mut started, &parent_caller).await;
+
+        assert_eq!(
+            coordinator
+                .get(&parent_caller, &child_id)
+                .await
+                .unwrap()
+                .state(),
+            TaskState::Running
+        );
+        parent.finish.send(Ok(result("parent"))).unwrap();
+        child.finish.send(Ok(result("child"))).unwrap();
+        coordinator.wait(&root, &parent_id).await.unwrap();
+        coordinator.wait(&root, &child_id).await.unwrap();
+        coordinator.settle_root_run(&root, []).await;
+
+        assert_eq!(
+            coordinator.get(&parent_caller, &child_id).await,
+            Err(AccessError::Denied(child_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_count_fences_visibility_replacement_after_events() {
+        let gate = super::OperationTestGate::new();
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_operation_test_gate(gate.clone());
+        let mut events = coordinator
+            .take_event_receiver()
+            .expect("take coordinator events");
+        let root = coordinator.root_caller().await;
+        let task = coordinator.start(&root, parameters(), ()).await.unwrap();
+        let running = started.recv().await.expect("child starts");
+        running.finish.send(Ok(result("done"))).unwrap();
+
+        gate.wait_until_terminal_published().await;
+        assert_eq!(coordinator.operation_count(), 1);
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        assert!(drained.iter().any(|event| matches!(
+            event,
+            CoordinatorEvent::Finished { record } if record.id() == task.id()
+        )));
+        assert!(!coordinator.replace_selected_origins([]).await);
+
+        gate.allow_settlement();
+        gate.wait_until_settled().await;
+        assert_eq!(coordinator.operation_count(), 0);
+        assert!(coordinator.replace_selected_origins([]).await);
+        assert!(events.try_recv().is_err());
+    }
+
     #[test]
     fn terminal_metric_claim_freezes_without_publishing_a_revision() {
         let (notifications, _) = watch::channel(0);
@@ -4202,6 +4549,7 @@ mod tests {
             async move { coordinator.start(&caller, parameters(), ()).await }
         });
         admission_gate.wait_until_started().await;
+        assert_eq!(coordinator.operation_count(), 1);
         assert!(
             started.try_recv().is_err(),
             "runner started before admission committed"
@@ -4887,6 +5235,7 @@ mod tests {
         finish.send(Ok(result("done"))).expect("finish child");
         drop(child);
         terminal_gate.wait_until_started().await;
+        assert_eq!(coordinator.operation_count(), 1);
 
         let (phase_sender, mut phase_receiver) = mpsc::unbounded_channel();
         let signal = WaitPhaseSignal::new(7, phase_sender);
@@ -4977,6 +5326,7 @@ mod tests {
         assert!(terminal_revision < foreground_revision);
 
         coordinator.shutdown().await;
+        assert_eq!(coordinator.operation_count(), 0);
         drop(events);
         drop(started);
         drop(caller);
@@ -6456,6 +6806,7 @@ mod tests {
             .send(Err(ChildFailure::new("parent failed")))
             .unwrap();
         cleanup_started.notified().await;
+        assert_eq!(coordinator.operation_count(), 2);
         let stopping = coordinator.get(&root, parent.id()).await.unwrap();
         assert_eq!(stopping.state(), TaskState::Stopping);
         assert_eq!(stopping.error(), Some("parent failed"));
@@ -6474,6 +6825,8 @@ mod tests {
         let record = coordinator.record(parent.id()).await.unwrap();
         assert_eq!(record.observation().elapsed(), Duration::from_secs(6));
         assert_eq!(record.terminal_at_ms(), Some(7_000));
+        coordinator.shutdown().await;
+        assert_eq!(coordinator.operation_count(), 0);
     }
 
     #[tokio::test]
@@ -6609,6 +6962,7 @@ mod tests {
         let admitted = coordinator.start(&caller, parameters(), ()).await.unwrap();
 
         gate.wait_until_before_lock().await;
+        assert_eq!(coordinator.operation_count(), 1);
         coordinator.request_background_cancellation(None).await;
         let stopping = coordinator.get(&caller, admitted.id()).await.unwrap();
         assert_eq!(stopping.state(), TaskState::Stopping);
@@ -6616,6 +6970,7 @@ mod tests {
 
         gate.allow_lock();
         gate.wait_until_after_lock().await;
+        assert_eq!(coordinator.operation_count(), 1);
         let after_runner_start = coordinator.get(&caller, admitted.id()).await.unwrap();
         assert_eq!(after_runner_start.state(), TaskState::Stopping);
         assert_eq!(after_runner_start.error(), Some("cancellation requested"));

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
@@ -299,6 +299,7 @@ pub(crate) struct RuntimeController<M: Model> {
 
 struct ActiveRun<M: Model> {
     run_id: Option<RunId>,
+    persisted_model_steps: BTreeSet<u64>,
     pending_busy_submissions: usize,
     caller: Caller,
     cancellation: CancellationToken,
@@ -636,11 +637,20 @@ impl<M: Model> RuntimeController<M> {
             .cloned()
             .map(restored_stored_record)
             .collect();
-        let restored_tasks = restore.tasks.iter().map(|task| task.record.clone());
+        let selected_origins = restore
+            .tasks
+            .iter()
+            .filter_map(|task| task.record.origin_step_id())
+            .collect::<Vec<_>>();
+        let restored_tasks = restore.all_tasks.iter().map(|task| task.record.clone());
         let subagents = subagents.with_session(session.writer());
         subagents
             .restore_terminal_tasks(restored_tasks, restore.next_task)
             .await;
+        assert!(
+            subagents.replace_selected_origins(selected_origins).await,
+            "restoration has no tracked subagent operations"
+        );
         let accepted_thinking = AcceptedThinking::new(
             *settings.borrow(),
             persisted_settings,
@@ -1279,6 +1289,7 @@ impl<M: Model> RuntimeController<M> {
         drop(worker_task);
         self.active = Some(ActiveRun {
             run_id: None,
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 0,
             caller,
             cancellation,
@@ -1361,6 +1372,7 @@ impl<M: Model> RuntimeController<M> {
                 if active.run_id != Some(run_id) {
                     return;
                 }
+                active.persisted_model_steps.insert(step_id.0);
                 self.publish_progress(
                     progress,
                     RuntimeEvent::ModelStepStarted { run_id, step_id },
@@ -1438,6 +1450,13 @@ impl<M: Model> RuntimeController<M> {
                             self.disabled_reason = Some(reason.clone());
                             self.emit(events, RuntimeEvent::RuntimeDisabled { reason });
                         }
+                        let active = self
+                            .active
+                            .as_ref()
+                            .expect("finished run remains active until settlement");
+                        self.subagents
+                            .settle_root_run(&active.caller, active.persisted_model_steps.clone())
+                            .await;
                         self.trace.emit(|| TraceEvent::RootRunSettled {
                             run_id: run_id.0,
                             outcome: settlement,
@@ -3841,6 +3860,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: None,
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 1,
             caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
@@ -7284,6 +7304,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: Some(RunId(1)),
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 0,
             caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
@@ -10667,7 +10688,7 @@ mod tests {
                 calls: calls.clone(),
                 actions: vec![
                     RestoredModelAction::Code {
-                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'unknown subagent `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '64'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '64'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
                             .to_owned(),
                         commentary: None,
                         attempts: Vec::new(),
@@ -10695,13 +10716,18 @@ mod tests {
         .await
         .expect("restore runtime");
         assert!(initial.disabled_reason.is_none());
+        assert!(initial.timeline.iter().all(|item| match item {
+            RestoredTimelineItem::Record(_) => true,
+            RestoredTimelineItem::SubagentSpawned(record)
+            | RestoredTimelineItem::SubagentFinished(record) => record.id().as_str() != "63",
+        }));
         let restored_tasks = controller.subagents.records().await;
         assert_eq!(
             restored_tasks
                 .iter()
                 .map(|task| task.id().as_str())
                 .collect::<Vec<_>>(),
-            ["00", "62"]
+            ["00", "62", "63"]
         );
         assert!(matches!(
             restored_tasks[0].outcome(),
@@ -10712,6 +10738,12 @@ mod tests {
             Some(TaskOutcome::Completed(result))
                 if result.message() == "late selected result"
                     && result.values().get("visible") == Some(&ToolValue::Integer(62))
+        ));
+        assert!(matches!(
+            restored_tasks[2].outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.message() == "hidden high result"
+                    && result.values().get("hidden") == Some(&ToolValue::Integer(63))
         ));
         let (commands, mut events, mut progress, controller) = start_controller(controller);
         assert!(matches!(
