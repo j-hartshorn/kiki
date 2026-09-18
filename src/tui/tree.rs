@@ -21,7 +21,8 @@ struct TreeNode<T> {
     search_text: String,
     canonical_search_text: String,
     depth: usize,
-    leading_ancestors: [Option<usize>; MAX_ANCESTOR_CONNECTORS],
+    branch_head: Option<usize>,
+    branch_heads: [Option<usize>; MAX_ANCESTOR_CONNECTORS],
     active_path: bool,
 }
 
@@ -86,7 +87,8 @@ impl<T: Copy + Eq> SessionTree<T> {
                     search_text,
                     canonical_search_text,
                     depth: 0,
-                    leading_ancestors: [None; MAX_ANCESTOR_CONNECTORS],
+                    branch_head: None,
+                    branch_heads: [None; MAX_ANCESTOR_CONNECTORS],
                     active_path: false,
                 }
             })
@@ -199,22 +201,37 @@ impl<T: Copy + Eq> SessionTree<T> {
             return String::new();
         }
 
+        let parent = node.parent.expect("non-root tree node has a parent");
+        let draws_joint =
+            self.nodes[parent].parent.is_none() || self.nodes[parent].children.len() > 1;
+        let ancestor_count = node.depth.saturating_sub(1);
         let mut connector = String::new();
-        for ancestor in node.leading_ancestors.iter().flatten() {
+        for ancestor in node.branch_heads.iter().take(ancestor_count).flatten() {
             connector.push_str(if projection.last_visible[*ancestor] {
                 "   "
             } else {
                 "│  "
             });
         }
-        if node.depth > MAX_ANCESTOR_CONNECTORS + 1 {
+        if ancestor_count > MAX_ANCESTOR_CONNECTORS {
             connector.push_str("… ");
         }
-        connector.push_str(if projection.last_visible[index] {
-            "└─ "
+        if draws_joint {
+            connector.push_str(if projection.last_visible[index] {
+                "└─ "
+            } else {
+                "├─ "
+            });
         } else {
-            "├─ "
-        });
+            let branch_head = node
+                .branch_head
+                .expect("tree continuation has a branch head");
+            connector.push_str(if projection.last_visible[branch_head] {
+                "   "
+            } else {
+                "│  "
+            });
+        }
         connector
     }
 
@@ -235,20 +252,35 @@ fn build_preorder<T>(nodes: &mut [TreeNode<T>], root: usize) -> Vec<usize> {
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
         preorder.push(index);
-        let (depth, mut leading_ancestors) = {
+        let (depth, branch_head, branch_heads, is_root, branches) = {
             let node = &nodes[index];
-            (node.depth, node.leading_ancestors)
+            (
+                node.depth,
+                node.branch_head,
+                node.branch_heads,
+                node.parent.is_none(),
+                node.children.len() > 1,
+            )
         };
-        if let Some(slot) = depth
-            .checked_sub(1)
-            .filter(|slot| *slot < MAX_ANCESTOR_CONNECTORS)
-        {
-            leading_ancestors[slot] = Some(index);
-        }
+        let child_depth = if is_root {
+            1
+        } else {
+            depth.saturating_add(usize::from(branches))
+        };
         for child_index in (0..nodes[index].children.len()).rev() {
             let child = nodes[index].children[child_index];
-            nodes[child].depth = depth.saturating_add(1);
-            nodes[child].leading_ancestors = leading_ancestors;
+            let child_branch_head = if is_root || branches {
+                child
+            } else {
+                branch_head.expect("tree continuation has a branch head")
+            };
+            let mut child_branch_heads = branch_heads;
+            if child_depth <= MAX_ANCESTOR_CONNECTORS {
+                child_branch_heads[child_depth - 1] = Some(child_branch_head);
+            }
+            nodes[child].depth = child_depth;
+            nodes[child].branch_head = Some(child_branch_head);
+            nodes[child].branch_heads = child_branch_heads;
             stack.push(child);
         }
     }
@@ -326,7 +358,49 @@ mod tests {
     use crate::tui::picker::{Picker, PickerAction};
 
     #[test]
-    fn renders_chronological_depth_first_tree_with_active_path() {
+    fn renders_linear_history_at_first_level_without_false_joints() {
+        let tree = SessionTree::from_catalogue(
+            &catalogue(
+                4,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("first request")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("first execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "final reply".to_owned(),
+                        },
+                    ),
+                ],
+            ),
+            |entry_id| entry_id,
+        );
+        let mut picker = tree.picker();
+
+        assert_eq!(
+            tree_rows(&mut picker),
+            [
+                "Session start",
+                "└─ User: first request",
+                "   Python: first execution",
+                "   ● Kiki: final reply",
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_one_fork_with_linear_continuations_in_chronological_order() {
         let tree = SessionTree::from_catalogue(
             &catalogue(
                 7,
@@ -394,11 +468,11 @@ mod tests {
             [
                 "Session start",
                 "└─ User: original",
-                "   └─ Python: first step",
-                "      ├─ User: first branch",
-                "      │  └─ Python",
-                "      │     └─ Kiki: first reply",
-                "      └─ ● Python: [tools: 1] second step",
+                "   Python: first step",
+                "   ├─ User: first branch",
+                "   │  Python",
+                "   │  Kiki: first reply",
+                "   └─ ● Python: [tools: 1] second step",
             ]
         );
         assert_eq!(
@@ -543,11 +617,11 @@ mod tests {
             [
                 "Session start",
                 "├─ User: first",
-                "│  └─ Python: first",
-                "│     ├─ User: same revision lower id",
-                "│     └─ User: same revision higher id",
+                "│  Python: first",
+                "│  ├─ User: same revision lower id",
+                "│  └─ User: same revision higher id",
                 "└─ User: second",
-                "   └─ ● Python: second",
+                "   ● Python: second",
             ]
         );
     }
@@ -670,11 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_deep_connectors_without_hiding_labels_or_active_marker() {
-        let tree = SessionTree::from_catalogue(&linear_catalogue(32), |entry_id| entry_id);
+    fn caps_deep_nested_fork_connectors_without_hiding_labels_or_active_marker() {
+        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(32), |entry_id| entry_id);
         let mut picker = tree.picker();
 
-        let wide = rendered(&mut picker, 72, 40);
+        let wide = rendered(&mut picker, 72, 80);
         assert!(wide.contains("…"));
         assert!(wide.contains("User: depth 31"));
         assert!(wide.contains("└─ ● User: depth 32"));
@@ -690,24 +764,41 @@ mod tests {
     }
 
     #[test]
-    fn renders_deep_connector_transition_and_branches() {
+    fn deep_continuations_keep_capped_branch_alignment() {
+        let mut catalogue = nested_fork_catalogue(8);
+        catalogue
+            .entries
+            .push(entry(17, Some(16), 17, request("continued depth")));
+        catalogue.active_entry = SessionEntryId(17);
+        let tree = SessionTree::from_catalogue(&catalogue, |entry_id| entry_id);
+        let mut picker = tree.picker();
+        let rows = tree_rows(&mut picker);
+
+        assert_eq!(
+            &rows[rows.len() - 2..],
+            [
+                "                  … └─ User: depth 8",
+                "                  …    ● User: continued depth",
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_nested_forks_with_linear_continuations() {
         let tree = SessionTree::from_catalogue(
             &catalogue(
-                11,
+                7,
                 [
                     entry(1, None, 1, SessionCatalogueKind::Start),
                     entry(2, Some(1), 2, request("leading ancestor")),
-                    entry(3, Some(2), 3, request("depth 2")),
-                    entry(4, Some(3), 4, request("depth 3")),
-                    entry(5, Some(4), 5, request("depth 4")),
-                    entry(6, Some(5), 6, request("depth 5")),
-                    entry(7, Some(6), 7, request("depth 6")),
-                    entry(8, Some(7), 8, request("depth 7")),
-                    entry(9, Some(8), 9, request("depth 8")),
-                    entry(10, Some(9), 10, request("deep parent")),
-                    entry(11, Some(10), 11, request("deep child")),
-                    entry(12, Some(9), 12, request("deep sibling")),
-                    entry(13, Some(1), 13, request("leading sibling")),
+                    entry(3, Some(2), 3, request("linear before fork")),
+                    entry(4, Some(3), 4, request("outer first")),
+                    entry(5, Some(4), 5, request("outer continuation")),
+                    entry(6, Some(5), 6, request("inner first")),
+                    entry(7, Some(6), 7, request("inner continuation")),
+                    entry(8, Some(5), 8, request("inner second")),
+                    entry(9, Some(3), 9, request("outer second")),
+                    entry(10, Some(1), 10, request("leading sibling")),
                 ],
             ),
             |entry_id| entry_id,
@@ -719,16 +810,13 @@ mod tests {
             [
                 "Session start",
                 "├─ User: leading ancestor",
-                "│  └─ User: depth 2",
-                "│     └─ User: depth 3",
-                "│        └─ User: depth 4",
-                "│           └─ User: depth 5",
-                "│              └─ User: depth 6",
-                "│                 └─ User: depth 7",
-                "│                 … └─ User: depth 8",
-                "│                 … ├─ User: deep parent",
-                "│                 … └─ ● User: deep child",
-                "│                 … └─ User: deep sibling",
+                "│  User: linear before fork",
+                "│  ├─ User: outer first",
+                "│  │  User: outer continuation",
+                "│  │  ├─ User: inner first",
+                "│  │  │  ● User: inner continuation",
+                "│  │  └─ User: inner second",
+                "│  └─ User: outer second",
                 "└─ User: leading sibling",
             ]
         );
@@ -737,7 +825,7 @@ mod tests {
     #[test]
     fn filters_a_4096_entry_chain_to_its_matching_leaf() {
         let tree = SessionTree::from_catalogue(&linear_catalogue(4_096), |entry_id| entry_id);
-        assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 4_095);
+        assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 1);
         let mut picker = tree.picker();
 
         picker.set_filter("depth 4096");
@@ -751,14 +839,14 @@ mod tests {
     }
 
     #[test]
-    fn filtering_retains_context_recomputes_connectors_and_recovers_entries() {
+    fn filtering_keeps_full_tree_fork_levels_and_recomputes_endings() {
         let tree = SessionTree::from_catalogue(
             &catalogue(
                 5,
                 [
                     entry(
                         5,
-                        Some(1),
+                        Some(3),
                         5,
                         SessionCatalogueKind::Request {
                             text: "need elsewhere".to_owned(),
@@ -803,8 +891,8 @@ mod tests {
             [
                 "Session start",
                 "└─ User: branch",
-                "   └─ Python: context",
-                "      └─ User: needle target",
+                "   Python: context",
+                "   └─ User: needle target",
             ]
         );
         assert_eq!(
@@ -961,6 +1049,32 @@ mod tests {
         )
     }
 
+    fn nested_fork_catalogue(depth: u64) -> SessionCatalogue {
+        let mut entries = vec![entry(1, None, 1, SessionCatalogueKind::Start)];
+        let mut parent = 1;
+        let mut entry_id = 2;
+        for level in 1..=depth {
+            if level > 1 {
+                entries.push(entry(
+                    entry_id,
+                    Some(parent),
+                    entry_id,
+                    request(&format!("sibling {level}")),
+                ));
+                entry_id += 1;
+            }
+            entries.push(entry(
+                entry_id,
+                Some(parent),
+                entry_id,
+                request(&format!("depth {level}")),
+            ));
+            parent = entry_id;
+            entry_id += 1;
+        }
+        catalogue(parent, entries)
+    }
+
     fn request(text: &str) -> SessionCatalogueKind {
         SessionCatalogueKind::Request {
             text: text.to_owned(),
@@ -995,13 +1109,16 @@ mod tests {
                     .to_owned()
             })
             .filter(|row| {
-                let row = row.trim_start();
-                row == "Session start"
-                    || row == "● Session start"
-                    || row.starts_with("├─ ")
-                    || row.starts_with("└─ ")
-                    || row.starts_with('│')
-                    || row.starts_with('…')
+                [
+                    "Session start",
+                    "User:",
+                    "Python",
+                    "Kiki:",
+                    "Cancelled",
+                    "Failed",
+                ]
+                .iter()
+                .any(|label| row.contains(label))
             })
             .collect()
     }
@@ -1012,7 +1129,8 @@ mod tests {
             .map(|row| {
                 let label = row
                     .rsplit_once("─ ")
-                    .map_or(row.as_str(), |(_, label)| label);
+                    .map_or(row.as_str(), |(_, label)| label)
+                    .trim_start_matches([' ', '│', '…']);
                 label.strip_prefix("● ").unwrap_or(label).to_owned()
             })
             .collect()

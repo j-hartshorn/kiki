@@ -4082,7 +4082,7 @@ mod tests {
         assert!(filtered.contains("Session start"), "{filtered}");
         assert!(filtered.contains("└─ User: authorise access"), "{filtered}");
         assert!(
-            filtered.contains("└─ ● Python: inspect credentials"),
+            filtered.contains("   ● Python: inspect credentials"),
             "{filtered}"
         );
 
@@ -4092,7 +4092,7 @@ mod tests {
         let restored = rendered(&mut app, 72, 12);
         assert!(restored.contains("└─ User: authorise access"), "{restored}");
         assert!(
-            restored.contains("└─ ● Python: inspect credentials"),
+            restored.contains("   ● Python: inspect credentials"),
             "{restored}"
         );
 
