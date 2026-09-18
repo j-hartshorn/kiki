@@ -49,6 +49,7 @@ use tree::SessionTree;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
+const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
 
 trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -173,6 +174,7 @@ struct App {
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
+    settled_escape_at: Option<Instant>,
     submission_at: Option<Instant>,
     correction_pending: bool,
     correction_run_id: Option<RunId>,
@@ -217,6 +219,7 @@ impl Default for App {
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
+            settled_escape_at: None,
             submission_at: None,
             correction_pending: false,
             correction_run_id: None,
@@ -492,6 +495,9 @@ impl App {
             return update;
         }
         if key.code == KeyCode::Esc {
+            if self.is_completely_settled() {
+                return self.handle_settled_escape(now);
+            }
             if self.is_configuration_only() {
                 return Update::default();
             }
@@ -570,6 +576,29 @@ impl App {
             };
         }
         Update::default()
+    }
+
+    fn is_completely_settled(&self) -> bool {
+        !self.is_submission_disabled()
+            && self.prompt.text().trim().is_empty()
+            && self.transcript.is_idle()
+            && !self.foreground_cancellation_requested
+            && !self.manual_navigation_pending
+            && !self.correction_pending
+            && !self.subagent_monitor.has_active_entries()
+    }
+
+    fn handle_settled_escape(&mut self, now: Instant) -> Update {
+        let double_escape = self
+            .settled_escape_at
+            .is_some_and(|first| now.saturating_duration_since(first) < SETTLED_ESCAPE_WINDOW);
+        if double_escape {
+            self.settled_escape_at = None;
+            self.open_session_tree("")
+        } else {
+            self.settled_escape_at = Some(now);
+            Update::default()
+        }
     }
 
     fn handle_completion_key(&mut self, key: KeyEvent) -> Option<Update> {
@@ -2645,6 +2674,26 @@ mod tests {
     fn enter_at(app: &mut App, prompt: &str, now: Instant) -> super::Update {
         set_prompt(app, prompt);
         app.handle_key_at(key(KeyCode::Enter), now)
+    }
+
+    fn armed_settled_escape(now: Instant) -> App {
+        let mut app = App::default();
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        app
+    }
+
+    fn assert_nonqualifying_escape(app: &mut App, now: Instant, expected: &[RuntimeCommand]) {
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(1))
+                .commands,
+            expected
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
     }
 
     fn applied_settings(update: &super::Update) -> (crate::config::ModelSelection, u64) {
@@ -8138,6 +8187,232 @@ mod tests {
     }
 
     #[test]
+    fn settled_double_escape_opens_an_unfiltered_tree_within_499ms() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        let first = app.handle_key_at(key(KeyCode::Esc), now);
+        assert!(first.commands.is_empty());
+        assert!(!first.visible_changed);
+
+        let second = app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499));
+        assert_eq!(
+            second.commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(
+            app.tree_picker
+                .as_ref()
+                .map(|tree_picker| tree_picker.filter.as_str()),
+            Some("")
+        );
+        assert_eq!(app.settled_escape_at, None);
+    }
+
+    #[test]
+    fn settled_double_escape_at_the_same_instant_opens_like_pi() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn settled_double_escape_at_500ms_rearms_before_opening() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert!(
+            app.tick(now + Duration::from_millis(500))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(500))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.settled_escape_at,
+            Some(now + Duration::from_millis(500))
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(999))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.settled_escape_at, None);
+    }
+
+    #[test]
+    fn settled_double_escape_accepts_whitespace_only_prompts() {
+        let now = Instant::now();
+        let mut app = app_with_prompt(" \n ");
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.prompt.text(), " \n ");
+    }
+
+    #[test]
+    fn settled_double_escape_survives_intervening_typing_and_clearing() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert!(
+            app.handle_key_at(key(KeyCode::Char('x')), now + Duration::from_millis(1))
+                .visible_changed
+        );
+        assert!(
+            app.handle_key_at(
+                modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                now + Duration::from_millis(2),
+            )
+            .visible_changed
+        );
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn nonqualifying_escape_paths_preserve_settled_double_escape_state() {
+        let now = Instant::now();
+
+        let mut background = armed_settled_escape(now);
+        background
+            .subagent_monitor
+            .insert_for_test("child", TaskState::Running, now);
+        assert_nonqualifying_escape(&mut background, now, &[RuntimeCommand::CancelBackground]);
+
+        let mut foreground = armed_settled_escape(now);
+        foreground.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        assert_nonqualifying_escape(
+            &mut foreground,
+            now,
+            &[RuntimeCommand::Cancel { correction: false }],
+        );
+
+        let mut nonempty_prompt = armed_settled_escape(now);
+        set_prompt(&mut nonempty_prompt, "draft");
+        assert_nonqualifying_escape(
+            &mut nonempty_prompt,
+            now,
+            &[RuntimeCommand::CancelBackground],
+        );
+
+        let mut configuration = armed_settled_escape(now);
+        configuration.mode = super::AppMode::ConfigurationOnly;
+        assert_nonqualifying_escape(&mut configuration, now, &[]);
+
+        let mut read_only = armed_settled_escape(now);
+        read_only.handle_event_at(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            },
+            now,
+        );
+        assert_nonqualifying_escape(&mut read_only, now, &[RuntimeCommand::CancelBackground]);
+
+        for pending in ["foreground cancellation", "manual navigation", "correction"] {
+            let mut app = armed_settled_escape(now);
+            match pending {
+                "foreground cancellation" => app.foreground_cancellation_requested = true,
+                "manual navigation" => app.manual_navigation_pending = true,
+                "correction" => app.correction_pending = true,
+                _ => unreachable!("unknown pending state"),
+            }
+            assert_nonqualifying_escape(&mut app, now, &[RuntimeCommand::CancelBackground]);
+        }
+    }
+
+    #[test]
+    fn released_escape_does_not_reset_settled_double_escape_state() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(
+            app.handle_key_at(release, now + Duration::from_millis(1))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn picker_escape_precedes_settled_double_escape() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        set_prompt(&mut app, "/model");
+        assert!(
+            app.handle_key_at(key(KeyCode::Enter), now + Duration::from_millis(1))
+                .commands
+                .is_empty()
+        );
+        assert!(app.picker.is_some());
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(2))
+                .commands
+                .is_empty()
+        );
+        assert!(app.picker.is_none());
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
     fn correction_restoration_keeps_drafts_prefills_and_retains_its_card_until_request_commit() {
         let now = Instant::now();
         let replacement = CorrectionOutcome::Replaced {
@@ -8378,7 +8653,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_foreground_once_then_background_except_in_configuration() {
+    fn escape_preserves_foreground_and_background_cancellation_outside_configuration() {
         let now = Instant::now();
         let mut app = App::default();
         app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
@@ -8412,12 +8687,6 @@ mod tests {
         );
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::CancelBackground]
-        );
-
-        let mut idle = App::default();
-        assert_eq!(
-            idle.handle_key_at(key(KeyCode::Esc), now).commands,
             vec![RuntimeCommand::CancelBackground]
         );
 

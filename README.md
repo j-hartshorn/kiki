@@ -59,9 +59,9 @@ Deferred features exclude in-client session switching, separate-session forks or
 
 ## Session tree navigation
 
-While fully idle, `/tree` opens the searchable retained session tree; `/tree <filter>` applies an initial filter, and `Ctrl-R` opens the same picker without clearing an editor draft. Navigation is unavailable while foreground or background work is active and never queues, cancels or otherwise affects that work.
+While fully idle, `/tree` opens the searchable retained session tree; `/tree <filter>` applies an initial filter, and `Ctrl-R` opens the same picker without clearing an editor draft. With a whitespace-only prompt, two `Esc` presses less than 500 milliseconds apart also open the unfiltered tree. Navigation is unavailable while foreground or background work is active and never queues, cancels or otherwise affects that work.
 
-The stable tree is chronological depth-first, retaining every branch. Search is case-insensitive over complete, untruncated whitespace-normalised row text and keeps ancestor context for each match. Rows use `Session start`, `User: …`, `Python…`, `Kiki: …`, `Cancelled`, and `Failed`; Python rows include recorded tool-count variants where applicable.
+The stable tree is chronological depth-first, retaining every branch. Linear history stays at the first level below `Session start`; indentation and joints increase only at genuine retained forks. Search is case-insensitive over complete, untruncated whitespace-normalised row text and keeps ancestor context for each match. Rows use `Session start`, `User: …`, `Python…`, `Kiki: …`, `Cancelled`, and `Failed`; Python rows include recorded tool-count variants where applicable. The scrollable tree replaces the prompt while open, uses the full terminal width, and grows to at most half the terminal height.
 
 Selecting a user request restores its parent and fills only an empty editor with that request; an existing or pending draft wins. Other entries restore through the selected point. A successful replacement temporarily shows `Session restored.` until the next request is durably accepted. No-op, rejected or failed navigation creates no restoration card.
 
@@ -162,11 +162,11 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - Typing `/` shows automatic command suggestions. With suggestions visible, `Up` / `Down` select, `Tab` or the first `Enter` completes, and a second `Enter` executes the command. Otherwise `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
 - `Shift-Enter` or `Ctrl-J` inserts a prompt newline. `Ctrl-J` remains available when a terminal cannot report modified Enter; plain `Enter` retains submission behaviour.
-- `Esc` first requests cancellation of the active foreground run. At most two seconds after submission, it also requests correction; a later `Esc` is ordinary cancellation. Press it again while cancellation is pending, or press it while foreground work is idle, to request background subagent cancellation.
+- `Esc` first requests cancellation of the active foreground run. At most two seconds after submission, it also requests correction; a later `Esc` is ordinary cancellation. Press it again while cancellation is pending, or press it while background subagents are active, to request background cancellation. When all work is settled and the prompt is whitespace-only, two presses less than 500 milliseconds apart open the session tree instead.
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
-- `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/tree` opens the session-tree picker; `Ctrl-R` opens it without clearing a draft.
+- `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; manual scrolling anchors its numeric document top. New history follows only at the newest page; reaching it or `Ctrl-End` resumes following. `Ctrl-Home` jumps to the oldest history. The mouse wheel scrolls history three lines per event.

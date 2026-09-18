@@ -259,6 +259,12 @@ impl SubagentMonitor {
         MonitorLayout { lines }
     }
 
+    pub(super) fn has_active_entries(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| is_active(entry.observation.state))
+    }
+
     pub(super) fn tick(&self, now: Instant) -> bool {
         self.visible_elapsed.iter().any(|(id, second)| {
             self.entries.get(id).is_some_and(|entry| {
