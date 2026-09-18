@@ -7,7 +7,8 @@ use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
 
 use super::picker::{
-    DynamicPickerItem, DynamicPickerMatch, PICKER_MAX_WIDTH, Picker, PickerSavePolicy,
+    DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerSavePolicy,
+    canonical_search,
 };
 
 const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
@@ -18,7 +19,9 @@ struct TreeNode<T> {
     children: Vec<usize>,
     value: T,
     search_text: String,
+    canonical_search_text: String,
     depth: usize,
+    leading_ancestors: [Option<usize>; MAX_ANCESTOR_CONNECTORS],
     active_path: bool,
 }
 
@@ -88,6 +91,7 @@ impl<T: Copy + Eq> SessionTree<T> {
             .iter()
             .map(|entry| {
                 let search_text = row_text(&entry.kind);
+                let canonical_search_text = canonical_search(&search_text);
                 TreeNode {
                     parent: entry.parent_id.map(|parent| {
                         *entry_indexes
@@ -97,7 +101,9 @@ impl<T: Copy + Eq> SessionTree<T> {
                     children: Vec::new(),
                     value: value_for_entry(entry.entry_id),
                     search_text,
+                    canonical_search_text,
                     depth: 0,
+                    leading_ancestors: [None; MAX_ANCESTOR_CONNECTORS],
                     active_path: false,
                 }
             })
@@ -155,7 +161,8 @@ impl<T: Copy + Eq> SessionTree<T> {
     fn filtered_projection(&self, picker: &Picker<T>) -> TreeProjection {
         let mut direct_matches = vec![false; self.nodes.len()];
         for &index in &self.preorder {
-            direct_matches[index] = picker.matches_search_text(&self.nodes[index].search_text);
+            direct_matches[index] =
+                picker.matches_canonical_text(&self.nodes[index].canonical_search_text);
         }
 
         let mut visible = direct_matches.clone();
@@ -182,14 +189,11 @@ impl<T: Copy + Eq> SessionTree<T> {
                         truncate_end(&self.display_text(index, projection), PICKER_ROW_WIDTH),
                         self.style(index),
                     ),
-                    direct_search: String::new(),
-                    context_search: String::new(),
-                    matching: if direct {
-                        DynamicPickerMatch::Direct
+                    role: if direct {
+                        DynamicPickerRole::Direct
                     } else {
-                        DynamicPickerMatch::Context
+                        DynamicPickerRole::Context
                     },
-                    selectable: direct,
                     value: node.value,
                 }
             })
@@ -208,30 +212,20 @@ impl<T: Copy + Eq> SessionTree<T> {
 
     fn connector(&self, index: usize, projection: &TreeProjection) -> String {
         let node = &self.nodes[index];
-        let Some(parent) = node.parent else {
+        if node.parent.is_none() {
             return String::new();
-        };
-        let ancestor_count = node.depth.saturating_sub(1);
-        let visible_ancestor_count = ancestor_count.min(MAX_ANCESTOR_CONNECTORS);
-        let mut ancestors = Vec::with_capacity(visible_ancestor_count);
-        let mut ancestor = parent;
-        for _ in 0..visible_ancestor_count {
-            ancestors.push(ancestor);
-            ancestor = self.nodes[ancestor]
-                .parent
-                .expect("non-root ancestor has a parent");
         }
 
         let mut connector = String::new();
-        if ancestor_count > MAX_ANCESTOR_CONNECTORS {
-            connector.push_str("… ");
-        }
-        for ancestor in ancestors.into_iter().rev() {
-            connector.push_str(if projection.last_visible[ancestor] {
+        for ancestor in node.leading_ancestors.iter().flatten() {
+            connector.push_str(if projection.last_visible[*ancestor] {
                 "   "
             } else {
                 "│  "
             });
+        }
+        if node.depth > MAX_ANCESTOR_CONNECTORS + 1 {
+            connector.push_str("… ");
         }
         connector.push_str(if projection.last_visible[index] {
             "└─ "
@@ -258,9 +252,20 @@ fn build_preorder<T>(nodes: &mut [TreeNode<T>], root: usize) -> Vec<usize> {
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
         preorder.push(index);
-        let depth = nodes[index].depth;
-        for &child in nodes[index].children.iter().rev() {
+        let (depth, mut leading_ancestors) = {
+            let node = &nodes[index];
+            (node.depth, node.leading_ancestors)
+        };
+        if let Some(slot) = depth
+            .checked_sub(1)
+            .filter(|slot| *slot < MAX_ANCESTOR_CONNECTORS)
+        {
+            leading_ancestors[slot] = Some(index);
+        }
+        for child_index in (0..nodes[index].children.len()).rev() {
+            let child = nodes[index].children[child_index];
             nodes[child].depth = depth.saturating_add(1);
+            nodes[child].leading_ancestors = leading_ancestors;
             stack.push(child);
         }
     }
@@ -702,7 +707,52 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_filters_a_deep_chain_without_retaining_descendant_text() {
+    fn renders_deep_connector_transition_and_branches() {
+        let tree = SessionTree::from_catalogue(
+            &catalogue(
+                11,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("leading ancestor")),
+                    entry(3, Some(2), 3, request("depth 2")),
+                    entry(4, Some(3), 4, request("depth 3")),
+                    entry(5, Some(4), 5, request("depth 4")),
+                    entry(6, Some(5), 6, request("depth 5")),
+                    entry(7, Some(6), 7, request("depth 6")),
+                    entry(8, Some(7), 8, request("depth 7")),
+                    entry(9, Some(8), 9, request("depth 8")),
+                    entry(10, Some(9), 10, request("deep parent")),
+                    entry(11, Some(10), 11, request("deep child")),
+                    entry(12, Some(9), 12, request("deep sibling")),
+                    entry(13, Some(1), 13, request("leading sibling")),
+                ],
+            ),
+            |entry_id| entry_id,
+        );
+        let mut picker = tree.picker();
+
+        assert_eq!(
+            tree_rows(&mut picker),
+            [
+                "Session start",
+                "├─ User: leading ancestor",
+                "│  └─ User: depth 2",
+                "│     └─ User: depth 3",
+                "│        └─ User: depth 4",
+                "│           └─ User: depth 5",
+                "│              └─ User: depth 6",
+                "│                 └─ User: depth 7",
+                "│                 … └─ User: depth 8",
+                "│                 … ├─ User: deep parent",
+                "│                 … └─ ● User: deep child",
+                "│                 … └─ User: deep sibling",
+                "└─ User: leading sibling",
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_a_4096_entry_chain_to_its_matching_leaf() {
         let tree = SessionTree::from_catalogue(&linear_catalogue(4_096), |entry_id| entry_id);
         assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 4_095);
         let mut picker = tree.picker();
@@ -763,7 +813,7 @@ mod tests {
         );
         let mut picker = tree.picker();
 
-        picker.set_filter("needle");
+        picker.set_filter("USER: NEEDLE");
         tree.refresh(&mut picker);
         assert_eq!(
             tree_rows(&mut picker),
@@ -928,6 +978,12 @@ mod tests {
         )
     }
 
+    fn request(text: &str) -> SessionCatalogueKind {
+        SessionCatalogueKind::Request {
+            text: text.to_owned(),
+        }
+    }
+
     fn entry(
         entry_id: u64,
         parent_id: Option<u64>,
@@ -962,6 +1018,7 @@ mod tests {
                     || row.starts_with("├─ ")
                     || row.starts_with("└─ ")
                     || row.starts_with('│')
+                    || row.starts_with('…')
             })
             .collect()
     }

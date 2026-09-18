@@ -25,18 +25,14 @@ pub(crate) enum PickerAction<T> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DynamicPickerMatch {
-    Search,
+pub(crate) enum DynamicPickerRole {
     Direct,
     Context,
 }
 
 pub(crate) struct DynamicPickerItem<T> {
     pub(crate) row: Line<'static>,
-    pub(crate) direct_search: String,
-    pub(crate) context_search: String,
-    pub(crate) matching: DynamicPickerMatch,
-    pub(crate) selectable: bool,
+    pub(crate) role: DynamicPickerRole,
     pub(crate) value: T,
 }
 
@@ -46,13 +42,15 @@ pub(crate) enum PickerSavePolicy {
     Disabled,
 }
 
+enum PickerRowRole {
+    SearchableLabel(String),
+    Dynamic(DynamicPickerRole),
+}
+
 struct PickerRow<T> {
     group: Option<&'static str>,
     row: Line<'static>,
-    direct_search: String,
-    context_search: String,
-    matching: DynamicPickerMatch,
-    selectable: bool,
+    role: PickerRowRole,
     value: T,
 }
 
@@ -131,25 +129,8 @@ impl<T: Copy + Eq> Picker<T> {
             .or_else(|| focusable.first().copied());
     }
 
-    #[cfg(test)]
-    pub(crate) fn matched_values(&self) -> Vec<T> {
-        self.matches()
-            .into_iter()
-            .map(|matched| self.items[matched.index].value)
-            .collect()
-    }
-
-    pub(crate) fn matches_canonical_search(
-        &self,
-        direct_search: &str,
-        context_search: &str,
-    ) -> bool {
-        self.match_canonical_search(direct_search, context_search)
-            .is_some()
-    }
-
-    pub(crate) fn matches_search_text(&self, search_text: &str) -> bool {
-        self.matches_canonical_search(&canonical_search(search_text), "")
+    pub(super) fn matches_canonical_text(&self, canonical_text: &str) -> bool {
+        canonical_text.contains(&self.canonical_filter)
     }
 
     pub(crate) fn set_filter(&mut self, filter: &str) {
@@ -277,8 +258,8 @@ impl<T: Copy + Eq> Picker<T> {
     fn initial_focus(items: &[PickerRow<T>], current: T) -> Option<usize> {
         items
             .iter()
-            .position(|item| item.selectable && item.value == current)
-            .or_else(|| items.iter().position(|item| item.selectable))
+            .position(|item| item.is_selectable() && item.value == current)
+            .or_else(|| items.iter().position(PickerRow::is_selectable))
     }
 
     fn group_heading_count(&self) -> usize {
@@ -388,7 +369,7 @@ impl<T: Copy + Eq> Picker<T> {
     }
 
     fn is_direct_match(&self, index: usize) -> bool {
-        self.items[index].selectable && self.item_match(&self.items[index]) == Some(true)
+        self.item_match(&self.items[index]) == Some(true)
     }
 
     fn matches(&self) -> Vec<PickerMatch> {
@@ -396,27 +377,29 @@ impl<T: Copy + Eq> Picker<T> {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                self.item_match(item).map(|direct| PickerMatch {
-                    index,
-                    direct: item.selectable && direct,
-                })
+                self.item_match(item)
+                    .map(|direct| PickerMatch { index, direct })
             })
             .collect()
     }
 
     fn item_match(&self, item: &PickerRow<T>) -> Option<bool> {
-        match item.matching {
-            DynamicPickerMatch::Search => {
-                self.match_canonical_search(&item.direct_search, &item.context_search)
+        match &item.role {
+            PickerRowRole::SearchableLabel(canonical_text) => {
+                self.matches_canonical_text(canonical_text).then_some(true)
             }
-            DynamicPickerMatch::Direct => Some(true),
-            DynamicPickerMatch::Context => Some(false),
+            PickerRowRole::Dynamic(DynamicPickerRole::Direct) => Some(true),
+            PickerRowRole::Dynamic(DynamicPickerRole::Context) => Some(false),
         }
     }
+}
 
-    fn match_canonical_search(&self, direct_search: &str, context_search: &str) -> Option<bool> {
-        let direct = direct_search.contains(&self.canonical_filter);
-        (direct || context_search.contains(&self.canonical_filter)).then_some(direct)
+impl<T> PickerRow<T> {
+    fn is_selectable(&self) -> bool {
+        !matches!(
+            self.role,
+            PickerRowRole::Dynamic(DynamicPickerRole::Context)
+        )
     }
 }
 
@@ -425,10 +408,7 @@ impl<T> From<PickerItem<T>> for PickerRow<T> {
         Self {
             group: Some(item.group),
             row: Line::raw(item.label),
-            direct_search: canonical_search(item.label),
-            context_search: String::new(),
-            matching: DynamicPickerMatch::Search,
-            selectable: true,
+            role: PickerRowRole::SearchableLabel(canonical_search(item.label)),
             value: item.value,
         }
     }
@@ -439,16 +419,13 @@ impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
         Self {
             group: None,
             row: item.row,
-            direct_search: canonical_search(&item.direct_search),
-            context_search: canonical_search(&item.context_search),
-            matching: item.matching,
-            selectable: item.selectable,
+            role: PickerRowRole::Dynamic(item.role),
             value: item.value,
         }
     }
 }
 
-pub(crate) fn canonical_search(text: &str) -> String {
+pub(super) fn canonical_search(text: &str) -> String {
     text.to_lowercase()
 }
 
@@ -475,8 +452,7 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        DynamicPickerItem, DynamicPickerMatch, Picker, PickerAction, PickerItem, PickerSavePolicy,
-        canonical_search,
+        DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem, PickerSavePolicy,
     };
 
     const ITEMS: [PickerItem<&str>; 4] = [
@@ -512,15 +488,12 @@ mod tests {
 
     fn dynamic_item(
         value: &'static str,
-        direct_search: &'static str,
-        context_search: &'static str,
+        label: &'static str,
+        role: DynamicPickerRole,
     ) -> DynamicPickerItem<&'static str> {
         DynamicPickerItem {
-            row: Line::raw(direct_search.to_owned()),
-            direct_search: direct_search.to_owned(),
-            context_search: context_search.to_owned(),
-            matching: DynamicPickerMatch::Search,
-            selectable: true,
+            row: Line::raw(label.to_owned()),
+            role,
             value,
         }
     }
@@ -563,24 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_supplied_canonical_search_text_with_the_current_filter() {
-        let mut picker = picker("sol");
-        picker.set_filter("NEEDLE");
-
-        assert!(picker.matches_search_text("Python needle"));
-        assert!(picker.matches_canonical_search(&canonical_search("Python needle"), ""));
-        assert!(picker.matches_canonical_search(
-            &canonical_search("Session start"),
-            &canonical_search("descendant Needle"),
-        ));
-        assert!(!picker.matches_canonical_search(
-            &canonical_search("Python other"),
-            &canonical_search("descendant other"),
-        ));
-    }
-
-    #[test]
-    fn dynamic_matches_keep_non_focusable_context_rows() {
+    fn dynamic_roles_keep_non_focusable_context_rows() {
         let normal = Style::new().fg(Color::White);
         let accent = Style::new().fg(Color::Cyan);
         let muted = Style::new().fg(Color::DarkGray);
@@ -594,10 +550,7 @@ mod tests {
                         Span::styled("Session γ".to_owned(), normal),
                         Span::styled(" α".to_owned(), accent),
                     ]),
-                    direct_search: "Session γ α".to_owned(),
-                    context_search: "needle".to_owned(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: true,
+                    role: DynamicPickerRole::Context,
                     value: "start",
                 },
                 DynamicPickerItem {
@@ -605,10 +558,7 @@ mod tests {
                         Span::styled("└─ ".to_owned(), muted),
                         Span::styled("Python needle".to_owned(), normal),
                     ]),
-                    direct_search: "Python needle".to_owned(),
-                    context_search: String::new(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: true,
+                    role: DynamicPickerRole::Direct,
                     value: "step",
                 },
                 DynamicPickerItem {
@@ -616,10 +566,7 @@ mod tests {
                         Span::styled("└─ ".to_owned(), muted),
                         Span::styled("Reply".to_owned(), normal),
                     ]),
-                    direct_search: "Reply".to_owned(),
-                    context_search: "needle".to_owned(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: true,
+                    role: DynamicPickerRole::Context,
                     value: "tail",
                 },
             ],
@@ -627,9 +574,6 @@ mod tests {
             PickerSavePolicy::Disabled,
         );
 
-        picker.set_filter("NEEDLE");
-
-        assert_eq!(picker.matched_values(), ["start", "step", "tail"]);
         assert_eq!(
             picker.handle_key(key(KeyCode::Enter)),
             PickerAction::Apply("step")
@@ -638,8 +582,6 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             PickerAction::None
         );
-        assert_eq!(picker.matched_values(), ["start", "step", "tail"]);
-
         let buffer = rendered_buffer(&mut picker, 60, 10);
         let (muted_column, muted_row) = cell_with_symbol(&buffer, "├");
         let (normal_column, normal_row) = cell_with_symbol(&buffer, "γ");
@@ -663,33 +605,61 @@ mod tests {
     }
 
     #[test]
-    fn non_selectable_rows_remain_visible_without_focus() {
+    fn dynamic_rows_derive_selectability_from_role() {
+        let mut picker = Picker::new_dynamic(
+            "Picker",
+            "No matching items",
+            [
+                DynamicPickerItem {
+                    row: Line::raw("Context"),
+                    role: DynamicPickerRole::Context,
+                    value: "context",
+                },
+                DynamicPickerItem {
+                    row: Line::raw("Direct"),
+                    role: DynamicPickerRole::Direct,
+                    value: "direct",
+                },
+            ],
+            "context",
+            PickerSavePolicy::Enabled,
+        );
+
+        assert_eq!(picker.apply(false), PickerAction::Apply("direct"));
+        let buffer = rendered_buffer(&mut picker, 60, 10);
+        let (context_column, context_row) = cell_start(&buffer, "Context");
+        let (direct_column, direct_row) = cell_start(&buffer, "Direct");
+        assert!(
+            !buffer[(context_column, context_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buffer[(direct_column, direct_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn context_rows_remain_visible_without_focus() {
         let mut picker = Picker::new_dynamic(
             "Picker",
             "No matching items",
             [
                 DynamicPickerItem {
                     row: Line::raw("First"),
-                    direct_search: "First".to_owned(),
-                    context_search: String::new(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: true,
+                    role: DynamicPickerRole::Direct,
                     value: "first",
                 },
                 DynamicPickerItem {
                     row: Line::raw("Loading…"),
-                    direct_search: "Loading…".to_owned(),
-                    context_search: String::new(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: false,
+                    role: DynamicPickerRole::Context,
                     value: "loading",
                 },
                 DynamicPickerItem {
                     row: Line::raw("Last"),
-                    direct_search: "Last".to_owned(),
-                    context_search: String::new(),
-                    matching: DynamicPickerMatch::Search,
-                    selectable: true,
+                    role: DynamicPickerRole::Direct,
                     value: "last",
                 },
             ],
@@ -697,7 +667,6 @@ mod tests {
             PickerSavePolicy::Enabled,
         );
 
-        assert_eq!(picker.matched_values(), ["first", "loading", "last"]);
         assert_eq!(
             picker.handle_key(key(KeyCode::Enter)),
             PickerAction::Apply("first")
@@ -738,16 +707,12 @@ mod tests {
             "No matching items",
             [DynamicPickerItem {
                 row: Line::raw("Loading…"),
-                direct_search: "Loading…".to_owned(),
-                context_search: String::new(),
-                matching: DynamicPickerMatch::Search,
-                selectable: false,
+                role: DynamicPickerRole::Context,
                 value: "loading",
             }],
             "loading",
             PickerSavePolicy::Enabled,
         );
-        assert_eq!(loading.matched_values(), ["loading"]);
         assert_eq!(
             loading.handle_key(key(KeyCode::Enter)),
             PickerAction::NoMatch
@@ -781,15 +746,14 @@ mod tests {
             "Session tree",
             "No matching session entries",
             [
-                dynamic_item("root", "Session start", "needle one needle two"),
-                dynamic_item("one", "Python needle one", ""),
-                dynamic_item("branch", "Alternative branch", "needle two"),
-                dynamic_item("two", "Python needle two", ""),
+                dynamic_item("root", "Session start", DynamicPickerRole::Context),
+                dynamic_item("one", "Python needle one", DynamicPickerRole::Direct),
+                dynamic_item("branch", "Alternative branch", DynamicPickerRole::Context),
+                dynamic_item("two", "Python needle two", DynamicPickerRole::Direct),
             ],
             "root",
             PickerSavePolicy::Disabled,
         );
-        picker.set_filter("needle");
         let _ = rendered(&mut picker, 60, 6);
 
         assert_eq!(picker.apply(false), PickerAction::Apply("one"));
@@ -818,28 +782,27 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_filtering_handles_context_only_matches_and_tiny_viewports() {
+    fn context_rows_remain_nonfocusable_after_replacement() {
         let mut picker = Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
             [
-                dynamic_item("root", "Session start", "needle"),
-                dynamic_item("step", "Python needle", ""),
-                dynamic_item("other", "Python other", ""),
+                dynamic_item("root", "Session start", DynamicPickerRole::Context),
+                dynamic_item("step", "Python needle", DynamicPickerRole::Direct),
+                dynamic_item("other", "Python other", DynamicPickerRole::Context),
             ],
             "step",
             PickerSavePolicy::Disabled,
         );
-        picker.set_filter("needle");
         assert_eq!(picker.apply(false), PickerAction::Apply("step"));
 
-        picker.set_filter("absent");
+        picker.replace_items([dynamic_item(
+            "root",
+            "Session start",
+            DynamicPickerRole::Context,
+        )]);
         assert_eq!(picker.apply(false), PickerAction::NoMatch);
-        assert!(rendered(&mut picker, 60, 6).contains("No matching session entries"));
-
-        picker.set_filter("context only");
-        picker.replace_items([dynamic_item("root", "Session start", "context only")]);
-        assert_eq!(picker.apply(false), PickerAction::NoMatch);
+        assert!(rendered(&mut picker, 60, 6).contains("Session start"));
         for code in [
             KeyCode::Up,
             KeyCode::Down,
@@ -853,9 +816,6 @@ mod tests {
         for (width, height) in [(1, 1), (1, 2), (2, 3), (3, 3)] {
             let _ = rendered(&mut picker, width, height);
         }
-
-        picker.set_filter("");
-        assert_eq!(picker.apply(false), PickerAction::Apply("root"));
     }
 
     #[test]
@@ -864,27 +824,32 @@ mod tests {
             "Session tree",
             "No matching session entries",
             [
-                dynamic_item("root", "Session start", "needle"),
-                dynamic_item("current", "Python needle current", ""),
+                dynamic_item("root", "Session start", DynamicPickerRole::Context),
+                dynamic_item(
+                    "current",
+                    "Python needle current",
+                    DynamicPickerRole::Direct,
+                ),
             ],
             "current",
             PickerSavePolicy::Disabled,
         );
-        picker.set_filter("needle");
-
         picker.replace_items([
-            dynamic_item("root", "Session start", "needle"),
-            dynamic_item("current", "Python needle current", ""),
-            dynamic_item("later", "Python needle later", ""),
+            dynamic_item("root", "Session start", DynamicPickerRole::Context),
+            dynamic_item(
+                "current",
+                "Python needle current",
+                DynamicPickerRole::Direct,
+            ),
+            dynamic_item("later", "Python needle later", DynamicPickerRole::Direct),
         ]);
         assert_eq!(picker.apply(false), PickerAction::Apply("current"));
 
         picker.replace_items([
-            dynamic_item("root", "Session start", "needle"),
-            dynamic_item("current", "Python renamed", ""),
-            dynamic_item("later", "Python needle later", ""),
+            dynamic_item("root", "Session start", DynamicPickerRole::Context),
+            dynamic_item("current", "Python renamed", DynamicPickerRole::Context),
+            dynamic_item("later", "Python needle later", DynamicPickerRole::Direct),
         ]);
-        assert_eq!(picker.matched_values(), ["root", "later"]);
         assert_eq!(picker.apply(false), PickerAction::Apply("later"));
     }
 

@@ -43,7 +43,7 @@ use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
 use picker::{
-    DynamicPickerItem, DynamicPickerMatch, Picker, PickerAction, PickerItem, PickerSavePolicy,
+    DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem, PickerSavePolicy,
 };
 use tree::SessionTree;
 
@@ -781,10 +781,7 @@ impl App {
             "No matching session entries",
             [DynamicPickerItem {
                 row: Line::raw("Loading…"),
-                direct_search: "Loading…".to_owned(),
-                context_search: String::new(),
-                matching: DynamicPickerMatch::Search,
-                selectable: false,
+                role: DynamicPickerRole::Context,
                 value: PickerValue::Tree(SessionEntryId(0)),
             }],
             PickerValue::Tree(SessionEntryId(0)),
