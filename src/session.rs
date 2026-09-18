@@ -2321,10 +2321,10 @@ fn restore_projection_at(
     }
 }
 
-fn decoded_restore_entry<'a>(
-    entries: &'a BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
+fn decoded_restore_entry(
+    entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
     entry_id: i64,
-) -> Result<&'a codec::DecodedEntry, ()> {
+) -> Result<&codec::DecodedEntry, ()> {
     entries
         .get(&entry_id)
         .and_then(|entry| entry.as_ref().ok())
@@ -3702,8 +3702,7 @@ mod tests {
         writer
             .commit_request("branched request".to_owned())
             .await
-            .expect("commit branched request")
-            .run_id;
+            .expect("commit branched request");
         let connection = session
             .connection_for_test()
             .expect("lock selected session connection");
@@ -3780,22 +3779,25 @@ mod tests {
             corrected.request_entry,
             SessionEntryId(active_entry_id(&session) as u64)
         );
-        let connection = session.connection_for_test().expect("lock session");
-        let parents = connection
-            .prepare("SELECT parent_id FROM entries WHERE id IN (?1, ?2) ORDER BY id")
-            .expect("prepare sibling query")
-            .query_map(
-                params![
-                    i64::try_from(original.request_entry.0).expect("original entry fits SQLite"),
-                    i64::try_from(corrected.request_entry.0).expect("corrected entry fits SQLite"),
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("query sibling parents")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read sibling parents");
-        assert_eq!(parents, [root.0 as i64, root.0 as i64]);
-        drop(connection);
+        {
+            let connection = session.connection_for_test().expect("lock session");
+            let parents = connection
+                .prepare("SELECT parent_id FROM entries WHERE id IN (?1, ?2) ORDER BY id")
+                .expect("prepare sibling query")
+                .query_map(
+                    params![
+                        i64::try_from(original.request_entry.0)
+                            .expect("original entry fits SQLite"),
+                        i64::try_from(corrected.request_entry.0)
+                            .expect("corrected entry fits SQLite"),
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("query sibling parents")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read sibling parents");
+            assert_eq!(parents, [root.0 as i64, root.0 as i64]);
+        }
 
         writer
             .close_run(
@@ -3855,8 +3857,7 @@ mod tests {
         writer
             .commit_request("corrected request".to_owned())
             .await
-            .expect("commit corrected request")
-            .run_id;
+            .expect("commit corrected request");
         assert_eq!(
             session
                 .connection_for_test()
@@ -4068,20 +4069,21 @@ mod tests {
             )
             .await
             .expect("close pending-step fixture");
-        let connection = session
-            .connection_for_test()
-            .expect("lock pending-step session connection");
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL)",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .expect("read pending-step fixture"),
-            (0, 1)
-        );
-        drop(connection);
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock pending-step session connection");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL)",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .expect("read pending-step fixture"),
+                (0, 1)
+            );
+        }
         let projection = writer
             .restore_at(SessionEntryId(root as u64))
             .await
@@ -4153,26 +4155,27 @@ mod tests {
             )
             .await
             .expect("close task run");
-        let connection = session
-            .connection_for_test()
-            .expect("lock unfinished-task session connection");
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM subagent_tasks WHERE terminal_revision IS NULL)",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
-                .expect("read unfinished-task fixture"),
-            (0, 0, 1)
-        );
-        drop(connection);
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock unfinished-task session connection");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM subagent_tasks WHERE terminal_revision IS NULL)",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .expect("read unfinished-task fixture"),
+                (0, 0, 1)
+            );
+        }
         let projection = writer
             .restore_at(SessionEntryId(root as u64))
             .await
@@ -4536,8 +4539,7 @@ mod tests {
         writer
             .commit_request("known request".to_owned())
             .await
-            .expect("commit request")
-            .run_id;
+            .expect("commit request");
         let before: (i64, i64, i64) = session
             .connection_for_test()
             .expect("lock session connection")
@@ -4924,8 +4926,7 @@ mod tests {
         writer
             .commit_request("corrupt sibling request".to_owned())
             .await
-            .expect("commit sibling request")
-            .run_id;
+            .expect("commit sibling request");
         let corrupt_request = active_entry_id(&session);
         set_active_entry(&session, selected_leaf);
         session
@@ -5507,8 +5508,7 @@ mod tests {
             .writer()
             .commit_request("readable request".to_owned())
             .await
-            .expect("commit request")
-            .run_id;
+            .expect("commit request");
         session
             .connection_for_test()
             .expect("lock session")

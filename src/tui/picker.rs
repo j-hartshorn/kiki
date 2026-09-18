@@ -122,6 +122,7 @@ impl<T: Copy + Eq> Picker<T> {
             .or_else(|| focusable.first().copied());
     }
 
+    #[cfg(test)]
     pub(crate) fn matched_values(&self) -> Vec<T> {
         self.matches()
             .into_iter()

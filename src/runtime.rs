@@ -1101,6 +1101,7 @@ impl<M: Model> RuntimeController<M> {
             Ok(restore) => restore,
             Err(_) => return (NavigationOutcome::Failed, None),
         };
+        debug_assert_eq!(restore.requested_entry, entry);
         if restore.effective_entry == restore.observed_active_entry {
             return (
                 NavigationOutcome::Unchanged {
@@ -6042,8 +6043,7 @@ mod tests {
             .writer()
             .commit_request("readable saved request".to_owned())
             .await
-            .expect("commit readable request")
-            .run_id;
+            .expect("commit readable request");
         let saved_metadata = session.metadata().expect("read saved metadata");
         let metadata_before: (String, i64, i64) = session
             .connection_for_test()
@@ -6151,8 +6151,7 @@ mod tests {
             .writer()
             .commit_request("readable saved request".to_owned())
             .await
-            .expect("commit readable request")
-            .run_id;
+            .expect("commit readable request");
         let metadata_before: (String, String, i64, i64) = session
             .connection_for_test()
             .expect("lock session")
@@ -8578,26 +8577,27 @@ mod tests {
             .await
             .expect("cancel corrected request");
         events_until_settled(&mut events).await;
-        let connection = session.connection_for_test().expect("lock session");
-        let parents = connection
-            .prepare("SELECT parent_id FROM entries WHERE kind = 'user_request' ORDER BY id")
-            .expect("prepare request parent query")
-            .query_map([], |row| row.get::<_, i64>(0))
-            .expect("query request parents")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read request parents");
-        assert_eq!(parents, [root.0 as i64, root.0 as i64]);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE kind = 'cancelled'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("count cancelled terminals"),
-            2
-        );
-        drop(connection);
+        {
+            let connection = session.connection_for_test().expect("lock session");
+            let parents = connection
+                .prepare("SELECT parent_id FROM entries WHERE kind = 'user_request' ORDER BY id")
+                .expect("prepare request parent query")
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query request parents")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read request parents");
+            assert_eq!(parents, [root.0 as i64, root.0 as i64]);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE kind = 'cancelled'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count cancelled terminals"),
+                2
+            );
+        }
         shutdown_controller(commands, controller).await;
         session.close().expect("close session");
     }
@@ -8861,10 +8861,10 @@ mod tests {
                         ..
                     },
                     RuntimeEvent::RunSettled { run_id: RunId(1) },
-                ] if match (expected, record) {
-                    ("final", Record::FinalMessage { .. }) | ("failed", Record::FailedRun { .. }) => true,
-                    _ => false,
-                }
+                ] if matches!(
+                    (expected, record),
+                    ("final", Record::FinalMessage { .. }) | ("failed", Record::FailedRun { .. })
+                )
             ));
             assert!(gate.attempts().is_empty());
             assert!(controller.active.is_none());

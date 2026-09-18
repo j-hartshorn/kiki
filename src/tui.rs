@@ -404,18 +404,22 @@ impl App {
         if key.is_release() {
             return Update::default();
         }
-        let notice_cleared = (!self.is_tree_loading())
-            .then(|| self.clear_notice())
-            .unwrap_or(false);
+        let notice_cleared = if !self.is_tree_loading() {
+            self.clear_notice()
+        } else {
+            false
+        };
         let mut update = self.handle_key_inner(key, now);
         update.visible_changed |= notice_cleared;
         update
     }
 
     fn handle_paste(&mut self, text: &str) -> Update {
-        let notice_cleared = (!self.is_tree_loading())
-            .then(|| self.clear_notice())
-            .unwrap_or(false);
+        let notice_cleared = if !self.is_tree_loading() {
+            self.clear_notice()
+        } else {
+            false
+        };
         let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
             false
         } else {
@@ -1490,11 +1494,11 @@ impl App {
     }
 
     fn apply_request_prefill(&mut self, request_prefill: &Option<String>) -> bool {
-        if self.prompt.is_empty() {
-            if let Some(request) = request_prefill {
-                let changed = self.prompt.insert_paste(request);
-                return changed | self.refresh_completion();
-            }
+        if self.prompt.is_empty()
+            && let Some(request) = request_prefill
+        {
+            let changed = self.prompt.insert_paste(request);
+            return changed | self.refresh_completion();
         }
         false
     }
