@@ -5,6 +5,8 @@ use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
+pub(crate) const PICKER_MAX_WIDTH: u16 = 72;
+
 #[derive(Clone, Copy)]
 pub(crate) struct PickerItem<T> {
     pub(crate) group: &'static str,
@@ -129,6 +131,15 @@ impl<T: Copy + Eq> Picker<T> {
             .into_iter()
             .map(|matched| self.items[matched.index].value)
             .collect()
+    }
+
+    pub(crate) fn matches_canonical_search(
+        &self,
+        direct_search: &str,
+        context_search: &str,
+    ) -> bool {
+        self.match_canonical_search(direct_search, context_search)
+            .is_some()
     }
 
     pub(crate) fn set_filter(&mut self, filter: &str) {
@@ -356,9 +367,8 @@ impl<T: Copy + Eq> Picker<T> {
     }
 
     fn is_direct_match(&self, index: usize) -> bool {
-        self.items[index]
-            .direct_search
-            .contains(&self.canonical_filter)
+        self.match_canonical_search(&self.items[index].direct_search, "")
+            .is_some()
     }
 
     fn matches(&self) -> Vec<PickerMatch> {
@@ -366,11 +376,15 @@ impl<T: Copy + Eq> Picker<T> {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                let direct = item.direct_search.contains(&self.canonical_filter);
-                (direct || item.context_search.contains(&self.canonical_filter))
-                    .then_some(PickerMatch { index, direct })
+                self.match_canonical_search(&item.direct_search, &item.context_search)
+                    .map(|direct| PickerMatch { index, direct })
             })
             .collect()
+    }
+
+    fn match_canonical_search(&self, direct_search: &str, context_search: &str) -> Option<bool> {
+        let direct = direct_search.contains(&self.canonical_filter);
+        (direct || context_search.contains(&self.canonical_filter)).then_some(direct)
     }
 }
 
@@ -398,12 +412,12 @@ impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
     }
 }
 
-fn canonical_search(text: &str) -> String {
+pub(crate) fn canonical_search(text: &str) -> String {
     text.to_lowercase()
 }
 
 fn popup_area(area: Rect, content_rows: usize) -> Rect {
-    let width = area.width.min(72);
+    let width = area.width.min(PICKER_MAX_WIDTH);
     let desired_height = u16::try_from(content_rows.saturating_add(3)).unwrap_or(u16::MAX);
     let height = area.height.min(desired_height.max(1));
     Rect::new(
@@ -424,7 +438,9 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
 
-    use super::{DynamicPickerItem, Picker, PickerAction, PickerItem, PickerSavePolicy};
+    use super::{
+        DynamicPickerItem, Picker, PickerAction, PickerItem, PickerSavePolicy, canonical_search,
+    };
 
     const ITEMS: [PickerItem<&str>; 4] = [
         PickerItem {
@@ -505,6 +521,22 @@ mod tests {
             non_contiguous.handle_key(key(KeyCode::Char(character)));
         }
         assert!(rendered(&mut non_contiguous, 20, 5).contains("anthropic/haiku"));
+    }
+
+    #[test]
+    fn matches_supplied_canonical_search_text_with_the_current_filter() {
+        let mut picker = picker("sol");
+        picker.set_filter("NEEDLE");
+
+        assert!(picker.matches_canonical_search(&canonical_search("Python needle"), ""));
+        assert!(picker.matches_canonical_search(
+            &canonical_search("Session start"),
+            &canonical_search("descendant Needle"),
+        ));
+        assert!(!picker.matches_canonical_search(
+            &canonical_search("Python other"),
+            &canonical_search("descendant other"),
+        ));
     }
 
     #[test]

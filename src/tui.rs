@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 mod picker;
 mod slash;
 mod subagents;
+mod tree;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
