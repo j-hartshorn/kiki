@@ -2699,33 +2699,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 });
                 self.publish_event(CoordinatorEvent::Spawned { record: spawned });
                 let coordinator = self.clone();
-                #[cfg(test)]
-                let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
                 tokio::spawn(async move {
                     let terminal = coordinator.run_child(child).await;
-                    let settled = terminal.as_ref().map(|record| record.id().clone());
-                    if let Some(record) = terminal {
-                        coordinator.publish_event(CoordinatorEvent::Finished { record });
-                    }
-                    #[cfg(test)]
-                    if settled.is_some()
-                        && let Some(gate) = &terminal_settlement_test_gate
-                    {
-                        gate.wait_after_terminal_settlement().await;
-                    }
-                    let publication = coordinator.publication.clone();
-                    drop(coordinator);
-                    drop(operation);
-                    #[cfg(test)]
-                    if let Some(gate) = terminal_settlement_test_gate {
-                        gate.operation_dropped();
-                    }
-                    if let Some(id) = settled {
-                        publish_publication_event(
-                            &publication,
-                            CoordinatorEvent::OperationSettled { id },
-                        );
-                    }
+                    coordinator.settle_spawned_task(operation, terminal).await;
                 });
                 return Ok(observation);
             }
@@ -2740,8 +2716,6 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let coordinator = self.clone();
         let caller = caller.clone();
-        #[cfg(test)]
-        let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
         tokio::spawn(async move {
             let terminal = coordinator
                 .complete_admission(
@@ -2753,30 +2727,36 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     sender,
                 )
                 .await;
-            let settled = terminal.as_ref().map(|record| record.id().clone());
-            if let Some(record) = terminal {
-                coordinator.publish_event(CoordinatorEvent::Finished { record });
-            }
-            #[cfg(test)]
-            if settled.is_some()
-                && let Some(gate) = &terminal_settlement_test_gate
-            {
-                gate.wait_after_terminal_settlement().await;
-            }
-            let publication = coordinator.publication.clone();
-            drop(coordinator);
-            drop(operation);
-            #[cfg(test)]
-            if let Some(gate) = terminal_settlement_test_gate {
-                gate.operation_dropped();
-            }
-            if let Some(id) = settled {
-                publish_publication_event(&publication, CoordinatorEvent::OperationSettled { id });
-            }
+            coordinator.settle_spawned_task(operation, terminal).await;
         });
         receiver
             .await
             .unwrap_or(Err(AdmissionError::StorageUnavailable))
+    }
+
+    async fn settle_spawned_task(self, operation: OperationGuard, terminal: Option<TaskRecord>) {
+        let settled = terminal.as_ref().map(|record| record.id().clone());
+        if let Some(record) = terminal {
+            self.publish_event(CoordinatorEvent::Finished { record });
+        }
+        #[cfg(test)]
+        let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
+        #[cfg(test)]
+        if settled.is_some()
+            && let Some(gate) = &terminal_settlement_test_gate
+        {
+            gate.wait_after_terminal_settlement().await;
+        }
+        let publication = self.publication.clone();
+        drop(self);
+        drop(operation);
+        #[cfg(test)]
+        if let Some(gate) = terminal_settlement_test_gate {
+            gate.operation_dropped();
+        }
+        if let Some(id) = settled {
+            publish_publication_event(&publication, CoordinatorEvent::OperationSettled { id });
+        }
     }
 
     async fn complete_admission(

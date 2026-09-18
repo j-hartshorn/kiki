@@ -43,7 +43,8 @@ use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
 use picker::{
-    DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem, PickerSavePolicy,
+    DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, PickerItem,
+    PickerSavePolicy,
 };
 use tree::SessionTree;
 
@@ -157,6 +158,7 @@ enum PickerValue {
 struct TreePicker {
     revision: u64,
     filter: String,
+    row_width: usize,
     tree: Option<SessionTree<PickerValue>>,
 }
 
@@ -783,8 +785,21 @@ impl App {
             .tree
             .as_ref()
             .expect("tree picker is populated before filtering")
-            .refresh(picker);
+            .refresh_for_width(picker, tree_picker.row_width);
         tree_picker.filter = picker.filter().to_owned();
+    }
+
+    fn refresh_tree_picker_width(&mut self, row_width: usize) {
+        let (Some(tree_picker), Some(picker)) = (&mut self.tree_picker, &mut self.picker) else {
+            return;
+        };
+        if tree_picker.row_width == row_width {
+            return;
+        }
+        tree_picker.row_width = row_width;
+        if let Some(tree) = &tree_picker.tree {
+            tree.refresh_for_width(picker, row_width);
+        }
     }
 
     fn apply_picker_value(&mut self, value: PickerValue) -> Update {
@@ -804,6 +819,7 @@ impl App {
         self.tree_picker = Some(TreePicker {
             revision,
             filter: initial_filter.to_owned(),
+            row_width: usize::from(PICKER_MAX_WIDTH.saturating_sub(2)),
             tree: None,
         });
         self.picker = Some(Picker::new_dynamic(
@@ -1427,10 +1443,11 @@ impl App {
         match outcome {
             TreeRequestOutcome::Catalogue(catalogue) => {
                 let filter = tree_picker.filter.clone();
+                let row_width = tree_picker.row_width;
                 let tree = SessionTree::from_catalogue(catalogue, PickerValue::Tree);
-                let mut picker = tree.picker();
+                let mut picker = tree.picker_for_width(row_width);
                 picker.set_filter(&filter);
-                tree.refresh(&mut picker);
+                tree.refresh_for_width(&mut picker, row_width);
                 self.picker = Some(picker);
                 self.tree_picker
                     .as_mut()
@@ -2129,6 +2146,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         1,
     );
     if app.tree_picker.is_some() {
+        app.refresh_tree_picker_width(usize::from(area.width.saturating_sub(2)));
         let header_bottom = area.y.saturating_add(1);
         let picker_bottom = bottom_rule.y;
         let picker_height = app
@@ -2160,13 +2178,6 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             bottom_rule,
         );
         if let Some(picker) = &mut app.picker {
-            if let Some(tree) = app
-                .tree_picker
-                .as_ref()
-                .and_then(|tree_picker| tree_picker.tree.as_ref())
-            {
-                tree.refresh_for_width(picker, usize::from(area.width.saturating_sub(2)));
-            }
             picker.render_in(
                 frame,
                 Rect::new(area.x, picker_top, area.width, picker_height),
@@ -4076,18 +4087,6 @@ mod tests {
     }
 
     #[test]
-    fn session_tree_picker_spans_full_terminal_width() {
-        let mut app = App::default();
-        let revision = tree_request(&mut app, "");
-        load_tree(&mut app, revision);
-
-        let buffer = rendered_buffer(&mut app, 100, 12);
-        let (_, title_row) = cell_start(&buffer, "Session tree");
-        assert_eq!(buffer[(0, title_row)].symbol(), "┌");
-        assert_eq!(buffer[(99, title_row)].symbol(), "┐");
-    }
-
-    #[test]
     fn session_tree_picker_replaces_prompt_dock_and_restores_draft() {
         let mut app = app_with_prompt("hidden draft");
         let revision = tree_request(&mut app, "");
@@ -4217,6 +4216,38 @@ mod tests {
         let (_, thinking_title_row) = cell_start(&thinking, "Thinking");
         assert_eq!(thinking[(14, thinking_title_row)].symbol(), "┌");
         assert_eq!(thinking[(85, thinking_title_row)].symbol(), "┐");
+    }
+
+    #[test]
+    fn session_tree_picker_tracks_current_row_width_before_catalogue_load() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        assert_eq!(
+            app.tree_picker
+                .as_ref()
+                .expect("session tree picker is open")
+                .row_width,
+            70
+        );
+
+        let loading = rendered(&mut app, 100, 12);
+        assert!(loading.contains("Loading…"), "{loading}");
+        assert_eq!(
+            app.tree_picker
+                .as_ref()
+                .expect("session tree picker remains open")
+                .row_width,
+            98
+        );
+
+        load_tree(&mut app, revision);
+        assert_eq!(
+            app.tree_picker
+                .as_ref()
+                .expect("loaded session tree picker remains open")
+                .row_width,
+            98
+        );
     }
 
     #[test]

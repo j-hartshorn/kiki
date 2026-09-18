@@ -6,11 +6,13 @@ use ratatui::text::Line;
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
 
+#[cfg(test)]
+use super::picker::PICKER_MAX_WIDTH;
 use super::picker::{
-    DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerSavePolicy,
-    canonical_search,
+    DynamicPickerItem, DynamicPickerRole, Picker, PickerSavePolicy, canonical_search,
 };
 
+#[cfg(test)]
 const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const MAX_ANCESTOR_CONNECTORS: usize = 6;
 
@@ -128,16 +130,22 @@ impl<T: Copy + Eq> SessionTree<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn picker(&self) -> Picker<T> {
+        self.picker_for_width(PICKER_ROW_WIDTH)
+    }
+
+    pub(crate) fn picker_for_width(&self, row_width: usize) -> Picker<T> {
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&TreeProjection::all(&self.nodes), PICKER_ROW_WIDTH),
+            self.items(&TreeProjection::all(&self.nodes), row_width),
             self.active_value,
             PickerSavePolicy::Disabled,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh(&self, picker: &mut Picker<T>) {
         self.refresh_for_width(picker, PICKER_ROW_WIDTH);
     }
