@@ -42,7 +42,9 @@ pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
-use picker::{DynamicPickerItem, Picker, PickerAction, PickerItem, PickerSavePolicy};
+use picker::{
+    DynamicPickerItem, DynamicPickerMatch, Picker, PickerAction, PickerItem, PickerSavePolicy,
+};
 use tree::SessionTree;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -781,6 +783,7 @@ impl App {
                 row: Line::raw("Loading…"),
                 direct_search: "Loading…".to_owned(),
                 context_search: String::new(),
+                matching: DynamicPickerMatch::Search,
                 selectable: false,
                 value: PickerValue::Tree(SessionEntryId(0)),
             }],

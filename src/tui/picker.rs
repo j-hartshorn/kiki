@@ -24,10 +24,18 @@ pub(crate) enum PickerAction<T> {
     NoMatch,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DynamicPickerMatch {
+    Search,
+    Direct,
+    Context,
+}
+
 pub(crate) struct DynamicPickerItem<T> {
     pub(crate) row: Line<'static>,
     pub(crate) direct_search: String,
     pub(crate) context_search: String,
+    pub(crate) matching: DynamicPickerMatch,
     pub(crate) selectable: bool,
     pub(crate) value: T,
 }
@@ -43,6 +51,7 @@ struct PickerRow<T> {
     row: Line<'static>,
     direct_search: String,
     context_search: String,
+    matching: DynamicPickerMatch,
     selectable: bool,
     value: T,
 }
@@ -137,6 +146,10 @@ impl<T: Copy + Eq> Picker<T> {
     ) -> bool {
         self.match_canonical_search(direct_search, context_search)
             .is_some()
+    }
+
+    pub(crate) fn matches_search_text(&self, search_text: &str) -> bool {
+        self.matches_canonical_search(&canonical_search(search_text), "")
     }
 
     pub(crate) fn set_filter(&mut self, filter: &str) {
@@ -375,10 +388,7 @@ impl<T: Copy + Eq> Picker<T> {
     }
 
     fn is_direct_match(&self, index: usize) -> bool {
-        self.items[index].selectable
-            && self
-                .match_canonical_search(&self.items[index].direct_search, "")
-                .is_some()
+        self.items[index].selectable && self.item_match(&self.items[index]) == Some(true)
     }
 
     fn matches(&self) -> Vec<PickerMatch> {
@@ -386,13 +396,22 @@ impl<T: Copy + Eq> Picker<T> {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                self.match_canonical_search(&item.direct_search, &item.context_search)
-                    .map(|direct| PickerMatch {
-                        index,
-                        direct: item.selectable && direct,
-                    })
+                self.item_match(item).map(|direct| PickerMatch {
+                    index,
+                    direct: item.selectable && direct,
+                })
             })
             .collect()
+    }
+
+    fn item_match(&self, item: &PickerRow<T>) -> Option<bool> {
+        match item.matching {
+            DynamicPickerMatch::Search => {
+                self.match_canonical_search(&item.direct_search, &item.context_search)
+            }
+            DynamicPickerMatch::Direct => Some(true),
+            DynamicPickerMatch::Context => Some(false),
+        }
     }
 
     fn match_canonical_search(&self, direct_search: &str, context_search: &str) -> Option<bool> {
@@ -408,6 +427,7 @@ impl<T> From<PickerItem<T>> for PickerRow<T> {
             row: Line::raw(item.label),
             direct_search: canonical_search(item.label),
             context_search: String::new(),
+            matching: DynamicPickerMatch::Search,
             selectable: true,
             value: item.value,
         }
@@ -421,6 +441,7 @@ impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
             row: item.row,
             direct_search: canonical_search(&item.direct_search),
             context_search: canonical_search(&item.context_search),
+            matching: item.matching,
             selectable: item.selectable,
             value: item.value,
         }
@@ -454,7 +475,8 @@ mod tests {
     use ratatui::text::{Line, Span};
 
     use super::{
-        DynamicPickerItem, Picker, PickerAction, PickerItem, PickerSavePolicy, canonical_search,
+        DynamicPickerItem, DynamicPickerMatch, Picker, PickerAction, PickerItem, PickerSavePolicy,
+        canonical_search,
     };
 
     const ITEMS: [PickerItem<&str>; 4] = [
@@ -497,6 +519,7 @@ mod tests {
             row: Line::raw(direct_search.to_owned()),
             direct_search: direct_search.to_owned(),
             context_search: context_search.to_owned(),
+            matching: DynamicPickerMatch::Search,
             selectable: true,
             value,
         }
@@ -544,6 +567,7 @@ mod tests {
         let mut picker = picker("sol");
         picker.set_filter("NEEDLE");
 
+        assert!(picker.matches_search_text("Python needle"));
         assert!(picker.matches_canonical_search(&canonical_search("Python needle"), ""));
         assert!(picker.matches_canonical_search(
             &canonical_search("Session start"),
@@ -572,6 +596,7 @@ mod tests {
                     ]),
                     direct_search: "Session γ α".to_owned(),
                     context_search: "needle".to_owned(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: true,
                     value: "start",
                 },
@@ -582,6 +607,7 @@ mod tests {
                     ]),
                     direct_search: "Python needle".to_owned(),
                     context_search: String::new(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: true,
                     value: "step",
                 },
@@ -592,6 +618,7 @@ mod tests {
                     ]),
                     direct_search: "Reply".to_owned(),
                     context_search: "needle".to_owned(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: true,
                     value: "tail",
                 },
@@ -645,6 +672,7 @@ mod tests {
                     row: Line::raw("First"),
                     direct_search: "First".to_owned(),
                     context_search: String::new(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: true,
                     value: "first",
                 },
@@ -652,6 +680,7 @@ mod tests {
                     row: Line::raw("Loading…"),
                     direct_search: "Loading…".to_owned(),
                     context_search: String::new(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: false,
                     value: "loading",
                 },
@@ -659,6 +688,7 @@ mod tests {
                     row: Line::raw("Last"),
                     direct_search: "Last".to_owned(),
                     context_search: String::new(),
+                    matching: DynamicPickerMatch::Search,
                     selectable: true,
                     value: "last",
                 },
@@ -710,6 +740,7 @@ mod tests {
                 row: Line::raw("Loading…"),
                 direct_search: "Loading…".to_owned(),
                 context_search: String::new(),
+                matching: DynamicPickerMatch::Search,
                 selectable: false,
                 value: "loading",
             }],

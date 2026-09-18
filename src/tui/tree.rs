@@ -7,33 +7,49 @@ use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
 
 use super::picker::{
-    DynamicPickerItem, PICKER_MAX_WIDTH, Picker, PickerSavePolicy, canonical_search,
+    DynamicPickerItem, DynamicPickerMatch, PICKER_MAX_WIDTH, Picker, PickerSavePolicy,
 };
 
 const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
+const MAX_ANCESTOR_CONNECTORS: usize = 6;
 
 struct TreeNode<T> {
     parent: Option<usize>,
     children: Vec<usize>,
     value: T,
     search_text: String,
-    direct_search: String,
-    context_search: String,
+    depth: usize,
     active_path: bool,
 }
 
 struct TreeProjection {
+    direct_matches: Vec<bool>,
     visible: Vec<bool>,
     last_visible: Vec<bool>,
 }
 
 impl TreeProjection {
-    fn new<T>(nodes: &[TreeNode<T>], visible_indexes: &[usize]) -> Self {
-        let mut visible = vec![false; nodes.len()];
+    fn all<T>(nodes: &[TreeNode<T>], preorder: &[usize]) -> Self {
+        Self::new(
+            nodes,
+            preorder,
+            vec![true; nodes.len()],
+            vec![true; nodes.len()],
+        )
+    }
+
+    fn new<T>(
+        nodes: &[TreeNode<T>],
+        preorder: &[usize],
+        direct_matches: Vec<bool>,
+        visible: Vec<bool>,
+    ) -> Self {
         let mut last_visible = vec![false; nodes.len()];
         let mut last_visible_child = vec![None; nodes.len()];
-        for &index in visible_indexes {
-            visible[index] = true;
+        for &index in preorder {
+            if !visible[index] {
+                continue;
+            }
             if let Some(parent) = nodes[index].parent {
                 if let Some(previous) = last_visible_child[parent].replace(index) {
                     last_visible[previous] = false;
@@ -42,6 +58,7 @@ impl TreeProjection {
             }
         }
         Self {
+            direct_matches,
             visible,
             last_visible,
         }
@@ -79,9 +96,8 @@ impl<T: Copy + Eq> SessionTree<T> {
                     }),
                     children: Vec::new(),
                     value: value_for_entry(entry.entry_id),
-                    direct_search: canonical_search(&search_text),
                     search_text,
-                    context_search: String::new(),
+                    depth: 0,
                     active_path: false,
                 }
             })
@@ -112,9 +128,7 @@ impl<T: Copy + Eq> SessionTree<T> {
             current = nodes[index].parent;
         }
 
-        let mut preorder = Vec::with_capacity(nodes.len());
-        append_preorder(&nodes, root, &mut preorder);
-        populate_context_search(&mut nodes, root);
+        let preorder = build_preorder(&mut nodes, root);
         Self {
             nodes,
             preorder,
@@ -127,44 +141,55 @@ impl<T: Copy + Eq> SessionTree<T> {
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&self.preorder),
+            self.items(&TreeProjection::all(&self.nodes, &self.preorder)),
             self.active_value,
             PickerSavePolicy::Disabled,
         )
     }
 
     pub(crate) fn refresh(&self, picker: &mut Picker<T>) {
-        let matching_indexes = self.matching_indexes(picker);
-        picker.replace_items(self.items(&matching_indexes));
+        let projection = self.filtered_projection(picker);
+        picker.replace_items(self.items(&projection));
     }
 
-    fn matching_indexes(&self, picker: &Picker<T>) -> Vec<usize> {
-        self.preorder
-            .iter()
-            .copied()
-            .filter(|index| {
-                let node = &self.nodes[*index];
-                picker.matches_canonical_search(&node.direct_search, &node.context_search)
-            })
-            .collect()
+    fn filtered_projection(&self, picker: &Picker<T>) -> TreeProjection {
+        let mut direct_matches = vec![false; self.nodes.len()];
+        for &index in &self.preorder {
+            direct_matches[index] = picker.matches_search_text(&self.nodes[index].search_text);
+        }
+
+        let mut visible = direct_matches.clone();
+        for &index in self.preorder.iter().rev() {
+            if visible[index]
+                && let Some(parent) = self.nodes[index].parent
+            {
+                visible[parent] = true;
+            }
+        }
+        TreeProjection::new(&self.nodes, &self.preorder, direct_matches, visible)
     }
 
-    fn items(&self, visible_indexes: &[usize]) -> Vec<DynamicPickerItem<T>> {
-        let projection = TreeProjection::new(&self.nodes, visible_indexes);
+    fn items(&self, projection: &TreeProjection) -> Vec<DynamicPickerItem<T>> {
         self.preorder
             .iter()
             .copied()
             .filter(|index| projection.visible[*index])
             .map(|index| {
                 let node = &self.nodes[index];
+                let direct = projection.direct_matches[index];
                 DynamicPickerItem {
                     row: Line::styled(
-                        truncate_end(&self.display_text(index, &projection), PICKER_ROW_WIDTH),
+                        truncate_end(&self.display_text(index, projection), PICKER_ROW_WIDTH),
                         self.style(index),
                     ),
-                    direct_search: node.search_text.clone(),
-                    context_search: node.context_search.clone(),
-                    selectable: true,
+                    direct_search: String::new(),
+                    context_search: String::new(),
+                    matching: if direct {
+                        DynamicPickerMatch::Direct
+                    } else {
+                        DynamicPickerMatch::Context
+                    },
+                    selectable: direct,
                     value: node.value,
                 }
             })
@@ -182,23 +207,26 @@ impl<T: Copy + Eq> SessionTree<T> {
     }
 
     fn connector(&self, index: usize, projection: &TreeProjection) -> String {
-        let Some(parent) = self.nodes[index].parent else {
+        let node = &self.nodes[index];
+        let Some(parent) = node.parent else {
             return String::new();
         };
-        let mut ancestors = Vec::new();
-        let mut ancestor = Some(parent);
-        while let Some(index) = ancestor {
-            let node = &self.nodes[index];
-            if node.parent.is_none() {
-                break;
-            }
-            ancestors.push(index);
-            ancestor = node.parent;
+        let ancestor_count = node.depth.saturating_sub(1);
+        let visible_ancestor_count = ancestor_count.min(MAX_ANCESTOR_CONNECTORS);
+        let mut ancestors = Vec::with_capacity(visible_ancestor_count);
+        let mut ancestor = parent;
+        for _ in 0..visible_ancestor_count {
+            ancestors.push(ancestor);
+            ancestor = self.nodes[ancestor]
+                .parent
+                .expect("non-root ancestor has a parent");
         }
-        ancestors.reverse();
 
         let mut connector = String::new();
-        for ancestor in ancestors {
+        if ancestor_count > MAX_ANCESTOR_CONNECTORS {
+            connector.push_str("… ");
+        }
+        for ancestor in ancestors.into_iter().rev() {
             connector.push_str(if projection.last_visible[ancestor] {
                 "   "
             } else {
@@ -225,31 +253,18 @@ impl<T: Copy + Eq> SessionTree<T> {
     }
 }
 
-fn append_preorder<T>(nodes: &[TreeNode<T>], index: usize, preorder: &mut Vec<usize>) {
-    preorder.push(index);
-    for child in &nodes[index].children {
-        append_preorder(nodes, *child, preorder);
-    }
-}
-
-fn populate_context_search<T>(nodes: &mut [TreeNode<T>], index: usize) {
-    let children = nodes[index].children.clone();
-    for &child in &children {
-        populate_context_search(nodes, child);
-    }
-
-    let mut context = String::new();
-    for child in children {
-        if !context.is_empty() {
-            context.push('\n');
-        }
-        context.push_str(&nodes[child].direct_search);
-        if !nodes[child].context_search.is_empty() {
-            context.push('\n');
-            context.push_str(&nodes[child].context_search);
+fn build_preorder<T>(nodes: &mut [TreeNode<T>], root: usize) -> Vec<usize> {
+    let mut preorder = Vec::with_capacity(nodes.len());
+    let mut stack = vec![root];
+    while let Some(index) = stack.pop() {
+        preorder.push(index);
+        let depth = nodes[index].depth;
+        for &child in nodes[index].children.iter().rev() {
+            nodes[child].depth = depth.saturating_add(1);
+            stack.push(child);
         }
     }
-    nodes[index].context_search = context;
+    preorder
 }
 
 fn row_text(kind: &SessionCatalogueKind) -> String {
@@ -667,6 +682,42 @@ mod tests {
     }
 
     #[test]
+    fn caps_deep_connectors_without_hiding_labels_or_active_marker() {
+        let tree = SessionTree::from_catalogue(&linear_catalogue(32), |entry_id| entry_id);
+        let mut picker = tree.picker();
+
+        let wide = rendered(&mut picker, 72, 40);
+        assert!(wide.contains("…"));
+        assert!(wide.contains("User: depth 31"));
+        assert!(wide.contains("└─ ● User: depth 32"));
+
+        let narrow = rendered(&mut picker, 32, 8);
+        let visible_rows = narrow
+            .lines()
+            .filter(|row| row.contains("User:"))
+            .collect::<Vec<_>>();
+        assert_eq!(visible_rows.len(), 5);
+        assert!(visible_rows.iter().all(|row| row.contains("User:")));
+        assert!(narrow.contains("● User:"));
+    }
+
+    #[test]
+    fn builds_and_filters_a_deep_chain_without_retaining_descendant_text() {
+        let tree = SessionTree::from_catalogue(&linear_catalogue(4_096), |entry_id| entry_id);
+        assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 4_095);
+        let mut picker = tree.picker();
+
+        picker.set_filter("depth 4096");
+        tree.refresh(&mut picker);
+
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            PickerAction::Apply(SessionEntryId(4_096))
+        );
+        assert!(rendered(&mut picker, 32, 8).contains("● User:"));
+    }
+
+    #[test]
     fn filtering_retains_context_recomputes_connectors_and_recovers_entries() {
         let tree = SessionTree::from_catalogue(
             &catalogue(
@@ -855,6 +906,26 @@ mod tests {
             active_entry: SessionEntryId(active_entry),
             entries: entries.into_iter().collect(),
         }
+    }
+
+    fn linear_catalogue(length: u64) -> SessionCatalogue {
+        catalogue(
+            length,
+            (1..=length).map(|entry_id| {
+                entry(
+                    entry_id,
+                    (entry_id > 1).then_some(entry_id - 1),
+                    entry_id,
+                    if entry_id == 1 {
+                        SessionCatalogueKind::Start
+                    } else {
+                        SessionCatalogueKind::Request {
+                            text: format!("depth {entry_id}"),
+                        }
+                    },
+                )
+            }),
+        )
     }
 
     fn entry(
