@@ -5623,6 +5623,7 @@ mod tests {
                 | RuntimeEvent::SubagentFinished { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::NameAccepted { .. }
+                | RuntimeEvent::NavigationCompleted { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
         }

@@ -214,7 +214,7 @@ First red: `runtime::tests::navigation_restores_arena_and_context_before_publish
 
 **Files**
 
-- Modify: `src/agent.rs`, `src/runtime.rs`.
+- Modify: `src/agent.rs`, `src/runtime.rs`, `src/openai.rs`, `src/transcript.rs`.
 
 **Verification**
 

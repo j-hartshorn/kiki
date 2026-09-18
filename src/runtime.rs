@@ -14,8 +14,8 @@ use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session, SessionError,
-    SessionMetadata, SessionRestore, SessionWriter,
+    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session,
+    SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -45,6 +45,9 @@ pub(crate) enum RuntimeCommand {
     SetSessionName {
         name: String,
         revision: u64,
+    },
+    Navigate {
+        entry: SessionEntryId,
     },
     Cancel,
     CancelBackground,
@@ -126,6 +129,20 @@ pub(crate) struct RuntimeInitialState {
     pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NavigationOutcome {
+    Replaced {
+        state: RuntimeInitialState,
+        request_prefill: Option<String>,
+    },
+    Unchanged {
+        request_prefill: Option<String>,
+    },
+    RejectedBusy,
+    RejectedReadOnly,
+    Failed,
+}
+
 impl RuntimeInitialState {
     pub(crate) fn empty() -> Self {
         Self {
@@ -205,6 +222,9 @@ pub(crate) enum RuntimeEvent {
     NameAccepted {
         revision: u64,
         name: String,
+    },
+    NavigationCompleted {
+        outcome: NavigationOutcome,
     },
     SubmissionRejectedBusy {
         active_run_id: RunId,
@@ -394,7 +414,8 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
         RuntimeCommand::Submit { .. }
         | RuntimeCommand::ApplySettings { .. }
-        | RuntimeCommand::SetSessionName { .. } => None,
+        | RuntimeCommand::SetSessionName { .. }
+        | RuntimeCommand::Navigate { .. } => None,
     }
 }
 
@@ -475,6 +496,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
+        | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
@@ -732,7 +754,7 @@ impl<M: Model> RuntimeController<M> {
             home.path(),
             std::path::Path::new("/"),
             selection,
-            agent.checkpoint_for_test(),
+            agent.checkpoint(),
         )
         .expect("create persisted runtime session");
         let mut controller = Self::with_session(
@@ -969,6 +991,41 @@ impl<M: Model> RuntimeController<M> {
                     }
                 }
             }
+            RuntimeCommand::Navigate { entry } => {
+                let outcome = if self.disabled_reason.is_some() {
+                    NavigationOutcome::RejectedReadOnly
+                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                    NavigationOutcome::RejectedBusy
+                } else {
+                    self.drain_coordinator_events(events, progress).await;
+                    let (outcome, disabled) = self.restore_selected_entry(entry).await;
+                    self.emit(
+                        events,
+                        RuntimeEvent::NavigationCompleted {
+                            outcome: outcome.clone(),
+                        },
+                    );
+                    if let Some(reason) = disabled {
+                        match reason {
+                            RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
+                                self.disable_arena_checkpoint_recovery(events);
+                            }
+                            RuntimeDisabledReason::SessionStorageWriteFailed => {
+                                self.subagents.latch_storage_failure().await;
+                                self.disable_session_storage(events).await;
+                            }
+                            RuntimeDisabledReason::OpenAiAuthentication
+                            | RuntimeDisabledReason::SessionRestoreFailed => {
+                                unreachable!(
+                                    "navigation only disables for Arena or storage recovery"
+                                )
+                            }
+                        }
+                    }
+                    return;
+                };
+                self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
+            }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
             RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
             RuntimeCommand::Shutdown => {
@@ -976,6 +1033,126 @@ impl<M: Model> RuntimeController<M> {
                 self.request_shutdown().await;
             }
         }
+    }
+
+    async fn restore_selected_entry(
+        &mut self,
+        entry: SessionEntryId,
+    ) -> (NavigationOutcome, Option<RuntimeDisabledReason>) {
+        debug_assert!(self.agent.is_some(), "navigation requires the idle agent");
+        debug_assert_eq!(
+            self.subagents.operation_count(),
+            0,
+            "navigation requires settled child operations"
+        );
+
+        let restore = match self.session.restore_at(entry).await {
+            Ok(restore) => restore,
+            Err(_) => return (NavigationOutcome::Failed, None),
+        };
+        if restore.effective_entry == restore.observed_active_entry {
+            return (
+                NavigationOutcome::Unchanged {
+                    request_prefill: restore.request_prefill,
+                },
+                None,
+            );
+        }
+        let Some(executable) = restore.executable.clone() else {
+            return (NavigationOutcome::Failed, None);
+        };
+        let Some(agent) = self.agent.as_ref() else {
+            return (NavigationOutcome::Failed, None);
+        };
+        if agent
+            .validate_restored_history(&executable.history)
+            .is_err()
+        {
+            return (NavigationOutcome::Failed, None);
+        }
+        let previous_checkpoint = agent.checkpoint();
+        let target_restore = self
+            .agent
+            .as_mut()
+            .expect("navigation checked the idle agent")
+            .restore_arena(executable.checkpoint)
+            .await;
+        if let Err(error) = target_restore {
+            if !matches!(
+                error,
+                crate::arena::ArenaError::IncompatibleCheckpoint { .. }
+            ) && self
+                .agent
+                .as_mut()
+                .expect("navigation retains its agent after a failed restore")
+                .restore_arena(previous_checkpoint)
+                .await
+                .is_err()
+            {
+                return (
+                    NavigationOutcome::Failed,
+                    Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed),
+                );
+            }
+            return (NavigationOutcome::Failed, None);
+        }
+        if self
+            .session
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .agent
+                .as_mut()
+                .expect("navigation retains its agent after persistence failure")
+                .restore_arena(previous_checkpoint)
+                .await;
+            return (
+                NavigationOutcome::Failed,
+                Some(RuntimeDisabledReason::SessionStorageWriteFailed),
+            );
+        }
+
+        let selected_origins = restore
+            .tasks
+            .iter()
+            .filter_map(|task| task.record.origin_step_id())
+            .collect::<Vec<_>>();
+        assert!(
+            self.subagents
+                .replace_selected_origins(selected_origins)
+                .await,
+            "navigation has no tracked child operations"
+        );
+        let initial = restored_initial_state(&restore);
+        let request_prefill = restore.request_prefill;
+        self.agent
+            .as_mut()
+            .expect("navigation retains its agent after persistence")
+            .replace_idle_state(executable.history);
+        self.records = restore
+            .records
+            .into_iter()
+            .map(restored_stored_record)
+            .collect();
+        (
+            NavigationOutcome::Replaced {
+                state: initial,
+                request_prefill,
+            },
+            None,
+        )
+    }
+
+    fn disable_arena_checkpoint_recovery(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+        self.disabled_reason = Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed);
+        self.emit(
+            events,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            },
+        );
     }
 
     async fn handle_coordinator_event(
@@ -1645,7 +1822,7 @@ mod tests {
         StoredRecord, TerminalDetails, WorkerMessage, restored_initial_state,
         runtime_event_payload_bytes,
     };
-    use crate::agent::{Agent, ExecutionFailure, TerminalEvidence};
+    use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
         ToolCall, ToolCallSummary, ToolName,
@@ -4023,6 +4200,7 @@ mod tests {
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
+            RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
@@ -10345,10 +10523,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct BranchedResumeFixture {
+        footer_adjustment: Vec<AttemptAccounting>,
+        selected_leaf: SessionEntryId,
+        sibling_leaf: SessionEntryId,
+    }
+
+    #[cfg(unix)]
     async fn append_branched_resume_fixture(
         session: &Session,
         workspace: &Path,
-    ) -> Vec<AttemptAccounting> {
+    ) -> BranchedResumeFixture {
         let writer = session.writer();
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let selected_origin_step = u64::try_from(
@@ -10491,6 +10676,9 @@ mod tests {
             )
             .await
             .expect("close sibling run");
+        let sibling_leaf = SessionEntryId(
+            u64::try_from(active_entry_id(session)).expect("sibling entry ID fits u64"),
+        );
 
         let hidden_attempt = known_usage(DEFAULT_MODEL, 55, 5, 50);
         let mut hidden = completed_fixture_task(
@@ -10538,12 +10726,18 @@ mod tests {
         assert!(hidden_task_revision > origin_revision);
         set_active_entry_for_fixture(session, selected_leaf);
 
-        vec![
-            sibling_execution_attempt,
-            sibling_terminal_attempt,
-            hidden_attempt.clone(),
-            hidden_attempt,
-        ]
+        BranchedResumeFixture {
+            footer_adjustment: vec![
+                sibling_execution_attempt,
+                sibling_terminal_attempt,
+                hidden_attempt.clone(),
+                hidden_attempt,
+            ],
+            selected_leaf: SessionEntryId(
+                u64::try_from(selected_leaf).expect("selected entry ID fits u64"),
+            ),
+            sibling_leaf,
+        }
     }
 
     #[cfg(unix)]
@@ -10659,6 +10853,18 @@ mod tests {
         let mut socket = UnixStream::connect(socket_path).expect("connect to parent");
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session = Session::open(&home, &session_id).expect("open session through normal path");
+        let resumed_run_id = RunId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("read resumed run ID"),
+            )
+            .expect("resumed run ID fits u64"),
+        );
         let mut expected_history = session
             .restore()
             .expect("restore session")
@@ -10780,13 +10986,13 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(resumed_events.iter().all(|event| match event {
             RuntimeEvent::RunStarted { run_id } | RuntimeEvent::RunSettled { run_id } => {
-                *run_id == RunId(3)
+                *run_id == resumed_run_id
             }
             RuntimeEvent::ModelStepStarted { run_id, .. }
             | RuntimeEvent::RecordAppended {
                 record: StoredRecord { run_id, .. },
                 ..
-            } => *run_id == RunId(3),
+            } => *run_id == resumed_run_id,
             RuntimeEvent::SubagentSpawned { record }
             | RuntimeEvent::SubagentRecord { record }
             | RuntimeEvent::SubagentFinished { record } => record.id().as_str() == "64",
@@ -10880,8 +11086,8 @@ mod tests {
         shutdown_controller(commands, controller).await;
         assert_eq!(starts.load(Ordering::SeqCst), 1, "{saved_events:?}");
 
-        let expected_footer_adjustment =
-            append_branched_resume_fixture(&session, workspace.path()).await;
+        let fixture = append_branched_resume_fixture(&session, workspace.path()).await;
+        let expected_footer_adjustment = fixture.footer_adjustment.clone();
         let (sibling_payload, sibling_replay): (String, Vec<u8>) = session
             .connection_for_test()
             .expect("lock session connection")
@@ -10959,9 +11165,212 @@ mod tests {
         assert!(footer.contains("CH0.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
 
+        let mut sibling_context = session
+            .writer()
+            .restore_at(fixture.sibling_leaf)
+            .await
+            .expect("restore sibling branch")
+            .executable
+            .expect("sibling branch is executable")
+            .history;
+        sibling_context.append_user_request("continue sibling");
+        let mut original_context = session
+            .writer()
+            .restore_at(fixture.selected_leaf)
+            .await
+            .expect("restore original branch")
+            .executable
+            .expect("original branch is executable")
+            .history;
+        original_context.append_user_request("probe original");
+        let root = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT id FROM entries WHERE kind = 'session_start'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read root entry"),
+            )
+            .expect("root entry ID fits u64"),
+        );
+        let navigation_contexts = Arc::new(Mutex::new(Vec::new()));
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create navigation tool host"),
+        )
+        .await
+        .expect("create navigation arena");
+        let (settings, _) = watch::channel(selection);
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            NavigationBranchesModel {
+                contexts: navigation_contexts.clone(),
+                step: 0,
+            },
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(Arc::new(AtomicUsize::new(0)))),
+            ),
+            None,
+        )
+        .await
+        .expect("restore navigation runtime");
+        assert_eq!(
+            initial,
+            restored_initial_state(&session.restore().expect("restore original"))
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("rewind to root");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: fixture.sibling_leaf,
+            })
+            .await
+            .expect("select sibling branch");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                request_prefill: None,
+                ..
+            }
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue sibling".to_owned(),
+            })
+            .await
+            .expect("continue sibling");
+        events_until_settled(&mut events).await;
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: fixture.selected_leaf,
+            })
+            .await
+            .expect("return original branch");
+        let returned_state = match next_navigation_outcome(&mut events).await {
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } => state,
+            outcome => panic!("unexpected original-branch outcome: {outcome:?}"),
+        };
+        let expected_returned_state =
+            restored_initial_state(&session.restore().expect("restore returned original branch"));
+        assert_eq!(returned_state, expected_returned_state);
+        assert_eq!(active_entry_id(&session), fixture.selected_leaf.0 as i64);
+        let visible_task_ids = returned_state
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::SubagentSpawned(record)
+                | RestoredTimelineItem::SubagentFinished(record) => {
+                    Some(record.id().as_str().to_owned())
+                }
+                RestoredTimelineItem::Record(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            visible_task_ids,
+            BTreeSet::from(["00".to_owned(), "62".to_owned()])
+        );
+        let returned_footer =
+            Transcript::restored(crate::config::ready_snapshot_for_test(), &returned_state)
+                .layout(160)
+                .footer_rule(160)
+                .to_string();
+        assert!(returned_footer.contains("↑220 ↓20"), "{returned_footer}");
+        assert!(returned_footer.contains("CH0.0%"), "{returned_footer}");
+        assert!(returned_footer.contains("0.0%/272k"), "{returned_footer}");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("authorised"))
+                .expect("read retained external effect"),
+            "original"
+        );
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "probe original".to_owned(),
+            })
+            .await
+            .expect("probe original branch");
+        let probe_events = events_until_settled(&mut events).await;
+        assert!(probe_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if result_head(execution) == "41"
+        )));
+        assert_eq!(
+            navigation_contexts
+                .lock()
+                .expect("navigation model contexts lock")[0],
+            sibling_context.entries()
+        );
+        assert_eq!(
+            navigation_contexts
+                .lock()
+                .expect("navigation model contexts lock")[2],
+            original_context.entries()
+        );
+        shutdown_controller(commands, controller).await;
+        let final_restore = session.restore().expect("restore final selected branch");
+        let final_checkpoint = final_restore
+            .executable
+            .as_ref()
+            .expect("final selected branch is executable")
+            .checkpoint
+            .clone();
+        let final_history = final_restore
+            .executable
+            .as_ref()
+            .expect("final selected branch is executable")
+            .history
+            .clone();
+        let final_leaf = final_restore.effective_entry;
+
         let session_id = session.id().to_owned();
         let id_bounds = stored_id_bounds(home.path(), &session_id);
         session.close().expect("close original session");
+        let reopened =
+            Session::open(home.path(), &session_id).expect("reopen final selected session");
+        let reopened_restore = reopened
+            .restore()
+            .expect("restore reopened selected branch");
+        assert_eq!(reopened_restore.effective_entry, final_leaf);
+        let reopened_executable = reopened_restore
+            .executable
+            .expect("reopened selected branch is executable");
+        assert_eq!(reopened_executable.checkpoint, final_checkpoint);
+        assert_eq!(reopened_executable.history, final_history);
+        assert_eq!(
+            reopened_restore.footer_adjustment,
+            final_restore.footer_adjustment
+        );
+        assert_eq!(reopened_restore.records, final_restore.records);
+        assert_eq!(reopened_restore.tasks, final_restore.tasks);
+        reopened.close().expect("close reopened selected session");
         let socket_path = home.path().join("resume.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind resume socket");
         let mut child = Command::new(env::current_exe().expect("test executable"))
@@ -11004,6 +11413,1559 @@ mod tests {
             fs::read_to_string(workspace.path().join("authorised")).expect("read restored write"),
             "changed without reread"
         );
+    }
+
+    async fn persist_navigation_branch(
+        session: &Session,
+        arena: &mut Arena,
+        request: &str,
+        source: &str,
+        final_text: &str,
+    ) -> (SessionEntryId, ModelHistory, Checkpoint) {
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request(request.to_owned())
+            .await
+            .expect("commit branch request");
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start branch execution");
+        let execution = arena
+            .execute(source, &CancellationToken::new())
+            .await
+            .expect("execute branch state");
+        let checkpoint = arena.checkpoint();
+        writer
+            .settle_execution(
+                run_id,
+                step_id,
+                PersistedCode {
+                    source: source.to_owned(),
+                    call_id: ModelCallId::new(format!("{request}-code")),
+                    commentary: None,
+                    reasoning_summary: String::new(),
+                    selection: Some(selection),
+                    replay: fixture_replay(&format!("{request} execution")),
+                    result: CodeResult::execution(String::new()),
+                    execution: Some(execution),
+                    attempts: Vec::new(),
+                },
+                checkpoint.clone(),
+            )
+            .await
+            .expect("settle branch execution");
+        let terminal_step = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start branch terminal");
+        let terminal_text = final_text.to_owned();
+        let terminal_replay = fixture_replay(&format!("{request} final"));
+        writer
+            .close_run(
+                run_id,
+                Some(terminal_step),
+                move || PersistedTerminal::Final {
+                    step_id: terminal_step,
+                    text: terminal_text,
+                    reasoning_summary: String::new(),
+                    replay: terminal_replay,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close branch run");
+        let terminal_entry = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT terminal_entry_id FROM runs WHERE id = ?1",
+                params![i64::try_from(run_id).expect("run ID fits SQLite")],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read branch terminal");
+        let mut history = ModelHistory::new();
+        history.append_user_request(request);
+        history
+            .append_completed_code(
+                source.to_owned(),
+                ModelCallId::new(format!("{request}-code")),
+                None,
+                String::new(),
+                fixture_replay(&format!("{request} execution")),
+                CodeResult::execution(String::new()),
+            )
+            .expect("append branch code");
+        history.append_final_message(
+            final_text.to_owned(),
+            String::new(),
+            fixture_replay(&format!("{request} final")),
+        );
+        (
+            SessionEntryId(u64::try_from(terminal_entry).expect("entry ID fits u64")),
+            history,
+            checkpoint,
+        )
+    }
+
+    struct NavigationStateModel {
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        step: usize,
+    }
+
+    struct RejectTargetHistoryModel;
+
+    impl Model for RejectTargetHistoryModel {
+        fn validate_history(&self, history: &ModelHistory) -> Result<(), ModelError> {
+            if history.entries().iter().any(|entry| {
+                matches!(entry, ModelContextEntry::UserRequest { text } if text == "target branch")
+            }) {
+                return Err(ModelError::InvalidResponse("rejected target history"));
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    struct NavigationBranchesModel {
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        step: usize,
+    }
+
+    impl Model for NavigationBranchesModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .expect("navigation model contexts lock")
+                    .push(history.entries().to_vec());
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "assert sibling_value == 99\nsibling_value".to_owned(),
+                        call_id: ModelCallId::new("continue-sibling"),
+                        commentary: None,
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "sibling continuation".to_owned(),
+                    },
+                    2 => CompletedModelAction::Code {
+                        source: "assert saved_value == 41\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('62')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
+                        call_id: ModelCallId::new("probe-original"),
+                        commentary: None,
+                    },
+                    3 => CompletedModelAction::Message {
+                        text: "original branch verified".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    impl Model for NavigationStateModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "assert branch_value == 'target'\nbranch_value".to_owned(),
+                        call_id: ModelCallId::new("navigation-continuation"),
+                        commentary: None,
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "continued target branch".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_arena_and_context_before_publishing_history() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let initial_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create initial arena");
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            selection,
+            initial_arena.checkpoint(),
+        )
+        .expect("create session");
+        let root = session.restore().expect("restore root").effective_entry;
+        let mut fixture_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create fixture tool host"),
+        )
+        .await
+        .expect("create fixture arena");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore root checkpoint");
+        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "old branch",
+            "branch_value = 'old'",
+            "old branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(root, old_entry)
+            .await
+            .expect("return fixture to root");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (target_entry, target_history, _) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "target branch",
+            "branch_value = 'target'",
+            "target branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(old_entry, target_entry)
+            .await
+            .expect("select old branch for navigation");
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create live tool host"),
+        )
+        .await
+        .expect("create live arena");
+        live_arena
+            .restore(old_checkpoint)
+            .await
+            .expect("restore old branch live state");
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(
+                live_arena,
+                NavigationStateModel {
+                    contexts: contexts.clone(),
+                    step: 0,
+                },
+                old_history,
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("navigate to target branch");
+        let navigation = next_event(&mut events).await;
+        assert!(matches!(
+            navigation,
+            RuntimeEvent::NavigationCompleted {
+                outcome: super::NavigationOutcome::Replaced {
+                    ref state,
+                    request_prefill: None,
+                },
+            } if state.timeline.len() == 3
+        ));
+        assert_eq!(
+            session
+                .restore()
+                .expect("persist selected target")
+                .effective_entry,
+            target_entry
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue".to_owned(),
+            })
+            .await
+            .expect("submit after navigation");
+        let continued = events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let mut expected_context = target_history;
+        expected_context.append_user_request("continue");
+        assert_eq!(contexts.lock().unwrap()[0], expected_context.entries());
+        assert!(continued.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if matches!(execution.outcome, ExecutionOutcome::Complete { .. })
+        )));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        session.close().expect("close session");
+    }
+
+    async fn next_navigation_outcome(
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> super::NavigationOutcome {
+        loop {
+            if let RuntimeEvent::NavigationCompleted { outcome } = next_event(events).await {
+                return outcome;
+            }
+        }
+    }
+
+    async fn navigation_fixture(
+        workspace: &tempfile::TempDir,
+    ) -> (
+        tempfile::TempDir,
+        Session,
+        Arena,
+        ModelHistory,
+        SessionEntryId,
+        SessionEntryId,
+        SessionEntryId,
+    ) {
+        let home = tempfile::tempdir().expect("create home");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let initial_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create initial tool host"),
+        )
+        .await
+        .expect("create initial arena");
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            selection,
+            initial_arena.checkpoint(),
+        )
+        .expect("create session");
+        let root = session.restore().expect("restore root").effective_entry;
+        let mut fixture_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create fixture tool host"),
+        )
+        .await
+        .expect("create fixture arena");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "old branch",
+            "branch_value = 'old'",
+            "old branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(root, old_entry)
+            .await
+            .expect("return fixture to root");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (target_entry, _, _) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "target branch",
+            "branch_value = 'target'",
+            "target branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(old_entry, target_entry)
+            .await
+            .expect("select old fixture branch");
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create live tool host"),
+        )
+        .await
+        .expect("create live arena");
+        live_arena
+            .restore(old_checkpoint)
+            .await
+            .expect("restore old live state");
+        (
+            home,
+            session,
+            live_arena,
+            old_history,
+            root,
+            old_entry,
+            target_entry,
+        )
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_root_request_execution_and_terminal_points() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        fs::write(workspace.path().join("effect"), "retained").expect("write external effect");
+        let (_home, session, live_arena, old_history, root, _old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_execution = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE id = ?1",
+                        [i64::try_from(target_entry.0).expect("target entry fits SQLite")],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read target execution"),
+            )
+            .expect("execution entry fits u64"),
+        );
+        let target_request = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE id = ?1",
+                        [i64::try_from(target_execution.0).expect("execution entry fits SQLite")],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read target request"),
+            )
+            .expect("request entry fits u64"),
+        );
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::with_session(
+            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("navigate to root");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_execution,
+            })
+            .await
+            .expect("navigate to execution");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.len() == 2
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_request,
+            })
+            .await
+            .expect("navigate to request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: Some(request),
+            } if state.timeline.is_empty() && request == "target branch"
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_request,
+            })
+            .await
+            .expect("navigate to current request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: Some(request),
+            } if request == "target branch"
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("navigate to terminal");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.len() == 3
+        ));
+        shutdown_controller(commands, controller).await;
+
+        assert_eq!(active_entry_id(&session), target_entry.0 as i64);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("effect")).expect("read external effect"),
+            "retained"
+        );
+        session.close().expect("close session");
+    }
+
+    fn replace_entry_checkpoint_state(session: &Session, entry: SessionEntryId, state: Vec<u8>) {
+        let connection = session.connection_for_test().expect("lock session");
+        connection
+            .execute_batch("DROP TRIGGER checkpoints_are_immutable_before_update")
+            .expect("allow corrupt checkpoint fixture");
+        connection
+            .execute(
+                "UPDATE checkpoints SET arena_state = ?1 WHERE id = (SELECT checkpoint_id FROM entries WHERE id = ?2)",
+                params![state, i64::try_from(entry.0).expect("entry ID fits SQLite")],
+            )
+            .expect("replace target checkpoint state");
+    }
+
+    fn replace_entry_checkpoint_identity(session: &Session, entry: SessionEntryId, identity: &str) {
+        let connection = session.connection_for_test().expect("lock session");
+        connection
+            .execute_batch("DROP TRIGGER checkpoints_are_immutable_before_update")
+            .expect("allow incompatible checkpoint fixture");
+        connection
+            .execute(
+                "UPDATE checkpoints SET runtime_identity = ?1 WHERE id = (SELECT checkpoint_id FROM entries WHERE id = ?2)",
+                params![identity, i64::try_from(entry.0).expect("entry ID fits SQLite")],
+            )
+            .expect("replace target checkpoint identity");
+    }
+
+    async fn navigation_checkpoint(session: &Session, entry: SessionEntryId) -> Checkpoint {
+        session
+            .writer()
+            .restore_at(entry)
+            .await
+            .expect("restore navigation entry")
+            .executable
+            .expect("navigation entry is executable")
+            .checkpoint
+    }
+
+    fn navigation_controller<M: Model>(
+        session: &Session,
+        arena: Arena,
+        history: ModelHistory,
+        model: M,
+        gate: ArenaRestoreTestGate,
+    ) -> RuntimeController<M> {
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        RuntimeController::with_session(
+            Agent::restored(arena, model, history).with_restore_test_gate(gate),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        )
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_invalid_history_without_restoring_arena() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            RejectTargetHistoryModel,
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert!(gate.attempts().is_empty());
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Navigate { entry: old_entry })
+            .await
+            .expect("navigate at unchanged entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_does_not_compensate_an_incompatible_checkpoint() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_identity(
+            &session,
+            target_entry,
+            "incompatible navigation runtime",
+        );
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(gate.attempts(), vec![target_checkpoint]);
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Navigate { entry: old_entry })
+            .await
+            .expect("navigate at unchanged entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_recovers_after_a_compatible_checkpoint_load_failure() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_state(&session, target_entry, vec![0]);
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "assert branch_value == 'old'\nbranch_value".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "old branch remains active".to_owned(),
+                },
+            ]),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue old branch".to_owned(),
+            })
+            .await
+            .expect("submit after recovered navigation");
+        let events_after_recovery = events_until_settled(&mut events).await;
+        assert!(events_after_recovery.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if result_head(execution) == "'old'"
+        )));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_disables_when_checkpoint_compensation_fails() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_state(&session, target_entry, vec![0]);
+        let gate = ArenaRestoreTestGate::new();
+        gate.fail_attempt(2);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert_eq!(
+            gate.attempts(),
+            vec![
+                session
+                    .writer()
+                    .restore_at(target_entry)
+                    .await
+                    .expect("restore target")
+                    .executable
+                    .expect("target history is executable")
+                    .checkpoint,
+                session
+                    .writer()
+                    .restore_at(old_entry)
+                    .await
+                    .expect("restore old")
+                    .executable
+                    .expect("old history is executable")
+                    .checkpoint,
+            ]
+        );
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must remain disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_compensates_after_an_active_leaf_conflict() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        gate.pause_attempt(1);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        gate.wait_until_paused().await;
+        set_active_entry_for_fixture(&session, target_entry.0 as i64);
+        gate.resume();
+
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        assert_eq!(active_entry_id(&session), target_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must remain disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_foreground_and_background_work() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "active request".to_owned(),
+            })
+            .await
+            .expect("submit active request");
+        provider_called.notified().await;
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            })
+            .await
+            .expect("request navigation during foreground work");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::RejectedBusy
+        ));
+        commands
+            .send(RuntimeCommand::Cancel)
+            .await
+            .expect("cancel foreground work");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let subagents = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CancellationOnlyChildRunner),
+        );
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let controller = controller_with_subagents(
+            &workspace,
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('background')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection,
+                message_waiting: None,
+            },
+            subagents,
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start background work".to_owned(),
+            })
+            .await
+            .expect("submit child request");
+        let settled = events_until_settled(&mut events).await;
+        assert!(
+            settled
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SubagentSpawned { .. })),
+            "child was not admitted: {settled:?}"
+        );
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            })
+            .await
+            .expect("request navigation during child work");
+        let outcome = next_navigation_outcome(&mut events).await;
+        assert!(
+            matches!(outcome, super::NavigationOutcome::RejectedBusy),
+            "unexpected navigation outcome: {outcome:?}"
+        );
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .expect("cancel background work");
+        shutdown_controller(commands, controller).await;
+    }
+
+    async fn assert_navigation_is_rejected_busy(
+        commands: &mpsc::Sender<RuntimeCommand>,
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) {
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            })
+            .await
+            .expect("request navigation while work is active");
+        assert!(matches!(
+            next_navigation_outcome(events).await,
+            super::NavigationOutcome::RejectedBusy
+        ));
+    }
+
+    async fn controller_with_write_gate<M: Model>(
+        workspace: &tempfile::TempDir,
+        gate: SessionWriteGate,
+        model: M,
+        subagents: SessionSubagents,
+    ) -> (tempfile::TempDir, Session, RuntimeController<M>) {
+        let home = tempfile::tempdir().expect("create session home");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate,
+        )
+        .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, model),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            subagents,
+            session.writer(),
+        );
+        (home, session, controller)
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_each_busy_phase() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let policy = SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents());
+
+        let request_gate = SessionWriteGate::new(SessionWriteKind::Request);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            request_gate.clone(),
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: Arc::new(Notify::new()),
+            },
+            SubagentCoordinator::new(policy, Arc::new(CancellationOnlyChildRunner)),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold request admission".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        request_gate.wait_until_started().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        request_gate.release();
+        commands
+            .send(RuntimeCommand::Cancel)
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold generation".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        provider_called.notified().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        commands
+            .send(RuntimeCommand::Cancel)
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let read_gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host")
+                .with_test_gate(read_gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let controller = RuntimeController::for_test(Agent::new(
+            arena,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await read('blocked')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "unreachable".to_owned(),
+                },
+            ]),
+        ));
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold execution".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        read_gate.wait_until_read_started().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        commands
+            .send(RuntimeCommand::Cancel)
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let closure_gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            closure_gate.clone(),
+            CountingMessageModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            SubagentCoordinator::new(policy, Arc::new(CancellationOnlyChildRunner)),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold closure".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        closure_gate.wait_until_started().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        closure_gate.release();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            admission_gate.clone(),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold admission')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child admission".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        admission_gate.wait_until_started().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        admission_gate.release();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let child_started = Arc::new(Notify::new());
+        let child_release = Arc::new(Notify::new());
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            SessionWriteGate::new(SessionWriteKind::Preferences),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold child execution')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: child_started.clone(),
+                release: child_release.clone(),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child execution".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        child_started.notified().await;
+        events_until_settled(&mut events).await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        child_release.notify_one();
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
+        let child_started = Arc::new(Notify::new());
+        let child_release = Arc::new(Notify::new());
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            terminal_gate.clone(),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold child terminal')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: child_started.clone(),
+                release: child_release.clone(),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child terminal".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        child_started.notified().await;
+        events_until_settled(&mut events).await;
+        child_release.notify_one();
+        terminal_gate.wait_until_started().await;
+        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        terminal_gate.release();
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_failure_preserves_selection_and_latches_storage() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_navigation_selection BEFORE UPDATE OF active_entry_id ON session WHEN NEW.active_entry_id != OLD.active_entry_id BEGIN SELECT RAISE(ABORT, 'reject navigation selection'); END;",
+            )
+            .expect("reject navigation selection");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history)
+                .with_restore_test_gate(gate.clone()),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation after storage failure");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::RejectedReadOnly
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "after storage failure".to_owned(),
+            })
+            .await
+            .expect("submit after storage failure");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_waits_for_selection_persistence_before_later_commands() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            live_arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let (_, history, _) = persist_navigation_branch(
+            &session,
+            &mut live_arena,
+            "selected branch",
+            "branch_value = 'selected'",
+            "selected final",
+        )
+        .await;
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(
+                live_arena,
+                CountingMessageModel {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                history,
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("request navigation");
+        gate.wait_until_started().await;
+        assert!(events.try_recv().is_err());
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "queued after navigation".to_owned(),
+            })
+            .await
+            .expect("queue request after navigation");
+        assert!(events.try_recv().is_err());
+        gate.release();
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        let submitted = events_until_settled(&mut events).await;
+        assert!(submitted.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { request },
+                    ..
+                },
+                ..
+            } if request == "queued after navigation"
+        )));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE kind = 'user_request' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read queued request parent"),
+            root.0 as i64
+        );
+        shutdown_controller(commands, controller).await;
+
+        let selected_after_submission = SessionEntryId(active_entry_id(&session) as u64);
+        let id = session.id().to_owned();
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        assert_eq!(
+            reopened
+                .restore()
+                .expect("restore persisted navigation")
+                .requested_entry,
+            selected_after_submission
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    async fn navigation_short_circuits_a_current_request_before_arena_restore() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let writer = session.writer();
+        let run = writer
+            .commit_request("prefilled request".to_owned())
+            .await
+            .expect("commit request");
+        let request = SessionEntryId(active_entry_id(&session) as u64);
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request");
+        set_active_entry_for_fixture(&session, root.0 as i64);
+        drop(writer);
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, ScriptedModel::new(Vec::new())),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: request })
+            .await
+            .expect("request current request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: Some(request),
+            } if request == "prefilled request"
+        ));
+        assert!(!gate.has_started());
+        assert_eq!(active_entry_id(&session), root.0 as i64);
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
     }
 
     #[tokio::test]

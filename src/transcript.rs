@@ -2517,7 +2517,9 @@ impl Transcript {
                     | self.replace_subagent_record(record)
             }
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
-            RuntimeEvent::SettingsAccepted { .. } | RuntimeEvent::NameAccepted { .. } => false,
+            RuntimeEvent::SettingsAccepted { .. }
+            | RuntimeEvent::NameAccepted { .. }
+            | RuntimeEvent::NavigationCompleted { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.disabled_reason.is_none()
                     && (self.run_state == RunState::Submitting
