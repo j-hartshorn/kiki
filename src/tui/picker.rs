@@ -187,17 +187,25 @@ impl<T: Copy + Eq> Picker<T> {
         }
     }
 
-    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        if area.is_empty() {
-            return;
-        }
-        let popup = popup_area(
-            area,
+    pub(crate) fn desired_height(&self) -> u16 {
+        u16::try_from(
             self.items
                 .len()
                 .saturating_add(self.group_heading_count())
-                .max(1),
-        );
+                .max(1)
+                .saturating_add(3),
+        )
+        .unwrap_or(u16::MAX)
+    }
+
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.render_in(frame, popup_area(area, self.desired_height()));
+    }
+
+    pub(crate) fn render_in(&mut self, frame: &mut Frame, popup: Rect) {
+        if popup.is_empty() {
+            return;
+        }
         frame.render_widget(Clear, popup);
         let block = Block::bordered().title(self.title);
         let inner = block.inner(popup);
@@ -429,9 +437,8 @@ pub(super) fn canonical_search(text: &str) -> String {
     text.to_lowercase()
 }
 
-fn popup_area(area: Rect, content_rows: usize) -> Rect {
+fn popup_area(area: Rect, desired_height: u16) -> Rect {
     let width = area.width.min(PICKER_MAX_WIDTH);
-    let desired_height = u16::try_from(content_rows.saturating_add(3)).unwrap_or(u16::MAX);
     let height = area.height.min(desired_height.max(1));
     Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),

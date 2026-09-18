@@ -132,15 +132,19 @@ impl<T: Copy + Eq> SessionTree<T> {
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&TreeProjection::all(&self.nodes)),
+            self.items(&TreeProjection::all(&self.nodes), PICKER_ROW_WIDTH),
             self.active_value,
             PickerSavePolicy::Disabled,
         )
     }
 
     pub(crate) fn refresh(&self, picker: &mut Picker<T>) {
+        self.refresh_for_width(picker, PICKER_ROW_WIDTH);
+    }
+
+    pub(crate) fn refresh_for_width(&self, picker: &mut Picker<T>, row_width: usize) {
         let projection = self.filtered_projection(picker);
-        picker.replace_items(self.items(&projection));
+        picker.replace_items(self.items(&projection, row_width));
     }
 
     fn filtered_projection(&self, picker: &Picker<T>) -> TreeProjection {
@@ -161,7 +165,7 @@ impl<T: Copy + Eq> SessionTree<T> {
         TreeProjection::new(&self.nodes, direct_matches, visible)
     }
 
-    fn items(&self, projection: &TreeProjection) -> Vec<DynamicPickerItem<T>> {
+    fn items(&self, projection: &TreeProjection, row_width: usize) -> Vec<DynamicPickerItem<T>> {
         self.preorder
             .iter()
             .copied()
@@ -171,7 +175,7 @@ impl<T: Copy + Eq> SessionTree<T> {
                 let direct = projection.direct_matches[index];
                 DynamicPickerItem {
                     row: Line::styled(
-                        truncate_end(&self.display_text(index, projection), PICKER_ROW_WIDTH),
+                        truncate_end(&self.display_text(index, projection), row_width),
                         self.style(index),
                     ),
                     role: if direct {
