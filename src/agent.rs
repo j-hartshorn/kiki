@@ -10,7 +10,9 @@ use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
-use crate::session::{PersistedCode, PersistedTerminal, SessionError, SessionWriter};
+use crate::session::{
+    PersistedCode, PersistedTerminal, SessionEntryId, SessionError, SessionWriter,
+};
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
@@ -107,6 +109,7 @@ pub enum AgentRunOutcome {
 pub(crate) enum PersistedAgentEvent {
     RequestCommitted {
         run_id: u64,
+        request_entry: SessionEntryId,
         request: String,
     },
     ModelStepStarted {
@@ -638,9 +641,14 @@ impl<M: Model> Agent<M> {
         if self.staged_final_message.is_some() {
             return Err(SessionError::InvalidTransition);
         }
-        let run_id = writer.commit_request(request.clone()).await?;
+        let admission = writer.commit_request(request.clone()).await?;
+        let run_id = admission.run_id;
         self.model_context.append_user_request(request.clone());
-        event(PersistedAgentEvent::RequestCommitted { run_id, request });
+        event(PersistedAgentEvent::RequestCommitted {
+            run_id,
+            request_entry: admission.request_entry,
+            request,
+        });
 
         let mut attempts = Vec::new();
         let mut committed_attempts = 0;
@@ -1455,7 +1463,7 @@ mod tests {
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
+    use crate::session::{Session, SessionEntryId, SessionWriteGate, SessionWriteKind};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -3021,6 +3029,55 @@ mod tests {
 
         drop(writer);
         session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_request_admission_carries_its_committed_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }],
+        )
+        .await;
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let mut events = Vec::new();
+        let outcome = {
+            let mut event = |event| events.push(event);
+            agent
+                .run_persisted(
+                    "request entry".to_owned(),
+                    &CancellationToken::new(),
+                    &session.writer(),
+                    &mut event,
+                )
+                .await
+                .expect("run persisted agent")
+        };
+        let request_entry = events
+            .into_iter()
+            .find_map(|event| match event {
+                super::PersistedAgentEvent::RequestCommitted { request_entry, .. } => {
+                    Some(request_entry)
+                }
+                _ => None,
+            })
+            .expect("request admission event");
+        let committed_entry: i64 = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT id FROM entries WHERE run_id = ?1 AND kind = 'user_request'",
+                [i64::try_from(outcome.run_id).expect("run ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read committed request entry");
+        assert_eq!(request_entry, SessionEntryId(committed_entry as u64));
+        session.close().expect("close session");
     }
 
     #[tokio::test]

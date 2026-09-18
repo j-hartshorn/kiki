@@ -31,8 +31,8 @@ use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
-    NavigationOutcome, ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState,
-    RuntimeProgressReceiver, TreeRequestOutcome, control_command,
+    CorrectionOutcome, NavigationOutcome, ProgressEnvelope, RunId, RuntimeCommand, RuntimeEvent,
+    RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
 use crate::session::SessionEntryId;
@@ -171,6 +171,10 @@ struct App {
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
+    submission_at: Option<Instant>,
+    correction_pending: bool,
+    correction_run_id: Option<RunId>,
+    ignored_progress_run_id: Option<RunId>,
     history_position: HistoryPosition,
     history_height: usize,
     history_rows: usize,
@@ -211,6 +215,10 @@ impl Default for App {
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
+            submission_at: None,
+            correction_pending: false,
+            correction_run_id: None,
+            ignored_progress_run_id: None,
             history_position: HistoryPosition::FollowingBottom,
             history_height: 0,
             history_rows: 0,
@@ -256,6 +264,33 @@ impl Update {
             commands,
             ..Self::default()
         }
+    }
+}
+
+fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
+    match event {
+        RuntimeEvent::RunStarted { run_id }
+        | RuntimeEvent::ModelStepStarted { run_id, .. }
+        | RuntimeEvent::ModelProgress { run_id, .. }
+        | RuntimeEvent::ExecutionStarted { run_id, .. }
+        | RuntimeEvent::ToolUpdated { run_id, .. }
+        | RuntimeEvent::RunPreviewUpdated { run_id, .. }
+        | RuntimeEvent::StdoutDelta { run_id, .. }
+        | RuntimeEvent::StdoutTruncated { run_id, .. }
+        | RuntimeEvent::RunSettled { run_id }
+        | RuntimeEvent::CorrectionCompleted { run_id, .. } => Some(*run_id),
+        RuntimeEvent::RecordAppended { record, .. } => Some(record.run_id),
+        RuntimeEvent::SettingsAccepted { .. }
+        | RuntimeEvent::NameAccepted { .. }
+        | RuntimeEvent::NavigationCompleted { .. }
+        | RuntimeEvent::TreeCatalogue { .. }
+        | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::RuntimeDisabled { .. }
+        | RuntimeEvent::SubmissionRejectedDisabled { .. }
+        | RuntimeEvent::SubagentSpawned { .. }
+        | RuntimeEvent::SubagentStatus { .. }
+        | RuntimeEvent::SubagentRecord { .. }
+        | RuntimeEvent::SubagentFinished { .. } => None,
     }
 }
 
@@ -459,7 +494,11 @@ impl App {
                 && !self.foreground_cancellation_requested
             {
                 self.foreground_cancellation_requested = true;
-                return Update::with_commands([RuntimeCommand::Cancel]);
+                let correction = self.submission_at.is_some_and(|submitted_at| {
+                    now.saturating_duration_since(submitted_at) <= Duration::from_secs(2)
+                });
+                self.correction_pending = correction;
+                return Update::with_commands([RuntimeCommand::Cancel { correction }]);
             }
             return Update::with_commands([RuntimeCommand::CancelBackground]);
         }
@@ -480,7 +519,9 @@ impl App {
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
         }
-        if self.manual_navigation_pending && key.code == KeyCode::Enter && key.modifiers.is_empty()
+        if (self.manual_navigation_pending || self.correction_pending)
+            && key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
         {
             self.set_notice("Session restoration is still in progress.".to_owned());
             return Update {
@@ -501,6 +542,7 @@ impl App {
                 let mut commands = Vec::new();
                 self.flush_preview(&mut commands);
                 self.transcript.begin_submission();
+                self.submission_at = Some(now);
                 commands.push(RuntimeCommand::Submit { request: draft });
                 let mut update = Update::with_commands(commands);
                 update.visible_changed = true;
@@ -1259,6 +1301,12 @@ impl App {
     }
 
     fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
+        if self
+            .ignored_progress_run_id
+            .is_some_and(|run_id| runtime_event_run_id(&envelope.item) == Some(run_id))
+        {
+            return false;
+        }
         self.handle_event_with_gap_at(envelope.item, envelope.gap_before, Instant::now())
     }
 
@@ -1268,8 +1316,39 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
-        if matches!(&event, RuntimeEvent::RunSettled { .. }) {
+        if let RuntimeEvent::RecordAppended { record, .. } = &event
+            && self.correction_pending
+            && matches!(&record.record, crate::runtime::Record::CancelledRun { .. })
+        {
+            self.correction_run_id = Some(record.run_id);
+        }
+        if let RuntimeEvent::RunSettled { run_id } = &event {
             self.foreground_cancellation_requested = false;
+            self.submission_at = None;
+            if self.correction_pending
+                && self
+                    .correction_run_id
+                    .is_none_or(|correction_run_id| correction_run_id == *run_id)
+            {
+                self.correction_pending = false;
+                self.correction_run_id = None;
+            }
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::SubmissionRejectedBusy { .. }
+                | RuntimeEvent::SubmissionRejectedDisabled { .. }
+                | RuntimeEvent::RuntimeDisabled { .. }
+        ) {
+            self.submission_at = None;
+            self.correction_pending = false;
+            self.correction_run_id = None;
+        }
+        if let RuntimeEvent::CorrectionCompleted { run_id, outcome } = &event
+            && self.correction_pending
+            && self.correction_run_id == Some(*run_id)
+        {
+            return self.handle_correction_completed(*run_id, outcome);
         }
         if let RuntimeEvent::TreeCatalogue { revision, outcome } = &event {
             return self.handle_tree_catalogue(*revision, outcome);
@@ -1331,6 +1410,31 @@ impl App {
             }
         }
         true
+    }
+
+    fn handle_correction_completed(&mut self, run_id: RunId, outcome: &CorrectionOutcome) -> bool {
+        let notice_cleared = self.clear_notice();
+        let changed = match outcome {
+            CorrectionOutcome::Replaced {
+                state,
+                request_prefill,
+            } => {
+                self.replace_restored_state(state, request_prefill);
+                self.ignored_progress_run_id = Some(run_id);
+                true
+            }
+            CorrectionOutcome::SkippedBackground => {
+                self.set_notice(
+                    "Session was not restored because background work is active.".to_owned(),
+                );
+                true
+            }
+            CorrectionOutcome::Failed => {
+                self.set_notice("Session could not be restored.".to_owned());
+                true
+            }
+        };
+        changed | notice_cleared
     }
 
     fn handle_navigation_completed(&mut self, outcome: &NavigationOutcome) -> bool {
@@ -2323,9 +2427,9 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        ModelStepId, NavigationOutcome, Record, RestoredTimelineItem, RunId, RuntimeCommand,
-        RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
-        TreeRequestOutcome,
+        CorrectionOutcome, ModelStepId, NavigationOutcome, ProgressEnvelope, Record,
+        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
+        RuntimeInitialState, StoredRecord, TerminalDetails, TreeRequestOutcome,
     };
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
@@ -3508,7 +3612,7 @@ mod tests {
         cancel.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         assert_eq!(
             cancel.handle_key(key(KeyCode::Esc)).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
         assert_eq!(cancel.prompt.text(), "/mo");
 
@@ -4267,7 +4371,7 @@ mod tests {
         assert!(app.picker.is_none());
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
     }
 
@@ -4356,14 +4460,17 @@ mod tests {
         let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
         let (sender, mut receiver) = mpsc::channel(3);
         let update = super::Update::with_commands([
-            RuntimeCommand::Cancel,
+            RuntimeCommand::Cancel { correction: false },
             RuntimeCommand::CancelBackground,
             RuntimeCommand::Shutdown,
         ]);
 
         super::dispatch_commands(&sender, &update, &trace_owner.handle())
             .expect("dispatch cancellation commands");
-        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Cancel)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::Cancel { correction: false })
+        ));
         assert!(matches!(
             receiver.try_recv(),
             Ok(RuntimeCommand::CancelBackground)
@@ -4754,7 +4861,7 @@ mod tests {
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
         assert!(std::ptr::eq(app.settings_selection.model(), &TERRA));
     }
@@ -5949,7 +6056,7 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
         assert_eq!(
             app.handle_key(key(KeyCode::Esc)).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
     }
 
@@ -7746,6 +7853,269 @@ mod tests {
     }
 
     #[test]
+    fn released_escape_does_not_change_keypress_anchored_correction_timing() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "delayed admission", submitted_at);
+
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(
+            app.handle_key_at(release, submitted_at + Duration::from_secs(1))
+                .commands
+                .is_empty()
+        );
+        assert!(!app.foreground_cancellation_requested);
+        assert!(!app.correction_pending);
+        assert_eq!(app.submission_at, Some(submitted_at));
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_secs(2))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+    }
+
+    #[test]
+    fn correction_restoration_keeps_drafts_prefills_and_retains_its_card_until_request_commit() {
+        let now = Instant::now();
+        let replacement = CorrectionOutcome::Replaced {
+            state: restored_state("restored parent"),
+            request_prefill: Some("original request".to_owned()),
+        };
+
+        let mut drafted = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        set_prompt(&mut drafted, "draft wins");
+        drafted.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: replacement.clone(),
+            },
+            now,
+        );
+        drafted.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert_eq!(drafted.prompt.text(), "draft wins");
+        assert!(rendered_at(&mut drafted, 80, 20, now).contains("Session restored."));
+
+        let mut prefilled = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        prefilled.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: replacement,
+            },
+            now,
+        );
+        prefilled.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(2) }, now);
+        assert_eq!(prefilled.prompt.text(), "original request");
+        assert!(rendered_at(&mut prefilled, 80, 20, now).contains("Session restored."));
+        prefilled.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "corrected request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(!rendered_at(&mut prefilled, 80, 20, now).contains("Session restored."));
+    }
+
+    #[test]
+    fn early_escape_carries_correction_intent_but_late_escape_only_cancels() {
+        let submitted_at = Instant::now();
+
+        for (elapsed, correction) in [
+            (Duration::from_millis(1_999), true),
+            (Duration::from_secs(2), true),
+            (Duration::from_millis(2_001), false),
+        ] {
+            let mut app = App::default();
+            assert_eq!(
+                enter_at(&mut app, "correct this", submitted_at).commands,
+                [RuntimeCommand::Submit {
+                    request: "correct this".to_owned(),
+                }]
+            );
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), submitted_at + elapsed)
+                    .commands,
+                [RuntimeCommand::Cancel { correction }],
+                "Esc at {elapsed:?}"
+            );
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), submitted_at + elapsed)
+                    .commands,
+                [RuntimeCommand::CancelBackground],
+                "repeated Esc at {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn correction_replacement_ignores_progress_after_reliable_settlement() {
+        let now = Instant::now();
+        let mut app = App::default();
+        assert_eq!(
+            enter_at(&mut app, "correct this", now).commands,
+            [RuntimeCommand::Submit {
+                request: "correct this".to_owned()
+            }]
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "correct this".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+        set_prompt(&mut app, "draft wins");
+        assert!(
+            app.handle_key_at(key(KeyCode::Enter), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.notice(),
+            Some("Session restoration is still in progress.")
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: terminal(None, vec![]),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(app.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced {
+                    state: restored_state("restored parent"),
+                    request_prefill: Some("correct this".to_owned()),
+                },
+            },
+            now,
+        ));
+        assert_eq!(app.prompt.text(), "draft wins");
+        let restored = rendered_at(&mut app, 80, 20, now);
+        assert!(restored.contains("restored parent"), "{restored}");
+        assert!(restored.contains("Session restored."), "{restored}");
+        assert!(!restored.contains("correct this"), "{restored}");
+        app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert!(!app.correction_pending);
+        assert_eq!(app.ignored_progress_run_id, Some(RunId(1)));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "stale progress".to_owned(),
+                },
+            },
+            gap_before: false,
+        }));
+        assert!(!rendered_at(&mut app, 80, 20, now).contains("stale progress"));
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(5) },
+            gap_before: false,
+        });
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(5),
+                step_id: ModelStepId(1),
+            },
+            gap_before: false,
+        });
+        assert!(app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(5),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "fresh progress".to_owned(),
+                },
+            },
+            gap_before: false,
+        }));
+        assert!(rendered_at(&mut app, 80, 20, now).contains("fresh progress"));
+
+        let mut refill = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        assert!(refill.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced {
+                    state: restored_state("refilled parent"),
+                    request_prefill: Some("correct this".to_owned()),
+                },
+            },
+            now,
+        ));
+        assert_eq!(refill.prompt.text(), "correct this");
+        assert!(rendered_at(&mut refill, 80, 20, now).contains("Session restored."));
+        refill.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "correct this".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(!rendered_at(&mut refill, 80, 20, now).contains("Session restored."));
+    }
+
+    #[test]
+    fn correction_keeps_the_cancelled_run_active_when_background_work_remains() {
+        let mut app = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+
+        assert!(app.handle_event(RuntimeEvent::CorrectionCompleted {
+            run_id: RunId(1),
+            outcome: CorrectionOutcome::SkippedBackground,
+        }));
+        assert_eq!(
+            app.notice(),
+            Some("Session was not restored because background work is active.")
+        );
+        assert!(app.correction_pending);
+        app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
+        assert!(!app.correction_pending);
+    }
+
+    #[test]
     fn escape_cancels_foreground_once_then_background_except_in_configuration() {
         let now = Instant::now();
         let mut app = App::default();
@@ -7753,7 +8123,7 @@ mod tests {
 
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::Cancel]
+            vec![RuntimeCommand::Cancel { correction: false }]
         );
         app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
         assert_eq!(
@@ -7764,7 +8134,7 @@ mod tests {
         );
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::Cancel]
+            vec![RuntimeCommand::Cancel { correction: true }]
         );
         app.handle_event_at(
             RuntimeEvent::RecordAppended {

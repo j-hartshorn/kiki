@@ -4141,7 +4141,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await
@@ -4530,7 +4531,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await
@@ -5206,7 +5208,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await
@@ -6017,7 +6020,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await

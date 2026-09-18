@@ -227,6 +227,12 @@ pub(crate) struct RestoredTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SessionEntryId(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestAdmission {
+    pub(crate) run_id: u64,
+    pub(crate) request_entry: SessionEntryId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionCatalogueKind {
     Start,
@@ -856,7 +862,10 @@ impl SessionWriter {
         .await
     }
 
-    pub(crate) async fn commit_request(&self, request: String) -> Result<u64, SessionError> {
+    pub(crate) async fn commit_request(
+        &self,
+        request: String,
+    ) -> Result<RequestAdmission, SessionError> {
         self.write(SessionWriteKind::Request, move |connection| {
             commit_request(connection, &request)
         })
@@ -1083,7 +1092,10 @@ fn select_active_entry(
     Ok(())
 }
 
-fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, SessionError> {
+fn commit_request(
+    connection: &mut Connection,
+    request: &str,
+) -> Result<RequestAdmission, SessionError> {
     let payload =
         codec::encode_request(request).map_err(|error| SessionError::Codec(error.to_string()))?;
     let now = now_ms()?;
@@ -1110,8 +1122,12 @@ fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, Ses
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
         params![entry_id, now, next_revision],
     )?;
+    let admission = RequestAdmission {
+        run_id: u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?,
+        request_entry: session_entry_id(entry_id)?,
+    };
     transaction.commit()?;
-    u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)
+    Ok(admission)
 }
 
 fn start_model_step(connection: &mut Connection, run_id: u64) -> Result<u64, SessionError> {
@@ -1841,7 +1857,7 @@ fn load_session_restore_for_entry(
         .iter()
         .find(|entry| entry.id == requested_entry_id)
         .ok_or(SessionError::InvalidTransition)?;
-    let effective_entry_id = if requested.kind == "user_request" {
+    let effective_entry_id = if requested_entry.is_some() && requested.kind == "user_request" {
         requested.parent_id.ok_or(SessionError::InvalidTransition)?
     } else {
         requested_entry_id
@@ -2070,15 +2086,19 @@ fn restore_projection_at(
             );
         }
     }
-    let request_prefill = entries
-        .get(&requested_entry_id)
-        .filter(|entry| entry.kind == "user_request")
-        .and_then(|entry| {
-            decoded_restore_entry(&decoded_entries, entry.id)
-                .ok()
-                .and_then(codec::decoded_request)
-                .map(str::to_owned)
-        });
+    let request_prefill = if requested_entry_id == effective_entry_id {
+        None
+    } else {
+        entries
+            .get(&requested_entry_id)
+            .filter(|entry| entry.kind == "user_request")
+            .and_then(|entry| {
+                decoded_restore_entry(&decoded_entries, entry.id)
+                    .ok()
+                    .and_then(codec::decoded_request)
+                    .map(str::to_owned)
+            })
+    };
     let requested_is_valid = entries.get(&requested_entry_id).is_some_and(|entry| {
         decoded_restore_entry(&decoded_entries, entry.id).is_ok()
             && (entry.kind != "user_request" || entry.provider_replay.is_none())
@@ -3396,7 +3416,8 @@ mod tests {
         let first_run = writer
             .commit_request("first branch request".to_owned())
             .await
-            .expect("commit first request");
+            .expect("commit first request")
+            .run_id;
         let first_step = writer
             .start_model_step(first_run)
             .await
@@ -3498,7 +3519,8 @@ mod tests {
         let sibling_run = writer
             .commit_request("sibling branch request".to_owned())
             .await
-            .expect("commit sibling request");
+            .expect("commit sibling request")
+            .run_id;
         let sibling_step = writer
             .start_model_step(sibling_run)
             .await
@@ -3602,7 +3624,8 @@ mod tests {
         let run = writer
             .commit_request("original request".to_owned())
             .await
-            .expect("commit original request");
+            .expect("commit original request")
+            .run_id;
         let (_, execution) = settle_fixture_execution(
             &session,
             &writer,
@@ -3679,7 +3702,8 @@ mod tests {
         writer
             .commit_request("branched request".to_owned())
             .await
-            .expect("commit branched request");
+            .expect("commit branched request")
+            .run_id;
         let connection = session
             .connection_for_test()
             .expect("lock selected session connection");
@@ -3710,6 +3734,87 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn corrected_request_admission_returns_the_committed_sibling_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+
+        let original = writer
+            .commit_request("original request".to_owned())
+            .await
+            .expect("commit original request");
+        assert_eq!(
+            original.request_entry,
+            SessionEntryId(active_entry_id(&session) as u64)
+        );
+        writer
+            .close_run(
+                original.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close original request");
+
+        let restore = writer
+            .restore_at(original.request_entry)
+            .await
+            .expect("project original request parent");
+        assert_eq!(restore.effective_entry, root);
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select original request parent");
+
+        let corrected = writer
+            .commit_request("corrected request".to_owned())
+            .await
+            .expect("commit corrected request");
+        assert_eq!(
+            corrected.request_entry,
+            SessionEntryId(active_entry_id(&session) as u64)
+        );
+        let connection = session.connection_for_test().expect("lock session");
+        let parents = connection
+            .prepare("SELECT parent_id FROM entries WHERE id IN (?1, ?2) ORDER BY id")
+            .expect("prepare sibling query")
+            .query_map(
+                params![
+                    i64::try_from(original.request_entry.0).expect("original entry fits SQLite"),
+                    i64::try_from(corrected.request_entry.0).expect("corrected entry fits SQLite"),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query sibling parents")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read sibling parents");
+        assert_eq!(parents, [root.0 as i64, root.0 as i64]);
+        drop(connection);
+
+        writer
+            .close_run(
+                corrected.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close corrected request");
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn select_active_entry_selects_a_requests_projected_parent() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -3719,7 +3824,8 @@ mod tests {
         let run = writer
             .commit_request("request to correct".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let request = active_entry_id(&session);
         writer
             .close_run(
@@ -3749,7 +3855,8 @@ mod tests {
         writer
             .commit_request("corrected request".to_owned())
             .await
-            .expect("commit corrected request");
+            .expect("commit corrected request")
+            .run_id;
         assert_eq!(
             session
                 .connection_for_test()
@@ -3825,7 +3932,8 @@ mod tests {
         let completed_run = writer
             .commit_request("completed request".to_owned())
             .await
-            .expect("commit completed request");
+            .expect("commit completed request")
+            .run_id;
         writer
             .close_run(
                 completed_run,
@@ -3889,7 +3997,8 @@ mod tests {
         let open_run = writer
             .commit_request("open request".to_owned())
             .await
-            .expect("commit open request");
+            .expect("commit open request")
+            .run_id;
         let open = writer
             .restore_at(SessionEntryId(root as u64))
             .await
@@ -3935,7 +4044,8 @@ mod tests {
         let run = writer
             .commit_request("pending step request".to_owned())
             .await
-            .expect("commit pending step request");
+            .expect("commit pending step request")
+            .run_id;
         writer
             .start_model_step(run)
             .await
@@ -4005,7 +4115,8 @@ mod tests {
         let run = writer
             .commit_request("task request".to_owned())
             .await
-            .expect("commit task request");
+            .expect("commit task request")
+            .run_id;
         let (step, _) =
             settle_fixture_execution(&session, &writer, run, "task_value = 1", None, Vec::new())
                 .await;
@@ -4103,7 +4214,8 @@ mod tests {
         let run = writer
             .commit_request("gated request".to_owned())
             .await
-            .expect("commit gated request");
+            .expect("commit gated request")
+            .run_id;
         writer
             .close_run(
                 run,
@@ -4157,7 +4269,8 @@ mod tests {
         let run = writer
             .commit_request("failing selection request".to_owned())
             .await
-            .expect("commit failing selection request");
+            .expect("commit failing selection request")
+            .run_id;
         writer
             .close_run(
                 run,
@@ -4214,7 +4327,8 @@ mod tests {
         let final_run = writer
             .commit_request("final request".to_owned())
             .await
-            .expect("commit final request");
+            .expect("commit final request")
+            .run_id;
         let request = active_entry_id(&session);
         let (_, execution) = settle_fixture_execution(
             &session,
@@ -4250,7 +4364,8 @@ mod tests {
         let cancelled_run = writer
             .commit_request("cancelled request".to_owned())
             .await
-            .expect("commit cancelled request");
+            .expect("commit cancelled request")
+            .run_id;
         writer
             .close_run(
                 cancelled_run,
@@ -4269,7 +4384,8 @@ mod tests {
         let failed_run = writer
             .commit_request("failed request".to_owned())
             .await
-            .expect("commit failed request");
+            .expect("commit failed request")
+            .run_id;
         writer
             .close_run(
                 failed_run,
@@ -4383,21 +4499,24 @@ mod tests {
         );
         assert_eq!(
             ordinary_request.effective_entry,
-            SessionEntryId(root as u64)
+            SessionEntryId(request as u64)
         );
         assert_eq!(
             ordinary_request.observed_active_entry,
             SessionEntryId(request as u64)
         );
-        assert_eq!(
-            ordinary_request.request_prefill.as_deref(),
-            Some("final request")
-        );
-        assert!(ordinary_request.records.is_empty());
+        assert_eq!(ordinary_request.request_prefill, None);
+        assert!(matches!(
+            ordinary_request.records.as_slice(),
+            [super::RestoredRecord {
+                kind: super::RestoredRecordKind::UserRequest { request: text },
+                ..
+            }] if text == "final request"
+        ));
         assert_eq!(
             ordinary_request
                 .executable
-                .expect("saved request parent is executable")
+                .expect("saved request is executable")
                 .checkpoint,
             root_checkpoint
         );
@@ -4417,7 +4536,8 @@ mod tests {
         writer
             .commit_request("known request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let before: (i64, i64, i64) = session
             .connection_for_test()
             .expect("lock session connection")
@@ -4461,7 +4581,8 @@ mod tests {
         let final_run = writer
             .commit_request("catalogue request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let (_, execution) = settle_fixture_execution(
             &session,
             &writer,
@@ -4509,7 +4630,8 @@ mod tests {
         let cancelled_run = writer
             .commit_request("catalogue cancelled".to_owned())
             .await
-            .expect("commit cancelled request");
+            .expect("commit cancelled request")
+            .run_id;
         writer
             .close_run(
                 cancelled_run,
@@ -4528,7 +4650,8 @@ mod tests {
         let failed_run = writer
             .commit_request("catalogue failed".to_owned())
             .await
-            .expect("commit failed request");
+            .expect("commit failed request")
+            .run_id;
         writer
             .close_run(
                 failed_run,
@@ -4619,7 +4742,8 @@ mod tests {
         let selected_run = writer
             .commit_request("selected request".to_owned())
             .await
-            .expect("commit selected request");
+            .expect("commit selected request")
+            .run_id;
         let (selected_step, _) = settle_fixture_execution(
             &session,
             &writer,
@@ -4661,7 +4785,8 @@ mod tests {
         let hidden_run = writer
             .commit_request("hidden request".to_owned())
             .await
-            .expect("commit hidden request");
+            .expect("commit hidden request")
+            .run_id;
         let (hidden_step, _) = settle_fixture_execution(
             &session,
             &writer,
@@ -4769,7 +4894,8 @@ mod tests {
         let selected_run = writer
             .commit_request("selected request".to_owned())
             .await
-            .expect("commit selected request");
+            .expect("commit selected request")
+            .run_id;
         let _ = settle_fixture_execution(
             &session,
             &writer,
@@ -4798,7 +4924,8 @@ mod tests {
         writer
             .commit_request("corrupt sibling request".to_owned())
             .await
-            .expect("commit sibling request");
+            .expect("commit sibling request")
+            .run_id;
         let corrupt_request = active_entry_id(&session);
         set_active_entry(&session, selected_leaf);
         session
@@ -4843,7 +4970,8 @@ mod tests {
         let selected_run = writer
             .commit_request("selected request".to_owned())
             .await
-            .expect("commit selected request");
+            .expect("commit selected request")
+            .run_id;
         let _ = settle_fixture_execution(
             &session,
             &writer,
@@ -4872,7 +5000,8 @@ mod tests {
         let sibling_run = writer
             .commit_request("sibling request".to_owned())
             .await
-            .expect("commit sibling request");
+            .expect("commit sibling request")
+            .run_id;
         let (_, sibling_execution) = settle_fixture_execution(
             &session,
             &writer,
@@ -4916,7 +5045,8 @@ mod tests {
         let run = writer
             .commit_request("restore target".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let (_, execution) =
             settle_fixture_execution(&session, &writer, run, "target_value = 1", None, Vec::new())
                 .await;
@@ -5377,7 +5507,8 @@ mod tests {
             .writer()
             .commit_request("readable request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         session
             .connection_for_test()
             .expect("lock session")
@@ -6018,7 +6149,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("generation interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             writer
                                 .start_model_step(run_id)
                                 .await
@@ -6029,7 +6161,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("execution interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             writer
                                 .start_model_step(run_id)
                                 .await
@@ -6053,7 +6186,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("committed step interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             let settled_step = writer
                                 .start_model_step(run_id)
                                 .await
@@ -6099,7 +6233,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("closed foreground".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             let origin_step_id = writer
                                 .start_model_step(run_id)
                                 .await
@@ -6298,7 +6433,8 @@ mod tests {
         let run_id = writer
             .commit_request("interrupted request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -6409,7 +6545,8 @@ mod tests {
         let run_id = writer
             .commit_request("closed foreground".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await
@@ -6715,7 +6852,8 @@ mod tests {
         let run_id = writer
             .commit_request("combined interruption".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -6982,7 +7120,8 @@ mod tests {
         let run_id = writer
             .commit_request("interrupted request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -7078,7 +7217,8 @@ mod tests {
         let run_id = writer
             .commit_request("persist this request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let code_step = writer
             .start_model_step(run_id)
             .await
@@ -7191,7 +7331,8 @@ mod tests {
         let run_id = writer
             .commit_request("rollback allocation".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         writer
             .start_model_step(run_id)
             .await
@@ -7236,7 +7377,8 @@ mod tests {
         let run_id = writer
             .commit_request("rollback".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -7300,7 +7442,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await

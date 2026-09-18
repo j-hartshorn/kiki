@@ -384,7 +384,7 @@ First red: `tui::tests::early_escape_carries_correction_intent_but_late_escape_o
 
 **Files**
 
-- Modify: `src/session.rs`, `src/agent.rs`, `src/runtime.rs`, `src/tui.rs`.
+- Modify: `src/session.rs`, `src/agent.rs`, `src/runtime.rs`, `src/tui.rs`, `src/transcript.rs`, `src/openai.rs`, `src/subagents.rs`.
 
 **Verification**
 

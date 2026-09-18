@@ -2546,6 +2546,7 @@ impl Transcript {
             RuntimeEvent::SettingsAccepted { .. }
             | RuntimeEvent::NameAccepted { .. }
             | RuntimeEvent::NavigationCompleted { .. }
+            | RuntimeEvent::CorrectionCompleted { .. }
             | RuntimeEvent::TreeCatalogue { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { active_run_id }
                 if self.disabled_reason.is_none()
