@@ -31,17 +31,19 @@ use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
-    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState, RuntimeProgressReceiver,
-    control_command,
+    NavigationOutcome, ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState,
+    RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
+use crate::session::SessionEntryId;
 use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
-use picker::{Picker, PickerAction, PickerItem};
+use picker::{DynamicPickerItem, Picker, PickerAction, PickerItem, PickerSavePolicy};
+use tree::SessionTree;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
@@ -146,6 +148,13 @@ struct Flash {
 enum PickerValue {
     Model(&'static ModelConfiguration),
     Thinking(&'static str),
+    Tree(SessionEntryId),
+}
+
+struct TreePicker {
+    revision: u64,
+    filter: String,
+    tree: Option<SessionTree<PickerValue>>,
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +188,9 @@ struct App {
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
+    tree_picker: Option<TreePicker>,
+    manual_navigation_pending: bool,
+    next_tree_revision: u64,
     completion: slash::Completion,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
@@ -216,6 +228,9 @@ impl Default for App {
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
+            tree_picker: None,
+            manual_navigation_pending: false,
+            next_tree_revision: 0,
             completion: slash::Completion::default(),
             slash_overlay: None,
             preview: None,
@@ -298,6 +313,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        if self.is_tree_loading() {
+            return Update::default();
+        }
         if let Some(update) = self.handle_slash_overlay_mouse(mouse) {
             return update;
         }
@@ -351,14 +369,18 @@ impl App {
         if key.is_release() {
             return Update::default();
         }
-        let notice_cleared = self.clear_notice();
+        let notice_cleared = (!self.is_tree_loading())
+            .then(|| self.clear_notice())
+            .unwrap_or(false);
         let mut update = self.handle_key_inner(key, now);
         update.visible_changed |= notice_cleared;
         update
     }
 
     fn handle_paste(&mut self, text: &str) -> Update {
-        let notice_cleared = self.clear_notice();
+        let notice_cleared = (!self.is_tree_loading())
+            .then(|| self.clear_notice())
+            .unwrap_or(false);
         let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
             false
         } else {
@@ -418,6 +440,9 @@ impl App {
                         quit: false,
                     };
                 }
+                KeyCode::Char('r' | 'R') if !self.is_configuration_only() => {
+                    return self.open_session_tree("");
+                }
                 _ => {}
             }
         }
@@ -439,10 +464,30 @@ impl App {
             return Update::with_commands([RuntimeCommand::CancelBackground]);
         }
         if self.is_submission_disabled() {
+            if !self.is_configuration_only()
+                && key.code == KeyCode::Enter
+                && key.modifiers.is_empty()
+                && let Some(argument) = slash::parse(self.prompt.text()).and_then(|command| {
+                    matches!(command.action, slash::Action::Tree)
+                        .then(|| command.argument.to_owned())
+                })
+            {
+                self.prompt.take();
+                return self.open_session_tree(&argument);
+            }
             return Update::default();
         }
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
+        }
+        if self.manual_navigation_pending && key.code == KeyCode::Enter && key.modifiers.is_empty()
+        {
+            self.set_notice("Session restoration is still in progress.".to_owned());
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
         }
         if let Some(update) = self.handle_completion_key(key) {
             return update;
@@ -528,6 +573,7 @@ impl App {
                 }
             }
             slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
                 let argument = command.argument;
                 let model = self.settings_selection.model();
@@ -562,7 +608,26 @@ impl App {
         }
     }
 
+    fn is_tree_loading(&self) -> bool {
+        self.tree_picker
+            .as_ref()
+            .is_some_and(|tree_picker| tree_picker.tree.is_none())
+    }
+
     fn handle_picker_key(&mut self, key: KeyEvent) -> Update {
+        if self.is_tree_loading() {
+            if key.code == KeyCode::Esc {
+                self.picker = None;
+                self.tree_picker = None;
+                return Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                };
+            }
+            return Update::default();
+        }
+
         let action = self
             .picker
             .as_mut()
@@ -570,13 +635,17 @@ impl App {
             .handle_key(key);
         match action {
             PickerAction::None => Update::default(),
-            PickerAction::Changed => Update {
-                commands: Vec::new(),
-                visible_changed: true,
-                quit: false,
-            },
+            PickerAction::Changed => {
+                self.refresh_tree_picker_filter();
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
             PickerAction::Close => {
                 self.picker = None;
+                self.tree_picker = None;
                 Update {
                     commands: Vec::new(),
                     visible_changed: true,
@@ -596,6 +665,12 @@ impl App {
                     quit: false,
                 }
             }
+            PickerAction::Apply(PickerValue::Tree(entry)) => {
+                self.picker = None;
+                self.tree_picker = None;
+                self.manual_navigation_pending = true;
+                Update::with_commands([RuntimeCommand::Navigate { entry }])
+            }
             PickerAction::Apply(value) => {
                 self.picker = None;
                 self.apply_picker_value(value)
@@ -611,6 +686,7 @@ impl App {
                         let model = self.settings_selection.model();
                         self.save_user_default(|settings| settings.save_thinking(model, thinking));
                     }
+                    PickerValue::Tree(_) => unreachable!("tree pickers disable saving"),
                 }
                 update.visible_changed = true;
                 update
@@ -618,10 +694,57 @@ impl App {
         }
     }
 
+    fn refresh_tree_picker_filter(&mut self) {
+        let (Some(tree_picker), Some(picker)) = (&mut self.tree_picker, &mut self.picker) else {
+            return;
+        };
+        if tree_picker.filter == picker.filter() {
+            return;
+        }
+        tree_picker
+            .tree
+            .as_ref()
+            .expect("tree picker is populated before filtering")
+            .refresh(picker);
+        tree_picker.filter = picker.filter().to_owned();
+    }
+
     fn apply_picker_value(&mut self, value: PickerValue) -> Update {
         match value {
             PickerValue::Model(model) => self.select_model(model),
             PickerValue::Thinking(thinking) => self.select_thinking(thinking),
+            PickerValue::Tree(_) => unreachable!("tree selections navigate directly"),
+        }
+    }
+
+    fn open_session_tree(&mut self, initial_filter: &str) -> Update {
+        self.next_tree_revision = self
+            .next_tree_revision
+            .checked_add(1)
+            .expect("tree revision overflowed");
+        let revision = self.next_tree_revision;
+        self.tree_picker = Some(TreePicker {
+            revision,
+            filter: initial_filter.to_owned(),
+            tree: None,
+        });
+        self.picker = Some(Picker::new_dynamic(
+            "Session tree",
+            "No matching session entries",
+            [DynamicPickerItem {
+                row: Line::raw("Loading…"),
+                direct_search: "Loading…".to_owned(),
+                context_search: String::new(),
+                selectable: false,
+                value: PickerValue::Tree(SessionEntryId(0)),
+            }],
+            PickerValue::Tree(SessionEntryId(0)),
+            PickerSavePolicy::Disabled,
+        ));
+        Update {
+            commands: vec![RuntimeCommand::RequestTree { revision }],
+            visible_changed: true,
+            quit: false,
         }
     }
 
@@ -1148,6 +1271,14 @@ impl App {
         if matches!(&event, RuntimeEvent::RunSettled { .. }) {
             self.foreground_cancellation_requested = false;
         }
+        if let RuntimeEvent::TreeCatalogue { revision, outcome } = &event {
+            return self.handle_tree_catalogue(*revision, outcome);
+        }
+        if let RuntimeEvent::NavigationCompleted { outcome } = &event
+            && self.manual_navigation_pending
+        {
+            return self.handle_navigation_completed(outcome);
+        }
         let metadata_changed = match &event {
             RuntimeEvent::SettingsAccepted { revision } => self.reconcile_settings(*revision),
             RuntimeEvent::NameAccepted { revision, name } => self.reconcile_name(*revision, name),
@@ -1159,6 +1290,109 @@ impl App {
             self.invalidate_selection();
         }
         metadata_changed || monitor_changed || transcript_changed
+    }
+
+    fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
+        let Some(tree_picker) = self.tree_picker.as_ref() else {
+            return false;
+        };
+        if tree_picker.revision != revision || tree_picker.tree.is_some() {
+            return false;
+        }
+        match outcome {
+            TreeRequestOutcome::Catalogue(catalogue) => {
+                let filter = tree_picker.filter.clone();
+                let tree = SessionTree::from_catalogue(catalogue, PickerValue::Tree);
+                let mut picker = tree.picker();
+                picker.set_filter(&filter);
+                tree.refresh(&mut picker);
+                self.picker = Some(picker);
+                self.tree_picker
+                    .as_mut()
+                    .expect("matching tree picker remains open")
+                    .tree = Some(tree);
+            }
+            TreeRequestOutcome::RejectedBusy => {
+                self.picker = None;
+                self.tree_picker = None;
+                self.set_notice("Session tree is unavailable while work is active.".to_owned());
+            }
+            TreeRequestOutcome::RejectedReadOnly => {
+                self.picker = None;
+                self.tree_picker = None;
+                self.set_notice(
+                    "Session tree is unavailable while the session is read-only.".to_owned(),
+                );
+            }
+            TreeRequestOutcome::Failed => {
+                self.picker = None;
+                self.tree_picker = None;
+                self.set_notice("Session could not be restored.".to_owned());
+            }
+        }
+        true
+    }
+
+    fn handle_navigation_completed(&mut self, outcome: &NavigationOutcome) -> bool {
+        let notice_cleared = self.clear_notice();
+        self.manual_navigation_pending = false;
+        match outcome {
+            NavigationOutcome::Replaced {
+                state,
+                request_prefill,
+            } => {
+                self.replace_restored_state(state, request_prefill);
+                true
+            }
+            NavigationOutcome::Unchanged { request_prefill } => {
+                notice_cleared | self.apply_request_prefill(request_prefill)
+            }
+            NavigationOutcome::RejectedBusy => {
+                self.set_notice("Session tree is unavailable while work is active.".to_owned());
+                true
+            }
+            NavigationOutcome::RejectedReadOnly => {
+                self.set_notice(
+                    "Session tree is unavailable while the session is read-only.".to_owned(),
+                );
+                true
+            }
+            NavigationOutcome::Failed => {
+                self.set_notice("Session could not be restored.".to_owned());
+                true
+            }
+        }
+    }
+
+    fn replace_restored_state(
+        &mut self,
+        state: &RuntimeInitialState,
+        request_prefill: &Option<String>,
+    ) {
+        let mut transcript = self.transcript.restored_replacement(state);
+        transcript.append_restoration_card();
+        self.transcript = transcript;
+        self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
+        self.history_position = HistoryPosition::FollowingBottom;
+        self.history_height = 0;
+        self.history_rows = 0;
+        self.history_viewport = None;
+        self.selection = None;
+        self.drag = None;
+        self.pending_copy = false;
+        self.pending_copy_text = None;
+        self.flash = None;
+        self.apply_request_prefill(request_prefill);
+    }
+
+    fn apply_request_prefill(&mut self, request_prefill: &Option<String>) -> bool {
+        if self.prompt.is_empty() {
+            if let Some(request) = request_prefill {
+                let changed = self.prompt.insert_paste(request);
+                return changed | self.refresh_completion();
+            }
+        }
+        false
     }
 
     fn reconcile_settings(&mut self, revision: u64) -> bool {
@@ -2077,7 +2311,7 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::Color;
 
-    use super::{App, HistoryPosition, TitlePublisher};
+    use super::{App, DocumentPosition, HistoryPosition, Selection, TitlePublisher};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -2089,11 +2323,15 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason,
-        RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
+        ModelStepId, NavigationOutcome, Record, RestoredTimelineItem, RunId, RuntimeCommand,
+        RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
+        TreeRequestOutcome,
     };
-    use crate::session::SessionMetadata;
-    use crate::subagents::TaskState;
+    use crate::session::{
+        SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
+        SessionMetadata,
+    };
+    use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -2144,6 +2382,80 @@ mod tests {
         let mut app = App::default();
         set_prompt(&mut app, text);
         app
+    }
+
+    fn session_tree_catalogue() -> SessionCatalogue {
+        SessionCatalogue {
+            active_entry: SessionEntryId(3),
+            entries: vec![
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(1),
+                    parent_id: None,
+                    revision: 1,
+                    kind: SessionCatalogueKind::Start,
+                },
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(2),
+                    parent_id: Some(SessionEntryId(1)),
+                    revision: 2,
+                    kind: SessionCatalogueKind::Request {
+                        text: "authorise access".to_owned(),
+                    },
+                },
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(3),
+                    parent_id: Some(SessionEntryId(2)),
+                    revision: 3,
+                    kind: SessionCatalogueKind::Execution {
+                        commentary: Some("inspect credentials".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                },
+            ],
+        }
+    }
+
+    fn tree_request(app: &mut App, initial_filter: &str) -> u64 {
+        let update = app.open_session_tree(initial_filter);
+        let [RuntimeCommand::RequestTree { revision }] = update.commands.as_slice() else {
+            panic!("expected tree request, got {:?}", update.commands);
+        };
+        *revision
+    }
+
+    fn load_tree(app: &mut App, revision: u64) {
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+    }
+
+    fn select_tree_request(app: &mut App) {
+        let revision = tree_request(app, "");
+        load_tree(app, revision);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Navigate {
+                entry: SessionEntryId(2)
+            }]
+        );
+        assert!(app.manual_navigation_pending);
+    }
+
+    fn restored_state(request: &str) -> RuntimeInitialState {
+        RuntimeInitialState {
+            metadata: None,
+            timeline: vec![RestoredTimelineItem::Record(StoredRecord {
+                run_id: RunId(4),
+                record: Record::UserRequest {
+                    request: request.to_owned(),
+                },
+            })],
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        }
     }
 
     fn submitted_prompt(app: &mut App) -> String {
@@ -3124,9 +3436,10 @@ mod tests {
         let (model_column, model_row) = cell_start(&initial, "/model");
         let (name_column, name_row) = cell_start(&initial, "/name");
         let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
+        let (tree_column, tree_row) = cell_start(&initial, "/tree");
 
         assert_eq!(model_column, overlay.x);
-        assert!(model_row < name_row && name_row < thinking_row);
+        assert!(model_row < name_row && name_row < thinking_row && thinking_row < tree_row);
         assert!(
             initial[(model_column, model_row)]
                 .modifier
@@ -3140,14 +3453,21 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let thinking = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            thinking[(thinking_column, thinking_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(
             !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        let thinking = rendered_buffer(&mut app, 40, 8);
+        let tree = rendered_buffer(&mut app, 40, 8);
         assert!(
-            thinking[(thinking_column, thinking_row)]
+            tree[(tree_column, tree_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
@@ -3310,7 +3630,7 @@ mod tests {
     #[test]
     fn slash_overlay_stays_above_prompt_over_visible_subagent_monitor() {
         let now = Instant::now();
-        for (height, last_suggestion) in [(12, "/thinking"), (6, "/name")] {
+        for (height, last_suggestion) in [(12, "/tree"), (6, "/name")] {
             let mut plain = app_with_history(App::default());
             plain
                 .subagent_monitor
@@ -3505,6 +3825,321 @@ mod tests {
     }
 
     #[test]
+    fn tree_picker_navigates_without_losing_the_editor_draft() {
+        let mut app = app_with_prompt("keep this draft");
+
+        let update = app.handle_key(modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            update.commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.prompt.text(), "keep this draft");
+        assert!(rendered(&mut app, 72, 12).contains("Session tree"));
+        assert!(rendered(&mut app, 72, 12).contains("Loading…"));
+    }
+
+    #[test]
+    fn tree_picker_loading_ignores_input_and_stale_catalogues() {
+        let now = Instant::now();
+        let mut bare = App::default();
+        assert_eq!(
+            enter_at(&mut bare, "/tree", now).commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert!(rendered(&mut bare, 72, 12).contains("Session tree"));
+
+        let mut app = App::default();
+        let update = enter_at(&mut app, "/tree auth", now);
+        let [RuntimeCommand::RequestTree { revision }] = update.commands.as_slice() else {
+            panic!("expected tree request, got {:?}", update.commands);
+        };
+        let screen = rendered(&mut app, 72, 12);
+        assert!(screen.contains("Session tree"), "{screen}");
+        assert!(screen.contains("Loading…"), "{screen}");
+        assert!(!screen.contains("authorise access"), "{screen}");
+        assert!(app.prompt.is_empty());
+
+        for key in [
+            key(KeyCode::Enter),
+            key(KeyCode::Char('x')),
+            modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        ] {
+            let update = app.handle_key_at(key, now);
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert!(app.notice().is_none());
+        }
+        assert!(!app.handle_paste("ignored").visible_changed);
+        assert!(app.prompt.is_empty());
+        app.set_notice("keep loading notice".to_owned());
+        assert!(
+            !app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 0, 0), now)
+                .visible_changed
+        );
+        assert_eq!(app.notice(), Some("keep loading notice"));
+        assert!(app.clear_notice());
+
+        assert!(app.handle_key_at(key(KeyCode::Esc), now).visible_changed);
+        assert!(app.picker.is_none());
+        assert!(app.tree_picker.is_none());
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision: *revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        assert!(app.picker.is_none());
+        assert!(app.notice().is_none());
+
+        let first = tree_request(&mut app, "first");
+        let second = tree_request(&mut app, "auth");
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision: first,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        assert!(rendered(&mut app, 72, 12).contains("Loading…"));
+        load_tree(&mut app, second);
+        let screen = rendered(&mut app, 72, 12);
+        assert!(screen.contains("Filter: auth"), "{screen}");
+        assert!(screen.contains("authorise access"), "{screen}");
+        assert!(!screen.contains("Loading…"), "{screen}");
+
+        let mut no_matches = App::default();
+        let revision = tree_request(&mut no_matches, "missing");
+        assert!(no_matches.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(1),
+                entries: vec![SessionCatalogueEntry {
+                    entry_id: SessionEntryId(1),
+                    parent_id: None,
+                    revision: 1,
+                    kind: SessionCatalogueKind::Start,
+                }],
+            }),
+        }));
+        assert!(rendered(&mut no_matches, 72, 12).contains("No matching session entries"));
+
+        for (outcome, notice) in [
+            (
+                TreeRequestOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                TreeRequestOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (TreeRequestOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = App::default();
+            app.transcript.append_restoration_card();
+            let revision = tree_request(&mut app, "");
+            assert!(app.handle_event(RuntimeEvent::TreeCatalogue { revision, outcome }));
+            assert!(app.picker.is_none());
+            assert_eq!(app.notice(), Some(notice));
+            assert!(rendered(&mut app, 72, 12).contains("Session restored."));
+            assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+                revision,
+                outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+            }));
+            assert!(app.picker.is_none());
+        }
+
+        let mut loaded = App::default();
+        let revision = tree_request(&mut loaded, "");
+        load_tree(&mut loaded, revision);
+        assert!(
+            loaded
+                .handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .commands
+                .is_empty()
+        );
+        assert!(loaded.handle_key(key(KeyCode::Esc)).commands.is_empty());
+        assert!(!loaded.manual_navigation_pending);
+    }
+
+    #[test]
+    fn tree_picker_filters_without_resetting_on_duplicate_catalogues() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        for character in "credentials".chars() {
+            assert!(
+                app.handle_key(key(KeyCode::Char(character)))
+                    .visible_changed
+            );
+        }
+        let filtered = rendered(&mut app, 72, 12);
+        assert!(filtered.contains("Session start"), "{filtered}");
+        assert!(filtered.contains("└─ User: authorise access"), "{filtered}");
+        assert!(
+            filtered.contains("└─ ● Python: inspect credentials"),
+            "{filtered}"
+        );
+
+        for _ in "credentials".chars() {
+            assert!(app.handle_key(key(KeyCode::Backspace)).visible_changed);
+        }
+        let restored = rendered(&mut app, 72, 12);
+        assert!(restored.contains("└─ User: authorise access"), "{restored}");
+        assert!(
+            restored.contains("└─ ● Python: inspect credentials"),
+            "{restored}"
+        );
+
+        for character in "access".chars() {
+            assert!(
+                app.handle_key(key(KeyCode::Char(character)))
+                    .visible_changed
+            );
+        }
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        let duplicate = rendered(&mut app, 72, 12);
+        assert!(duplicate.contains("Filter: access"), "{duplicate}");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Navigate {
+                entry: SessionEntryId(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn tree_navigation_preserves_pending_drafts_and_replaces_the_projection() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 80, 12);
+        app.history_position = HistoryPosition::Anchored(0);
+        app.selection = Some(Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(0, 1),
+        ));
+        select_tree_request(&mut app);
+
+        type_prompt(&mut app, "draft");
+        assert!(app.handle_key(shifted_key(KeyCode::Enter)).visible_changed);
+        assert!(app.handle_paste("after selection").visible_changed);
+        let blocked = app.handle_key(key(KeyCode::Enter));
+        assert!(blocked.commands.is_empty());
+        assert_eq!(
+            app.notice(),
+            Some("Session restoration is still in progress.")
+        );
+        assert_eq!(app.prompt.text(), "draft\nafter selection");
+
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("restored branch"),
+                request_prefill: Some("prefill must not replace a draft".to_owned()),
+            },
+        }));
+        assert!(!app.manual_navigation_pending);
+        assert_eq!(app.notice(), None);
+        assert_eq!(app.prompt.text(), "draft\nafter selection");
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.history_viewport.is_none());
+        assert!(app.selection.is_none());
+        let screen = rendered(&mut app, 80, 30);
+        assert!(screen.contains("restored branch"), "{screen}");
+        assert!(screen.contains("Session restored."), "{screen}");
+        assert!(!screen.contains("request 8"), "{screen}");
+    }
+
+    #[test]
+    fn tree_navigation_applies_request_prefill_only_after_each_outcome() {
+        let mut replaced = App::default();
+        select_tree_request(&mut replaced);
+        assert!(replaced.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("replacement"),
+                request_prefill: Some("selected request".to_owned()),
+            },
+        }));
+        assert_eq!(replaced.prompt.text(), "selected request");
+        assert!(rendered(&mut replaced, 80, 12).contains("Session restored."));
+
+        let mut non_request = App::default();
+        select_tree_request(&mut non_request);
+        assert!(non_request.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("replacement"),
+                request_prefill: None,
+            },
+        }));
+        assert!(non_request.prompt.is_empty());
+
+        let mut unchanged = app_with_history(App::default());
+        select_tree_request(&mut unchanged);
+        unchanged.set_notice("Session restoration is still in progress.".to_owned());
+        assert!(unchanged.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Unchanged {
+                request_prefill: Some("current request".to_owned()),
+            },
+        }));
+        assert!(!unchanged.manual_navigation_pending);
+        assert_eq!(unchanged.notice(), None);
+        assert_eq!(unchanged.prompt.text(), "current request");
+        let screen = rendered(&mut unchanged, 80, 12);
+        assert!(screen.contains("request 8"), "{screen}");
+        assert!(!screen.contains("Session restored."), "{screen}");
+
+        for (outcome, notice) in [
+            (
+                NavigationOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                NavigationOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (NavigationOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = app_with_history(App::default());
+            select_tree_request(&mut app);
+            assert!(app.handle_event(RuntimeEvent::NavigationCompleted { outcome }));
+            assert!(!app.manual_navigation_pending);
+            assert_eq!(app.notice(), Some(notice));
+            let screen = rendered(&mut app, 80, 12);
+            assert!(screen.contains("request 8"), "{screen}");
+            assert!(!screen.contains("Session restored."), "{screen}");
+        }
+    }
+
+    #[test]
+    fn tree_navigation_rebuilds_the_subagent_monitor_from_the_restored_timeline() {
+        let mut app = App::default();
+        select_tree_request(&mut app);
+        let task = TaskRecord::for_test(
+            "00",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let mut state = restored_state("restored request");
+        state
+            .timeline
+            .push(RestoredTimelineItem::SubagentSpawned(task.clone()));
+        state
+            .timeline
+            .push(RestoredTimelineItem::SubagentFinished(task));
+
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            },
+        }));
+        let screen = rendered(&mut app, 80, 20);
+        assert!(screen.contains("✓ subagent:00"), "{screen}");
+        assert!(screen.contains("Session restored."), "{screen}");
+    }
+
+    #[test]
     fn model_argument_opens_a_filtered_picker_without_submitting() {
         let mut app = App::default();
         type_prompt(&mut app, "/model terra");
@@ -3600,24 +4235,16 @@ mod tests {
     #[test]
     fn unrecognised_or_multiline_slash_input_remains_an_ordinary_prompt() {
         let now = Instant::now();
-        let mut app = App::default();
-
-        let update = enter_at(&mut app, "/future task", now);
-        assert_eq!(
-            update.commands,
-            [RuntimeCommand::Submit {
-                request: "/future task".to_owned()
-            }]
-        );
-
-        let mut multiline = App::default();
-        let update = enter_at(&mut multiline, "/model\nterra", now);
-        assert_eq!(
-            update.commands,
-            [RuntimeCommand::Submit {
-                request: "/model\nterra".to_owned()
-            }]
-        );
+        for draft in ["/future task", "/tree-more", "/model\nterra", "/tree\nauth"] {
+            let mut app = App::default();
+            assert_eq!(
+                enter_at(&mut app, draft, now).commands,
+                [RuntimeCommand::Submit {
+                    request: draft.to_owned()
+                }],
+                "{draft}"
+            );
+        }
     }
 
     #[test]

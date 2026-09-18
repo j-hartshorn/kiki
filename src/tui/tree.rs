@@ -164,6 +164,7 @@ impl<T: Copy + Eq> SessionTree<T> {
                     ),
                     direct_search: node.search_text.clone(),
                     context_search: node.context_search.clone(),
+                    selectable: true,
                     value: node.value,
                 }
             })

@@ -4,6 +4,7 @@ use std::ops::Range;
 pub(super) enum Action {
     Model,
     Name,
+    Tree,
     Thinking,
 }
 
@@ -14,7 +15,7 @@ struct Command {
     action: Action,
 }
 
-const CATALOGUE: [Command; 3] = [
+const CATALOGUE: [Command; 4] = [
     Command {
         token: "/model",
         purpose: "Choose model",
@@ -29,6 +30,11 @@ const CATALOGUE: [Command; 3] = [
         token: "/thinking",
         purpose: "Choose thinking level",
         action: Action::Thinking,
+    },
+    Command {
+        token: "/tree",
+        purpose: "Navigate session history",
+        action: Action::Tree,
     },
 ];
 
@@ -158,6 +164,7 @@ mod tests {
                 ("/model", "Choose model"),
                 ("/name", "Name session"),
                 ("/thinking", "Choose thinking level"),
+                ("/tree", "Navigate session history"),
             ]
         );
     }
@@ -169,6 +176,8 @@ mod tests {
             ("/model  terra\t", Action::Model, "terra", 0..6),
             ("/name  A session  ", Action::Name, "A session", 0..5),
             ("/thinking\t high", Action::Thinking, "high", 0..9),
+            ("/tree", Action::Tree, "", 0..5),
+            ("/tree  auth\t", Action::Tree, "auth", 0..5),
         ] {
             let parsed = parse(draft).expect("recognised command");
             assert_eq!(parsed.action, action);
@@ -183,6 +192,8 @@ mod tests {
             "/models",
             "/namex",
             "/thinking-more",
+            "/tree-more",
+            "/tree\nauth",
             "/model\nterra",
         ] {
             assert!(parse(draft).is_none(), "{draft}");
@@ -194,10 +205,12 @@ mod tests {
     fn completion_requires_a_strict_prefix_at_the_end_of_a_single_line() {
         let mut completion = Completion::default();
         for (draft, caret_at_end, expected) in [
-            ("/", true, vec!["/model", "/name", "/thinking"]),
+            ("/", true, vec!["/model", "/name", "/thinking", "/tree"]),
             ("/mo", true, vec!["/model"]),
             ("/model", true, vec![]),
             ("/model ", true, vec![]),
+            ("/tr", true, vec!["/tree"]),
+            ("/tree auth", true, vec![]),
             ("/M", true, vec![]),
             ("/future", true, vec![]),
             ("/mo", false, vec![]),
@@ -232,14 +245,14 @@ mod tests {
 
         completion.sync("/", true);
         assert!(completion.move_selection(99));
-        assert_eq!(completion.selected_token(), Some("/thinking"));
+        assert_eq!(completion.selected_token(), Some("/tree"));
         assert!(!completion.move_selection(1));
         completion.sync("/t", true);
-        assert_eq!(completion.selected_token(), Some("/thinking"));
+        assert_eq!(completion.selected_token(), Some("/tree"));
 
         let rows = completion.visible_rows(1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].token, "/thinking");
+        assert_eq!(rows[0].token, "/tree");
         assert!(rows[0].selected);
     }
 }

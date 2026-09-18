@@ -343,7 +343,7 @@ First red: `tui::tests::tree_picker_navigates_without_losing_the_editor_draft`.
 
 **Files**
 
-- Modify: `src/tui/slash.rs`, `src/tui.rs`, `src/transcript.rs`, `src/tui/subagents.rs`.
+- Modify: `src/tui/slash.rs`, `src/tui.rs`, `src/tui/picker.rs`, `src/tui/tree.rs`, `src/transcript.rs`, `src/tui/subagents.rs`.
 
 **Verification**
 

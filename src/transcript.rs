@@ -199,6 +199,7 @@ enum TranscriptBlock {
     Status {
         text: String,
     },
+    SessionRestored,
     Metadata {
         lines: Vec<String>,
     },
@@ -254,6 +255,7 @@ enum NormalisedBlock {
     Status {
         text: String,
     },
+    SessionRestored,
     Metadata {
         lines: Vec<String>,
     },
@@ -347,6 +349,7 @@ impl TranscriptBlock {
             Self::Status { text } => NormalisedBlock::Status {
                 text: normalise_terminal_text(&text),
             },
+            Self::SessionRestored => NormalisedBlock::SessionRestored,
             Self::Metadata { lines } => NormalisedBlock::Metadata {
                 lines: lines
                     .into_iter()
@@ -1394,6 +1397,7 @@ impl NormalisedBlock {
             Self::SubagentFinished(card) => subagent_finished_plain_text(card),
             Self::Arena(arena) => arena.plain_text(),
             Self::Status { text } => text.clone(),
+            Self::SessionRestored => "Session restored.".to_owned(),
             Self::Accounting { text } => format!("\n{text}"),
             Self::Reasoning { .. } | Self::Assistant { .. } => unreachable!("markdown block"),
         }
@@ -2234,6 +2238,7 @@ pub(crate) struct Transcript {
     footer_adjustment: Vec<AttemptAccounting>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
+    restoration_card: bool,
     show_reasoning: bool,
     expand_arenas: bool,
     highlighter: PythonHighlighter,
@@ -2258,6 +2263,7 @@ impl Default for Transcript {
             footer_adjustment: Vec::new(),
             settled_blocks: Vec::new(),
             live_step: None,
+            restoration_card: false,
             show_reasoning: true,
             expand_arenas: false,
             highlighter: PythonHighlighter::new(),
@@ -2280,6 +2286,27 @@ impl Transcript {
 
     pub(crate) fn restored(startup: StartupSnapshot, initial: &RuntimeInitialState) -> Self {
         let mut transcript = Self::configured(startup);
+        transcript.apply_initial_state(initial);
+        transcript
+    }
+
+    pub(crate) fn restored_replacement(&self, initial: &RuntimeInitialState) -> Self {
+        let mut replacement = self
+            .startup
+            .clone()
+            .map_or_else(Self::default, Self::configured);
+        replacement.apply_initial_state(initial);
+        replacement.show_reasoning = self.show_reasoning;
+        replacement.expand_arenas = self.expand_arenas;
+        replacement
+    }
+
+    pub(crate) fn append_restoration_card(&mut self) {
+        self.restoration_card = true;
+        self.append_settled_blocks([TranscriptBlock::SessionRestored]);
+    }
+
+    fn apply_initial_state(&mut self, initial: &RuntimeInitialState) {
         for item in &initial.timeline {
             let event = match item {
                 RestoredTimelineItem::Record(record) => RuntimeEvent::RecordAppended {
@@ -2293,18 +2320,17 @@ impl Transcript {
                     record: record.clone(),
                 },
             };
-            transcript.apply(event, false);
+            self.apply(event, false);
         }
-        transcript.footer_adjustment = initial.footer_adjustment.clone();
+        self.footer_adjustment = initial.footer_adjustment.clone();
         if let Some(reason) = &initial.disabled_reason {
-            transcript.apply(
+            self.apply(
                 RuntimeEvent::RuntimeDisabled {
                     reason: reason.clone(),
                 },
                 false,
             );
         }
-        transcript
     }
 
     pub(crate) fn begin_submission(&mut self) -> bool {
@@ -2737,6 +2763,9 @@ impl Transcript {
         if let Some(live) = &self.live_step {
             blocks.extend(live_blocks(live));
         }
+        if self.restoration_card {
+            blocks.push(TranscriptBlock::SessionRestored);
+        }
         DisplayProjection { blocks }
     }
 
@@ -2887,6 +2916,11 @@ impl Transcript {
     }
 
     fn append_record(&mut self, record: StoredRecord, progress_gap: bool) -> bool {
+        if matches!(record.record, Record::UserRequest { .. }) && self.restoration_card {
+            self.restoration_card = false;
+            self.settled_blocks
+                .retain(|block| !matches!(block.source, NormalisedBlock::SessionRestored));
+        }
         self.latest_run_id = Some(
             self.latest_run_id
                 .map_or(record.run_id, |latest| latest.max(record.run_id)),
@@ -3083,6 +3117,16 @@ fn build_render_block(
             0,
             0,
         ),
+        NormalisedBlock::SessionRestored => {
+            let style = card_style(COMPLETE_ARENA);
+            RenderBlock::card(
+                own_styled_text(Text::raw("Session restored."), style),
+                style,
+                width,
+                1,
+                1,
+            )
+        }
         NormalisedBlock::Accounting { text } => RenderBlock::card(
             Text {
                 alignment: None,
@@ -3924,8 +3968,8 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
-        ModelStepId, Record, RunId, RuntimeDisabledReason, RuntimeEvent, StoredRecord,
-        TerminalDetails,
+        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent,
+        RuntimeInitialState, StoredRecord, TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
     use crate::subagents::TaskRecord;
@@ -3948,6 +3992,114 @@ mod tests {
             false,
         ));
         assert!(transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn session_restored_replacement_keeps_toggles_and_removes_its_card_on_a_request() {
+        let mut transcript = Transcript::default();
+        transcript.toggle_reasoning();
+        transcript.toggle_arena_expansion();
+        let state = RuntimeInitialState {
+            metadata: None,
+            timeline: vec![RestoredTimelineItem::Record(StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "restored request".to_owned(),
+                },
+            })],
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+
+        let mut replacement = transcript.restored_replacement(&state);
+        replacement.append_restoration_card();
+        assert!(!replacement.show_reasoning);
+        assert!(replacement.expand_arenas);
+        assert_eq!(
+            replacement
+                .blocks()
+                .iter()
+                .map(|block| match block {
+                    TranscriptBlock::User { .. } => "user",
+                    TranscriptBlock::SessionRestored => "restored",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>(),
+            ["user", "restored"]
+        );
+
+        assert!(replacement.begin_submission());
+        assert!(replacement.apply(
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: RunId(2),
+            },
+            false,
+        ));
+        assert!(replacement.apply(
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            },
+            false,
+        ));
+        assert!(
+            replacement
+                .blocks()
+                .iter()
+                .any(|block| matches!(block, TranscriptBlock::SessionRestored))
+        );
+        assert!(replacement.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "new request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        ));
+        assert!(
+            !replacement
+                .blocks()
+                .iter()
+                .any(|block| matches!(block, TranscriptBlock::SessionRestored))
+        );
+    }
+
+    #[test]
+    fn session_restored_card_follows_late_finished_tasks() {
+        let task = TaskRecord::for_test(
+            "00",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let state = RuntimeInitialState {
+            metadata: None,
+            timeline: vec![
+                RestoredTimelineItem::Record(StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "restored request".to_owned(),
+                    },
+                }),
+                RestoredTimelineItem::SubagentSpawned(task.clone()),
+                RestoredTimelineItem::SubagentFinished(task),
+            ],
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+        let mut transcript = Transcript::default().restored_replacement(&state);
+        transcript.append_restoration_card();
+        let text = rendered_layout_text(&mut transcript);
+
+        assert!(
+            text.find("subagent:00").expect("finished task")
+                < text.find("Session restored.").expect("restoration card")
+        );
     }
 
     #[test]
@@ -7407,6 +7559,7 @@ truncated"
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
                 TranscriptBlock::Status { .. } => "status",
+                TranscriptBlock::SessionRestored => "session restored",
                 TranscriptBlock::Metadata { .. } => "metadata",
                 TranscriptBlock::Accounting { .. } => "accounting",
             })
@@ -7523,6 +7676,7 @@ truncated"
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
                 TranscriptBlock::Status { .. } => "status",
+                TranscriptBlock::SessionRestored => "session restored",
                 TranscriptBlock::Metadata { .. } => "metadata",
                 TranscriptBlock::Accounting { .. } => "accounting",
             })

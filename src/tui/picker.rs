@@ -28,6 +28,7 @@ pub(crate) struct DynamicPickerItem<T> {
     pub(crate) row: Line<'static>,
     pub(crate) direct_search: String,
     pub(crate) context_search: String,
+    pub(crate) selectable: bool,
     pub(crate) value: T,
 }
 
@@ -42,6 +43,7 @@ struct PickerRow<T> {
     row: Line<'static>,
     direct_search: String,
     context_search: String,
+    selectable: bool,
     value: T,
 }
 
@@ -70,10 +72,7 @@ impl<T: Copy + Eq> Picker<T> {
         current: T,
     ) -> Self {
         let items = items.into_iter().map(PickerRow::from).collect::<Vec<_>>();
-        let focus = items
-            .iter()
-            .position(|item| item.value == current)
-            .or_else(|| (!items.is_empty()).then_some(0));
+        let focus = Self::initial_focus(&items, current);
         Self {
             title,
             empty_message,
@@ -95,10 +94,7 @@ impl<T: Copy + Eq> Picker<T> {
         save_policy: PickerSavePolicy,
     ) -> Self {
         let items = items.into_iter().map(PickerRow::from).collect::<Vec<_>>();
-        let focus = items
-            .iter()
-            .position(|item| item.value == current)
-            .or_else(|| (!items.is_empty()).then_some(0));
+        let focus = Self::initial_focus(&items, current);
         Self {
             title,
             empty_message,
@@ -149,6 +145,10 @@ impl<T: Copy + Eq> Picker<T> {
 
     pub(crate) fn empty_message(&self) -> &'static str {
         self.empty_message
+    }
+
+    pub(crate) fn filter(&self) -> &str {
+        &self.filter
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
@@ -260,6 +260,13 @@ impl<T: Copy + Eq> Picker<T> {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn initial_focus(items: &[PickerRow<T>], current: T) -> Option<usize> {
+        items
+            .iter()
+            .position(|item| item.selectable && item.value == current)
+            .or_else(|| items.iter().position(|item| item.selectable))
+    }
+
     fn group_heading_count(&self) -> usize {
         let mut last_group = None;
         self.items
@@ -367,8 +374,10 @@ impl<T: Copy + Eq> Picker<T> {
     }
 
     fn is_direct_match(&self, index: usize) -> bool {
-        self.match_canonical_search(&self.items[index].direct_search, "")
-            .is_some()
+        self.items[index].selectable
+            && self
+                .match_canonical_search(&self.items[index].direct_search, "")
+                .is_some()
     }
 
     fn matches(&self) -> Vec<PickerMatch> {
@@ -377,7 +386,10 @@ impl<T: Copy + Eq> Picker<T> {
             .enumerate()
             .filter_map(|(index, item)| {
                 self.match_canonical_search(&item.direct_search, &item.context_search)
-                    .map(|direct| PickerMatch { index, direct })
+                    .map(|direct| PickerMatch {
+                        index,
+                        direct: item.selectable && direct,
+                    })
             })
             .collect()
     }
@@ -395,6 +407,7 @@ impl<T> From<PickerItem<T>> for PickerRow<T> {
             row: Line::raw(item.label),
             direct_search: canonical_search(item.label),
             context_search: String::new(),
+            selectable: true,
             value: item.value,
         }
     }
@@ -407,6 +420,7 @@ impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
             row: item.row,
             direct_search: canonical_search(&item.direct_search),
             context_search: canonical_search(&item.context_search),
+            selectable: item.selectable,
             value: item.value,
         }
     }
@@ -482,6 +496,7 @@ mod tests {
             row: Line::raw(direct_search.to_owned()),
             direct_search: direct_search.to_owned(),
             context_search: context_search.to_owned(),
+            selectable: true,
             value,
         }
     }
@@ -556,6 +571,7 @@ mod tests {
                     ]),
                     direct_search: "Session γ α".to_owned(),
                     context_search: "needle".to_owned(),
+                    selectable: true,
                     value: "start",
                 },
                 DynamicPickerItem {
@@ -565,6 +581,7 @@ mod tests {
                     ]),
                     direct_search: "Python needle".to_owned(),
                     context_search: String::new(),
+                    selectable: true,
                     value: "step",
                 },
                 DynamicPickerItem {
@@ -574,6 +591,7 @@ mod tests {
                     ]),
                     direct_search: "Reply".to_owned(),
                     context_search: "needle".to_owned(),
+                    selectable: true,
                     value: "tail",
                 },
             ],
@@ -611,6 +629,115 @@ mod tests {
         assert_eq!(buffer[(next_row_column, next_row)].fg, Color::White);
         assert!(
             !buffer[(next_row_column, next_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn non_selectable_rows_remain_visible_without_focus() {
+        let mut picker = Picker::new_dynamic(
+            "Picker",
+            "No matching items",
+            [
+                DynamicPickerItem {
+                    row: Line::raw("First"),
+                    direct_search: "First".to_owned(),
+                    context_search: String::new(),
+                    selectable: true,
+                    value: "first",
+                },
+                DynamicPickerItem {
+                    row: Line::raw("Loading…"),
+                    direct_search: "Loading…".to_owned(),
+                    context_search: String::new(),
+                    selectable: false,
+                    value: "loading",
+                },
+                DynamicPickerItem {
+                    row: Line::raw("Last"),
+                    direct_search: "Last".to_owned(),
+                    context_search: String::new(),
+                    selectable: true,
+                    value: "last",
+                },
+            ],
+            "loading",
+            PickerSavePolicy::Enabled,
+        );
+
+        assert_eq!(picker.matched_values(), ["first", "loading", "last"]);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerAction::Apply("first")
+        );
+        let initial = rendered_buffer(&mut picker, 60, 10);
+        let (loading_column, loading_row) = cell_start(&initial, "Loading…");
+        assert!(
+            !initial[(loading_column, loading_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+            let _ = picker.handle_key(key(code));
+            assert_eq!(
+                picker.handle_key(key(KeyCode::Enter)),
+                PickerAction::Apply("last")
+            );
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+                PickerAction::Save("last")
+            );
+        }
+        for code in [KeyCode::Up, KeyCode::PageUp, KeyCode::Home] {
+            let _ = picker.handle_key(key(code));
+            assert_eq!(
+                picker.handle_key(key(KeyCode::Enter)),
+                PickerAction::Apply("first")
+            );
+            assert_eq!(
+                picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+                PickerAction::Save("first")
+            );
+        }
+
+        let mut loading = Picker::new_dynamic(
+            "Picker",
+            "No matching items",
+            [DynamicPickerItem {
+                row: Line::raw("Loading…"),
+                direct_search: "Loading…".to_owned(),
+                context_search: String::new(),
+                selectable: false,
+                value: "loading",
+            }],
+            "loading",
+            PickerSavePolicy::Enabled,
+        );
+        assert_eq!(loading.matched_values(), ["loading"]);
+        assert_eq!(
+            loading.handle_key(key(KeyCode::Enter)),
+            PickerAction::NoMatch
+        );
+        assert_eq!(
+            loading.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            PickerAction::NoMatch
+        );
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(loading.handle_key(key(code)), PickerAction::None);
+        }
+        let buffer = rendered_buffer(&mut loading, 60, 10);
+        let (loading_column, loading_row) = cell_start(&buffer, "Loading…");
+        assert!(
+            !buffer[(loading_column, loading_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );

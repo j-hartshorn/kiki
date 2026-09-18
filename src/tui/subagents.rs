@@ -964,6 +964,38 @@ mod tests {
         assert!(monitor.entries.contains_key("01"));
     }
 
+    #[test]
+    fn restored_monitor_keeps_a_late_finished_task_visible() {
+        let task = TaskRecord::for_test(
+            "00",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let request = RestoredTimelineItem::Record(StoredRecord {
+            run_id: RunId(1),
+            record: Record::UserRequest {
+                request: "saved request".to_owned(),
+            },
+        });
+
+        let mut monitor = SubagentMonitor::restored(&[
+            request,
+            RestoredTimelineItem::SubagentSpawned(task.clone()),
+            RestoredTimelineItem::SubagentFinished(task),
+        ]);
+        assert_eq!(
+            monitor
+                .entries
+                .get("00")
+                .map(|entry| entry.observation.state),
+            Some(TaskState::Completed)
+        );
+        assert!(layout_text(&mut monitor, 80, 4, Instant::now()).contains("✓ subagent:00"));
+    }
+
     fn insert(monitor: &mut SubagentMonitor, id: &str, entry: Entry) {
         monitor.admission_order.push(id.to_owned());
         monitor.entries.insert(id.to_owned(), entry);
