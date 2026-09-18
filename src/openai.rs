@@ -5624,6 +5624,7 @@ mod tests {
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::NameAccepted { .. }
                 | RuntimeEvent::NavigationCompleted { .. }
+                | RuntimeEvent::TreeCatalogue { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
         }

@@ -273,7 +273,7 @@ First red: `runtime::tests::tree_request_returns_catalogue_only_when_fully_settl
 
 **Files**
 
-- Modify: `src/runtime.rs`.
+- Modify: `src/runtime.rs`, `src/openai.rs`, `src/transcript.rs`.
 
 **Verification**
 

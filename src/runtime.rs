@@ -15,7 +15,7 @@ use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
     PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session,
-    SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
+    SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -48,6 +48,9 @@ pub(crate) enum RuntimeCommand {
     },
     Navigate {
         entry: SessionEntryId,
+    },
+    RequestTree {
+        revision: u64,
     },
     Cancel,
     CancelBackground,
@@ -127,6 +130,14 @@ pub(crate) struct RuntimeInitialState {
     pub(crate) timeline: Vec<RestoredTimelineItem>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
     pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TreeRequestOutcome {
+    Catalogue(SessionCatalogue),
+    RejectedBusy,
+    RejectedReadOnly,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +236,10 @@ pub(crate) enum RuntimeEvent {
     },
     NavigationCompleted {
         outcome: NavigationOutcome,
+    },
+    TreeCatalogue {
+        revision: u64,
+        outcome: TreeRequestOutcome,
     },
     SubmissionRejectedBusy {
         active_run_id: RunId,
@@ -415,7 +430,8 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::Submit { .. }
         | RuntimeCommand::ApplySettings { .. }
         | RuntimeCommand::SetSessionName { .. }
-        | RuntimeCommand::Navigate { .. } => None,
+        | RuntimeCommand::Navigate { .. }
+        | RuntimeCommand::RequestTree { .. } => None,
     }
 }
 
@@ -497,6 +513,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
         | RuntimeEvent::NavigationCompleted { .. }
+        | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
@@ -1025,6 +1042,20 @@ impl<M: Model> RuntimeController<M> {
                     return;
                 };
                 self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
+            }
+            RuntimeCommand::RequestTree { revision } => {
+                let storage_failure = self.subagents.storage_failure_token().is_cancelled();
+                let outcome = if storage_failure || self.disabled_reason.is_some() {
+                    TreeRequestOutcome::RejectedReadOnly
+                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                    TreeRequestOutcome::RejectedBusy
+                } else {
+                    match self.session.catalogue().await {
+                        Ok(catalogue) => TreeRequestOutcome::Catalogue(catalogue),
+                        Err(_) => TreeRequestOutcome::Failed,
+                    }
+                };
+                self.emit(events, RuntimeEvent::TreeCatalogue { revision, outcome });
             }
             RuntimeCommand::Cancel => self.request_active_cancellation(),
             RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
@@ -4115,6 +4146,51 @@ mod tests {
         }
     }
 
+    fn assert_restore_unchanged(before: &SessionRestore, after: &SessionRestore) {
+        assert_eq!(after.requested_entry, before.requested_entry);
+        assert_eq!(after.effective_entry, before.effective_entry);
+        assert_eq!(after.observed_active_entry, before.observed_active_entry);
+        assert_eq!(after.request_prefill, before.request_prefill);
+        assert_eq!(after.metadata, before.metadata);
+        assert_eq!(after.records, before.records);
+        assert_eq!(after.tasks, before.tasks);
+        assert_eq!(after.all_tasks, before.all_tasks);
+        assert_eq!(after.footer_adjustment, before.footer_adjustment);
+        assert_eq!(after.next_task, before.next_task);
+        assert_eq!(
+            after
+                .executable
+                .as_ref()
+                .map(|state| (&state.checkpoint, &state.history)),
+            before
+                .executable
+                .as_ref()
+                .map(|state| (&state.checkpoint, &state.history))
+        );
+    }
+
+    fn session_database_snapshot(session: &Session) -> (i64, i64, i64, i64, i64, i64, i64) {
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT active_entry_id, revision, updated_at_ms, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps), (SELECT COUNT(*) FROM subagent_tasks) FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("snapshot session database")
+    }
+
     async fn progress_until_execution_started(
         progress: &mut RuntimeProgressReceiver,
         step_id: ModelStepId,
@@ -4201,6 +4277,7 @@ mod tests {
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
+            RuntimeEvent::TreeCatalogue { revision, .. } => format!("tree-catalogue:{revision}"),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
@@ -11783,6 +11860,16 @@ mod tests {
         }
     }
 
+    async fn next_tree_outcome(
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> (u64, super::TreeRequestOutcome) {
+        loop {
+            if let RuntimeEvent::TreeCatalogue { revision, outcome } = next_event(events).await {
+                return (revision, outcome);
+            }
+        }
+    }
+
     async fn navigation_fixture(
         workspace: &tempfile::TempDir,
     ) -> (
@@ -12421,20 +12508,41 @@ mod tests {
         shutdown_controller(commands, controller).await;
     }
 
-    async fn assert_navigation_is_rejected_busy(
+    #[derive(Clone, Copy)]
+    enum BusyCommand {
+        Navigation,
+        TreeRequest,
+    }
+
+    async fn assert_command_is_rejected_busy(
+        command: BusyCommand,
         commands: &mpsc::Sender<RuntimeCommand>,
         events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
     ) {
-        commands
-            .send(RuntimeCommand::Navigate {
-                entry: SessionEntryId(1),
-            })
-            .await
-            .expect("request navigation while work is active");
-        assert!(matches!(
-            next_navigation_outcome(events).await,
-            super::NavigationOutcome::RejectedBusy
-        ));
+        match command {
+            BusyCommand::Navigation => {
+                commands
+                    .send(RuntimeCommand::Navigate {
+                        entry: SessionEntryId(1),
+                    })
+                    .await
+                    .expect("request navigation while work is active");
+                assert!(matches!(
+                    next_navigation_outcome(events).await,
+                    super::NavigationOutcome::RejectedBusy
+                ));
+            }
+            BusyCommand::TreeRequest => {
+                commands
+                    .send(RuntimeCommand::RequestTree { revision: 1 })
+                    .await
+                    .expect("request session tree while work is active");
+                assert!(matches!(
+                    next_tree_outcome(events).await,
+                    (1, super::TreeRequestOutcome::RejectedBusy)
+                ));
+            }
+        }
     }
 
     async fn controller_with_write_gate<M: Model>(
@@ -12472,8 +12580,7 @@ mod tests {
         (home, session, controller)
     }
 
-    #[tokio::test]
-    async fn navigation_rejects_each_busy_phase() {
+    async fn assert_each_busy_phase_rejects(command: BusyCommand) {
         let workspace = tempfile::tempdir().expect("create workspace");
         let policy = SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents());
 
@@ -12496,7 +12603,7 @@ mod tests {
             .await
             .expect("submit request");
         request_gate.wait_until_started().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         request_gate.release();
         commands
             .send(RuntimeCommand::Cancel)
@@ -12523,7 +12630,7 @@ mod tests {
             .await
             .expect("submit request");
         provider_called.notified().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         commands
             .send(RuntimeCommand::Cancel)
             .await
@@ -12560,7 +12667,7 @@ mod tests {
             .await
             .expect("submit request");
         read_gate.wait_until_read_started().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         commands
             .send(RuntimeCommand::Cancel)
             .await
@@ -12586,7 +12693,7 @@ mod tests {
             .await
             .expect("submit request");
         closure_gate.wait_until_started().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         closure_gate.release();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, controller).await;
@@ -12624,7 +12731,7 @@ mod tests {
             .await
             .expect("submit request");
         admission_gate.wait_until_started().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         admission_gate.release();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, controller).await;
@@ -12664,7 +12771,7 @@ mod tests {
             .expect("submit request");
         child_started.notified().await;
         events_until_settled(&mut events).await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         child_release.notify_one();
         shutdown_controller(commands, controller).await;
         session.close().expect("close session");
@@ -12706,10 +12813,20 @@ mod tests {
         events_until_settled(&mut events).await;
         child_release.notify_one();
         terminal_gate.wait_until_started().await;
-        assert_navigation_is_rejected_busy(&commands, &mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
         terminal_gate.release();
         shutdown_controller(commands, controller).await;
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_each_busy_phase() {
+        assert_each_busy_phase_rejects(BusyCommand::Navigation).await;
+    }
+
+    #[tokio::test]
+    async fn tree_request_rejects_each_busy_phase() {
+        assert_each_busy_phase_rejects(BusyCommand::TreeRequest).await;
     }
 
     #[tokio::test]
@@ -12966,6 +13083,305 @@ mod tests {
         assert_eq!(active_entry_id(&session), root.0 as i64);
         shutdown_controller(commands, controller).await;
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn tree_request_returns_catalogue_only_when_fully_settled() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, history, root, active_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let before = session.restore().expect("snapshot selected session");
+        let database_before = session_database_snapshot(&session);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            history,
+            ScriptedModel::new(Vec::new()),
+            ArenaRestoreTestGate::new(),
+        );
+        let records_before = controller.records.clone();
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 72 })
+            .await
+            .expect("request session tree");
+        let catalogue = match next_event(&mut events).await {
+            RuntimeEvent::TreeCatalogue {
+                revision: 72,
+                outcome: super::TreeRequestOutcome::Catalogue(catalogue),
+            } => catalogue,
+            event => panic!("unexpected tree response: {event:?}"),
+        };
+        assert_eq!(catalogue.active_entry, active_entry);
+        assert_eq!(catalogue.active_entry, before.effective_entry);
+        assert_eq!(catalogue.active_entry, before.observed_active_entry);
+        assert_eq!(catalogue.entries.len(), 7);
+        assert!(matches!(
+            catalogue.entries[0].kind,
+            crate::session::SessionCatalogueKind::Start
+        ));
+        assert!(matches!(
+            &catalogue.entries[1].kind,
+            crate::session::SessionCatalogueKind::Request { text } if text == "old branch"
+        ));
+        assert!(matches!(
+            catalogue.entries[2].kind,
+            crate::session::SessionCatalogueKind::Execution {
+                commentary: None,
+                ref tool_summaries,
+            } if tool_summaries.is_empty()
+        ));
+        assert!(matches!(
+            &catalogue.entries[3].kind,
+            crate::session::SessionCatalogueKind::Final { text } if text == "old branch final"
+        ));
+        assert!(matches!(
+            &catalogue.entries[4].kind,
+            crate::session::SessionCatalogueKind::Request { text } if text == "target branch"
+        ));
+        assert!(matches!(
+            catalogue.entries[5].kind,
+            crate::session::SessionCatalogueKind::Execution {
+                commentary: None,
+                ref tool_summaries,
+            } if tool_summaries.is_empty()
+        ));
+        assert!(matches!(
+            &catalogue.entries[6].kind,
+            crate::session::SessionCatalogueKind::Final { text } if text == "target branch final"
+        ));
+        assert_eq!(catalogue.entries[0].entry_id, root);
+        assert_eq!(catalogue.entries[3].entry_id, active_entry);
+        assert_eq!(catalogue.entries[6].entry_id, target_entry);
+        assert_eq!(catalogue.entries[1].parent_id, Some(root));
+        assert_eq!(catalogue.entries[4].parent_id, Some(root));
+
+        let after = session.restore().expect("snapshot selected session");
+        assert_restore_unchanged(&before, &after);
+        assert_eq!(session_database_snapshot(&session), database_before);
+        assert_eq!(
+            shutdown_controller(commands, controller).await,
+            records_before
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn tree_request_busy_reply_is_not_deferred_until_settlement() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold generation".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        provider_called.notified().await;
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 73 })
+            .await
+            .expect("request session tree while busy");
+        assert!(matches!(
+            next_tree_outcome(&mut events).await,
+            (73, super::TreeRequestOutcome::RejectedBusy)
+        ));
+        commands
+            .send(RuntimeCommand::Cancel)
+            .await
+            .expect("cancel request");
+        let settlement = events_until_settled(&mut events).await;
+        assert!(
+            !settlement
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TreeCatalogue { .. }))
+        );
+        assert!(events.try_recv().is_err());
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn tree_request_distinguishes_read_only_and_catalogue_failure() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut controller =
+            controller_with_model(&workspace, ScriptedModel::new(Vec::new())).await;
+        controller.disabled_reason = Some(RuntimeDisabledReason::SessionRestoreFailed);
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 74 })
+            .await
+            .expect("request session tree while read-only");
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 74,
+                outcome: super::TreeRequestOutcome::RejectedReadOnly,
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+
+        let (_home, session, live_arena, history, _root, active_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_request: i64 = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = (SELECT parent_id FROM entries WHERE id = ?1)",
+                params![i64::try_from(target_entry.0).expect("target entry fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read target request");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE entries SET payload_json = '{}' WHERE id = ?1",
+                params![target_request],
+            )
+            .expect("corrupt non-selected request");
+        let before = session.restore().expect("restore selected branch");
+        assert!(before.executable.is_some());
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            history,
+            ScriptedModel::new(Vec::new()),
+            ArenaRestoreTestGate::new(),
+        );
+        let records_before = controller.records.clone();
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 75 })
+            .await
+            .expect("request corrupt session tree");
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 75,
+                outcome: super::TreeRequestOutcome::Failed,
+            }
+        ));
+        let after = session.restore().expect("restore selected branch");
+        assert_restore_unchanged(&before, &after);
+        assert!(after.executable.is_some());
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: active_entry,
+            })
+            .await
+            .expect("navigate to unchanged selected entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None,
+            }
+        ));
+        assert_eq!(
+            shutdown_controller(commands, controller).await,
+            records_before
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn tree_request_observes_latched_storage_failure_before_loading() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        let mut controller = controller_with_subagents(
+            &workspace,
+            ScriptedModel::new(Vec::new()),
+            coordinator.clone(),
+        )
+        .await;
+        coordinator.latch_storage_failure().await;
+        let (events_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let mut shutdown_requested = false;
+
+        controller
+            .handle_command(
+                RuntimeCommand::RequestTree { revision: 76 },
+                &events_sender,
+                &mut progress,
+                &mut shutdown_requested,
+            )
+            .await;
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 76,
+                outcome: super::TreeRequestOutcome::RejectedReadOnly,
+            }
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(controller.disabled_reason, None);
+        assert!(controller.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn tree_request_preserves_correlation_and_command_ordering() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let controller = controller_with_model(&workspace, ScriptedModel::new(Vec::new())).await;
+        let selection = ModelSelection::new(&TERRA, TERRA.default_thinking).expect("select Terra");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        for revision in [76, 77] {
+            commands
+                .send(RuntimeCommand::RequestTree { revision })
+                .await
+                .expect("request session tree");
+        }
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection,
+                revision: 78,
+            })
+            .await
+            .expect("apply settings");
+        commands
+            .send(RuntimeCommand::Shutdown)
+            .await
+            .expect("request shutdown");
+
+        for revision in [76, 77] {
+            assert!(matches!(
+                next_event(&mut events).await,
+                RuntimeEvent::TreeCatalogue {
+                    revision: actual_revision,
+                    outcome: super::TreeRequestOutcome::Catalogue(_),
+                } if actual_revision == revision
+            ));
+        }
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 78 }
+        );
+        assert!(
+            timeout(TEST_TIMEOUT, controller)
+                .await
+                .expect("controller should stop")
+                .expect("controller task should not panic")
+                .is_empty()
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
