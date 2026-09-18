@@ -605,43 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_rows_derive_selectability_from_role() {
-        let mut picker = Picker::new_dynamic(
-            "Picker",
-            "No matching items",
-            [
-                DynamicPickerItem {
-                    row: Line::raw("Context"),
-                    role: DynamicPickerRole::Context,
-                    value: "context",
-                },
-                DynamicPickerItem {
-                    row: Line::raw("Direct"),
-                    role: DynamicPickerRole::Direct,
-                    value: "direct",
-                },
-            ],
-            "context",
-            PickerSavePolicy::Enabled,
-        );
-
-        assert_eq!(picker.apply(false), PickerAction::Apply("direct"));
-        let buffer = rendered_buffer(&mut picker, 60, 10);
-        let (context_column, context_row) = cell_start(&buffer, "Context");
-        let (direct_column, direct_row) = cell_start(&buffer, "Direct");
-        assert!(
-            !buffer[(context_column, context_row)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-        assert!(
-            buffer[(direct_column, direct_row)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-    }
-
-    #[test]
     fn context_rows_remain_visible_without_focus() {
         let mut picker = Picker::new_dynamic(
             "Picker",

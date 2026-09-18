@@ -2020,7 +2020,6 @@ fn restore_projection_at(
     effective_entry_id: i64,
     observed_active_entry_id: i64,
 ) -> SessionRestore {
-    let metadata = snapshot.metadata.clone();
     let requested_entry = session_entry_id(requested_entry_id).unwrap_or(SessionEntryId(0));
     let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
     let observed_active_entry =
@@ -2100,7 +2099,7 @@ fn restore_projection_at(
         decoded_restore_entry(&decoded_entries, entry.id).is_ok()
             && (entry.kind != "user_request" || entry.provider_replay.is_none())
     });
-    let mut executable = metadata.is_some()
+    let mut executable = snapshot.metadata.is_some()
         && ancestry.intact
         && !ancestry.entries.is_empty()
         && requested_is_valid
@@ -2308,7 +2307,7 @@ fn restore_projection_at(
         effective_entry,
         observed_active_entry,
         request_prefill,
-        metadata,
+        metadata: snapshot.metadata,
         records,
         tasks,
         all_tasks,

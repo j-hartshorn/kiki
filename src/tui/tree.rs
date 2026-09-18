@@ -32,32 +32,15 @@ struct TreeProjection {
 }
 
 impl TreeProjection {
-    fn all<T>(nodes: &[TreeNode<T>], preorder: &[usize]) -> Self {
-        Self::new(
-            nodes,
-            preorder,
-            vec![true; nodes.len()],
-            vec![true; nodes.len()],
-        )
+    fn all<T>(nodes: &[TreeNode<T>]) -> Self {
+        Self::new(nodes, vec![true; nodes.len()], vec![true; nodes.len()])
     }
 
-    fn new<T>(
-        nodes: &[TreeNode<T>],
-        preorder: &[usize],
-        direct_matches: Vec<bool>,
-        visible: Vec<bool>,
-    ) -> Self {
+    fn new<T>(nodes: &[TreeNode<T>], direct_matches: Vec<bool>, visible: Vec<bool>) -> Self {
         let mut last_visible = vec![false; nodes.len()];
-        let mut last_visible_child = vec![None; nodes.len()];
-        for &index in preorder {
-            if !visible[index] {
-                continue;
-            }
-            if let Some(parent) = nodes[index].parent {
-                if let Some(previous) = last_visible_child[parent].replace(index) {
-                    last_visible[previous] = false;
-                }
-                last_visible[index] = true;
+        for node in nodes {
+            if let Some(&child) = node.children.iter().rev().find(|&&child| visible[child]) {
+                last_visible[child] = true;
             }
         }
         Self {
@@ -147,7 +130,7 @@ impl<T: Copy + Eq> SessionTree<T> {
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&TreeProjection::all(&self.nodes, &self.preorder)),
+            self.items(&TreeProjection::all(&self.nodes)),
             self.active_value,
             PickerSavePolicy::Disabled,
         )
@@ -173,7 +156,7 @@ impl<T: Copy + Eq> SessionTree<T> {
                 visible[parent] = true;
             }
         }
-        TreeProjection::new(&self.nodes, &self.preorder, direct_matches, visible)
+        TreeProjection::new(&self.nodes, direct_matches, visible)
     }
 
     fn items(&self, projection: &TreeProjection) -> Vec<DynamicPickerItem<T>> {

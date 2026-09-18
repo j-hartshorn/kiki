@@ -1036,12 +1036,7 @@ impl<M: Model> RuntimeController<M> {
                 } else {
                     self.drain_coordinator_events(events, progress).await;
                     let (outcome, disabled) = self.restore_selected_entry(entry).await;
-                    self.emit(
-                        events,
-                        RuntimeEvent::NavigationCompleted {
-                            outcome: outcome.clone(),
-                        },
-                    );
+                    self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
                     self.disable_after_restoration(events, disabled).await;
                     return;
                 };
