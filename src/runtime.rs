@@ -1042,23 +1042,7 @@ impl<M: Model> RuntimeController<M> {
                             outcome: outcome.clone(),
                         },
                     );
-                    if let Some(reason) = disabled {
-                        match reason {
-                            RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
-                                self.disable_arena_checkpoint_recovery(events);
-                            }
-                            RuntimeDisabledReason::SessionStorageWriteFailed => {
-                                self.subagents.latch_storage_failure().await;
-                                self.disable_session_storage(events).await;
-                            }
-                            RuntimeDisabledReason::OpenAiAuthentication
-                            | RuntimeDisabledReason::SessionRestoreFailed => {
-                                unreachable!(
-                                    "navigation only disables for Arena or storage recovery"
-                                )
-                            }
-                        }
-                    }
+                    self.disable_after_restoration(events, disabled).await;
                     return;
                 };
                 self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
@@ -1110,7 +1094,7 @@ impl<M: Model> RuntimeController<M> {
                 None,
             );
         }
-        let Some(executable) = restore.executable.clone() else {
+        let Some(executable) = restore.executable.as_ref() else {
             return (NavigationOutcome::Failed, None);
         };
         let Some(agent) = self.agent.as_ref() else {
@@ -1122,6 +1106,10 @@ impl<M: Model> RuntimeController<M> {
         {
             return (NavigationOutcome::Failed, None);
         }
+        let initial = restored_initial_state(&restore);
+        let executable = restore
+            .executable
+            .expect("navigation validated executable state");
         let previous_checkpoint = agent.checkpoint();
         let target_restore = self
             .agent
@@ -1177,7 +1165,6 @@ impl<M: Model> RuntimeController<M> {
                 .await,
             "navigation has no tracked child operations"
         );
-        let initial = restored_initial_state(&restore);
         let request_prefill = restore.request_prefill;
         self.agent
             .as_mut()
@@ -1195,6 +1182,29 @@ impl<M: Model> RuntimeController<M> {
             },
             None,
         )
+    }
+
+    async fn disable_after_restoration(
+        &mut self,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        disabled: Option<RuntimeDisabledReason>,
+    ) {
+        let Some(reason) = disabled else {
+            return;
+        };
+        match reason {
+            RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
+                self.disable_arena_checkpoint_recovery(events);
+            }
+            RuntimeDisabledReason::SessionStorageWriteFailed => {
+                self.subagents.latch_storage_failure().await;
+                self.disable_session_storage(events).await;
+            }
+            RuntimeDisabledReason::OpenAiAuthentication
+            | RuntimeDisabledReason::SessionRestoreFailed => {
+                unreachable!("restoration only disables for Arena or storage recovery")
+            }
+        }
     }
 
     fn disable_arena_checkpoint_recovery(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
@@ -1719,8 +1729,8 @@ impl<M: Model> RuntimeController<M> {
                             .settle_root_run(&caller, persisted_model_steps)
                             .await;
                         if correction {
-                            let outcome = if self.subagents.operation_count() != 0 {
-                                CorrectionOutcome::SkippedBackground
+                            let (outcome, disabled) = if self.subagents.operation_count() != 0 {
+                                (CorrectionOutcome::SkippedBackground, None)
                             } else {
                                 self.drain_coordinator_events(events, progress).await;
                                 let (outcome, disabled) = self
@@ -1728,51 +1738,28 @@ impl<M: Model> RuntimeController<M> {
                                         request_entry.expect("eligible correction has a request"),
                                     )
                                     .await;
-                                let outcome = match outcome {
-                                    NavigationOutcome::Replaced {
-                                        state,
-                                        request_prefill,
-                                    } => CorrectionOutcome::Replaced {
-                                        state,
-                                        request_prefill,
+                                (
+                                    match outcome {
+                                        NavigationOutcome::Replaced {
+                                            state,
+                                            request_prefill,
+                                        } => CorrectionOutcome::Replaced {
+                                            state,
+                                            request_prefill,
+                                        },
+                                        NavigationOutcome::Unchanged { .. }
+                                        | NavigationOutcome::RejectedBusy
+                                        | NavigationOutcome::RejectedReadOnly
+                                        | NavigationOutcome::Failed => CorrectionOutcome::Failed,
                                     },
-                                    NavigationOutcome::Unchanged { .. }
-                                    | NavigationOutcome::RejectedBusy
-                                    | NavigationOutcome::RejectedReadOnly
-                                    | NavigationOutcome::Failed => CorrectionOutcome::Failed,
-                                };
-                                self.emit(
-                                    events,
-                                    RuntimeEvent::CorrectionCompleted {
-                                        run_id,
-                                        outcome: outcome.clone(),
-                                    },
-                                );
-                                if let Some(reason) = disabled {
-                                    match reason {
-                                        RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
-                                            self.disable_arena_checkpoint_recovery(events);
-                                        }
-                                        RuntimeDisabledReason::SessionStorageWriteFailed => {
-                                            self.subagents.latch_storage_failure().await;
-                                            self.disable_session_storage(events).await;
-                                        }
-                                        RuntimeDisabledReason::OpenAiAuthentication
-                                        | RuntimeDisabledReason::SessionRestoreFailed => {
-                                            unreachable!(
-                                                "correction only disables for Arena or storage recovery"
-                                            )
-                                        }
-                                    }
-                                }
-                                outcome
+                                    disabled,
+                                )
                             };
-                            if matches!(outcome, CorrectionOutcome::SkippedBackground) {
-                                self.emit(
-                                    events,
-                                    RuntimeEvent::CorrectionCompleted { run_id, outcome },
-                                );
-                            }
+                            self.emit(
+                                events,
+                                RuntimeEvent::CorrectionCompleted { run_id, outcome },
+                            );
+                            self.disable_after_restoration(events, disabled).await;
                         }
                         self.trace.emit(|| TraceEvent::RootRunSettled {
                             run_id: run_id.0,

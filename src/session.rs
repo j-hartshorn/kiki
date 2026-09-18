@@ -264,7 +264,7 @@ pub(crate) struct SessionCatalogue {
     pub(crate) entries: Vec<SessionCatalogueEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct RestoredExecutableState {
     pub(crate) checkpoint: Checkpoint,
     pub(crate) history: ModelHistory,
@@ -294,7 +294,7 @@ impl SessionMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SessionRestore {
     pub(crate) requested_entry: SessionEntryId,
     pub(crate) effective_entry: SessionEntryId,
@@ -1048,9 +1048,6 @@ fn select_active_entry(
     effective_entry: SessionEntryId,
     observed_active_entry: SessionEntryId,
 ) -> Result<(), SessionError> {
-    if effective_entry == observed_active_entry {
-        return Ok(());
-    }
     let effective_entry = i64::try_from(effective_entry.0).map_err(|_| SessionError::IdOverflow)?;
     let observed_active_entry =
         i64::try_from(observed_active_entry.0).map_err(|_| SessionError::IdOverflow)?;
@@ -3893,20 +3890,6 @@ mod tests {
         let active = SessionEntryId(active_entry_id(&session) as u64);
         let before = selection_snapshot(&session);
         let before_database = selection_database_bytes(home.path(), &session);
-        super::select_active_entry(
-            &mut session
-                .connection_for_test()
-                .expect("lock session connection"),
-            SessionEntryId(u64::MAX),
-            SessionEntryId(u64::MAX),
-        )
-        .expect("short-circuit equivalent private selection");
-        assert_eq!(selection_snapshot(&session), before);
-        assert_eq!(
-            selection_database_bytes(home.path(), &session),
-            before_database
-        );
-
         writer
             .select_active_entry(active, active)
             .await
