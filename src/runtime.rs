@@ -236,6 +236,9 @@ pub(crate) enum RuntimeEvent {
     SubagentFinished {
         record: TaskRecord,
     },
+    SubagentOperationSettled {
+        id: TaskId,
+    },
     RunSettled {
         run_id: RunId,
     },
@@ -528,6 +531,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SubagentStatus { .. }
         | RuntimeEvent::SubagentRecord { .. }
         | RuntimeEvent::SubagentFinished { .. }
+        | RuntimeEvent::SubagentOperationSettled { .. }
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
@@ -1049,6 +1053,7 @@ impl<M: Model> RuntimeController<M> {
                 } else if self.active.is_some() || self.subagents.operation_count() != 0 {
                     TreeRequestOutcome::RejectedBusy
                 } else {
+                    self.drain_coordinator_events(events, progress).await;
                     match self.session.catalogue().await {
                         Ok(catalogue) => TreeRequestOutcome::Catalogue(catalogue),
                         Err(_) => TreeRequestOutcome::Failed,
@@ -1233,7 +1238,7 @@ impl<M: Model> RuntimeController<M> {
                 let Some(record) = self.subagents.record(&id).await else {
                     return;
                 };
-                if record.revision() < revision {
+                if record.revision() < revision || record.observation().state().is_terminal() {
                     return;
                 }
                 self.publish_subagent_record(events, &record);
@@ -1243,6 +1248,9 @@ impl<M: Model> RuntimeController<M> {
                 self.publish_subagent_record(events, &record);
                 self.publish_subagent_status(progress, &record);
                 self.emit(events, RuntimeEvent::SubagentFinished { record });
+            }
+            CoordinatorEvent::OperationSettled { id } => {
+                self.emit(events, RuntimeEvent::SubagentOperationSettled { id });
             }
         }
     }
@@ -1966,9 +1974,9 @@ mod tests {
     };
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
-        CompleteChildRunner, OperationTestGate, RunnerFuture, SessionSubagents,
-        StartSubagentTestGate, SubagentCoordinator, SubagentPolicy, TaskAttempt, TaskExecution,
-        TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState,
+        CompleteChildRunner, RunnerFuture, SessionSubagents, StartSubagentTestGate,
+        SubagentCoordinator, SubagentPolicy, TaskAttempt, TaskExecution, TaskOutcome,
+        TaskPersistedDetails, TaskRecord, TaskState, TerminalSettlementTestGate,
     };
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
@@ -4380,6 +4388,9 @@ mod tests {
             }
             RuntimeEvent::SubagentFinished { record } => {
                 format!("subagent-finished:{}", record.id())
+            }
+            RuntimeEvent::SubagentOperationSettled { id } => {
+                format!("subagent-operation-settled:{id}")
             }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
@@ -9221,7 +9232,7 @@ mod tests {
     #[tokio::test]
     async fn correction_skips_stopping_background_work_without_later_restoration() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let operation_gate = OperationTestGate::new();
+        let operation_gate = TerminalSettlementTestGate::new();
         let factory = CleanupGatedChildFactory {
             started: Arc::new(Notify::new()),
             cleanup_started: Arc::new(Notify::new()),
@@ -9229,7 +9240,7 @@ mod tests {
             returned: Arc::new(Notify::new()),
         };
         let coordinator = complete_child_coordinator(factory.clone())
-            .with_operation_test_gate(operation_gate.clone());
+            .with_terminal_settlement_test_gate(operation_gate.clone());
         let caller = coordinator.root_caller().await;
         let child = coordinator
             .start(&caller, child_parameters(), child_payload(&workspace).await)
@@ -9272,9 +9283,9 @@ mod tests {
         );
 
         factory.release.notify_one();
-        operation_gate.wait_until_terminal_published().await;
-        operation_gate.allow_settlement();
-        operation_gate.wait_until_settled().await;
+        operation_gate.wait_until_terminal_settled().await;
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
         assert_eq!(coordinator.operation_count(), 0);
         let mut later = Vec::new();
         loop {
@@ -9294,16 +9305,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn correction_skips_terminal_persistence_pending_background_work() {
+    async fn correction_skips_terminal_settlement_pending_background_work() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let operation_gate = OperationTestGate::new();
+        let operation_gate = TerminalSettlementTestGate::new();
         let factory = GatedChildFactory {
             started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
             attempts: Vec::new(),
         };
         let coordinator = complete_child_coordinator(factory.clone())
-            .with_operation_test_gate(operation_gate.clone());
+            .with_terminal_settlement_test_gate(operation_gate.clone());
         let caller = coordinator.root_caller().await;
         coordinator
             .start(&caller, child_parameters(), child_payload(&workspace).await)
@@ -9311,7 +9322,7 @@ mod tests {
             .expect("admit background child");
         factory.started.notified().await;
         factory.release.notify_one();
-        operation_gate.wait_until_terminal_published().await;
+        operation_gate.wait_until_terminal_settled().await;
         assert_eq!(coordinator.operation_count(), 1);
         let ready = Arc::new(Notify::new());
         let controller = controller_with_subagents(
@@ -9338,8 +9349,8 @@ mod tests {
             [CorrectionOutcome::SkippedBackground]
         );
 
-        operation_gate.allow_settlement();
-        operation_gate.wait_until_settled().await;
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
         assert_eq!(coordinator.operation_count(), 0);
         assert!(!foreground.iter().any(|event| matches!(
             event,
@@ -9356,14 +9367,14 @@ mod tests {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
         let closure_gate = SessionWriteGate::new(SessionWriteKind::Closure);
-        let operation_gate = OperationTestGate::new();
+        let operation_gate = TerminalSettlementTestGate::new();
         let factory = GatedChildFactory {
             started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
             attempts: Vec::new(),
         };
         let coordinator = complete_child_coordinator(factory.clone())
-            .with_operation_test_gate(operation_gate.clone());
+            .with_terminal_settlement_test_gate(operation_gate.clone());
         let caller = coordinator.root_caller().await;
         coordinator
             .start(&caller, child_parameters(), child_payload(&workspace).await)
@@ -9410,9 +9421,9 @@ mod tests {
             .send(RuntimeCommand::CancelBackground)
             .await
             .expect("repeat Escape cancels background work");
-        operation_gate.wait_until_terminal_published().await;
-        operation_gate.allow_settlement();
-        operation_gate.wait_until_settled().await;
+        operation_gate.wait_until_terminal_settled().await;
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
         assert_eq!(coordinator.operation_count(), 0);
         closure_gate.release();
         let foreground = events_until_settled(&mut events).await;
@@ -9438,7 +9449,7 @@ mod tests {
     async fn correction_hides_cancelled_run_tasks_until_manual_return() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
-        let operation_gate = OperationTestGate::new();
+        let operation_gate = TerminalSettlementTestGate::new();
         let child_attempt = known_usage(DEFAULT_MODEL, 7, 3, 0);
         let factory = GatedChildFactory {
             started: Arc::new(Notify::new()),
@@ -9446,7 +9457,7 @@ mod tests {
             attempts: vec![child_attempt.clone()],
         };
         let coordinator = complete_child_coordinator(factory.clone())
-            .with_operation_test_gate(operation_gate.clone());
+            .with_terminal_settlement_test_gate(operation_gate.clone());
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let arena = Arena::new(
             worker_path(),
@@ -9485,13 +9496,13 @@ mod tests {
             .await
             .expect("child should start");
         factory.release.notify_one();
-        timeout(TEST_TIMEOUT, operation_gate.wait_until_terminal_published())
+        timeout(TEST_TIMEOUT, operation_gate.wait_until_terminal_settled())
             .await
-            .expect("child terminal should publish");
-        operation_gate.allow_settlement();
-        timeout(TEST_TIMEOUT, operation_gate.wait_until_settled())
+            .expect("child terminal should settle");
+        operation_gate.allow_operation_drop();
+        timeout(TEST_TIMEOUT, operation_gate.wait_until_operation_dropped())
             .await
-            .expect("child operation should settle");
+            .expect("child operation should drop");
         timeout(TEST_TIMEOUT, ready.notified())
             .await
             .expect("foreground should wait for correction");
@@ -11190,6 +11201,39 @@ mod tests {
 
         factory.release.notify_one();
         coordinator.wait(&caller, child.id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_child_changes_emit_no_record_or_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let terminal = TaskRecord::for_test("c1", 2, selection, None, 1, Vec::new());
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        coordinator
+            .restore_terminal_tasks([terminal.clone()], Some(1))
+            .await;
+        let mut controller =
+            controller_with_subagents(&workspace, ScriptedModel::default(), coordinator).await;
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut statuses) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+
+        controller
+            .handle_coordinator_event(
+                CoordinatorEvent::Changed {
+                    id: terminal.id().clone(),
+                    revision: terminal.revision(),
+                },
+                &event_sender,
+                &mut progress,
+            )
+            .await;
+
+        assert!(events.try_recv().is_err());
+        assert!(statuses.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -14504,6 +14548,81 @@ mod tests {
             records_before
         );
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn idle_tree_and_navigation_commands_drain_finished_before_responding() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+
+        for command in [
+            RuntimeCommand::RequestTree { revision: 1 },
+            RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            },
+        ] {
+            let mut controller = controller(&workspace, Vec::new()).await;
+            let (coordinator_events, receiver) = mpsc::unbounded_channel();
+            controller.subagent_events = Some(receiver);
+            let record = TaskRecord::for_test("00", 2, selection, None, 1, Vec::new());
+            coordinator_events
+                .send(CoordinatorEvent::Finished {
+                    record: record.clone(),
+                })
+                .expect("queue finished child");
+            let (event_sender, mut events) = mpsc::unbounded_channel();
+            let (progress_sender, _) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+            let mut progress = ProgressPublisher::new(progress_sender);
+            let mut shutdown_requested = false;
+            let tree_request = matches!(command, RuntimeCommand::RequestTree { .. });
+
+            controller
+                .handle_command(
+                    command,
+                    &event_sender,
+                    &mut progress,
+                    &mut shutdown_requested,
+                )
+                .await;
+
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentRecord { record: emitted }) if emitted == record
+            ));
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentFinished { record: emitted }) if emitted == record
+            ));
+            if tree_request {
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(RuntimeEvent::TreeCatalogue { revision: 1, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(RuntimeEvent::NavigationCompleted {
+                        outcome: super::NavigationOutcome::Unchanged { .. }
+                    })
+                ));
+            }
+            assert!(events.try_recv().is_err());
+
+            coordinator_events
+                .send(CoordinatorEvent::OperationSettled {
+                    id: record.id().clone(),
+                })
+                .expect("queue operation settlement");
+            controller
+                .drain_coordinator_events(&event_sender, &mut progress)
+                .await;
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentOperationSettled { ref id }) if id == record.id()
+            ));
+            assert!(events.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

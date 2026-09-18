@@ -84,12 +84,27 @@ pub(crate) enum CoordinatorEvent {
     Spawned { record: TaskRecord },
     Changed { id: TaskId, revision: u64 },
     Finished { record: TaskRecord },
+    OperationSettled { id: TaskId },
 }
 
 #[derive(Default)]
 struct CoordinatorPublication {
     taken: bool,
     sender: Option<mpsc::UnboundedSender<CoordinatorEvent>>,
+}
+
+fn publish_publication_event(
+    publication: &Arc<SyncMutex<CoordinatorPublication>>,
+    event: CoordinatorEvent,
+) {
+    if let Some(sender) = publication
+        .lock()
+        .expect("coordinator publication lock")
+        .sender
+        .as_ref()
+    {
+        let _ = sender.send(event);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,18 +539,13 @@ impl TaskMetrics {
 
     fn publish_changed(&self, revision: u64) {
         self.notify(revision);
-        if let Some(sender) = self
-            .publication
-            .lock()
-            .expect("coordinator publication lock")
-            .sender
-            .as_ref()
-        {
-            let _ = sender.send(CoordinatorEvent::Changed {
+        publish_publication_event(
+            &self.publication,
+            CoordinatorEvent::Changed {
                 id: self.id.clone(),
                 revision,
-            });
-        }
+            },
+        );
     }
 
     fn notify(&self, revision: u64) {
@@ -1870,41 +1880,41 @@ impl StartSubagentTestGate {
 
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct OperationTestGate {
-    terminal_published: Arc<Semaphore>,
-    allow_settlement: Arc<Semaphore>,
-    settled: Arc<Semaphore>,
+pub(crate) struct TerminalSettlementTestGate {
+    terminal_settled: Arc<Semaphore>,
+    allow_operation_drop: Arc<Semaphore>,
+    operation_dropped: Arc<Semaphore>,
 }
 
 #[cfg(test)]
-impl OperationTestGate {
+impl TerminalSettlementTestGate {
     pub(crate) fn new() -> Self {
         Self {
-            terminal_published: Arc::new(Semaphore::new(0)),
-            allow_settlement: Arc::new(Semaphore::new(0)),
-            settled: Arc::new(Semaphore::new(0)),
+            terminal_settled: Arc::new(Semaphore::new(0)),
+            allow_operation_drop: Arc::new(Semaphore::new(0)),
+            operation_dropped: Arc::new(Semaphore::new(0)),
         }
     }
 
-    pub(crate) async fn wait_until_terminal_published(&self) {
-        take_test_permit(&self.terminal_published).await;
+    pub(crate) async fn wait_until_terminal_settled(&self) {
+        take_test_permit(&self.terminal_settled).await;
     }
 
-    pub(crate) fn allow_settlement(&self) {
-        self.allow_settlement.add_permits(1);
+    pub(crate) fn allow_operation_drop(&self) {
+        self.allow_operation_drop.add_permits(1);
     }
 
-    pub(crate) async fn wait_until_settled(&self) {
-        take_test_permit(&self.settled).await;
+    pub(crate) async fn wait_until_operation_dropped(&self) {
+        take_test_permit(&self.operation_dropped).await;
     }
 
-    async fn wait_after_terminal_published(&self) {
-        self.terminal_published.add_permits(1);
-        take_test_permit(&self.allow_settlement).await;
+    async fn wait_after_terminal_settlement(&self) {
+        self.terminal_settled.add_permits(1);
+        take_test_permit(&self.allow_operation_drop).await;
     }
 
     fn operation_dropped(&self) {
-        self.settled.add_permits(1);
+        self.operation_dropped.add_permits(1);
     }
 }
 
@@ -2022,7 +2032,7 @@ pub(crate) struct SubagentCoordinator<P: Send + 'static> {
     #[cfg(test)]
     run_child_test_gate: Option<RunChildTestGate>,
     #[cfg(test)]
-    operation_test_gate: Option<OperationTestGate>,
+    terminal_settlement_test_gate: Option<TerminalSettlementTestGate>,
 }
 
 impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
@@ -2042,7 +2052,7 @@ impl<P: Send + 'static> Clone for SubagentCoordinator<P> {
             #[cfg(test)]
             run_child_test_gate: self.run_child_test_gate.clone(),
             #[cfg(test)]
-            operation_test_gate: self.operation_test_gate.clone(),
+            terminal_settlement_test_gate: self.terminal_settlement_test_gate.clone(),
         }
     }
 }
@@ -2333,7 +2343,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             #[cfg(test)]
             run_child_test_gate: None,
             #[cfg(test)]
-            operation_test_gate: None,
+            terminal_settlement_test_gate: None,
         }
     }
 
@@ -2428,11 +2438,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_operation_test_gate(
+    pub(crate) fn with_terminal_settlement_test_gate(
         mut self,
-        operation_test_gate: OperationTestGate,
+        terminal_settlement_test_gate: TerminalSettlementTestGate,
     ) -> Self {
-        self.operation_test_gate = Some(operation_test_gate);
+        self.terminal_settlement_test_gate = Some(terminal_settlement_test_gate);
         self
     }
 
@@ -2467,15 +2477,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
     }
 
     fn publish_event(&self, event: CoordinatorEvent) {
-        if let Some(sender) = self
-            .publication
-            .lock()
-            .expect("coordinator publication lock")
-            .sender
-            .as_ref()
-        {
-            let _ = sender.send(event);
-        }
+        publish_publication_event(&self.publication, event);
     }
 
     async fn lock_inner(&self, operation: CoordinatorOperation) -> CoordinatorLockGuard<'_> {
@@ -2698,18 +2700,31 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 self.publish_event(CoordinatorEvent::Spawned { record: spawned });
                 let coordinator = self.clone();
                 #[cfg(test)]
-                let operation_test_gate = self.operation_test_gate.clone();
+                let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
                 tokio::spawn(async move {
-                    coordinator.run_child(child).await;
-                    #[cfg(test)]
-                    if let Some(gate) = &operation_test_gate {
-                        gate.wait_after_terminal_published().await;
+                    let terminal = coordinator.run_child(child).await;
+                    let settled = terminal.as_ref().map(|record| record.id().clone());
+                    if let Some(record) = terminal {
+                        coordinator.publish_event(CoordinatorEvent::Finished { record });
                     }
+                    #[cfg(test)]
+                    if settled.is_some()
+                        && let Some(gate) = &terminal_settlement_test_gate
+                    {
+                        gate.wait_after_terminal_settlement().await;
+                    }
+                    let publication = coordinator.publication.clone();
                     drop(coordinator);
                     drop(operation);
                     #[cfg(test)]
-                    if let Some(gate) = operation_test_gate {
+                    if let Some(gate) = terminal_settlement_test_gate {
                         gate.operation_dropped();
+                    }
+                    if let Some(id) = settled {
+                        publish_publication_event(
+                            &publication,
+                            CoordinatorEvent::OperationSettled { id },
+                        );
                     }
                 });
                 return Ok(observation);
@@ -2726,9 +2741,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         let coordinator = self.clone();
         let caller = caller.clone();
         #[cfg(test)]
-        let operation_test_gate = self.operation_test_gate.clone();
+        let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
         tokio::spawn(async move {
-            coordinator
+            let terminal = coordinator
                 .complete_admission(
                     writer,
                     spawned,
@@ -2738,15 +2753,25 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     sender,
                 )
                 .await;
-            #[cfg(test)]
-            if let Some(gate) = &operation_test_gate {
-                gate.wait_after_terminal_published().await;
+            let settled = terminal.as_ref().map(|record| record.id().clone());
+            if let Some(record) = terminal {
+                coordinator.publish_event(CoordinatorEvent::Finished { record });
             }
+            #[cfg(test)]
+            if settled.is_some()
+                && let Some(gate) = &terminal_settlement_test_gate
+            {
+                gate.wait_after_terminal_settlement().await;
+            }
+            let publication = coordinator.publication.clone();
             drop(coordinator);
             drop(operation);
             #[cfg(test)]
-            if let Some(gate) = operation_test_gate {
+            if let Some(gate) = terminal_settlement_test_gate {
                 gate.operation_dropped();
+            }
+            if let Some(id) = settled {
+                publish_publication_event(&publication, CoordinatorEvent::OperationSettled { id });
             }
         });
         receiver
@@ -2762,7 +2787,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         caller: Caller,
         invocation_cancellation: CancellationToken,
         sender: tokio::sync::oneshot::Sender<Result<TaskObservation, AdmissionError>>,
-    ) {
+    ) -> Option<TaskRecord> {
         let id = spawned.id().clone();
         let admission_cancellation = {
             let inner = self.lock_inner(CoordinatorOperation::Start).await;
@@ -2773,32 +2798,32 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     AdmissionError::Cancelled
                 };
                 let _ = sender.send(Err(error));
-                return;
+                return None;
             };
             task.cancellation.clone()
         };
         let Some(origin_step_id) = spawned.origin_step_id() else {
             self.discard_pending(&id).await;
             let _ = sender.send(Err(AdmissionError::MissingProvenance));
-            return;
+            return None;
         };
         let admission = match TaskAdmission::from_record(&spawned, origin_step_id) {
             Ok(admission) => admission,
             Err(SessionError::InvalidTaskProvenance) => {
                 self.discard_pending(&id).await;
                 let _ = sender.send(Err(AdmissionError::InvalidProvenance));
-                return;
+                return None;
             }
             Err(SessionError::IdOverflow) => {
                 self.discard_pending(&id).await;
                 let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
-                return;
+                return None;
             }
             Err(_) => {
                 self.discard_pending(&id).await;
                 self.latch_storage_failure().await;
                 let _ = sender.send(Err(AdmissionError::StorageUnavailable));
-                return;
+                return None;
             }
         };
         let failure = self.storage_failure.clone();
@@ -2820,23 +2845,23 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     AdmissionError::Cancelled
                 };
                 let _ = sender.send(Err(error));
-                return;
+                return None;
             }
             Err(SessionError::InvalidTaskProvenance) => {
                 self.discard_pending(&id).await;
                 let _ = sender.send(Err(AdmissionError::InvalidProvenance));
-                return;
+                return None;
             }
             Err(SessionError::IdOverflow) => {
                 self.discard_pending(&id).await;
                 let _ = sender.send(Err(AdmissionError::IdentifierSpaceExhausted));
-                return;
+                return None;
             }
             Err(_) => {
                 self.discard_pending(&id).await;
                 self.latch_storage_failure().await;
                 let _ = sender.send(Err(AdmissionError::StorageUnavailable));
-                return;
+                return None;
             }
         }
 
@@ -2849,7 +2874,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     AdmissionError::Cancelled
                 };
                 let _ = sender.send(Err(error));
-                return;
+                return None;
             };
             let child = ChildRun {
                 id: id.clone(),
@@ -2879,7 +2904,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             record: spawned.clone(),
         });
         let _ = sender.send(Ok(spawned.observation().clone()));
-        self.run_child(child).await;
+        self.run_child(child).await
     }
 
     async fn discard_pending(&self, id: &TaskId) {
@@ -3142,7 +3167,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         self.inner.lock().await.active_slots
     }
 
-    async fn run_child(&self, child: ChildRun<P>) {
+    async fn run_child(&self, child: ChildRun<P>) -> Option<TaskRecord> {
         let id = child.id().clone();
         self.trace.emit(|| TraceEvent::ChildRunnerStarted {
             child_id: id.clone(),
@@ -3198,10 +3223,14 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             child_id: id.clone(),
             outcome,
         });
-        self.finish_child(&id, result).await;
+        self.finish_child(&id, result).await
     }
 
-    async fn finish_child(&self, id: &TaskId, result: Result<ChildResult, ChildFailure>) {
+    async fn finish_child(
+        &self,
+        id: &TaskId,
+        result: Result<ChildResult, ChildFailure>,
+    ) -> Option<TaskRecord> {
         let (claim, stop_descendants) = {
             let mut inner = self.lock_inner(CoordinatorOperation::FinishChild).await;
             let task = inner
@@ -3209,7 +3238,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 .get_mut(id)
                 .expect("admitted child must remain retained");
             if task.state.is_terminal() || task.terminal_claim.is_some() {
-                return;
+                return None;
             }
             let (outcome, stop_descendants) = if let Some(stop) = task.stop.clone() {
                 (stop.outcome(), true)
@@ -3225,19 +3254,15 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             };
             (task.claim_terminal(outcome), stop_descendants)
         };
-        let Some(claim) = claim else {
-            return;
-        };
+        let claim = claim?;
         if stop_descendants {
             let descendants = self
                 .request_stop_descendants(id, StopReason::AncestorStopped)
                 .await;
             let _ = self.wait_for_all(descendants).await;
         }
-        let Some(settlement) = self.prepare_terminal_settlement(id, &claim).await else {
-            return;
-        };
-        self.persist_terminal(id, settlement).await;
+        let settlement = self.prepare_terminal_settlement(id, &claim).await?;
+        self.persist_terminal(id, settlement).await
     }
 
     async fn prepare_terminal_settlement(
@@ -3259,7 +3284,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         Some(task.terminal_settlement(stored_claim, self.now(), self.unix_time_ms()))
     }
 
-    async fn persist_terminal(&self, id: &TaskId, terminal_settlement: TerminalSettlement) {
+    async fn persist_terminal(
+        &self,
+        id: &TaskId,
+        terminal_settlement: TerminalSettlement,
+    ) -> Option<TaskRecord> {
         let writer = self.writer.clone();
         let persisted = match writer {
             Some(writer) => match TaskTerminal::from_record(&terminal_settlement.record) {
@@ -3270,7 +3299,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         };
         if persisted.is_err() {
             self.latch_storage_failure().await;
-            return;
+            return None;
         }
         let record =
             {
@@ -3278,15 +3307,13 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                     .lock_inner(CoordinatorOperation::FinishChildSettlement)
                     .await;
                 if inner.storage_failed {
-                    return;
+                    return None;
                 }
-                let Some(task) = inner.tasks.get_mut(id) else {
-                    return;
-                };
+                let task = inner.tasks.get_mut(id)?;
                 if task.terminal_claim.as_ref().is_none_or(|claim| {
                     claim.metrics.revision != terminal_settlement.record.revision()
                 }) {
-                    return;
+                    return None;
                 }
                 let stored_claim = task
                     .terminal_claim
@@ -3315,7 +3342,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 });
                 record
             };
-        self.publish_event(CoordinatorEvent::Finished { record });
+        Some(record)
     }
 
     async fn request_stop_subtree(&self, id: &TaskId, reason: StopReason) -> Vec<TaskId> {
@@ -4455,34 +4482,46 @@ mod tests {
 
     #[tokio::test]
     async fn operation_count_fences_visibility_replacement_after_events() {
-        let gate = super::OperationTestGate::new();
+        let gate = super::TerminalSettlementTestGate::new();
         let (coordinator, mut started) = coordinator(policy());
-        let coordinator = coordinator.with_operation_test_gate(gate.clone());
+        let coordinator = coordinator.with_terminal_settlement_test_gate(gate.clone());
         let mut events = coordinator
             .take_event_receiver()
             .expect("take coordinator events");
         let root = coordinator.root_caller().await;
         let task = coordinator.start(&root, parameters(), ()).await.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::Spawned { record }) if record.id() == task.id()
+        ));
         let running = started.recv().await.expect("child starts");
         running.finish.send(Ok(result("done"))).unwrap();
 
-        gate.wait_until_terminal_published().await;
+        gate.wait_until_terminal_settled().await;
         assert_eq!(coordinator.operation_count(), 1);
-        let mut drained = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            drained.push(event);
-        }
+        let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(drained.iter().any(|event| matches!(
+            event,
+            CoordinatorEvent::Changed { id, .. } if id == task.id()
+        )));
         assert!(drained.iter().any(|event| matches!(
             event,
             CoordinatorEvent::Finished { record } if record.id() == task.id()
         )));
+        assert!(!drained.iter().any(|event| matches!(
+            event,
+            CoordinatorEvent::OperationSettled { id } if id == task.id()
+        )));
         assert!(!coordinator.replace_selected_origins([]).await);
 
-        gate.allow_settlement();
-        gate.wait_until_settled().await;
+        gate.allow_operation_drop();
+        gate.wait_until_operation_dropped().await;
         assert_eq!(coordinator.operation_count(), 0);
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::OperationSettled { ref id }) if id == task.id()
+        ));
         assert!(coordinator.replace_selected_origins([]).await);
-        assert!(events.try_recv().is_err());
     }
 
     #[test]
@@ -5405,6 +5444,10 @@ mod tests {
             events.recv().await,
             Some(CoordinatorEvent::Finished { .. })
         ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::OperationSettled { ref id }) if id == admitted.id()
+        ));
         assert!(events.try_recv().is_err());
         let state: String = session
             .connection_for_test()
@@ -5487,10 +5530,16 @@ mod tests {
             coordinator.wait(&caller, admitted.id()).await.unwrap_err(),
             admitted.id(),
         );
-        loop {
+        let mut finished = false;
+        let mut operation_settled = false;
+        while !finished || !operation_settled {
             match events.recv().await {
                 Some(CoordinatorEvent::Changed { .. }) => {}
-                Some(CoordinatorEvent::Finished { .. }) => break,
+                Some(CoordinatorEvent::Finished { .. }) => finished = true,
+                Some(CoordinatorEvent::OperationSettled { ref id }) if id == admitted.id() => {
+                    operation_settled = true;
+                }
+                Some(CoordinatorEvent::OperationSettled { .. }) => {}
                 Some(CoordinatorEvent::Spawned { .. }) => panic!("spawn is emitted exactly once"),
                 None => panic!("coordinator event sender remains live"),
             }
@@ -6855,7 +6904,9 @@ mod tests {
         let finished = loop {
             match events.recv().await.expect("coordinator event") {
                 CoordinatorEvent::Finished { record } => break record,
-                CoordinatorEvent::Spawned { .. } | CoordinatorEvent::Changed { .. } => {}
+                CoordinatorEvent::Spawned { .. }
+                | CoordinatorEvent::Changed { .. }
+                | CoordinatorEvent::OperationSettled { .. } => {}
             }
         };
         let record = coordinator.record(admitted.id()).await.unwrap();
@@ -8204,6 +8255,7 @@ mod tests {
                     revisions.push(revision);
                 }
                 CoordinatorEvent::Finished { record } => break record,
+                CoordinatorEvent::OperationSettled { .. } => {}
                 CoordinatorEvent::Spawned { .. } => panic!("spawn is emitted exactly once"),
             }
         };
@@ -8222,6 +8274,10 @@ mod tests {
         assert!(final_record.attempt_evidence()[0].accounting().is_some());
         assert_eq!(final_record.attempt_evidence()[1].provider_attempt(), 8);
 
+        assert!(matches!(
+            events.recv().await,
+            Some(CoordinatorEvent::OperationSettled { ref id }) if id == admitted.id()
+        ));
         reporter.set_attempts(vec![crate::model::AttemptAccounting::UsageUnavailable]);
         assert!(matches!(
             events.try_recv(),
@@ -8272,7 +8328,7 @@ mod tests {
                     spawns.push((record.id().clone(), record.parent().cloned()));
                 }
                 CoordinatorEvent::Finished { record } => finishes.push(record.id().clone()),
-                CoordinatorEvent::Changed { .. } => {}
+                CoordinatorEvent::Changed { .. } | CoordinatorEvent::OperationSettled { .. } => {}
             }
         }
         assert_eq!(

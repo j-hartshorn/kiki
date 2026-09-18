@@ -5621,6 +5621,7 @@ mod tests {
                 | RuntimeEvent::SubagentStatus { .. }
                 | RuntimeEvent::SubagentRecord { .. }
                 | RuntimeEvent::SubagentFinished { .. }
+                | RuntimeEvent::SubagentOperationSettled { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::NameAccepted { .. }
                 | RuntimeEvent::NavigationCompleted { .. }

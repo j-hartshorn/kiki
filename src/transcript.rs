@@ -2542,6 +2542,7 @@ impl Transcript {
                 self.append_subagent_card(&record, SubagentCardPhase::Finished)
                     | self.replace_subagent_record(record)
             }
+            RuntimeEvent::SubagentOperationSettled { .. } => false,
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
             RuntimeEvent::SettingsAccepted { .. }
             | RuntimeEvent::NameAccepted { .. }

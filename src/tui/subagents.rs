@@ -70,6 +70,7 @@ impl Entry {
 #[derive(Default)]
 pub(super) struct SubagentMonitor {
     entries: BTreeMap<String, Entry>,
+    operationally_active: BTreeSet<String>,
     admission_order: Vec<String>,
     cleared_terminals: BTreeSet<String>,
     visible_elapsed: BTreeMap<String, u64>,
@@ -119,14 +120,33 @@ impl SubagentMonitor {
 
     pub(super) fn apply(&mut self, event: &RuntimeEvent, now: Instant) -> bool {
         match event {
-            RuntimeEvent::SubagentSpawned { record }
-            | RuntimeEvent::SubagentRecord { record }
-            | RuntimeEvent::SubagentFinished { record } => self.apply_record(record, now),
+            RuntimeEvent::SubagentSpawned { record } => self.apply_record(record, now),
+            RuntimeEvent::SubagentRecord { record } => {
+                let record_changed = self.apply_record(record, now);
+                let operation_changed = record_changed
+                    && record.observation().state().is_terminal()
+                    && self.mark_operationally_active(record.id());
+                record_changed || operation_changed
+            }
+            RuntimeEvent::SubagentFinished { record } => {
+                let record_changed = self.apply_record(record, now);
+                let operation_changed = self.mark_operationally_active(record.id());
+                record_changed || operation_changed
+            }
+            RuntimeEvent::SubagentOperationSettled { id } => {
+                self.operationally_active.remove(id.as_str())
+            }
             RuntimeEvent::SubagentStatus {
                 id,
                 revision,
                 observation,
-            } => self.apply_status(id, *revision, observation, now),
+            } => {
+                let status_changed = self.apply_status(id, *revision, observation, now);
+                let operation_changed = status_changed
+                    && observation.state().is_terminal()
+                    && self.mark_operationally_active(id);
+                status_changed || operation_changed
+            }
             RuntimeEvent::RecordAppended { record, .. }
                 if matches!(record.record, Record::UserRequest { .. }) =>
             {
@@ -188,11 +208,10 @@ impl SubagentMonitor {
 
     fn clear_terminals(&mut self) -> bool {
         let mut ancestors = BTreeSet::new();
-        for entry in self
-            .entries
-            .values()
-            .filter(|entry| is_active(entry.observation.state))
-        {
+        for (id, entry) in &self.entries {
+            if !self.is_operationally_active(id, entry) {
+                continue;
+            }
             let mut parent = entry.parent.clone();
             while let Some(id) = parent {
                 if !ancestors.insert(id.clone()) {
@@ -203,8 +222,12 @@ impl SubagentMonitor {
         }
 
         let mut cleared = false;
+        let operationally_active = &self.operationally_active;
         self.entries.retain(|id, entry| {
-            if is_active(entry.observation.state) || ancestors.contains(id) {
+            if is_active(entry.observation.state)
+                || operationally_active.contains(id)
+                || ancestors.contains(id)
+            {
                 true
             } else {
                 self.cleared_terminals.insert(id.clone());
@@ -240,8 +263,8 @@ impl SubagentMonitor {
                 lines: vec![Line::raw(clipped(
                     &summary(
                         self.entries
-                            .values()
-                            .filter(|entry| is_active(entry.observation.state))
+                            .iter()
+                            .filter(|(id, entry)| self.is_operationally_active(id, entry))
                             .count(),
                         self.entries.len(),
                     ),
@@ -261,8 +284,16 @@ impl SubagentMonitor {
 
     pub(super) fn has_active_entries(&self) -> bool {
         self.entries
-            .values()
-            .any(|entry| is_active(entry.observation.state))
+            .iter()
+            .any(|(id, entry)| self.is_operationally_active(id, entry))
+    }
+
+    fn mark_operationally_active(&mut self, id: &TaskId) -> bool {
+        self.entries.contains_key(id.as_str()) && self.operationally_active.insert(id.to_string())
+    }
+
+    fn is_operationally_active(&self, id: &str, entry: &Entry) -> bool {
+        is_active(entry.observation.state) || self.operationally_active.contains(id)
     }
 
     pub(super) fn tick(&self, now: Instant) -> bool {
@@ -308,7 +339,7 @@ impl SubagentMonitor {
                 continue;
             };
             forest.admission.insert(id.clone(), admission);
-            if is_active(entry.observation.state) {
+            if self.is_operationally_active(id, entry) {
                 forest.active.insert(id.clone());
             }
             if let Some(parent) = entry
@@ -999,6 +1030,7 @@ mod tests {
                 .map(|entry| entry.observation.state),
             Some(TaskState::Completed)
         );
+        assert!(!monitor.has_active_entries());
         assert!(layout_text(&mut monitor, 80, 4, Instant::now()).contains("✓ subagent:00"));
     }
 
@@ -1439,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_requests_retain_terminal_ancestors_then_clear_the_settled_subtree() {
+    fn finished_tasks_and_ancestors_persist_until_operation_settlement() {
         let now = Instant::now();
         let record = |id, parent| {
             TaskRecord::for_test(
@@ -1460,25 +1492,32 @@ mod tests {
             },
             progress_gap: false,
         };
+        let root = record("00", None);
+        let child = record("01", Some("00"));
         let mut monitor = SubagentMonitor::default();
-        for record in [record("00", None), record("01", Some("00"))] {
+        for record in [root.clone(), child.clone()] {
             assert!(monitor.apply(&RuntimeEvent::SubagentSpawned { record }, now));
         }
-        monitor.entries.get_mut("01").unwrap().observation.state = TaskState::Running;
 
+        assert!(monitor.apply(
+            &RuntimeEvent::SubagentFinished {
+                record: child.clone(),
+            },
+            now,
+        ));
         assert!(!monitor.apply(&request(1), now));
         assert!(monitor.entries.contains_key("00"));
         assert!(monitor.entries.contains_key("01"));
 
-        monitor.entries.get_mut("01").unwrap().observation.state = TaskState::Completed;
+        assert!(monitor.apply(
+            &RuntimeEvent::SubagentOperationSettled {
+                id: child.id().clone(),
+            },
+            now,
+        ));
         assert!(monitor.apply(&request(2), now));
         assert!(monitor.entries.is_empty());
-        assert!(!monitor.apply(
-            &RuntimeEvent::SubagentFinished {
-                record: record("00", None)
-            },
-            now
-        ));
+        assert!(!monitor.apply(&RuntimeEvent::SubagentFinished { record: root }, now));
     }
 
     #[test]
@@ -1685,6 +1724,12 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().contains("00:10"))
         );
+        assert!(monitor.apply(
+            &RuntimeEvent::SubagentOperationSettled {
+                id: original.id().clone(),
+            },
+            now,
+        ));
         assert!(monitor.apply(
             &RuntimeEvent::RecordAppended {
                 record: StoredRecord {

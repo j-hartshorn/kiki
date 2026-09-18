@@ -295,7 +295,8 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::SubagentSpawned { .. }
         | RuntimeEvent::SubagentStatus { .. }
         | RuntimeEvent::SubagentRecord { .. }
-        | RuntimeEvent::SubagentFinished { .. } => None,
+        | RuntimeEvent::SubagentFinished { .. }
+        | RuntimeEvent::SubagentOperationSettled { .. } => None,
     }
 }
 
@@ -1206,20 +1207,32 @@ impl App {
     }
 
     fn invalidate_selection(&mut self) -> bool {
-        let visible_changed =
-            self.selection.is_some() || self.notice.is_some() || self.flash.is_some();
+        self.invalidate_selection_with_status(false)
+    }
+
+    fn invalidate_layout_selection(&mut self) -> bool {
+        self.invalidate_selection_with_status(true)
+    }
+
+    fn invalidate_selection_with_status(&mut self, keep_status: bool) -> bool {
+        let preserve_status = keep_status && matches!(&self.notice, Some(Notice::Status(_)));
+        let visible_changed = self.selection.is_some()
+            || (!preserve_status && self.notice.is_some())
+            || self.flash.is_some();
         self.selection = None;
         self.drag = None;
         self.pending_copy = false;
         self.pending_copy_text = None;
-        self.notice = None;
+        if !preserve_status {
+            self.notice = None;
+        }
         self.flash = None;
         visible_changed
     }
 
     fn history_unavailable(&mut self) {
         self.history_viewport = None;
-        self.invalidate_selection();
+        self.invalidate_layout_selection();
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<Update> {
@@ -1399,7 +1412,7 @@ impl App {
         let monitor_changed = self.subagent_monitor.apply(&event, now);
         let transcript_changed = self.transcript.apply(event, gap_before);
         if transcript_changed {
-            self.invalidate_selection();
+            self.invalidate_layout_selection();
         }
         metadata_changed || monitor_changed || transcript_changed
     }
@@ -1893,7 +1906,7 @@ fn run_configuration_loop<B: Backend>(
                     dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
                 }
                 Event::Resize(_, _) => {
-                    app.invalidate_selection();
+                    app.invalidate_layout_selection();
                     dirty = true;
                 }
                 Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
@@ -1988,7 +2001,7 @@ fn run_loop_with_titles<B: Backend>(
                     dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
                 }
                 Event::Resize(_, _) => {
-                    app.invalidate_selection();
+                    app.invalidate_layout_selection();
                     dirty = true;
                 }
                 Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
@@ -2263,7 +2276,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
         .history_viewport
         .is_some_and(|history| history.area != viewport)
     {
-        app.invalidate_selection();
+        app.invalidate_layout_selection();
     }
     app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
@@ -4371,6 +4384,98 @@ mod tests {
         );
         assert!(loaded.handle_key(key(KeyCode::Esc)).commands.is_empty());
         assert!(!loaded.manual_navigation_pending);
+    }
+
+    #[test]
+    fn tree_loading_rejections_preserve_status_notices_across_prompt_geometry() {
+        for (outcome, notice) in [
+            (
+                TreeRequestOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                TreeRequestOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (TreeRequestOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = App::default();
+            let revision = tree_request(&mut app, "");
+            rendered(&mut app, 120, 12);
+
+            assert!(app.handle_event(RuntimeEvent::TreeCatalogue { revision, outcome }));
+            for _ in 0..2 {
+                let screen = rendered(&mut app, 120, 12);
+                assert!(screen.contains(notice), "{screen}");
+                assert_eq!(app.notice(), Some(notice));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_subagent_projections_stay_operational_until_settlement() {
+        let now = Instant::now();
+        let terminal = TaskRecord::for_test(
+            "c1",
+            2,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).expect("select test model"),
+            None,
+            1,
+            Vec::new(),
+        );
+        for event in [
+            RuntimeEvent::SubagentRecord {
+                record: terminal.clone(),
+            },
+            RuntimeEvent::SubagentStatus {
+                id: terminal.id().clone(),
+                revision: terminal.revision(),
+                observation: terminal.observation().clone(),
+            },
+        ] {
+            let mut app = App::default();
+            app.subagent_monitor
+                .insert_for_test(terminal.id().as_str(), TaskState::Running, now);
+
+            assert!(app.handle_event_at(event, now));
+            assert!(app.subagent_monitor.has_active_entries());
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), now).commands,
+                [RuntimeCommand::CancelBackground]
+            );
+            assert_eq!(app.settled_escape_at, None);
+
+            assert!(app.handle_event_at(
+                RuntimeEvent::SubagentFinished {
+                    record: terminal.clone(),
+                },
+                now,
+            ));
+            assert!(app.subagent_monitor.has_active_entries());
+
+            assert!(app.handle_event_at(
+                RuntimeEvent::SubagentOperationSettled {
+                    id: terminal.id().clone(),
+                },
+                now,
+            ));
+            assert!(!app.subagent_monitor.has_active_entries());
+            assert!(!app.handle_event_at(
+                RuntimeEvent::SubagentStatus {
+                    id: terminal.id().clone(),
+                    revision: terminal.revision(),
+                    observation: terminal.observation().clone(),
+                },
+                now,
+            ));
+            assert!(!app.subagent_monitor.has_active_entries());
+            assert!(
+                app.handle_key_at(key(KeyCode::Esc), now)
+                    .commands
+                    .is_empty()
+            );
+            assert_eq!(app.settled_escape_at, Some(now));
+        }
     }
 
     #[test]
@@ -7319,6 +7424,7 @@ mod tests {
         )
         .unwrap();
         assert!(resized.selection.is_none());
+        assert!(resized.notice().is_none());
 
         let (mut tiny, _) = app_with_pending_copy("tiny history");
         rendered_buffer(&mut tiny, 3, 3);
@@ -8632,24 +8738,31 @@ mod tests {
     }
 
     #[test]
-    fn correction_keeps_the_cancelled_run_active_when_background_work_remains() {
-        let mut app = App {
-            correction_pending: true,
-            correction_run_id: Some(RunId(1)),
-            ..App::default()
-        };
+    fn correction_failure_notices_survive_settlement_transcript_mutation() {
+        for (outcome, notice) in [
+            (CorrectionOutcome::Failed, "Session could not be restored."),
+            (
+                CorrectionOutcome::SkippedBackground,
+                "Session was not restored because background work is active.",
+            ),
+        ] {
+            let mut app = App {
+                correction_pending: true,
+                correction_run_id: Some(RunId(1)),
+                ..App::default()
+            };
+            assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) }));
+            assert!(app.handle_event(RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome,
+            }));
+            assert_eq!(app.notice(), Some(notice));
+            assert!(app.correction_pending);
 
-        assert!(app.handle_event(RuntimeEvent::CorrectionCompleted {
-            run_id: RunId(1),
-            outcome: CorrectionOutcome::SkippedBackground,
-        }));
-        assert_eq!(
-            app.notice(),
-            Some("Session was not restored because background work is active.")
-        );
-        assert!(app.correction_pending);
-        app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) });
-        assert!(!app.correction_pending);
+            assert!(app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) }));
+            assert_eq!(app.notice(), Some(notice));
+            assert!(!app.correction_pending);
+        }
     }
 
     #[test]
