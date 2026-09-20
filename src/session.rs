@@ -220,6 +220,8 @@ pub(crate) struct RestoredRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RestoredTask {
     pub(crate) record: TaskRecord,
+    pub(crate) admission_anchor_revision: u64,
+    pub(crate) terminal_anchor_revision: u64,
     pub(crate) admitted_revision: u64,
     pub(crate) terminal_revision: u64,
 }
@@ -259,6 +261,7 @@ pub(crate) struct SessionRestore {
     pub(crate) metadata: Option<SessionMetadata>,
     pub(crate) records: Vec<RestoredRecord>,
     pub(crate) tasks: Vec<RestoredTask>,
+    pub(crate) reserved_task_ids: Vec<TaskId>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
     pub(crate) next_task: Option<u64>,
     pub(crate) executable: Option<RestoredExecutableState>,
@@ -297,11 +300,8 @@ impl TaskAdmission {
         origin_step_id: u64,
     ) -> Result<Self, SessionError> {
         Ok(Self {
-            task_id: task_sql_id(record.id().as_str())?,
-            parent_task_id: record
-                .parent()
-                .map(|parent| task_sql_id(parent.as_str()))
-                .transpose()?,
+            task_id: task_sql_id(record.storage_id())?,
+            parent_task_id: record.parent_storage_id().map(task_sql_id).transpose()?,
             origin_step_id: i64::try_from(origin_step_id)
                 .map_err(|_| SessionError::InvalidTaskProvenance)?,
             task_revision: i64::try_from(record.revision())
@@ -326,7 +326,7 @@ impl TaskSnapshot {
             return Err(SessionError::InvalidTransition);
         }
         Ok(Self {
-            task_id: task_sql_id(record.id().as_str())?,
+            task_id: task_sql_id(record.storage_id())?,
             state: state.as_str(),
             task_revision: i64::try_from(record.revision())
                 .map_err(|_| SessionError::IdOverflow)?,
@@ -357,7 +357,7 @@ impl TaskTerminal {
             return Err(SessionError::InvalidTransition);
         }
         Ok(Self {
-            task_id: task_sql_id(record.id().as_str())?,
+            task_id: task_sql_id(record.storage_id())?,
             state: state.as_str(),
             task_revision: i64::try_from(record.revision())
                 .map_err(|_| SessionError::IdOverflow)?,
@@ -433,6 +433,7 @@ impl SessionWriteGate {
 
 struct SessionState {
     connection: Mutex<Connection>,
+    active_execution_step: Mutex<Option<u64>>,
     _writer_lock: File,
     #[cfg(test)]
     write_gate: Option<SessionWriteGate>,
@@ -666,6 +667,7 @@ impl Session {
             id,
             state: Arc::new(SessionState {
                 connection: Mutex::new(connection),
+                active_execution_step: Mutex::new(None),
                 _writer_lock: writer_lock,
                 #[cfg(test)]
                 write_gate: None,
@@ -750,6 +752,41 @@ impl Session {
 }
 
 impl SessionWriter {
+    pub(crate) fn mark_execution_started(&self, step_id: u64) {
+        *self
+            .state
+            .active_execution_step
+            .lock()
+            .expect("active execution lock") = Some(step_id);
+    }
+
+    pub(crate) fn clear_execution(&self, step_id: u64) {
+        let mut active = self
+            .state
+            .active_execution_step
+            .lock()
+            .expect("active execution lock");
+        if *active == Some(step_id) {
+            *active = None;
+        }
+    }
+
+    pub(crate) fn clear_active_execution(&self) {
+        *self
+            .state
+            .active_execution_step
+            .lock()
+            .expect("active execution lock") = None;
+    }
+
+    pub(crate) fn active_execution_step(&self) -> Option<u64> {
+        *self
+            .state
+            .active_execution_step
+            .lock()
+            .expect("active execution lock")
+    }
+
     pub(crate) async fn commit_preferences(
         &self,
         preferences: SessionPreferences,
@@ -1342,11 +1379,8 @@ fn recover_interrupted_operations(connection: &mut Connection) -> Result<(), Ses
     Ok(())
 }
 
-fn task_sql_id(value: &str) -> Result<i64, SessionError> {
-    u64::from_str_radix(value, 16)
-        .ok()
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or(SessionError::IdOverflow)
+fn task_sql_id(value: u64) -> Result<i64, SessionError> {
+    i64::try_from(value).map_err(|_| SessionError::IdOverflow)
 }
 
 fn initialise(
@@ -1392,6 +1426,7 @@ fn initialise(
         id,
         state: Arc::new(SessionState {
             connection: Mutex::new(connection),
+            active_execution_step: Mutex::new(None),
             _writer_lock: writer_lock,
             #[cfg(test)]
             write_gate,
@@ -1784,6 +1819,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             metadata,
             records: Vec::new(),
             tasks: Vec::new(),
+            reserved_task_ids: Vec::new(),
             footer_adjustment: Vec::new(),
             next_task,
             executable: None,
@@ -1835,6 +1871,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
     }
 
     let mut tasks = Vec::new();
+    let mut restored_task_ids = BTreeMap::new();
     let mut visible_task_ids = BTreeSet::new();
     for task in snapshot.tasks {
         let Ok(task_id) = u64::try_from(task.id) else {
@@ -1881,7 +1918,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             continue;
         };
         let parent = match task.parent_task_id {
-            Some(parent_id) if parent_id < task.id => TaskId::parse(&format!("{parent_id:02x}")),
+            Some(parent_id) if parent_id < task.id => restored_task_ids.get(&parent_id).cloned(),
             Some(_) => None,
             None => None,
         };
@@ -1909,34 +1946,74 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             footer_adjustment.extend(decoded.attempts);
             continue;
         }
-        let Some(id) = TaskId::parse(&format!("{task_id:02x}")) else {
+        let stored_id = decoded
+            .id
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{task_id:02x}"));
+        let Some(id) = TaskId::parse(&stored_id).filter(|id| {
+            !restored_task_ids.values().any(|existing| existing == id)
+                && task_id_matches_parent(id, parent.as_ref(), decoded.id.is_none())
+        }) else {
             executable = false;
             footer_adjustment.extend(decoded.attempts);
             continue;
         };
         let record = TaskRecord::from_persisted(RestoredTaskRecord {
             id: id.clone(),
+            storage_id: task_id,
             revision: record_revision,
             parent: parent.clone(),
+            parent_storage_id: task
+                .parent_task_id
+                .and_then(|parent| u64::try_from(parent).ok()),
+            admission_history_step_id: decoded.admission_history_step_id,
+            terminal_history_step_id: decoded.terminal_history_step_id,
             origin_step_id,
             depth: decoded.depth,
             parameters: decoded.parameters,
             attempts: decoded.attempts.clone(),
             details,
         });
-        let origin_is_selected = origin_step.settled_entry_id.is_some_and(|entry_id| {
-            selected_ids.contains(&entry_id)
-                && entries
-                    .get(&entry_id)
-                    .is_some_and(|entry| entry.run_id == Some(origin_step.run_id))
-        });
+        restored_task_ids.insert(task.id, id.clone());
+        let Some(origin_entry) = origin_step
+            .settled_entry_id
+            .and_then(|entry_id| entries.get(&entry_id))
+        else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let Some(origin_revision) = u64::try_from(origin_entry.revision).ok() else {
+            executable = false;
+            footer_adjustment.extend(decoded.attempts);
+            continue;
+        };
+        let origin_is_selected = selected_ids.contains(&origin_entry.id)
+            && origin_entry.run_id == Some(origin_step.run_id);
         let parent_is_visible = parent
             .as_ref()
             .is_none_or(|parent| visible_task_ids.contains(parent));
         if origin_is_selected && parent_is_visible {
+            let admission_anchor_revision = selected_step_revision(
+                record.admission_history_step_id(),
+                &snapshot.steps,
+                &entries,
+                &selected_ids,
+            )
+            .unwrap_or(origin_revision);
+            let terminal_anchor_revision = selected_step_revision(
+                record.terminal_history_step_id(),
+                &snapshot.steps,
+                &entries,
+                &selected_ids,
+            )
+            .unwrap_or(origin_revision);
             visible_task_ids.insert(id);
             tasks.push(RestoredTask {
                 record,
+                admission_anchor_revision,
+                terminal_anchor_revision,
                 admitted_revision,
                 terminal_revision,
             });
@@ -1948,6 +2025,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
         }
     }
 
+    let reserved_task_ids = restored_task_ids.into_values().collect();
     let history = executable
         .then(|| restored_history(&verified, &snapshot.steps, &runs))
         .flatten();
@@ -1966,6 +2044,7 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
         metadata,
         records,
         tasks,
+        reserved_task_ids,
         footer_adjustment,
         next_task,
         executable,
@@ -1974,6 +2053,39 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
 
 fn next_task_after(maximum: Option<u64>) -> Option<u64> {
     maximum.map_or(Some(0), |maximum| maximum.checked_add(1))
+}
+
+fn selected_step_revision(
+    step_id: Option<u64>,
+    steps: &[RestoreStepRow],
+    entries: &BTreeMap<i64, RestoreEntryRow>,
+    selected_ids: &BTreeSet<i64>,
+) -> Option<u64> {
+    let step_id = step_id.and_then(|step_id| i64::try_from(step_id).ok())?;
+    let mut matching = steps.iter().filter(|step| step.id == step_id);
+    let step = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let entry = entries.get(&step.settled_entry_id?)?;
+    if selected_ids.contains(&entry.id) && entry.run_id == Some(step.run_id) {
+        u64::try_from(entry.revision).ok()
+    } else {
+        None
+    }
+}
+
+fn task_id_matches_parent(id: &TaskId, parent: Option<&TaskId>, legacy: bool) -> bool {
+    if legacy {
+        return true;
+    }
+    match parent {
+        None => !id.as_str().contains('.'),
+        Some(parent) => id
+            .as_str()
+            .rsplit_once('.')
+            .is_some_and(|(prefix, _)| prefix == parent.as_str()),
+    }
 }
 
 struct SelectedAncestry {
@@ -2835,6 +2947,14 @@ mod tests {
                     BTreeMap::from([("value".to_owned(), ToolValue::Integer(7))]),
                 ))),
             });
+        let mut task_details: serde_json::Value = serde_json::from_str(
+            &super::codec::encode_task_details(&task).expect("encode late task"),
+        )
+        .expect("decode task details JSON");
+        let task_details = task_details.as_object_mut().expect("task details object");
+        task_details.remove("id");
+        task_details.remove("admission_history_step_id");
+        task_details.remove("terminal_history_step_id");
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 3,
             session_revision: 5,
@@ -2864,7 +2984,7 @@ mod tests {
                 admitted_revision: 4,
                 terminal_revision: Some(5),
                 task_revision: 2,
-                details_json: super::codec::encode_task_details(&task).expect("encode late task"),
+                details_json: serde_json::to_string(&task_details).expect("encode legacy details"),
             }],
             checkpoint: valid_checkpoint_tuple(),
         });
@@ -2872,9 +2992,10 @@ mod tests {
         assert!(restore.executable.is_some());
         assert!(matches!(
             restore.tasks.as_slice(),
-            [task] if matches!(task.record.outcome(), Some(TaskOutcome::Completed(result))
-                if result.message() == "late selected result"
-                    && result.values().get("value") == Some(&ToolValue::Integer(7)))
+            [task] if task.record.id().as_str() == "00"
+                && matches!(task.record.outcome(), Some(TaskOutcome::Completed(result))
+                    if result.message() == "late selected result"
+                        && result.values().get("value") == Some(&ToolValue::Integer(7)))
         ));
     }
 

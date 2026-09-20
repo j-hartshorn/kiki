@@ -318,6 +318,11 @@ enum WorkerMessage<M: Model> {
         run_id: u64,
         step_id: u64,
     },
+    ExecutionStarted {
+        run_id: u64,
+        step_id: u64,
+        commentary: Option<String>,
+    },
     PersistedToolSettled {
         run_id: u64,
         step_id: u64,
@@ -510,26 +515,36 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
         .map(|record| {
             (
                 record.revision,
+                false,
+                record.revision,
                 RestoredTimelineItem::Record(restored_stored_record(record)),
             )
         })
         .chain(restore.tasks.iter().flat_map(|task| {
+            let admitted_revision = task.admitted_revision.max(task.admission_anchor_revision);
+            let terminal_revision = task.terminal_revision.max(task.terminal_anchor_revision);
             [
                 (
+                    admitted_revision,
+                    admitted_revision != task.admitted_revision,
                     task.admitted_revision,
                     RestoredTimelineItem::SubagentSpawned(task.record.clone()),
                 ),
                 (
+                    terminal_revision,
+                    terminal_revision != task.terminal_revision,
                     task.terminal_revision,
                     RestoredTimelineItem::SubagentFinished(task.record.clone()),
                 ),
             ]
         }))
         .collect::<Vec<_>>();
-    ordered.sort_by_key(|(revision, _)| *revision);
+    ordered.sort_by_key(|(revision, shifted, original_revision, _)| {
+        (*revision, *shifted, *original_revision)
+    });
     RuntimeInitialState {
         metadata: restore.metadata.clone(),
-        timeline: ordered.into_iter().map(|(_, item)| item).collect(),
+        timeline: ordered.into_iter().map(|(_, _, _, item)| item).collect(),
         footer_adjustment: restore.footer_adjustment.clone(),
         disabled_reason: restore
             .executable
@@ -639,7 +654,11 @@ impl<M: Model> RuntimeController<M> {
         let restored_tasks = restore.tasks.iter().map(|task| task.record.clone());
         let subagents = subagents.with_session(session.writer());
         subagents
-            .restore_terminal_tasks(restored_tasks, restore.next_task)
+            .restore_terminal_tasks(
+                restored_tasks,
+                restore.next_task,
+                restore.reserved_task_ids.clone(),
+            )
             .await;
         let accepted_thinking = AcceptedThinking::new(
             *settings.borrow(),
@@ -1180,9 +1199,10 @@ impl<M: Model> RuntimeController<M> {
                         step_id,
                         commentary,
                     } => {
+                        writer.mark_execution_started(step_id);
                         let progress = AgentProgress::ExecutionStarted {
                             selection: None,
-                            commentary,
+                            commentary: commentary.clone(),
                         };
                         let bytes = agent_progress_payload_bytes(&progress);
                         progress_sender.publish(
@@ -1194,6 +1214,11 @@ impl<M: Model> RuntimeController<M> {
                             false,
                             bytes,
                         );
+                        let _ = completion_sender.send(WorkerMessage::ExecutionStarted {
+                            run_id,
+                            step_id,
+                            commentary,
+                        });
                     }
                     PersistedAgentEvent::ToolUpdated {
                         run_id,
@@ -1367,6 +1392,20 @@ impl<M: Model> RuntimeController<M> {
                     false,
                 );
             }
+            WorkerMessage::ExecutionStarted {
+                run_id,
+                step_id,
+                commentary,
+            } => {
+                self.emit(
+                    events,
+                    RuntimeEvent::ExecutionStarted {
+                        run_id: RunId(run_id),
+                        step_id: ModelStepId(step_id),
+                        commentary,
+                    },
+                );
+            }
             WorkerMessage::PersistedToolSettled {
                 run_id,
                 step_id,
@@ -1405,6 +1444,7 @@ impl<M: Model> RuntimeController<M> {
                     },
                     false,
                 );
+                self.session.clear_execution(step_id);
             }
             WorkerMessage::PersistedFinished {
                 agent,
@@ -1452,6 +1492,7 @@ impl<M: Model> RuntimeController<M> {
                         self.active = None;
                     }
                 }
+                self.session.clear_active_execution();
             }
         }
     }
@@ -1495,6 +1536,7 @@ impl<M: Model> RuntimeController<M> {
         self.subagents.latch_storage_failure().await;
         self.disable_session_storage(events).await;
         self.active = None;
+        self.session.clear_active_execution();
     }
 
     fn drain_worker_progress(&mut self, progress: &mut ProgressPublisher<RuntimeEvent>) {
@@ -7164,6 +7206,13 @@ mod tests {
         let records = shutdown_controller(commands, controller).await;
 
         assert_eq!(progress.len(), PROGRESS_CHANNEL_CAPACITY);
+        assert_eq!(
+            reliable
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ExecutionStarted { .. }))
+                .count(),
+            2
+        );
         assert!(reliable.iter().any(|event| matches!(
             event,
             RuntimeEvent::RecordAppended {
@@ -7405,7 +7454,9 @@ mod tests {
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:inspect",
+                "execution:1:1",
                 "record:1:execution:1",
+                "execution:1:2",
                 "record:1:execution:2",
                 "record:1:message:3:I inspected Cargo.toml.",
                 "settled:1",
@@ -7585,7 +7636,9 @@ mod tests {
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:continue",
+                "execution:1:1",
                 "record:1:execution:1",
+                "execution:1:2",
                 "record:1:execution:2",
                 "record:1:message:3:done",
                 "settled:1",
@@ -7649,11 +7702,27 @@ mod tests {
         ));
         assert!(matches!(
             next_event(&mut events).await,
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
             RuntimeEvent::RecordAppended {
                 record: StoredRecord {
                     record: Record::CompletedExecution { .. },
                     ..
                 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(2),
                 ..
             }
         ));
@@ -7795,7 +7864,12 @@ mod tests {
         );
         assert_eq!(
             reliable_events.iter().map(event_label).collect::<Vec<_>>(),
-            ["record:1:user:cancel", "record:1:cancelled", "settled:1",]
+            [
+                "record:1:user:cancel",
+                "execution:1:1",
+                "record:1:cancelled",
+                "settled:1",
+            ]
         );
         assert!(
             timeout(Duration::from_millis(100), events.recv())
@@ -7859,7 +7933,9 @@ mod tests {
             first_settled.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:first",
+                "execution:1:1",
                 "record:1:execution:1",
+                "execution:1:2",
                 "record:1:cancelled",
                 "settled:1",
             ]
@@ -7917,7 +7993,12 @@ mod tests {
         );
         assert_eq!(
             reliable_events.iter().map(event_label).collect::<Vec<_>>(),
-            ["record:1:user:stop", "record:1:cancelled", "settled:1",]
+            [
+                "record:1:user:stop",
+                "execution:1:1",
+                "record:1:cancelled",
+                "settled:1",
+            ]
         );
         assert_eq!(records, committed_records(&reliable_events));
     }
@@ -8187,6 +8268,7 @@ mod tests {
                     },
                     ..
                 },
+                RuntimeEvent::ExecutionStarted { .. },
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
                         record: Record::FailedRun { .. },
@@ -8275,6 +8357,7 @@ mod tests {
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:inspect",
+                "execution:1:1",
                 "record:1:execution:1",
                 "record:1:message:2:done",
                 "settled:1",
@@ -8343,7 +8426,9 @@ mod tests {
             events.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:accounting",
+                "execution:1:1",
                 "record:1:execution:1",
+                "execution:1:2",
                 "record:1:execution:2",
                 "record:1:message:3:done",
                 "settled:1",
@@ -8432,6 +8517,7 @@ mod tests {
             first_events.iter().map(event_label).collect::<Vec<_>>(),
             [
                 "record:1:user:first",
+                "execution:1:1",
                 "record:1:execution:1",
                 "record:1:cancelled",
                 "settled:1",
@@ -8527,6 +8613,7 @@ mod tests {
                     },
                     ..
                 },
+                RuntimeEvent::ExecutionStarted { .. },
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
                         record: Record::FailedRun { terminal, .. },
@@ -8621,6 +8708,7 @@ mod tests {
             terminal_events.as_slice(),
             [
                 RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::ExecutionStarted { .. },
                 RuntimeEvent::RecordAppended { .. },
                 RuntimeEvent::RuntimeDisabled {
                     reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
@@ -8689,6 +8777,7 @@ mod tests {
             terminal_events.as_slice(),
             [
                 RuntimeEvent::RecordAppended { .. },
+                RuntimeEvent::ExecutionStarted { .. },
                 RuntimeEvent::RecordAppended { .. },
                 RuntimeEvent::RuntimeDisabled {
                     reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
@@ -8949,6 +9038,7 @@ mod tests {
                     },
                     ..
                 },
+                RuntimeEvent::ExecutionStarted { .. },
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
                         record: Record::FailedRun { .. },
@@ -9722,7 +9812,12 @@ mod tests {
                 .iter()
                 .map(|record| record.id().to_string())
                 .collect::<Vec<_>>(),
-            ["00", "01", "02", "03"]
+            ["0", "1", "2", "2.0"]
+        );
+        assert!(
+            child_records[..3]
+                .iter()
+                .all(|record| record.admission_history_step_id().is_some())
         );
         assert_eq!(
             child_records
@@ -9737,7 +9832,7 @@ mod tests {
             ]
         );
         assert!(child_records[3].parameters().read_only());
-        assert_eq!(child_records[3].parent().unwrap().to_string(), "02");
+        assert_eq!(child_records[3].parent().unwrap().to_string(), "2");
         assert!(matches!(
             child_records[0].outcome(),
             Some(TaskOutcome::Completed(result))
@@ -9756,7 +9851,7 @@ mod tests {
             Some(TaskOutcome::Completed(result))
                 if result.values() == &BTreeMap::from([(
                     "descendant_id".to_owned(),
-                    ToolValue::String("03".to_owned()),
+                    ToolValue::String("2.0".to_owned()),
                 )])
         ));
         assert!(matches!(
@@ -9782,6 +9877,18 @@ mod tests {
             ]
         );
 
+        let first_execution_started = workflow_events
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::ExecutionStarted { .. }))
+            .expect("reliable execution start");
+        let first_root_spawned = workflow_events
+            .iter()
+            .position(|event| {
+                matches!(event, RuntimeEvent::SubagentSpawned { record } if record.id().as_str() == "0")
+            })
+            .expect("first root spawn");
+        assert!(first_execution_started < first_root_spawned);
+
         let first_spawns = workflow_events
             .iter()
             .filter_map(|event| match event {
@@ -9795,7 +9902,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id().to_string())
                 .collect::<Vec<_>>(),
-            ["00", "01", "02", "03"]
+            ["0", "1", "2", "2.0"]
         );
         for record in &child_records {
             assert_eq!(
@@ -9823,10 +9930,10 @@ mod tests {
             }));
         }
         for (id, state) in [
-            ("00", TaskState::Completed),
-            ("01", TaskState::Failed),
-            ("02", TaskState::Completed),
-            ("03", TaskState::Cancelled),
+            ("0", TaskState::Completed),
+            ("1", TaskState::Failed),
+            ("2", TaskState::Completed),
+            ("2.0", TaskState::Cancelled),
         ] {
             assert!(status_events.iter().any(|event| {
                 matches!(event, RuntimeEvent::SubagentStatus { id: observed, observation, .. }
@@ -9840,15 +9947,15 @@ mod tests {
             [
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("01".to_owned()),
+                    summary: ToolCallSummary::Subagent("1".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("02".to_owned()),
+                    summary: ToolCallSummary::Subagent("2".to_owned()),
                 },
             ]
         );
@@ -9859,47 +9966,47 @@ mod tests {
             [
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("01".to_owned()),
+                    summary: ToolCallSummary::Subagent("1".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("01".to_owned()),
+                    summary: ToolCallSummary::Subagent("1".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("02".to_owned()),
+                    summary: ToolCallSummary::Subagent("2".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::WaitSubagent,
-                    summary: ToolCallSummary::Subagent("02".to_owned()),
+                    summary: ToolCallSummary::Subagent("2".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::GetSubagent,
-                    summary: ToolCallSummary::Subagent("03".to_owned()),
+                    summary: ToolCallSummary::Subagent("2.0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("03".to_owned()),
+                    summary: ToolCallSummary::Subagent("2.0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
-                    summary: ToolCallSummary::Subagent("02".to_owned()),
+                    summary: ToolCallSummary::Subagent("2".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::RefreshSubagent,
-                    summary: ToolCallSummary::Subagent("03".to_owned()),
+                    summary: ToolCallSummary::Subagent("2.0".to_owned()),
                 },
             ]
         );
@@ -10029,9 +10136,12 @@ mod tests {
             ],
             tasks: vec![RestoredTask {
                 record: task,
+                admission_anchor_revision: 5,
+                terminal_anchor_revision: 5,
                 admitted_revision: 3,
                 terminal_revision: 4,
             }],
+            reserved_task_ids: Vec::new(),
             footer_adjustment: Vec::new(),
             next_task: Some(1),
             executable: None,
@@ -10044,12 +10154,174 @@ mod tests {
                     record: Record::UserRequest { .. },
                     ..
                 }),
-                RestoredTimelineItem::SubagentSpawned(_),
-                RestoredTimelineItem::SubagentFinished(_),
                 RestoredTimelineItem::Record(StoredRecord {
                     record: Record::FinalMessage { .. },
                     ..
                 }),
+                RestoredTimelineItem::SubagentSpawned(_),
+                RestoredTimelineItem::SubagentFinished(_),
+            ]
+        ));
+    }
+
+    #[test]
+    fn restored_timeline_keeps_later_task_completion_at_its_event_revision() {
+        let task = crate::subagents::TaskRecord::for_test(
+            "0",
+            2,
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let initial = restored_initial_state(&SessionRestore {
+            metadata: None,
+            records: vec![
+                RestoredRecord {
+                    revision: 2,
+                    run_id: 1,
+                    kind: RestoredRecordKind::UserRequest {
+                        request: "origin request".to_owned(),
+                    },
+                },
+                RestoredRecord {
+                    revision: 5,
+                    run_id: 1,
+                    kind: RestoredRecordKind::FinalMessage {
+                        step_id: 1,
+                        text: "origin answer".to_owned(),
+                        reasoning_summary: String::new(),
+                        terminal: crate::session::ReadableTerminal::Final {
+                            text: "origin answer".to_owned(),
+                            reasoning_summary: String::new(),
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                RestoredRecord {
+                    revision: 6,
+                    run_id: 2,
+                    kind: RestoredRecordKind::UserRequest {
+                        request: "later request".to_owned(),
+                    },
+                },
+            ],
+            tasks: vec![RestoredTask {
+                record: task,
+                admission_anchor_revision: 5,
+                terminal_anchor_revision: 5,
+                admitted_revision: 3,
+                terminal_revision: 7,
+            }],
+            reserved_task_ids: Vec::new(),
+            footer_adjustment: Vec::new(),
+            next_task: Some(1),
+            executable: None,
+        });
+
+        assert!(matches!(
+            initial.timeline.as_slice(),
+            [
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::UserRequest { request: origin },
+                    ..
+                }),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::FinalMessage { .. },
+                    ..
+                }),
+                RestoredTimelineItem::SubagentSpawned(_),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::UserRequest { request: later },
+                    ..
+                }),
+                RestoredTimelineItem::SubagentFinished(_),
+            ] if origin == "origin request" && later == "later request"
+        ));
+    }
+
+    #[test]
+    fn restored_timeline_queues_completion_after_its_later_foreground_anchor() {
+        let task = crate::subagents::TaskRecord::for_test(
+            "0",
+            2,
+            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let final_message = |step_id, text: &str| RestoredRecordKind::FinalMessage {
+            step_id,
+            text: text.to_owned(),
+            reasoning_summary: String::new(),
+            terminal: crate::session::ReadableTerminal::Final {
+                text: text.to_owned(),
+                reasoning_summary: String::new(),
+                attempts: Vec::new(),
+            },
+        };
+        let initial = restored_initial_state(&SessionRestore {
+            metadata: None,
+            records: vec![
+                RestoredRecord {
+                    revision: 2,
+                    run_id: 1,
+                    kind: RestoredRecordKind::UserRequest {
+                        request: "origin request".to_owned(),
+                    },
+                },
+                RestoredRecord {
+                    revision: 5,
+                    run_id: 1,
+                    kind: final_message(1, "origin answer"),
+                },
+                RestoredRecord {
+                    revision: 6,
+                    run_id: 2,
+                    kind: RestoredRecordKind::UserRequest {
+                        request: "later request".to_owned(),
+                    },
+                },
+                RestoredRecord {
+                    revision: 8,
+                    run_id: 2,
+                    kind: final_message(2, "later answer"),
+                },
+            ],
+            tasks: vec![RestoredTask {
+                record: task,
+                admission_anchor_revision: 5,
+                terminal_anchor_revision: 8,
+                admitted_revision: 3,
+                terminal_revision: 7,
+            }],
+            reserved_task_ids: Vec::new(),
+            footer_adjustment: Vec::new(),
+            next_task: Some(1),
+            executable: None,
+        });
+
+        assert!(matches!(
+            initial.timeline.as_slice(),
+            [
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                }),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::FinalMessage { .. },
+                    ..
+                }),
+                RestoredTimelineItem::SubagentSpawned(_),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                }),
+                RestoredTimelineItem::Record(StoredRecord {
+                    record: Record::FinalMessage { .. },
+                    ..
+                }),
+                RestoredTimelineItem::SubagentFinished(_),
             ]
         ));
     }
@@ -10283,6 +10555,7 @@ mod tests {
             terminal.depth(),
             Vec::new(),
         )
+        .with_storage_ids_for_test(terminal.storage_id(), terminal.parent_storage_id())
         .with_persisted_details_for_test(TaskPersistedDetails {
             admitted_at_ms: terminal.admitted_at_ms(),
             terminal_at_ms: None,
@@ -10332,29 +10605,28 @@ mod tests {
                 .expect("read selected origin step"),
         )
         .expect("selected origin step fits u64");
-        persist_fixture_task(
-            &writer,
-            selected_origin_step,
-            completed_fixture_task(
-                "62",
-                Some("00"),
-                Vec::new(),
-                ChildResult::new(
-                    "late selected result".to_owned(),
-                    BTreeMap::from([("visible".to_owned(), ToolValue::Integer(62))]),
-                ),
+        let late_task = completed_fixture_task(
+            "0.0",
+            Some("0"),
+            Vec::new(),
+            ChildResult::new(
+                "late selected result".to_owned(),
+                BTreeMap::from([("visible".to_owned(), ToolValue::Integer(62))]),
             ),
         )
-        .await;
+        .with_storage_ids_for_test(98, Some(0));
+        let late_task_storage_id = late_task.storage_id();
+        persist_fixture_task(&writer, selected_origin_step, late_task).await;
         let selected_leaf = active_entry_id(session);
         let (origin_revision, selected_terminal_revision, late_task_revision): (i64, i64, i64) = session
             .connection_for_test()
             .expect("lock session connection")
             .query_row(
-                "SELECT (SELECT entries.revision FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?1), (SELECT revision FROM entries WHERE id = ?2), (SELECT terminal_revision FROM subagent_tasks WHERE id = 98)",
+                "SELECT (SELECT entries.revision FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?1), (SELECT revision FROM entries WHERE id = ?2), (SELECT terminal_revision FROM subagent_tasks WHERE id = ?3)",
                 params![
                     i64::try_from(selected_origin_step).expect("selected origin fits SQLite"),
-                    selected_leaf
+                    selected_leaf,
+                    i64::try_from(late_task_storage_id).expect("task ID fits SQLite"),
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -10470,7 +10742,8 @@ mod tests {
                 "hidden high result".to_owned(),
                 BTreeMap::from([("hidden".to_owned(), ToolValue::Integer(63))]),
             ),
-        );
+        )
+        .with_storage_ids_for_test(99, None);
         hidden = hidden.with_persisted_details_for_test(TaskPersistedDetails {
             admitted_at_ms: 300,
             terminal_at_ms: Some(400),
@@ -10657,7 +10930,7 @@ mod tests {
                 calls: calls.clone(),
                 actions: vec![
                     RestoredModelAction::Code {
-                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'unknown subagent `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '64'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'unknown subagent `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
                             .to_owned(),
                         commentary: None,
                         attempts: Vec::new(),
@@ -10691,7 +10964,7 @@ mod tests {
                 .iter()
                 .map(|task| task.id().as_str())
                 .collect::<Vec<_>>(),
-            ["00", "62"]
+            ["0", "0.0"]
         );
         assert!(matches!(
             restored_tasks[0].outcome(),
@@ -10747,7 +11020,7 @@ mod tests {
             } => *run_id == RunId(3),
             RuntimeEvent::SubagentSpawned { record }
             | RuntimeEvent::SubagentRecord { record }
-            | RuntimeEvent::SubagentFinished { record } => record.id().as_str() == "64",
+            | RuntimeEvent::SubagentFinished { record } => record.id().as_str() == "1",
             _ => true,
         }));
         let contexts = contexts.lock().unwrap();
@@ -10900,7 +11173,7 @@ mod tests {
                 .iter()
                 .map(|task| task.record.id().as_str())
                 .collect::<Vec<_>>(),
-            ["00", "62"]
+            ["0", "0.0"]
         );
         assert!(matches!(
             restore.tasks[1].record.outcome(),
@@ -10982,7 +11255,14 @@ mod tests {
 
         assert_eq!(records, committed_records(&events));
         assert_eq!(records.len(), 4);
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 7);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ExecutionStarted { .. }))
+                .count(),
+            2
+        );
         assert!(
             !events
                 .iter()
