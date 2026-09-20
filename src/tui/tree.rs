@@ -1,25 +1,28 @@
 use std::collections::BTreeMap;
 
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
 
-#[cfg(test)]
-use super::picker::PICKER_MAX_WIDTH;
 use super::picker::{
-    DynamicPickerItem, DynamicPickerRole, Picker, PickerSavePolicy, canonical_search,
+    DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, canonical_search,
 };
 
 #[cfg(test)]
 const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
+const INITIAL_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const MAX_ANCESTOR_CONNECTORS: usize = 6;
+const LOADING_ENTRY: SessionEntryId = SessionEntryId(0);
 
-struct TreeNode<T> {
+struct TreeNode {
     parent: Option<usize>,
     children: Vec<usize>,
-    value: T,
+    entry: SessionEntryId,
     search_text: String,
     canonical_search_text: String,
     depth: usize,
@@ -35,11 +38,11 @@ struct TreeProjection {
 }
 
 impl TreeProjection {
-    fn all<T>(nodes: &[TreeNode<T>]) -> Self {
+    fn all(nodes: &[TreeNode]) -> Self {
         Self::new(nodes, vec![true; nodes.len()], vec![true; nodes.len()])
     }
 
-    fn new<T>(nodes: &[TreeNode<T>], direct_matches: Vec<bool>, visible: Vec<bool>) -> Self {
+    fn new(nodes: &[TreeNode], direct_matches: Vec<bool>, visible: Vec<bool>) -> Self {
         let mut last_visible = vec![false; nodes.len()];
         for node in nodes {
             if let Some(&child) = node.children.iter().rev().find(|&&child| visible[child]) {
@@ -54,18 +57,15 @@ impl TreeProjection {
     }
 }
 
-pub(crate) struct SessionTree<T> {
-    nodes: Vec<TreeNode<T>>,
+struct SessionTree {
+    nodes: Vec<TreeNode>,
     preorder: Vec<usize>,
     active_index: usize,
-    active_value: T,
+    active_entry: SessionEntryId,
 }
 
-impl<T: Copy + Eq> SessionTree<T> {
-    pub(crate) fn from_catalogue(
-        catalogue: &SessionCatalogue,
-        mut value_for_entry: impl FnMut(SessionEntryId) -> T,
-    ) -> Self {
+impl SessionTree {
+    fn from_catalogue(catalogue: &SessionCatalogue) -> Self {
         let entry_indexes = catalogue
             .entries
             .iter()
@@ -85,7 +85,7 @@ impl<T: Copy + Eq> SessionTree<T> {
                             .expect("session catalogue parent exists")
                     }),
                     children: Vec::new(),
-                    value: value_for_entry(entry.entry_id),
+                    entry: entry.entry_id,
                     search_text,
                     canonical_search_text,
                     depth: 0,
@@ -114,7 +114,7 @@ impl<T: Copy + Eq> SessionTree<T> {
         let active = *entry_indexes
             .get(&catalogue.active_entry)
             .expect("session catalogue active entry exists");
-        let active_value = nodes[active].value;
+        let active_entry = nodes[active].entry;
         let mut current = Some(active);
         while let Some(index) = current {
             nodes[index].active_path = true;
@@ -126,40 +126,50 @@ impl<T: Copy + Eq> SessionTree<T> {
             nodes,
             preorder,
             active_index: active,
-            active_value,
+            active_entry,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn picker(&self) -> Picker<T> {
+    fn picker(&self) -> Picker<SessionEntryId> {
         self.picker_for_width(PICKER_ROW_WIDTH)
     }
 
-    pub(crate) fn picker_for_width(&self, row_width: usize) -> Picker<T> {
+    fn picker_for_width(&self, row_width: usize) -> Picker<SessionEntryId> {
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
             self.items(&TreeProjection::all(&self.nodes), row_width),
-            self.active_value,
-            PickerSavePolicy::Disabled,
+            self.active_entry,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn refresh(&self, picker: &mut Picker<T>) {
-        self.refresh_for_width(picker, PICKER_ROW_WIDTH);
+    fn refresh(&self, picker: &mut Picker<SessionEntryId>) {
+        let query = picker.filter().to_owned();
+        self.refresh_for_query(picker, &query, PICKER_ROW_WIDTH);
     }
 
-    pub(crate) fn refresh_for_width(&self, picker: &mut Picker<T>, row_width: usize) {
-        let projection = self.filtered_projection(picker);
+    fn refresh_for_query(
+        &self,
+        picker: &mut Picker<SessionEntryId>,
+        query: &str,
+        row_width: usize,
+    ) {
+        let projection = self.filtered_projection(query);
         picker.replace_items(self.items(&projection, row_width));
     }
 
-    fn filtered_projection(&self, picker: &Picker<T>) -> TreeProjection {
+    fn filtered_projection(&self, query: &str) -> TreeProjection {
+        let tokens = query
+            .split_whitespace()
+            .map(canonical_search)
+            .collect::<Vec<_>>();
         let mut direct_matches = vec![false; self.nodes.len()];
         for &index in &self.preorder {
-            direct_matches[index] =
-                picker.matches_canonical_text(&self.nodes[index].canonical_search_text);
+            direct_matches[index] = tokens
+                .iter()
+                .all(|token| self.nodes[index].canonical_search_text.contains(token));
         }
 
         let mut visible = direct_matches.clone();
@@ -173,7 +183,11 @@ impl<T: Copy + Eq> SessionTree<T> {
         TreeProjection::new(&self.nodes, direct_matches, visible)
     }
 
-    fn items(&self, projection: &TreeProjection, row_width: usize) -> Vec<DynamicPickerItem<T>> {
+    fn items(
+        &self,
+        projection: &TreeProjection,
+        row_width: usize,
+    ) -> Vec<DynamicPickerItem<SessionEntryId>> {
         self.preorder
             .iter()
             .copied()
@@ -191,7 +205,7 @@ impl<T: Copy + Eq> SessionTree<T> {
                     } else {
                         DynamicPickerRole::Context
                     },
-                    value: node.value,
+                    value: node.entry,
                 }
             })
             .collect()
@@ -259,7 +273,158 @@ impl<T: Copy + Eq> SessionTree<T> {
     }
 }
 
-fn build_preorder<T>(nodes: &mut [TreeNode<T>], root: usize) -> Vec<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeNavigatorAction {
+    None,
+    Changed,
+    Close,
+    Navigate(SessionEntryId),
+}
+
+pub(crate) struct TreeNavigator {
+    revision: u64,
+    row_width: usize,
+    state: TreeNavigatorState,
+}
+
+enum TreeNavigatorState {
+    Loading {
+        picker: Picker<SessionEntryId>,
+    },
+    Ready {
+        tree: SessionTree,
+        picker: Picker<SessionEntryId>,
+    },
+}
+
+impl TreeNavigator {
+    pub(crate) fn new(revision: u64, query: &str) -> Self {
+        let mut picker = Picker::new_dynamic(
+            "Session tree",
+            "No matching session entries",
+            [DynamicPickerItem {
+                row: Line::raw("Loading…"),
+                role: DynamicPickerRole::Context,
+                value: LOADING_ENTRY,
+            }],
+            LOADING_ENTRY,
+        );
+        picker.set_filter(query);
+        Self {
+            revision,
+            row_width: INITIAL_ROW_WIDTH,
+            state: TreeNavigatorState::Loading { picker },
+        }
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        matches!(self.state, TreeNavigatorState::Loading { .. })
+    }
+
+    pub(crate) fn install_catalogue(
+        &mut self,
+        revision: u64,
+        catalogue: &SessionCatalogue,
+    ) -> bool {
+        if self.revision != revision {
+            return false;
+        }
+        let TreeNavigatorState::Loading { picker } = &self.state else {
+            return false;
+        };
+        let query = picker.filter().to_owned();
+        let tree = SessionTree::from_catalogue(catalogue);
+        let mut picker = tree.picker_for_width(self.row_width);
+        picker.set_filter(&query);
+        tree.refresh_for_query(&mut picker, &query, self.row_width);
+        self.state = TreeNavigatorState::Ready { tree, picker };
+        true
+    }
+
+    pub(crate) fn reject_catalogue(&self, revision: u64) -> bool {
+        self.revision == revision && self.is_loading()
+    }
+
+    pub(crate) fn refresh_width(&mut self, row_width: usize) {
+        if self.row_width == row_width {
+            return;
+        }
+        self.row_width = row_width;
+        let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
+            return;
+        };
+        let query = picker.filter().to_owned();
+        tree.refresh_for_query(picker, &query, row_width);
+    }
+
+    pub(crate) fn desired_height(&self) -> u16 {
+        self.picker().desired_height()
+    }
+
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.picker_mut().render_in(frame, area);
+    }
+
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> TreeNavigatorAction {
+        if self.is_loading() {
+            return if key.code == KeyCode::Esc {
+                TreeNavigatorAction::Close
+            } else {
+                TreeNavigatorAction::None
+            };
+        }
+        if matches!(key.code, KeyCode::Char('s' | 'S'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return TreeNavigatorAction::None;
+        }
+        if key.code == KeyCode::Esc {
+            let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
+                unreachable!("ready tree navigator has ready state");
+            };
+            if picker.filter().is_empty() {
+                return TreeNavigatorAction::Close;
+            }
+            picker.set_filter("");
+            tree.refresh_for_query(picker, "", self.row_width);
+            return TreeNavigatorAction::Changed;
+        }
+
+        let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
+            unreachable!("ready tree navigator has ready state");
+        };
+        match picker.handle_key(key) {
+            PickerAction::None | PickerAction::NoMatch | PickerAction::Save(_) => {
+                TreeNavigatorAction::None
+            }
+            PickerAction::Changed => {
+                let query = picker.filter().to_owned();
+                tree.refresh_for_query(picker, &query, self.row_width);
+                TreeNavigatorAction::Changed
+            }
+            PickerAction::Apply(entry) => TreeNavigatorAction::Navigate(entry),
+            PickerAction::Close => unreachable!("tree navigator handles Escape"),
+        }
+    }
+
+    fn picker(&self) -> &Picker<SessionEntryId> {
+        match &self.state {
+            TreeNavigatorState::Loading { picker } | TreeNavigatorState::Ready { picker, .. } => {
+                picker
+            }
+        }
+    }
+
+    fn picker_mut(&mut self) -> &mut Picker<SessionEntryId> {
+        match &mut self.state {
+            TreeNavigatorState::Loading { picker } | TreeNavigatorState::Ready { picker, .. } => {
+                picker
+            }
+        }
+    }
+}
+
+fn build_preorder(nodes: &mut [TreeNode], root: usize) -> Vec<usize> {
     let mut preorder = Vec::with_capacity(nodes.len());
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
@@ -362,7 +527,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::{Color, Modifier};
 
-    use super::SessionTree;
+    use super::{SessionTree, TreeNavigator, TreeNavigatorAction};
     use crate::arena::ToolCallSummary;
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
@@ -370,34 +535,81 @@ mod tests {
     use crate::tui::picker::{Picker, PickerAction};
 
     #[test]
-    fn renders_linear_history_at_first_level_without_false_joints() {
-        let tree = SessionTree::from_catalogue(
+    fn navigator_tokenises_search_and_clears_it_before_closing() {
+        let mut loading = TreeNavigator::new(7, "credentials python");
+        assert_eq!(
+            loading.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::None
+        );
+        assert_eq!(
+            loading.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Close
+        );
+
+        let mut navigator = TreeNavigator::new(8, "  CREDENTIALS\tpython ");
+        assert!(navigator.install_catalogue(
+            8,
             &catalogue(
-                4,
+                3,
                 [
                     entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(2, Some(1), 2, request("first request")),
+                    entry(2, Some(1), 2, request("authorise access")),
                     entry(
                         3,
                         Some(2),
                         3,
                         SessionCatalogueKind::Execution {
-                            commentary: Some("first execution".to_owned()),
+                            commentary: Some("Inspect credentials".to_owned()),
                             tool_summaries: Vec::new(),
                         },
                     ),
-                    entry(
-                        4,
-                        Some(3),
-                        4,
-                        SessionCatalogueKind::Final {
-                            text: "final reply".to_owned(),
-                        },
-                    ),
                 ],
-            ),
-            |entry_id| entry_id,
+            )
+        ));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(3))
         );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::None
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Close
+        );
+    }
+
+    #[test]
+    fn renders_linear_history_at_first_level_without_false_joints() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            4,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("first request")),
+                entry(
+                    3,
+                    Some(2),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("first execution".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    4,
+                    Some(3),
+                    4,
+                    SessionCatalogueKind::Final {
+                        text: "final reply".to_owned(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -413,66 +625,63 @@ mod tests {
 
     #[test]
     fn renders_one_fork_with_linear_continuations_in_chronological_order() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                7,
-                [
-                    entry(
-                        6,
-                        Some(5),
-                        6,
-                        SessionCatalogueKind::Final {
-                            text: "first reply".to_owned(),
-                        },
-                    ),
-                    entry(
-                        7,
-                        Some(3),
-                        7,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("second step".to_owned()),
-                            tool_summaries: vec![ToolCallSummary::Count(1)],
-                        },
-                    ),
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        4,
-                        Some(3),
-                        4,
-                        SessionCatalogueKind::Request {
-                            text: "first branch".to_owned(),
-                        },
-                    ),
-                    entry(
-                        5,
-                        Some(4),
-                        5,
-                        SessionCatalogueKind::Execution {
-                            commentary: None,
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: "original".to_owned(),
-                        },
-                    ),
-                    entry(
-                        3,
-                        Some(2),
-                        3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("first step".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            7,
+            [
+                entry(
+                    6,
+                    Some(5),
+                    6,
+                    SessionCatalogueKind::Final {
+                        text: "first reply".to_owned(),
+                    },
+                ),
+                entry(
+                    7,
+                    Some(3),
+                    7,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("second step".to_owned()),
+                        tool_summaries: vec![ToolCallSummary::Count(1)],
+                    },
+                ),
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    4,
+                    Some(3),
+                    4,
+                    SessionCatalogueKind::Request {
+                        text: "first branch".to_owned(),
+                    },
+                ),
+                entry(
+                    5,
+                    Some(4),
+                    5,
+                    SessionCatalogueKind::Execution {
+                        commentary: None,
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: "original".to_owned(),
+                    },
+                ),
+                entry(
+                    3,
+                    Some(2),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("first step".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -513,24 +722,21 @@ mod tests {
     }
 
     #[test]
-    fn marks_active_root_by_node_index_when_values_coincide() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                1,
-                [
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: "alternative".to_owned(),
-                        },
-                    ),
-                ],
-            ),
-            |_| SessionEntryId(0),
-        );
+    fn marks_the_active_root() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            1,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: "alternative".to_owned(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -563,65 +769,62 @@ mod tests {
 
     #[test]
     fn keeps_returned_branches_together_in_chronological_depth_first_order() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                5,
-                [
-                    entry(
-                        9,
-                        Some(3),
-                        6,
-                        SessionCatalogueKind::Request {
-                            text: "same revision higher id".to_owned(),
-                        },
-                    ),
-                    entry(
-                        5,
-                        Some(4),
-                        5,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("second".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        4,
-                        Some(1),
-                        4,
-                        SessionCatalogueKind::Request {
-                            text: "second".to_owned(),
-                        },
-                    ),
-                    entry(
-                        8,
-                        Some(3),
-                        6,
-                        SessionCatalogueKind::Request {
-                            text: "same revision lower id".to_owned(),
-                        },
-                    ),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: "first".to_owned(),
-                        },
-                    ),
-                    entry(
-                        3,
-                        Some(2),
-                        3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("first".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            5,
+            [
+                entry(
+                    9,
+                    Some(3),
+                    6,
+                    SessionCatalogueKind::Request {
+                        text: "same revision higher id".to_owned(),
+                    },
+                ),
+                entry(
+                    5,
+                    Some(4),
+                    5,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("second".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    4,
+                    Some(1),
+                    4,
+                    SessionCatalogueKind::Request {
+                        text: "second".to_owned(),
+                    },
+                ),
+                entry(
+                    8,
+                    Some(3),
+                    6,
+                    SessionCatalogueKind::Request {
+                        text: "same revision lower id".to_owned(),
+                    },
+                ),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: "first".to_owned(),
+                    },
+                ),
+                entry(
+                    3,
+                    Some(2),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("first".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -640,101 +843,98 @@ mod tests {
 
     #[test]
     fn renders_complete_row_vocabulary_and_normalises_text() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                11,
-                [
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: " request\n\ttext \u{001b}".to_owned(),
-                        },
-                    ),
-                    entry(
-                        3,
-                        Some(1),
-                        3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some(" \n \t ".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(
-                        4,
-                        Some(1),
-                        4,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("# comment\n only".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(
-                        5,
-                        Some(1),
-                        5,
-                        SessionCatalogueKind::Execution {
-                            commentary: None,
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(
-                        6,
-                        Some(1),
-                        6,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("all passed".to_owned()),
-                            tool_summaries: vec![
-                                ToolCallSummary::Pending,
-                                ToolCallSummary::Exit(0),
-                                ToolCallSummary::Exit(7),
-                                ToolCallSummary::Signal,
-                                ToolCallSummary::Count(0),
-                                ToolCallSummary::Created,
-                                ToolCallSummary::Replaced,
-                                ToolCallSummary::Applied,
-                                ToolCallSummary::Subagent("00".to_owned()),
-                            ],
-                        },
-                    ),
-                    entry(
-                        7,
-                        Some(1),
-                        7,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("mixed".to_owned()),
-                            tool_summaries: vec![
-                                ToolCallSummary::Exit(7),
-                                ToolCallSummary::Signal,
-                                ToolCallSummary::Failed,
-                            ],
-                        },
-                    ),
-                    entry(
-                        8,
-                        Some(1),
-                        8,
-                        SessionCatalogueKind::Execution {
-                            commentary: None,
-                            tool_summaries: vec![ToolCallSummary::Failed, ToolCallSummary::Failed],
-                        },
-                    ),
-                    entry(
-                        9,
-                        Some(1),
-                        9,
-                        SessionCatalogueKind::Final {
-                            text: "reply\r\n\ttext \u{001b}".to_owned(),
-                        },
-                    ),
-                    entry(10, Some(1), 10, SessionCatalogueKind::Cancelled),
-                    entry(11, Some(1), 11, SessionCatalogueKind::Failed),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            11,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: " request\n\ttext \u{001b}".to_owned(),
+                    },
+                ),
+                entry(
+                    3,
+                    Some(1),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some(" \n \t ".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    4,
+                    Some(1),
+                    4,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("# comment\n only".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    5,
+                    Some(1),
+                    5,
+                    SessionCatalogueKind::Execution {
+                        commentary: None,
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    6,
+                    Some(1),
+                    6,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("all passed".to_owned()),
+                        tool_summaries: vec![
+                            ToolCallSummary::Pending,
+                            ToolCallSummary::Exit(0),
+                            ToolCallSummary::Exit(7),
+                            ToolCallSummary::Signal,
+                            ToolCallSummary::Count(0),
+                            ToolCallSummary::Created,
+                            ToolCallSummary::Replaced,
+                            ToolCallSummary::Applied,
+                            ToolCallSummary::Subagent("00".to_owned()),
+                        ],
+                    },
+                ),
+                entry(
+                    7,
+                    Some(1),
+                    7,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("mixed".to_owned()),
+                        tool_summaries: vec![
+                            ToolCallSummary::Exit(7),
+                            ToolCallSummary::Signal,
+                            ToolCallSummary::Failed,
+                        ],
+                    },
+                ),
+                entry(
+                    8,
+                    Some(1),
+                    8,
+                    SessionCatalogueKind::Execution {
+                        commentary: None,
+                        tool_summaries: vec![ToolCallSummary::Failed, ToolCallSummary::Failed],
+                    },
+                ),
+                entry(
+                    9,
+                    Some(1),
+                    9,
+                    SessionCatalogueKind::Final {
+                        text: "reply\r\n\ttext \u{001b}".to_owned(),
+                    },
+                ),
+                entry(10, Some(1), 10, SessionCatalogueKind::Cancelled),
+                entry(11, Some(1), 11, SessionCatalogueKind::Failed),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -757,7 +957,7 @@ mod tests {
 
     #[test]
     fn caps_deep_nested_fork_connectors_without_hiding_labels_or_active_marker() {
-        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(32), |entry_id| entry_id);
+        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(32));
         let mut picker = tree.picker();
 
         let wide = rendered(&mut picker, 72, 80);
@@ -782,7 +982,7 @@ mod tests {
             .entries
             .push(entry(17, Some(16), 17, request("continued depth")));
         catalogue.active_entry = SessionEntryId(17);
-        let tree = SessionTree::from_catalogue(&catalogue, |entry_id| entry_id);
+        let tree = SessionTree::from_catalogue(&catalogue);
         let mut picker = tree.picker();
         let rows = tree_rows(&mut picker);
 
@@ -797,24 +997,21 @@ mod tests {
 
     #[test]
     fn renders_nested_forks_with_linear_continuations() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                7,
-                [
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(2, Some(1), 2, request("leading ancestor")),
-                    entry(3, Some(2), 3, request("linear before fork")),
-                    entry(4, Some(3), 4, request("outer first")),
-                    entry(5, Some(4), 5, request("outer continuation")),
-                    entry(6, Some(5), 6, request("inner first")),
-                    entry(7, Some(6), 7, request("inner continuation")),
-                    entry(8, Some(5), 8, request("inner second")),
-                    entry(9, Some(3), 9, request("outer second")),
-                    entry(10, Some(1), 10, request("leading sibling")),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            7,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("leading ancestor")),
+                entry(3, Some(2), 3, request("linear before fork")),
+                entry(4, Some(3), 4, request("outer first")),
+                entry(5, Some(4), 5, request("outer continuation")),
+                entry(6, Some(5), 6, request("inner first")),
+                entry(7, Some(6), 7, request("inner continuation")),
+                entry(8, Some(5), 8, request("inner second")),
+                entry(9, Some(3), 9, request("outer second")),
+                entry(10, Some(1), 10, request("leading sibling")),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -836,7 +1033,7 @@ mod tests {
 
     #[test]
     fn filters_a_4096_entry_chain_to_its_matching_leaf() {
-        let tree = SessionTree::from_catalogue(&linear_catalogue(4_096), |entry_id| entry_id);
+        let tree = SessionTree::from_catalogue(&linear_catalogue(4_096));
         assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 1);
         let mut picker = tree.picker();
 
@@ -852,48 +1049,45 @@ mod tests {
 
     #[test]
     fn filtering_keeps_full_tree_fork_levels_and_recomputes_endings() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                5,
-                [
-                    entry(
-                        5,
-                        Some(3),
-                        5,
-                        SessionCatalogueKind::Request {
-                            text: "need elsewhere".to_owned(),
-                        },
-                    ),
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        4,
-                        Some(3),
-                        4,
-                        SessionCatalogueKind::Request {
-                            text: "needle target".to_owned(),
-                        },
-                    ),
-                    entry(
-                        3,
-                        Some(2),
-                        3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("context".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
-                    ),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: "branch".to_owned(),
-                        },
-                    ),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            5,
+            [
+                entry(
+                    5,
+                    Some(3),
+                    5,
+                    SessionCatalogueKind::Request {
+                        text: "need elsewhere".to_owned(),
+                    },
+                ),
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    4,
+                    Some(3),
+                    4,
+                    SessionCatalogueKind::Request {
+                        text: "needle target".to_owned(),
+                    },
+                ),
+                entry(
+                    3,
+                    Some(2),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("context".to_owned()),
+                        tool_summaries: Vec::new(),
+                    },
+                ),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: "branch".to_owned(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         picker.set_filter("USER: NEEDLE");
@@ -950,21 +1144,18 @@ mod tests {
     #[test]
     fn finds_untruncated_previews_and_preserves_graphemes() {
         let request = "🦀e\u{0301}".repeat(25) + " needle";
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                1,
-                [
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request { text: request },
-                    ),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+        let tree = SessionTree::from_catalogue(&catalogue(
+            1,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request { text: request },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
         let buffer = rendered_buffer(&mut picker, 72, 8);
         let (user_column, user_row) = cell_start(&buffer, "User:");
@@ -986,24 +1177,21 @@ mod tests {
     }
 
     #[test]
-    fn disables_saving_and_handles_empty_and_narrow_results() {
-        let tree = SessionTree::from_catalogue(
-            &catalogue(
-                1,
-                [
-                    entry(1, None, 1, SessionCatalogueKind::Start),
-                    entry(
-                        2,
-                        Some(1),
-                        2,
-                        SessionCatalogueKind::Request {
-                            text: "selectable".to_owned(),
-                        },
-                    ),
-                ],
-            ),
-            |entry_id| entry_id,
-        );
+    fn handles_empty_and_narrow_results() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            1,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(
+                    2,
+                    Some(1),
+                    2,
+                    SessionCatalogueKind::Request {
+                        text: "selectable".to_owned(),
+                    },
+                ),
+            ],
+        ));
         let mut picker = tree.picker();
 
         assert_eq!(
@@ -1014,11 +1202,6 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             PickerAction::Apply(SessionEntryId(1))
         );
-        assert_eq!(
-            picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            PickerAction::None
-        );
-
         picker.set_filter("absent");
         tree.refresh(&mut picker);
         assert_eq!(

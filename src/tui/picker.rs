@@ -36,12 +36,6 @@ pub(crate) struct DynamicPickerItem<T> {
     pub(crate) value: T,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PickerSavePolicy {
-    Enabled,
-    Disabled,
-}
-
 enum PickerRowRole {
     SearchableLabel(String),
     Dynamic(DynamicPickerRole),
@@ -65,7 +59,6 @@ pub(crate) struct Picker<T> {
     items: Vec<PickerRow<T>>,
     filter: String,
     canonical_filter: String,
-    save_policy: PickerSavePolicy,
     focus: Option<usize>,
     scroll: usize,
     page_size: usize,
@@ -86,7 +79,6 @@ impl<T: Copy + Eq> Picker<T> {
             items,
             filter: String::new(),
             canonical_filter: String::new(),
-            save_policy: PickerSavePolicy::Enabled,
             focus,
             scroll: 0,
             page_size: 1,
@@ -98,7 +90,6 @@ impl<T: Copy + Eq> Picker<T> {
         empty_message: &'static str,
         items: impl IntoIterator<Item = DynamicPickerItem<T>>,
         current: T,
-        save_policy: PickerSavePolicy,
     ) -> Self {
         let items = items.into_iter().map(PickerRow::from).collect::<Vec<_>>();
         let focus = Self::initial_focus(&items, current);
@@ -108,7 +99,6 @@ impl<T: Copy + Eq> Picker<T> {
             items,
             filter: String::new(),
             canonical_filter: String::new(),
-            save_policy,
             focus,
             scroll: 0,
             page_size: 1,
@@ -150,10 +140,7 @@ impl<T: Copy + Eq> Picker<T> {
         match key.code {
             KeyCode::Esc => PickerAction::Close,
             KeyCode::Enter if key.modifiers.is_empty() => self.apply(false),
-            KeyCode::Char('s' | 'S')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.save_policy == PickerSavePolicy::Enabled =>
-            {
+            KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.apply(true)
             }
             KeyCode::Backspace if key.modifiers.is_empty() => {
@@ -458,9 +445,7 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
 
-    use super::{
-        DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem, PickerSavePolicy,
-    };
+    use super::{DynamicPickerItem, DynamicPickerRole, Picker, PickerAction, PickerItem};
 
     const ITEMS: [PickerItem<&str>; 4] = [
         PickerItem {
@@ -578,7 +563,6 @@ mod tests {
                 },
             ],
             "start",
-            PickerSavePolicy::Disabled,
         );
 
         assert_eq!(
@@ -587,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             picker.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            PickerAction::None
+            PickerAction::Save("step")
         );
         let buffer = rendered_buffer(&mut picker, 60, 10);
         let (muted_column, muted_row) = cell_with_symbol(&buffer, "├");
@@ -634,7 +618,6 @@ mod tests {
                 },
             ],
             "loading",
-            PickerSavePolicy::Enabled,
         );
 
         assert_eq!(
@@ -681,7 +664,6 @@ mod tests {
                 value: "loading",
             }],
             "loading",
-            PickerSavePolicy::Enabled,
         );
         assert_eq!(
             loading.handle_key(key(KeyCode::Enter)),
@@ -722,7 +704,6 @@ mod tests {
                 dynamic_item("two", "Python needle two", DynamicPickerRole::Direct),
             ],
             "root",
-            PickerSavePolicy::Disabled,
         );
         let _ = rendered(&mut picker, 60, 6);
 
@@ -762,7 +743,6 @@ mod tests {
                 dynamic_item("other", "Python other", DynamicPickerRole::Context),
             ],
             "step",
-            PickerSavePolicy::Disabled,
         );
         assert_eq!(picker.apply(false), PickerAction::Apply("step"));
 
@@ -802,7 +782,6 @@ mod tests {
                 ),
             ],
             "current",
-            PickerSavePolicy::Disabled,
         );
         picker.replace_items([
             dynamic_item("root", "Session start", DynamicPickerRole::Context),

@@ -35,18 +35,14 @@ use crate::runtime::{
     RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
-use crate::session::SessionEntryId;
 use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
-use picker::{
-    DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, PickerItem,
-    PickerSavePolicy,
-};
-use tree::SessionTree;
+use picker::{Picker, PickerAction, PickerItem};
+use tree::{TreeNavigator, TreeNavigatorAction};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
@@ -152,14 +148,6 @@ struct Flash {
 enum PickerValue {
     Model(&'static ModelConfiguration),
     Thinking(&'static str),
-    Tree(SessionEntryId),
-}
-
-struct TreePicker {
-    revision: u64,
-    filter: String,
-    row_width: usize,
-    tree: Option<SessionTree<PickerValue>>,
 }
 
 #[derive(Clone, Copy)]
@@ -198,7 +186,7 @@ struct App {
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
-    tree_picker: Option<TreePicker>,
+    tree_navigator: Option<TreeNavigator>,
     manual_navigation_pending: bool,
     next_tree_revision: u64,
     completion: slash::Completion,
@@ -243,7 +231,7 @@ impl Default for App {
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
-            tree_picker: None,
+            tree_navigator: None,
             manual_navigation_pending: false,
             next_tree_revision: 0,
             completion: slash::Completion::default(),
@@ -428,7 +416,10 @@ impl App {
         } else {
             false
         };
-        let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
+        let prompt_changed = if self.is_submission_disabled()
+            || self.picker.is_some()
+            || self.tree_navigator.is_some()
+        {
             false
         } else {
             let text = normalise_terminal_text(&normalise_paste_line_endings(text));
@@ -444,6 +435,9 @@ impl App {
     fn handle_key_inner(&mut self, key: KeyEvent, now: Instant) -> Update {
         if key.is_release() {
             return Update::default();
+        }
+        if self.tree_navigator.is_some() {
+            return self.handle_tree_navigator_key(key);
         }
         if self.picker.is_some() {
             return self.handle_picker_key(key);
@@ -689,25 +683,41 @@ impl App {
     }
 
     fn is_tree_loading(&self) -> bool {
-        self.tree_picker
+        self.tree_navigator
             .as_ref()
-            .is_some_and(|tree_picker| tree_picker.tree.is_none())
+            .is_some_and(TreeNavigator::is_loading)
     }
 
-    fn handle_picker_key(&mut self, key: KeyEvent) -> Update {
-        if self.is_tree_loading() {
-            if key.code == KeyCode::Esc {
-                self.picker = None;
-                self.tree_picker = None;
-                return Update {
+    fn handle_tree_navigator_key(&mut self, key: KeyEvent) -> Update {
+        let action = self
+            .tree_navigator
+            .as_mut()
+            .expect("tree navigator was checked before handling its key")
+            .handle_key(key);
+        match action {
+            TreeNavigatorAction::None => Update::default(),
+            TreeNavigatorAction::Changed => Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            },
+            TreeNavigatorAction::Close => {
+                self.tree_navigator = None;
+                Update {
                     commands: Vec::new(),
                     visible_changed: true,
                     quit: false,
-                };
+                }
             }
-            return Update::default();
+            TreeNavigatorAction::Navigate(entry) => {
+                self.tree_navigator = None;
+                self.manual_navigation_pending = true;
+                Update::with_commands([RuntimeCommand::Navigate { entry }])
+            }
         }
+    }
 
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Update {
         let action = self
             .picker
             .as_mut()
@@ -715,17 +725,13 @@ impl App {
             .handle_key(key);
         match action {
             PickerAction::None => Update::default(),
-            PickerAction::Changed => {
-                self.refresh_tree_picker_filter();
-                Update {
-                    commands: Vec::new(),
-                    visible_changed: true,
-                    quit: false,
-                }
-            }
+            PickerAction::Changed => Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            },
             PickerAction::Close => {
                 self.picker = None;
-                self.tree_picker = None;
                 Update {
                     commands: Vec::new(),
                     visible_changed: true,
@@ -745,12 +751,6 @@ impl App {
                     quit: false,
                 }
             }
-            PickerAction::Apply(PickerValue::Tree(entry)) => {
-                self.picker = None;
-                self.tree_picker = None;
-                self.manual_navigation_pending = true;
-                Update::with_commands([RuntimeCommand::Navigate { entry }])
-            }
             PickerAction::Apply(value) => {
                 self.picker = None;
                 self.apply_picker_value(value)
@@ -766,7 +766,6 @@ impl App {
                         let model = self.settings_selection.model();
                         self.save_user_default(|settings| settings.save_thinking(model, thinking));
                     }
-                    PickerValue::Tree(_) => unreachable!("tree pickers disable saving"),
                 }
                 update.visible_changed = true;
                 update
@@ -774,39 +773,10 @@ impl App {
         }
     }
 
-    fn refresh_tree_picker_filter(&mut self) {
-        let (Some(tree_picker), Some(picker)) = (&mut self.tree_picker, &mut self.picker) else {
-            return;
-        };
-        if tree_picker.filter == picker.filter() {
-            return;
-        }
-        tree_picker
-            .tree
-            .as_ref()
-            .expect("tree picker is populated before filtering")
-            .refresh_for_width(picker, tree_picker.row_width);
-        tree_picker.filter = picker.filter().to_owned();
-    }
-
-    fn refresh_tree_picker_width(&mut self, row_width: usize) {
-        let (Some(tree_picker), Some(picker)) = (&mut self.tree_picker, &mut self.picker) else {
-            return;
-        };
-        if tree_picker.row_width == row_width {
-            return;
-        }
-        tree_picker.row_width = row_width;
-        if let Some(tree) = &tree_picker.tree {
-            tree.refresh_for_width(picker, row_width);
-        }
-    }
-
     fn apply_picker_value(&mut self, value: PickerValue) -> Update {
         match value {
             PickerValue::Model(model) => self.select_model(model),
             PickerValue::Thinking(thinking) => self.select_thinking(thinking),
-            PickerValue::Tree(_) => unreachable!("tree selections navigate directly"),
         }
     }
 
@@ -816,23 +786,7 @@ impl App {
             .checked_add(1)
             .expect("tree revision overflowed");
         let revision = self.next_tree_revision;
-        self.tree_picker = Some(TreePicker {
-            revision,
-            filter: initial_filter.to_owned(),
-            row_width: usize::from(PICKER_MAX_WIDTH.saturating_sub(2)),
-            tree: None,
-        });
-        self.picker = Some(Picker::new_dynamic(
-            "Session tree",
-            "No matching session entries",
-            [DynamicPickerItem {
-                row: Line::raw("Loading…"),
-                role: DynamicPickerRole::Context,
-                value: PickerValue::Tree(SessionEntryId(0)),
-            }],
-            PickerValue::Tree(SessionEntryId(0)),
-            PickerSavePolicy::Disabled,
-        ));
+        self.tree_navigator = Some(TreeNavigator::new(revision, initial_filter));
         Update {
             commands: vec![RuntimeCommand::RequestTree { revision }],
             visible_changed: true,
@@ -1434,45 +1388,40 @@ impl App {
     }
 
     fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
-        let Some(tree_picker) = self.tree_picker.as_ref() else {
+        let Some(navigator) = &mut self.tree_navigator else {
             return false;
         };
-        if tree_picker.revision != revision || tree_picker.tree.is_some() {
-            return false;
-        }
         match outcome {
             TreeRequestOutcome::Catalogue(catalogue) => {
-                let filter = tree_picker.filter.clone();
-                let row_width = tree_picker.row_width;
-                let tree = SessionTree::from_catalogue(catalogue, PickerValue::Tree);
-                let mut picker = tree.picker_for_width(row_width);
-                picker.set_filter(&filter);
-                tree.refresh_for_width(&mut picker, row_width);
-                self.picker = Some(picker);
-                self.tree_picker
-                    .as_mut()
-                    .expect("matching tree picker remains open")
-                    .tree = Some(tree);
+                navigator.install_catalogue(revision, catalogue)
             }
             TreeRequestOutcome::RejectedBusy => {
-                self.picker = None;
-                self.tree_picker = None;
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
                 self.set_notice("Session tree is unavailable while work is active.".to_owned());
+                true
             }
             TreeRequestOutcome::RejectedReadOnly => {
-                self.picker = None;
-                self.tree_picker = None;
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
                 self.set_notice(
                     "Session tree is unavailable while the session is read-only.".to_owned(),
                 );
+                true
             }
             TreeRequestOutcome::Failed => {
-                self.picker = None;
-                self.tree_picker = None;
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
                 self.set_notice("Session could not be restored.".to_owned());
+                true
             }
         }
-        true
     }
 
     fn handle_correction_completed(&mut self, run_id: RunId, outcome: &CorrectionOutcome) -> bool {
@@ -2145,14 +2094,17 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         area.width,
         1,
     );
-    if app.tree_picker.is_some() {
-        app.refresh_tree_picker_width(usize::from(area.width.saturating_sub(2)));
+    if app.tree_navigator.is_some() {
+        app.tree_navigator
+            .as_mut()
+            .expect("tree navigator was checked before rendering")
+            .refresh_width(usize::from(area.width.saturating_sub(2)));
         let header_bottom = area.y.saturating_add(1);
         let picker_bottom = bottom_rule.y;
         let picker_height = app
-            .picker
+            .tree_navigator
             .as_ref()
-            .map_or(0, |picker| picker.desired_height())
+            .map_or(0, TreeNavigator::desired_height)
             .min(area.height / 2)
             .min(picker_bottom.saturating_sub(header_bottom));
         let picker_top = picker_bottom.saturating_sub(picker_height);
@@ -2177,8 +2129,8 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
             bottom_rule,
         );
-        if let Some(picker) = &mut app.picker {
-            picker.render_in(
+        if let Some(navigator) = &mut app.tree_navigator {
+            navigator.render(
                 frame,
                 Rect::new(area.x, picker_top, area.width, picker_height),
             );
@@ -2262,7 +2214,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         &prompt,
         content,
-        !app.is_submission_disabled() && app.picker.is_none(),
+        !app.is_submission_disabled() && app.picker.is_none() && app.tree_navigator.is_none(),
         slash::recognised_token_range(app.prompt.text()),
     );
     frame.render_widget(
@@ -2315,7 +2267,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
 }
 
 fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.is_submission_disabled() || app.picker.is_some() {
+    if app.is_submission_disabled() || app.picker.is_some() || app.tree_navigator.is_some() {
         return;
     }
     let rows = app.completion.visible_rows(usize::from(area.height));
@@ -4219,41 +4171,12 @@ mod tests {
     }
 
     #[test]
-    fn session_tree_picker_tracks_current_row_width_before_catalogue_load() {
+    fn session_tree_navigator_refreshes_width_before_catalogue_load() {
         let mut app = App::default();
         let revision = tree_request(&mut app, "");
-        assert_eq!(
-            app.tree_picker
-                .as_ref()
-                .expect("session tree picker is open")
-                .row_width,
-            70
-        );
-
         let loading = rendered(&mut app, 100, 12);
         assert!(loading.contains("Loading…"), "{loading}");
-        assert_eq!(
-            app.tree_picker
-                .as_ref()
-                .expect("session tree picker remains open")
-                .row_width,
-            98
-        );
 
-        load_tree(&mut app, revision);
-        assert_eq!(
-            app.tree_picker
-                .as_ref()
-                .expect("loaded session tree picker remains open")
-                .row_width,
-            98
-        );
-    }
-
-    #[test]
-    fn session_tree_picker_rows_use_the_full_overlay_width() {
-        let mut app = App::default();
-        let revision = tree_request(&mut app, "");
         let text = format!("{} wide tail", "x".repeat(75));
         assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
             revision,
@@ -4342,7 +4265,7 @@ mod tests {
 
         assert!(app.handle_key_at(key(KeyCode::Esc), now).visible_changed);
         assert!(app.picker.is_none());
-        assert!(app.tree_picker.is_none());
+        assert!(app.tree_navigator.is_none());
         assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
             revision: *revision,
             outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
@@ -8337,12 +8260,7 @@ mod tests {
             second.commands,
             [RuntimeCommand::RequestTree { revision: 1 }]
         );
-        assert_eq!(
-            app.tree_picker
-                .as_ref()
-                .map(|tree_picker| tree_picker.filter.as_str()),
-            Some("")
-        );
+        assert!(app.tree_navigator.is_some());
         assert_eq!(app.settled_escape_at, None);
     }
 
