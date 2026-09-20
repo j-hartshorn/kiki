@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -154,6 +154,72 @@ impl<'a> TreeProjection<'a> {
             last_visible,
         }
     }
+
+    fn with_hidden_descendants(
+        &self,
+        preorder: &[usize],
+        is_folded: impl Fn(usize) -> bool,
+    ) -> Self {
+        let mut visible = self.visible.clone();
+        let mut hidden = vec![false; visible.len()];
+        for &index in preorder {
+            if let Some(parent) = self.topology.parents[index] {
+                hidden[index] = hidden[parent] || (self.visible[parent] && is_folded(parent));
+            }
+            if hidden[index] {
+                visible[index] = false;
+            }
+        }
+        Self::new(
+            self.topology,
+            preorder,
+            self.direct_matches.clone(),
+            visible,
+        )
+    }
+
+    fn visible_children(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
+        self.topology.children[index]
+            .iter()
+            .copied()
+            .filter(|child| self.visible[*child])
+    }
+
+    fn is_foldable(&self, index: usize) -> bool {
+        self.visible[index]
+            && self.visible_children(index).next().is_some()
+            && match self.topology.parents[index] {
+                None => true,
+                Some(parent) => self.visible_children(parent).nth(1).is_some(),
+            }
+    }
+
+    fn enclosing_segment_start(&self, selected: usize) -> usize {
+        let mut current = selected;
+        loop {
+            let Some(parent) = self.topology.parents[current] else {
+                return current;
+            };
+            if current != selected && self.visible_children(parent).nth(1).is_some() {
+                return current;
+            }
+            current = parent;
+        }
+    }
+
+    fn first_child_segment_start(&self, selected: usize) -> usize {
+        let mut current = selected;
+        loop {
+            let mut children = self.visible_children(current);
+            let Some(first) = children.next() else {
+                return current;
+            };
+            if children.next().is_some() {
+                return first;
+            }
+            current = first;
+        }
+    }
 }
 
 struct SessionTree {
@@ -239,15 +305,20 @@ impl SessionTree {
 
     #[cfg(test)]
     fn picker(&self) -> Picker<SessionEntryId> {
-        self.picker_for_width(PICKER_ROW_WIDTH, TreeMode::Full)
+        self.picker_for_width(PICKER_ROW_WIDTH, TreeMode::Full, &BTreeSet::new())
     }
 
-    fn picker_for_width(&self, row_width: usize, mode: TreeMode) -> Picker<SessionEntryId> {
+    fn picker_for_width(
+        &self,
+        row_width: usize,
+        mode: TreeMode,
+        folded_heads: &BTreeSet<SessionEntryId>,
+    ) -> Picker<SessionEntryId> {
         let projection = self.filtered_projection(mode, "");
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&projection, row_width),
+            self.items(&projection, row_width, folded_heads),
             self.active_entry,
         )
     }
@@ -255,7 +326,13 @@ impl SessionTree {
     #[cfg(test)]
     fn refresh(&self, picker: &mut Picker<SessionEntryId>) {
         let query = picker.filter().to_owned();
-        self.refresh_for_query(picker, TreeMode::Full, &query, PICKER_ROW_WIDTH);
+        self.refresh_for_query(
+            picker,
+            TreeMode::Full,
+            &query,
+            PICKER_ROW_WIDTH,
+            &BTreeSet::new(),
+        );
     }
 
     fn refresh_for_query(
@@ -264,9 +341,10 @@ impl SessionTree {
         mode: TreeMode,
         query: &str,
         row_width: usize,
+        folded_heads: &BTreeSet<SessionEntryId>,
     ) -> TreeProjection<'_> {
         let projection = self.filtered_projection(mode, query);
-        picker.replace_items(self.items(&projection, row_width));
+        picker.replace_items(self.items(&projection, row_width, folded_heads));
         projection
     }
 
@@ -302,17 +380,21 @@ impl SessionTree {
         &self,
         projection: &TreeProjection<'_>,
         row_width: usize,
+        folded_heads: &BTreeSet<SessionEntryId>,
     ) -> Vec<DynamicPickerItem<SessionEntryId>> {
         enum ProjectionStep {
             Enter(usize),
             Exit(usize),
         }
 
+        let displayed = projection.with_hidden_descendants(&self.preorder, |index| {
+            folded_heads.contains(&self.nodes[index].entry)
+        });
         let root = *self
             .preorder
             .first()
             .expect("session tree preorder has a root");
-        if !projection.visible[root] {
+        if !displayed.visible[root] {
             return Vec::new();
         }
         let mut items = Vec::new();
@@ -324,9 +406,16 @@ impl SessionTree {
                 ProjectionStep::Exit(length) => connectors.truncate(length),
                 ProjectionStep::Enter(index) => {
                     let connector_length = connectors.len();
-                    let text = self.row_text(index, projection, &connectors, row_width);
-                    if self.draws_joint(index, &projection.topology) {
-                        connectors.push(!projection.last_visible[index]);
+                    let text = self.row_text(
+                        index,
+                        &displayed,
+                        projection,
+                        folded_heads,
+                        &connectors,
+                        row_width,
+                    );
+                    if self.draws_joint(index, displayed.topology) {
+                        connectors.push(!displayed.last_visible[index]);
                     }
                     items.push(DynamicPickerItem {
                         row: Line::styled(text, self.style(index)),
@@ -339,8 +428,8 @@ impl SessionTree {
                     });
 
                     traversal.push(ProjectionStep::Exit(connector_length));
-                    for &child in projection.topology.children[index].iter().rev() {
-                        if projection.visible[child] {
+                    for &child in displayed.topology.children[index].iter().rev() {
+                        if displayed.visible[child] {
                             traversal.push(ProjectionStep::Enter(child));
                         }
                     }
@@ -355,6 +444,8 @@ impl SessionTree {
         &self,
         index: usize,
         projection: &TreeProjection<'_>,
+        pre_fold: &TreeProjection<'_>,
+        folded_heads: &BTreeSet<SessionEntryId>,
         connectors: &[bool],
         row_width: usize,
     ) -> String {
@@ -374,17 +465,32 @@ impl SessionTree {
                 return text;
             }
         }
-        if self.draws_joint(index, &projection.topology)
+        let folded = folded_heads.contains(&self.nodes[index].entry);
+        if self.draws_joint(index, projection.topology)
             && let Some(text) = append_until_truncated(
                 &mut text,
                 &mut display_width,
-                if projection.last_visible[index] {
-                    "└─ "
-                } else {
-                    "├─ "
+                match (
+                    projection.last_visible[index],
+                    pre_fold.is_foldable(index),
+                    folded,
+                ) {
+                    (true, _, true) => "└⊞ ",
+                    (false, _, true) => "├⊞ ",
+                    (true, true, false) => "└⊟ ",
+                    (false, true, false) => "├⊟ ",
+                    (true, false, false) => "└─ ",
+                    (false, false, false) => "├─ ",
                 },
                 row_width,
             )
+        {
+            return text;
+        }
+        if projection.topology.parents[index].is_none()
+            && folded
+            && let Some(text) =
+                append_until_truncated(&mut text, &mut display_width, "⊞ ", row_width)
         {
             return text;
         }
@@ -434,6 +540,7 @@ pub(crate) struct TreeNavigator {
     revision: u64,
     row_width: usize,
     mode: TreeMode,
+    folded_heads: BTreeSet<SessionEntryId>,
     state: TreeNavigatorState,
 }
 
@@ -442,7 +549,7 @@ enum TreeNavigatorState {
         picker: Picker<SessionEntryId>,
     },
     Ready {
-        tree: SessionTree,
+        tree: Box<SessionTree>,
         picker: Picker<SessionEntryId>,
     },
 }
@@ -464,6 +571,7 @@ impl TreeNavigator {
             revision,
             row_width: INITIAL_ROW_WIDTH,
             mode: TreeMode::Full,
+            folded_heads: BTreeSet::new(),
             state: TreeNavigatorState::Loading { picker },
         }
     }
@@ -485,10 +593,19 @@ impl TreeNavigator {
         };
         let query = picker.filter().to_owned();
         let tree = SessionTree::from_catalogue(catalogue);
-        let mut picker = tree.picker_for_width(self.row_width, self.mode);
+        let mut picker = tree.picker_for_width(self.row_width, self.mode, &self.folded_heads);
         picker.set_filter(&query);
-        tree.refresh_for_query(&mut picker, self.mode, &query, self.row_width);
-        self.state = TreeNavigatorState::Ready { tree, picker };
+        tree.refresh_for_query(
+            &mut picker,
+            self.mode,
+            &query,
+            self.row_width,
+            &self.folded_heads,
+        );
+        self.state = TreeNavigatorState::Ready {
+            tree: Box::new(tree),
+            picker,
+        };
         true
     }
 
@@ -506,7 +623,7 @@ impl TreeNavigator {
             return;
         };
         let query = picker.filter().to_owned();
-        tree.refresh_for_query(picker, mode, &query, row_width);
+        tree.refresh_for_query(picker, mode, &query, row_width, &self.folded_heads);
     }
 
     pub(crate) fn desired_height(&self) -> u16 {
@@ -534,12 +651,16 @@ impl TreeNavigator {
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.mode = self.mode.toggled();
-            let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
+            self.folded_heads.clear();
+            let mode = self.mode;
+            let row_width = self.row_width;
+            let (folded_heads, state) = (&self.folded_heads, &mut self.state);
+            let TreeNavigatorState::Ready { tree, picker } = state else {
                 unreachable!("ready tree navigator has ready state");
             };
             let focused = picker.focused_value();
             let query = picker.filter().to_owned();
-            let projection = tree.refresh_for_query(picker, self.mode, &query, self.row_width);
+            let projection = tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
             if let Some(focused) = focused {
                 let focused = tree.entry_indexes[&focused];
                 if !projection.topology.eligible[focused]
@@ -551,31 +672,88 @@ impl TreeNavigator {
             return TreeNavigatorAction::Changed;
         }
         if key.code == KeyCode::Esc {
-            let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
-                unreachable!("ready tree navigator has ready state");
-            };
-            if picker.filter().is_empty() {
+            if self.picker().filter().is_empty() {
                 return TreeNavigatorAction::Close;
             }
+            self.folded_heads.clear();
+            let mode = self.mode;
+            let row_width = self.row_width;
+            let (folded_heads, state) = (&self.folded_heads, &mut self.state);
+            let TreeNavigatorState::Ready { tree, picker } = state else {
+                unreachable!("ready tree navigator has ready state");
+            };
             picker.set_filter("");
-            tree.refresh_for_query(picker, self.mode, "", self.row_width);
+            tree.refresh_for_query(picker, mode, "", row_width, folded_heads);
             return TreeNavigatorAction::Changed;
         }
-
-        let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
-            unreachable!("ready tree navigator has ready state");
-        };
-        match picker.handle_key(key) {
-            PickerAction::None | PickerAction::NoMatch | PickerAction::Save(_) => {
-                TreeNavigatorAction::None
+        if matches!(key.code, KeyCode::Left | KeyCode::Right) && key.modifiers.is_empty() {
+            let mode = self.mode;
+            let row_width = self.row_width;
+            let (folded_heads, state) = (&mut self.folded_heads, &mut self.state);
+            let TreeNavigatorState::Ready { tree, picker } = state else {
+                unreachable!("ready tree navigator has ready state");
+            };
+            let Some(focused) = picker.focused_value() else {
+                return TreeNavigatorAction::None;
+            };
+            let selected = tree.entry_indexes[&focused];
+            let query = picker.filter().to_owned();
+            let projection = tree.filtered_projection(mode, &query);
+            match key.code {
+                KeyCode::Left
+                    if projection.is_foldable(selected) && !folded_heads.contains(&focused) =>
+                {
+                    folded_heads.insert(focused);
+                    tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
+                    TreeNavigatorAction::Changed
+                }
+                KeyCode::Left => {
+                    let target = projection.enclosing_segment_start(selected);
+                    if target != selected && projection.direct_matches[target] {
+                        picker.focus_value(tree.nodes[target].entry);
+                        TreeNavigatorAction::Changed
+                    } else {
+                        TreeNavigatorAction::None
+                    }
+                }
+                KeyCode::Right if folded_heads.remove(&focused) => {
+                    tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
+                    TreeNavigatorAction::Changed
+                }
+                KeyCode::Right => {
+                    let target = projection.first_child_segment_start(selected);
+                    if target != selected && projection.direct_matches[target] {
+                        picker.focus_value(tree.nodes[target].entry);
+                        TreeNavigatorAction::Changed
+                    } else {
+                        TreeNavigatorAction::None
+                    }
+                }
+                _ => unreachable!("tree branch key was checked"),
             }
-            PickerAction::Changed => {
-                let query = picker.filter().to_owned();
-                tree.refresh_for_query(picker, self.mode, &query, self.row_width);
-                TreeNavigatorAction::Changed
+        } else {
+            let mode = self.mode;
+            let row_width = self.row_width;
+            let (folded_heads, state) = (&mut self.folded_heads, &mut self.state);
+            let TreeNavigatorState::Ready { tree, picker } = state else {
+                unreachable!("ready tree navigator has ready state");
+            };
+            let filter = picker.filter().to_owned();
+            match picker.handle_key(key) {
+                PickerAction::None | PickerAction::NoMatch | PickerAction::Save(_) => {
+                    TreeNavigatorAction::None
+                }
+                PickerAction::Changed => {
+                    if picker.filter() != filter {
+                        folded_heads.clear();
+                    }
+                    let query = picker.filter().to_owned();
+                    tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
+                    TreeNavigatorAction::Changed
+                }
+                PickerAction::Apply(entry) => TreeNavigatorAction::Navigate(entry),
+                PickerAction::Close => unreachable!("tree navigator handles Escape"),
             }
-            PickerAction::Apply(entry) => TreeNavigatorAction::Navigate(entry),
-            PickerAction::Close => unreachable!("tree navigator handles Escape"),
         }
     }
 
@@ -707,6 +885,8 @@ fn normalise_single_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1139,11 +1319,204 @@ mod tests {
             tree_rows(navigator.picker_mut()),
             [
                 "Session start",
-                "├─ User: older branch",
+                "├⊟ User: older branch",
                 "│  Kiki: latest durable descendant",
-                "└─ User: newer branch",
+                "└⊟ User: newer branch",
                 "   ● Kiki: older durable descendant",
             ]
+        );
+    }
+
+    #[test]
+    fn left_and_right_fold_and_traverse_branch_segments() {
+        let catalogue = catalogue(
+            8,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("segment head needle")),
+                entry(3, Some(2), 3, request("flat continuation needle")),
+                entry(4, Some(3), 4, request("fork needle")),
+                entry(5, Some(4), 5, request("older segment needle")),
+                entry(6, Some(5), 6, request("older descendant needle")),
+                entry(7, Some(4), 7, request("newer segment needle")),
+                entry(8, Some(7), 8, request("active hidden descendant needle")),
+                entry(9, Some(1), 9, request("root sibling needle")),
+            ],
+        );
+        let mut navigator = TreeNavigator::new(9, "");
+        assert!(navigator.install_catalogue(9, &catalogue));
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "├─ User: root sibling needle",
+                "└⊟ User: segment head needle",
+                "   User: flat continuation needle",
+                "   User: fork needle",
+                "   ├⊟ User: newer segment needle",
+                "   │  ● User: active hidden descendant needle",
+                "   └⊟ User: older segment needle",
+                "      User: older descendant needle",
+            ]
+        );
+
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "├─ User: root sibling needle",
+                "└⊞ User: segment head needle",
+            ]
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(2))
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "├─ User: root sibling needle",
+                "└⊟ User: segment head needle",
+                "   User: flat continuation needle",
+                "   User: fork needle",
+                "   ├⊟ User: newer segment needle",
+                "   │  ● User: active hidden descendant needle",
+                "   └⊟ User: older segment needle",
+                "      User: older descendant needle",
+            ]
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(2))
+        );
+
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(4)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(2))
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(7))
+        );
+
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(1)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(tree_rows(navigator.picker_mut()), ["⊞ Session start"]);
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::None
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(9))
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            TreeNavigatorAction::None
+        );
+
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(
+            tree_rows(navigator.picker_mut())
+                .iter()
+                .any(|row| row.contains("flat continuation needle"))
+        );
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(
+            tree_rows(navigator.picker_mut())
+                .iter()
+                .any(|row| row.contains("flat continuation needle"))
+        );
+
+        let mut escaped = TreeNavigator::new(10, "needle");
+        assert!(escaped.install_catalogue(10, &catalogue));
+        assert!(escaped.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            escaped.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            escaped.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(
+            tree_rows(escaped.picker_mut())
+                .iter()
+                .any(|row| row.contains("flat continuation needle"))
+        );
+
+        let mut conversation = TreeNavigator::new(11, "");
+        assert!(conversation.install_catalogue(11, &catalogue));
+        assert!(conversation.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            conversation.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            conversation.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(
+            tree_rows(conversation.picker_mut())
+                .iter()
+                .any(|row| row.contains("flat continuation needle"))
+        );
+
+        let mut filtered = TreeNavigator::new(12, "flat continuation");
+        assert!(filtered.install_catalogue(12, &catalogue));
+        assert_eq!(
+            filtered.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::None
+        );
+        assert_eq!(
+            filtered.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(3))
         );
     }
 
@@ -1167,11 +1540,11 @@ mod tests {
             tree_rows(&mut picker),
             [
                 "Session start",
-                "├─ User: older continued",
+                "├⊟ User: older continued",
                 "│  User: latest continuation",
-                "├─ User: recent sibling",
+                "├⊟ User: recent sibling",
                 "│  User: recent sibling leaf",
-                "└─ User: older active",
+                "└⊟ User: older active",
                 "   ● User: older active leaf",
             ]
         );
@@ -1284,7 +1657,7 @@ mod tests {
                 "└─ User: original",
                 "   Python: first step",
                 "   ├─ ● Python: [tools: 1] second step",
-                "   └─ User: first branch",
+                "   └⊟ User: first branch",
                 "      Python",
                 "      Kiki: first reply",
             ]
@@ -1424,9 +1797,9 @@ mod tests {
             tree_rows(&mut picker),
             [
                 "Session start",
-                "├─ User: second",
+                "├⊟ User: second",
                 "│  ● Python: second",
-                "└─ User: first",
+                "└⊟ User: first",
                 "   Python: first",
                 "   ├─ User: same revision higher id",
                 "   └─ User: same revision lower id",
@@ -1557,7 +1930,7 @@ mod tests {
         assert_eq!(
             &rows[7..9],
             [
-                "   │  │  │  │  │  ├─ User: depth 7",
+                "   │  │  │  │  │  ├⊟ User: depth 7",
                 "   │  │  │  │  │  │  ├─ ● User: depth 8",
             ]
         );
@@ -1588,13 +1961,13 @@ mod tests {
             [
                 "Session start",
                 "├─ User: leading sibling",
-                "└─ User: leading ancestor",
+                "└⊟ User: leading ancestor",
                 "   User: linear before fork",
                 "   ├─ User: outer second",
-                "   └─ User: outer first",
+                "   └⊟ User: outer first",
                 "      User: outer continuation",
                 "      ├─ User: inner second",
-                "      └─ User: inner first",
+                "      └⊟ User: inner first",
                 "         ● User: inner continuation",
             ]
         );
@@ -1634,6 +2007,7 @@ mod tests {
         let items = tree.items(
             &TreeProjection::all(&tree.full_topology, &tree.preorder),
             PICKER_ROW_WIDTH,
+            &BTreeSet::new(),
         );
         assert_eq!(items.len(), tree.preorder.len());
         assert!(

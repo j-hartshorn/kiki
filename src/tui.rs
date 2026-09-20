@@ -4274,6 +4274,58 @@ mod tests {
     }
 
     #[test]
+    fn tree_picker_left_and_right_reach_the_navigator_before_prompt_controls() {
+        let mut app = app_with_prompt("preserved draft");
+        let revision = tree_request(&mut app, "");
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(1),
+                entries: vec![
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(1),
+                        parent_id: None,
+                        revision: 1,
+                        kind: SessionCatalogueKind::Start,
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(2),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 2,
+                        kind: SessionCatalogueKind::Request {
+                            text: "first branch".to_owned(),
+                        },
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(3),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 3,
+                        kind: SessionCatalogueKind::Request {
+                            text: "second branch".to_owned(),
+                        },
+                    },
+                ],
+            }),
+        }));
+
+        let left = app.handle_key(key(KeyCode::Left));
+        assert!(left.visible_changed);
+        assert!(left.commands.is_empty());
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let folded = rendered(&mut app, 72, 12);
+        assert!(folded.contains("⊞ ● Session start"), "{folded}");
+        assert!(!folded.contains("first branch"), "{folded}");
+
+        let right = app.handle_key(key(KeyCode::Right));
+        assert!(right.visible_changed);
+        assert!(right.commands.is_empty());
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let expanded = rendered(&mut app, 72, 12);
+        assert!(expanded.contains("first branch"), "{expanded}");
+        assert!(expanded.contains("second branch"), "{expanded}");
+    }
+
+    #[test]
     fn tree_picker_loading_ignores_input_and_stale_catalogues() {
         let now = Instant::now();
         let mut bare = App::default();
