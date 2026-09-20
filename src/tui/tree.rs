@@ -1193,7 +1193,6 @@ fn copy_text(kind: &SessionCatalogueKind) -> String {
                 let tools = execution
                     .tool_calls
                     .iter()
-                    .cloned()
                     .map(tool_call_label)
                     .collect::<Vec<_>>()
                     .join("\n");

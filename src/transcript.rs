@@ -439,10 +439,7 @@ fn tool_call_text(
         .enumerate()
         .skip(omitted.unwrap_or_default())
     {
-        lines.push(Line::styled(
-            tool_call_label(call.clone()),
-            card_style(background),
-        ));
+        lines.push(Line::styled(tool_call_label(call), card_style(background)));
         if let Some(preview) = run_previews.get(index).and_then(Option::as_ref) {
             lines.push(Line::styled(
                 format!("╭─ $ {}", preview.command),
@@ -465,8 +462,8 @@ fn tool_call_text(
     })
 }
 
-pub(crate) fn tool_call_label(call: ToolCall) -> String {
-    if let ToolCallSummary::Subagent(id) = call.summary {
+pub(crate) fn tool_call_label(call: &ToolCall) -> String {
+    if let ToolCallSummary::Subagent(id) = &call.summary {
         let label = match call.tool {
             ToolName::StartSubagent => "Spawned",
             ToolName::GetSubagent | ToolName::RefreshSubagent => "Refreshed",
@@ -476,13 +473,13 @@ pub(crate) fn tool_call_label(call: ToolCall) -> String {
         };
         return format!("{label} · subagent:{id}");
     }
-    let summary = match call.summary {
+    let summary = match &call.summary {
         ToolCallSummary::Pending => "pending".to_owned(),
         ToolCallSummary::Failed => "failed".to_owned(),
         ToolCallSummary::Exit(code) => format!("exit {code}"),
         ToolCallSummary::Signal => "signal".to_owned(),
         ToolCallSummary::Count(count) => {
-            format!("{count} {}", call.tool.count_label(count))
+            format!("{count} {}", call.tool.count_label(*count))
         }
         ToolCallSummary::Created => "created".to_owned(),
         ToolCallSummary::Replaced => "replaced".to_owned(),
@@ -2443,7 +2440,7 @@ impl Transcript {
                 token,
                 call,
             } => {
-                let activity = tool_call_label(call.clone());
+                let activity = tool_call_label(&call);
                 let mut accepted = false;
                 let mut changed =
                     self.update_live_step(run_id, step_id, gap_before, None, |live| {
@@ -2477,7 +2474,7 @@ impl Transcript {
                 token,
                 preview,
             } => {
-                let activity = tool_call_label(ToolCall {
+                let activity = tool_call_label(&ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Pending,
                 });
@@ -4107,21 +4104,21 @@ mod tests {
     #[test]
     fn mutation_tool_labels_are_path_free() {
         assert_eq!(
-            tool_call_label(ToolCall {
+            tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Created,
             }),
             "write · created"
         );
         assert_eq!(
-            tool_call_label(ToolCall {
+            tool_call_label(&ToolCall {
                 tool: ToolName::Write,
                 summary: ToolCallSummary::Replaced,
             }),
             "write · replaced"
         );
         assert_eq!(
-            tool_call_label(ToolCall {
+            tool_call_label(&ToolCall {
                 tool: ToolName::Edit,
                 summary: ToolCallSummary::Applied,
             }),
@@ -4537,7 +4534,7 @@ mod tests {
             (ToolCallSummary::Failed, "run · failed"),
         ] {
             assert_eq!(
-                tool_call_label(ToolCall {
+                tool_call_label(&ToolCall {
                     tool: ToolName::Run,
                     summary,
                 }),
@@ -4552,7 +4549,7 @@ mod tests {
             (ToolName::CancelSubagent, "Cancelled · subagent:child1"),
         ] {
             assert_eq!(
-                tool_call_label(ToolCall {
+                tool_call_label(&ToolCall {
                     tool,
                     summary: ToolCallSummary::Subagent("child1".to_owned()),
                 }),
