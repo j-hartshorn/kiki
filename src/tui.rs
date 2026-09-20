@@ -54,8 +54,7 @@ rattles::rattle!(
     4,
     50,
     [
-        "⠁   ", "⠈   ", " ⠁  ", " ⠈  ", "  ⠁ ", "  ⠈ ", "   ⠁", "   ⠈", "   ⠐", "   ⠠", "   ⢀",
-        "   ⡀", "  ⢀ ", "  ⡀ ", " ⢀  ", " ⡀  ", "⢀   ", "⡀   ", "⠄   ", "⠂   "
+        "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠"
     ]
 );
 
@@ -1867,7 +1866,10 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     );
     if throbber_height > 0 {
         frame.render_widget(
-            Paragraph::new(app.throbber.current_frame()),
+            Paragraph::new(Line::styled(
+                app.throbber.current_frame(),
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
             Rect::new(
                 area.x.saturating_add(GENERATION_THROBBER_LEFT_PADDING),
                 prompt_top.saturating_sub(1),
@@ -2142,7 +2144,7 @@ mod tests {
         MouseEventKind,
     };
     use ratatui::layout::Position;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
 
     use super::{App, HistoryPosition, TitlePublisher, generation_throbber};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
@@ -7290,18 +7292,17 @@ mod tests {
     }
 
     #[test]
-    fn generation_throbber_is_a_single_row_four_cell_orbit() {
+    fn generation_throbber_is_a_single_row_four_cell_orbit_with_opposite_dots() {
         let throbber = generation_throbber();
 
         assert_eq!((throbber.size().width, throbber.size().height), (4, 1));
         assert_eq!(
+            (0..10)
+                .map(|index| throbber.frame(index))
+                .collect::<Vec<_>>(),
             [
-                throbber.frame(0),
-                throbber.frame(7),
-                throbber.frame(11),
-                throbber.frame(17),
-            ],
-            ["⠁   ", "   ⠈", "   ⡀", "⡀   "]
+                "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠",
+            ]
         );
     }
 
@@ -7321,7 +7322,9 @@ mod tests {
         let initial = rendered_at(&mut app, 20, 12, now);
         let rows = initial.lines().collect::<Vec<_>>();
         assert!(rows[7].trim().is_empty());
-        assert!(rows[8].starts_with(" ⠁   "));
+        assert!(rows[8].starts_with(" ⠁  ⢀"));
+        let initial_buffer = rendered_buffer(&mut app, 20, 12);
+        assert!(initial_buffer[(1, 8)].modifier.contains(Modifier::BOLD));
         assert_eq!(rows[9], "─".repeat(20));
         assert!(!rows[1..9].join("\n").contains("generating"));
         assert_eq!(app.history_height, 6);
@@ -7342,7 +7345,7 @@ mod tests {
             streaming
                 .lines()
                 .nth(8)
-                .is_some_and(|row| row.starts_with(" ⠁   "))
+                .is_some_and(|row| row.starts_with(" ⠁  ⢀"))
         );
 
         set_prompt(&mut app, "/");
@@ -7352,7 +7355,7 @@ mod tests {
             with_completion
                 .lines()
                 .nth(8)
-                .is_some_and(|row| row.starts_with(" ⠁   "))
+                .is_some_and(|row| row.starts_with(" ⠁  ⢀"))
         );
 
         assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
@@ -7362,7 +7365,7 @@ mod tests {
             advanced
                 .lines()
                 .nth(8)
-                .is_some_and(|row| row.starts_with(" ⠈   "))
+                .is_some_and(|row| row.starts_with(" ⠈  ⡀"))
         );
 
         app.handle_event_at(
