@@ -5,6 +5,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
@@ -16,7 +17,6 @@ use super::picker::{
 #[cfg(test)]
 const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const INITIAL_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
-const MAX_ANCESTOR_CONNECTORS: usize = 6;
 const LOADING_ENTRY: SessionEntryId = SessionEntryId(0);
 
 struct TreeNode {
@@ -25,9 +25,6 @@ struct TreeNode {
     entry: SessionEntryId,
     search_text: String,
     canonical_search_text: String,
-    depth: usize,
-    branch_head: Option<usize>,
-    branch_heads: [Option<usize>; MAX_ANCESTOR_CONNECTORS],
     active_path: bool,
 }
 
@@ -88,9 +85,6 @@ impl SessionTree {
                     entry: entry.entry_id,
                     search_text,
                     canonical_search_text,
-                    depth: 0,
-                    branch_head: None,
-                    branch_heads: [None; MAX_ANCESTOR_CONNECTORS],
                     active_path: false,
                 }
             })
@@ -100,10 +94,21 @@ impl SessionTree {
                 nodes[parent].children.push(index);
             }
         }
+        let latest_revisions = subtree_latest_revisions(&nodes, catalogue);
         for node in &mut nodes {
-            node.children.sort_by_key(|child| {
-                let entry = &catalogue.entries[*child];
-                (entry.revision, entry.entry_id)
+            node.children.sort_by(|left, right| {
+                latest_revisions[*right]
+                    .cmp(&latest_revisions[*left])
+                    .then_with(|| {
+                        catalogue.entries[*right]
+                            .revision
+                            .cmp(&catalogue.entries[*left].revision)
+                    })
+                    .then_with(|| {
+                        catalogue.entries[*right]
+                            .entry_id
+                            .cmp(&catalogue.entries[*left].entry_id)
+                    })
             });
         }
 
@@ -121,7 +126,7 @@ impl SessionTree {
             current = nodes[index].parent;
         }
 
-        let preorder = build_preorder(&mut nodes, root);
+        let preorder = build_preorder(&nodes, root);
         Self {
             nodes,
             preorder,
@@ -188,77 +193,111 @@ impl SessionTree {
         projection: &TreeProjection,
         row_width: usize,
     ) -> Vec<DynamicPickerItem<SessionEntryId>> {
-        self.preorder
-            .iter()
-            .copied()
-            .filter(|index| projection.visible[*index])
-            .map(|index| {
-                let node = &self.nodes[index];
-                let direct = projection.direct_matches[index];
-                DynamicPickerItem {
-                    row: Line::styled(
-                        truncate_end(&self.display_text(index, projection), row_width),
-                        self.style(index),
-                    ),
-                    role: if direct {
-                        DynamicPickerRole::Direct
-                    } else {
-                        DynamicPickerRole::Context
-                    },
-                    value: node.entry,
-                }
-            })
-            .collect()
-    }
-
-    fn display_text(&self, index: usize, projection: &TreeProjection) -> String {
-        let node = &self.nodes[index];
-        let mut text = self.connector(index, projection);
-        if index == self.active_index {
-            text.push_str("● ");
+        enum ProjectionStep {
+            Enter(usize),
+            Exit(usize),
         }
-        text.push_str(&node.search_text);
-        text
+
+        let root = *self
+            .preorder
+            .first()
+            .expect("session tree preorder has a root");
+        if !projection.visible[root] {
+            return Vec::new();
+        }
+        let mut items = Vec::new();
+        let mut traversal = vec![ProjectionStep::Enter(root)];
+        let mut connectors = Vec::new();
+
+        while let Some(step) = traversal.pop() {
+            match step {
+                ProjectionStep::Exit(length) => connectors.truncate(length),
+                ProjectionStep::Enter(index) => {
+                    let connector_length = connectors.len();
+                    let text = self.row_text(index, projection, &connectors, row_width);
+                    if self.draws_joint(index) {
+                        connectors.push(!projection.last_visible[index]);
+                    }
+                    items.push(DynamicPickerItem {
+                        row: Line::styled(text, self.style(index)),
+                        role: if projection.direct_matches[index] {
+                            DynamicPickerRole::Direct
+                        } else {
+                            DynamicPickerRole::Context
+                        },
+                        value: self.nodes[index].entry,
+                    });
+
+                    traversal.push(ProjectionStep::Exit(connector_length));
+                    for &child in self.nodes[index].children.iter().rev() {
+                        if projection.visible[child] {
+                            traversal.push(ProjectionStep::Enter(child));
+                        }
+                    }
+                }
+            }
+        }
+
+        items
     }
 
-    fn connector(&self, index: usize, projection: &TreeProjection) -> String {
-        let node = &self.nodes[index];
-        if node.parent.is_none() {
+    fn row_text(
+        &self,
+        index: usize,
+        projection: &TreeProjection,
+        connectors: &[bool],
+        row_width: usize,
+    ) -> String {
+        if row_width == 0 {
             return String::new();
         }
 
-        let parent = node.parent.expect("non-root tree node has a parent");
-        let draws_joint =
-            self.nodes[parent].parent.is_none() || self.nodes[parent].children.len() > 1;
-        let ancestor_count = node.depth.saturating_sub(1);
-        let mut connector = String::new();
-        for ancestor in node.branch_heads.iter().take(ancestor_count).flatten() {
-            connector.push_str(if projection.last_visible[*ancestor] {
-                "   "
-            } else {
-                "│  "
-            });
+        let mut text = String::with_capacity(row_width.saturating_add(3));
+        let mut display_width = 0;
+        for &continues in connectors {
+            if let Some(text) = append_until_truncated(
+                &mut text,
+                &mut display_width,
+                if continues { "│  " } else { "   " },
+                row_width,
+            ) {
+                return text;
+            }
         }
-        if ancestor_count > MAX_ANCESTOR_CONNECTORS {
-            connector.push_str("… ");
+        if self.draws_joint(index)
+            && let Some(text) = append_until_truncated(
+                &mut text,
+                &mut display_width,
+                if projection.last_visible[index] {
+                    "└─ "
+                } else {
+                    "├─ "
+                },
+                row_width,
+            )
+        {
+            return text;
         }
-        if draws_joint {
-            connector.push_str(if projection.last_visible[index] {
-                "└─ "
-            } else {
-                "├─ "
-            });
-        } else {
-            let branch_head = node
-                .branch_head
-                .expect("tree continuation has a branch head");
-            connector.push_str(if projection.last_visible[branch_head] {
-                "   "
-            } else {
-                "│  "
-            });
+        if index == self.active_index
+            && let Some(text) =
+                append_until_truncated(&mut text, &mut display_width, "● ", row_width)
+        {
+            return text;
         }
-        connector
+        append_until_truncated(
+            &mut text,
+            &mut display_width,
+            &self.nodes[index].search_text,
+            row_width,
+        )
+        .unwrap_or(text)
+    }
+
+    fn draws_joint(&self, index: usize) -> bool {
+        let Some(parent) = self.nodes[index].parent else {
+            return false;
+        };
+        self.nodes[parent].parent.is_none() || self.nodes[parent].children.len() > 1
     }
 
     fn style(&self, index: usize) -> Style {
@@ -424,42 +463,58 @@ impl TreeNavigator {
     }
 }
 
-fn build_preorder(nodes: &mut [TreeNode], root: usize) -> Vec<usize> {
+fn append_until_truncated(
+    text: &mut String,
+    display_width: &mut usize,
+    content: &str,
+    row_width: usize,
+) -> Option<String> {
+    for grapheme in content.graphemes(true) {
+        text.push_str(grapheme);
+        *display_width = display_width.saturating_add(Line::raw(grapheme).width());
+        if *display_width > row_width {
+            return Some(truncate_end(text, row_width));
+        }
+    }
+    None
+}
+
+fn subtree_latest_revisions(nodes: &[TreeNode], catalogue: &SessionCatalogue) -> Vec<u64> {
+    let mut latest_revisions = catalogue
+        .entries
+        .iter()
+        .map(|entry| entry.revision)
+        .collect::<Vec<_>>();
+    let mut remaining_children = nodes
+        .iter()
+        .map(|node| node.children.len())
+        .collect::<Vec<_>>();
+    let mut stack = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| node.children.is_empty().then_some(index))
+        .collect::<Vec<_>>();
+
+    while let Some(index) = stack.pop() {
+        let Some(parent) = nodes[index].parent else {
+            continue;
+        };
+        latest_revisions[parent] = latest_revisions[parent].max(latest_revisions[index]);
+        remaining_children[parent] -= 1;
+        if remaining_children[parent] == 0 {
+            stack.push(parent);
+        }
+    }
+
+    latest_revisions
+}
+
+fn build_preorder(nodes: &[TreeNode], root: usize) -> Vec<usize> {
     let mut preorder = Vec::with_capacity(nodes.len());
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
         preorder.push(index);
-        let (depth, branch_head, branch_heads, is_root, branches) = {
-            let node = &nodes[index];
-            (
-                node.depth,
-                node.branch_head,
-                node.branch_heads,
-                node.parent.is_none(),
-                node.children.len() > 1,
-            )
-        };
-        let child_depth = if is_root {
-            1
-        } else {
-            depth.saturating_add(usize::from(branches))
-        };
-        for child_index in (0..nodes[index].children.len()).rev() {
-            let child = nodes[index].children[child_index];
-            let child_branch_head = if is_root || branches {
-                child
-            } else {
-                branch_head.expect("tree continuation has a branch head")
-            };
-            let mut child_branch_heads = branch_heads;
-            if child_depth <= MAX_ANCESTOR_CONNECTORS {
-                child_branch_heads[child_depth - 1] = Some(child_branch_head);
-            }
-            nodes[child].depth = child_depth;
-            nodes[child].branch_head = Some(child_branch_head);
-            nodes[child].branch_heads = child_branch_heads;
-            stack.push(child);
-        }
+        stack.extend(nodes[index].children.iter().rev().copied());
     }
     preorder
 }
@@ -527,7 +582,9 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::{Color, Modifier};
 
-    use super::{SessionTree, TreeNavigator, TreeNavigatorAction};
+    use super::{
+        PICKER_ROW_WIDTH, SessionTree, TreeNavigator, TreeNavigatorAction, TreeProjection,
+    };
     use crate::arena::ToolCallSummary;
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
@@ -585,6 +642,36 @@ mod tests {
     }
 
     #[test]
+    fn orders_sibling_branches_by_latest_descendant_revision() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            4,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("older continued")),
+                entry(3, Some(1), 3, request("older active")),
+                entry(4, Some(3), 4, request("older active leaf")),
+                entry(5, Some(1), 5, request("recent sibling")),
+                entry(6, Some(5), 6, request("recent sibling leaf")),
+                entry(7, Some(2), 7, request("latest continuation")),
+            ],
+        ));
+        let mut picker = tree.picker();
+
+        assert_eq!(
+            tree_rows(&mut picker),
+            [
+                "Session start",
+                "├─ User: older continued",
+                "│  User: latest continuation",
+                "├─ User: recent sibling",
+                "│  User: recent sibling leaf",
+                "└─ User: older active",
+                "   ● User: older active leaf",
+            ]
+        );
+    }
+
+    #[test]
     fn renders_linear_history_at_first_level_without_false_joints() {
         let tree = SessionTree::from_catalogue(&catalogue(
             4,
@@ -624,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_one_fork_with_linear_continuations_in_chronological_order() {
+    fn renders_one_fork_with_linear_continuations_by_latest_descendant() {
         let tree = SessionTree::from_catalogue(&catalogue(
             7,
             [
@@ -690,10 +777,10 @@ mod tests {
                 "Session start",
                 "└─ User: original",
                 "   Python: first step",
-                "   ├─ User: first branch",
-                "   │  Python",
-                "   │  Kiki: first reply",
-                "   └─ ● Python: [tools: 1] second step",
+                "   ├─ ● Python: [tools: 1] second step",
+                "   └─ User: first branch",
+                "      Python",
+                "      Kiki: first reply",
             ]
         );
         assert_eq!(
@@ -768,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_returned_branches_together_in_chronological_depth_first_order() {
+    fn orders_equal_latest_siblings_by_direct_revision_and_entry_id() {
         let tree = SessionTree::from_catalogue(&catalogue(
             5,
             [
@@ -783,7 +870,7 @@ mod tests {
                 entry(
                     5,
                     Some(4),
-                    5,
+                    6,
                     SessionCatalogueKind::Execution {
                         commentary: Some("second".to_owned()),
                         tool_summaries: Vec::new(),
@@ -831,12 +918,12 @@ mod tests {
             tree_rows(&mut picker),
             [
                 "Session start",
-                "├─ User: first",
-                "│  Python: first",
-                "│  ├─ User: same revision lower id",
-                "│  └─ User: same revision higher id",
-                "└─ User: second",
-                "   ● Python: second",
+                "├─ User: second",
+                "│  ● Python: second",
+                "└─ User: first",
+                "   Python: first",
+                "   ├─ User: same revision higher id",
+                "   └─ User: same revision lower id",
             ]
         );
     }
@@ -941,62 +1028,38 @@ mod tests {
             labels(&mut picker),
             [
                 "Session start",
-                "User: request text \\x1B",
+                "Failed",
+                "Cancelled",
+                "Kiki: reply text \\x1B",
+                "Python: [tools: 2✗]",
+                "Python: [tools: 2✓ 1✗] mixed",
+                "Python: [tools: 9] all passed",
                 "Python",
                 "Python: # comment only",
                 "Python",
-                "Python: [tools: 9] all passed",
-                "Python: [tools: 2✓ 1✗] mixed",
-                "Python: [tools: 2✗]",
-                "Kiki: reply text \\x1B",
-                "Cancelled",
-                "Failed",
+                "User: request text \\x1B",
             ]
         );
     }
 
     #[test]
-    fn caps_deep_nested_fork_connectors_without_hiding_labels_or_active_marker() {
-        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(32));
-        let mut picker = tree.picker();
-
-        let wide = rendered(&mut picker, 72, 80);
-        assert!(wide.contains("…"));
-        assert!(wide.contains("User: depth 31"));
-        assert!(wide.contains("└─ ● User: depth 32"));
-
-        let narrow = rendered(&mut picker, 32, 8);
-        let visible_rows = narrow
-            .lines()
-            .filter(|row| row.contains("User:"))
-            .collect::<Vec<_>>();
-        assert_eq!(visible_rows.len(), 5);
-        assert!(visible_rows.iter().all(|row| row.contains("User:")));
-        assert!(narrow.contains("● User:"));
-    }
-
-    #[test]
-    fn deep_continuations_keep_capped_branch_alignment() {
-        let mut catalogue = nested_fork_catalogue(8);
-        catalogue
-            .entries
-            .push(entry(17, Some(16), 17, request("continued depth")));
-        catalogue.active_entry = SessionEntryId(17);
-        let tree = SessionTree::from_catalogue(&catalogue);
+    fn renders_complete_connectors_at_depths_seven_and_eight() {
+        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(8));
         let mut picker = tree.picker();
         let rows = tree_rows(&mut picker);
 
         assert_eq!(
-            &rows[rows.len() - 2..],
+            &rows[7..9],
             [
-                "                  … └─ User: depth 8",
-                "                  …    ● User: continued depth",
+                "   │  │  │  │  │  ├─ User: depth 7",
+                "   │  │  │  │  │  │  ├─ ● User: depth 8",
             ]
         );
+        assert!(rows.iter().all(|row| !row.contains('…')));
     }
 
     #[test]
-    fn renders_nested_forks_with_linear_continuations() {
+    fn keeps_nested_parents_before_descendants() {
         let tree = SessionTree::from_catalogue(&catalogue(
             7,
             [
@@ -1018,15 +1081,15 @@ mod tests {
             tree_rows(&mut picker),
             [
                 "Session start",
-                "├─ User: leading ancestor",
-                "│  User: linear before fork",
-                "│  ├─ User: outer first",
-                "│  │  User: outer continuation",
-                "│  │  ├─ User: inner first",
-                "│  │  │  ● User: inner continuation",
-                "│  │  └─ User: inner second",
-                "│  └─ User: outer second",
-                "└─ User: leading sibling",
+                "├─ User: leading sibling",
+                "└─ User: leading ancestor",
+                "   User: linear before fork",
+                "   ├─ User: outer second",
+                "   └─ User: outer first",
+                "      User: outer continuation",
+                "      ├─ User: inner second",
+                "      └─ User: inner first",
+                "         ● User: inner continuation",
             ]
         );
     }
@@ -1034,7 +1097,7 @@ mod tests {
     #[test]
     fn filters_a_4096_entry_chain_to_its_matching_leaf() {
         let tree = SessionTree::from_catalogue(&linear_catalogue(4_096));
-        assert_eq!(tree.nodes.last().expect("deepest node exists").depth, 1);
+        assert_eq!(tree.preorder.len(), 4_096);
         let mut picker = tree.picker();
 
         picker.set_filter("depth 4096");
@@ -1045,6 +1108,35 @@ mod tests {
             PickerAction::Apply(SessionEntryId(4_096))
         );
         assert!(rendered(&mut picker, 32, 8).contains("● User:"));
+    }
+
+    #[test]
+    fn projects_a_large_mixed_tree_without_quadratic_connector_materialisation() {
+        let tree = SessionTree::from_catalogue(&nested_fork_catalogue(2_048));
+        assert_eq!(tree.preorder.len(), 4_096);
+
+        let mut positions = vec![0; tree.nodes.len()];
+        for (position, &index) in tree.preorder.iter().enumerate() {
+            positions[index] = position;
+        }
+        for (position, &index) in tree.preorder.iter().enumerate() {
+            if let Some(parent) = tree.nodes[index].parent {
+                assert!(positions[parent] < position);
+            }
+        }
+
+        let items = tree.items(&TreeProjection::all(&tree.nodes), PICKER_ROW_WIDTH);
+        assert_eq!(items.len(), tree.preorder.len());
+        assert!(
+            items
+                .iter()
+                .all(|item| item.row.width() <= PICKER_ROW_WIDTH)
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.row.to_string().contains("… "))
+        );
     }
 
     #[test]
@@ -1135,8 +1227,8 @@ mod tests {
                 "Session start",
                 "User: branch",
                 "Python: context",
-                "User: needle target",
                 "User: need elsewhere",
+                "User: needle target",
             ]
         );
     }
