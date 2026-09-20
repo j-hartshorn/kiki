@@ -297,7 +297,6 @@ impl SessionMetadata {
 
 #[derive(Debug)]
 pub(crate) struct SessionRestore {
-    pub(crate) requested_entry: SessionEntryId,
     pub(crate) effective_entry: SessionEntryId,
     pub(crate) observed_active_entry: SessionEntryId,
     pub(crate) request_prefill: Option<String>,
@@ -1925,7 +1924,6 @@ fn load_session_restore_for_entry(
         },
         requested_entry_id,
         effective_entry_id,
-        observed_active_entry_id,
     ))
 }
 
@@ -2017,19 +2015,17 @@ fn session_catalogue_entry(
 #[cfg(test)]
 fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
     let active_entry_id = snapshot.active_entry_id;
-    restore_projection_at(snapshot, active_entry_id, active_entry_id, active_entry_id)
+    restore_projection_at(snapshot, active_entry_id, active_entry_id)
 }
 
 fn restore_projection_at(
     snapshot: RestoreSnapshot,
     requested_entry_id: i64,
     effective_entry_id: i64,
-    observed_active_entry_id: i64,
 ) -> SessionRestore {
-    let requested_entry = session_entry_id(requested_entry_id).unwrap_or(SessionEntryId(0));
     let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
     let observed_active_entry =
-        session_entry_id(observed_active_entry_id).unwrap_or(SessionEntryId(0));
+        session_entry_id(snapshot.active_entry_id).unwrap_or(SessionEntryId(0));
     let next_task = next_task_after(
         snapshot
             .tasks
@@ -2309,7 +2305,6 @@ fn restore_projection_at(
             history,
         });
     SessionRestore {
-        requested_entry,
         effective_entry,
         observed_active_entry,
         request_prefill,
@@ -3600,7 +3595,6 @@ mod tests {
             .await
             .expect("project first execution");
 
-        assert_eq!(restore.requested_entry, SessionEntryId(first_entry as u64));
         assert_eq!(restore.effective_entry, SessionEntryId(first_entry as u64));
         assert_eq!(
             restore.observed_active_entry,
@@ -4493,7 +4487,6 @@ mod tests {
         }
 
         let ordinary = session.restore().expect("restore saved active leaf");
-        assert_eq!(ordinary.requested_entry, SessionEntryId(final_entry as u64));
         assert_eq!(ordinary.effective_entry, SessionEntryId(final_entry as u64));
         assert_eq!(
             ordinary.observed_active_entry,
@@ -4516,10 +4509,6 @@ mod tests {
 
         set_active_entry(&session, request);
         let ordinary_request = session.restore().expect("restore saved request");
-        assert_eq!(
-            ordinary_request.requested_entry,
-            SessionEntryId(request as u64)
-        );
         assert_eq!(
             ordinary_request.effective_entry,
             SessionEntryId(request as u64)

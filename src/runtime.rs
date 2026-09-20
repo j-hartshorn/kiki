@@ -1085,7 +1085,6 @@ impl<M: Model> RuntimeController<M> {
             Ok(restore) => restore,
             Err(_) => return (NavigationOutcome::Failed, None),
         };
-        debug_assert_eq!(restore.requested_entry, entry);
         if restore.effective_entry == restore.observed_active_entry {
             return (
                 NavigationOutcome::Unchanged {
@@ -4263,7 +4262,6 @@ mod tests {
     }
 
     fn assert_restore_unchanged(before: &SessionRestore, after: &SessionRestore) {
-        assert_eq!(after.requested_entry, before.requested_entry);
         assert_eq!(after.effective_entry, before.effective_entry);
         assert_eq!(after.observed_active_entry, before.observed_active_entry);
         assert_eq!(after.request_prefill, before.request_prefill);
@@ -11659,7 +11657,6 @@ mod tests {
             Vec::new(),
         );
         let initial = restored_initial_state(&SessionRestore {
-            requested_entry: SessionEntryId(1),
             effective_entry: SessionEntryId(1),
             observed_active_entry: SessionEntryId(1),
             request_prefill: None,
@@ -14389,7 +14386,7 @@ mod tests {
             reopened
                 .restore()
                 .expect("restore persisted navigation")
-                .requested_entry,
+                .effective_entry,
             selected_after_submission
         );
         reopened.close().expect("close reopened session");
