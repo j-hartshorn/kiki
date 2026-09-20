@@ -14512,8 +14512,9 @@ mod tests {
             catalogue.entries[2].kind,
             crate::session::SessionCatalogueKind::Execution {
                 commentary: None,
-                ref tool_summaries,
-            } if tool_summaries.is_empty()
+                ref execution,
+                ..
+            } if execution.tool_calls.is_empty()
         ));
         assert!(matches!(
             &catalogue.entries[3].kind,
@@ -14527,8 +14528,9 @@ mod tests {
             catalogue.entries[5].kind,
             crate::session::SessionCatalogueKind::Execution {
                 commentary: None,
-                ref tool_summaries,
-            } if tool_summaries.is_empty()
+                ref execution,
+                ..
+            } if execution.tool_calls.is_empty()
         ));
         assert!(matches!(
             &catalogue.entries[6].kind,

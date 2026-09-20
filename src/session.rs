@@ -18,7 +18,7 @@ use thiserror::Error;
 use tokio::task;
 
 use crate::agent::TerminalEvidence;
-use crate::arena::{Checkpoint, Execution, ToolCallSummary};
+use crate::arena::{Checkpoint, Execution};
 use crate::config::{ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelHistory};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
@@ -240,8 +240,9 @@ pub(crate) enum SessionCatalogueKind {
         text: String,
     },
     Execution {
+        source: String,
         commentary: Option<String>,
-        tool_summaries: Vec<ToolCallSummary>,
+        execution: Box<Execution>,
     },
     Final {
         text: String,
@@ -1985,11 +1986,15 @@ fn session_catalogue_entry(
                 .to_owned(),
         },
         codec::DecodedEntryKind::Execution => {
-            let (commentary, tool_summaries) = codec::decoded_execution_catalogue(&decoded)
+            let (code, execution) = codec::decoded_readable_execution(&decoded)
                 .ok_or(SessionError::InvalidTransition)?;
+            if !matches!(&code.result, crate::model::CodeResult::Execution { .. }) {
+                return Err(SessionError::InvalidTransition);
+            }
             SessionCatalogueKind::Execution {
-                commentary: commentary.map(str::to_owned),
-                tool_summaries,
+                source: code.source,
+                commentary: code.commentary,
+                execution: Box::new(execution),
             }
         }
         codec::DecodedEntryKind::FinalReply => SessionCatalogueKind::Final {
@@ -2855,20 +2860,24 @@ mod tests {
         home.join(".kiki/sessions").join(format!("{id}.lock"))
     }
 
-    fn empty_observation() -> crate::arena::Observation {
+    fn observation(text: &str) -> crate::arena::Observation {
         crate::arena::Observation {
-            head: String::new(),
+            head: text.to_owned(),
             tail: None,
-            head_lines: 0,
+            head_lines: usize::from(!text.is_empty()),
             tail_lines: 0,
-            total_lines: 0,
-            total_bytes: 0,
+            total_lines: usize::from(!text.is_empty()),
+            total_bytes: text.len(),
             omitted_lines: 0,
             omitted_bytes: 0,
             head_ends_mid_line: false,
             tail_starts_mid_line: false,
             partial_lines: false,
         }
+    }
+
+    fn empty_observation() -> crate::arena::Observation {
+        observation("")
     }
 
     fn insert_entry(
@@ -3020,6 +3029,31 @@ mod tests {
         commentary: Option<&str>,
         tool_calls: Vec<ToolCall>,
     ) -> (u64, i64) {
+        settle_fixture_execution_with(
+            session,
+            writer,
+            run_id,
+            source,
+            commentary,
+            Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls,
+            },
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn settle_fixture_execution_with(
+        session: &Session,
+        writer: &super::SessionWriter,
+        run_id: u64,
+        source: &str,
+        commentary: Option<&str>,
+        execution: Execution,
+    ) -> (u64, i64) {
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -3034,12 +3068,7 @@ mod tests {
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
             },
-            execution: Some(Execution {
-                stdout: empty_observation(),
-                stderr: empty_observation(),
-                outcome: ExecutionOutcome::Complete { result: None },
-                tool_calls,
-            }),
+            execution: Some(execution),
             attempts: Vec::new(),
         };
         writer
@@ -4555,7 +4584,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn catalogue_contains_typed_entries_without_payload_internals() {
+    async fn catalogue_retains_complete_execution_for_tree_copy() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
         let session = create_session(&home, &workspace).await;
@@ -4567,13 +4596,13 @@ mod tests {
             .await
             .expect("commit request")
             .run_id;
-        let (_, execution) = settle_fixture_execution(
-            &session,
-            &writer,
-            final_run,
-            "catalogue_value = 1",
-            Some("catalogue commentary"),
-            vec![
+        let expected_execution = Execution {
+            stdout: observation("catalogue stdout"),
+            stderr: observation("catalogue stderr"),
+            outcome: ExecutionOutcome::Complete {
+                result: Some(observation("catalogue result")),
+            },
+            tool_calls: vec![
                 ToolCall {
                     tool: ToolName::Run,
                     summary: ToolCallSummary::Exit(7),
@@ -4587,6 +4616,14 @@ mod tests {
                     summary: ToolCallSummary::Signal,
                 },
             ],
+        };
+        let (_, execution) = settle_fixture_execution_with(
+            &session,
+            &writer,
+            final_run,
+            "catalogue_value = 1",
+            Some("catalogue commentary"),
+            expected_execution.clone(),
         )
         .await;
         let final_step = writer
@@ -4671,18 +4708,17 @@ mod tests {
             catalogue.entries[2].entry_id,
             SessionEntryId(execution as u64)
         );
-        assert!(matches!(
-            &catalogue.entries[2].kind,
-            super::SessionCatalogueKind::Execution {
-                commentary: Some(commentary),
-                tool_summaries,
-            } if commentary == "catalogue commentary"
-                && tool_summaries == &vec![
-                    ToolCallSummary::Exit(7),
-                    ToolCallSummary::Failed,
-                    ToolCallSummary::Signal,
-                ]
-        ));
+        let super::SessionCatalogueKind::Execution {
+            source,
+            commentary,
+            execution,
+        } = &catalogue.entries[2].kind
+        else {
+            panic!("expected execution entry");
+        };
+        assert_eq!(source, "catalogue_value = 1");
+        assert_eq!(commentary.as_deref(), Some("catalogue commentary"));
+        assert_eq!(execution.as_ref(), &expected_execution);
         assert!(matches!(
             &catalogue.entries[3].kind,
             super::SessionCatalogueKind::Final { text } if text == "catalogue final"

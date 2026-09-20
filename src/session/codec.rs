@@ -480,24 +480,6 @@ pub(super) fn decoded_request(entry: &DecodedEntry) -> Option<&str> {
     Some(request)
 }
 
-pub(super) fn decoded_execution_catalogue(
-    entry: &DecodedEntry,
-) -> Option<(Option<&str>, Vec<ToolCallSummary>)> {
-    let DecodedEntryPayload::Execution { code, execution } = &entry.0 else {
-        return None;
-    };
-    matches!(code.result, StoredCodeResult::Execution { .. }).then(|| {
-        (
-            code.commentary.as_deref(),
-            execution
-                .tool_calls
-                .iter()
-                .map(|call| decode_tool_call_summary(&call.summary))
-                .collect(),
-        )
-    })
-}
-
 pub(super) fn decoded_final_text(entry: &DecodedEntry) -> Option<&str> {
     let DecodedEntryPayload::Terminal {
         terminal: StoredTerminal::Final { text, .. },

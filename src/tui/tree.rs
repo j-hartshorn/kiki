@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
-use crate::transcript::normalise_terminal_text;
+use crate::transcript::{normalise_terminal_text, observation_text, tool_call_label};
 
 use super::picker::{
     DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, canonical_search,
@@ -511,11 +511,12 @@ impl SessionTree {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TreeNavigatorAction {
     None,
     Changed,
     Close,
+    Copy(String),
     Navigate(SessionEntryId),
 }
 
@@ -630,6 +631,13 @@ impl TreeNavigator {
             } else {
                 TreeNavigatorAction::None
             };
+        }
+        if matches!(key.code, KeyCode::Char('x' | 'X'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return self
+                .copy_focused()
+                .map_or(TreeNavigatorAction::None, TreeNavigatorAction::Copy);
         }
         if matches!(key.code, KeyCode::Char('s' | 'S'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -746,6 +754,14 @@ impl TreeNavigator {
         }
     }
 
+    fn copy_focused(&self) -> Option<String> {
+        let TreeNavigatorState::Ready { tree, picker } = &self.state else {
+            return None;
+        };
+        let entry = picker.focused_value()?;
+        Some(copy_text(&tree.nodes[tree.entry_indexes[&entry]].kind))
+    }
+
     fn picker(&self) -> &Picker<SessionEntryId> {
         match &self.state {
             TreeNavigatorState::Loading { picker } | TreeNavigatorState::Ready { picker, .. } => {
@@ -851,8 +867,14 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
         }
         SessionCatalogueKind::Execution {
             commentary,
-            tool_summaries,
-        } => append_execution_row(row, commentary.as_deref(), tool_summaries, content_style),
+            execution,
+            ..
+        } => append_execution_row(
+            row,
+            commentary.as_deref(),
+            &execution.tool_calls,
+            content_style,
+        ),
         SessionCatalogueKind::Final { text } => {
             row.push("Kiki:", colour_style(SUCCESS));
             append_preview(row, text, content_style);
@@ -873,26 +895,26 @@ fn append_preview(row: &mut StyledRow, text: &str, content_style: Style) {
 fn append_execution_row(
     row: &mut StyledRow,
     commentary: Option<&str>,
-    tool_summaries: &[crate::arena::ToolCallSummary],
+    tool_calls: &[crate::arena::ToolCall],
     content_style: Style,
 ) {
     let commentary = commentary
         .map(normalise_single_line)
         .filter(|text| !text.is_empty());
-    let failed = tool_summaries
+    let failed = tool_calls
         .iter()
-        .filter(|summary| matches!(summary, crate::arena::ToolCallSummary::Failed))
+        .filter(|call| matches!(call.summary, crate::arena::ToolCallSummary::Failed))
         .count();
-    let succeeded = tool_summaries.len().saturating_sub(failed);
+    let succeeded = tool_calls.len().saturating_sub(failed);
 
-    if tool_summaries.is_empty() && commentary.is_none() {
+    if tool_calls.is_empty() && commentary.is_none() {
         row.push("Python", colour_style(MUTED));
         return;
     }
     row.push("Python:", colour_style(MUTED));
-    if !tool_summaries.is_empty() {
+    if !tool_calls.is_empty() {
         row.push(" [tools: ", colour_style(DIM));
-        match (tool_summaries.len(), failed) {
+        match (tool_calls.len(), failed) {
             (total, 0) => row.push(&total.to_string(), colour_style(DIM)),
             (_, failed) if succeeded == 0 => {
                 row.push(&failed.to_string(), colour_style(DIM));
@@ -962,8 +984,9 @@ fn row_text(kind: &SessionCatalogueKind) -> String {
         SessionCatalogueKind::Request { text } => preview("User", text),
         SessionCatalogueKind::Execution {
             commentary,
-            tool_summaries,
-        } => execution_row(commentary.as_deref(), tool_summaries),
+            execution,
+            ..
+        } => execution_row(commentary.as_deref(), &execution.tool_calls),
         SessionCatalogueKind::Final { text } => preview("Kiki", text),
         SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
         SessionCatalogueKind::Failed => "Failed".to_owned(),
@@ -979,19 +1002,16 @@ fn preview(prefix: &str, text: &str) -> String {
     }
 }
 
-fn execution_row(
-    commentary: Option<&str>,
-    tool_summaries: &[crate::arena::ToolCallSummary],
-) -> String {
+fn execution_row(commentary: Option<&str>, tool_calls: &[crate::arena::ToolCall]) -> String {
     let commentary = commentary
         .map(normalise_single_line)
         .filter(|text| !text.is_empty());
-    let failed = tool_summaries
+    let failed = tool_calls
         .iter()
-        .filter(|summary| matches!(summary, crate::arena::ToolCallSummary::Failed))
+        .filter(|call| matches!(call.summary, crate::arena::ToolCallSummary::Failed))
         .count();
-    let succeeded = tool_summaries.len().saturating_sub(failed);
-    let prefix = match (tool_summaries.len(), failed) {
+    let succeeded = tool_calls.len().saturating_sub(failed);
+    let prefix = match (tool_calls.len(), failed) {
         (0, _) => "Python".to_owned(),
         (total, 0) => format!("Python: [tools: {total}]"),
         (_, failed) if succeeded == 0 => format!("Python: [tools: {failed}✗]"),
@@ -1002,6 +1022,62 @@ fn execution_row(
         Some(commentary) => format!("{prefix} {commentary}"),
         None => prefix,
     }
+}
+
+fn copy_text(kind: &SessionCatalogueKind) -> String {
+    match kind {
+        SessionCatalogueKind::Start => "Session start".to_owned(),
+        SessionCatalogueKind::Request { text } | SessionCatalogueKind::Final { text } => {
+            normalise_terminal_text(text)
+        }
+        SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
+        SessionCatalogueKind::Failed => "Failed".to_owned(),
+        SessionCatalogueKind::Execution {
+            source,
+            commentary,
+            execution,
+        } => {
+            let mut sections = Vec::new();
+            if let Some(commentary) = commentary.as_deref().filter(|text| !text.is_empty()) {
+                sections.push(copy_section("Commentary", commentary));
+            }
+            sections.push(copy_section("Python", source));
+            if !execution.tool_calls.is_empty() {
+                let tools = execution
+                    .tool_calls
+                    .iter()
+                    .cloned()
+                    .map(tool_call_label)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                sections.push(copy_section("Tools", &tools));
+            }
+            if execution.stdout.total_bytes > 0 {
+                sections.push(copy_section("Stdout", &observation_text(&execution.stdout)));
+            }
+            if execution.stderr.total_bytes > 0 {
+                sections.push(copy_section("Stderr", &observation_text(&execution.stderr)));
+            }
+            match &execution.outcome {
+                crate::arena::ExecutionOutcome::Complete {
+                    result: Some(result),
+                } => sections.push(copy_section("Result", &observation_text(result))),
+                crate::arena::ExecutionOutcome::Complete { result: None } => {}
+                crate::arena::ExecutionOutcome::PythonError(error) => {
+                    let mut text = error.text.clone();
+                    if error.omitted_bytes > 0 {
+                        text.push_str(&format!("\n[{} bytes omitted]", error.omitted_bytes));
+                    }
+                    sections.push(copy_section("Error", &text));
+                }
+            }
+            sections.join("\n\n")
+        }
+    }
+}
+
+fn copy_section(heading: &str, content: &str) -> String {
+    format!("{heading}:\n{}", normalise_terminal_text(content))
 }
 
 fn normalise_single_line(text: &str) -> String {
@@ -1024,7 +1100,9 @@ mod tests {
     use super::{
         PICKER_ROW_WIDTH, SessionTree, TreeNavigator, TreeNavigatorAction, TreeProjection,
     };
-    use crate::arena::ToolCallSummary;
+    use crate::arena::{
+        Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
+    };
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
     };
@@ -1054,10 +1132,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("Inspect credentials".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("Inspect credentials"), Vec::new()),
                     ),
                 ],
             )
@@ -1081,6 +1156,170 @@ mod tests {
     }
 
     #[test]
+    fn copy_formats_complete_entries_without_display_truncation() {
+        let omitted = Observation {
+            head: "first output".to_owned(),
+            tail: Some("last output".to_owned()),
+            head_lines: 1,
+            tail_lines: 1,
+            total_lines: 4,
+            total_bytes: 30,
+            omitted_lines: 2,
+            omitted_bytes: 9,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        };
+        let cases = vec![
+            (
+                detailed_execution(
+                    "print('first')\r\nprint('second')",
+                    Some("explain\nthis"),
+                    omitted,
+                    observation("diagnostic"),
+                    ExecutionOutcome::Complete {
+                        result: Some(observation("result value")),
+                    },
+                    vec![
+                        ToolCall {
+                            tool: ToolName::Run,
+                            summary: ToolCallSummary::Exit(7),
+                        },
+                        ToolCall {
+                            tool: ToolName::Read,
+                            summary: ToolCallSummary::Failed,
+                        },
+                        ToolCall {
+                            tool: ToolName::Write,
+                            summary: ToolCallSummary::Signal,
+                        },
+                    ],
+                ),
+                "Commentary:\nexplain\nthis\n\nPython:\nprint('first')\nprint('second')\n\nTools:\nrun · exit 7\nread · failed\nwrite · signal\n\nStdout:\nfirst output\n[2 lines, 9 bytes omitted]\nlast output\n\nStderr:\ndiagnostic\n\nResult:\nresult value",
+            ),
+            (
+                detailed_execution(
+                    "pass",
+                    None,
+                    observation(""),
+                    observation(""),
+                    ExecutionOutcome::Complete { result: None },
+                    Vec::new(),
+                ),
+                "Python:\npass",
+            ),
+            (
+                detailed_execution(
+                    "raise ValueError('bad')",
+                    None,
+                    observation(""),
+                    observation(""),
+                    ExecutionOutcome::PythonError(PythonError {
+                        text: "bad\tvalue\u{1b}".to_owned(),
+                        omitted_bytes: 5,
+                    }),
+                    Vec::new(),
+                ),
+                "Python:\nraise ValueError('bad')\n\nError:\nbad    value\\x1B\n[5 bytes omitted]",
+            ),
+            (request("first\r\nsecond\t\u{1b}"), "first\nsecond    \\x1B"),
+            (
+                SessionCatalogueKind::Final {
+                    text: "first\r\nsecond\u{9d}".to_owned(),
+                },
+                "first\nsecond\\x9D",
+            ),
+            (SessionCatalogueKind::Start, "Session start"),
+            (SessionCatalogueKind::Cancelled, "Cancelled"),
+            (SessionCatalogueKind::Failed, "Failed"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(
+                copy_action(kind),
+                TreeNavigatorAction::Copy(expected.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn copy_ignores_loading_and_no_match_trees() {
+        let mut loading = TreeNavigator::new(13, "");
+        assert_eq!(
+            loading.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::None
+        );
+
+        let mut no_match = TreeNavigator::new(14, "missing");
+        assert!(no_match.install_catalogue(
+            14,
+            &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
+        ));
+        assert_eq!(
+            no_match.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::None
+        );
+    }
+
+    #[test]
+    fn copy_preserves_ready_tree_view_state() {
+        let mut navigator = TreeNavigator::new(16, "needle");
+        assert!(navigator.install_catalogue(
+            16,
+            &catalogue(
+                4,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("needle request")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        execution(Some("needle execution"), Vec::new())
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "needle final".to_owned(),
+                        },
+                    ),
+                    entry(5, Some(1), 5, request("needle sibling")),
+                ],
+            )
+        ));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(2)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        let folded_rows = tree_rows(navigator.picker_mut());
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Copy("needle request".to_owned())
+        );
+        assert_eq!(navigator.picker().filter(), "needle");
+        assert_eq!(navigator.picker().focused_value(), Some(SessionEntryId(2)));
+        assert_eq!(tree_rows(navigator.picker_mut()), folded_rows);
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(
+            tree_rows(navigator.picker_mut())
+                .iter()
+                .all(|row| !row.contains("Python"))
+        );
+    }
+
+    #[test]
     fn conversation_mode_reparents_history_and_keeps_current_python() {
         let mut navigator = TreeNavigator::new(4, "");
         assert!(navigator.install_catalogue(
@@ -1094,10 +1333,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("omitted execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("omitted execution"), Vec::new()),
                     ),
                     entry(
                         4,
@@ -1111,10 +1347,7 @@ mod tests {
                         5,
                         Some(4),
                         5,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("current execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("current execution"), Vec::new()),
                     ),
                 ],
             )
@@ -1178,10 +1411,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("omitted branch point".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("omitted branch point"), Vec::new()),
                     ),
                     entry(
                         4,
@@ -1227,10 +1457,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("needle focused execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("needle focused execution"), Vec::new()),
                     ),
                     entry(
                         4,
@@ -1267,10 +1494,7 @@ mod tests {
                         2,
                         Some(1),
                         2,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("needle focused execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("needle focused execution"), Vec::new()),
                     ),
                     entry(
                         3,
@@ -1311,10 +1535,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("hidden execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("hidden execution"), Vec::new()),
                     ),
                     entry(
                         4,
@@ -1404,10 +1625,7 @@ mod tests {
                         3,
                         Some(2),
                         3,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("older execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("older execution"), Vec::new()),
                     ),
                     entry(
                         4,
@@ -1422,10 +1640,7 @@ mod tests {
                         6,
                         Some(5),
                         5,
-                        SessionCatalogueKind::Execution {
-                            commentary: Some("newer execution".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        execution(Some("newer execution"), Vec::new()),
                     ),
                     entry(
                         7,
@@ -1659,10 +1874,10 @@ mod tests {
                     3,
                     Some(1),
                     3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("alternative execution".to_owned()),
-                        tool_summaries: vec![ToolCallSummary::Count(1)],
-                    },
+                    execution(
+                        Some("alternative execution"),
+                        vec![ToolCallSummary::Count(1)],
+                    ),
                 ),
                 entry(
                     4,
@@ -1679,10 +1894,10 @@ mod tests {
                     8,
                     Some(7),
                     8,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("active execution".to_owned()),
-                        tool_summaries: vec![ToolCallSummary::Count(1), ToolCallSummary::Failed],
-                    },
+                    execution(
+                        Some("active execution"),
+                        vec![ToolCallSummary::Count(1), ToolCallSummary::Failed],
+                    ),
                 ),
                 entry(
                     9,
@@ -1902,10 +2117,7 @@ mod tests {
                     3,
                     Some(2),
                     3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("first execution".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
+                    execution(Some("first execution"), Vec::new()),
                 ),
                 entry(
                     4,
@@ -1947,10 +2159,7 @@ mod tests {
                     7,
                     Some(3),
                     7,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("second step".to_owned()),
-                        tool_summaries: vec![ToolCallSummary::Count(1)],
-                    },
+                    execution(Some("second step"), vec![ToolCallSummary::Count(1)]),
                 ),
                 entry(1, None, 1, SessionCatalogueKind::Start),
                 entry(
@@ -1961,15 +2170,7 @@ mod tests {
                         text: "first branch".to_owned(),
                     },
                 ),
-                entry(
-                    5,
-                    Some(4),
-                    5,
-                    SessionCatalogueKind::Execution {
-                        commentary: None,
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(5, Some(4), 5, execution(None, Vec::new())),
                 entry(
                     2,
                     Some(1),
@@ -1978,15 +2179,7 @@ mod tests {
                         text: "original".to_owned(),
                     },
                 ),
-                entry(
-                    3,
-                    Some(2),
-                    3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("first step".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(3, Some(2), 3, execution(Some("first step"), Vec::new())),
             ],
         ));
         let mut picker = tree.picker();
@@ -2046,15 +2239,7 @@ mod tests {
                         text: "same revision higher id".to_owned(),
                     },
                 ),
-                entry(
-                    5,
-                    Some(4),
-                    6,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("second".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(5, Some(4), 6, execution(Some("second"), Vec::new())),
                 entry(1, None, 1, SessionCatalogueKind::Start),
                 entry(
                     4,
@@ -2080,15 +2265,7 @@ mod tests {
                         text: "first".to_owned(),
                     },
                 ),
-                entry(
-                    3,
-                    Some(2),
-                    3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("first".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(3, Some(2), 3, execution(Some("first"), Vec::new())),
             ],
         ));
         let mut picker = tree.picker();
@@ -2121,40 +2298,21 @@ mod tests {
                         text: " request\n\ttext \u{001b}".to_owned(),
                     },
                 ),
-                entry(
-                    3,
-                    Some(1),
-                    3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some(" \n \t ".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(3, Some(1), 3, execution(Some(" \n \t "), Vec::new())),
                 entry(
                     4,
                     Some(1),
                     4,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("# comment\n only".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
+                    execution(Some("# comment\n only"), Vec::new()),
                 ),
-                entry(
-                    5,
-                    Some(1),
-                    5,
-                    SessionCatalogueKind::Execution {
-                        commentary: None,
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(5, Some(1), 5, execution(None, Vec::new())),
                 entry(
                     6,
                     Some(1),
                     6,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("all passed".to_owned()),
-                        tool_summaries: vec![
+                    execution(
+                        Some("all passed"),
+                        vec![
                             ToolCallSummary::Pending,
                             ToolCallSummary::Exit(0),
                             ToolCallSummary::Exit(7),
@@ -2165,29 +2323,26 @@ mod tests {
                             ToolCallSummary::Applied,
                             ToolCallSummary::Subagent("00".to_owned()),
                         ],
-                    },
+                    ),
                 ),
                 entry(
                     7,
                     Some(1),
                     7,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("mixed".to_owned()),
-                        tool_summaries: vec![
+                    execution(
+                        Some("mixed"),
+                        vec![
                             ToolCallSummary::Exit(7),
                             ToolCallSummary::Signal,
                             ToolCallSummary::Failed,
                         ],
-                    },
+                    ),
                 ),
                 entry(
                     8,
                     Some(1),
                     8,
-                    SessionCatalogueKind::Execution {
-                        commentary: None,
-                        tool_summaries: vec![ToolCallSummary::Failed, ToolCallSummary::Failed],
-                    },
+                    execution(None, vec![ToolCallSummary::Failed, ToolCallSummary::Failed]),
                 ),
                 entry(
                     9,
@@ -2344,15 +2499,7 @@ mod tests {
                         text: "needle target".to_owned(),
                     },
                 ),
-                entry(
-                    3,
-                    Some(2),
-                    3,
-                    SessionCatalogueKind::Execution {
-                        commentary: Some("context".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
-                ),
+                entry(3, Some(2), 3, execution(Some("context"), Vec::new())),
                 entry(
                     2,
                     Some(1),
@@ -2582,10 +2729,7 @@ mod tests {
                 entry_id,
                 Some(parent),
                 entry_id,
-                SessionCatalogueKind::Execution {
-                    commentary: None,
-                    tool_summaries: Vec::new(),
-                },
+                execution(None, Vec::new()),
             ));
             parent = entry_id;
         }
@@ -2605,6 +2749,92 @@ mod tests {
     fn request(text: &str) -> SessionCatalogueKind {
         SessionCatalogueKind::Request {
             text: text.to_owned(),
+        }
+    }
+
+    fn copy_action(kind: SessionCatalogueKind) -> TreeNavigatorAction {
+        let active_entry = if matches!(&kind, SessionCatalogueKind::Start) {
+            1
+        } else {
+            2
+        };
+        let mut entries = vec![entry(1, None, 1, SessionCatalogueKind::Start)];
+        if active_entry == 2 {
+            entries.push(entry(2, Some(1), 2, kind));
+        }
+        let mut navigator = TreeNavigator::new(15, "");
+        assert!(navigator.install_catalogue(15, &catalogue(active_entry, entries)));
+        navigator.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+    }
+
+    fn detailed_execution(
+        source: &str,
+        commentary: Option<&str>,
+        stdout: Observation,
+        stderr: Observation,
+        outcome: ExecutionOutcome,
+        tool_calls: Vec<ToolCall>,
+    ) -> SessionCatalogueKind {
+        SessionCatalogueKind::Execution {
+            source: source.to_owned(),
+            commentary: commentary.map(str::to_owned),
+            execution: Box::new(Execution {
+                stdout,
+                stderr,
+                outcome,
+                tool_calls,
+            }),
+        }
+    }
+
+    fn observation(text: &str) -> Observation {
+        Observation {
+            head: text.to_owned(),
+            tail: None,
+            head_lines: usize::from(!text.is_empty()),
+            tail_lines: 0,
+            total_lines: usize::from(!text.is_empty()),
+            total_bytes: text.len(),
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        }
+    }
+
+    fn execution(
+        commentary: Option<&str>,
+        tool_summaries: Vec<ToolCallSummary>,
+    ) -> SessionCatalogueKind {
+        let observation = Observation {
+            head: String::new(),
+            tail: None,
+            head_lines: 0,
+            tail_lines: 0,
+            total_lines: 0,
+            total_bytes: 0,
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        };
+        SessionCatalogueKind::Execution {
+            source: String::new(),
+            commentary: commentary.map(str::to_owned),
+            execution: Box::new(Execution {
+                stdout: observation.clone(),
+                stderr: observation,
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: tool_summaries
+                    .into_iter()
+                    .map(|summary| ToolCall {
+                        tool: ToolName::Read,
+                        summary,
+                    })
+                    .collect(),
+            }),
         }
     }
 

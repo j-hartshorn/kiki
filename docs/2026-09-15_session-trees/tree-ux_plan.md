@@ -217,7 +217,7 @@ Expose transcript tool-label and observation formatting narrowly for reuse. `App
 
 **Tests** (`src/session.rs`, catalogue projection; `src/tui/tree.rs`, navigator copy; `src/tui.rs`, clipboard composition) — First red: `session::tests::catalogue_retains_complete_execution_for_tree_copy`. Session coverage proves one decoded `Execution`; existing codec tests continue to own round-trip detail. Tree table tests cover exact section order, absent sections, mixed tools, omissions, Python error, multiline User/Kiki and terminal controls. TUI adds only clipboard success/failure while the tree remains open.
 
-**Files** — Modify: `src/session.rs`, `src/session/codec.rs`, `src/transcript.rs`, `src/tui.rs`, `src/tui/tree.rs`.
+**Files** — Modify: `src/session.rs`, `src/session/codec.rs`, `src/transcript.rs`, `src/tui.rs`, `src/tui/tree.rs`, `src/runtime.rs` (test-only).
 
 **Verification** —
 

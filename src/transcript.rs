@@ -465,7 +465,7 @@ fn tool_call_text(
     })
 }
 
-fn tool_call_label(call: ToolCall) -> String {
+pub(crate) fn tool_call_label(call: ToolCall) -> String {
     if let ToolCallSummary::Subagent(id) = call.summary {
         let label = match call.tool {
             ToolName::StartSubagent => "Spawned",
@@ -3909,7 +3909,7 @@ fn format_usd(nanodollars: u128) -> String {
     format!("${dollars}.{}", fractional.trim_end_matches('0'))
 }
 
-fn observation_text(observation: &Observation) -> String {
+pub(crate) fn observation_text(observation: &Observation) -> String {
     let mut text = observation.head.clone();
     if let Some(tail) = &observation.tail {
         text.push_str(&format!(

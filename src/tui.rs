@@ -709,6 +709,14 @@ impl App {
                     quit: false,
                 }
             }
+            TreeNavigatorAction::Copy(text) => {
+                self.pending_copy_text = Some(text);
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
             TreeNavigatorAction::Navigate(entry) => {
                 self.tree_navigator = None;
                 self.manual_navigation_pending = true;
@@ -2544,6 +2552,19 @@ mod tests {
         app
     }
 
+    fn tree_execution(commentary: &str) -> SessionCatalogueKind {
+        SessionCatalogueKind::Execution {
+            source: "pass".to_owned(),
+            commentary: Some(commentary.to_owned()),
+            execution: Box::new(Execution {
+                stdout: observation(""),
+                stderr: observation(""),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+            }),
+        }
+    }
+
     fn session_tree_catalogue() -> SessionCatalogue {
         SessionCatalogue {
             active_entry: SessionEntryId(3),
@@ -2566,10 +2587,7 @@ mod tests {
                     entry_id: SessionEntryId(3),
                     parent_id: Some(SessionEntryId(2)),
                     revision: 3,
-                    kind: SessionCatalogueKind::Execution {
-                        commentary: Some("inspect credentials".to_owned()),
-                        tool_summaries: Vec::new(),
-                    },
+                    kind: tree_execution("inspect credentials"),
                 },
             ],
         }
@@ -4219,6 +4237,50 @@ mod tests {
     }
 
     #[test]
+    fn successful_copy_from_tree_keeps_tree_open() {
+        let now = Instant::now();
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(app.tree_navigator.is_some());
+        let mut clipboard = FakeClipboard::available();
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(
+            clipboard.writes,
+            ["Commentary:\ninspect credentials\n\nPython:\npass"]
+        );
+        assert_eq!(app.notice(), Some("Copied"));
+        assert!(app.flash.is_some());
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
+    fn failed_copy_from_tree_keeps_tree_open() {
+        let now = Instant::now();
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        let mut clipboard = FakeClipboard {
+            writes: Vec::new(),
+            result: Err(ClipboardError),
+        };
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(app.notice(), Some("Copy failed"));
+        assert!(app.flash.is_none());
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
     fn tree_picker_ctrl_u_reaches_the_navigator_before_prompt_controls() {
         let mut app = app_with_prompt("preserved draft");
         let revision = tree_request(&mut app, "");
@@ -4245,10 +4307,7 @@ mod tests {
                         entry_id: SessionEntryId(3),
                         parent_id: Some(SessionEntryId(2)),
                         revision: 3,
-                        kind: SessionCatalogueKind::Execution {
-                            commentary: Some("omitted Python".to_owned()),
-                            tool_summaries: Vec::new(),
-                        },
+                        kind: tree_execution("omitted Python"),
                     },
                     SessionCatalogueEntry {
                         entry_id: SessionEntryId(4),
