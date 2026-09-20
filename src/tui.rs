@@ -52,7 +52,7 @@ rattles::rattle!(
     GenerationThrobber,
     generation_throbber,
     4,
-    80,
+    50,
     [
         "⠁   ", "⠈   ", " ⠁  ", " ⠈  ", "  ⠁ ", "  ⠈ ", "   ⠁", "   ⠈", "   ⠐", "   ⠠", "   ⢀",
         "   ⡀", "  ⢀ ", "  ⡀ ", " ⢀  ", " ⡀  ", "⢀   ", "⡀   ", "⠄   ", "⠂   "
@@ -7355,9 +7355,9 @@ mod tests {
                 .is_some_and(|row| row.starts_with(" ⠁   "))
         );
 
-        assert!(!app.tick(now + Duration::from_millis(79)).visible_changed);
-        assert!(app.tick(now + Duration::from_millis(80)).visible_changed);
-        let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(80));
+        assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
+        assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
+        let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
         assert!(
             advanced
                 .lines()
@@ -7371,12 +7371,12 @@ mod tests {
                 step_id: ModelStepId(1),
                 commentary: None,
             },
-            now + Duration::from_millis(80),
+            now + Duration::from_millis(50),
         );
-        let executing = rendered_at(&mut app, 20, 12, now + Duration::from_millis(80));
+        let executing = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
         assert!(!executing.contains('⠈'));
         assert_eq!(app.history_height, 8);
-        assert!(!app.tick(now + Duration::from_millis(160)).visible_changed);
+        assert!(!app.tick(now + Duration::from_millis(100)).visible_changed);
     }
 
     #[test]
