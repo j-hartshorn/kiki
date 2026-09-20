@@ -47,6 +47,9 @@ use tree::{TreeNavigator, TreeNavigatorAction};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
 const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
+const TREE_BUSY_NOTICE: &str = "Session tree is unavailable while work is active.";
+const TREE_READ_ONLY_NOTICE: &str = "Session tree is unavailable while the session is read-only.";
+const SESSION_RESTORE_FAILED_NOTICE: &str = "Session could not be restored.";
 
 trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -1408,7 +1411,7 @@ impl App {
                     return false;
                 }
                 self.tree_navigator = None;
-                self.set_notice("Session tree is unavailable while work is active.".to_owned());
+                self.set_notice(TREE_BUSY_NOTICE.to_owned());
                 true
             }
             TreeRequestOutcome::RejectedReadOnly => {
@@ -1416,9 +1419,7 @@ impl App {
                     return false;
                 }
                 self.tree_navigator = None;
-                self.set_notice(
-                    "Session tree is unavailable while the session is read-only.".to_owned(),
-                );
+                self.set_notice(TREE_READ_ONLY_NOTICE.to_owned());
                 true
             }
             TreeRequestOutcome::Failed => {
@@ -1426,7 +1427,7 @@ impl App {
                     return false;
                 }
                 self.tree_navigator = None;
-                self.set_notice("Session could not be restored.".to_owned());
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
                 true
             }
         }
@@ -1450,7 +1451,7 @@ impl App {
                 true
             }
             CorrectionOutcome::Failed => {
-                self.set_notice("Session could not be restored.".to_owned());
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
                 true
             }
         };
@@ -1472,17 +1473,15 @@ impl App {
                 notice_cleared | self.apply_request_prefill(request_prefill)
             }
             NavigationOutcome::RejectedBusy => {
-                self.set_notice("Session tree is unavailable while work is active.".to_owned());
+                self.set_notice(TREE_BUSY_NOTICE.to_owned());
                 true
             }
             NavigationOutcome::RejectedReadOnly => {
-                self.set_notice(
-                    "Session tree is unavailable while the session is read-only.".to_owned(),
-                );
+                self.set_notice(TREE_READ_ONLY_NOTICE.to_owned());
                 true
             }
             NavigationOutcome::Failed => {
-                self.set_notice("Session could not be restored.".to_owned());
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
                 true
             }
         }
