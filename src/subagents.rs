@@ -2739,6 +2739,9 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         if let Some(record) = terminal {
             self.publish_event(CoordinatorEvent::Finished { record });
         }
+        if let Some(id) = &settled {
+            self.publish_event(CoordinatorEvent::OperationSettled { id: id.clone() });
+        }
         #[cfg(test)]
         let terminal_settlement_test_gate = self.terminal_settlement_test_gate.clone();
         #[cfg(test)]
@@ -2747,15 +2750,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         {
             gate.wait_after_terminal_settlement().await;
         }
-        let publication = self.publication.clone();
         drop(self);
         drop(operation);
         #[cfg(test)]
         if let Some(gate) = terminal_settlement_test_gate {
             gate.operation_dropped();
-        }
-        if let Some(id) = settled {
-            publish_publication_event(&publication, CoordinatorEvent::OperationSettled { id });
         }
     }
 
@@ -4488,7 +4487,7 @@ mod tests {
             event,
             CoordinatorEvent::Finished { record } if record.id() == task.id()
         )));
-        assert!(!drained.iter().any(|event| matches!(
+        assert!(drained.iter().any(|event| matches!(
             event,
             CoordinatorEvent::OperationSettled { id } if id == task.id()
         )));
@@ -4497,10 +4496,7 @@ mod tests {
         gate.allow_operation_drop();
         gate.wait_until_operation_dropped().await;
         assert_eq!(coordinator.operation_count(), 0);
-        assert!(matches!(
-            events.recv().await,
-            Some(CoordinatorEvent::OperationSettled { ref id }) if id == task.id()
-        ));
+        assert!(events.try_recv().is_err());
         assert!(coordinator.replace_selected_origins([]).await);
     }
 
