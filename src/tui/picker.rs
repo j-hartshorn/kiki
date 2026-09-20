@@ -32,6 +32,7 @@ pub(crate) enum DynamicPickerRole {
 
 pub(crate) struct DynamicPickerItem<T> {
     pub(crate) row: Line<'static>,
+    pub(crate) focused_row: Option<Line<'static>>,
     pub(crate) role: DynamicPickerRole,
     pub(crate) value: T,
 }
@@ -44,6 +45,7 @@ enum PickerRowRole {
 struct PickerRow<T> {
     group: Option<&'static str>,
     row: Line<'static>,
+    focused_row: Option<Line<'static>>,
     role: PickerRowRole,
     value: T,
 }
@@ -254,10 +256,15 @@ impl<T: Copy + Eq> Picker<T> {
                     lines.push(Line::raw(item.group.expect("group was checked")));
                     last_group = item.group;
                 }
-                let mut row = item.row.clone();
-                if focus == Some(index) {
-                    row.style = row.style.add_modifier(Modifier::REVERSED);
-                }
+                let row = if focus == Some(index) {
+                    item.focused_row.clone().unwrap_or_else(|| {
+                        let mut row = item.row.clone();
+                        row.style = row.style.add_modifier(Modifier::REVERSED);
+                        row
+                    })
+                } else {
+                    item.row.clone()
+                };
                 lines.push(row);
             }
         }
@@ -417,6 +424,7 @@ impl<T> From<PickerItem<T>> for PickerRow<T> {
         Self {
             group: Some(item.group),
             row: Line::raw(item.label),
+            focused_row: None,
             role: PickerRowRole::SearchableLabel(canonical_search(item.label)),
             value: item.value,
         }
@@ -428,6 +436,7 @@ impl<T> From<DynamicPickerItem<T>> for PickerRow<T> {
         Self {
             group: None,
             row: item.row,
+            focused_row: item.focused_row,
             role: PickerRowRole::Dynamic(item.role),
             value: item.value,
         }
@@ -499,6 +508,7 @@ mod tests {
     ) -> DynamicPickerItem<&'static str> {
         DynamicPickerItem {
             row: Line::raw(label.to_owned()),
+            focused_row: None,
             role,
             value,
         }
@@ -556,6 +566,7 @@ mod tests {
                         Span::styled("Session γ".to_owned(), normal),
                         Span::styled(" α".to_owned(), accent),
                     ]),
+                    focused_row: None,
                     role: DynamicPickerRole::Context,
                     value: "start",
                 },
@@ -564,6 +575,7 @@ mod tests {
                         Span::styled("└─ ".to_owned(), muted),
                         Span::styled("Python needle".to_owned(), normal),
                     ]),
+                    focused_row: None,
                     role: DynamicPickerRole::Direct,
                     value: "step",
                 },
@@ -572,6 +584,7 @@ mod tests {
                         Span::styled("└─ ".to_owned(), muted),
                         Span::styled("Reply".to_owned(), normal),
                     ]),
+                    focused_row: None,
                     role: DynamicPickerRole::Context,
                     value: "tail",
                 },
@@ -604,6 +617,49 @@ mod tests {
         assert_eq!(buffer[(next_row_column, next_row)].fg, Color::White);
         assert!(
             !buffer[(next_row_column, next_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn focused_dynamic_rows_use_caller_variant_while_static_rows_remain_reversed() {
+        let accent = Style::new().fg(Color::Cyan);
+        let text = Style::new().fg(Color::White);
+        let selected = Color::Rgb(58, 58, 74);
+        let mut dynamic = Picker::new_dynamic(
+            "Session tree",
+            "No matching session entries",
+            [DynamicPickerItem {
+                row: Line::from(vec![Span::styled("  ", text), Span::styled("Python", text)]),
+                focused_row: Some(Line::from(vec![
+                    Span::styled("› ", accent.bg(selected)),
+                    Span::styled("Python", text.bg(selected)),
+                ])),
+                role: DynamicPickerRole::Direct,
+                value: "python",
+            }],
+            "python",
+        );
+
+        let dynamic_buffer = rendered_buffer(&mut dynamic, 60, 10);
+        let (gutter_column, gutter_row) = cell_with_symbol(&dynamic_buffer, "›");
+        let (python_column, python_row) = cell_start(&dynamic_buffer, "Python");
+        assert_eq!(dynamic_buffer[(gutter_column, gutter_row)].fg, Color::Cyan);
+        assert_eq!(dynamic_buffer[(gutter_column, gutter_row)].bg, selected);
+        assert_eq!(dynamic_buffer[(python_column, python_row)].fg, Color::White);
+        assert_eq!(dynamic_buffer[(python_column, python_row)].bg, selected);
+        assert!(
+            !dynamic_buffer[(python_column, python_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        let mut static_picker = picker("sol");
+        let static_buffer = rendered_buffer(&mut static_picker, 60, 10);
+        let (static_column, static_row) = cell_start(&static_buffer, "openai/gpt-5.6-sol");
+        assert!(
+            static_buffer[(static_column, static_row)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -647,16 +703,19 @@ mod tests {
             [
                 DynamicPickerItem {
                     row: Line::raw("First"),
+                    focused_row: None,
                     role: DynamicPickerRole::Direct,
                     value: "first",
                 },
                 DynamicPickerItem {
                     row: Line::raw("Loading…"),
+                    focused_row: None,
                     role: DynamicPickerRole::Context,
                     value: "loading",
                 },
                 DynamicPickerItem {
                     row: Line::raw("Last"),
+                    focused_row: None,
                     role: DynamicPickerRole::Direct,
                     value: "last",
                 },
@@ -704,6 +763,7 @@ mod tests {
             "No matching items",
             [DynamicPickerItem {
                 row: Line::raw("Loading…"),
+                focused_row: None,
                 role: DynamicPickerRole::Context,
                 value: "loading",
             }],

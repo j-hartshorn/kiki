@@ -4,11 +4,11 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
-use crate::transcript::{muted_page_style, normalise_terminal_text, page_style, truncate_end};
+use crate::transcript::normalise_terminal_text;
 
 use super::picker::{
     DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, canonical_search,
@@ -19,9 +19,18 @@ const PICKER_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const INITIAL_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const LOADING_ENTRY: SessionEntryId = SessionEntryId(0);
 
+const TEXT: Color = Color::Rgb(212, 212, 212);
+const ACCENT: Color = Color::Rgb(138, 190, 183);
+const SUCCESS: Color = Color::Rgb(181, 189, 104);
+const ERROR: Color = Color::Rgb(204, 102, 102);
+const WARNING: Color = Color::Rgb(255, 255, 0);
+const MUTED: Color = Color::Rgb(128, 128, 128);
+const DIM: Color = Color::Rgb(102, 102, 102);
+const SELECTED_BACKGROUND: Color = Color::Rgb(58, 58, 74);
+
 struct TreeNode {
     entry: SessionEntryId,
-    search_text: String,
+    kind: SessionCatalogueKind,
     canonical_search_text: String,
     is_execution: bool,
     active_path: bool,
@@ -248,7 +257,7 @@ impl SessionTree {
                 let canonical_search_text = canonical_search(&search_text);
                 TreeNode {
                     entry: entry.entry_id,
-                    search_text,
+                    kind: entry.kind.clone(),
                     canonical_search_text,
                     is_execution: matches!(&entry.kind, SessionCatalogueKind::Execution { .. }),
                     active_path: false,
@@ -406,7 +415,7 @@ impl SessionTree {
                 ProjectionStep::Exit(length) => connectors.truncate(length),
                 ProjectionStep::Enter(index) => {
                     let connector_length = connectors.len();
-                    let text = self.row_text(
+                    let (row, focused_row) = self.row(
                         index,
                         &displayed,
                         projection,
@@ -418,7 +427,8 @@ impl SessionTree {
                         connectors.push(!displayed.last_visible[index]);
                     }
                     items.push(DynamicPickerItem {
-                        row: Line::styled(text, self.style(index)),
+                        row,
+                        focused_row: Some(focused_row),
                         role: if projection.direct_matches[index] {
                             DynamicPickerRole::Direct
                         } else {
@@ -440,7 +450,7 @@ impl SessionTree {
         items
     }
 
-    fn row_text(
+    fn row(
         &self,
         index: usize,
         projection: &TreeProjection<'_>,
@@ -448,28 +458,21 @@ impl SessionTree {
         folded_heads: &BTreeSet<SessionEntryId>,
         connectors: &[bool],
         row_width: usize,
-    ) -> String {
-        if row_width == 0 {
-            return String::new();
-        }
+    ) -> (Line<'static>, Line<'static>) {
+        let active = self.nodes[index].active_path;
+        let connector_style = colour_style(if active { ACCENT } else { DIM });
+        let content_style = colour_style(if active { TEXT } else { MUTED });
+        let mut body = StyledRow::new(row_width.saturating_sub(2));
 
-        let mut text = String::with_capacity(row_width.saturating_add(3));
-        let mut display_width = 0;
         for &continues in connectors {
-            if let Some(text) = append_until_truncated(
-                &mut text,
-                &mut display_width,
-                if continues { "│  " } else { "   " },
-                row_width,
-            ) {
-                return text;
+            body.push(if continues { "│  " } else { "   " }, connector_style);
+            if body.is_truncated() {
+                return row_variants(body.into_spans(), row_width);
             }
         }
         let folded = folded_heads.contains(&self.nodes[index].entry);
-        if self.draws_joint(index, projection.topology)
-            && let Some(text) = append_until_truncated(
-                &mut text,
-                &mut display_width,
+        if self.draws_joint(index, projection.topology) {
+            body.push(
                 match (
                     projection.last_visible[index],
                     pre_fold.is_foldable(index),
@@ -482,31 +485,22 @@ impl SessionTree {
                     (true, false, false) => "└─ ",
                     (false, false, false) => "├─ ",
                 },
-                row_width,
-            )
-        {
-            return text;
+                connector_style,
+            );
+        } else if projection.topology.parents[index].is_none() && folded {
+            body.push("⊞ ", connector_style);
         }
-        if projection.topology.parents[index].is_none()
-            && folded
-            && let Some(text) =
-                append_until_truncated(&mut text, &mut display_width, "⊞ ", row_width)
-        {
-            return text;
+        if !body.is_truncated() {
+            if index == self.active_index {
+                body.push("● ", colour_style(ACCENT));
+            } else if active {
+                body.push("• ", colour_style(ACCENT));
+            }
         }
-        if index == self.active_index
-            && let Some(text) =
-                append_until_truncated(&mut text, &mut display_width, "● ", row_width)
-        {
-            return text;
+        if !body.is_truncated() {
+            append_kind_row(&mut body, &self.nodes[index].kind, content_style);
         }
-        append_until_truncated(
-            &mut text,
-            &mut display_width,
-            &self.nodes[index].search_text,
-            row_width,
-        )
-        .unwrap_or(text)
+        row_variants(body.into_spans(), row_width)
     }
 
     fn draws_joint(&self, index: usize, topology: &TreeTopology) -> bool {
@@ -514,17 +508,6 @@ impl SessionTree {
             return false;
         };
         topology.parents[parent].is_none() || topology.children[parent].len() > 1
-    }
-
-    fn style(&self, index: usize) -> Style {
-        let node = &self.nodes[index];
-        if index == self.active_index {
-            page_style()
-        } else if node.active_path {
-            page_style().fg(Color::Cyan)
-        } else {
-            muted_page_style()
-        }
     }
 }
 
@@ -556,11 +539,17 @@ enum TreeNavigatorState {
 
 impl TreeNavigator {
     pub(crate) fn new(revision: u64, query: &str) -> Self {
+        let loading_row = row_variants(
+            vec![Span::styled("Loading…", colour_style(TEXT))],
+            INITIAL_ROW_WIDTH,
+        )
+        .0;
         let mut picker = Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
             [DynamicPickerItem {
-                row: Line::raw("Loading…"),
+                row: loading_row,
+                focused_row: None,
                 role: DynamicPickerRole::Context,
                 value: LOADING_ENTRY,
             }],
@@ -774,20 +763,159 @@ impl TreeNavigator {
     }
 }
 
-fn append_until_truncated(
-    text: &mut String,
-    display_width: &mut usize,
-    content: &str,
-    row_width: usize,
-) -> Option<String> {
-    for grapheme in content.graphemes(true) {
-        text.push_str(grapheme);
-        *display_width = display_width.saturating_add(Line::raw(grapheme).width());
-        if *display_width > row_width {
-            return Some(truncate_end(text, row_width));
+struct StyledRow {
+    spans: Vec<Span<'static>>,
+    width: usize,
+    max_width: usize,
+    truncated: bool,
+}
+
+impl StyledRow {
+    fn new(max_width: usize) -> Self {
+        Self {
+            spans: Vec::new(),
+            width: 0,
+            max_width,
+            truncated: false,
         }
     }
-    None
+
+    fn push(&mut self, content: &str, style: Style) {
+        if self.truncated || content.is_empty() {
+            return;
+        }
+        if self.max_width == 0 {
+            self.truncated = true;
+            return;
+        }
+        for grapheme in content.graphemes(true) {
+            let grapheme_width = Line::raw(grapheme).width();
+            if self.width >= self.max_width
+                || self.width.saturating_add(grapheme_width) > self.max_width
+            {
+                self.ellipsis(style);
+                self.truncated = true;
+                return;
+            }
+            self.spans.push(Span::styled(grapheme.to_owned(), style));
+            self.width = self.width.saturating_add(grapheme_width);
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn into_spans(self) -> Vec<Span<'static>> {
+        self.spans
+    }
+
+    fn ellipsis(&mut self, style: Style) {
+        while self.width >= self.max_width {
+            let span = self.spans.pop().expect("visible row has a span");
+            self.width = self.width.saturating_sub(Line::raw(span.content).width());
+        }
+        self.spans.push(Span::styled("…", style));
+        self.width += 1;
+    }
+}
+
+fn row_variants(body: Vec<Span<'static>>, row_width: usize) -> (Line<'static>, Line<'static>) {
+    let normal_gutter = match row_width {
+        0 => "",
+        1 => " ",
+        _ => "  ",
+    };
+    let focused_gutter = match row_width {
+        0 => "",
+        1 => "›",
+        _ => "› ",
+    };
+    let mut normal = vec![Span::styled(normal_gutter, colour_style(TEXT))];
+    normal.extend(body.iter().cloned());
+    let mut focused = vec![Span::styled(focused_gutter, colour_style(ACCENT))];
+    focused.extend(body);
+    let mut focused = Line::from(focused);
+    for span in &mut focused.spans {
+        span.style = span.style.bg(SELECTED_BACKGROUND);
+    }
+    (Line::from(normal), focused)
+}
+
+fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_style: Style) {
+    match kind {
+        SessionCatalogueKind::Start => row.push("Session start", content_style),
+        SessionCatalogueKind::Request { text } => {
+            row.push("User:", colour_style(ACCENT));
+            append_preview(row, text, content_style);
+        }
+        SessionCatalogueKind::Execution {
+            commentary,
+            tool_summaries,
+        } => append_execution_row(row, commentary.as_deref(), tool_summaries, content_style),
+        SessionCatalogueKind::Final { text } => {
+            row.push("Kiki:", colour_style(SUCCESS));
+            append_preview(row, text, content_style);
+        }
+        SessionCatalogueKind::Cancelled => row.push("Cancelled", colour_style(WARNING)),
+        SessionCatalogueKind::Failed => row.push("Failed", colour_style(ERROR)),
+    }
+}
+
+fn append_preview(row: &mut StyledRow, text: &str, content_style: Style) {
+    let text = normalise_single_line(text);
+    if !text.is_empty() {
+        row.push(" ", content_style);
+        row.push(&text, content_style);
+    }
+}
+
+fn append_execution_row(
+    row: &mut StyledRow,
+    commentary: Option<&str>,
+    tool_summaries: &[crate::arena::ToolCallSummary],
+    content_style: Style,
+) {
+    let commentary = commentary
+        .map(normalise_single_line)
+        .filter(|text| !text.is_empty());
+    let failed = tool_summaries
+        .iter()
+        .filter(|summary| matches!(summary, crate::arena::ToolCallSummary::Failed))
+        .count();
+    let succeeded = tool_summaries.len().saturating_sub(failed);
+
+    if tool_summaries.is_empty() && commentary.is_none() {
+        row.push("Python", colour_style(MUTED));
+        return;
+    }
+    row.push("Python:", colour_style(MUTED));
+    if !tool_summaries.is_empty() {
+        row.push(" [tools: ", colour_style(DIM));
+        match (tool_summaries.len(), failed) {
+            (total, 0) => row.push(&total.to_string(), colour_style(DIM)),
+            (_, failed) if succeeded == 0 => {
+                row.push(&failed.to_string(), colour_style(DIM));
+                row.push("✗", colour_style(ERROR));
+            }
+            (_, failed) => {
+                row.push(&succeeded.to_string(), colour_style(DIM));
+                row.push("✓", colour_style(SUCCESS));
+                row.push(" ", colour_style(DIM));
+                row.push(&failed.to_string(), colour_style(DIM));
+                row.push("✗", colour_style(ERROR));
+            }
+        }
+        row.push("]", colour_style(DIM));
+    }
+    if let Some(commentary) = commentary {
+        row.push(" ", content_style);
+        row.push(&commentary, content_style);
+    }
+}
+
+fn colour_style(colour: Color) -> Style {
+    Style::new().fg(colour)
 }
 
 fn subtree_latest_revisions(topology: &TreeTopology, catalogue: &SessionCatalogue) -> Vec<u64> {
@@ -1521,6 +1649,219 @@ mod tests {
     }
 
     #[test]
+    fn semantic_rows_preserve_colours_under_subtle_selection() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            11,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("alternative request")),
+                entry(
+                    3,
+                    Some(1),
+                    3,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("alternative execution".to_owned()),
+                        tool_summaries: vec![ToolCallSummary::Count(1)],
+                    },
+                ),
+                entry(
+                    4,
+                    Some(1),
+                    4,
+                    SessionCatalogueKind::Final {
+                        text: "alternative final".to_owned(),
+                    },
+                ),
+                entry(5, Some(1), 5, SessionCatalogueKind::Cancelled),
+                entry(6, Some(1), 6, SessionCatalogueKind::Failed),
+                entry(7, Some(1), 7, request("active request")),
+                entry(
+                    8,
+                    Some(7),
+                    8,
+                    SessionCatalogueKind::Execution {
+                        commentary: Some("active execution".to_owned()),
+                        tool_summaries: vec![ToolCallSummary::Count(1), ToolCallSummary::Failed],
+                    },
+                ),
+                entry(
+                    9,
+                    Some(8),
+                    9,
+                    SessionCatalogueKind::Final {
+                        text: "active final".to_owned(),
+                    },
+                ),
+                entry(10, Some(9), 10, SessionCatalogueKind::Cancelled),
+                entry(11, Some(10), 11, SessionCatalogueKind::Failed),
+            ],
+        ));
+        let mut picker = tree.picker();
+        let buffer = rendered_buffer(&mut picker, 72, 20);
+
+        let (failed_column, failed_row) = cell_start(&buffer, "Failed");
+        assert_eq!(buffer[(1, failed_row)].symbol(), "›");
+        assert_eq!(buffer[(1, failed_row)].fg, Color::Rgb(138, 190, 183));
+        assert_eq!(buffer[(1, failed_row)].bg, Color::Rgb(58, 58, 74));
+        assert_eq!(
+            buffer[(failed_column, failed_row)].fg,
+            Color::Rgb(204, 102, 102)
+        );
+        assert_eq!(
+            buffer[(failed_column, failed_row)].bg,
+            Color::Rgb(58, 58, 74)
+        );
+        assert!(
+            !buffer[(failed_column, failed_row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(buffer[(failed_column + 6, failed_row)].bg, Color::Reset);
+        let (current_marker_column, current_marker_row) = cell_start(&buffer, "● Failed");
+        assert_eq!(
+            buffer[(current_marker_column, current_marker_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(current_marker_column, current_marker_row)].bg,
+            Color::Rgb(58, 58, 74)
+        );
+
+        let (root_marker_column, root_marker_row) = cell_start(&buffer, "• Session start");
+        assert_eq!(
+            buffer[(root_marker_column, root_marker_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(root_marker_column + 2, root_marker_row)].fg,
+            Color::Rgb(212, 212, 212)
+        );
+
+        let (active_connector_column, active_connector_row) =
+            cell_start(&buffer, "├⊟ • User: active request");
+        assert_eq!(
+            buffer[(active_connector_column, active_connector_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(active_connector_column + 3, active_connector_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(active_connector_column + 5, active_connector_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(active_connector_column + 11, active_connector_row)].fg,
+            Color::Rgb(212, 212, 212)
+        );
+
+        let (python_column, python_row) =
+            cell_start(&buffer, "Python: [tools: 1✓ 1✗] active execution");
+        assert_eq!(
+            buffer[(python_column, python_row)].fg,
+            Color::Rgb(128, 128, 128)
+        );
+        assert_eq!(
+            buffer[(python_column + 9, python_row)].fg,
+            Color::Rgb(102, 102, 102)
+        );
+        assert_eq!(
+            buffer[(python_column + 17, python_row)].fg,
+            Color::Rgb(181, 189, 104)
+        );
+        assert_eq!(
+            buffer[(python_column + 20, python_row)].fg,
+            Color::Rgb(204, 102, 102)
+        );
+        assert_eq!(
+            buffer[(python_column + 23, python_row)].fg,
+            Color::Rgb(212, 212, 212)
+        );
+
+        let (kiki_column, kiki_row) = cell_start(&buffer, "Kiki: active final");
+        assert_eq!(
+            buffer[(kiki_column, kiki_row)].fg,
+            Color::Rgb(181, 189, 104)
+        );
+        assert_eq!(
+            buffer[(kiki_column + 6, kiki_row)].fg,
+            Color::Rgb(212, 212, 212)
+        );
+        let (cancelled_column, cancelled_row) = cell_start(&buffer, "Cancelled");
+        assert_eq!(
+            buffer[(cancelled_column, cancelled_row)].fg,
+            Color::Rgb(255, 255, 0)
+        );
+
+        let (alternative_connector_column, alternative_row) =
+            cell_start(&buffer, "└─ User: alternative request");
+        assert_eq!(buffer[(1, alternative_row)].symbol(), " ");
+        assert_eq!(buffer[(2, alternative_row)].symbol(), " ");
+        assert_eq!(
+            buffer[(alternative_connector_column, alternative_row)].fg,
+            Color::Rgb(102, 102, 102)
+        );
+        assert_eq!(
+            buffer[(alternative_connector_column + 3, alternative_row)].fg,
+            Color::Rgb(138, 190, 183)
+        );
+        assert_eq!(
+            buffer[(alternative_connector_column + 9, alternative_row)].fg,
+            Color::Rgb(128, 128, 128)
+        );
+        let alternative = (buffer.area.left()..buffer.area.right())
+            .map(|column| buffer[(column, alternative_row)].symbol())
+            .collect::<String>();
+        assert!(!alternative.contains('•'));
+        assert!(!alternative.contains('●'));
+
+        let (alternative_python_column, alternative_python_row) =
+            cell_start(&buffer, "Python: [tools: 1] alternative execution");
+        assert_eq!(
+            buffer[(alternative_python_column, alternative_python_row)].fg,
+            Color::Rgb(128, 128, 128)
+        );
+        assert_eq!(
+            buffer[(alternative_python_column + 19, alternative_python_row)].fg,
+            Color::Rgb(128, 128, 128)
+        );
+
+        let (alternative_kiki_column, alternative_kiki_row) =
+            cell_start(&buffer, "Kiki: alternative final");
+        assert_eq!(
+            buffer[(alternative_kiki_column, alternative_kiki_row)].fg,
+            Color::Rgb(181, 189, 104)
+        );
+        assert_eq!(
+            buffer[(alternative_kiki_column + 6, alternative_kiki_row)].fg,
+            Color::Rgb(128, 128, 128)
+        );
+        let cancelled_rows = cell_starts(&buffer, "Cancelled");
+        let (alternative_cancelled_column, alternative_cancelled_row) =
+            *cancelled_rows.last().expect("alternative cancelled row");
+        assert_eq!(
+            buffer[(alternative_cancelled_column, alternative_cancelled_row)].fg,
+            Color::Rgb(255, 255, 0)
+        );
+        assert_eq!(
+            buffer[(alternative_cancelled_column, alternative_cancelled_row)].bg,
+            Color::Reset
+        );
+        let failed_rows = cell_starts(&buffer, "Failed");
+        let (alternative_failed_column, alternative_failed_row) =
+            *failed_rows.last().expect("alternative failed row");
+        assert_eq!(
+            buffer[(alternative_failed_column, alternative_failed_row)].fg,
+            Color::Rgb(204, 102, 102)
+        );
+        assert_eq!(
+            buffer[(alternative_failed_column, alternative_failed_row)].bg,
+            Color::Reset
+        );
+    }
+
+    #[test]
     fn orders_sibling_branches_by_latest_descendant_revision() {
         let tree = SessionTree::from_catalogue(&catalogue(
             4,
@@ -1666,25 +2007,6 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             PickerAction::Apply(SessionEntryId(7))
         );
-
-        let buffer = rendered_buffer(&mut picker, 72, 12);
-        let (root_column, root_row) = cell_start(&buffer, "Session start");
-        let (alternative_column, alternative_row) = cell_start(&buffer, "first branch");
-        let (current_column, current_row) = cell_start(&buffer, "second step");
-        assert_eq!(buffer[(root_column, root_row)].fg, Color::Cyan);
-        assert_eq!(
-            buffer[(alternative_column, alternative_row)].fg,
-            Color::Rgb(128, 128, 128)
-        );
-        assert_eq!(
-            buffer[(current_column, current_row)].fg,
-            Color::Rgb(212, 212, 212)
-        );
-        assert!(
-            buffer[(current_column, current_row)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
     }
 
     #[test]
@@ -1708,28 +2030,6 @@ mod tests {
         assert_eq!(
             tree_rows(&mut picker),
             ["● Session start", "└─ User: alternative"]
-        );
-
-        let buffer = rendered_buffer(&mut picker, 72, 8);
-        let (root_column, root_row) = cell_start(&buffer, "Session start");
-        let (alternative_column, alternative_row) = cell_start(&buffer, "alternative");
-        assert_eq!(
-            buffer[(root_column, root_row)].fg,
-            Color::Rgb(212, 212, 212)
-        );
-        assert!(
-            buffer[(root_column, root_row)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-        assert_eq!(
-            buffer[(alternative_column, alternative_row)].fg,
-            Color::Rgb(128, 128, 128)
-        );
-        assert!(
-            !buffer[(alternative_column, alternative_row)]
-                .modifier
-                .contains(Modifier::REVERSED)
         );
     }
 
@@ -2118,9 +2418,9 @@ mod tests {
 
     #[test]
     fn finds_untruncated_previews_and_preserves_graphemes() {
-        let request = "🦀e\u{0301}".repeat(25) + " needle";
+        let request = "界🦀e\u{0301}".repeat(25) + " needle";
         let tree = SessionTree::from_catalogue(&catalogue(
-            1,
+            2,
             [
                 entry(1, None, 1, SessionCatalogueKind::Start),
                 entry(
@@ -2131,12 +2431,19 @@ mod tests {
                 ),
             ],
         ));
-        let mut picker = tree.picker();
-        let buffer = rendered_buffer(&mut picker, 72, 8);
-        let (user_column, user_row) = cell_start(&buffer, "User:");
-        assert_eq!(buffer[(user_column + 65, user_row)].symbol(), "e\u{301}");
-        assert_eq!(buffer[(user_column + 66, user_row)].symbol(), "…");
+        let items = tree.items(
+            &TreeProjection::all(&tree.full_topology, &tree.preorder),
+            19,
+            &BTreeSet::new(),
+        );
+        assert_eq!(items[1].row.to_string(), "  └─ ● User: 界🦀e\u{0301}…");
+        assert_eq!(items[1].row.width(), 19);
+        assert_eq!(
+            items[1].row.spans.last().expect("ellipsis span").style.fg,
+            Some(Color::Rgb(212, 212, 212))
+        );
 
+        let mut picker = tree.picker();
         picker.set_filter("needle");
         tree.refresh(&mut picker);
         let buffer = rendered_buffer(&mut picker, 72, 8);
@@ -2186,6 +2493,28 @@ mod tests {
         assert!(rendered(&mut picker, 72, 8).contains("No matching session entries"));
         for (width, height) in [(1, 1), (1, 2), (2, 3), (3, 3)] {
             let _ = rendered_buffer(&mut picker, width, height);
+        }
+    }
+
+    #[test]
+    fn builds_rows_at_tiny_widths() {
+        let tree = SessionTree::from_catalogue(&catalogue(
+            2,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("narrow")),
+            ],
+        ));
+        let projection = TreeProjection::all(&tree.full_topology, &tree.preorder);
+
+        for row_width in [0, 1, 2] {
+            let items = tree.items(&projection, row_width, &BTreeSet::new());
+            assert!(items.iter().all(|item| item.row.width() <= row_width));
+            assert!(items.iter().all(|item| {
+                item.focused_row
+                    .as_ref()
+                    .is_some_and(|row| row.width() <= row_width)
+            }));
         }
     }
 
@@ -2300,11 +2629,16 @@ mod tests {
             .chunks(72)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .map(|row| {
-                row.strip_prefix('│')
+                let row = row
+                    .strip_prefix('│')
                     .and_then(|row| row.strip_suffix('│'))
                     .unwrap_or(&row)
-                    .trim_end()
-                    .to_owned()
+                    .trim_end();
+                let row = row
+                    .strip_prefix("› ")
+                    .or_else(|| row.strip_prefix("  "))
+                    .unwrap_or(row);
+                row.replace("• ", "")
             })
             .filter(|row| {
                 [
@@ -2353,10 +2687,17 @@ mod tests {
     }
 
     fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
+        *cell_starts(buffer, text)
+            .first()
+            .unwrap_or_else(|| panic!("rendered text: {text}"))
+    }
+
+    fn cell_starts(buffer: &Buffer, text: &str) -> Vec<(u16, u16)> {
         let symbols = text
             .chars()
             .map(|character| character.to_string())
             .collect::<Vec<_>>();
+        let mut starts = Vec::new();
         for row in buffer.area.top()..buffer.area.bottom() {
             for column in buffer.area.left()..buffer.area.right() {
                 if symbols.iter().enumerate().all(|(offset, symbol)| {
@@ -2364,10 +2705,10 @@ mod tests {
                     column.saturating_add(offset) < buffer.area.right()
                         && buffer[(column + offset, row)].symbol() == symbol
                 }) {
-                    return (column, row);
+                    starts.push((column, row));
                 }
             }
         }
-        panic!("rendered text: {text}")
+        starts
     }
 }
