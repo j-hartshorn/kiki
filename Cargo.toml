@@ -11,6 +11,7 @@ cap-std = "4"
 futures = "0.3"
 getrandom = "0.3"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+rattles = "=0.3.1"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 monty-pool = "=0.0.22"

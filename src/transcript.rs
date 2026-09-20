@@ -2319,6 +2319,14 @@ impl Transcript {
         self.run_state == RunState::Idle
     }
 
+    pub(crate) fn is_generating(&self) -> bool {
+        self.disabled_reason.is_none()
+            && self
+                .live_step
+                .as_ref()
+                .is_some_and(|live| live.phase == LivePhase::Generating)
+    }
+
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled_reason.is_some()
     }
@@ -3253,11 +3261,6 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
     let accounting = step_accounting(&live.settled_attempts);
 
     let mut blocks = Vec::new();
-    if !has_arena_content {
-        blocks.push(TranscriptBlock::Status {
-            text: live.phase.label().to_owned(),
-        });
-    }
     append_reasoning(&mut blocks, "", &live.reasoning);
     if has_arena_content {
         if !live.assistant_text.is_empty() {
@@ -5324,7 +5327,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_joins_a_standalone_accounting_card_with_one_blank_line() {
+    fn selection_extracts_standalone_live_accounting() {
         let mut transcript = Transcript::default();
         transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
         transcript.apply(
@@ -5346,7 +5349,7 @@ mod tests {
                 DocumentPosition::new(0, 0),
                 DocumentPosition::new(layout.total_height(), 0),
             )),
-            "generating\n\n↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
+            "↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
         );
     }
 
@@ -6144,7 +6147,7 @@ truncated"
 
         let history = rendered_text(&transcript);
         assert!(history.contains("settled\ndisplay gap"));
-        assert!(history.ends_with("generating"));
+        assert!(history.ends_with("display gap: some live progress was dropped"));
     }
 
     #[test]
@@ -10375,7 +10378,7 @@ truncated"
             false,
         );
         assert_eq!(transcript.status(), "generating");
-        assert_eq!(rendered_text(&transcript), "generating");
+        assert_eq!(rendered_text(&transcript), "");
 
         let history = rendered_text(&transcript);
         let status = transcript.status().to_owned();
