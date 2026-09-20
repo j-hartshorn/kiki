@@ -137,11 +137,11 @@ Ordering, full-depth connectors and stack-safety cases pass.
 
 **Changes** — Add a transient full/conversation mode, defaulting to full on each open. Ctrl-U toggles mode. Conversation mode retains Session start, User, Kiki, Cancelled and Failed, omits Python rows, and reconnects retained nodes to their nearest retained visible ancestors. Retain the exact current Python row as the sole execution exception.
 
-Ordering remains based on the complete durable subtree. Search only eligible rows and retains eligible context ancestry. If the focused Python row becomes ineligible, focus its nearest retained visible ancestor. Keep mode private; Task 7 derives selected/visible position through the picker only when header formatting needs it.
+Ordering remains based on the complete durable subtree. Search only eligible rows and retains eligible context ancestry. If Ctrl-U removes a focused Python row during search, focus its nearest retained ancestor that directly matches the query; if none does, allow the picker's ordinary first matching-row fallback. Preserve context rows as non-selectable. Keep mode private. Add only narrow generic picker `focused_value` and `focus_value` primitives for this fallback; tree policy stays in `tree.rs`. Task 7 derives selected/visible position through the picker only when header formatting needs it.
 
-**Tests** (`src/tui/tree.rs`, navigator interface/golden; `src/tui.rs`, key composition) — First red: `tui::tree::tests::conversation_mode_reparents_history_and_keeps_current_python`. Cover default/round-trip mode, request-execution-final chains, terminal outcomes, forks from omitted executions, reconstructed connectors, exact-current exception, nearest-ancestor focus, search and recency ordering. One TUI test proves Ctrl-U reaches the navigator rather than prompt controls.
+**Tests** (`src/tui/tree.rs`, navigator interface/golden; `src/tui/picker.rs`, focused-value contract; `src/tui.rs`, key composition) — First red: `tui::tree::tests::conversation_mode_reparents_history_and_keeps_current_python`. Cover default/round-trip mode, request-execution-final chains, terminal outcomes, forks from omitted executions, reconstructed connectors, exact-current exception, nearest-ancestor focus, search and recency ordering. Picker tests cover focused-value access and focusing an eligible value. One TUI test proves Ctrl-U reaches the navigator rather than prompt controls.
 
-**Files** — Modify: `src/tui.rs`, `src/tui/tree.rs`.
+**Files** — Modify: `src/tui.rs`, `src/tui/picker.rs`, `src/tui/tree.rs`.
 
 **Verification** —
 
@@ -201,7 +201,7 @@ Semantic tree styling and unchanged static-picker styling pass.
 
 **Changes** — Replace the lossy catalogue execution projection with one canonical representation containing source, commentary and the existing decoded `arena::Execution`. Use `codec::decoded_readable_execution` during catalogue construction and delete the redundant `decoded_execution_catalogue` helper. Derive row tool counts from `Execution.tool_calls`; no schema or persisted payload changes.
 
-Add the picker's narrow focused-value accessor at this first use. Ctrl-X formats only the selected node and returns a copy outcome without closing or moving focus. User/Kiki copy complete stored text without row prefixes. Python emits non-empty sections in this exact order, separated by one blank line:
+Reuse the picker's focused-value accessor added by Task 3. Ctrl-X formats only the selected node and returns a copy outcome without closing or moving focus. User/Kiki copy complete stored text without row prefixes. Python emits non-empty sections in this exact order, separated by one blank line:
 
 1. `Commentary:` with complete commentary, when present.
 2. `Python:` with complete source, always.
@@ -217,7 +217,7 @@ Expose transcript tool-label and observation formatting narrowly for reuse. `App
 
 **Tests** (`src/session.rs`, catalogue projection; `src/tui/tree.rs`, navigator copy; `src/tui.rs`, clipboard composition) — First red: `session::tests::catalogue_retains_complete_execution_for_tree_copy`. Session coverage proves one decoded `Execution`; existing codec tests continue to own round-trip detail. Tree table tests cover exact section order, absent sections, mixed tools, omissions, Python error, multiline User/Kiki and terminal controls. TUI adds only clipboard success/failure while the tree remains open.
 
-**Files** — Modify: `src/session.rs`, `src/session/codec.rs`, `src/transcript.rs`, `src/tui.rs`, `src/tui/picker.rs`, `src/tui/tree.rs`.
+**Files** — Modify: `src/session.rs`, `src/session/codec.rs`, `src/transcript.rs`, `src/tui.rs`, `src/tui/tree.rs`.
 
 **Verification** —
 

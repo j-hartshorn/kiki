@@ -20,34 +20,136 @@ const INITIAL_ROW_WIDTH: usize = PICKER_MAX_WIDTH as usize - 2;
 const LOADING_ENTRY: SessionEntryId = SessionEntryId(0);
 
 struct TreeNode {
-    parent: Option<usize>,
-    children: Vec<usize>,
     entry: SessionEntryId,
     search_text: String,
     canonical_search_text: String,
+    is_execution: bool,
     active_path: bool,
 }
 
-struct TreeProjection {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeMode {
+    Full,
+    Conversation,
+}
+
+impl TreeMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Full => Self::Conversation,
+            Self::Conversation => Self::Full,
+        }
+    }
+}
+
+struct TreeTopology {
+    eligible: Vec<bool>,
+    parents: Vec<Option<usize>>,
+    children: Vec<Vec<usize>>,
+}
+
+impl TreeTopology {
+    fn full(catalogue: &SessionCatalogue, entry_indexes: &BTreeMap<SessionEntryId, usize>) -> Self {
+        let parents = catalogue
+            .entries
+            .iter()
+            .map(|entry| {
+                entry.parent_id.map(|parent| {
+                    *entry_indexes
+                        .get(&parent)
+                        .expect("session catalogue parent exists")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut children = (0..parents.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (index, parent) in parents.iter().enumerate() {
+            if let Some(parent) = parent {
+                children[*parent].push(index);
+            }
+        }
+        Self {
+            eligible: vec![true; parents.len()],
+            parents,
+            children,
+        }
+    }
+
+    fn conversation(
+        nodes: &[TreeNode],
+        full: &Self,
+        preorder: &[usize],
+        active_index: usize,
+    ) -> Self {
+        let mut eligible = nodes
+            .iter()
+            .map(|node| !node.is_execution)
+            .collect::<Vec<_>>();
+        eligible[active_index] = true;
+        let mut parents = vec![None; nodes.len()];
+        let mut children = (0..nodes.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+
+        for &index in preorder {
+            let parent = full.parents[index]
+                .and_then(|parent| eligible[parent].then_some(parent).or(parents[parent]));
+            parents[index] = parent;
+            if eligible[index]
+                && let Some(parent) = parent
+            {
+                children[parent].push(index);
+            }
+        }
+
+        Self {
+            eligible,
+            parents,
+            children,
+        }
+    }
+}
+
+struct TreeProjection<'a> {
+    topology: &'a TreeTopology,
     direct_matches: Vec<bool>,
+    nearest_direct_match: Vec<Option<usize>>,
     visible: Vec<bool>,
     last_visible: Vec<bool>,
 }
 
-impl TreeProjection {
-    fn all(nodes: &[TreeNode]) -> Self {
-        Self::new(nodes, vec![true; nodes.len()], vec![true; nodes.len()])
+impl<'a> TreeProjection<'a> {
+    #[cfg(test)]
+    fn all(topology: &'a TreeTopology, preorder: &[usize]) -> Self {
+        Self::new(
+            topology,
+            preorder,
+            vec![true; topology.children.len()],
+            vec![true; topology.children.len()],
+        )
     }
 
-    fn new(nodes: &[TreeNode], direct_matches: Vec<bool>, visible: Vec<bool>) -> Self {
-        let mut last_visible = vec![false; nodes.len()];
-        for node in nodes {
-            if let Some(&child) = node.children.iter().rev().find(|&&child| visible[child]) {
+    fn new(
+        topology: &'a TreeTopology,
+        preorder: &[usize],
+        direct_matches: Vec<bool>,
+        visible: Vec<bool>,
+    ) -> Self {
+        let mut nearest_direct_match = vec![None; topology.children.len()];
+        let mut last_visible = vec![false; topology.children.len()];
+        for &index in preorder {
+            nearest_direct_match[index] = topology.parents[index].and_then(|parent| {
+                direct_matches[parent]
+                    .then_some(parent)
+                    .or(nearest_direct_match[parent])
+            });
+        }
+        for children in &topology.children {
+            if let Some(&child) = children.iter().rev().find(|&&child| visible[child]) {
                 last_visible[child] = true;
             }
         }
         Self {
+            topology,
             direct_matches,
+            nearest_direct_match,
             visible,
             last_visible,
         }
@@ -55,7 +157,10 @@ impl TreeProjection {
 }
 
 struct SessionTree {
+    entry_indexes: BTreeMap<SessionEntryId, usize>,
     nodes: Vec<TreeNode>,
+    full_topology: TreeTopology,
+    conversation_topology: TreeTopology,
     preorder: Vec<usize>,
     active_index: usize,
     active_entry: SessionEntryId,
@@ -76,27 +181,18 @@ impl SessionTree {
                 let search_text = row_text(&entry.kind);
                 let canonical_search_text = canonical_search(&search_text);
                 TreeNode {
-                    parent: entry.parent_id.map(|parent| {
-                        *entry_indexes
-                            .get(&parent)
-                            .expect("session catalogue parent exists")
-                    }),
-                    children: Vec::new(),
                     entry: entry.entry_id,
                     search_text,
                     canonical_search_text,
+                    is_execution: matches!(&entry.kind, SessionCatalogueKind::Execution { .. }),
                     active_path: false,
                 }
             })
             .collect::<Vec<_>>();
-        for index in 0..nodes.len() {
-            if let Some(parent) = nodes[index].parent {
-                nodes[parent].children.push(index);
-            }
-        }
-        let latest_revisions = subtree_latest_revisions(&nodes, catalogue);
-        for node in &mut nodes {
-            node.children.sort_by(|left, right| {
+        let mut full_topology = TreeTopology::full(catalogue, &entry_indexes);
+        let latest_revisions = subtree_latest_revisions(&full_topology, catalogue);
+        for children in &mut full_topology.children {
+            children.sort_by(|left, right| {
                 latest_revisions[*right]
                     .cmp(&latest_revisions[*left])
                     .then_with(|| {
@@ -112,9 +208,10 @@ impl SessionTree {
             });
         }
 
-        let root = nodes
+        let root = full_topology
+            .parents
             .iter()
-            .position(|node| node.parent.is_none())
+            .position(Option::is_none)
             .expect("session catalogue root exists");
         let active = *entry_indexes
             .get(&catalogue.active_entry)
@@ -123,12 +220,17 @@ impl SessionTree {
         let mut current = Some(active);
         while let Some(index) = current {
             nodes[index].active_path = true;
-            current = nodes[index].parent;
+            current = full_topology.parents[index];
         }
 
-        let preorder = build_preorder(&nodes, root);
+        let preorder = build_preorder(&full_topology, root);
+        let conversation_topology =
+            TreeTopology::conversation(&nodes, &full_topology, &preorder, active);
         Self {
+            entry_indexes,
             nodes,
+            full_topology,
+            conversation_topology,
             preorder,
             active_index: active,
             active_entry,
@@ -137,14 +239,15 @@ impl SessionTree {
 
     #[cfg(test)]
     fn picker(&self) -> Picker<SessionEntryId> {
-        self.picker_for_width(PICKER_ROW_WIDTH)
+        self.picker_for_width(PICKER_ROW_WIDTH, TreeMode::Full)
     }
 
-    fn picker_for_width(&self, row_width: usize) -> Picker<SessionEntryId> {
+    fn picker_for_width(&self, row_width: usize, mode: TreeMode) -> Picker<SessionEntryId> {
+        let projection = self.filtered_projection(mode, "");
         Picker::new_dynamic(
             "Session tree",
             "No matching session entries",
-            self.items(&TreeProjection::all(&self.nodes), row_width),
+            self.items(&projection, row_width),
             self.active_entry,
         )
     }
@@ -152,45 +255,52 @@ impl SessionTree {
     #[cfg(test)]
     fn refresh(&self, picker: &mut Picker<SessionEntryId>) {
         let query = picker.filter().to_owned();
-        self.refresh_for_query(picker, &query, PICKER_ROW_WIDTH);
+        self.refresh_for_query(picker, TreeMode::Full, &query, PICKER_ROW_WIDTH);
     }
 
     fn refresh_for_query(
         &self,
         picker: &mut Picker<SessionEntryId>,
+        mode: TreeMode,
         query: &str,
         row_width: usize,
-    ) {
-        let projection = self.filtered_projection(query);
+    ) -> TreeProjection<'_> {
+        let projection = self.filtered_projection(mode, query);
         picker.replace_items(self.items(&projection, row_width));
+        projection
     }
 
-    fn filtered_projection(&self, query: &str) -> TreeProjection {
+    fn filtered_projection(&self, mode: TreeMode, query: &str) -> TreeProjection<'_> {
+        let topology = match mode {
+            TreeMode::Full => &self.full_topology,
+            TreeMode::Conversation => &self.conversation_topology,
+        };
         let tokens = query
             .split_whitespace()
             .map(canonical_search)
             .collect::<Vec<_>>();
         let mut direct_matches = vec![false; self.nodes.len()];
         for &index in &self.preorder {
-            direct_matches[index] = tokens
-                .iter()
-                .all(|token| self.nodes[index].canonical_search_text.contains(token));
+            direct_matches[index] = topology.eligible[index]
+                && tokens
+                    .iter()
+                    .all(|token| self.nodes[index].canonical_search_text.contains(token));
         }
 
         let mut visible = direct_matches.clone();
         for &index in self.preorder.iter().rev() {
             if visible[index]
-                && let Some(parent) = self.nodes[index].parent
+                && let Some(parent) = topology.parents[index]
             {
                 visible[parent] = true;
             }
         }
-        TreeProjection::new(&self.nodes, direct_matches, visible)
+        TreeProjection::new(topology, &self.preorder, direct_matches, visible)
     }
 
     fn items(
         &self,
-        projection: &TreeProjection,
+        projection: &TreeProjection<'_>,
         row_width: usize,
     ) -> Vec<DynamicPickerItem<SessionEntryId>> {
         enum ProjectionStep {
@@ -215,7 +325,7 @@ impl SessionTree {
                 ProjectionStep::Enter(index) => {
                     let connector_length = connectors.len();
                     let text = self.row_text(index, projection, &connectors, row_width);
-                    if self.draws_joint(index) {
+                    if self.draws_joint(index, &projection.topology) {
                         connectors.push(!projection.last_visible[index]);
                     }
                     items.push(DynamicPickerItem {
@@ -229,7 +339,7 @@ impl SessionTree {
                     });
 
                     traversal.push(ProjectionStep::Exit(connector_length));
-                    for &child in self.nodes[index].children.iter().rev() {
+                    for &child in projection.topology.children[index].iter().rev() {
                         if projection.visible[child] {
                             traversal.push(ProjectionStep::Enter(child));
                         }
@@ -244,7 +354,7 @@ impl SessionTree {
     fn row_text(
         &self,
         index: usize,
-        projection: &TreeProjection,
+        projection: &TreeProjection<'_>,
         connectors: &[bool],
         row_width: usize,
     ) -> String {
@@ -264,7 +374,7 @@ impl SessionTree {
                 return text;
             }
         }
-        if self.draws_joint(index)
+        if self.draws_joint(index, &projection.topology)
             && let Some(text) = append_until_truncated(
                 &mut text,
                 &mut display_width,
@@ -293,11 +403,11 @@ impl SessionTree {
         .unwrap_or(text)
     }
 
-    fn draws_joint(&self, index: usize) -> bool {
-        let Some(parent) = self.nodes[index].parent else {
+    fn draws_joint(&self, index: usize, topology: &TreeTopology) -> bool {
+        let Some(parent) = topology.parents[index] else {
             return false;
         };
-        self.nodes[parent].parent.is_none() || self.nodes[parent].children.len() > 1
+        topology.parents[parent].is_none() || topology.children[parent].len() > 1
     }
 
     fn style(&self, index: usize) -> Style {
@@ -323,6 +433,7 @@ pub(crate) enum TreeNavigatorAction {
 pub(crate) struct TreeNavigator {
     revision: u64,
     row_width: usize,
+    mode: TreeMode,
     state: TreeNavigatorState,
 }
 
@@ -352,6 +463,7 @@ impl TreeNavigator {
         Self {
             revision,
             row_width: INITIAL_ROW_WIDTH,
+            mode: TreeMode::Full,
             state: TreeNavigatorState::Loading { picker },
         }
     }
@@ -373,9 +485,9 @@ impl TreeNavigator {
         };
         let query = picker.filter().to_owned();
         let tree = SessionTree::from_catalogue(catalogue);
-        let mut picker = tree.picker_for_width(self.row_width);
+        let mut picker = tree.picker_for_width(self.row_width, self.mode);
         picker.set_filter(&query);
-        tree.refresh_for_query(&mut picker, &query, self.row_width);
+        tree.refresh_for_query(&mut picker, self.mode, &query, self.row_width);
         self.state = TreeNavigatorState::Ready { tree, picker };
         true
     }
@@ -389,11 +501,12 @@ impl TreeNavigator {
             return;
         }
         self.row_width = row_width;
+        let mode = self.mode;
         let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
             return;
         };
         let query = picker.filter().to_owned();
-        tree.refresh_for_query(picker, &query, row_width);
+        tree.refresh_for_query(picker, mode, &query, row_width);
     }
 
     pub(crate) fn desired_height(&self) -> u16 {
@@ -417,6 +530,26 @@ impl TreeNavigator {
         {
             return TreeNavigatorAction::None;
         }
+        if matches!(key.code, KeyCode::Char('u' | 'U'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.mode = self.mode.toggled();
+            let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
+                unreachable!("ready tree navigator has ready state");
+            };
+            let focused = picker.focused_value();
+            let query = picker.filter().to_owned();
+            let projection = tree.refresh_for_query(picker, self.mode, &query, self.row_width);
+            if let Some(focused) = focused {
+                let focused = tree.entry_indexes[&focused];
+                if !projection.topology.eligible[focused]
+                    && let Some(fallback) = projection.nearest_direct_match[focused]
+                {
+                    picker.focus_value(tree.nodes[fallback].entry);
+                }
+            }
+            return TreeNavigatorAction::Changed;
+        }
         if key.code == KeyCode::Esc {
             let TreeNavigatorState::Ready { tree, picker } = &mut self.state else {
                 unreachable!("ready tree navigator has ready state");
@@ -425,7 +558,7 @@ impl TreeNavigator {
                 return TreeNavigatorAction::Close;
             }
             picker.set_filter("");
-            tree.refresh_for_query(picker, "", self.row_width);
+            tree.refresh_for_query(picker, self.mode, "", self.row_width);
             return TreeNavigatorAction::Changed;
         }
 
@@ -438,7 +571,7 @@ impl TreeNavigator {
             }
             PickerAction::Changed => {
                 let query = picker.filter().to_owned();
-                tree.refresh_for_query(picker, &query, self.row_width);
+                tree.refresh_for_query(picker, self.mode, &query, self.row_width);
                 TreeNavigatorAction::Changed
             }
             PickerAction::Apply(entry) => TreeNavigatorAction::Navigate(entry),
@@ -479,24 +612,22 @@ fn append_until_truncated(
     None
 }
 
-fn subtree_latest_revisions(nodes: &[TreeNode], catalogue: &SessionCatalogue) -> Vec<u64> {
+fn subtree_latest_revisions(topology: &TreeTopology, catalogue: &SessionCatalogue) -> Vec<u64> {
     let mut latest_revisions = catalogue
         .entries
         .iter()
         .map(|entry| entry.revision)
         .collect::<Vec<_>>();
-    let mut remaining_children = nodes
-        .iter()
-        .map(|node| node.children.len())
-        .collect::<Vec<_>>();
-    let mut stack = nodes
+    let mut remaining_children = topology.children.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut stack = topology
+        .children
         .iter()
         .enumerate()
-        .filter_map(|(index, node)| node.children.is_empty().then_some(index))
+        .filter_map(|(index, children)| children.is_empty().then_some(index))
         .collect::<Vec<_>>();
 
     while let Some(index) = stack.pop() {
-        let Some(parent) = nodes[index].parent else {
+        let Some(parent) = topology.parents[index] else {
             continue;
         };
         latest_revisions[parent] = latest_revisions[parent].max(latest_revisions[index]);
@@ -509,12 +640,12 @@ fn subtree_latest_revisions(nodes: &[TreeNode], catalogue: &SessionCatalogue) ->
     latest_revisions
 }
 
-fn build_preorder(nodes: &[TreeNode], root: usize) -> Vec<usize> {
-    let mut preorder = Vec::with_capacity(nodes.len());
+fn build_preorder(topology: &TreeTopology, root: usize) -> Vec<usize> {
+    let mut preorder = Vec::with_capacity(topology.children.len());
     let mut stack = vec![root];
     while let Some(index) = stack.pop() {
         preorder.push(index);
-        stack.extend(nodes[index].children.iter().rev().copied());
+        stack.extend(topology.children[index].iter().rev().copied());
     }
     preorder
 }
@@ -638,6 +769,381 @@ mod tests {
         assert_eq!(
             navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             TreeNavigatorAction::Close
+        );
+    }
+
+    #[test]
+    fn conversation_mode_reparents_history_and_keeps_current_python() {
+        let mut navigator = TreeNavigator::new(4, "");
+        assert!(navigator.install_catalogue(
+            4,
+            &catalogue(
+                5,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("conversation")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("omitted execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "reconnected reply".to_owned(),
+                        },
+                    ),
+                    entry(
+                        5,
+                        Some(4),
+                        5,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("current execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                ],
+            )
+        ));
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "└─ User: conversation",
+                "   Python: omitted execution",
+                "   Kiki: reconnected reply",
+                "   ● Python: current execution",
+            ]
+        );
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "└─ User: conversation",
+                "   Kiki: reconnected reply",
+                "   ● Python: current execution",
+            ]
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(5))
+        );
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "└─ User: conversation",
+                "   Python: omitted execution",
+                "   Kiki: reconnected reply",
+                "   ● Python: current execution",
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_mode_keeps_terminal_outcomes_and_reconstructs_forks() {
+        let mut navigator = TreeNavigator::new(5, "");
+        assert!(navigator.install_catalogue(
+            5,
+            &catalogue(
+                6,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("terminal outcomes")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("omitted branch point".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "older reply".to_owned(),
+                        },
+                    ),
+                    entry(5, Some(3), 5, SessionCatalogueKind::Cancelled),
+                    entry(6, Some(3), 6, SessionCatalogueKind::Failed),
+                ],
+            )
+        ));
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "└─ User: terminal outcomes",
+                "   ├─ ● Failed",
+                "   ├─ Cancelled",
+                "   └─ Kiki: older reply",
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_mode_filtered_focus_prefers_a_matching_ancestor_or_first_match() {
+        let mut ancestor = TreeNavigator::new(6, "needle");
+        assert!(ancestor.install_catalogue(
+            6,
+            &catalogue(
+                4,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("needle ancestor")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("needle focused execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "current reply".to_owned(),
+                        },
+                    ),
+                ],
+            )
+        ));
+        assert_eq!(
+            ancestor.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            ancestor.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            ancestor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(2))
+        );
+
+        let mut fallback = TreeNavigator::new(7, "needle");
+        assert!(fallback.install_catalogue(
+            7,
+            &catalogue(
+                3,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(
+                        2,
+                        Some(1),
+                        2,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("needle focused execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        3,
+                        Some(1),
+                        3,
+                        SessionCatalogueKind::Final {
+                            text: "needle fallback".to_owned(),
+                        },
+                    ),
+                ],
+            )
+        ));
+        assert_eq!(
+            fallback.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            fallback.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            fallback.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(3))
+        );
+    }
+
+    #[test]
+    fn conversation_mode_searches_eligible_rows_and_keeps_context() {
+        let mut navigator = TreeNavigator::new(7, "");
+        assert!(navigator.install_catalogue(
+            7,
+            &catalogue(
+                4,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("conversation context")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("hidden execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        4,
+                        SessionCatalogueKind::Final {
+                            text: "matching response".to_owned(),
+                        },
+                    ),
+                ],
+            )
+        ));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        for character in "matching".chars() {
+            assert_eq!(
+                navigator.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                TreeNavigatorAction::Changed
+            );
+        }
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "└─ User: conversation context",
+                "   ● Kiki: matching response",
+            ]
+        );
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        for character in "hidden".chars() {
+            assert_eq!(
+                navigator.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                TreeNavigatorAction::Changed
+            );
+        }
+        assert!(tree_rows(navigator.picker_mut()).is_empty());
+    }
+
+    #[test]
+    fn conversation_mode_reuses_deep_topology_across_query_and_width_refreshes() {
+        let depth = 2_048;
+        let active_entry = SessionEntryId(depth * 2 + 1);
+        let mut navigator = TreeNavigator::new(8, "");
+        assert!(navigator.install_catalogue(8, &deep_conversation_catalogue(depth),));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+
+        for row_width in [8, 16, 32, PICKER_ROW_WIDTH] {
+            navigator.refresh_width(row_width);
+            for character in "reply".chars() {
+                assert_eq!(
+                    navigator
+                        .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                    TreeNavigatorAction::Changed
+                );
+            }
+            assert_eq!(
+                navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                TreeNavigatorAction::Navigate(active_entry)
+            );
+            assert_eq!(
+                navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                TreeNavigatorAction::Changed
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_mode_preserves_complete_durable_recency_order() {
+        let mut navigator = TreeNavigator::new(8, "");
+        assert!(navigator.install_catalogue(
+            8,
+            &catalogue(
+                7,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("older branch")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("older execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        4,
+                        Some(3),
+                        9,
+                        SessionCatalogueKind::Final {
+                            text: "latest durable descendant".to_owned(),
+                        },
+                    ),
+                    entry(5, Some(1), 4, request("newer branch")),
+                    entry(
+                        6,
+                        Some(5),
+                        5,
+                        SessionCatalogueKind::Execution {
+                            commentary: Some("newer execution".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        7,
+                        Some(6),
+                        6,
+                        SessionCatalogueKind::Final {
+                            text: "older durable descendant".to_owned(),
+                        },
+                    ),
+                ],
+            )
+        ));
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            tree_rows(navigator.picker_mut()),
+            [
+                "Session start",
+                "├─ User: older branch",
+                "│  Kiki: latest durable descendant",
+                "└─ User: newer branch",
+                "   ● Kiki: older durable descendant",
+            ]
         );
     }
 
@@ -1120,12 +1626,15 @@ mod tests {
             positions[index] = position;
         }
         for (position, &index) in tree.preorder.iter().enumerate() {
-            if let Some(parent) = tree.nodes[index].parent {
+            if let Some(parent) = tree.full_topology.parents[index] {
                 assert!(positions[parent] < position);
             }
         }
 
-        let items = tree.items(&TreeProjection::all(&tree.nodes), PICKER_ROW_WIDTH);
+        let items = tree.items(
+            &TreeProjection::all(&tree.full_topology, &tree.preorder),
+            PICKER_ROW_WIDTH,
+        );
         assert_eq!(items.len(), tree.preorder.len());
         assert!(
             items
@@ -1360,6 +1869,34 @@ mod tests {
             entry_id += 1;
         }
         catalogue(parent, entries)
+    }
+
+    fn deep_conversation_catalogue(depth: u64) -> SessionCatalogue {
+        let mut entries = vec![entry(1, None, 1, SessionCatalogueKind::Start)];
+        let mut parent = 1;
+        for entry_id in 2..=depth + 1 {
+            entries.push(entry(
+                entry_id,
+                Some(parent),
+                entry_id,
+                SessionCatalogueKind::Execution {
+                    commentary: None,
+                    tool_summaries: Vec::new(),
+                },
+            ));
+            parent = entry_id;
+        }
+        for entry_id in depth + 2..=depth * 2 + 1 {
+            entries.push(entry(
+                entry_id,
+                Some(parent),
+                entry_id,
+                SessionCatalogueKind::Final {
+                    text: format!("reply {entry_id}"),
+                },
+            ));
+        }
+        catalogue(depth * 2 + 1, entries)
     }
 
     fn request(text: &str) -> SessionCatalogueKind {

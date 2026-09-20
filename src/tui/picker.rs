@@ -136,6 +136,20 @@ impl<T: Copy + Eq> Picker<T> {
         &self.filter
     }
 
+    pub(crate) fn focused_value(&self) -> Option<T> {
+        self.focus.map(|index| self.items[index].value)
+    }
+
+    pub(crate) fn focus_value(&mut self, value: T) -> bool {
+        let Some(index) = self.items.iter().enumerate().find_map(|(index, item)| {
+            (item.value == value && self.is_direct_match(index)).then_some(index)
+        }) else {
+            return false;
+        };
+        self.focus = Some(index);
+        true
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
         match key.code {
             KeyCode::Esc => PickerAction::Close,
@@ -593,6 +607,36 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn focused_value_and_focus_value_target_direct_dynamic_rows() {
+        let mut picker = Picker::new_dynamic(
+            "Session tree",
+            "No matching session entries",
+            [
+                dynamic_item("root", "Session start", DynamicPickerRole::Context),
+                dynamic_item("one", "First", DynamicPickerRole::Direct),
+                dynamic_item("two", "Second", DynamicPickerRole::Direct),
+            ],
+            "one",
+        );
+
+        assert_eq!(picker.focused_value(), Some("one"));
+        assert!(!picker.focus_value("root"));
+        assert_eq!(picker.focused_value(), Some("one"));
+        assert!(picker.focus_value("two"));
+        assert_eq!(picker.focused_value(), Some("two"));
+    }
+
+    #[test]
+    fn focus_value_respects_static_picker_filters() {
+        let mut picker = picker("sol");
+        picker.set_filter("terra");
+
+        assert_eq!(picker.focused_value(), Some("terra"));
+        assert!(!picker.focus_value("sol"));
+        assert_eq!(picker.focused_value(), Some("terra"));
     }
 
     #[test]

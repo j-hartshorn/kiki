@@ -4219,6 +4219,61 @@ mod tests {
     }
 
     #[test]
+    fn tree_picker_ctrl_u_reaches_the_navigator_before_prompt_controls() {
+        let mut app = app_with_prompt("preserved draft");
+        let revision = tree_request(&mut app, "");
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(4),
+                entries: vec![
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(1),
+                        parent_id: None,
+                        revision: 1,
+                        kind: SessionCatalogueKind::Start,
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(2),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 2,
+                        kind: SessionCatalogueKind::Request {
+                            text: "conversation".to_owned(),
+                        },
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(3),
+                        parent_id: Some(SessionEntryId(2)),
+                        revision: 3,
+                        kind: SessionCatalogueKind::Execution {
+                            commentary: Some("omitted Python".to_owned()),
+                            tool_summaries: Vec::new(),
+                        },
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(4),
+                        parent_id: Some(SessionEntryId(3)),
+                        revision: 4,
+                        kind: SessionCatalogueKind::Final {
+                            text: "retained reply".to_owned(),
+                        },
+                    },
+                ],
+            }),
+        }));
+        assert!(rendered(&mut app, 72, 12).contains("Python: omitted Python"));
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let screen = rendered(&mut app, 72, 12);
+        assert!(!screen.contains("Python: omitted Python"), "{screen}");
+        assert!(screen.contains("Kiki: retained reply"), "{screen}");
+    }
+
+    #[test]
     fn tree_picker_loading_ignores_input_and_stale_catalogues() {
         let now = Instant::now();
         let mut bare = App::default();
