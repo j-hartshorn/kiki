@@ -591,7 +591,7 @@ impl TreeNavigator {
         self.revision == revision && self.is_loading()
     }
 
-    pub(crate) fn refresh_width(&mut self, row_width: usize) {
+    fn refresh_width(&mut self, row_width: usize) {
         if self.row_width == row_width {
             return;
         }
@@ -604,11 +604,14 @@ impl TreeNavigator {
         tree.refresh_for_query(picker, mode, &query, row_width, &self.folded_heads);
     }
 
-    pub(crate) fn content_height(&self) -> u16 {
+    pub(super) fn content_height(&self) -> u16 {
         self.picker().content_height()
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, dock: Rect, notice: Option<&str>) {
+        if dock.width > 0 {
+            self.refresh_width(usize::from(dock.width));
+        }
         if dock.is_empty() {
             return;
         }

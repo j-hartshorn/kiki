@@ -152,7 +152,7 @@ impl<T: Copy + Eq> Picker<T> {
         true
     }
 
-    pub(crate) fn position(&self) -> (usize, usize) {
+    pub(super) fn position(&self) -> (usize, usize) {
         let matches = self.focusable_matches();
         let Some(index) = self
             .focus
@@ -201,11 +201,11 @@ impl<T: Copy + Eq> Picker<T> {
         }
     }
 
-    pub(crate) fn desired_height(&self) -> u16 {
+    fn desired_height(&self) -> u16 {
         self.content_height().saturating_add(3)
     }
 
-    pub(crate) fn content_height(&self) -> u16 {
+    pub(super) fn content_height(&self) -> u16 {
         u16::try_from(
             self.items
                 .len()
@@ -219,7 +219,7 @@ impl<T: Copy + Eq> Picker<T> {
         self.render_in(frame, popup_area(area, self.desired_height()));
     }
 
-    pub(crate) fn render_in(&mut self, frame: &mut Frame, popup: Rect) {
+    fn render_in(&mut self, frame: &mut Frame, popup: Rect) {
         if popup.is_empty() {
             return;
         }
@@ -237,7 +237,7 @@ impl<T: Copy + Eq> Picker<T> {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    pub(crate) fn render_frameless(&mut self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render_frameless(&mut self, frame: &mut Frame, area: Rect) {
         if area.is_empty() {
             return;
         }

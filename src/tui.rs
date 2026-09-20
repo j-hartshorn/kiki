@@ -2110,10 +2110,6 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
             .saturating_add(3)
             .min(area.height.saturating_sub(1));
         let dock_top = bottom_rule.y.saturating_sub(dock_height);
-        app.tree_navigator
-            .as_mut()
-            .expect("tree navigator was checked before rendering")
-            .refresh_width(usize::from(area.width));
         let monitor = app.subagent_monitor.layout(
             area.width,
             dock_top.saturating_sub(area.y).saturating_sub(1),
