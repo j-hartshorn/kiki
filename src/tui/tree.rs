@@ -46,7 +46,6 @@ struct TreeNode {
     entry: SessionEntryId,
     kind: SessionCatalogueKind,
     canonical_search_text: String,
-    is_execution: bool,
     active_path: bool,
 }
 
@@ -105,7 +104,7 @@ impl TreeTopology {
     ) -> Self {
         let mut eligible = nodes
             .iter()
-            .map(|node| !node.is_execution)
+            .map(|node| !matches!(&node.kind, SessionCatalogueKind::Execution { .. }))
             .collect::<Vec<_>>();
         eligible[active_index] = true;
         let mut parents = vec![None; nodes.len()];
@@ -133,37 +132,22 @@ impl TreeTopology {
 struct TreeProjection<'a> {
     topology: &'a TreeTopology,
     direct_matches: Vec<bool>,
-    nearest_direct_match: Vec<Option<usize>>,
     visible: Vec<bool>,
     last_visible: Vec<bool>,
 }
 
 impl<'a> TreeProjection<'a> {
     #[cfg(test)]
-    fn all(topology: &'a TreeTopology, preorder: &[usize]) -> Self {
+    fn all(topology: &'a TreeTopology) -> Self {
         Self::new(
             topology,
-            preorder,
             vec![true; topology.children.len()],
             vec![true; topology.children.len()],
         )
     }
 
-    fn new(
-        topology: &'a TreeTopology,
-        preorder: &[usize],
-        direct_matches: Vec<bool>,
-        visible: Vec<bool>,
-    ) -> Self {
-        let mut nearest_direct_match = vec![None; topology.children.len()];
+    fn new(topology: &'a TreeTopology, direct_matches: Vec<bool>, visible: Vec<bool>) -> Self {
         let mut last_visible = vec![false; topology.children.len()];
-        for &index in preorder {
-            nearest_direct_match[index] = topology.parents[index].and_then(|parent| {
-                direct_matches[parent]
-                    .then_some(parent)
-                    .or(nearest_direct_match[parent])
-            });
-        }
         for children in &topology.children {
             if let Some(&child) = children.iter().rev().find(|&&child| visible[child]) {
                 last_visible[child] = true;
@@ -172,7 +156,6 @@ impl<'a> TreeProjection<'a> {
         Self {
             topology,
             direct_matches,
-            nearest_direct_match,
             visible,
             last_visible,
         }
@@ -193,12 +176,7 @@ impl<'a> TreeProjection<'a> {
                 visible[index] = false;
             }
         }
-        Self::new(
-            self.topology,
-            preorder,
-            self.direct_matches.clone(),
-            visible,
-        )
+        Self::new(self.topology, self.direct_matches.clone(), visible)
     }
 
     fn visible_children(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
@@ -252,7 +230,6 @@ struct SessionTree {
     conversation_topology: TreeTopology,
     preorder: Vec<usize>,
     active_index: usize,
-    active_entry: SessionEntryId,
 }
 
 impl SessionTree {
@@ -273,7 +250,6 @@ impl SessionTree {
                     entry: entry.entry_id,
                     kind: entry.kind.clone(),
                     canonical_search_text,
-                    is_execution: matches!(&entry.kind, SessionCatalogueKind::Execution { .. }),
                     active_path: false,
                 }
             })
@@ -305,7 +281,6 @@ impl SessionTree {
         let active = *entry_indexes
             .get(&catalogue.active_entry)
             .expect("session catalogue active entry exists");
-        let active_entry = nodes[active].entry;
         let mut current = Some(active);
         while let Some(index) = current {
             nodes[index].active_path = true;
@@ -322,7 +297,6 @@ impl SessionTree {
             conversation_topology,
             preorder,
             active_index: active,
-            active_entry,
         }
     }
 
@@ -342,7 +316,7 @@ impl SessionTree {
             "Session tree",
             "No matching session entries",
             self.items(&projection, row_width, folded_heads),
-            self.active_entry,
+            self.nodes[self.active_index].entry,
         )
     }
 
@@ -396,7 +370,7 @@ impl SessionTree {
                 visible[parent] = true;
             }
         }
-        TreeProjection::new(topology, &self.preorder, direct_matches, visible)
+        TreeProjection::new(topology, direct_matches, visible)
     }
 
     fn items(
@@ -796,10 +770,15 @@ impl TreeNavigator {
             let projection = tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
             if let Some(focused) = focused {
                 let focused = tree.entry_indexes[&focused];
-                if !projection.topology.eligible[focused]
-                    && let Some(fallback) = projection.nearest_direct_match[focused]
-                {
-                    picker.focus_value(tree.nodes[fallback].entry);
+                if !projection.topology.eligible[focused] {
+                    let mut ancestor = projection.topology.parents[focused];
+                    while let Some(index) = ancestor {
+                        if projection.direct_matches[index] {
+                            picker.focus_value(tree.nodes[index].entry);
+                            break;
+                        }
+                        ancestor = projection.topology.parents[index];
+                    }
                 }
             }
             return TreeNavigatorAction::Changed;
@@ -2753,7 +2732,7 @@ mod tests {
         }
 
         let items = tree.items(
-            &TreeProjection::all(&tree.full_topology, &tree.preorder),
+            &TreeProjection::all(&tree.full_topology),
             PICKER_ROW_WIDTH,
             &BTreeSet::new(),
         );
@@ -2872,7 +2851,7 @@ mod tests {
             ],
         ));
         let items = tree.items(
-            &TreeProjection::all(&tree.full_topology, &tree.preorder),
+            &TreeProjection::all(&tree.full_topology),
             19,
             &BTreeSet::new(),
         );
@@ -2945,7 +2924,7 @@ mod tests {
                 entry(2, Some(1), 2, request("narrow")),
             ],
         ));
-        let projection = TreeProjection::all(&tree.full_topology, &tree.preorder);
+        let projection = TreeProjection::all(&tree.full_topology);
 
         for row_width in [0, 1, 2] {
             let items = tree.items(&projection, row_width, &BTreeSet::new());
