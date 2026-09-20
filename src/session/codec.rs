@@ -521,21 +521,23 @@ pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
 
 pub(super) fn decoded_readable_execution(
     entry: &DecodedEntry,
-) -> Option<(ReadableCode, Execution)> {
+) -> Result<Option<(ReadableCode, Execution)>, CodecError> {
     let DecodedEntryPayload::Execution { code, execution } = &entry.0 else {
-        return None;
+        return Ok(None);
     };
-    Some((
+    Ok(Some((
         decode_readable_code(code),
-        decode_execution_value(execution),
-    ))
+        decode_execution_value(execution)?,
+    )))
 }
 
-pub(super) fn decoded_readable_terminal(entry: &DecodedEntry) -> Option<ReadableTerminal> {
+pub(super) fn decoded_readable_terminal(
+    entry: &DecodedEntry,
+) -> Result<Option<ReadableTerminal>, CodecError> {
     let DecodedEntryPayload::Terminal { terminal, .. } = &entry.0 else {
-        return None;
+        return Ok(None);
     };
-    Some(decode_readable_terminal_value(terminal))
+    Ok(Some(decode_readable_terminal_value(terminal)?))
 }
 
 pub(super) fn decoded_execution_history(
@@ -706,19 +708,19 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
                 .executions
                 .into_iter()
                 .map(|execution| {
-                    crate::subagents::TaskExecution::for_persisted(
+                    Ok(crate::subagents::TaskExecution::for_persisted(
                         execution.model_step,
                         execution.source,
                         execution.reasoning_summary,
-                        decode_execution_value(&execution.execution),
+                        decode_execution_value(&execution.execution)?,
                         execution
                             .attempts
                             .into_iter()
                             .map(|attempt| decode_attempt(&attempt))
                             .collect(),
-                    )
+                    ))
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, CodecError>>()?,
             outcome,
         },
     })
@@ -773,8 +775,10 @@ pub(super) fn encode_terminal(
     })
 }
 
-fn decode_readable_terminal_value(terminal: &StoredTerminal) -> ReadableTerminal {
-    match terminal {
+fn decode_readable_terminal_value(
+    terminal: &StoredTerminal,
+) -> Result<ReadableTerminal, CodecError> {
+    Ok(match terminal {
         StoredTerminal::Final {
             text,
             reasoning_summary,
@@ -785,7 +789,7 @@ fn decode_readable_terminal_value(terminal: &StoredTerminal) -> ReadableTerminal
             attempts: attempts.iter().map(decode_attempt).collect(),
         },
         StoredTerminal::Cancelled { evidence, attempts } => ReadableTerminal::Cancelled {
-            evidence: evidence.as_ref().map(decode_evidence),
+            evidence: evidence.as_ref().map(decode_evidence).transpose()?,
             attempts: attempts.iter().map(decode_attempt).collect(),
         },
         StoredTerminal::Failed {
@@ -794,10 +798,10 @@ fn decode_readable_terminal_value(terminal: &StoredTerminal) -> ReadableTerminal
             attempts,
         } => ReadableTerminal::Failed {
             message: message.clone(),
-            evidence: evidence.as_ref().map(decode_evidence),
+            evidence: evidence.as_ref().map(decode_evidence).transpose()?,
             attempts: attempts.iter().map(decode_attempt).collect(),
         },
-    }
+    })
 }
 
 fn decode_readable_code(code: &StoredCode) -> ReadableCode {
@@ -921,8 +925,8 @@ fn encode_execution_value(execution: &Execution) -> StoredExecution {
     }
 }
 
-fn decode_execution_value(execution: &StoredExecution) -> Execution {
-    Execution {
+fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, CodecError> {
+    Ok(Execution {
         stdout: decode_observation(&execution.stdout),
         stderr: decode_observation(&execution.stderr),
         outcome: match &execution.outcome {
@@ -937,8 +941,12 @@ fn decode_execution_value(execution: &StoredExecution) -> Execution {
                 omitted_bytes: *omitted_bytes,
             }),
         },
-        tool_calls: execution.tool_calls.iter().map(decode_tool_call).collect(),
-    }
+        tool_calls: execution
+            .tool_calls
+            .iter()
+            .map(decode_tool_call)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn encode_observation(observation: &Observation) -> StoredObservation {
@@ -1003,8 +1011,11 @@ fn encode_tool_call(call: &ToolCall) -> StoredToolCall {
     }
 }
 
-fn decode_tool_call(call: &StoredToolCall) -> ToolCall {
-    ToolCall {
+fn decode_tool_call(call: &StoredToolCall) -> Result<ToolCall, CodecError> {
+    if !valid_tool_call_pair(&call.tool, &call.summary) {
+        return Err(CodecError::InvalidPayload);
+    }
+    Ok(ToolCall {
         tool: match call.tool {
             StoredToolName::Read => ToolName::Read,
             StoredToolName::Write => ToolName::Write,
@@ -1020,7 +1031,37 @@ fn decode_tool_call(call: &StoredToolCall) -> ToolCall {
             StoredToolName::CancelSubagent => ToolName::CancelSubagent,
         },
         summary: decode_tool_call_summary(&call.summary),
-    }
+    })
+}
+
+fn valid_tool_call_pair(tool: &StoredToolName, summary: &StoredToolCallSummary) -> bool {
+    matches!(
+        (tool, summary),
+        (
+            _,
+            StoredToolCallSummary::Pending | StoredToolCallSummary::Failed
+        ) | (
+            StoredToolName::Run,
+            StoredToolCallSummary::Exit(_) | StoredToolCallSummary::Signal
+        ) | (
+            StoredToolName::Read
+                | StoredToolName::ListDir
+                | StoredToolName::Glob
+                | StoredToolName::Grep,
+            StoredToolCallSummary::Count(_)
+        ) | (
+            StoredToolName::Write,
+            StoredToolCallSummary::Created | StoredToolCallSummary::Replaced
+        ) | (StoredToolName::Edit, StoredToolCallSummary::Applied)
+            | (
+                StoredToolName::StartSubagent
+                    | StoredToolName::GetSubagent
+                    | StoredToolName::RefreshSubagent
+                    | StoredToolName::WaitSubagent
+                    | StoredToolName::CancelSubagent,
+                StoredToolCallSummary::Subagent(_)
+            )
+    )
 }
 
 fn decode_tool_call_summary(summary: &StoredToolCallSummary) -> ToolCallSummary {
@@ -1101,8 +1142,8 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
     }
 }
 
-fn decode_evidence(evidence: &StoredTerminalEvidence) -> TerminalEvidence {
-    match evidence {
+fn decode_evidence(evidence: &StoredTerminalEvidence) -> Result<TerminalEvidence, CodecError> {
+    Ok(match evidence {
         StoredTerminalEvidence::Generation(evidence) => {
             TerminalEvidence::Generation(GenerationEvidence {
                 reasoning_summary: evidence.reasoning_summary.clone(),
@@ -1119,7 +1160,11 @@ fn decode_evidence(evidence: &StoredTerminalEvidence) -> TerminalEvidence {
                 began: evidence.began,
                 stdout: decode_observation(&evidence.stdout),
                 stderr: decode_observation(&evidence.stderr),
-                tool_calls: evidence.tool_calls.iter().map(decode_tool_call).collect(),
+                tool_calls: evidence
+                    .tool_calls
+                    .iter()
+                    .map(decode_tool_call)
+                    .collect::<Result<Vec<_>, _>>()?,
                 cancellation_warning: evidence.cancellation_warning.clone(),
                 failure: evidence.failure.as_ref().map(|failure| match failure {
                     StoredExecutionFailure::Arena { message } => ExecutionFailure::Arena {
@@ -1134,7 +1179,7 @@ fn decode_evidence(evidence: &StoredTerminalEvidence) -> TerminalEvidence {
                 }),
             }))
         }
-    }
+    })
 }
 
 fn encode_attempt(accounting: &AttemptAccounting) -> StoredAttemptAccounting {
@@ -1342,11 +1387,11 @@ mod tests {
 
     use super::{
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
-        decode_path, decode_session_preferences, decode_task_details, decode_tool_value,
-        decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
-        decoded_terminal_history, encode_checkpoint, encode_execution, encode_execution_value,
-        encode_path, encode_request, encode_session_preferences, encode_task_details,
-        encode_terminal, encode_tool_value, fail_unfinished_task_details,
+        decode_path, decode_session_preferences, decode_task_details, decode_task_record_details,
+        decode_tool_value, decoded_execution_history, decoded_readable_execution,
+        decoded_readable_terminal, decoded_terminal_history, encode_checkpoint, encode_execution,
+        encode_execution_value, encode_path, encode_request, encode_session_preferences,
+        encode_task_details, encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
@@ -1431,9 +1476,105 @@ mod tests {
         };
 
         assert_eq!(
-            decode_execution_value(&encode_execution_value(&execution)),
+            decode_execution_value(&encode_execution_value(&execution)).expect("decode execution"),
             execution
         );
+    }
+
+    #[test]
+    fn codec_rejects_invalid_tool_pairs_in_all_stored_execution_evidence() {
+        let mut execution = task_execution();
+        execution.tool_calls.push(crate::arena::ToolCall {
+            tool: crate::arena::ToolName::StartSubagent,
+            summary: crate::arena::ToolCallSummary::Subagent("00".to_owned()),
+        });
+        let code = crate::session::PersistedCode {
+            source: "value = 1".to_owned(),
+            call_id: crate::model::ModelCallId::new("call-id"),
+            commentary: None,
+            reasoning_summary: String::new(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("provider", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(execution.clone()),
+            attempts: Vec::new(),
+        };
+        let stored = encode_execution(&code).expect("encode foreground execution");
+        let mut foreground: serde_json::Value =
+            serde_json::from_str(&stored.payload_json).expect("decode foreground execution");
+        foreground["Execution"]["execution"]["tool_calls"][0]["tool"] =
+            serde_json::Value::String("Read".to_owned());
+        let decoded =
+            decode_entry(stored.kind, &foreground.to_string()).expect("decode foreground envelope");
+        assert!(matches!(
+            decoded_readable_execution(&decoded),
+            Err(super::CodecError::InvalidPayload)
+        ));
+
+        let terminal = crate::session::PersistedTerminal::Cancelled {
+            evidence: Some(crate::agent::TerminalEvidence::Execution(Box::new(
+                crate::agent::ExecutionEvidence {
+                    source: "value = 1".to_owned(),
+                    commentary: None,
+                    reasoning_summary: String::new(),
+                    began: true,
+                    stdout: execution.stdout.clone(),
+                    stderr: execution.stderr.clone(),
+                    tool_calls: execution.tool_calls.clone(),
+                    cancellation_warning: None,
+                    failure: None,
+                },
+            ))),
+            attempts: Vec::new(),
+        };
+        let stored = encode_terminal(&terminal, None).expect("encode terminal evidence");
+        let mut terminal: serde_json::Value =
+            serde_json::from_str(&stored.payload_json).expect("decode terminal evidence");
+        terminal["Terminal"]["terminal"]["Cancelled"]["evidence"]["Execution"]["tool_calls"][0]["tool"] =
+            serde_json::Value::String("Read".to_owned());
+        let decoded =
+            decode_entry(stored.kind, &terminal.to_string()).expect("decode terminal envelope");
+        assert!(matches!(
+            decoded_readable_terminal(&decoded),
+            Err(super::CodecError::InvalidPayload)
+        ));
+
+        let selection = crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .expect("default selection");
+        let record =
+            crate::subagents::TaskRecord::for_test("0a", 1, selection, None, 1, Vec::new())
+                .with_persisted_details_for_test(TaskPersistedDetails {
+                    admitted_at_ms: 1,
+                    terminal_at_ms: None,
+                    state: crate::subagents::TaskState::Running,
+                    step_count: 1,
+                    elapsed: std::time::Duration::ZERO,
+                    observed_at_ms: 1,
+                    attempt_evidence: Vec::new(),
+                    executions: vec![crate::subagents::TaskExecution::for_test(
+                        1,
+                        "value = 1".to_owned(),
+                        String::new(),
+                        execution,
+                        Vec::new(),
+                    )],
+                    outcome: None,
+                });
+        let mut child: serde_json::Value = serde_json::from_str(
+            &encode_task_details(&record).expect("encode child task evidence"),
+        )
+        .expect("decode child task evidence");
+        child["executions"][0]["execution"]["tool_calls"][0]["tool"] =
+            serde_json::Value::String("Read".to_owned());
+        assert!(matches!(
+            decode_task_record_details(&child.to_string()),
+            Err(super::CodecError::InvalidPayload)
+        ));
     }
 
     #[test]
@@ -1544,7 +1685,7 @@ mod tests {
             }
         );
         assert_eq!(
-            decoded_readable_execution(&decoded),
+            decoded_readable_execution(&decoded).expect("decode readable execution"),
             Some((
                 crate::session::ReadableCode {
                     source: code.source.clone(),
@@ -1599,7 +1740,7 @@ mod tests {
             unreachable!("test terminal is cancelled");
         };
         assert_eq!(
-            decoded_readable_terminal(&decoded),
+            decoded_readable_terminal(&decoded).expect("decode readable terminal"),
             Some(crate::session::ReadableTerminal::Cancelled { evidence, attempts })
         );
 

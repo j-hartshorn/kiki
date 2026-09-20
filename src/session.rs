@@ -1987,6 +1987,7 @@ fn session_catalogue_entry(
         },
         codec::DecodedEntryKind::Execution => {
             let (code, execution) = codec::decoded_readable_execution(&decoded)
+                .map_err(|error| SessionError::Codec(error.to_string()))?
                 .ok_or(SessionError::InvalidTransition)?;
             if !matches!(&code.result, crate::model::CodeResult::Execution { .. }) {
                 return Err(SessionError::InvalidTransition);
@@ -2549,7 +2550,9 @@ fn readable_record(
         }
         "execution" => {
             let step_id = settled_step_id(entry, steps)?;
-            let (code, execution) = codec::decoded_readable_execution(decoded).ok_or(())?;
+            let (code, execution) = codec::decoded_readable_execution(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             if !matches!(code.result, crate::model::CodeResult::Execution { .. }) {
                 return Err(());
             }
@@ -2565,7 +2568,9 @@ fn readable_record(
         "final_reply" => {
             let step_id = settled_step_id(entry, steps)?;
             let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
-            let terminal = codec::decoded_readable_terminal(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             let ReadableTerminal::Final {
                 text,
                 reasoning_summary,
@@ -2588,7 +2593,9 @@ fn readable_record(
         }
         "cancelled" => {
             let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
-            let terminal = codec::decoded_readable_terminal(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             if !matches!(terminal, ReadableTerminal::Cancelled { .. })
                 || runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
                 || code.is_some_and(|code| {
@@ -2607,7 +2614,9 @@ fn readable_record(
         }
         "failed" => {
             let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
-            let terminal = codec::decoded_readable_terminal(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             let ReadableTerminal::Failed { message, .. } = &terminal else {
                 return Err(());
             };
@@ -4613,7 +4622,7 @@ mod tests {
                 },
                 ToolCall {
                     tool: ToolName::Write,
-                    summary: ToolCallSummary::Signal,
+                    summary: ToolCallSummary::Created,
                 },
             ],
         };
@@ -4967,6 +4976,98 @@ mod tests {
             restore.observed_active_entry,
             SessionEntryId(selected_leaf as u64)
         );
+        assert!(matches!(
+            writer.catalogue().await,
+            Err(SessionError::Codec(_))
+        ));
+        assert_eq!(active_entry_id(&session), selected_leaf);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrupt_non_selected_execution_tool_call_fails_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let selected_run = writer
+            .commit_request("selected request".to_owned())
+            .await
+            .expect("commit selected request")
+            .run_id;
+        let _ = settle_fixture_execution(
+            &session,
+            &writer,
+            selected_run,
+            "selected_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        writer
+            .close_run(
+                selected_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selected terminal".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close selected run");
+        let selected_leaf = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let sibling_run = writer
+            .commit_request("sibling request".to_owned())
+            .await
+            .expect("commit sibling request")
+            .run_id;
+        let (_, sibling_execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            sibling_run,
+            "sibling_value = 2",
+            None,
+            vec![ToolCall {
+                tool: ToolName::StartSubagent,
+                summary: ToolCallSummary::Subagent("00".to_owned()),
+            }],
+        )
+        .await;
+        set_active_entry(&session, selected_leaf);
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            let payload_json: String = connection
+                .query_row(
+                    "SELECT payload_json FROM entries WHERE id = ?1",
+                    params![sibling_execution],
+                    |row| row.get(0),
+                )
+                .expect("read sibling execution");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&payload_json).expect("decode sibling execution");
+            payload["Execution"]["execution"]["tool_calls"][0]["tool"] =
+                serde_json::Value::String("Read".to_owned());
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                    params![payload.to_string(), sibling_execution],
+                )
+                .expect("corrupt sibling tool call");
+        }
+
         assert!(matches!(
             writer.catalogue().await,
             Err(SessionError::Codec(_))
