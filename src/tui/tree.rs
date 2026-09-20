@@ -5,10 +5,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
-use crate::transcript::{normalise_terminal_text, observation_text, tool_call_label};
+use crate::transcript::{
+    normalise_terminal_text, observation_text, tool_call_label, truncate_front,
+};
 
 use super::picker::{
     DynamicPickerItem, DynamicPickerRole, PICKER_MAX_WIDTH, Picker, PickerAction, canonical_search,
@@ -27,6 +30,17 @@ const WARNING: Color = Color::Rgb(255, 255, 0);
 const MUTED: Color = Color::Rgb(128, 128, 128);
 const DIM: Color = Color::Rgb(102, 102, 102);
 const SELECTED_BACKGROUND: Color = Color::Rgb(58, 58, 74);
+const BORDER: Color = Color::Rgb(95, 135, 255);
+const HEADER_SEPARATOR: &str = " · ";
+const HEADER_HINTS: [&str; 7] = [
+    "Enter restore",
+    "Esc clear/close",
+    "↑/↓ move",
+    "←/→ branch",
+    "Ctrl-X copy",
+    "Ctrl-U conversation",
+    "PgUp/PgDn page",
+];
 
 struct TreeNode {
     entry: SessionEntryId,
@@ -616,12 +630,134 @@ impl TreeNavigator {
         tree.refresh_for_query(picker, mode, &query, row_width, &self.folded_heads);
     }
 
-    pub(crate) fn desired_height(&self) -> u16 {
-        self.picker().desired_height()
+    pub(crate) fn content_height(&self) -> u16 {
+        self.picker().content_height()
     }
 
-    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        self.picker_mut().render_in(frame, area);
+    pub(crate) fn render(&mut self, frame: &mut Frame, dock: Rect, notice: Option<&str>) {
+        if dock.is_empty() {
+            return;
+        }
+        frame.render_widget(Clear, dock);
+        render_rule(frame, Rect::new(dock.x, dock.y, dock.width, 1));
+        if dock.height == 1 {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(self.header(dock.width, notice)),
+            Rect::new(dock.x, dock.y.saturating_add(1), dock.width, 1),
+        );
+        if dock.height == 2 {
+            return;
+        }
+        render_rule(
+            frame,
+            Rect::new(dock.x, dock.y.saturating_add(2), dock.width, 1),
+        );
+        if dock.height > 3 {
+            self.picker_mut().render_frameless(
+                frame,
+                Rect::new(
+                    dock.x,
+                    dock.y.saturating_add(3),
+                    dock.width,
+                    dock.height.saturating_sub(3),
+                ),
+            );
+        }
+    }
+
+    fn header(&self, width: u16, notice: Option<&str>) -> String {
+        let notice = notice
+            .map(normalise_single_line)
+            .filter(|notice| !notice.is_empty());
+        let query_text = (!self.picker().filter().is_empty())
+            .then(|| normalise_header_line(self.picker().filter()));
+        let query = query_text.as_ref().map(|query| format!("Search: {query}"));
+        let position = (!self.is_loading()).then(|| {
+            let (selected, total) = self.picker().position();
+            format!("{selected}/{total}")
+        });
+        let mode = (self.mode == TreeMode::Conversation).then(|| "[conversation]".to_owned());
+
+        let mut core = vec!["Session tree".to_owned()];
+        if let Some(notice) = &notice {
+            core.push(notice.clone());
+        }
+        if let Some(query) = &query {
+            core.push(query.clone());
+        }
+        if let Some(position) = &position {
+            core.push(position.clone());
+        }
+        if let Some(mode) = &mode {
+            core.push(mode.clone());
+        }
+
+        let mut with_hints = core.clone();
+        if notice.is_none() {
+            for hint in HEADER_HINTS {
+                let mut candidate = with_hints.clone();
+                candidate.push(hint.to_owned());
+                if display_width(&header_text(&candidate)) <= usize::from(width) {
+                    with_hints = candidate;
+                } else {
+                    break;
+                }
+            }
+        }
+        let header = header_text(&with_hints);
+        if display_width(&header) <= usize::from(width) {
+            return header;
+        }
+
+        let mut without_position = vec!["Session tree".to_owned()];
+        if let Some(notice) = &notice {
+            without_position.push(notice.clone());
+        }
+        if let Some(query) = &query {
+            without_position.push(query.clone());
+        }
+        if let Some(mode) = &mode {
+            without_position.push(mode.clone());
+        }
+        let header = header_text(&without_position);
+        if display_width(&header) <= usize::from(width) {
+            return header;
+        }
+
+        if let Some(query_text) = query_text {
+            let mut without_query = vec!["Session tree".to_owned()];
+            if let Some(notice) = &notice {
+                without_query.push(notice.clone());
+            }
+            if let Some(mode) = &mode {
+                without_query.push(mode.clone());
+            }
+            let query_width = usize::from(width)
+                .saturating_sub(display_width(&header_text(&without_query)))
+                .saturating_sub(display_width(HEADER_SEPARATOR));
+            let prefix_width = display_width("Search: ");
+            if query_width > prefix_width {
+                let mut truncated = vec!["Session tree".to_owned()];
+                if let Some(notice) = &notice {
+                    truncated.push(notice.clone());
+                }
+                truncated.push(format!(
+                    "Search: {}",
+                    truncate_front(&query_text, query_width.saturating_sub(prefix_width))
+                ));
+                if let Some(mode) = &mode {
+                    truncated.push(mode.clone());
+                }
+                let header = header_text(&truncated);
+                if display_width(&header) <= usize::from(width) {
+                    return header;
+                }
+            }
+            without_position = without_query;
+        }
+        clip_end(&header_text(&without_position), usize::from(width))
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> TreeNavigatorAction {
@@ -777,6 +913,35 @@ impl TreeNavigator {
             }
         }
     }
+}
+
+fn render_rule(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(area.width))).style(Style::new().fg(BORDER)),
+        area,
+    );
+}
+
+fn header_text(segments: &[String]) -> String {
+    segments.join(HEADER_SEPARATOR)
+}
+
+fn display_width(text: &str) -> usize {
+    Line::raw(text).width()
+}
+
+fn clip_end(text: &str, width: usize) -> String {
+    let mut clipped = String::new();
+    let mut used = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        clipped.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    clipped
 }
 
 struct StyledRow {
@@ -1087,6 +1252,10 @@ fn normalise_single_line(text: &str) -> String {
         .join(" ")
 }
 
+fn normalise_header_line(text: &str) -> String {
+    normalise_terminal_text(text).replace('\n', "\\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1153,6 +1322,130 @@ mod tests {
             navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             TreeNavigatorAction::Close
         );
+    }
+
+    #[test]
+    fn header_prioritises_live_state_on_one_line() {
+        let mut navigator = TreeNavigator::new(17, "credentials");
+        assert!(navigator.install_catalogue(
+            17,
+            &catalogue(
+                3,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("authorise access")),
+                    entry(
+                        3,
+                        Some(2),
+                        3,
+                        execution(Some("inspect credentials"), Vec::new()),
+                    ),
+                ],
+            )
+        ));
+
+        for (width, expected) in [
+            (
+                200,
+                "Session tree · Search: credentials · 1/1 · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page",
+            ),
+            (
+                95,
+                "Session tree · Search: credentials · 1/1 · Enter restore · Esc clear/close · ↑/↓ move",
+            ),
+            (32, "Session tree · Search: …dentials"),
+            (10, "Session tr"),
+        ] {
+            assert_eq!(navigator.header(width, None), expected);
+        }
+        assert_eq!(
+            navigator.header(200, Some(" Copied\n\t\u{1b}")),
+            "Session tree · Copied \\x1B · Search: credentials · 1/1"
+        );
+        assert_eq!(navigator.header(16, Some("🧑‍💻")), "Session tree · ");
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(
+            navigator.header(200, None),
+            "Session tree · Search: credentials · 1/1 · [conversation] · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
+        );
+
+        let loading = TreeNavigator::new(18, "credentials");
+        assert_eq!(
+            loading.header(200, None),
+            "Session tree · Search: credentials · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
+        );
+        let mut no_match = TreeNavigator::new(19, "missing");
+        assert!(no_match.install_catalogue(
+            19,
+            &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
+        ));
+        assert_eq!(
+            no_match.header(200, None),
+            "Session tree · Search: missing · 0/0 · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy · Ctrl-U conversation · PgUp/PgDn page"
+        );
+
+        let unicode = TreeNavigator::new(20, "needle 🧑‍💻");
+        assert_eq!(unicode.header(25, None), "Session tree · Search: …");
+
+        let repeated_spaces = TreeNavigator::new(21, "  repeated  spaces  \nnext  ");
+        let repeated_header = repeated_spaces.header(200, None);
+        assert!(
+            repeated_header.contains("Search:   repeated  spaces  \\nnext  "),
+            "{repeated_header}"
+        );
+        assert!(!repeated_header.contains('\n'), "{repeated_header}");
+
+        let mut whitespace_only = TreeNavigator::new(22, "   ");
+        assert!(whitespace_only.install_catalogue(
+            22,
+            &catalogue(1, [entry(1, None, 1, SessionCatalogueKind::Start)])
+        ));
+        assert!(
+            whitespace_only.header(200, None).contains("Search:    "),
+            "{}",
+            whitespace_only.header(200, None)
+        );
+        assert_eq!(
+            whitespace_only.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert!(!whitespace_only.header(200, None).contains("Search:"));
+    }
+
+    #[test]
+    fn dock_renders_full_width_rules_and_frameless_content() {
+        let mut navigator = TreeNavigator::new(21, "");
+        assert!(navigator.install_catalogue(
+            21,
+            &catalogue(
+                2,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("frameless row")),
+                ],
+            )
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal
+            .draw(|frame| navigator.render(frame, frame.area(), None))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for row in [0, 2] {
+            for column in 0..40 {
+                assert_eq!(buffer[(column, row)].symbol(), "─");
+                assert_eq!(buffer[(column, row)].fg, Color::Rgb(95, 135, 255));
+            }
+        }
+        assert!(row_text(buffer, 1).starts_with("Session tree"));
+        assert_eq!(buffer[(0, 3)].symbol(), " ");
+        assert!(row_text(buffer, 3).contains("Session start"));
+        assert!(row_text(buffer, 4).contains("frameless row"));
+        assert!(!row_text(buffer, 3).contains("Filter:"));
+        assert_ne!(buffer[(0, 0)].symbol(), "┌");
     }
 
     #[test]
@@ -2850,6 +3143,12 @@ mod tests {
             revision,
             kind,
         }
+    }
+
+    fn row_text(buffer: &Buffer, row: u16) -> String {
+        (buffer.area.left()..buffer.area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
     }
 
     fn tree_rows(picker: &mut Picker<SessionEntryId>) -> Vec<String> {

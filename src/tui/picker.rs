@@ -152,6 +152,17 @@ impl<T: Copy + Eq> Picker<T> {
         true
     }
 
+    pub(crate) fn position(&self) -> (usize, usize) {
+        let matches = self.focusable_matches();
+        let Some(index) = self
+            .focus
+            .and_then(|focus| matches.iter().position(|index| *index == focus))
+        else {
+            return (0, 0);
+        };
+        (index.saturating_add(1), matches.len())
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
         match key.code {
             KeyCode::Esc => PickerAction::Close,
@@ -191,12 +202,15 @@ impl<T: Copy + Eq> Picker<T> {
     }
 
     pub(crate) fn desired_height(&self) -> u16 {
+        self.content_height().saturating_add(3)
+    }
+
+    pub(crate) fn content_height(&self) -> u16 {
         u16::try_from(
             self.items
                 .len()
                 .saturating_add(self.group_heading_count())
-                .max(1)
-                .saturating_add(3),
+                .max(1),
         )
         .unwrap_or(u16::MAX)
     }
@@ -219,56 +233,70 @@ impl<T: Copy + Eq> Picker<T> {
 
         let result_rows = usize::from(inner.height.saturating_sub(1));
         let mut lines = vec![Line::raw(format!("Filter: {}", self.filter))];
+        lines.extend(self.rows(result_rows));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    pub(crate) fn render_frameless(&mut self, frame: &mut Frame, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Paragraph::new(self.rows(usize::from(area.height))), area);
+    }
+
+    fn rows(&mut self, result_rows: usize) -> Vec<Line<'static>> {
         let matches = self.matches();
         if matches.is_empty() {
-            if result_rows > 0 {
-                lines.push(Line::raw(self.empty_message));
-            }
-        } else {
-            let focus = self.focus;
-            let focused_match = focus.and_then(|focus| {
-                matches
-                    .iter()
-                    .position(|matched| matched.index == focus && matched.direct)
-            });
-            let mut start = focused_match.map_or_else(
-                || self.scroll.min(matches.len().saturating_sub(1)),
-                |focused_match| self.scroll.min(focused_match),
-            );
-            let mut visible = self.visible_matches(&matches, start, result_rows);
-            if let Some(focused_match) = focused_match {
-                while !visible.contains(&matches[focused_match].index) && start < focused_match {
-                    start += 1;
-                    visible = self.visible_matches(&matches, start, result_rows);
-                }
-            }
-            self.scroll = start;
-            self.page_size = visible
-                .iter()
-                .filter(|index| self.is_direct_match(**index))
-                .count()
-                .max(1);
+            return if result_rows > 0 {
+                vec![Line::raw(self.empty_message)]
+            } else {
+                Vec::new()
+            };
+        }
 
-            let mut last_group = None;
-            for index in visible {
-                let item = &self.items[index];
-                if result_rows > 1 && item.group.is_some_and(|group| last_group != Some(group)) {
-                    lines.push(Line::raw(item.group.expect("group was checked")));
-                    last_group = item.group;
-                }
-                let row = if focus == Some(index) {
-                    item.focused_row.clone().unwrap_or_else(|| {
-                        let mut row = item.row.clone();
-                        row.style = row.style.add_modifier(Modifier::REVERSED);
-                        row
-                    })
-                } else {
-                    item.row.clone()
-                };
-                lines.push(row);
+        let focus = self.focus;
+        let focused_match = focus.and_then(|focus| {
+            matches
+                .iter()
+                .position(|matched| matched.index == focus && matched.direct)
+        });
+        let mut start = focused_match.map_or_else(
+            || self.scroll.min(matches.len().saturating_sub(1)),
+            |focused_match| self.scroll.min(focused_match),
+        );
+        let mut visible = self.visible_matches(&matches, start, result_rows);
+        if let Some(focused_match) = focused_match {
+            while !visible.contains(&matches[focused_match].index) && start < focused_match {
+                start += 1;
+                visible = self.visible_matches(&matches, start, result_rows);
             }
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        self.scroll = start;
+        self.page_size = visible
+            .iter()
+            .filter(|index| self.is_direct_match(**index))
+            .count()
+            .max(1);
+
+        let mut lines = Vec::new();
+        let mut last_group = None;
+        for index in visible {
+            let item = &self.items[index];
+            if result_rows > 1 && item.group.is_some_and(|group| last_group != Some(group)) {
+                lines.push(Line::raw(item.group.expect("group was checked")));
+                last_group = item.group;
+            }
+            lines.push(if focus == Some(index) {
+                item.focused_row.clone().unwrap_or_else(|| {
+                    let mut row = item.row.clone();
+                    row.style = row.style.add_modifier(Modifier::REVERSED);
+                    row
+                })
+            } else {
+                item.row.clone()
+            });
+        }
+        lines
     }
 
     fn initial_focus(items: &[PickerRow<T>], current: T) -> Option<usize> {
@@ -663,6 +691,48 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn static_pickers_are_framed_while_dynamic_rows_are_frameless_with_position() {
+        let mut static_picker = picker("sol");
+        let static_buffer = rendered_buffer(&mut static_picker, 40, 8);
+        assert_eq!(static_buffer[(0, 0)].symbol(), "┌");
+        assert!(rendered(&mut static_picker, 40, 8).contains("Filter: "));
+
+        let mut dynamic = Picker::new_dynamic(
+            "Session tree",
+            "No matching session entries",
+            [
+                dynamic_item("context", "Session start", DynamicPickerRole::Context),
+                dynamic_item("one", "First", DynamicPickerRole::Direct),
+                dynamic_item("two", "Second", DynamicPickerRole::Direct),
+            ],
+            "one",
+        );
+        assert_eq!(dynamic.position(), (1, 2));
+        assert_eq!(
+            dynamic.handle_key(key(KeyCode::Down)),
+            PickerAction::Changed
+        );
+        assert_eq!(dynamic.position(), (2, 2));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        terminal
+            .draw(|frame| dynamic.render_frameless(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "S");
+        assert_eq!(buffer[(0, 1)].symbol(), "F");
+        let screen = buffer
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("First"));
+        assert!(screen.contains("Second"));
+        assert!(!screen.contains("Filter:"));
     }
 
     #[test]

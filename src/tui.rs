@@ -2040,36 +2040,39 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     let configuration_only = app.is_configuration_only();
-    let notice = app.notice();
-    let header = if configuration_only {
-        notice.map_or_else(
-            || {
-                "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
-                    .to_owned()
-            },
-            |notice| {
-                format!(
-                    "{notice} | Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
-                )
-            },
-        )
-    } else if app.transcript.is_disabled() {
-        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
-        format!(
-            "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T thinking | Ctrl-O expand | Ctrl-C quit",
-            app.transcript.status()
-        )
-    } else {
-        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
-        format!(
-            "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
-            app.transcript.status()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(normalise_terminal_text(&header)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
+    let tree_open = app.tree_navigator.is_some();
+    if !tree_open {
+        let notice = app.notice();
+        let header = if configuration_only {
+            notice.map_or_else(
+                || {
+                    "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                        .to_owned()
+                },
+                |notice| {
+                    format!(
+                        "{notice} | Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                    )
+                },
+            )
+        } else if app.transcript.is_disabled() {
+            let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
+            format!(
+                "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T thinking | Ctrl-O expand | Ctrl-C quit",
+                app.transcript.status()
+            )
+        } else {
+            let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
+            format!(
+                "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
+                app.transcript.status()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(normalise_terminal_text(&header)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
 
     if configuration_only {
         let _ = app.subagent_monitor.layout(area.width, 0, now);
@@ -2090,44 +2093,43 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         return;
     }
 
-    if area.height == 1 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
-        app.history_unavailable();
-        return;
-    }
-
     let bottom_rule = Rect::new(
         area.x,
         area.y.saturating_add(area.height.saturating_sub(1)),
         area.width,
         1,
     );
-    if app.tree_navigator.is_some() {
+    if tree_open {
+        let notice = app.notice().map(str::to_owned);
+        let content_height = app
+            .tree_navigator
+            .as_ref()
+            .map_or(0, TreeNavigator::content_height)
+            .min(area.height / 2);
+        let dock_height = content_height
+            .saturating_add(3)
+            .min(area.height.saturating_sub(1));
+        let dock_top = bottom_rule.y.saturating_sub(dock_height);
         app.tree_navigator
             .as_mut()
             .expect("tree navigator was checked before rendering")
-            .refresh_width(usize::from(area.width.saturating_sub(2)));
-        let header_bottom = area.y.saturating_add(1);
-        let picker_bottom = bottom_rule.y;
-        let picker_height = app
-            .tree_navigator
-            .as_ref()
-            .map_or(0, TreeNavigator::desired_height)
-            .min(area.height / 2)
-            .min(picker_bottom.saturating_sub(header_bottom));
-        let picker_top = picker_bottom.saturating_sub(picker_height);
-        let history_height = picker_top.saturating_sub(header_bottom);
-        let monitor =
-            app.subagent_monitor
-                .layout(area.width, history_height.saturating_sub(1), now);
-        let monitor_top = picker_top.saturating_sub(monitor.height());
-        let history = Rect::new(
-            area.x,
-            header_bottom,
+            .refresh_width(usize::from(area.width));
+        let monitor = app.subagent_monitor.layout(
             area.width,
-            monitor_top.saturating_sub(header_bottom),
+            dock_top.saturating_sub(area.y).saturating_sub(1),
+            now,
         );
-        let layout = render_history(frame, app, history);
+        let monitor_top = dock_top.saturating_sub(monitor.height());
+        let layout = render_history(
+            frame,
+            app,
+            Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                monitor_top.saturating_sub(area.y),
+            ),
+        );
         monitor.render(
             frame,
             Rect::new(area.x, monitor_top, area.width, monitor.height()),
@@ -2140,9 +2142,16 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         if let Some(navigator) = &mut app.tree_navigator {
             navigator.render(
                 frame,
-                Rect::new(area.x, picker_top, area.width, picker_height),
+                Rect::new(area.x, dock_top, area.width, dock_height),
+                notice.as_deref(),
             );
         }
+        return;
+    }
+
+    if area.height == 1 {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        app.history_unavailable();
         return;
     }
 
@@ -2745,29 +2754,20 @@ mod tests {
             .expect("history top row")
     }
 
-    fn tree_picker_top(buffer: &Buffer) -> u16 {
-        (buffer.area.top()..buffer.area.bottom())
-            .find(|row| buffer[(buffer.area.left(), *row)].symbol() == "┌")
-            .expect("tree picker top border")
-    }
-
-    fn tree_picker_bottom(buffer: &Buffer) -> u16 {
-        let row = (buffer.area.top()..buffer.area.bottom())
-            .find(|row| buffer[(buffer.area.left(), *row)].symbol() == "└")
-            .expect("tree picker bottom border");
-        row.saturating_add(1)
-    }
-
     fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
         for row in buffer.area.top()..buffer.area.bottom() {
-            let rendered = (buffer.area.left()..buffer.area.right())
-                .map(|column| buffer[(column, row)].symbol())
-                .collect::<String>();
+            let rendered = buffer_row(buffer, row);
             if let Some(column) = rendered.find(text) {
                 return (u16::try_from(column).expect("test terminal column"), row);
             }
         }
         panic!("rendered text: {text}")
+    }
+
+    fn buffer_row(buffer: &Buffer, row: u16) -> String {
+        (buffer.area.left()..buffer.area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
     }
 
     fn observation(text: &str) -> Observation {
@@ -4057,114 +4057,105 @@ mod tests {
     }
 
     #[test]
-    fn session_tree_picker_replaces_prompt_dock_and_restores_draft() {
-        let mut app = app_with_prompt("hidden draft");
-        let revision = tree_request(&mut app, "");
-        load_tree(&mut app, revision);
-
-        let tree_screen = rendered(&mut app, 100, 12);
-        assert!(!tree_screen.contains("hidden draft"), "{tree_screen}");
-        let tree = rendered_buffer(&mut app, 100, 12);
-        let tree_bottom = tree_picker_bottom(&tree);
-        assert_eq!(tree_bottom, tree.area.bottom().saturating_sub(1));
-        assert!(
-            !(tree.area.top()..tree.area.bottom().saturating_sub(1)).any(|row| {
-                (tree.area.left()..tree.area.right())
-                    .all(|column| tree[(column, row)].symbol() == "─")
-            }),
-            "prompt rule rendered while tree was open"
-        );
-        assert_eq!(
-            tree[(0, tree_bottom)].symbol(),
-            "─",
-            "footer remains below tree"
-        );
-
-        assert!(app.handle_key(key(KeyCode::Esc)).visible_changed);
-        assert_eq!(app.prompt.text(), "hidden draft");
-        let restored = rendered(&mut app, 100, 12);
-        assert!(restored.contains("hidden draft"), "{restored}");
-        let restored = rendered_buffer(&mut app, 100, 12);
-        assert!(
-            (restored.area.top()..restored.area.bottom().saturating_sub(1)).any(|row| {
-                (restored.area.left()..restored.area.right())
-                    .all(|column| restored[(column, row)].symbol() == "─")
-            }),
-            "prompt rule was not restored"
-        );
-    }
-
-    #[test]
-    fn session_tree_picker_ignores_hidden_multiline_draft_geometry() {
-        let mut single_line = app_with_prompt("one line");
-        let revision = tree_request(&mut single_line, "");
-        load_tree(&mut single_line, revision);
-        let single_line_tree = rendered_buffer(&mut single_line, 100, 12);
-
-        let mut multiline = app_with_prompt("one\ntwo");
-        let revision = tree_request(&mut multiline, "");
-        load_tree(&mut multiline, revision);
-        let multiline_tree = rendered_buffer(&mut multiline, 100, 12);
-
-        assert_eq!(
-            tree_picker_top(&multiline_tree),
-            tree_picker_top(&single_line_tree)
-        );
-        assert_eq!(
-            tree_picker_bottom(&multiline_tree),
-            tree_picker_bottom(&single_line_tree)
-        );
-
-        assert!(multiline.handle_key(key(KeyCode::Esc)).visible_changed);
-        assert_eq!(multiline.prompt.text(), "one\ntwo");
-    }
-
-    #[test]
-    fn session_tree_picker_keeps_subagent_monitor_above_tree() {
+    fn session_tree_picker_composes_rules_content_and_surrounding_views() {
         let now = Instant::now();
-        let mut app = App::default();
+        let mut app = app_with_history(app_with_prompt("hidden\nmultiline draft"));
         app.subagent_monitor
             .insert_for_test("child", TaskState::Completed, now);
-        let revision = tree_request(&mut app, "");
-        load_tree(&mut app, revision);
-
-        let tree = rendered_buffer(&mut app, 100, 12);
-        let (_, monitor_row) = cell_start(&tree, "✓ subagent:child");
-        assert!(monitor_row < tree_picker_top(&tree));
-    }
-
-    #[test]
-    fn session_tree_picker_caps_at_half_height_and_pages_scrolling_rows() {
-        let mut app = App::default();
         let revision = tree_request(&mut app, "");
         assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
             revision,
             outcome: TreeRequestOutcome::Catalogue(long_session_tree_catalogue(20)),
         }));
 
-        let initial = rendered(&mut app, 100, 20);
-        assert_eq!(tree_picker_top(&rendered_buffer(&mut app, 100, 20)), 9);
-        assert_eq!(tree_picker_bottom(&rendered_buffer(&mut app, 100, 20)), 19);
-        assert!(!initial.contains("User: entry 7"), "{initial}");
+        let screen = rendered_at(&mut app, 100, 20, now);
+        assert!(!screen.contains("hidden"), "{screen}");
+        assert!(!screen.contains("Status:"), "{screen}");
+        let tree = rendered_buffer(&mut app, 100, 20);
+        for row in [6, 8] {
+            assert!(
+                (tree.area.left()..tree.area.right())
+                    .all(|column| tree[(column, row)].symbol() == "─"),
+                "tree rule at row {row}"
+            );
+        }
+        assert!(
+            (tree.area.left()..tree.area.right()).all(|column| tree[(column, 19)].symbol() == "─"),
+            "footer rule"
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 7)].symbol())
+                .collect::<String>()
+                .starts_with("Session tree")
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 9)].symbol())
+                .collect::<String>()
+                .contains("Session start")
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 18)].symbol())
+                .collect::<String>()
+                .contains("User: entry 9")
+        );
+        let (_, transcript_row) = cell_start(&tree, "request 8");
+        let (_, monitor_row) = cell_start(&tree, "✓ subagent:child");
+        assert!(transcript_row < 6, "transcript row {transcript_row}");
+        assert!(monitor_row < 6, "monitor row {monitor_row}");
+        assert!(!screen.contains("Filter:"), "{screen}");
+        assert!(!screen.contains('┌'), "{screen}");
 
         assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
-        let paged = rendered(&mut app, 100, 20);
-        assert!(paged.contains("User: entry 7"), "{paged}");
-        assert_eq!(tree_picker_top(&rendered_buffer(&mut app, 100, 20)), 9);
-        assert_eq!(tree_picker_bottom(&rendered_buffer(&mut app, 100, 20)), 19);
+        let paged = rendered_at(&mut app, 100, 20, now);
+        assert!(paged.contains("User: entry 10"), "{paged}");
+
+        assert!(app.handle_key(key(KeyCode::Esc)).visible_changed);
+        assert_eq!(app.prompt.text(), "hidden\nmultiline draft");
+        let restored = rendered_at(&mut app, 100, 20, now);
+        assert!(restored.contains("hidden"), "{restored}");
+        assert!(restored.contains("multiline draft"), "{restored}");
     }
 
     #[test]
-    fn only_session_tree_picker_replaces_the_prompt_dock() {
-        let mut tree = app_with_prompt("tree draft");
+    fn only_session_tree_picker_clips_constrained_docks_while_ordinary_pickers_remain_boxed() {
+        let mut tree = app_with_prompt("hidden\nmultiline draft");
+        let revision = tree_request(&mut tree, "");
+        assert!(tree.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(long_session_tree_catalogue(20)),
+        }));
+
+        let screen = rendered(&mut tree, 100, 10);
+        assert!(!screen.contains("hidden"), "{screen}");
+        assert!(!screen.contains("multiline draft"), "{screen}");
+        assert!(!screen.contains("User: entry 5"), "{screen}");
+        let tree_buffer = rendered_buffer(&mut tree, 100, 10);
+        assert_eq!(buffer_row(&tree_buffer, 1), "─".repeat(100));
+        assert_eq!(
+            buffer_row(&tree_buffer, 2).trim_end(),
+            "Session tree · 1/21 · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy"
+        );
+        assert_eq!(buffer_row(&tree_buffer, 3), "─".repeat(100));
+        assert_eq!(buffer_row(&tree_buffer, 4).trim_end(), "› ● Session start");
+        assert_eq!(buffer_row(&tree_buffer, 8).trim_end(), "     User: entry 4");
+        assert_eq!(buffer_row(&tree_buffer, 9), "─".repeat(100));
+
+        assert!(tree.handle_key(key(KeyCode::Esc)).visible_changed);
+        assert_eq!(tree.prompt.text(), "hidden\nmultiline draft");
+        let restored = rendered(&mut tree, 100, 12);
+        assert!(restored.contains("hidden"), "{restored}");
+        assert!(restored.contains("multiline draft"), "{restored}");
+
+        let mut tree = App::default();
         let revision = tree_request(&mut tree, "");
         load_tree(&mut tree, revision);
-        let tree_screen = rendered(&mut tree, 100, 12);
-        assert!(!tree_screen.contains("tree draft"), "{tree_screen}");
         let tree = rendered_buffer(&mut tree, 100, 12);
         let (_, tree_title_row) = cell_start(&tree, "Session tree");
-        assert_eq!(tree[(0, tree_title_row)].symbol(), "┌");
-        assert_eq!(tree[(99, tree_title_row)].symbol(), "┐");
+        assert_eq!(tree[(0, tree_title_row.saturating_sub(1))].symbol(), "─");
+        assert_ne!(tree[(0, tree_title_row.saturating_sub(1))].symbol(), "┌");
 
         let mut model = app_with_prompt("model draft");
         model.open_model_picker("");
@@ -4394,8 +4385,8 @@ mod tests {
         );
         assert!(rendered(&mut bare, 72, 12).contains("Session tree"));
         let loading = rendered_buffer(&mut bare, 72, 12);
-        assert_eq!(tree_picker_top(&loading), 7);
-        assert_eq!(tree_picker_bottom(&loading), 11);
+        let (_, header_row) = cell_start(&loading, "Session tree");
+        assert_eq!(loading[(0, header_row.saturating_sub(1))].symbol(), "─");
 
         let mut app = App::default();
         let update = enter_at(&mut app, "/tree auth", now);
@@ -4448,7 +4439,7 @@ mod tests {
         assert!(rendered(&mut app, 72, 12).contains("Loading…"));
         load_tree(&mut app, second);
         let screen = rendered(&mut app, 72, 12);
-        assert!(screen.contains("Filter: auth"), "{screen}");
+        assert!(screen.contains("Search: auth"), "{screen}");
         assert!(screen.contains("authorise access"), "{screen}");
         assert!(!screen.contains("Loading…"), "{screen}");
 
@@ -4611,21 +4602,23 @@ mod tests {
             );
         }
         let filtered = rendered(&mut app, 72, 12);
-        assert!(filtered.contains("Session start"), "{filtered}");
-        assert!(filtered.contains("└─ User: authorise access"), "{filtered}");
-        assert!(
-            filtered.contains("   ● Python: inspect credentials"),
-            "{filtered}"
+        let filtered_rows = filtered.lines().collect::<Vec<_>>();
+        assert_eq!(filtered_rows[8].trim_end(), "  • Session start");
+        assert_eq!(filtered_rows[9].trim_end(), "  └─ • User: authorise access");
+        assert_eq!(
+            filtered_rows[10].trim_end(),
+            "›    ● Python: inspect credentials"
         );
 
         for _ in "credentials".chars() {
             assert!(app.handle_key(key(KeyCode::Backspace)).visible_changed);
         }
         let restored = rendered(&mut app, 72, 12);
-        assert!(restored.contains("└─ User: authorise access"), "{restored}");
-        assert!(
-            restored.contains("   ● Python: inspect credentials"),
-            "{restored}"
+        let restored_rows = restored.lines().collect::<Vec<_>>();
+        assert_eq!(restored_rows[9].trim_end(), "  └─ • User: authorise access");
+        assert_eq!(
+            restored_rows[10].trim_end(),
+            "›    ● Python: inspect credentials"
         );
 
         for character in "access".chars() {
@@ -4639,7 +4632,7 @@ mod tests {
             outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
         }));
         let duplicate = rendered(&mut app, 72, 12);
-        assert!(duplicate.contains("Filter: access"), "{duplicate}");
+        assert!(duplicate.contains("Search: access"), "{duplicate}");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)).commands,
             [RuntimeCommand::Navigate {
