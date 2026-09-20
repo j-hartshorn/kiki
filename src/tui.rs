@@ -21,8 +21,6 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use rattles::TickedRattler;
-use rattles::presets::braille::Dots;
-use rattles::presets::prelude as presets;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -47,6 +45,19 @@ use picker::{Picker, PickerAction, PickerItem};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
+const GENERATION_THROBBER_ROWS: u16 = 2;
+const GENERATION_THROBBER_LEFT_PADDING: u16 = 1;
+
+rattles::rattle!(
+    GenerationThrobber,
+    generation_throbber,
+    4,
+    80,
+    [
+        "⠁   ", "⠈   ", " ⠁  ", " ⠈  ", "  ⠁ ", "  ⠈ ", "   ⠁", "   ⠈", "   ⠐", "   ⠠", "   ⢀",
+        "   ⡀", "  ⢀ ", "  ⡀ ", " ⢀  ", " ⡀  ", "⢀   ", "⡀   ", "⠄   ", "⠂   "
+    ]
+);
 
 trait EventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -174,7 +185,7 @@ struct App {
     pending_copy_text: Option<String>,
     notice: Option<Notice>,
     flash: Option<Flash>,
-    throbber: TickedRattler<Dots>,
+    throbber: TickedRattler<GenerationThrobber>,
     throbber_next_tick: Option<Instant>,
     settings: Option<SettingsContext>,
     workspace_root: Option<String>,
@@ -213,7 +224,7 @@ impl Default for App {
             pending_copy_text: None,
             notice: None,
             flash: None,
-            throbber: presets::dots().into_ticked(),
+            throbber: generation_throbber().into_ticked(),
             throbber_next_tick: None,
             settings: None,
             workspace_root: None,
@@ -1821,7 +1832,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         .height
         .saturating_sub(1)
         .saturating_sub(prompt_box_height);
-    let throbber_height = u16::from(app.transcript.is_generating() && history_height > 0);
+    let throbber_height = if !app.transcript.is_generating() || history_height < 2 {
+        0
+    } else if history_height == GENERATION_THROBBER_ROWS {
+        1
+    } else {
+        GENERATION_THROBBER_ROWS
+    };
     let monitor = app.subagent_monitor.layout(
         area.width,
         history_height
@@ -1851,7 +1868,12 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     if throbber_height > 0 {
         frame.render_widget(
             Paragraph::new(app.throbber.current_frame()),
-            Rect::new(area.x, throbber_top, area.width, throbber_height),
+            Rect::new(
+                area.x.saturating_add(GENERATION_THROBBER_LEFT_PADDING),
+                prompt_top.saturating_sub(1),
+                area.width.saturating_sub(GENERATION_THROBBER_LEFT_PADDING),
+                1,
+            ),
         );
     }
     render_slash_overlay(frame, app, completion_area);
@@ -2122,7 +2144,7 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::Color;
 
-    use super::{App, HistoryPosition, TitlePublisher};
+    use super::{App, HistoryPosition, TitlePublisher, generation_throbber};
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -7268,6 +7290,22 @@ mod tests {
     }
 
     #[test]
+    fn generation_throbber_is_a_single_row_four_cell_orbit() {
+        let throbber = generation_throbber();
+
+        assert_eq!((throbber.size().width, throbber.size().height), (4, 1));
+        assert_eq!(
+            [
+                throbber.frame(0),
+                throbber.frame(7),
+                throbber.frame(11),
+                throbber.frame(17),
+            ],
+            ["⠁   ", "   ⠈", "   ⡀", "⡀   "]
+        );
+    }
+
+    #[test]
     fn generating_throbber_is_animated_and_anchored_above_the_prompt() {
         let now = Instant::now();
         let mut app = App::default();
@@ -7282,10 +7320,11 @@ mod tests {
 
         let initial = rendered_at(&mut app, 20, 12, now);
         let rows = initial.lines().collect::<Vec<_>>();
-        assert_eq!(rows[8].trim(), "⠋");
+        assert!(rows[7].trim().is_empty());
+        assert!(rows[8].starts_with(" ⠁   "));
         assert_eq!(rows[9], "─".repeat(20));
         assert!(!rows[1..9].join("\n").contains("generating"));
-        assert_eq!(app.history_height, 7);
+        assert_eq!(app.history_height, 6);
 
         app.handle_event_at(
             RuntimeEvent::ModelProgress {
@@ -7299,17 +7338,32 @@ mod tests {
         );
         let streaming = rendered_at(&mut app, 20, 12, now);
         assert!(streaming.contains("streamed answer"));
-        assert_eq!(streaming.lines().nth(8).map(str::trim), Some("⠋"));
+        assert!(
+            streaming
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ⠁   "))
+        );
 
         set_prompt(&mut app, "/");
         let with_completion = rendered_at(&mut app, 20, 12, now);
         assert!(with_completion.contains("/model"));
-        assert_eq!(with_completion.lines().nth(8).map(str::trim), Some("⠋"));
+        assert!(
+            with_completion
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ⠁   "))
+        );
 
         assert!(!app.tick(now + Duration::from_millis(79)).visible_changed);
         assert!(app.tick(now + Duration::from_millis(80)).visible_changed);
         let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(80));
-        assert_eq!(advanced.lines().nth(8).map(str::trim), Some("⠙"));
+        assert!(
+            advanced
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ⠈   "))
+        );
 
         app.handle_event_at(
             RuntimeEvent::ExecutionStarted {
@@ -7320,9 +7374,31 @@ mod tests {
             now + Duration::from_millis(80),
         );
         let executing = rendered_at(&mut app, 20, 12, now + Duration::from_millis(80));
-        assert!(!executing.contains('⠙'));
+        assert!(!executing.contains('⠈'));
         assert_eq!(app.history_height, 8);
         assert!(!app.tick(now + Duration::from_millis(160)).visible_changed);
+    }
+
+    #[test]
+    fn tiny_generation_keeps_the_only_history_row() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        app.handle_event_at(
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            now,
+        );
+
+        let screen = rendered_at(&mut app, 20, 5, now);
+        assert!(!screen.contains('⠁'));
+        assert_eq!(app.history_height, 1);
+        assert_eq!(
+            app.history_viewport.map(|viewport| viewport.area.height),
+            Some(1)
+        );
     }
 
     #[test]
@@ -7345,7 +7421,7 @@ mod tests {
         );
 
         let screen = rendered_at(&mut app, 20, 12, now);
-        assert!(!screen.contains('⠋'));
+        assert!(!screen.contains('⠁'));
         assert!(!app.transcript.is_generating());
         assert_eq!(app.history_height, 8);
         assert!(!app.tick(now + Duration::from_millis(80)).visible_changed);
@@ -7513,12 +7589,12 @@ mod tests {
             },
         });
         rendered(&mut app, 20, 12);
-        assert_eq!(app.history_height, 6);
+        assert_eq!(app.history_height, 5);
         assert_eq!(app.history_position, position);
 
         set_prompt(&mut app, "");
         rendered(&mut app, 20, 12);
-        assert_eq!(app.history_height, 7);
+        assert_eq!(app.history_height, 6);
         assert_eq!(app.history_position, position);
         let backend = TestBackend::new(0, 12);
         let mut terminal = Terminal::new(backend).unwrap();
