@@ -412,6 +412,14 @@ impl App {
                     update.quit = true;
                     return update;
                 }
+                KeyCode::Char('p' | 'P') if !self.is_submission_disabled() => {
+                    self.open_model_picker("");
+                    return Update {
+                        commands: Vec::new(),
+                        visible_changed: true,
+                        quit: false,
+                    };
+                }
                 KeyCode::Char('t' | 'T') => {
                     let visible_changed = self.transcript.toggle_reasoning();
                     if visible_changed {
@@ -3589,6 +3597,23 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_p_opens_model_picker_during_an_active_run_without_consuming_the_draft() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut app, "keep this draft");
+        app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+
+        let update =
+            app.handle_key_at(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL), now);
+
+        assert!(update.commands.is_empty());
+        assert!(update.visible_changed);
+        assert_eq!(app.prompt.text(), "keep this draft");
+        assert!(app.picker.is_some());
+        assert!(rendered(&mut app, 80, 15).contains("Models"));
+    }
+
+    #[test]
     fn astra_is_first_and_uses_its_model_owned_thinking_levels() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
@@ -4320,10 +4345,12 @@ mod tests {
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
             modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
         ] {
             assert!(!disabled.handle_key(event).visible_changed);
         }
         assert_eq!(disabled.prompt.text(), "locked");
+        assert!(disabled.picker.is_none());
 
         let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
         set_prompt(&mut configuration, "locked");
@@ -4333,10 +4360,12 @@ mod tests {
             key(KeyCode::Enter),
             shifted_key(KeyCode::Enter),
             modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
         ] {
             assert!(!configuration.handle_key(event).visible_changed);
         }
         assert_eq!(configuration.prompt.text(), "locked");
+        assert!(configuration.picker.is_none());
 
         let mut bounded = App::default();
         set_prompt(&mut bounded, &"a".repeat(MAX_PROMPT_BYTES - 1));
