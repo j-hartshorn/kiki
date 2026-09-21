@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentProgress, AgentRunOutcome};
+use crate::agent::{Agent, AgentProgress};
 use crate::arena::{ArenaChildSource, Checkpoint, Execution};
 use crate::config::{
     ModelSelection, SessionPreferences,
@@ -1401,10 +1401,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                 .run_with_progress(request, &cancellation, &mut progress)
                 .await
             {
-                Ok(AgentRunOutcome::FinalMessageStaged) => {
-                    let final_message = agent
-                        .discard_staged_final_message()
-                        .expect("completed child must stage a final message");
+                Ok(final_message) => {
                     reporter.set_attempts(final_message.attempts().to_vec());
                     if cancellation.is_cancelled() {
                         return Err(ChildFailure::new(format!(

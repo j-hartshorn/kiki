@@ -9111,14 +9111,13 @@ mod tests {
         Arc<Notify>,
         RuntimeController<WaitingCancellationModel>,
     ) {
-        let (home, session, live_arena, old_history, _root, old_entry, _target_entry) =
+        let (home, session, live_arena, _root, old_entry, _target_entry) =
             navigation_fixture(workspace).await;
         let old_checkpoint = live_arena.checkpoint();
         let ready = Arc::new(Notify::new());
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             WaitingCancellationModel {
                 ready: ready.clone(),
                 partial: false,
@@ -13567,7 +13566,7 @@ mod tests {
             .restore(session.initial_checkpoint().expect("load root checkpoint"))
             .await
             .expect("restore root checkpoint");
-        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+        let (old_entry, _, old_checkpoint) = persist_navigation_branch(
             &session,
             &mut fixture_arena,
             "old branch",
@@ -13613,13 +13612,12 @@ mod tests {
         let starts = Arc::new(AtomicUsize::new(0));
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(
+            Agent::new(
                 live_arena,
                 NavigationStateModel {
                     contexts: contexts.clone(),
                     step: 0,
                 },
-                old_history,
             ),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -13707,7 +13705,6 @@ mod tests {
         tempfile::TempDir,
         Session,
         Arena,
-        ModelHistory,
         SessionEntryId,
         SessionEntryId,
         SessionEntryId,
@@ -13742,7 +13739,7 @@ mod tests {
             .restore(session.initial_checkpoint().expect("load root checkpoint"))
             .await
             .expect("restore fixture root checkpoint");
-        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+        let (old_entry, _, old_checkpoint) = persist_navigation_branch(
             &session,
             &mut fixture_arena,
             "old branch",
@@ -13784,22 +13781,14 @@ mod tests {
             .restore(old_checkpoint)
             .await
             .expect("restore old live state");
-        (
-            home,
-            session,
-            live_arena,
-            old_history,
-            root,
-            old_entry,
-            target_entry,
-        )
+        (home, session, live_arena, root, old_entry, target_entry)
     }
 
     #[tokio::test]
     async fn navigation_restores_root_request_execution_and_terminal_points() {
         let workspace = tempfile::tempdir().expect("create workspace");
         fs::write(workspace.path().join("effect"), "retained").expect("write external effect");
-        let (_home, session, live_arena, old_history, root, _old_entry, target_entry) =
+        let (_home, session, live_arena, root, _old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_execution = SessionEntryId(
             u64::try_from(
@@ -13833,7 +13822,7 @@ mod tests {
         let (settings, _) = watch::channel(selection);
         let starts = Arc::new(AtomicUsize::new(0));
         let controller = RuntimeController::with_session(
-            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history),
+            Agent::new(live_arena, ScriptedModel::new(Vec::new())),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
@@ -13957,14 +13946,13 @@ mod tests {
     fn navigation_controller<M: Model>(
         session: &Session,
         arena: Arena,
-        history: ModelHistory,
         model: M,
         gate: ArenaRestoreTestGate,
     ) -> RuntimeController<M> {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let (settings, _) = watch::channel(selection);
         RuntimeController::with_session(
-            Agent::restored(arena, model, history).with_restore_test_gate(gate),
+            Agent::new(arena, model).with_restore_test_gate(gate),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
@@ -13978,16 +13966,11 @@ mod tests {
     #[tokio::test]
     async fn navigation_rejects_invalid_history_without_restoring_arena() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let gate = ArenaRestoreTestGate::new();
-        let controller = navigation_controller(
-            &session,
-            live_arena,
-            old_history,
-            RejectTargetHistoryModel,
-            gate.clone(),
-        );
+        let controller =
+            navigation_controller(&session, live_arena, RejectTargetHistoryModel, gate.clone());
         let (commands, mut events, _progress, controller) = start_controller(controller);
 
         commands
@@ -14019,7 +14002,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_does_not_compensate_an_incompatible_checkpoint() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_identity(
             &session,
@@ -14031,7 +14014,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -14066,7 +14048,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_recovers_after_a_compatible_checkpoint_load_failure() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_state(&session, target_entry, vec![0]);
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
@@ -14075,7 +14057,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(vec![
                 ModelAction::Code {
                     source: "assert branch_value == 'old'\nbranch_value".to_owned(),
@@ -14124,7 +14105,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_disables_when_checkpoint_compensation_fails() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_state(&session, target_entry, vec![0]);
         let gate = ArenaRestoreTestGate::new();
@@ -14132,7 +14113,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -14195,7 +14175,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_compensates_after_an_active_leaf_conflict() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
         let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
@@ -14204,7 +14184,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -14663,7 +14642,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_failure_preserves_selection_and_latches_storage() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
         let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
@@ -14678,7 +14657,7 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history)
+            Agent::new(live_arena, ScriptedModel::new(Vec::new()))
                 .with_restore_test_gate(gate.clone()),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -14768,7 +14747,7 @@ mod tests {
         )
         .expect("create session");
         let root = SessionEntryId(active_entry_id(&session) as u64);
-        let (_, history, _) = persist_navigation_branch(
+        let (_, _, _) = persist_navigation_branch(
             &session,
             &mut live_arena,
             "selected branch",
@@ -14782,12 +14761,11 @@ mod tests {
             .expect("read selected branch context");
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(
+            Agent::new(
                 live_arena,
                 CountingMessageModel {
                     calls: Arc::new(AtomicUsize::new(0)),
                 },
-                history,
             ),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -14951,14 +14929,13 @@ mod tests {
     #[tokio::test]
     async fn tree_request_returns_catalogue_only_when_fully_settled() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, history, root, active_entry, target_entry) =
+        let (_home, session, live_arena, root, active_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let before = session.restore().expect("snapshot selected session");
         let database_before = session_database_snapshot(&session);
         let controller = navigation_controller(
             &session,
             live_arena,
-            history,
             ScriptedModel::new(Vec::new()),
             ArenaRestoreTestGate::new(),
         );
@@ -15169,7 +15146,7 @@ mod tests {
         ));
         shutdown_controller(commands, controller).await;
 
-        let (_home, session, live_arena, history, _root, active_entry, target_entry) =
+        let (_home, session, live_arena, _root, active_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_request: i64 = session
             .connection_for_test()
@@ -15198,7 +15175,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            history,
             ScriptedModel::new(Vec::new()),
             ArenaRestoreTestGate::new(),
         );
