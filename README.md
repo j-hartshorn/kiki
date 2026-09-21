@@ -178,6 +178,7 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
+- `Ctrl-P` opens the model picker without consuming the current prompt, including while a run is active.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.

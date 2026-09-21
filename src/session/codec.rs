@@ -307,6 +307,12 @@ enum StoredToolValue {
 
 #[derive(Serialize, Deserialize)]
 struct StoredTaskDetails {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    admission_history_step_id: Option<u64>,
+    #[serde(default)]
+    terminal_history_step_id: Option<u64>,
     prompt: String,
     selection: StoredSelection,
     read_only: bool,
@@ -358,6 +364,9 @@ enum StoredTaskOutcome {
 }
 
 pub(super) struct DecodedTaskDetails {
+    pub(super) id: Option<String>,
+    pub(super) admission_history_step_id: Option<u64>,
+    pub(super) terminal_history_step_id: Option<u64>,
     pub(super) parameters: ChildParameters,
     pub(super) depth: usize,
     pub(super) details: TaskPersistedDetails,
@@ -600,6 +609,9 @@ pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecEr
     let parameters = record.parameters();
     let observation = record.observation();
     serde_json::to_string(&StoredTaskDetails {
+        id: Some(record.id().to_string()),
+        admission_history_step_id: record.admission_history_step_id(),
+        terminal_history_step_id: record.terminal_history_step_id(),
         prompt: parameters.prompt().to_owned(),
         selection: encode_selection(parameters.selection()),
         read_only: parameters.read_only(),
@@ -676,6 +688,9 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
     );
     let outcome = details.outcome.map(decode_task_outcome);
     Ok(DecodedTaskDetails {
+        id: details.id,
+        admission_history_step_id: details.admission_history_step_id,
+        terminal_history_step_id: details.terminal_history_step_id,
         parameters,
         depth: details.depth,
         attempts: details
@@ -2132,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn task_details_codec_excludes_structural_and_derived_fields() {
+    fn task_details_codec_stores_public_id_but_excludes_internal_structure() {
         let selection = crate::config::ModelSelection::new(
             crate::config::DEFAULT_MODEL,
             crate::config::DEFAULT_MODEL.default_thinking,
@@ -2146,6 +2161,7 @@ mod tests {
             2,
             vec![task_usage()],
         )
+        .with_history_steps_for_test(Some(3), Some(4))
         .with_persisted_details_for_test(TaskPersistedDetails {
             admitted_at_ms: 10,
             terminal_at_ms: Some(20),
@@ -2163,9 +2179,20 @@ mod tests {
             serde_json::from_str(&encode_task_details(&record).expect("encode task details"))
                 .expect("decode JSON");
         let object = json.as_object().expect("task details object");
+        assert_eq!(
+            object.get("id").and_then(serde_json::Value::as_str),
+            Some("0a")
+        );
+        assert_eq!(object["admission_history_step_id"], 3);
+        assert_eq!(object["terminal_history_step_id"], 4);
+        let decoded = decode_task_record_details(
+            &serde_json::to_string(&json).expect("re-encode task details"),
+        )
+        .expect("decode task details");
+        assert_eq!(decoded.admission_history_step_id, Some(3));
+        assert_eq!(decoded.terminal_history_step_id, Some(4));
         for key in [
             "cost",
-            "id",
             "parent",
             "origin",
             "origin_step",

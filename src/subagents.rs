@@ -42,19 +42,50 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 #[serde(transparent)]
 pub(crate) struct TaskId(String);
 
+enum TaskIdParts {
+    Path(Vec<u64>),
+    Legacy(u64),
+}
+
 impl TaskId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        (value.len() >= 2
+        Self::parts(value).map(|_| Self(value.to_owned()))
+    }
+
+    fn parts(value: &str) -> Option<TaskIdParts> {
+        let path = value
+            .split('.')
+            .map(|segment| {
+                if segment.is_empty()
+                    || segment.len() > 1 && segment.starts_with('0')
+                    || !segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+                {
+                    None
+                } else {
+                    u64::from_str_radix(segment, 36).ok()
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(path) = path {
+            return Some(TaskIdParts::Path(path));
+        }
+        if value.len() >= 2
+            && !value.contains('.')
             && (value.len() == 2 || !value.starts_with('0'))
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            && u64::from_str_radix(value, 16).is_ok())
-        .then(|| Self(value.to_owned()))
+        {
+            u64::from_str_radix(value, 16).ok().map(TaskIdParts::Legacy)
+        } else {
+            None
+        }
     }
 }
 
@@ -66,10 +97,19 @@ impl PartialOrd for TaskId {
 
 impl Ord for TaskId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .len()
-            .cmp(&other.0.len())
-            .then_with(|| self.0.cmp(&other.0))
+        match (Self::parts(&self.0), Self::parts(&other.0)) {
+            (Some(TaskIdParts::Path(left)), Some(TaskIdParts::Path(right))) => {
+                left.cmp(&right).then_with(|| self.0.cmp(&other.0))
+            }
+            (Some(TaskIdParts::Path(_)), Some(TaskIdParts::Legacy(_))) => std::cmp::Ordering::Less,
+            (Some(TaskIdParts::Legacy(_)), Some(TaskIdParts::Path(_))) => {
+                std::cmp::Ordering::Greater
+            }
+            (Some(TaskIdParts::Legacy(left)), Some(TaskIdParts::Legacy(right))) => {
+                left.cmp(&right).then_with(|| self.0.cmp(&other.0))
+            }
+            _ => self.0.cmp(&other.0),
+        }
     }
 }
 
@@ -1060,9 +1100,7 @@ fn task_id_argument(arguments: ToolValue, operation: &str) -> Result<TaskId, Too
         return Err(ToolError::type_error("subagent task ID must be a string"));
     };
     TaskId::parse(id).ok_or_else(|| {
-        ToolError::value(
-            "subagent task ID must be a canonical lowercase hexadecimal string with at least two characters",
-        )
+        ToolError::value("subagent task ID must be a dot-separated lowercase base-36 path")
     })
 }
 
@@ -1486,8 +1524,12 @@ pub(crate) enum TaskOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TaskRecord {
     id: TaskId,
+    storage_id: u64,
     revision: u64,
     parent: Option<TaskId>,
+    parent_storage_id: Option<u64>,
+    admission_history_step_id: Option<u64>,
+    terminal_history_step_id: Option<u64>,
     origin: OriginId,
     origin_step_id: Option<u64>,
     depth: usize,
@@ -1506,12 +1548,28 @@ impl TaskRecord {
         &self.id
     }
 
+    pub(crate) fn storage_id(&self) -> u64 {
+        self.storage_id
+    }
+
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
 
     pub(crate) fn parent(&self) -> Option<&TaskId> {
         self.parent.as_ref()
+    }
+
+    pub(crate) fn parent_storage_id(&self) -> Option<u64> {
+        self.parent_storage_id
+    }
+
+    pub(crate) fn admission_history_step_id(&self) -> Option<u64> {
+        self.admission_history_step_id
+    }
+
+    pub(crate) fn terminal_history_step_id(&self) -> Option<u64> {
+        self.terminal_history_step_id
     }
 
     #[cfg(test)]
@@ -1572,9 +1630,13 @@ impl TaskRecord {
         let parent = parent.map(|id| TaskId::parse(id).expect("test parent ID must be valid"));
         let cost = estimate_run_cost(&attempts);
         Self {
+            storage_id: test_storage_id(&id),
+            parent_storage_id: parent.as_ref().map(test_storage_id),
             id: id.clone(),
             revision,
             parent,
+            admission_history_step_id: None,
+            terminal_history_step_id: None,
             origin: OriginId(0),
             origin_step_id: None,
             depth,
@@ -1596,6 +1658,28 @@ impl TaskRecord {
             executions: Vec::new(),
             outcome: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_storage_ids_for_test(
+        mut self,
+        storage_id: u64,
+        parent_storage_id: Option<u64>,
+    ) -> Self {
+        self.storage_id = storage_id;
+        self.parent_storage_id = parent_storage_id;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_history_steps_for_test(
+        mut self,
+        admission: Option<u64>,
+        terminal: Option<u64>,
+    ) -> Self {
+        self.admission_history_step_id = admission;
+        self.terminal_history_step_id = terminal;
+        self
     }
 
     #[cfg(test)]
@@ -1624,8 +1708,12 @@ impl TaskRecord {
     pub(crate) fn from_persisted(restored: RestoredTaskRecord) -> Self {
         let RestoredTaskRecord {
             id,
+            storage_id,
             revision,
             parent,
+            parent_storage_id,
+            admission_history_step_id,
+            terminal_history_step_id,
             origin_step_id,
             depth,
             parameters,
@@ -1643,8 +1731,12 @@ impl TaskRecord {
         };
         Self {
             id: id.clone(),
+            storage_id,
             revision,
             parent,
+            parent_storage_id,
+            admission_history_step_id,
+            terminal_history_step_id,
             origin: OriginId(origin_step_id),
             origin_step_id: Some(origin_step_id),
             depth,
@@ -1692,8 +1784,12 @@ impl TaskRecord {
 
 pub(crate) struct RestoredTaskRecord {
     pub(crate) id: TaskId,
+    pub(crate) storage_id: u64,
     pub(crate) revision: u64,
     pub(crate) parent: Option<TaskId>,
+    pub(crate) parent_storage_id: Option<u64>,
+    pub(crate) admission_history_step_id: Option<u64>,
+    pub(crate) terminal_history_step_id: Option<u64>,
     pub(crate) origin_step_id: u64,
     pub(crate) depth: usize,
     pub(crate) parameters: ChildParameters,
@@ -2091,6 +2187,7 @@ struct Inner {
     session: u64,
     next_origin: u64,
     next_task: Option<u64>,
+    next_sibling: BTreeMap<Option<TaskId>, Option<u64>>,
     active_slots: usize,
     shutting_down: bool,
     storage_failed: bool,
@@ -2099,6 +2196,7 @@ struct Inner {
     selected_origins: Option<BTreeSet<u64>>,
     origin_starts: BTreeMap<OriginId, usize>,
     notifications: watch::Sender<u64>,
+    reserved_task_ids: BTreeSet<TaskId>,
     pending: BTreeMap<TaskId, Task>,
     tasks: BTreeMap<TaskId, Task>,
 }
@@ -2112,7 +2210,11 @@ impl Inner {
 
 struct Task {
     id: TaskId,
+    storage_id: u64,
     parent: Option<TaskId>,
+    parent_storage_id: Option<u64>,
+    admission_history_step_id: Option<u64>,
+    terminal_history_step_id: Option<u64>,
     origin: OriginId,
     origin_step_id: Option<u64>,
     depth: usize,
@@ -2179,7 +2281,11 @@ impl Task {
         let admitted_at = now.checked_sub(record.observation.elapsed()).unwrap_or(now);
         Self {
             id: record.id.clone(),
+            storage_id: record.storage_id,
             parent: record.parent.clone(),
+            parent_storage_id: record.parent_storage_id,
+            admission_history_step_id: record.admission_history_step_id,
+            terminal_history_step_id: record.terminal_history_step_id,
             origin: record.origin,
             origin_step_id: record.origin_step_id,
             depth: record.depth,
@@ -2251,8 +2357,12 @@ impl Task {
     ) -> TaskRecord {
         TaskRecord {
             id: self.id.clone(),
+            storage_id: self.storage_id,
             revision: metrics.revision,
             parent: self.parent.clone(),
+            parent_storage_id: self.parent_storage_id,
+            admission_history_step_id: self.admission_history_step_id,
+            terminal_history_step_id: self.terminal_history_step_id,
             origin: self.origin,
             origin_step_id: self.origin_step_id,
             depth: self.depth,
@@ -2281,11 +2391,13 @@ impl Task {
         claim: &TerminalClaim,
         settled_at: Instant,
         terminal_at_ms: i64,
+        terminal_history_step_id: Option<u64>,
     ) -> TerminalSettlement {
         let mut record =
             self.record_from_snapshot(settled_at, terminal_at_ms, claim.metrics.clone());
         record.revision = claim.metrics.revision;
         record.terminal_at_ms = Some(terminal_at_ms);
+        record.terminal_history_step_id = terminal_history_step_id;
         record.observation.state = terminal_state(&claim.outcome);
         record.observation.elapsed = settled_at.saturating_duration_since(self.admitted_at);
         record.observation.error = match &claim.outcome {
@@ -2316,6 +2428,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
                 next_origin: 1,
                 next_task: Some(0),
+                next_sibling: BTreeMap::new(),
                 active_slots: 0,
                 shutting_down: false,
                 storage_failed: false,
@@ -2324,6 +2437,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 selected_origins: None,
                 origin_starts: BTreeMap::new(),
                 notifications: watch::channel(0).0,
+                reserved_task_ids: BTreeSet::new(),
                 pending: BTreeMap::new(),
                 tasks: BTreeMap::new(),
             })),
@@ -2356,9 +2470,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         &self,
         tasks: impl IntoIterator<Item = TaskRecord>,
         next_task: Option<u64>,
+        reserved_task_ids: impl IntoIterator<Item = TaskId>,
     ) {
         let mut inner = self.inner.lock().await;
         inner.next_task = next_task;
+        inner.reserved_task_ids.extend(reserved_task_ids);
         let notifications = inner.notifications.clone();
         for record in tasks {
             if let Some(origin_step_id) = record.origin_step_id {
@@ -2369,6 +2485,7 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 );
             }
             let id = record.id.clone();
+            inner.reserved_task_ids.insert(id.clone());
             inner
                 .tasks
                 .insert(id, Task::restored(record, notifications.clone()));
@@ -2575,30 +2692,33 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
                 return Err(AdmissionError::CallerStopped);
             }
 
-            let (parent, depth, inherited_read_only, inherited_deadline) = match &caller.owner {
-                CallerOwner::Root => (None, 1, false, None),
-                CallerOwner::Child(parent) => {
-                    let Some(task) = inner.tasks.get(parent) else {
-                        return Err(AdmissionError::InvalidCaller);
-                    };
-                    if task.origin != caller.origin || task.origin_step_id != caller.origin_step_id
-                    {
-                        return Err(AdmissionError::InvalidCaller);
+            let (parent, parent_storage_id, depth, inherited_read_only, inherited_deadline) =
+                match &caller.owner {
+                    CallerOwner::Root => (None, None, 1, false, None),
+                    CallerOwner::Child(parent) => {
+                        let Some(task) = inner.tasks.get(parent) else {
+                            return Err(AdmissionError::InvalidCaller);
+                        };
+                        if task.origin != caller.origin
+                            || task.origin_step_id != caller.origin_step_id
+                        {
+                            return Err(AdmissionError::InvalidCaller);
+                        }
+                        if task.state.is_terminal() || task.stop.is_some() || task.deadline <= now {
+                            return Err(AdmissionError::CallerStopped);
+                        }
+                        if !self.policy.allow_nested {
+                            return Err(AdmissionError::NestedDisabled);
+                        }
+                        (
+                            Some(parent.clone()),
+                            Some(task.storage_id),
+                            task.depth.saturating_add(1),
+                            task.parameters.read_only(),
+                            Some(task.deadline),
+                        )
                     }
-                    if task.state.is_terminal() || task.stop.is_some() || task.deadline <= now {
-                        return Err(AdmissionError::CallerStopped);
-                    }
-                    if !self.policy.allow_nested {
-                        return Err(AdmissionError::NestedDisabled);
-                    }
-                    (
-                        Some(parent.clone()),
-                        task.depth.saturating_add(1),
-                        task.parameters.read_only(),
-                        Some(task.deadline),
-                    )
-                }
-            };
+                };
             if depth > self.policy.max_depth {
                 return Err(AdmissionError::DepthLimit);
             }
@@ -2624,7 +2744,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             if self.writer.is_some() && sequence > i64::MAX as u64 {
                 return Err(AdmissionError::IdentifierSpaceExhausted);
             }
-            let id = task_id(sequence);
+            let id = allocate_task_id(&mut inner, parent.as_ref())?;
+            let admission_history_step_id = self
+                .writer
+                .as_ref()
+                .and_then(SessionWriter::active_execution_step);
             parameters.read_only |= inherited_read_only;
             let cancellation = self.storage_failure.child_token();
             let metrics = Arc::new(TaskMetrics::new(
@@ -2634,7 +2758,11 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             ));
             let task = Task {
                 id: id.clone(),
+                storage_id: sequence,
                 parent,
+                parent_storage_id,
+                admission_history_step_id,
+                terminal_history_step_id: None,
                 origin: caller.origin,
                 origin_step_id: caller.origin_step_id,
                 depth,
@@ -3260,7 +3388,16 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
         if stored_claim.metrics.revision != claim.metrics.revision {
             return None;
         }
-        Some(task.terminal_settlement(stored_claim, self.now(), self.unix_time_ms()))
+        Some(
+            task.terminal_settlement(
+                stored_claim,
+                self.now(),
+                self.unix_time_ms(),
+                self.writer
+                    .as_ref()
+                    .and_then(SessionWriter::active_execution_step),
+            ),
+        )
     }
 
     async fn persist_terminal(
@@ -3280,47 +3417,49 @@ impl<P: Send + 'static> SubagentCoordinator<P> {
             self.latch_storage_failure().await;
             return None;
         }
-        let record =
+        let record = {
+            let mut inner = self
+                .lock_inner(CoordinatorOperation::FinishChildSettlement)
+                .await;
+            if inner.storage_failed {
+                return None;
+            }
+            let task = inner.tasks.get_mut(id)?;
+            if task
+                .terminal_claim
+                .as_ref()
+                .is_none_or(|claim| claim.metrics.revision != terminal_settlement.record.revision())
             {
-                let mut inner = self
-                    .lock_inner(CoordinatorOperation::FinishChildSettlement)
-                    .await;
-                if inner.storage_failed {
-                    return None;
-                }
-                let task = inner.tasks.get_mut(id)?;
-                if task.terminal_claim.as_ref().is_none_or(|claim| {
-                    claim.metrics.revision != terminal_settlement.record.revision()
-                }) {
-                    return None;
-                }
-                let stored_claim = task
-                    .terminal_claim
-                    .take()
-                    .expect("matching terminal claim remains present");
-                task.state = terminal_state(&stored_claim.outcome);
-                task.outcome = Some(stored_claim.outcome);
-                task.settled_at = Some(terminal_settlement.settled_at);
-                task.terminal_at_ms = Some(terminal_settlement.terminal_at_ms);
-                let metrics = task.metrics.clone();
-                let revision = terminal_settlement.record.revision();
-                let record = terminal_settlement.record;
-                let releases_slot = task.holds_slot;
-                task.holds_slot = false;
-                if releases_slot {
-                    inner.active_slots = inner
-                        .active_slots
-                        .checked_sub(1)
-                        .expect("every active task owns exactly one slot");
-                }
-                metrics.publish_terminal(revision);
-                inner.notify();
-                self.trace.emit(|| TraceEvent::ChildSettled {
-                    child_id: id.clone(),
-                    outcome: settlement(record.outcome().expect("terminal record has outcome")),
-                });
-                record
-            };
+                return None;
+            }
+            let stored_claim = task
+                .terminal_claim
+                .take()
+                .expect("matching terminal claim remains present");
+            task.state = terminal_state(&stored_claim.outcome);
+            task.outcome = Some(stored_claim.outcome);
+            task.settled_at = Some(terminal_settlement.settled_at);
+            task.terminal_at_ms = Some(terminal_settlement.terminal_at_ms);
+            task.terminal_history_step_id = terminal_settlement.record.terminal_history_step_id();
+            let metrics = task.metrics.clone();
+            let revision = terminal_settlement.record.revision();
+            let record = terminal_settlement.record;
+            let releases_slot = task.holds_slot;
+            task.holds_slot = false;
+            if releases_slot {
+                inner.active_slots = inner
+                    .active_slots
+                    .checked_sub(1)
+                    .expect("every active task owns exactly one slot");
+            }
+            metrics.publish_terminal(revision);
+            inner.notify();
+            self.trace.emit(|| TraceEvent::ChildSettled {
+                child_id: id.clone(),
+                outcome: settlement(record.outcome().expect("terminal record has outcome")),
+            });
+            record
+        };
         Some(record)
     }
 
@@ -3654,8 +3793,58 @@ fn release_task_slot(inner: &mut Inner, task: &mut Task) {
     }
 }
 
-fn task_id(sequence: u64) -> TaskId {
-    TaskId(format!("{sequence:02x}"))
+#[cfg(test)]
+fn test_storage_id(id: &TaskId) -> u64 {
+    match TaskId::parts(id.as_str()).expect("test task ID is valid") {
+        TaskIdParts::Path(segments) => segments.into_iter().fold(0_u64, |encoded, segment| {
+            encoded
+                .checked_mul(37)
+                .and_then(|encoded| encoded.checked_add(segment + 1))
+                .expect("test ID fits storage")
+        }),
+        TaskIdParts::Legacy(value) => value,
+    }
+}
+
+fn allocate_task_id(inner: &mut Inner, parent: Option<&TaskId>) -> Result<TaskId, AdmissionError> {
+    let key = parent.cloned();
+    let mut sequence = inner
+        .next_sibling
+        .get(&key)
+        .copied()
+        .unwrap_or(Some(0))
+        .ok_or(AdmissionError::IdentifierSpaceExhausted)?;
+    loop {
+        let id = task_id(parent, sequence);
+        let next = sequence.checked_add(1);
+        inner.next_sibling.insert(key.clone(), next);
+        if !inner.reserved_task_ids.contains(&id) {
+            return Ok(id);
+        }
+        sequence = next.ok_or(AdmissionError::IdentifierSpaceExhausted)?;
+    }
+}
+
+fn task_id(parent: Option<&TaskId>, sequence: u64) -> TaskId {
+    let segment = base36(sequence);
+    TaskId(match parent {
+        Some(parent) => format!("{parent}.{segment}"),
+        None => segment,
+    })
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut encoded = Vec::new();
+    loop {
+        encoded.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    encoded.reverse();
+    String::from_utf8(encoded).expect("base-36 digits are UTF-8")
 }
 
 fn bounded_utf8(mut value: String, limit: usize) -> String {
@@ -3998,8 +4187,12 @@ mod tests {
     ) -> TaskRecord {
         TaskRecord::from_persisted(RestoredTaskRecord {
             id: TaskId::parse(id).expect("valid task ID"),
+            storage_id: 0,
             revision: 2,
             parent: parent.map(|id| TaskId::parse(id).expect("valid parent task ID")),
+            parent_storage_id: None,
+            admission_history_step_id: None,
+            terminal_history_step_id: None,
             origin_step_id,
             depth: 1,
             parameters: parameters(),
@@ -4034,8 +4227,12 @@ mod tests {
         let record = |details| {
             TaskRecord::from_persisted(RestoredTaskRecord {
                 id: TaskId::parse("00").expect("valid task ID"),
+                storage_id: 0,
                 revision: 4,
                 parent: None,
+                parent_storage_id: None,
+                admission_history_step_id: None,
+                terminal_history_step_id: None,
                 origin_step_id: 1,
                 depth: 1,
                 parameters: parameters(),
@@ -4212,13 +4409,33 @@ mod tests {
     async fn restore_without_tasks_allocates_the_first_child_as_zero() {
         let (coordinator, mut started) = coordinator(policy());
         coordinator
-            .restore_terminal_tasks(Vec::new(), Some(0))
+            .restore_terminal_tasks(Vec::new(), Some(0), Vec::new())
             .await;
         let caller = coordinator.root_caller().await;
 
         let (id, child) = start(&coordinator, &mut started, &caller).await;
 
-        assert_eq!(id.as_str(), "00");
+        assert_eq!(id.as_str(), "0");
+        drop(child);
+        coordinator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_reuse_a_hidden_public_task_id() {
+        let (coordinator, mut started) = coordinator(policy());
+        let first = TaskRecord::for_test("0", 0, parameters().selection(), None, 1, Vec::new());
+        coordinator
+            .restore_terminal_tasks(
+                [first],
+                Some(2),
+                [TaskId::parse("1").expect("reserved task ID")],
+            )
+            .await;
+        let caller = coordinator.root_caller().await;
+
+        let (id, child) = start(&coordinator, &mut started, &caller).await;
+
+        assert_eq!(id.as_str(), "2");
         drop(child);
         coordinator.shutdown().await;
     }
@@ -4266,7 +4483,7 @@ mod tests {
         let completed_id = completed.id().clone();
         let failed_id = failed.id().clone();
         coordinator
-            .restore_terminal_tasks([completed, failed], Some(2))
+            .restore_terminal_tasks([completed, failed], Some(2), Vec::new())
             .await;
         let caller = coordinator.root_caller().await;
 
@@ -4324,7 +4541,7 @@ mod tests {
         let selected_id = selected.id().clone();
         let sibling_id = sibling.id().clone();
         coordinator
-            .restore_terminal_tasks([selected, sibling], Some(2))
+            .restore_terminal_tasks([selected, sibling], Some(2), std::iter::empty())
             .await;
         assert!(coordinator.replace_selected_origins([11]).await);
         let root = coordinator.root_caller().await;
@@ -4413,7 +4630,9 @@ mod tests {
         let (coordinator, _) = coordinator(policy());
         let hidden = restored_task("00", None, 1, "hidden");
         let id = hidden.id().clone();
-        coordinator.restore_terminal_tasks([hidden], Some(1)).await;
+        coordinator
+            .restore_terminal_tasks([hidden], Some(1), std::iter::empty())
+            .await;
         assert!(coordinator.replace_selected_origins([]).await);
         let root = coordinator.root_caller().await;
 
@@ -5654,6 +5873,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_tasks_capture_foreground_execution_history_anchors() {
+        let (_home, _workspace, session, writer, _run_id, origin_step_id) =
+            persisted_origin(None).await;
+        let (coordinator, mut started) = coordinator(policy());
+        let coordinator = coordinator.with_session(writer.clone());
+        let mut caller = coordinator.root_caller().await;
+        caller.origin_step_id = Some(origin_step_id);
+        writer.mark_execution_started(101);
+
+        let (id, Started { child, finish }) = start(&coordinator, &mut started, &caller).await;
+
+        assert_eq!(
+            coordinator
+                .record(&id)
+                .await
+                .unwrap()
+                .admission_history_step_id(),
+            Some(101)
+        );
+        writer.mark_execution_started(202);
+        finish.send(Ok(result("done"))).unwrap();
+        coordinator.wait(&caller, &id).await.unwrap();
+        let terminal = coordinator.record(&id).await.unwrap();
+        assert_eq!(terminal.admission_history_step_id(), Some(101));
+        assert_eq!(terminal.terminal_history_step_id(), Some(202));
+
+        coordinator.shutdown().await;
+        drop(child);
+        drop(started);
+        drop(caller);
+        drop(coordinator);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn start_budget_remains_scoped_to_root_across_originating_steps() {
         let (_home, _workspace, session, writer, run_id, first_step_id) =
             persisted_origin(None).await;
@@ -5805,18 +6060,28 @@ mod tests {
                 .await,
             Err(AdmissionError::StartBudget)
         );
+        let descendant_storage_id = coordinator
+            .record(descendant.id())
+            .await
+            .expect("descendant record")
+            .storage_id();
+        let parent_storage_id = coordinator
+            .record(parent.id())
+            .await
+            .expect("parent record")
+            .storage_id();
         let (parent_id, origin_id): (Option<i64>, i64) = session
             .connection_for_test()
             .expect("lock session connection")
             .query_row(
                 "SELECT parent_task_id, origin_step_id FROM subagent_tasks WHERE id = ?1",
-                [i64::from_str_radix(descendant.id().as_str(), 16).expect("task SQL ID")],
+                [i64::try_from(descendant_storage_id).expect("task SQL ID")],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("read descendant provenance");
         assert_eq!(
             parent_id,
-            Some(i64::from_str_radix(parent.id().as_str(), 16).expect("task SQL ID"))
+            Some(i64::try_from(parent_storage_id).expect("task SQL ID"))
         );
         assert_eq!(
             origin_id,
@@ -6197,7 +6462,7 @@ mod tests {
             assert_eq!(child.payload().get(), 7);
             let (id, caller, parent, depth, parameters, payload, reporter, coordinator) =
                 child.into_parts();
-            assert_eq!(id.as_str().len(), 2);
+            assert_eq!(id.as_str(), "0");
             assert_eq!(parent, None);
             assert_eq!(depth, 1);
             let (prompt, selection, read_only) = parameters.into_parts();
@@ -6384,55 +6649,96 @@ mod tests {
     }
 
     #[test]
-    fn task_identifiers_use_canonical_hexadecimal_sequence() {
+    fn task_identifiers_use_dotted_base36_paths() {
         for (sequence, expected) in [
-            (0, "00"),
-            (1, "01"),
-            (15, "0f"),
-            (16, "10"),
-            (255, "ff"),
-            (256, "100"),
+            (0, "0"),
+            (1, "1"),
+            (9, "9"),
+            (10, "a"),
+            (35, "z"),
+            (36, "10"),
         ] {
-            assert_eq!(task_id(sequence).as_str(), expected);
+            assert_eq!(task_id(None, sequence).as_str(), expected);
         }
+        let parent = TaskId::parse("g").expect("valid parent ID");
+        assert_eq!(task_id(Some(&parent), 0).as_str(), "g.0");
+        assert_eq!(task_id(Some(&parent), 35).as_str(), "g.z");
+        assert_eq!(task_id(Some(&parent), 36).as_str(), "g.10");
+    }
+
+    #[tokio::test]
+    async fn child_identifiers_extend_their_parent_path() {
+        let (coordinator, mut started) = coordinator(policy());
+        let root = coordinator.root_caller().await;
+        let (parent_id, parent) = start(&coordinator, &mut started, &root).await;
+        let parent_caller = parent.child.caller().clone();
+        let (first_id, first) = start(&coordinator, &mut started, &parent_caller).await;
+        let (second_id, second) = start(&coordinator, &mut started, &parent_caller).await;
+
+        assert_eq!(parent_id.as_str(), "0");
+        assert_eq!(first_id.as_str(), "0.0");
+        assert_eq!(second_id.as_str(), "0.1");
+
+        first.finish.send(Ok(result("first"))).unwrap();
+        second.finish.send(Ok(result("second"))).unwrap();
+        parent.finish.send(Ok(result("parent"))).unwrap();
+        coordinator.wait(&root, &first_id).await.unwrap();
+        coordinator.wait(&root, &second_id).await.unwrap();
+        coordinator.wait(&root, &parent_id).await.unwrap();
     }
 
     #[test]
-    fn task_identifier_parsing_is_strict_and_keeps_canonical_unknowns() {
-        for canonical in ["00", "01", "0f", "10", "ff", "100", "dead"] {
+    fn task_identifier_parsing_is_strict_and_keeps_legacy_ids_reachable() {
+        for canonical in ["0", "g", "10", "g.0", "g.10", "g.a.0", "dead"] {
             assert_eq!(TaskId::parse(canonical).unwrap().as_str(), canonical);
         }
-        for malformed in ["", "0", "0A", "0g", "000", "0100", "10000000000000000"] {
+        for legacy in ["00", "01", "0f"] {
+            assert_eq!(TaskId::parse(legacy).unwrap().as_str(), legacy);
+        }
+        for malformed in ["", ".", ".g", "g.", "g..0", "G", "g.01", "00.0", "g-0"] {
             assert!(TaskId::parse(malformed).is_none(), "{malformed}");
+        }
+        let canonical = TaskId::parse("a").unwrap();
+        let legacy = TaskId::parse("0a").unwrap();
+        assert_ne!(canonical.cmp(&legacy), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn task_identifiers_sort_segments_numerically() {
+        let mut identifiers = ["1000000000000000", "g.10", "g.2", "10", "z", "0", "g.0"]
+            .map(|id| TaskId::parse(id).expect("valid task ID"));
+        identifiers.sort();
+        assert_eq!(
+            identifiers.each_ref().map(ToString::to_string),
+            ["0", "g.0", "g.2", "g.10", "z", "10", "1000000000000000",]
+        );
+        for left in &identifiers {
+            for middle in &identifiers {
+                for right in &identifiers {
+                    if left <= middle && middle <= right {
+                        assert!(left <= right);
+                    }
+                }
+            }
         }
     }
 
     #[test]
-    fn task_identifiers_sort_numerically_across_widths() {
-        let mut identifiers = ["100", "0f", "ff", "10", "00", "01"].map(|id| TaskId(id.to_owned()));
-        identifiers.sort();
-        assert_eq!(
-            identifiers.map(|id| id.to_string()),
-            ["00", "01", "0f", "10", "ff", "100"]
-        );
-    }
-
-    #[test]
-    fn malformed_task_identifier_errors_describe_canonical_hexadecimal_ids() {
+    fn malformed_task_identifier_errors_describe_dotted_base36_paths() {
         assert_eq!(
             task_id_argument(
-                ToolValue::List(vec![ToolValue::String("0g".to_owned())]),
+                ToolValue::List(vec![ToolValue::String("g-0".to_owned())]),
                 "get_subagent",
             )
             .unwrap_err()
             .to_string(),
-            "subagent task ID must be a canonical lowercase hexadecimal string with at least two characters"
+            "subagent task ID must be a dot-separated lowercase base-36 path"
         );
     }
 
     #[tokio::test]
     async fn canonical_unknown_task_identifiers_remain_distinct_from_malformed_ids() {
-        assert!(TaskId::parse("0g").is_none());
+        assert!(TaskId::parse("g-0").is_none());
         let unknown = TaskId::parse("dead").expect("canonical unknown task ID");
         let (coordinator, _) = coordinator(policy());
         let caller = coordinator.root_caller().await;
@@ -6455,8 +6761,8 @@ mod tests {
         second.finish.send(Ok(result("second"))).unwrap();
         coordinator.wait(&caller, &second_id).await.unwrap();
 
-        assert_eq!(first_id.as_str(), "00");
-        assert_eq!(second_id.as_str(), "01");
+        assert_eq!(first_id.as_str(), "0");
+        assert_eq!(second_id.as_str(), "1");
     }
 
     #[tokio::test]
@@ -6466,7 +6772,7 @@ mod tests {
         let caller = coordinator.root_caller().await;
 
         let (id, final_task) = start(&coordinator, &mut started, &caller).await;
-        assert_eq!(id.as_str(), "ffffffffffffffff");
+        assert_eq!(id.as_str(), "0");
         final_task.finish.send(Ok(result("final"))).unwrap();
         coordinator.wait(&caller, &id).await.unwrap();
 
@@ -6481,7 +6787,7 @@ mod tests {
                 .iter()
                 .map(|record| record.id().as_str())
                 .collect::<Vec<_>>(),
-            ["ffffffffffffffff"]
+            ["0"]
         );
         assert!(started.try_recv().is_err());
     }
@@ -7705,7 +8011,7 @@ mod tests {
                 "process_shutdown",
             ]
         );
-        assert_eq!(child_events[1]["child_id"], "00");
+        assert_eq!(child_events[1]["child_id"], "0");
         assert_eq!(child_events[1]["parent_id"], serde_json::Value::Null);
         assert_eq!(child_events[1]["model"], DEFAULT_MODEL.id);
         assert_eq!(child_events[1]["thinking"], DEFAULT_MODEL.default_thinking);
@@ -7786,8 +8092,8 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&execution_events),
             [
-                ("00", "child_execution_started", 1, None),
-                ("00", "child_execution_settled", 1, Some("succeeded")),
+                ("0", "child_execution_started", 1, None),
+                ("0", "child_execution_settled", 1, Some("succeeded")),
             ]
         );
         assert!(execution_events.iter().all(|event| {
@@ -7879,10 +8185,10 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&child_execution_events(&trace)),
             [
-                ("00", "child_execution_started", 1, None),
-                ("00", "child_execution_settled", 1, Some("cancelled")),
-                ("01", "child_execution_started", 1, None),
-                ("01", "child_execution_settled", 1, Some("failed")),
+                ("0", "child_execution_started", 1, None),
+                ("0", "child_execution_settled", 1, Some("cancelled")),
+                ("1", "child_execution_started", 1, None),
+                ("1", "child_execution_settled", 1, Some("failed")),
             ]
         );
         for sensitive in ["cancelled-SECRET", "failure-SECRET"] {
@@ -7946,8 +8252,8 @@ mod tests {
         assert_eq!(
             child_execution_event_summaries(&child_execution_events(&trace)),
             [
-                ("00", "child_execution_started", 1, None),
-                ("00", "child_execution_settled", 1, Some("cancelled")),
+                ("0", "child_execution_started", 1, None),
+                ("0", "child_execution_settled", 1, Some("cancelled")),
             ]
         );
         assert!(!trace.contains("timed-out-SECRET"));

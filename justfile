@@ -15,8 +15,8 @@ lint:
 format:
     cargo fmt --all
 
-run: monty
-    cargo run
+run *args: monty
+    cargo run -- {{args}}
 
 test: monty
     cargo test --all-targets

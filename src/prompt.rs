@@ -153,6 +153,36 @@ mod tests {
     }
 
     #[test]
+    fn bundled_prompt_explains_monty_arena_constraints() {
+        for guidance in [
+            "### Monty/Arena Python primer",
+            "generator expressions materialize as lists",
+            "`enumerate`, `zip`, `map`, `filter`, and `reversed` are eager",
+            "Host functions must be awaited",
+            "There are no third-party packages",
+            "`sys.path`, or ambient filesystem/network/process access",
+            "Unsupported features include `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for`, async comprehensions, and wildcard imports",
+            "consider a Monty incompatibility",
+        ] {
+            assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
+        }
+    }
+
+    #[test]
+    fn root_and_child_prompts_use_the_same_direct_first_delegation_gate() {
+        for prompt in [BUNDLED_PROMPT, BUNDLED_CHILD_PROMPT] {
+            for guidance in [
+                "Default to doing the work yourself",
+                "Before starting a child, identify that benefit",
+                "Sequential work, generic exploration, routine review, and difficulty alone do not justify delegation",
+                "Apply this rule recursively",
+            ] {
+                assert!(prompt.contains(guidance), "missing `{guidance}`");
+            }
+        }
+    }
+
+    #[test]
     fn bundled_prompt_requests_commentary_before_code_execution() {
         let prompt = BUNDLED_PROMPT.to_lowercase();
         for guidance in [

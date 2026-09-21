@@ -1,10 +1,10 @@
-# Spec: Compact subagent tree and hexadecimal IDs
+# Spec: Compact subagent tree and hierarchical IDs
 
 ## Context
 
 The live sticky subagent monitor is flat: it stores records in admission order, partitions active entries before terminal entries, and renders at most four two-row entries (`src/tui/subagents.rs:69-75`, `src/tui/subagents.rs:180-280`). Nested task records already carry their immediate parent, but the monitor discards it (`src/subagents.rs:1316-1352`, `src/tui/subagents.rs:37-57`). The flat display therefore gives no visible indication that one subagent started another.
 
-Task IDs are currently six-character sequential base-36 strings (`src/subagents.rs:34-56`, `src/subagents.rs:2608-2626`). That width is unnecessary at the configured scale and consumes useful header space. This follow-up supersedes the ID format and flat sticky-list rules in `docs/2026-09-05_subagents/spec.md`; history cards and runtime ownership remain unchanged.
+Task IDs began as six-character sequential base-36 strings, then moved to compact global hexadecimal strings. Global IDs still hide ancestry and spend header space repeating information the tree already knows. This follow-up supersedes the ID format and flat sticky-list rules in `docs/2026-09-05_subagents/spec.md`; it also clarifies where lifecycle cards join foreground history.
 
 ## Goals
 
@@ -12,12 +12,12 @@ Task IDs are currently six-character sequential base-36 strings (`src/subagents.
 - Prioritise the deepest branch containing active work so recursion progress is immediately visible.
 - Keep the preferred display to four real task nodes while retaining each visible task's two-row header and prompt preview.
 - Preserve tree context when a terminal ancestor still has active descendants.
-- Replace six-character base-36 task IDs with compact, sequential lowercase hexadecimal IDs that start at `00` and expand after `ff`.
+- Replace global task IDs with compact dot-separated base-36 paths whose segments identify siblings beneath each parent.
 - Keep tree selection cheap and derived from current monitor state rather than adding persistent layout caches.
 
 ## Non-goals
 
-- Nested history cards, a tree navigator, expansion controls, or changes to transcript ordering.
+- Nested history cards, a tree navigator, or expansion controls.
 - Random, reused, fixed-width, or user-configurable task IDs.
 - Changes to subagent admission, ancestry, lifecycle, limits, Python signatures, telemetry ownership, or authority.
 - A general TUI tree widget or a runtime-owned hierarchical projection.
@@ -29,7 +29,7 @@ Task IDs are currently six-character sequential base-36 strings (`src/subagents.
 - The monitor currently drops parent identity, keeps a flat admission-order vector, and derives its complete layout on each redraw (`src/tui/subagents.rs:37-75`, `src/tui/subagents.rs:180-280`).
 - Terminal entries are cleared on the next accepted user request even when an active descendant may outlive its parent (`src/tui/subagents.rs:162-177`, `docs/2026-09-05_subagents/spec.md:114-116`).
 - The existing layout already performs a linear scan of retained entries and rebuilds lines. The configured defaults are 64 starts per run and eight active tasks, but settings may be larger. A temporary derived forest can preserve the existing linear layout cost; persistent cache invalidation state is not justified without measurement (`src/config/constants.rs:15-18`, `src/config/settings.rs:623-656`, `src/tui/subagents.rs:180-240`).
-- Header and transcript formatting use task IDs as variable-width strings, but `TaskId` derives lexical ordering. Variable-width hexadecimal IDs therefore need numeric ordering once `100` follows `ff` (`src/subagents.rs:38-56`, `src/tui/subagents.rs:320-370`, `src/transcript.rs:460-480`).
+- Header and transcript formatting use task IDs as variable-width strings. Each path segment needs numeric ordering once `10` follows `z`, while ancestry follows dot-separated prefixes.
 - The Python task interface types IDs only as `str`; no model-facing signature changes are required (`src/tools.rs:687-746`).
 - Task state and sequence allocation are in-memory for one session. Trace output serialises IDs but Kiki does not deserialize those traces into live tasks (`src/subagents.rs:1655-1783`, `src/telemetry.rs:325-405`).
 
@@ -37,15 +37,17 @@ Task IDs are currently six-character sequential base-36 strings (`src/subagents.
 
 ### Canonical task IDs
 
-Generate IDs from the session sequence as lowercase hexadecimal with a minimum width of two:
+Allocate a lowercase base-36 sibling sequence independently beneath each parent. Join ancestor and child segments with dots:
 
 ```text
-00, 01, …, 0f, 10, …, ff, 100, …
+0, 1, …, z, 10, …
+g.0, g.1, …, g.10
+g.a.0
 ```
 
-Parsing is strict. A valid ID contains only lowercase ASCII hexadecimal digits, has at least two characters, fits in the sequence counter, and has no redundant leading zero after the two-character range. Uppercase and non-canonical forms such as `0A`, `000`, and `0100` raise the existing invalid-ID `ValueError`. Unknown but well-formed IDs remain distinguishable from malformed IDs.
+Parsing is strict. Each segment contains only lowercase ASCII base-36 digits, fits an unsigned 64-bit sequence, and has no redundant leading zero. Empty segments, uppercase, and forms such as `g.01` raise the existing invalid-ID `ValueError`. Unknown but well-formed IDs remain distinguishable from malformed IDs. Legacy flat hexadecimal IDs remain readable when restoring existing sessions.
 
-IDs remain session-unique and are never reused. Allocation must detect sequence exhaustion rather than wrap. Ordering remains numeric across width changes, so `ff` precedes `100` anywhere `TaskId` is used as a sorted key. Serialization and every model-facing/display surface use the canonical string.
+IDs remain session-unique and are never reused, including IDs retained only on an unselected history branch. Allocation must detect sequence exhaustion rather than wrap. Ordering compares numeric path segments, so `z` precedes `10` and parents precede descendants. Persist the public path separately from the internal numeric SQLite task key; serialization and every model-facing/display surface use the public path.
 
 ### Derived monitor tree
 
@@ -66,9 +68,9 @@ Use this row grammar, where node depth is relative to the displayed root:
 For example:
 
 ```text
-  ✓ subagent:00  openai/gpt-5.6-sol  2 steps  00:18
+  ✓ subagent:0  openai/gpt-5.6-sol  2 steps  00:18
     └ `Investigate the recursive behaviour and…`
-    └─• subagent:03  openai/gpt-5.6-sol  1 step  00:06
+    └─• subagent:0.0  openai/gpt-5.6-sol  1 step  00:06
       └ `Check the deepest active branch`
     └─… +2 siblings
 ```
@@ -112,8 +114,8 @@ Only visible active task headers participate in whole-second redraw tracking. Tr
 - Keep each visible child's prompt preview; reject one-line child nodes because prompt intent is part of the useful live view.
 - Retain terminal ancestors of active work; reject promoting their children to roots because that hides ancestry.
 - Derive layout on demand without a persistent cache; measure before adding invalidation state.
-- Use strict, expanding lowercase hexadecimal IDs; reject random two-character IDs because their 256-value hexadecimal space collides quickly, and reject fixed-width IDs because sessions can exceed that space.
-- Preserve numeric ID ordering and reject permissive case or leading-zero normalisation.
+- Use strict, expanding dot-separated base-36 paths; reject opaque global IDs because they hide ancestry, and reject fixed-width segments because sibling sets can exceed that space.
+- Preserve numeric path ordering and reject permissive case or leading-zero normalisation.
 
 ## Risks / unknowns
 
@@ -133,12 +135,12 @@ Only visible active task headers participate in whole-second redraw tracking. Tr
 
 ### Acceptance criteria
 
-- Canonical task IDs are sequential lowercase hexadecimal strings: `00` through `ff`, then `100`; they expand without reuse, reject malformed/non-canonical input, and retain numeric ordering across width changes.
+- Canonical task IDs are dot-separated lowercase base-36 paths: root and sibling segments run `0` through `z`, then `10`; descendants append their per-parent segment, expand without reuse, reject malformed input, and retain numeric path ordering.
 - The live sticky monitor renders the deepest active branch first, with first-admitted tie-breaking, terminal ancestors, tree connectors, and each real node's prompt preview.
 - The preferred projection contains at most four real task nodes. Root capacity falls from four to one as the expanded visible branch grows from one to four nodes.
 - Headers, backtick-delimited prompt rows and omission rows follow the specified indentation grammar. Omitted siblings, collapsed descendants, deeper nodes and roots have non-overlapping clipped counts; deeper summaries include active descendants, while missing parents degrade to roots.
 - Accepted requests preserve terminal ancestors of active tasks and clear them on a later accepted request after the subtree settles.
-- Durable history cards, runtime event shapes, Python subagent signatures, admission behaviour, selection boundaries, narrow-terminal fallbacks, and once-per-visible-second redraw behaviour remain unchanged.
+- Lifecycle cards published during foreground Python are queued behind that live Python card in publication order; durable event shapes, Python subagent signatures, admission behaviour, selection boundaries, narrow-terminal fallbacks, and once-per-visible-second redraw behaviour remain unchanged.
 
 ### Overall validation
 
@@ -171,19 +173,19 @@ git -C worktrees/subagents branch -d work/subagent-tree-and-ids
 ### Planning context
 
 - `TaskId` owns validation, display and sorted-key behaviour; allocation currently increments `Inner.next_task` after admission (`src/subagents.rs:34-56`, `src/subagents.rs:1960-1995`, `src/subagents.rs:2608-2626`).
-- Exact six-digit fixtures occur across coordinator, Arena, runtime, transcript and TUI tests. Valid-unknown fixtures must remain canonical hexadecimal rather than becoming malformed (`src/subagents.rs:3185-3210`, `src/arena.rs:5140-5180`, `src/runtime.rs:6815-7000`).
+- Exact legacy-ID fixtures occur across coordinator, Arena, runtime, transcript and TUI tests. Valid unknown IDs must remain canonical paths rather than becoming malformed; restore coverage must retain old flat hexadecimal records.
 - Reliable task records already contain the parent needed by the monitor. No production runtime or coordinator interface change is required (`src/subagents.rs:1316-1352`, `src/runtime.rs:595-685`).
 - Monitor layout, clearing, prompt clipping, width pressure and timer visibility are concentrated in `src/tui/subagents.rs`; outer geometry and selection behaviour are covered in `src/tui.rs:5808-6011`.
 
-### Task 1: Use canonical hexadecimal task IDs
+### Task 1: Use canonical hierarchical task IDs
 
-**Changes** — Replace six-character base-36 generation and parsing with strict minimum-two-character lowercase hexadecimal IDs, checked non-reusing sequence exhaustion, and numeric ordering across variable widths. Keep serialized/model-facing IDs as strings. Update the original subagent specification's ID contract and examples. Update exact ID fixtures without weakening malformed-versus-unknown coverage.
+**Changes** — Replace global ID generation and parsing with strict per-parent base-36 path segments, checked non-reusing sequence exhaustion, and numeric ordering across variable-width paths. Persist the public path separately from the internal numeric task key, retaining backward restoration for records without a public path. Keep serialized/model-facing IDs as strings. Update the original subagent specification's ID contract and examples without weakening malformed-versus-unknown coverage.
 
-**Tests** (`src/subagents.rs`, identity policy; existing integration fixtures) — First make the identity test require `00`, `01`, `0f`, `10`, `ff`, and `100`, numeric sorted order across the width boundary, strict rejection of uppercase/redundant-leading-zero/non-hex/overflow forms, a canonical unknown ID, and no reuse after settlement. Seed the isolated allocator at its final representable sequence, admit that final ID, and prove the next admission returns identifier-space exhaustion without wrapping or reuse. Existing Arena, runtime, transcript, telemetry and TUI tests must continue to cover correlation and presentation using the new IDs.
+**Tests** (`src/subagents.rs`, identity policy; existing integration fixtures) — Require root IDs `0`, `1`, `z`, and `10`; descendant IDs such as `g.0`, `g.10`, and `g.a.0`; numeric path ordering; strict rejection of uppercase, empty segments, redundant leading zeroes, non-base-36 and overflow forms; a canonical unknown ID; and no reuse after settlement or restoration. Existing Arena, runtime, session, transcript, telemetry and TUI tests must continue to cover correlation and presentation using the new IDs.
 
 **Files** — Modify: `src/subagents.rs`, `src/arena.rs`, `src/runtime.rs`, `src/transcript.rs`, `src/tui.rs`, `src/tui/subagents.rs`, `docs/2026-09-05_subagents/spec.md`; modify other test-only fixtures only where the compiler or focused test search identifies an exact old-format assumption.
 
-**Verification** — `MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test subagents::tests --all-targets -- --test-threads=1 && MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test arena::tests --all-targets -- --test-threads=1` — identity boundaries, authority lookup and real-worker task operations pass with canonical hexadecimal IDs.
+**Verification** — `MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test subagents::tests --all-targets -- --test-threads=1 && MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test arena::tests --all-targets -- --test-threads=1` — identity boundaries, authority lookup and real-worker task operations pass with canonical hierarchical IDs.
 
 ### Task 2: Render the bounded live subagent tree
 

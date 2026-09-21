@@ -130,6 +130,7 @@ struct LiveStep {
     run_id: RunId,
     step_id: ModelStepId,
     phase: LivePhase,
+    attempt: Option<u32>,
     settled_attempts: Vec<AttemptAccounting>,
     reasoning: String,
     assistant_text: String,
@@ -149,6 +150,7 @@ impl LiveStep {
             run_id,
             step_id,
             phase: LivePhase::Generating,
+            attempt: None,
             settled_attempts: Vec::new(),
             reasoning: String::new(),
             assistant_text: String::new(),
@@ -2220,6 +2222,12 @@ pub(crate) struct ConstructionCounts {
     selection_region_builds: usize,
 }
 
+struct PendingSubagentBlock {
+    run_id: Option<RunId>,
+    step_id: ModelStepId,
+    block: TranscriptBlock,
+}
+
 pub(crate) struct Transcript {
     startup: Option<StartupSnapshot>,
     run_state: RunState,
@@ -2232,6 +2240,8 @@ pub(crate) struct Transcript {
     records: Vec<DisplayedRecord>,
     subagent_records: BTreeMap<TaskId, TaskRecord>,
     subagent_lifecycle_cards: BTreeSet<(TaskId, SubagentCardPhase)>,
+    pending_subagent_blocks: Vec<PendingSubagentBlock>,
+    show_pending_subagent_blocks: bool,
     footer_adjustment: Vec<AttemptAccounting>,
     settled_blocks: Vec<SettledBlock>,
     live_step: Option<LiveStep>,
@@ -2257,6 +2267,8 @@ impl Default for Transcript {
             records: Vec::new(),
             subagent_records: BTreeMap::new(),
             subagent_lifecycle_cards: BTreeSet::new(),
+            pending_subagent_blocks: Vec::new(),
+            show_pending_subagent_blocks: false,
             footer_adjustment: Vec::new(),
             settled_blocks: Vec::new(),
             live_step: None,
@@ -2305,19 +2317,25 @@ impl Transcript {
 
     fn apply_initial_state(&mut self, initial: &RuntimeInitialState) {
         for item in &initial.timeline {
-            let event = match item {
-                RestoredTimelineItem::Record(record) => RuntimeEvent::RecordAppended {
-                    record: record.clone(),
-                    progress_gap: false,
-                },
-                RestoredTimelineItem::SubagentSpawned(record) => RuntimeEvent::SubagentSpawned {
-                    record: record.clone(),
-                },
-                RestoredTimelineItem::SubagentFinished(record) => RuntimeEvent::SubagentFinished {
-                    record: record.clone(),
-                },
-            };
-            self.apply(event, false);
+            match item {
+                RestoredTimelineItem::Record(record) => {
+                    self.apply(
+                        RuntimeEvent::RecordAppended {
+                            record: record.clone(),
+                            progress_gap: false,
+                        },
+                        false,
+                    );
+                }
+                RestoredTimelineItem::SubagentSpawned(record) => {
+                    self.append_restored_subagent_card(record, SubagentCardPhase::Spawned);
+                    self.replace_subagent_record(record.clone());
+                }
+                RestoredTimelineItem::SubagentFinished(record) => {
+                    self.append_restored_subagent_card(record, SubagentCardPhase::Finished);
+                    self.replace_subagent_record(record.clone());
+                }
+            }
         }
         self.footer_adjustment = initial.footer_adjustment.clone();
         if let Some(reason) = &initial.disabled_reason {
@@ -2342,12 +2360,26 @@ impl Transcript {
         self.run_state == RunState::Idle
     }
 
+    pub(crate) fn is_generating(&self) -> bool {
+        self.disabled_reason.is_none()
+            && self
+                .live_step
+                .as_ref()
+                .is_some_and(|live| live.phase == LivePhase::Generating)
+    }
+
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled_reason.is_some()
     }
 
     pub(crate) fn status(&self) -> &str {
         &self.status
+    }
+
+    fn is_executing_step(&self, run_id: RunId, step_id: ModelStepId) -> bool {
+        self.live_step.as_ref().is_some_and(|live| {
+            live.run_id == run_id && live.step_id == step_id && live.phase == LivePhase::Executing
+        })
     }
 
     fn has_settled_run(&self, run_id: RunId, step_id: ModelStepId) -> bool {
@@ -2367,13 +2399,9 @@ impl Transcript {
                 if self.has_settled_run(run_id, step_id) {
                     false
                 } else {
-                    self.update_live_step(
-                        run_id,
-                        step_id,
-                        gap_before,
-                        Some("generating".to_owned()),
-                        |_| {},
-                    )
+                    let status =
+                        (!self.is_executing_step(run_id, step_id)).then(|| "generating".to_owned());
+                    self.update_live_step(run_id, step_id, gap_before, status, |_| {})
                 }
             }
             RuntimeEvent::ModelProgress {
@@ -2384,25 +2412,33 @@ impl Transcript {
                 if self.has_settled_run(run_id, step_id) {
                     false
                 } else {
+                    let executing = self.is_executing_step(run_id, step_id);
+                    let status = (!executing).then(|| "generating".to_owned());
                     self.update_live_step(
                         run_id,
                         step_id,
                         gap_before,
-                        Some("generating".to_owned()),
+                        status,
                         |live| match progress {
-                            ModelProgress::AttemptStarted { .. } => {
-                                live.phase = LivePhase::Generating;
-                                live.reasoning.clear();
-                                live.assistant_text.clear();
-                                live.decoded_python.clear();
-                                live.activity = "generating".to_owned();
+                            ModelProgress::AttemptStarted { attempt } => {
+                                if live.attempt.is_none_or(|current| attempt > current) {
+                                    live.attempt = Some(attempt);
+                                    live.reasoning.clear();
+                                    live.decoded_python.clear();
+                                    if !executing {
+                                        live.phase = LivePhase::Generating;
+                                        live.assistant_text.clear();
+                                        live.activity = "generating".to_owned();
+                                    }
+                                }
                             }
                             ModelProgress::ReasoningSummaryChunk { text } => {
                                 live.reasoning.push_str(&text)
                             }
-                            ModelProgress::AssistantTextChunk { text } => {
+                            ModelProgress::AssistantTextChunk { text } if !executing => {
                                 live.assistant_text.push_str(&text)
                             }
+                            ModelProgress::AssistantTextChunk { .. } => {}
                             ModelProgress::DecodedPythonChunk { code } => {
                                 live.decoded_python.push_str(&code)
                             }
@@ -2418,6 +2454,7 @@ impl Transcript {
                 step_id,
                 commentary,
             } => {
+                self.associate_pending_subagent_blocks(run_id, step_id);
                 if self.has_settled_run(run_id, step_id) {
                     false
                 } else {
@@ -2580,17 +2617,104 @@ impl Transcript {
     }
 
     fn append_subagent_card(&mut self, record: &TaskRecord, phase: SubagentCardPhase) -> bool {
+        self.append_subagent_card_with_anchor(record, phase, true)
+    }
+
+    fn append_restored_subagent_card(
+        &mut self,
+        record: &TaskRecord,
+        phase: SubagentCardPhase,
+    ) -> bool {
+        self.append_subagent_card_with_anchor(record, phase, false)
+    }
+
+    fn append_subagent_card_with_anchor(
+        &mut self,
+        record: &TaskRecord,
+        phase: SubagentCardPhase,
+        defer_until_anchor: bool,
+    ) -> bool {
         if !self
             .subagent_lifecycle_cards
             .insert((record.id().clone(), phase))
         {
             return false;
         }
-        let block = match phase {
-            SubagentCardPhase::Spawned => spawned_subagent_block(record),
-            SubagentCardPhase::Finished => finished_subagent_block(record),
+        let (block, history_step_id) = match phase {
+            SubagentCardPhase::Spawned => (
+                spawned_subagent_block(record),
+                record.admission_history_step_id(),
+            ),
+            SubagentCardPhase::Finished => (
+                finished_subagent_block(record),
+                record.terminal_history_step_id(),
+            ),
         };
-        self.append_settled_blocks([block]);
+        let pending_anchor = history_step_id
+            .filter(|_| defer_until_anchor)
+            .map(ModelStepId)
+            .filter(|step_id| {
+                !self
+                    .completed_steps
+                    .iter()
+                    .any(|(_, completed_step_id)| completed_step_id == step_id)
+            })
+            .map(|step_id| {
+                let run_id = self.live_step.as_ref().and_then(|live| {
+                    (live.phase == LivePhase::Executing && live.step_id == step_id)
+                        .then_some(live.run_id)
+                });
+                (run_id, step_id)
+            });
+        if let Some((run_id, step_id)) = pending_anchor {
+            self.pending_subagent_blocks.push(PendingSubagentBlock {
+                run_id,
+                step_id,
+                block,
+            });
+            if self.disabled_reason.is_some() {
+                self.show_pending_subagent_blocks = true;
+            }
+        } else {
+            self.append_settled_blocks([block]);
+        }
+        true
+    }
+
+    fn associate_pending_subagent_blocks(&mut self, run_id: RunId, step_id: ModelStepId) {
+        for pending in &mut self.pending_subagent_blocks {
+            if pending.run_id.is_none() && pending.step_id == step_id {
+                pending.run_id = Some(run_id);
+            }
+        }
+    }
+
+    fn flush_pending_subagent_blocks(
+        &mut self,
+        run_id: RunId,
+        step_id: Option<ModelStepId>,
+    ) -> bool {
+        let mut blocks = Vec::new();
+        let mut remaining = Vec::new();
+        for pending in std::mem::take(&mut self.pending_subagent_blocks) {
+            if pending
+                .run_id
+                .is_none_or(|pending_run_id| pending_run_id == run_id)
+                && step_id.is_none_or(|step_id| pending.step_id == step_id)
+            {
+                blocks.push(pending.block);
+            } else {
+                remaining.push(pending);
+            }
+        }
+        self.pending_subagent_blocks = remaining;
+        if self.pending_subagent_blocks.is_empty() {
+            self.show_pending_subagent_blocks = false;
+        }
+        if blocks.is_empty() {
+            return false;
+        }
+        self.append_settled_blocks(blocks);
         true
     }
 
@@ -2625,7 +2749,8 @@ impl Transcript {
                     || !live.decoded_python.is_empty()
                     || !live.stdout.is_empty()
                     || live.stdout_truncated
-            });
+            })
+            || self.show_pending_subagent_blocks && !self.pending_subagent_blocks.is_empty();
         if visible {
             for block in &mut self.settled_blocks {
                 if block.invalidates_for_expansion() {
@@ -2670,10 +2795,20 @@ impl Transcript {
             .into_iter()
             .map(TranscriptBlock::normalise)
             .collect::<Vec<_>>();
+        let pending_sources = if self.show_pending_subagent_blocks {
+            self.pending_subagent_blocks
+                .iter()
+                .map(|pending| pending.block.clone().normalise())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let highlighter = &mut self.highlighter;
         #[cfg(test)]
         let mut construction_counts = use_cache.then_some(&mut self.construction_counts);
-        let mut blocks = Vec::with_capacity(self.settled_blocks.len() + live_sources.len());
+        let mut blocks = Vec::with_capacity(
+            self.settled_blocks.len() + live_sources.len() + pending_sources.len(),
+        );
         for settled in &mut self.settled_blocks {
             if use_cache
                 && let Some(raster) = settled
@@ -2716,7 +2851,7 @@ impl Transcript {
             };
             blocks.push(block);
         }
-        for source in &live_sources {
+        for source in live_sources.iter().chain(&pending_sources) {
             blocks.push(LayoutBlock::Fresh(build_render_block(
                 source,
                 show_reasoning,
@@ -2765,6 +2900,13 @@ impl Transcript {
         if self.restoration_card {
             blocks.push(TranscriptBlock::SessionRestored);
         }
+        if self.show_pending_subagent_blocks {
+            blocks.extend(
+                self.pending_subagent_blocks
+                    .iter()
+                    .map(|pending| pending.block.clone()),
+            );
+        }
         DisplayProjection { blocks }
     }
 
@@ -2805,7 +2947,19 @@ impl Transcript {
         if submitting_cleared {
             self.run_state = RunState::Idle;
         }
-        reason_changed | submitting_cleared | self.set_status(disabled_status(&reason).to_owned())
+        let cards_released = self.release_pending_subagent_blocks();
+        reason_changed
+            | submitting_cleared
+            | cards_released
+            | self.set_status(disabled_status(&reason).to_owned())
+    }
+
+    fn release_pending_subagent_blocks(&mut self) -> bool {
+        if self.pending_subagent_blocks.is_empty() || self.show_pending_subagent_blocks {
+            return false;
+        }
+        self.show_pending_subagent_blocks = true;
+        true
     }
 
     fn start_run(&mut self, run_id: RunId, gap_before: bool) -> bool {
@@ -2920,6 +3074,25 @@ impl Transcript {
             self.settled_blocks
                 .retain(|block| !matches!(block.source, NormalisedBlock::SessionRestored));
         }
+        let run_id = record.run_id;
+        let settled_step = match &record.record {
+            Record::CompletedExecution { step_id, .. } => Some(*step_id),
+            Record::UserRequest { .. }
+            | Record::FinalMessage { .. }
+            | Record::CancelledRun { .. }
+            | Record::FailedRun { .. } => None,
+        };
+        let settles_run = matches!(
+            &record.record,
+            Record::FinalMessage { .. } | Record::CancelledRun { .. } | Record::FailedRun { .. }
+        );
+        let terminal_step = settles_run.then(|| {
+            self.live_step.as_ref().and_then(|live| {
+                (live.run_id == record.run_id && live.phase == LivePhase::Executing)
+                    .then_some(live.step_id)
+            })
+        });
+        let terminal_step = terminal_step.flatten();
         self.latest_run_id = Some(
             self.latest_run_id
                 .map_or(record.run_id, |latest| latest.max(record.run_id)),
@@ -2946,6 +3119,9 @@ impl Transcript {
             Record::FinalMessage { .. }
             | Record::CancelledRun { .. }
             | Record::FailedRun { .. } => {
+                if let Some(step_id) = terminal_step {
+                    self.completed_steps.push((record.run_id, step_id));
+                }
                 self.mark_terminal_run(record.run_id);
             }
             Record::UserRequest { .. } => {}
@@ -2958,6 +3134,11 @@ impl Transcript {
         let blocks = record_blocks(&displayed);
         self.records.push(displayed);
         self.append_settled_blocks(blocks);
+        if let Some(step_id) = settled_step {
+            self.flush_pending_subagent_blocks(run_id, Some(step_id));
+        } else if settles_run {
+            self.flush_pending_subagent_blocks(run_id, None);
+        }
         true
     }
 
@@ -2970,10 +3151,18 @@ impl Transcript {
             return false;
         }
         self.latest_run_id = Some(run_id);
+        if let Some(step_id) = self.live_step.as_ref().and_then(|live| {
+            (live.run_id == run_id && live.phase == LivePhase::Executing).then_some(live.step_id)
+        }) {
+            self.completed_steps.push((run_id, step_id));
+        }
         self.mark_terminal_run(run_id);
         let state_changed = self.run_state != RunState::Idle;
         self.run_state = RunState::Idle;
-        state_changed | (self.disabled_reason.is_none() && self.set_status("idle".to_owned()))
+        let cards_flushed = self.flush_pending_subagent_blocks(run_id, None);
+        state_changed
+            | cards_flushed
+            | (self.disabled_reason.is_none() && self.set_status("idle".to_owned()))
     }
 
     fn mark_terminal_run(&mut self, run_id: RunId) {
@@ -3299,11 +3488,6 @@ fn live_blocks(live: &LiveStep) -> Vec<TranscriptBlock> {
     let accounting = step_accounting(&live.settled_attempts);
 
     let mut blocks = Vec::new();
-    if !has_arena_content {
-        blocks.push(TranscriptBlock::Status {
-            text: live.phase.label().to_owned(),
-        });
-    }
     append_reasoning(&mut blocks, "", &live.reasoning);
     if has_arena_content {
         if !live.assistant_text.is_empty() {
@@ -3950,11 +4134,11 @@ mod tests {
 
     use super::{
         ArenaBlock, COMPLETE_ARENA, CardRenderBlock, DIM, ERROR_ARENA, Footer, FooterContext,
-        FooterField, FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, MUTED, ModelFooter,
-        NormalisedBlock, RenderBlock, SubagentFinishedCard, SubagentSpawnedCard, TEXT, Transcript,
-        TranscriptBlock, TranscriptLayout, USER, assistant_text, format_footer_usd,
-        format_token_count, markdown, muted_page_style, normalise_terminal_text, own_styled_text,
-        page_style, subagent_preview, tool_call_label,
+        FooterField, FooterIdentity, IN_PROGRESS_ARENA, LayoutBlock, LivePhase, MUTED, ModelFooter,
+        NormalisedBlock, RenderBlock, SubagentCardPhase, SubagentFinishedCard, SubagentSpawnedCard,
+        TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
+        format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
+        own_styled_text, page_style, subagent_preview, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -4069,7 +4253,7 @@ mod tests {
     #[test]
     fn session_restored_card_follows_late_finished_tasks() {
         let task = TaskRecord::for_test(
-            "00",
+            "0",
             1,
             ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
             None,
@@ -4096,8 +4280,316 @@ mod tests {
         let text = rendered_layout_text(&mut transcript);
 
         assert!(
-            text.find("subagent:00").expect("finished task")
+            text.find("subagent:0").expect("finished task")
                 < text.find("Session restored.").expect("restoration card")
+        );
+    }
+
+    #[test]
+    fn disabling_after_storage_failure_releases_queued_subagent_cards_after_python() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "await start_subagent('review')".to_owned(),
+                },
+            },
+            false,
+        ));
+        assert!(
+            transcript.apply(
+                RuntimeEvent::SubagentSpawned {
+                    record: TaskRecord::for_test(
+                        "c1",
+                        1,
+                        ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                        None,
+                        1,
+                        Vec::new(),
+                    )
+                    .with_history_steps_for_test(Some(1), None),
+                },
+                false,
+            )
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+            false,
+        ));
+
+        assert!(transcript.live_step.is_some());
+        let rendered = rendered_layout_text(&mut transcript);
+        let python = rendered
+            .find("await start_subagent('review')")
+            .expect("Python card");
+        let spawned = rendered
+            .find("Spawned · subagent:c1")
+            .expect("spawned card");
+        assert!(python < spawned, "{rendered}");
+
+        let mut late = Transcript::default();
+        start_live_run(&mut late);
+        late.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "late_python()".to_owned(),
+                },
+            },
+            false,
+        );
+        late.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+            false,
+        );
+        late.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: TaskRecord::for_test(
+                    "c2",
+                    1,
+                    ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                )
+                .with_history_steps_for_test(Some(1), None),
+            },
+            false,
+        );
+        let rendered = rendered_layout_text(&mut late);
+        assert!(
+            rendered.find("late_python()").unwrap()
+                < rendered.find("Spawned · subagent:c2").unwrap(),
+            "{rendered}"
+        );
+
+        let mut no_live = Transcript::default();
+        no_live.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        no_live.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+            false,
+        );
+        no_live.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: TaskRecord::for_test(
+                    "c3",
+                    1,
+                    ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                )
+                .with_history_steps_for_test(Some(1), None),
+            },
+            false,
+        );
+        assert!(no_live.toggle_arena_expansion());
+    }
+
+    #[test]
+    fn delayed_generation_progress_keeps_execution_state_and_authoritative_content() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptStarted { attempt: 1 },
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "discarded_python()".to_owned(),
+                },
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                commentary: Some("Authoritative commentary.".to_owned()),
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptStarted { attempt: 2 },
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "Authoritative commentary.".to_owned(),
+                },
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "executed_python()".to_owned(),
+                },
+            },
+            false,
+        );
+
+        let live = transcript.live_step.as_ref().unwrap();
+        assert_eq!(live.phase, LivePhase::Executing);
+        assert_eq!(live.assistant_text, "Authoritative commentary.");
+        assert_eq!(live.decoded_python, "executed_python()");
+    }
+
+    #[test]
+    fn terminal_settlement_does_not_strand_late_anchored_cards() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails {
+                            evidence: None,
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let record = TaskRecord::for_test(
+            "late",
+            1,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        )
+        .with_history_steps_for_test(None, Some(1));
+
+        transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: record.clone(),
+            },
+            false,
+        );
+        assert!(transcript.pending_subagent_blocks.is_empty());
+        assert!(rendered_layout_text(&mut transcript).contains("Completed · subagent:late"));
+
+        let mut restored = Transcript::default();
+        restored.append_restored_subagent_card(&record, SubagentCardPhase::Finished);
+        assert!(restored.pending_subagent_blocks.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_anchor_queues_before_execution_progress_arrives() {
+        let mut transcript = Transcript::default();
+        transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
+        transcript.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: TaskRecord::for_test(
+                    "early",
+                    1,
+                    ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                )
+                .with_history_steps_for_test(Some(1), None),
+            },
+            false,
+        );
+        assert!(!rendered_layout_text(&mut transcript).contains("Spawned · subagent:early"));
+
+        transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                commentary: None,
+            },
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "spawn_python()".to_owned(),
+                },
+            },
+            false,
+        );
+        transcript.apply(
+            completed_execution(1, 1, "spawn_python()", "", Vec::new()),
+            false,
+        );
+
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(
+            rendered.find("spawn_python()").unwrap()
+                < rendered.find("Spawned · subagent:early").unwrap(),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_cards_use_the_captured_history_anchor_not_delivery_time() {
+        let mut transcript = Transcript::default();
+        start_live_run(&mut transcript);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "current_python()".to_owned(),
+                },
+            },
+            false,
+        );
+
+        transcript.apply(
+            RuntimeEvent::SubagentFinished {
+                record: TaskRecord::for_test(
+                    "earlier",
+                    1,
+                    ModelSelection::new(&TERRA, TERRA.default_thinking).unwrap(),
+                    None,
+                    1,
+                    Vec::new(),
+                ),
+            },
+            false,
+        );
+
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(
+            rendered.find("Completed · subagent:earlier").unwrap()
+                < rendered.find("current_python()").unwrap(),
+            "{rendered}"
         );
     }
 
@@ -4127,9 +4619,17 @@ mod tests {
     }
 
     #[test]
-    fn spawned_subagent_card_is_separate_from_a_live_python_tail() {
+    fn subagent_lifecycle_cards_follow_the_active_python_in_publication_order() {
         let mut transcript = Transcript::default();
         start_live_run(&mut transcript);
+        transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AttemptStarted { attempt: 2 },
+            },
+            false,
+        );
         assert!(transcript.apply(
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
@@ -4140,6 +4640,7 @@ mod tests {
             },
             false,
         ));
+        assert!(transcript.is_executing_step(RunId(1), ModelStepId(1)));
         let child = TaskRecord::for_test(
             "c1",
             1,
@@ -4147,24 +4648,54 @@ mod tests {
             None,
             1,
             Vec::new(),
-        );
+        )
+        .with_history_steps_for_test(Some(1), Some(1));
 
-        assert!(transcript.apply(RuntimeEvent::SubagentSpawned { record: child }, false));
+        assert!(transcript.apply(
+            RuntimeEvent::SubagentSpawned {
+                record: child.clone(),
+            },
+            false,
+        ));
+        assert!(transcript.apply(RuntimeEvent::SubagentFinished { record: child }, false));
 
-        let rendered = rendered_layout_text(&mut transcript);
-        let spawned = rendered
-            .find("Spawned · subagent:c1")
-            .expect("spawned card");
-        let live = rendered
-            .find("await start_subagent('review')")
-            .expect("live Python tail");
+        let live = rendered_layout_text(&mut transcript);
+        assert!(live.contains("await start_subagent('review')"), "{live}");
+        assert!(!live.contains("Spawned · subagent:c1"), "{live}");
+        assert!(!live.contains("Completed · subagent:c1"), "{live}");
+
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(2),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "later_python()".to_owned(),
+                },
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            completed_execution(1, 1, "await start_subagent('review')", "", Vec::new(),),
+            false,
+        ));
+        let settled = rendered_layout_text(&mut transcript);
+        let positions = [
+            "await start_subagent('review')",
+            "Spawned · subagent:c1",
+            "Completed · subagent:c1",
+            "later_python()",
+        ]
+        .map(|text| settled.find(text).expect(text));
         assert!(
-            rendered.contains("Model · openai/gpt-5.6-terra"),
-            "{rendered}"
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{settled}"
         );
-        assert!(rendered.contains("Prompt"), "{rendered}");
-        assert!(rendered.contains("test child"), "{rendered}");
-        assert!(spawned < live, "{rendered}");
+        assert!(
+            settled.contains("Model · openai/gpt-5.6-terra"),
+            "{settled}"
+        );
+        assert!(settled.contains("Prompt"), "{settled}");
+        assert!(settled.contains("test child"), "{settled}");
     }
 
     #[test]
@@ -5478,7 +6009,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_joins_a_standalone_accounting_card_with_one_blank_line() {
+    fn selection_extracts_standalone_live_accounting() {
         let mut transcript = Transcript::default();
         transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false);
         transcript.apply(
@@ -5500,7 +6031,7 @@ mod tests {
                 DocumentPosition::new(0, 0),
                 DocumentPosition::new(layout.total_height(), 0),
             )),
-            "generating\n\n↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
+            "↑1 ↓1 R0 W0 r0 Σ2 · $0.000024"
         );
     }
 
@@ -6298,7 +6829,7 @@ truncated"
 
         let history = rendered_text(&transcript);
         assert!(history.contains("settled\ndisplay gap"));
-        assert!(history.ends_with("generating"));
+        assert!(history.ends_with("display gap: some live progress was dropped"));
     }
 
     #[test]
@@ -10531,7 +11062,7 @@ truncated"
             false,
         );
         assert_eq!(transcript.status(), "generating");
-        assert_eq!(rendered_text(&transcript), "generating");
+        assert_eq!(rendered_text(&transcript), "");
 
         let history = rendered_text(&transcript);
         let status = transcript.status().to_owned();
