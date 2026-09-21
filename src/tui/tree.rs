@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -230,6 +233,8 @@ struct SessionTree {
     conversation_topology: TreeTopology,
     preorder: Vec<usize>,
     active_index: usize,
+    #[cfg(test)]
+    row_item_constructions: Cell<usize>,
 }
 
 impl SessionTree {
@@ -297,6 +302,8 @@ impl SessionTree {
             conversation_topology,
             preorder,
             active_index: active,
+            #[cfg(test)]
+            row_item_constructions: Cell::new(0),
         }
     }
 
@@ -343,6 +350,11 @@ impl SessionTree {
         let projection = self.filtered_projection(mode, query);
         picker.replace_items(self.items(&projection, row_width, folded_heads));
         projection
+    }
+
+    #[cfg(test)]
+    fn row_item_constructions(&self) -> usize {
+        self.row_item_constructions.get()
     }
 
     fn filtered_projection(&self, mode: TreeMode, query: &str) -> TreeProjection<'_> {
@@ -414,6 +426,9 @@ impl SessionTree {
                     if self.draws_joint(index, displayed.topology) {
                         connectors.push(!displayed.last_visible[index]);
                     }
+                    #[cfg(test)]
+                    self.row_item_constructions
+                        .set(self.row_item_constructions.get() + 1);
                     items.push(DynamicPickerItem {
                         row,
                         focused_row: Some(focused_row),
@@ -861,15 +876,23 @@ impl TreeNavigator {
                 PickerAction::Changed => {
                     if picker.filter() != filter {
                         folded_heads.clear();
+                        let query = picker.filter().to_owned();
+                        tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
                     }
-                    let query = picker.filter().to_owned();
-                    tree.refresh_for_query(picker, mode, &query, row_width, folded_heads);
                     TreeNavigatorAction::Changed
                 }
                 PickerAction::Apply(entry) => TreeNavigatorAction::Navigate(entry),
                 PickerAction::Close => unreachable!("tree navigator handles Escape"),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn row_item_constructions(&self) -> usize {
+        let TreeNavigatorState::Ready { tree, .. } = &self.state else {
+            unreachable!("catalogue installation creates ready tree");
+        };
+        tree.row_item_constructions()
     }
 
     fn copy_focused(&self) -> Option<String> {
@@ -1302,6 +1325,40 @@ mod tests {
         assert_eq!(
             navigator.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             TreeNavigatorAction::Close
+        );
+    }
+
+    #[test]
+    fn navigator_does_not_rebuild_rows_for_focus_movement() {
+        let mut navigator = TreeNavigator::new(23, "");
+        assert!(navigator.install_catalogue(
+            23,
+            &catalogue(
+                1,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, request("needle")),
+                ],
+            )
+        ));
+        let constructions = navigator.row_item_constructions();
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(navigator.picker().focused_value(), Some(SessionEntryId(2)));
+        assert_eq!(navigator.row_item_constructions(), constructions);
+
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            TreeNavigatorAction::Changed
+        );
+        assert_eq!(navigator.picker().filter(), "n");
+        assert!(navigator.row_item_constructions() > constructions);
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(2))
         );
     }
 
