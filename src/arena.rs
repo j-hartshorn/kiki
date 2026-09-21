@@ -3983,7 +3983,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::StartSubagent,
-                summary: ToolCallSummary::Subagent("00".to_owned()),
+                summary: ToolCallSummary::Subagent("0".to_owned()),
             }]
         );
         let finish = started.recv().await.expect("child starts");
@@ -4004,7 +4004,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::RefreshSubagent,
-                summary: ToolCallSummary::Subagent("00".to_owned()),
+                summary: ToolCallSummary::Subagent("0".to_owned()),
             }]
         );
 
@@ -4033,7 +4033,7 @@ mod tests {
             execution.tool_calls,
             [ToolCall {
                 tool: ToolName::WaitSubagent,
-                summary: ToolCallSummary::Subagent("00".to_owned()),
+                summary: ToolCallSummary::Subagent("0".to_owned()),
             }]
         );
     }
@@ -4145,8 +4145,8 @@ mod tests {
         let limit = crate::config::constants::MAX_PROMPT_BYTES;
 
         for (prompt, expected_id) in [
-            ("a".repeat(limit), "00"),
-            ("🦀".repeat(limit / '🦀'.len_utf8()), "01"),
+            ("a".repeat(limit), "0"),
+            ("🦀".repeat(limit / '🦀'.len_utf8()), "1"),
         ] {
             let execution = execute_with_invocation(
                 &mut arena,
@@ -4247,7 +4247,7 @@ mod tests {
             "task = await start_subagent('failure')\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'00'");
+        assert_eq!(complete(&execution).unwrap().head, "'0'");
         let finish = started.recv().await.expect("child starts");
         finish.send(Err(ChildFailure::new("failed work"))).unwrap();
         let execution = execute_with_invocation(
@@ -4299,7 +4299,7 @@ mod tests {
             "import asyncio\ncontents, task = await asyncio.gather(read('file'), start_subagent('child'))\nawait write('file', contents + '!')\nawait task.cancel()\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'00'");
+        assert_eq!(complete(&execution).unwrap().head, "'0'");
         assert_eq!(
             fs::read_to_string(workspace.path().join("file")).unwrap(),
             "before!"
@@ -4313,7 +4313,7 @@ mod tests {
                 },
                 ToolCall {
                     tool: ToolName::StartSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
                 ToolCall {
                     tool: ToolName::Write,
@@ -4321,7 +4321,7 @@ mod tests {
                 },
                 ToolCall {
                     tool: ToolName::CancelSubagent,
-                    summary: ToolCallSummary::Subagent("00".to_owned()),
+                    summary: ToolCallSummary::Subagent("0".to_owned()),
                 },
             ]
         );
@@ -4338,7 +4338,7 @@ mod tests {
             "first = await start_subagent('first')\nsecond = await start_subagent('second')\n(second.id)",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'01'");
+        assert_eq!(complete(&execution).unwrap().head, "'1'");
         let first = started.recv().await.expect("first child starts");
         let second = started.recv().await.expect("second child starts");
         first.send(Err(ChildFailure::new("failed first"))).unwrap();
@@ -4381,7 +4381,7 @@ mod tests {
             "task = await start_subagent('timeout')\ntask.id",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "'00'");
+        assert_eq!(complete(&execution).unwrap().head, "'0'");
         let _finish = started.recv().await.expect("child starts");
         clock.advance(Duration::from_secs(901));
         coordinator.service().await;
@@ -5159,7 +5159,7 @@ mod tests {
             "same_execution = 'later'\nfirst = await start_subagent('first')\nsecond = await start_subagent('second')\n(first.id, second.id)",
         )
         .await;
-        assert_eq!(complete(&execution).unwrap().head, "('00', '01')");
+        assert_eq!(complete(&execution).unwrap().head, "('0', '1')");
 
         let execution = execute_with_invocation(
             &mut arena,
@@ -5187,7 +5187,7 @@ mod tests {
         .await;
         assert_eq!(
             complete(&execution).unwrap().head,
-            "(['malformed_refresh', 'malformed_wait', 'malformed_cancel', 'unknown_refresh', 'unknown_wait', 'unknown_cancel'], '00')"
+            "(['malformed_refresh', 'malformed_wait', 'malformed_cancel', 'unknown_refresh', 'unknown_wait', 'unknown_cancel'], '0')"
         );
         let checkpoint = arena.checkpoint();
         arena.restore(checkpoint).await.unwrap();
@@ -5199,7 +5199,7 @@ mod tests {
         .await;
         assert!(matches!(
             complete(&execution).unwrap().head.as_str(),
-            "('00', 'starting')" | "('00', 'running')"
+            "('0', 'starting')" | "('0', 'running')"
         ));
         let finish = started.recv().await.expect("child starts");
         finish
@@ -5207,7 +5207,7 @@ mod tests {
             .unwrap();
         let execution =
             execute_with_invocation(&mut arena, &context, "(await task.wait())['id']").await;
-        assert_eq!(complete(&execution).unwrap().head, "'00'");
+        assert_eq!(complete(&execution).unwrap().head, "'0'");
     }
 
     #[tokio::test]
@@ -5311,7 +5311,7 @@ mod tests {
         let context = complete_invocation_context([
             vec![
                 ScriptedAction::Code {
-                    source: "try:\n    await get_subagent('00')\nexcept PermissionError:\n    result_values['self_denied'] = True".to_owned(),
+                    source: "try:\n    await get_subagent('0')\nexcept PermissionError:\n    result_values['self_denied'] = True".to_owned(),
                 },
                 ScriptedAction::Message {
                     text: "authority checked".to_owned(),
