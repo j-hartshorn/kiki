@@ -108,10 +108,13 @@ impl SubagentMonitor {
                     );
                 }
                 RestoredTimelineItem::SubagentSpawned(record) => {
-                    monitor.apply_record(record, now);
+                    if monitor.apply_record(record, now) {
+                        monitor.mark_operationally_active(record.id());
+                    }
                 }
                 RestoredTimelineItem::SubagentFinished(record) => {
                     monitor.apply_record(record, now);
+                    monitor.operationally_active.remove(record.id().as_str());
                 }
             }
         }
@@ -960,6 +963,43 @@ mod tests {
         } else {
             estimate_run_cost([&attempt])
         }
+    }
+
+    #[test]
+    fn restored_monitor_preserves_task_finished_after_later_request() {
+        let task = TaskRecord::for_test(
+            "0",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let request = |run_id, request: &str| {
+            RestoredTimelineItem::Record(StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: request.to_owned(),
+                },
+            })
+        };
+
+        let mut monitor = SubagentMonitor::restored(&[
+            request(1, "request A"),
+            RestoredTimelineItem::SubagentSpawned(task.clone()),
+            request(2, "request B"),
+            RestoredTimelineItem::SubagentFinished(task),
+        ]);
+
+        assert_eq!(
+            monitor
+                .entries
+                .get("0")
+                .map(|entry| entry.observation.state),
+            Some(TaskState::Completed)
+        );
+        assert!(!monitor.has_active_entries());
+        assert!(layout_text(&mut monitor, 80, 4, Instant::now()).contains("✓ subagent:0"));
     }
 
     #[test]
