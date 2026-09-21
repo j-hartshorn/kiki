@@ -1332,7 +1332,6 @@ fn settle_execution(
     checkpoint: &Checkpoint,
     expected_parent: SessionEntryId,
 ) -> Result<SessionEntryId, SessionError> {
-    validate_execution_projection(code)?;
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
     let step_id = i64::try_from(step_id).map_err(|_| SessionError::IdOverflow)?;
     let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
@@ -1395,7 +1394,6 @@ fn close_run(
     code: Option<&PersistedCode>,
     expected_parent: SessionEntryId,
 ) -> Result<SessionEntryId, SessionError> {
-    validate_terminal_projection(pending_step_id, terminal, code)?;
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
     let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
     let pending_step_id = pending_step_id

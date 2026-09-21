@@ -585,7 +585,8 @@ impl<M: Model> Agent<M> {
             .await
     }
 
-    pub async fn run(
+    #[cfg(test)]
+    pub(crate) async fn run(
         &mut self,
         request: impl Into<String>,
         cancellation: &CancellationToken,
@@ -720,7 +721,7 @@ impl<M: Model> Agent<M> {
                     call_id,
                     commentary,
                 } => {
-                    if writer.model_history()?.contains_call_id(&call_id) {
+                    if history.contains_call_id(&call_id) {
                         let message = bounded_utf8(
                             ModelHistoryError::DuplicateCallId(call_id).to_string(),
                             FAILED_RUN_MESSAGE_LIMIT,
@@ -1045,15 +1046,6 @@ impl<M: Model> Agent<M> {
                             pending.reasoning_summary.clone(),
                             None,
                         ));
-                        if let Err(error) =
-                            pending.append(&mut history, CodeResult::cancelled(evidence.feedback()))
-                        {
-                            return Err(AgentError::ModelHistory {
-                                error,
-                                attempts,
-                                evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
-                            });
-                        }
                         return Err(AgentError::Cancelled {
                             attempts,
                             evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
@@ -1136,18 +1128,6 @@ impl<M: Model> Agent<M> {
                                     &error,
                                 )
                             });
-                            let result = if cancelled {
-                                CodeResult::cancelled(evidence.feedback())
-                            } else {
-                                CodeResult::failure(evidence.feedback())
-                            };
-                            if let Err(history_error) = pending.append(&mut history, result) {
-                                return Err(AgentError::ModelHistory {
-                                    error: history_error,
-                                    attempts,
-                                    evidence: Some(Box::new(TerminalEvidence::Execution(evidence))),
-                                });
-                            }
                             return Err(AgentError::Arena {
                                 error,
                                 attempts,
