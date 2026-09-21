@@ -165,7 +165,6 @@ pub(crate) struct PersistedRunOutcome {
 pub struct FinalMessage {
     text: String,
     attempts: Vec<AttemptAccounting>,
-    generation: GenerationEvidence,
 }
 
 impl FinalMessage {
@@ -175,11 +174,6 @@ impl FinalMessage {
 
     pub fn attempts(&self) -> &[AttemptAccounting] {
         &self.attempts
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reasoning_summary(&self) -> &str {
-        &self.generation.reasoning_summary
     }
 }
 
@@ -1137,11 +1131,7 @@ impl<M: Model> Agent<M> {
                     }
                 }
                 ModelAction::Message { text } => {
-                    return Ok(FinalMessage {
-                        generation: generation.with_final_message(text.clone(), reasoning_summary),
-                        text,
-                        attempts,
-                    });
+                    return Ok(FinalMessage { text, attempts });
                 }
             }
         }
@@ -1763,7 +1753,6 @@ mod tests {
         assert_eq!(execution_commentary, Some("I’ll calculate this first."));
         assert_eq!(execution_reasoning_summary, "code summary");
         assert_eq!(final_message.text(), "done");
-        assert_eq!(final_message.reasoning_summary(), "message summary");
     }
 
     struct SummaryCodeModel {
