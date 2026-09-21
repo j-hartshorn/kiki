@@ -557,6 +557,7 @@ impl<M: Model> Agent<M> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn restored(arena: Arena, model: M, model_context: ModelHistory) -> Self {
         Self {
             arena,
@@ -599,6 +600,7 @@ impl<M: Model> Agent<M> {
         self.arena.restore(checkpoint).await
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_idle_state(&mut self, model_context: ModelHistory) {
         self.model_context = model_context;
         self.staged_final_message = None;
@@ -643,7 +645,6 @@ impl<M: Model> Agent<M> {
         }
         let admission = writer.commit_request(request.clone()).await?;
         let run_id = admission.run_id;
-        self.model_context.append_user_request(request.clone());
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
             request_entry: admission.request_entry,
@@ -702,9 +703,10 @@ impl<M: Model> Agent<M> {
                     progress,
                 });
             };
+            let history = writer.model_history()?;
             let model_step = match self
                 .model
-                .step(&self.model_context, cancellation, &mut model_progress)
+                .step(&history, cancellation, &mut model_progress)
                 .await
             {
                 Ok(step) => step,
@@ -759,7 +761,7 @@ impl<M: Model> Agent<M> {
                     call_id,
                     commentary,
                 } => {
-                    if self.model_context.contains_call_id(&call_id) {
+                    if writer.model_history()?.contains_call_id(&call_id) {
                         let message = bounded_utf8(
                             ModelHistoryError::DuplicateCallId(call_id).to_string(),
                             FAILED_RUN_MESSAGE_LIMIT,
@@ -809,8 +811,6 @@ impl<M: Model> Agent<M> {
                             None,
                         );
                         let result = CodeResult::cancelled(evidence.feedback());
-                        let mut proposed = self.model_context.clone();
-                        append_persisted_code(&pending, &mut proposed, result.clone())?;
                         let code = persisted_code(&pending, result, None, step_attempts.clone());
                         let terminal = PersistedTerminal::Cancelled {
                             evidence: Some(TerminalEvidence::Execution(Box::new(evidence))),
@@ -819,7 +819,6 @@ impl<M: Model> Agent<M> {
                         let terminal = writer
                             .close_run(run_id, pending_step_id, move || terminal, Some(code))
                             .await?;
-                        self.model_context = proposed;
                         return Ok(PersistedRunOutcome {
                             run_id,
                             terminal,
@@ -874,8 +873,6 @@ impl<M: Model> Agent<M> {
                     match execution {
                         Ok(execution) => {
                             let result = CodeResult::execution(execution_feedback(&execution));
-                            let mut proposed = self.model_context.clone();
-                            append_persisted_code(&pending, &mut proposed, result.clone())?;
                             let code = persisted_code(
                                 &pending,
                                 result,
@@ -886,7 +883,6 @@ impl<M: Model> Agent<M> {
                             writer
                                 .settle_execution(run_id, step_id, code, checkpoint)
                                 .await?;
-                            self.model_context = proposed;
                             pending_step_id = None;
                             committed_attempts += step_attempts.len();
                             event(PersistedAgentEvent::ExecutionCommitted {
@@ -921,8 +917,6 @@ impl<M: Model> Agent<M> {
                             } else {
                                 CodeResult::failure(evidence.feedback())
                             };
-                            let mut proposed = self.model_context.clone();
-                            append_persisted_code(&pending, &mut proposed, result.clone())?;
                             let code =
                                 persisted_code(&pending, result, None, step_attempts.clone());
                             let is_recovery_failure =
@@ -951,7 +945,6 @@ impl<M: Model> Agent<M> {
                                     Some(code),
                                 )
                                 .await?;
-                            self.model_context = proposed;
                             return Ok(PersistedRunOutcome {
                                 run_id,
                                 recovery_failure: matches!(
@@ -992,19 +985,6 @@ impl<M: Model> Agent<M> {
                             None,
                         )
                         .await?;
-                    if let PersistedTerminal::Final {
-                        text,
-                        reasoning_summary,
-                        replay,
-                        ..
-                    } = &terminal
-                    {
-                        self.model_context.append_final_message(
-                            text.clone(),
-                            reasoning_summary.clone(),
-                            replay.clone(),
-                        );
-                    }
                     return Ok(PersistedRunOutcome {
                         run_id,
                         terminal,
@@ -1259,17 +1239,6 @@ impl<M: Model> Agent<M> {
             }
         }
     }
-}
-
-fn append_persisted_code(
-    pending: &PendingCode,
-    history: &mut ModelHistory,
-    result: CodeResult,
-) -> Result<(), SessionError> {
-    pending
-        .clone()
-        .append(history, result)
-        .map_err(|error| SessionError::Codec(error.to_string()))
 }
 
 fn persisted_code(
@@ -2993,8 +2962,9 @@ mod tests {
             crate::session::PersistedTerminal::Cancelled { .. }
         ));
         assert!(matches!(
-            agent
-                .model_context
+            writer
+                .model_history()
+                .expect("read persisted context")
                 .entries()
                 .last()
                 .and_then(ModelContextEntry::completed_code)
