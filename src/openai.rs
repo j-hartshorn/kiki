@@ -5621,8 +5621,12 @@ mod tests {
                 | RuntimeEvent::SubagentStatus { .. }
                 | RuntimeEvent::SubagentRecord { .. }
                 | RuntimeEvent::SubagentFinished { .. }
+                | RuntimeEvent::SubagentOperationSettled { .. }
                 | RuntimeEvent::SettingsAccepted { .. }
                 | RuntimeEvent::NameAccepted { .. }
+                | RuntimeEvent::NavigationCompleted { .. }
+                | RuntimeEvent::CorrectionCompleted { .. }
+                | RuntimeEvent::TreeCatalogue { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
             }
         }
@@ -5848,7 +5852,10 @@ mod tests {
         loop {
             let input = collector.next(controller, deadline).await?;
             if collector.run(run_id).is_some_and(|run| run.steps.len() > 8) {
-                send_command(&controller.commands, crate::runtime::RuntimeCommand::Cancel)?;
+                send_command(
+                    &controller.commands,
+                    crate::runtime::RuntimeCommand::Cancel { correction: false },
+                )?;
                 return Err(LIVE_STEP_LIMIT);
             }
             if settled_run(&input, run_id) {
@@ -5962,7 +5969,10 @@ mod tests {
         )
         .await
         .map_err(|_| LIVE_SECOND_START)?;
-        send_command(&controller.commands, crate::runtime::RuntimeCommand::Cancel)?;
+        send_command(
+            &controller.commands,
+            crate::runtime::RuntimeCommand::Cancel { correction: false },
+        )?;
         let cancellation_settlement_deadline = Instant::now() + LIVE_CANCELLATION_TIMEOUT;
         wait_for_settlement(
             controller,

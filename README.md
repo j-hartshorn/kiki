@@ -55,7 +55,29 @@ On resume, unfinished foreground work and children are settled from committed st
 
 Each session persists its `/name`, selected model, and accepted thinking values per model. Saved session preferences override ordinary user and project settings on resume, while explicit `KIKI_MODEL` and `KIKI_THINKING` still win. After a successful executable restore, Kiki saves the effective choice, including an environment override, for a later resume. `Ctrl-S` in a picker saves a user default separately from the active session's accepted setting.
 
-Phase 1 excludes interactive tree navigation, correction or rewind, in-client session switching, forks, clones, export, sharing, compaction, branch summaries, merging, bookmarks, automatic Monty installation, checkpoint migration, unsent-draft retention, automatic history pruning, filesystem sandboxing, and external-effect reversal.
+Deferred features exclude in-client session switching, separate-session forks or clones, export, sharing, compaction, branch summaries, labels, merging, bookmarks, custom themes, horizontal panning, configurable keys, automatic Monty installation, checkpoint migration, unsent-draft retention, automatic history pruning, filesystem sandboxing, and external-effect reversal. When compaction is implemented, its rows need a distinct semantic colour.
+
+## Session tree navigation
+
+While fully idle, `/tree` opens the searchable retained session tree; `/tree <filter>` applies an initial filter, and `Ctrl-R` opens the same picker without clearing an editor draft. With a whitespace-only prompt, two `Esc` presses less than 500 milliseconds apart also open the unfiltered tree. Navigation is unavailable while foreground or background work is active and never queues, cancels or otherwise affects that work.
+
+The stable tree retains every durable branch in parent-before-descendant preorder. At each fork, sibling subtrees are ordered by their latest descendant revision, newest first. Linear continuations stay flat below `Session start`; indentation and joints increase only at genuine retained forks, at unlimited depth, with no structural `…` or horizontal panning. Rows use `Session start`, `User: …`, `Python…`, `Kiki: …`, `Cancelled`, and `Failed`; Python rows include recorded tool-count variants where applicable.
+
+Rows use semantic colours: User and active connectors use the accent, Kiki and successful tool marks use success, Python and tool summaries use muted or dim text, Cancelled uses warning, and Failed uses error. Alternative branches are subdued without losing their semantic prefixes or terminal colours. `•` marks active ancestors, `●` marks the exact durable current point, and `›` with a subtle background marks the focused row without replacing its semantic foreground colours.
+
+Tree search splits the query on whitespace and requires every case-insensitive token to match the complete, untruncated canonical row text. Matching rows retain non-selectable ancestor context. The first `Esc` with a non-empty query clears it; the next closes the tree.
+
+`Left` folds the selected expanded visible segment, or moves to its enclosing segment start. `Right` unfolds the selected folded segment, or follows the first visible child through flat continuations to the next fork or branch end. Expanded and folded joints use `⊟` and `⊞`; a folded root uses `⊞`. Folds are transient and reset on query edits, when `Esc` clears a query, and when `Ctrl-U` changes view mode.
+
+`Ctrl-U` toggles a transient conversation projection. It retains `Session start`, User, Kiki, Cancelled, and Failed rows, omits Python rows, and reconnects remaining rows to their nearest visible ancestor. The sole exception is the exact current Python execution, which remains visible with `●`. Search, conversation mode, and folds are view state only: they never alter the durable branches.
+
+`Ctrl-X` copies the complete terminal-safe stored content of the focused durable entry to the local clipboard without tree connectors, markers, or preview truncation; the tree remains open and reports `Copied` or `Copy failed`. User and Kiki entries copy their complete stored text. A Python entry includes stored commentary, complete source, concise tool names and summaries, and every available durable execution observation: bounded stdout, stderr, and result, or a Python error. Omission markers remain in bounded observations and Python errors, so the copy never claims unavailable raw tool arguments or output.
+
+The scrollable tree replaces the prompt while open, uses the full terminal width, and hides the normal prompt header. Its dock has full-width rules above the local header, between that header and the content, and below the content in the existing footer/accounting rule. The responsive one-line local header shows, as space permits, the title, active notice, live query, selected/visible count, conversation state, and key hints. Only content rows, not the header or rules, are capped at half the terminal height.
+
+Selecting a user request restores its parent and fills only an empty editor with that request; an existing or pending draft wins. Other entries restore through the selected point. A successful replacement temporarily shows `Session restored.` until the next request is durably accepted. No-op, rejected or failed navigation creates no restoration card.
+
+`Esc` at most two seconds after submission requests cancellation and correction. Once cancellation settles, correction restores the request's parent only when background work is already settled; otherwise it retains the cancelled branch and shows `Session was not restored because background work is active.` It neither cancels background work nor queues restoration for later. A corrected request is a sibling of the cancelled request. Rewinding model context or the Arena never reverses filesystem, command, network or other external effects.
 
 ## Model and thinking settings
 
@@ -114,7 +136,7 @@ Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by
 
 Child work continues after the foreground execution, final reply, or later request. Waiting does not join a completed child's descendants. Cancelling a task cancels its unfinished subtree while preserving completed results. Child failure cancels that child's unfinished descendants only, never its parent or siblings. There are no automatic retries, merges, result printing, or root model-context insertion: inspect a waited result deliberately.
 
-Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. `Ctrl-O` expands retained history prompts and terminal results; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting includes foreground and every descendant attempt once, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
+Kiki records immutable Spawned and terminal subagent history cards separately from ordinary Python activity. Tree navigation retains terminal child data in memory but scopes root access, history cards and the sticky list to the selected branch; returning to a branch makes its tasks and latest results visible again without restarting them. `Ctrl-O` expands retained history prompts and terminal results; it never expands the compact sticky list. The sticky list shows active and completed children, retains terminal entries until the next accepted foreground request, and does not affect model context. Session token and cost accounting remains session-wide across foreground and every descendant attempt, including known failure/cancellation usage; unavailable provider usage remains unavailable rather than zero.
 
 ## Commands
 
@@ -152,12 +174,12 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - Typing `/` shows automatic command suggestions. With suggestions visible, `Up` / `Down` select, `Tab` or the first `Enter` completes, and a second `Enter` executes the command. Otherwise `Enter` submits while idle.
 - Bracketed paste inserts a whole draft edit without submitting. It remains available while a Run is active; CRLF and lone CR become newlines, tabs become four spaces, and other controls become visible `\xNN` text. At the 64 KiB limit, Kiki retains the longest complete UTF-8 prefix that fits.
 - `Shift-Enter` or `Ctrl-J` inserts a prompt newline. `Ctrl-J` remains available when a terminal cannot report modified Enter; plain `Enter` retains submission behaviour.
-- `Esc` first cancels the active foreground run. Press it again while cancellation is pending, or press it while foreground work is idle, to cancel background subagent work.
+- `Esc` first requests cancellation of the active foreground run. At most two seconds after submission, it also requests correction; a later `Esc` is ordinary cancellation. Press it again while cancellation is pending, or press it while background subagents are active, to request background cancellation. When all work is settled and the prompt is whitespace-only, two presses less than 500 milliseconds apart open the session tree instead.
 - `Ctrl-C` clears a non-empty editable prompt. With an empty or read-only prompt, it shuts down.
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `Ctrl-P` opens the model picker without consuming the current prompt, including while a run is active.
-- `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title.
+- `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
 - `PageUp` / `PageDown` scroll history ten lines; manual scrolling anchors its numeric document top. New history follows only at the newest page; reaching it or `Ctrl-End` resumes following. `Ctrl-Home` jumps to the oldest history. The mouse wheel scrolls history three lines per event.

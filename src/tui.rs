@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 mod picker;
 mod slash;
 mod subagents;
+mod tree;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -31,8 +32,8 @@ use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
-    ProgressEnvelope, RuntimeCommand, RuntimeEvent, RuntimeInitialState, RuntimeProgressReceiver,
-    control_command,
+    CorrectionOutcome, NavigationOutcome, ProgressEnvelope, RunId, RuntimeCommand, RuntimeEvent,
+    RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
 use crate::telemetry::{Trace, TraceEvent};
@@ -42,9 +43,14 @@ use crate::transcript::{
     FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
 };
 use picker::{Picker, PickerAction, PickerItem};
+use tree::{TreeNavigator, TreeNavigatorAction};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_WHEEL_SCROLL_ROWS: usize = 3;
+const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
+const TREE_BUSY_NOTICE: &str = "Session tree is unavailable while work is active.";
+const TREE_READ_ONLY_NOTICE: &str = "Session tree is unavailable while the session is read-only.";
+const SESSION_RESTORE_FAILED_NOTICE: &str = "Session could not be restored.";
 const GENERATION_THROBBER_ROWS: u16 = 2;
 const GENERATION_THROBBER_LEFT_PADDING: u16 = 1;
 
@@ -174,6 +180,11 @@ struct App {
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
+    settled_escape_at: Option<Instant>,
+    submission_at: Option<Instant>,
+    correction_pending: bool,
+    correction_run_id: Option<RunId>,
+    ignored_progress_run_id: Option<RunId>,
     history_position: HistoryPosition,
     history_height: usize,
     history_rows: usize,
@@ -193,6 +204,9 @@ struct App {
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
     picker: Option<Picker<PickerValue>>,
+    tree_navigator: Option<TreeNavigator>,
+    manual_navigation_pending: bool,
+    next_tree_revision: u64,
     completion: slash::Completion,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
@@ -213,6 +227,11 @@ impl Default for App {
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
+            settled_escape_at: None,
+            submission_at: None,
+            correction_pending: false,
+            correction_run_id: None,
+            ignored_progress_run_id: None,
             history_position: HistoryPosition::FollowingBottom,
             history_height: 0,
             history_rows: 0,
@@ -232,6 +251,9 @@ impl Default for App {
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
             picker: None,
+            tree_navigator: None,
+            manual_navigation_pending: false,
+            next_tree_revision: 0,
             completion: slash::Completion::default(),
             slash_overlay: None,
             preview: None,
@@ -257,6 +279,34 @@ impl Update {
             commands,
             ..Self::default()
         }
+    }
+}
+
+fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
+    match event {
+        RuntimeEvent::RunStarted { run_id }
+        | RuntimeEvent::ModelStepStarted { run_id, .. }
+        | RuntimeEvent::ModelProgress { run_id, .. }
+        | RuntimeEvent::ExecutionStarted { run_id, .. }
+        | RuntimeEvent::ToolUpdated { run_id, .. }
+        | RuntimeEvent::RunPreviewUpdated { run_id, .. }
+        | RuntimeEvent::StdoutDelta { run_id, .. }
+        | RuntimeEvent::StdoutTruncated { run_id, .. }
+        | RuntimeEvent::RunSettled { run_id }
+        | RuntimeEvent::CorrectionCompleted { run_id, .. } => Some(*run_id),
+        RuntimeEvent::RecordAppended { record, .. } => Some(record.run_id),
+        RuntimeEvent::SettingsAccepted { .. }
+        | RuntimeEvent::NameAccepted { .. }
+        | RuntimeEvent::NavigationCompleted { .. }
+        | RuntimeEvent::TreeCatalogue { .. }
+        | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::RuntimeDisabled { .. }
+        | RuntimeEvent::SubmissionRejectedDisabled { .. }
+        | RuntimeEvent::SubagentSpawned { .. }
+        | RuntimeEvent::SubagentStatus { .. }
+        | RuntimeEvent::SubagentRecord { .. }
+        | RuntimeEvent::SubagentFinished { .. }
+        | RuntimeEvent::SubagentOperationSettled { .. } => None,
     }
 }
 
@@ -314,6 +364,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Update {
+        if self.is_tree_loading() {
+            return Update::default();
+        }
         if let Some(update) = self.handle_slash_overlay_mouse(mouse) {
             return update;
         }
@@ -367,15 +420,26 @@ impl App {
         if key.is_release() {
             return Update::default();
         }
-        let notice_cleared = self.clear_notice();
+        let notice_cleared = if !self.is_tree_loading() {
+            self.clear_notice()
+        } else {
+            false
+        };
         let mut update = self.handle_key_inner(key, now);
         update.visible_changed |= notice_cleared;
         update
     }
 
     fn handle_paste(&mut self, text: &str) -> Update {
-        let notice_cleared = self.clear_notice();
-        let prompt_changed = if self.is_submission_disabled() || self.picker.is_some() {
+        let notice_cleared = if !self.is_tree_loading() {
+            self.clear_notice()
+        } else {
+            false
+        };
+        let prompt_changed = if self.is_submission_disabled()
+            || self.picker.is_some()
+            || self.tree_navigator.is_some()
+        {
             false
         } else {
             let text = normalise_terminal_text(&normalise_paste_line_endings(text));
@@ -391,6 +455,9 @@ impl App {
     fn handle_key_inner(&mut self, key: KeyEvent, now: Instant) -> Update {
         if key.is_release() {
             return Update::default();
+        }
+        if self.tree_navigator.is_some() {
+            return self.handle_tree_navigator_key(key);
         }
         if self.picker.is_some() {
             return self.handle_picker_key(key);
@@ -442,6 +509,9 @@ impl App {
                         quit: false,
                     };
                 }
+                KeyCode::Char('r' | 'R') if !self.is_configuration_only() => {
+                    return self.open_session_tree("");
+                }
                 _ => {}
             }
         }
@@ -450,6 +520,9 @@ impl App {
             return update;
         }
         if key.code == KeyCode::Esc {
+            if self.is_completely_settled() {
+                return self.handle_settled_escape(now);
+            }
             if self.is_configuration_only() {
                 return Update::default();
             }
@@ -458,15 +531,41 @@ impl App {
                 && !self.foreground_cancellation_requested
             {
                 self.foreground_cancellation_requested = true;
-                return Update::with_commands([RuntimeCommand::Cancel]);
+                let correction = self.submission_at.is_some_and(|submitted_at| {
+                    now.saturating_duration_since(submitted_at) <= Duration::from_secs(2)
+                });
+                self.correction_pending = correction;
+                return Update::with_commands([RuntimeCommand::Cancel { correction }]);
             }
             return Update::with_commands([RuntimeCommand::CancelBackground]);
         }
         if self.is_submission_disabled() {
+            if !self.is_configuration_only()
+                && key.code == KeyCode::Enter
+                && key.modifiers.is_empty()
+                && let Some(argument) = slash::parse(self.prompt.text()).and_then(|command| {
+                    matches!(command.action, slash::Action::Tree)
+                        .then(|| command.argument.to_owned())
+                })
+            {
+                self.prompt.take();
+                return self.open_session_tree(&argument);
+            }
             return Update::default();
         }
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
+        }
+        if (self.manual_navigation_pending || self.correction_pending)
+            && key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+        {
+            self.set_notice("Session restoration is still in progress.".to_owned());
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
         }
         if let Some(update) = self.handle_completion_key(key) {
             return update;
@@ -480,6 +579,7 @@ impl App {
                 let mut commands = Vec::new();
                 self.flush_preview(&mut commands);
                 self.transcript.begin_submission();
+                self.submission_at = Some(now);
                 commands.push(RuntimeCommand::Submit { request: draft });
                 let mut update = Update::with_commands(commands);
                 update.visible_changed = true;
@@ -501,6 +601,29 @@ impl App {
             };
         }
         Update::default()
+    }
+
+    fn is_completely_settled(&self) -> bool {
+        !self.is_submission_disabled()
+            && self.prompt.text().trim().is_empty()
+            && self.transcript.is_idle()
+            && !self.foreground_cancellation_requested
+            && !self.manual_navigation_pending
+            && !self.correction_pending
+            && !self.subagent_monitor.has_active_entries()
+    }
+
+    fn handle_settled_escape(&mut self, now: Instant) -> Update {
+        let double_escape = self
+            .settled_escape_at
+            .is_some_and(|first| now.saturating_duration_since(first) < SETTLED_ESCAPE_WINDOW);
+        if double_escape {
+            self.settled_escape_at = None;
+            self.open_session_tree("")
+        } else {
+            self.settled_escape_at = Some(now);
+            Update::default()
+        }
     }
 
     fn handle_completion_key(&mut self, key: KeyEvent) -> Option<Update> {
@@ -552,6 +675,7 @@ impl App {
                 }
             }
             slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
                 let argument = command.argument;
                 let model = self.settings_selection.model();
@@ -582,6 +706,51 @@ impl App {
                         quit: false,
                     }
                 }
+            }
+        }
+    }
+
+    fn is_tree_loading(&self) -> bool {
+        self.tree_navigator
+            .as_ref()
+            .is_some_and(TreeNavigator::is_loading)
+    }
+
+    fn handle_tree_navigator_key(&mut self, key: KeyEvent) -> Update {
+        let action = self
+            .tree_navigator
+            .as_mut()
+            .expect("tree navigator was checked before handling its key")
+            .handle_key(key);
+        match action {
+            TreeNavigatorAction::None => Update::default(),
+            TreeNavigatorAction::Changed => Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            },
+            TreeNavigatorAction::Close => {
+                self.tree_navigator = None;
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
+            TreeNavigatorAction::Copy(text) => {
+                self.pending_copy_text = Some(text);
+                Update {
+                    commands: Vec::new(),
+                    visible_changed: true,
+                    quit: false,
+                }
+            }
+            TreeNavigatorAction::Navigate(entry) => {
+                self.tree_navigator = None;
+                self.manual_navigation_pending = true;
+                let mut update = Update::with_commands([RuntimeCommand::Navigate { entry }]);
+                update.visible_changed = true;
+                update
             }
         }
     }
@@ -646,6 +815,20 @@ impl App {
         match value {
             PickerValue::Model(model) => self.select_model(model),
             PickerValue::Thinking(thinking) => self.select_thinking(thinking),
+        }
+    }
+
+    fn open_session_tree(&mut self, initial_filter: &str) -> Update {
+        self.next_tree_revision = self
+            .next_tree_revision
+            .checked_add(1)
+            .expect("tree revision overflowed");
+        let revision = self.next_tree_revision;
+        self.tree_navigator = Some(TreeNavigator::new(revision, initial_filter));
+        Update {
+            commands: vec![RuntimeCommand::RequestTree { revision }],
+            visible_changed: true,
+            quit: false,
         }
     }
 
@@ -1051,20 +1234,31 @@ impl App {
     }
 
     fn invalidate_selection(&mut self) -> bool {
-        let visible_changed =
-            self.selection.is_some() || self.notice.is_some() || self.flash.is_some();
+        self.invalidate_selection_with_status(false)
+    }
+
+    fn invalidate_layout_selection(&mut self) -> bool {
+        self.invalidate_selection_with_status(true)
+    }
+
+    fn invalidate_selection_with_status(&mut self, keep_status: bool) -> bool {
+        let preserve_status = keep_status && matches!(&self.notice, Some(Notice::Status(_)));
+        let visible_changed = self.selection.is_some()
+            || (!preserve_status && self.notice.is_some())
+            || self.flash.is_some();
         self.selection = None;
         self.drag = None;
         self.pending_copy = false;
-        self.pending_copy_text = None;
-        self.notice = None;
+        if !preserve_status {
+            self.notice = None;
+        }
         self.flash = None;
         visible_changed
     }
 
     fn history_unavailable(&mut self) {
         self.history_viewport = None;
-        self.invalidate_selection();
+        self.invalidate_layout_selection();
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<Update> {
@@ -1179,6 +1373,12 @@ impl App {
     }
 
     fn handle_progress(&mut self, envelope: ProgressEnvelope<RuntimeEvent>) -> bool {
+        if self
+            .ignored_progress_run_id
+            .is_some_and(|run_id| runtime_event_run_id(&envelope.item) == Some(run_id))
+        {
+            return false;
+        }
         self.handle_event_with_gap_at(envelope.item, envelope.gap_before, Instant::now())
     }
 
@@ -1188,8 +1388,47 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
-        if matches!(&event, RuntimeEvent::RunSettled { .. }) {
+        if let RuntimeEvent::RecordAppended { record, .. } = &event
+            && self.correction_pending
+            && matches!(&record.record, crate::runtime::Record::CancelledRun { .. })
+        {
+            self.correction_run_id = Some(record.run_id);
+        }
+        if let RuntimeEvent::RunSettled { run_id } = &event {
             self.foreground_cancellation_requested = false;
+            self.submission_at = None;
+            if self.correction_pending
+                && self
+                    .correction_run_id
+                    .is_none_or(|correction_run_id| correction_run_id == *run_id)
+            {
+                self.correction_pending = false;
+                self.correction_run_id = None;
+            }
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::SubmissionRejectedBusy { .. }
+                | RuntimeEvent::SubmissionRejectedDisabled { .. }
+                | RuntimeEvent::RuntimeDisabled { .. }
+        ) {
+            self.submission_at = None;
+            self.correction_pending = false;
+            self.correction_run_id = None;
+        }
+        if let RuntimeEvent::CorrectionCompleted { run_id, outcome } = &event
+            && self.correction_pending
+            && self.correction_run_id == Some(*run_id)
+        {
+            return self.handle_correction_completed(*run_id, outcome);
+        }
+        if let RuntimeEvent::TreeCatalogue { revision, outcome } = &event {
+            return self.handle_tree_catalogue(*revision, outcome);
+        }
+        if let RuntimeEvent::NavigationCompleted { outcome } = &event
+            && self.manual_navigation_pending
+        {
+            return self.handle_navigation_completed(outcome);
         }
         let metadata_changed = match &event {
             RuntimeEvent::SettingsAccepted { revision } => self.reconcile_settings(*revision),
@@ -1207,9 +1446,129 @@ impl App {
             self.throbber_next_tick = None;
         }
         if transcript_changed {
-            self.invalidate_selection();
+            self.invalidate_layout_selection();
         }
         metadata_changed || monitor_changed || transcript_changed
+    }
+
+    fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
+        let Some(navigator) = &mut self.tree_navigator else {
+            return false;
+        };
+        match outcome {
+            TreeRequestOutcome::Catalogue(catalogue) => {
+                navigator.install_catalogue(revision, catalogue)
+            }
+            TreeRequestOutcome::RejectedBusy => {
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
+                self.set_notice(TREE_BUSY_NOTICE.to_owned());
+                true
+            }
+            TreeRequestOutcome::RejectedReadOnly => {
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
+                self.set_notice(TREE_READ_ONLY_NOTICE.to_owned());
+                true
+            }
+            TreeRequestOutcome::Failed => {
+                if !navigator.reject_catalogue(revision) {
+                    return false;
+                }
+                self.tree_navigator = None;
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
+                true
+            }
+        }
+    }
+
+    fn handle_correction_completed(&mut self, run_id: RunId, outcome: &CorrectionOutcome) -> bool {
+        let notice_cleared = self.clear_notice();
+        let changed = match outcome {
+            CorrectionOutcome::Replaced {
+                state,
+                request_prefill,
+            } => {
+                self.replace_restored_state(state, request_prefill);
+                self.ignored_progress_run_id = Some(run_id);
+                true
+            }
+            CorrectionOutcome::SkippedBackground => {
+                self.set_notice(
+                    "Session was not restored because background work is active.".to_owned(),
+                );
+                true
+            }
+            CorrectionOutcome::Failed => {
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
+                true
+            }
+        };
+        changed | notice_cleared
+    }
+
+    fn handle_navigation_completed(&mut self, outcome: &NavigationOutcome) -> bool {
+        let notice_cleared = self.clear_notice();
+        self.manual_navigation_pending = false;
+        match outcome {
+            NavigationOutcome::Replaced {
+                state,
+                request_prefill,
+            } => {
+                self.replace_restored_state(state, request_prefill);
+                true
+            }
+            NavigationOutcome::Unchanged { request_prefill } => {
+                notice_cleared | self.apply_request_prefill(request_prefill)
+            }
+            NavigationOutcome::RejectedBusy => {
+                self.set_notice(TREE_BUSY_NOTICE.to_owned());
+                true
+            }
+            NavigationOutcome::RejectedReadOnly => {
+                self.set_notice(TREE_READ_ONLY_NOTICE.to_owned());
+                true
+            }
+            NavigationOutcome::Failed => {
+                self.set_notice(SESSION_RESTORE_FAILED_NOTICE.to_owned());
+                true
+            }
+        }
+    }
+
+    fn replace_restored_state(
+        &mut self,
+        state: &RuntimeInitialState,
+        request_prefill: &Option<String>,
+    ) {
+        let mut transcript = self.transcript.restored_replacement(state);
+        transcript.append_restoration_card();
+        self.transcript = transcript;
+        self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
+        self.history_position = HistoryPosition::FollowingBottom;
+        self.history_height = 0;
+        self.history_rows = 0;
+        self.history_viewport = None;
+        self.selection = None;
+        self.drag = None;
+        self.pending_copy = false;
+        self.pending_copy_text = None;
+        self.flash = None;
+        self.apply_request_prefill(request_prefill);
+    }
+
+    fn apply_request_prefill(&mut self, request_prefill: &Option<String>) -> bool {
+        if self.prompt.is_empty()
+            && let Some(request) = request_prefill
+        {
+            let changed = self.prompt.insert_paste(request);
+            return changed | self.refresh_completion();
+        }
+        false
     }
 
     fn reconcile_settings(&mut self, revision: u64) -> bool {
@@ -1573,7 +1932,7 @@ fn run_configuration_loop<B: Backend>(
                     dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
                 }
                 Event::Resize(_, _) => {
-                    app.invalidate_selection();
+                    app.invalidate_layout_selection();
                     dirty = true;
                 }
                 Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
@@ -1668,7 +2027,7 @@ fn run_loop_with_titles<B: Backend>(
                     dirty |= app.handle_mouse(mouse, Instant::now()).visible_changed
                 }
                 Event::Resize(_, _) => {
-                    app.invalidate_selection();
+                    app.invalidate_layout_selection();
                     dirty = true;
                 }
                 Event::Paste(text) => dirty |= app.handle_paste(&text).visible_changed,
@@ -1733,36 +2092,39 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     }
 
     let configuration_only = app.is_configuration_only();
-    let notice = app.notice();
-    let header = if configuration_only {
-        notice.map_or_else(
-            || {
-                "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
-                    .to_owned()
-            },
-            |notice| {
-                format!(
-                    "{notice} | Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
-                )
-            },
-        )
-    } else if app.transcript.is_disabled() {
-        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
-        format!(
-            "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T thinking | Ctrl-O expand | Ctrl-C quit",
-            app.transcript.status()
-        )
-    } else {
-        let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
-        format!(
-            "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
-            app.transcript.status()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(normalise_terminal_text(&header)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
+    let tree_open = app.tree_navigator.is_some();
+    if !tree_open {
+        let notice = app.notice();
+        let header = if configuration_only {
+            notice.map_or_else(
+                || {
+                    "Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                        .to_owned()
+                },
+                |notice| {
+                    format!(
+                        "{notice} | Configuration only: read-only; submission unavailable | Ctrl-C quit | Up/Down scroll"
+                    )
+                },
+            )
+        } else if app.transcript.is_disabled() {
+            let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
+            format!(
+                "Status: {}{notice} | Input disabled | Up/Down scroll | Ctrl-T thinking | Ctrl-O expand | Ctrl-C quit",
+                app.transcript.status()
+            )
+        } else {
+            let notice = notice.map_or(String::new(), |notice| format!(" | {notice}"));
+            format!(
+                "Status: {}{notice} | Enter submit | Shift-Enter/Ctrl-J newline | Arrows edit | PgUp/PgDn scroll | Esc cancel | Ctrl-T thinking | Ctrl-O expand | Ctrl-C clear/quit",
+                app.transcript.status()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(normalise_terminal_text(&header)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
 
     if configuration_only {
         let _ = app.subagent_monitor.layout(area.width, 0, now);
@@ -1783,18 +2145,64 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         return;
     }
 
-    if area.height == 1 {
-        let _ = app.subagent_monitor.layout(area.width, 0, now);
-        app.history_unavailable();
-        return;
-    }
-
     let bottom_rule = Rect::new(
         area.x,
         area.y.saturating_add(area.height.saturating_sub(1)),
         area.width,
         1,
     );
+    if tree_open {
+        let notice = app.notice().map(str::to_owned);
+        let content_height = app
+            .tree_navigator
+            .as_ref()
+            .map_or(0, TreeNavigator::content_height)
+            .min(area.height / 2);
+        let dock_height = content_height
+            .saturating_add(3)
+            .min(area.height.saturating_sub(1));
+        let dock_top = bottom_rule.y.saturating_sub(dock_height);
+        let monitor = app.subagent_monitor.layout(
+            area.width,
+            dock_top.saturating_sub(area.y).saturating_sub(1),
+            now,
+        );
+        let monitor_top = dock_top.saturating_sub(monitor.height());
+        let layout = render_history(
+            frame,
+            app,
+            Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                monitor_top.saturating_sub(area.y),
+            ),
+        );
+        monitor.render(
+            frame,
+            Rect::new(area.x, monitor_top, area.width, monitor.height()),
+        );
+        let rule_style = thinking_rule_style(app.settings_selection);
+        frame.render_widget(
+            Paragraph::new(layout.footer_rule(bottom_rule.width)).style(rule_style),
+            bottom_rule,
+        );
+        if let Some(navigator) = &mut app.tree_navigator {
+            navigator.render(
+                frame,
+                Rect::new(area.x, dock_top, area.width, dock_height),
+                notice.as_deref(),
+            );
+        }
+        return;
+    }
+
+    if area.height == 1 {
+        let _ = app.subagent_monitor.layout(area.width, 0, now);
+        app.history_unavailable();
+        return;
+    }
+
     if area.height <= 3 {
         let _ = app.subagent_monitor.layout(area.width, 0, now);
         let rule_style = thinking_rule_style(app.settings_selection);
@@ -1897,7 +2305,7 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         &prompt,
         content,
-        !app.is_submission_disabled() && app.picker.is_none(),
+        !app.is_submission_disabled() && app.picker.is_none() && app.tree_navigator.is_none(),
         slash::recognised_token_range(app.prompt.text()),
     );
     frame.render_widget(
@@ -1922,7 +2330,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
         .history_viewport
         .is_some_and(|history| history.area != viewport)
     {
-        app.invalidate_selection();
+        app.invalidate_layout_selection();
     }
     app.history_height = usize::from(viewport.height);
     app.history_rows = layout.total_height();
@@ -1950,7 +2358,7 @@ fn render_history(frame: &mut Frame, app: &mut App, viewport: Rect) -> Transcrip
 }
 
 fn render_slash_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.is_submission_disabled() || app.picker.is_some() {
+    if app.is_submission_disabled() || app.picker.is_some() || app.tree_navigator.is_some() {
         return;
     }
     let rows = app.completion.visible_rows(usize::from(area.height));
@@ -2154,7 +2562,9 @@ mod tests {
     use ratatui::layout::Position;
     use ratatui::style::{Color, Modifier};
 
-    use super::{App, HistoryPosition, TitlePublisher, generation_throbber};
+    use super::{
+        App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, generation_throbber,
+    };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -2166,11 +2576,15 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason,
-        RuntimeEvent, RuntimeInitialState, StoredRecord, TerminalDetails,
+        CorrectionOutcome, ModelStepId, NavigationOutcome, ProgressEnvelope, Record,
+        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
+        RuntimeInitialState, StoredRecord, TerminalDetails, TreeRequestOutcome,
     };
-    use crate::session::SessionMetadata;
-    use crate::subagents::TaskState;
+    use crate::session::{
+        SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
+        SessionMetadata,
+    };
+    use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -2223,6 +2637,111 @@ mod tests {
         app
     }
 
+    fn tree_execution(commentary: &str) -> SessionCatalogueKind {
+        SessionCatalogueKind::Execution {
+            source: "pass".to_owned(),
+            commentary: Some(commentary.to_owned()),
+            execution: Box::new(Execution {
+                stdout: observation(""),
+                stderr: observation(""),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+            }),
+        }
+    }
+
+    fn session_tree_catalogue() -> SessionCatalogue {
+        SessionCatalogue {
+            active_entry: SessionEntryId(3),
+            entries: vec![
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(1),
+                    parent_id: None,
+                    revision: 1,
+                    kind: SessionCatalogueKind::Start,
+                },
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(2),
+                    parent_id: Some(SessionEntryId(1)),
+                    revision: 2,
+                    kind: SessionCatalogueKind::Request {
+                        text: "authorise access".to_owned(),
+                    },
+                },
+                SessionCatalogueEntry {
+                    entry_id: SessionEntryId(3),
+                    parent_id: Some(SessionEntryId(2)),
+                    revision: 3,
+                    kind: tree_execution("inspect credentials"),
+                },
+            ],
+        }
+    }
+
+    fn long_session_tree_catalogue(request_count: u64) -> SessionCatalogue {
+        SessionCatalogue {
+            active_entry: SessionEntryId(1),
+            entries: std::iter::once(SessionCatalogueEntry {
+                entry_id: SessionEntryId(1),
+                parent_id: None,
+                revision: 1,
+                kind: SessionCatalogueKind::Start,
+            })
+            .chain((1..=request_count).map(|request| SessionCatalogueEntry {
+                entry_id: SessionEntryId(request + 1),
+                parent_id: Some(SessionEntryId(request)),
+                revision: request + 1,
+                kind: SessionCatalogueKind::Request {
+                    text: format!("entry {request}"),
+                },
+            }))
+            .collect(),
+        }
+    }
+
+    fn tree_request(app: &mut App, initial_filter: &str) -> u64 {
+        let update = app.open_session_tree(initial_filter);
+        let [RuntimeCommand::RequestTree { revision }] = update.commands.as_slice() else {
+            panic!("expected tree request, got {:?}", update.commands);
+        };
+        *revision
+    }
+
+    fn load_tree(app: &mut App, revision: u64) {
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+    }
+
+    fn select_tree_request(app: &mut App) {
+        let revision = tree_request(app, "");
+        load_tree(app, revision);
+        assert!(app.handle_key(key(KeyCode::Home)).visible_changed);
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Navigate {
+                entry: SessionEntryId(2)
+            }]
+        );
+        assert!(app.manual_navigation_pending);
+    }
+
+    fn restored_state(request: &str) -> RuntimeInitialState {
+        RuntimeInitialState {
+            metadata: None,
+            timeline: vec![RestoredTimelineItem::Record(StoredRecord {
+                run_id: RunId(4),
+                record: Record::UserRequest {
+                    request: request.to_owned(),
+                },
+            })],
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        }
+    }
+
     fn submitted_prompt(app: &mut App) -> String {
         let update = app.handle_key(key(KeyCode::Enter));
         let Some(RuntimeCommand::Submit { request }) = update.commands.into_iter().next() else {
@@ -2234,6 +2753,26 @@ mod tests {
     fn enter_at(app: &mut App, prompt: &str, now: Instant) -> super::Update {
         set_prompt(app, prompt);
         app.handle_key_at(key(KeyCode::Enter), now)
+    }
+
+    fn armed_settled_escape(now: Instant) -> App {
+        let mut app = App::default();
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        app
+    }
+
+    fn assert_nonqualifying_escape(app: &mut App, now: Instant, expected: &[RuntimeCommand]) {
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(1))
+                .commands,
+            expected
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
     }
 
     fn applied_settings(update: &super::Update) -> (crate::config::ModelSelection, u64) {
@@ -2293,14 +2832,18 @@ mod tests {
 
     fn cell_start(buffer: &Buffer, text: &str) -> (u16, u16) {
         for row in buffer.area.top()..buffer.area.bottom() {
-            let rendered = (buffer.area.left()..buffer.area.right())
-                .map(|column| buffer[(column, row)].symbol())
-                .collect::<String>();
+            let rendered = buffer_row(buffer, row);
             if let Some(column) = rendered.find(text) {
                 return (u16::try_from(column).expect("test terminal column"), row);
             }
         }
         panic!("rendered text: {text}")
+    }
+
+    fn buffer_row(buffer: &Buffer, row: u16) -> String {
+        (buffer.area.left()..buffer.area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
     }
 
     fn observation(text: &str) -> Observation {
@@ -3201,9 +3744,10 @@ mod tests {
         let (model_column, model_row) = cell_start(&initial, "/model");
         let (name_column, name_row) = cell_start(&initial, "/name");
         let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
+        let (tree_column, tree_row) = cell_start(&initial, "/tree");
 
         assert_eq!(model_column, overlay.x);
-        assert!(model_row < name_row && name_row < thinking_row);
+        assert!(model_row < name_row && name_row < thinking_row && thinking_row < tree_row);
         assert!(
             initial[(model_column, model_row)]
                 .modifier
@@ -3217,14 +3761,21 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let thinking = rendered_buffer(&mut app, 40, 8);
+        assert!(
+            thinking[(thinking_column, thinking_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(!app.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(
             !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        let thinking = rendered_buffer(&mut app, 40, 8);
+        let tree = rendered_buffer(&mut app, 40, 8);
         assert!(
-            thinking[(thinking_column, thinking_row)]
+            tree[(tree_column, tree_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
@@ -3265,7 +3816,7 @@ mod tests {
         cancel.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         assert_eq!(
             cancel.handle_key(key(KeyCode::Esc)).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
         assert_eq!(cancel.prompt.text(), "/mo");
 
@@ -3387,7 +3938,7 @@ mod tests {
     #[test]
     fn slash_overlay_stays_above_prompt_over_visible_subagent_monitor() {
         let now = Instant::now();
-        for (height, last_suggestion) in [(12, "/thinking"), (6, "/name")] {
+        for (height, last_suggestion) in [(12, "/tree"), (6, "/name")] {
             let mut plain = app_with_history(App::default());
             plain
                 .subagent_monitor
@@ -3582,6 +4133,800 @@ mod tests {
     }
 
     #[test]
+    fn session_tree_picker_composes_rules_content_and_surrounding_views() {
+        let now = Instant::now();
+        let mut app = app_with_history(app_with_prompt("hidden\nmultiline draft"));
+        app.subagent_monitor
+            .insert_for_test("child", TaskState::Completed, now);
+        let revision = tree_request(&mut app, "");
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(long_session_tree_catalogue(20)),
+        }));
+
+        let screen = rendered_at(&mut app, 100, 20, now);
+        assert!(!screen.contains("hidden"), "{screen}");
+        assert!(!screen.contains("Status:"), "{screen}");
+        let tree = rendered_buffer(&mut app, 100, 20);
+        for row in [6, 8] {
+            assert!(
+                (tree.area.left()..tree.area.right())
+                    .all(|column| tree[(column, row)].symbol() == "─"),
+                "tree rule at row {row}"
+            );
+        }
+        assert!(
+            (tree.area.left()..tree.area.right()).all(|column| tree[(column, 19)].symbol() == "─"),
+            "footer rule"
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 7)].symbol())
+                .collect::<String>()
+                .starts_with("Session tree")
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 9)].symbol())
+                .collect::<String>()
+                .contains("Session start")
+        );
+        assert!(
+            (tree.area.left()..tree.area.right())
+                .map(|column| tree[(column, 18)].symbol())
+                .collect::<String>()
+                .contains("User: entry 9")
+        );
+        let (_, transcript_row) = cell_start(&tree, "request 8");
+        let (_, monitor_row) = cell_start(&tree, "✓ subagent:child");
+        assert!(transcript_row < 6, "transcript row {transcript_row}");
+        assert!(monitor_row < 6, "monitor row {monitor_row}");
+        assert!(!screen.contains("Filter:"), "{screen}");
+        assert!(!screen.contains('┌'), "{screen}");
+
+        assert!(app.handle_key(key(KeyCode::PageDown)).visible_changed);
+        let paged = rendered_at(&mut app, 100, 20, now);
+        assert!(paged.contains("User: entry 10"), "{paged}");
+
+        assert!(app.handle_key(key(KeyCode::Esc)).visible_changed);
+        assert_eq!(app.prompt.text(), "hidden\nmultiline draft");
+        let restored = rendered_at(&mut app, 100, 20, now);
+        assert!(restored.contains("hidden"), "{restored}");
+        assert!(restored.contains("multiline draft"), "{restored}");
+    }
+
+    #[test]
+    fn only_session_tree_picker_clips_constrained_docks_while_ordinary_pickers_remain_boxed() {
+        let mut tree = app_with_prompt("hidden\nmultiline draft");
+        let revision = tree_request(&mut tree, "");
+        assert!(tree.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(long_session_tree_catalogue(20)),
+        }));
+
+        let screen = rendered(&mut tree, 100, 10);
+        assert!(!screen.contains("hidden"), "{screen}");
+        assert!(!screen.contains("multiline draft"), "{screen}");
+        assert!(!screen.contains("User: entry 5"), "{screen}");
+        let tree_buffer = rendered_buffer(&mut tree, 100, 10);
+        assert_eq!(buffer_row(&tree_buffer, 1), "─".repeat(100));
+        assert_eq!(
+            buffer_row(&tree_buffer, 2).trim_end(),
+            "Session tree · 1/21 · Enter restore · Esc clear/close · ↑/↓ move · ←/→ branch · Ctrl-X copy"
+        );
+        assert_eq!(buffer_row(&tree_buffer, 3), "─".repeat(100));
+        assert_eq!(buffer_row(&tree_buffer, 4).trim_end(), "› ● Session start");
+        assert_eq!(buffer_row(&tree_buffer, 8).trim_end(), "     User: entry 4");
+        assert_eq!(buffer_row(&tree_buffer, 9), "─".repeat(100));
+
+        assert!(tree.handle_key(key(KeyCode::Esc)).visible_changed);
+        assert_eq!(tree.prompt.text(), "hidden\nmultiline draft");
+        let restored = rendered(&mut tree, 100, 12);
+        assert!(restored.contains("hidden"), "{restored}");
+        assert!(restored.contains("multiline draft"), "{restored}");
+
+        let mut tree = App::default();
+        let revision = tree_request(&mut tree, "");
+        load_tree(&mut tree, revision);
+        let tree = rendered_buffer(&mut tree, 100, 12);
+        let (_, tree_title_row) = cell_start(&tree, "Session tree");
+        assert_eq!(tree[(0, tree_title_row.saturating_sub(1))].symbol(), "─");
+        assert_ne!(tree[(0, tree_title_row.saturating_sub(1))].symbol(), "┌");
+
+        let mut model = app_with_prompt("model draft");
+        model.open_model_picker("");
+        let model_screen = rendered(&mut model, 100, 12);
+        assert!(model_screen.contains("model draft"), "{model_screen}");
+        let model = rendered_buffer(&mut model, 100, 12);
+        let (_, model_title_row) = cell_start(&model, "Models");
+        assert_eq!(model[(14, model_title_row)].symbol(), "┌");
+        assert_eq!(model[(85, model_title_row)].symbol(), "┐");
+
+        let mut thinking = app_with_prompt("thinking draft");
+        thinking.open_thinking_picker();
+        let thinking_screen = rendered(&mut thinking, 100, 12);
+        assert!(
+            thinking_screen.contains("thinking draft"),
+            "{thinking_screen}"
+        );
+        let thinking = rendered_buffer(&mut thinking, 100, 12);
+        let (_, thinking_title_row) = cell_start(&thinking, "Thinking");
+        assert_eq!(thinking[(14, thinking_title_row)].symbol(), "┌");
+        assert_eq!(thinking[(85, thinking_title_row)].symbol(), "┐");
+    }
+
+    #[test]
+    fn session_tree_navigator_refreshes_width_before_catalogue_load() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        let loading = rendered(&mut app, 100, 12);
+        assert!(loading.contains("Loading…"), "{loading}");
+
+        let text = format!("{} wide tail", "x".repeat(75));
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(2),
+                entries: vec![
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(1),
+                        parent_id: None,
+                        revision: 1,
+                        kind: SessionCatalogueKind::Start,
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(2),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 2,
+                        kind: SessionCatalogueKind::Request { text },
+                    },
+                ],
+            }),
+        }));
+
+        let screen = rendered(&mut app, 100, 12);
+        assert!(screen.contains("wide tail"), "{screen}");
+    }
+
+    #[test]
+    fn tree_picker_navigates_without_losing_the_editor_draft() {
+        let mut app = app_with_prompt("keep this draft");
+
+        let update = app.handle_key(modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            update.commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.prompt.text(), "keep this draft");
+        assert!(rendered(&mut app, 72, 12).contains("Session tree"));
+        assert!(rendered(&mut app, 72, 12).contains("Loading…"));
+    }
+
+    #[test]
+    fn successful_copy_from_tree_keeps_tree_open() {
+        let now = Instant::now();
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(app.tree_navigator.is_some());
+        let mut clipboard = FakeClipboard::available();
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(
+            clipboard.writes,
+            ["Commentary:\ninspect credentials\n\nPython:\npass"]
+        );
+        assert_eq!(app.notice(), Some("Copied"));
+        assert!(app.flash.is_some());
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
+    fn copying_from_tree_survives_unavailable_history_geometry() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        let mut catalogue = long_session_tree_catalogue(3);
+        catalogue.active_entry = SessionEntryId(4);
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(catalogue),
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(72, 8)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+
+        assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert!(app.history_viewport.is_none());
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert_eq!(clipboard.writes, ["entry 3"]);
+        assert_eq!(app.notice(), Some("Copied"));
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
+    fn failed_copy_from_tree_keeps_tree_open() {
+        let now = Instant::now();
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        let mut clipboard = FakeClipboard {
+            writes: Vec::new(),
+            result: Err(ClipboardError),
+        };
+        assert!(app.finish_pending_copy(&mut clipboard, now));
+        assert_eq!(app.notice(), Some("Copy failed"));
+        assert!(app.flash.is_none());
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
+    fn tree_picker_ctrl_u_reaches_the_navigator_before_prompt_controls() {
+        let mut app = app_with_prompt("preserved draft");
+        let revision = tree_request(&mut app, "");
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(4),
+                entries: vec![
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(1),
+                        parent_id: None,
+                        revision: 1,
+                        kind: SessionCatalogueKind::Start,
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(2),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 2,
+                        kind: SessionCatalogueKind::Request {
+                            text: "conversation".to_owned(),
+                        },
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(3),
+                        parent_id: Some(SessionEntryId(2)),
+                        revision: 3,
+                        kind: tree_execution("omitted Python"),
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(4),
+                        parent_id: Some(SessionEntryId(3)),
+                        revision: 4,
+                        kind: SessionCatalogueKind::Final {
+                            text: "retained reply".to_owned(),
+                        },
+                    },
+                ],
+            }),
+        }));
+        assert!(rendered(&mut app, 72, 12).contains("Python: omitted Python"));
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let screen = rendered(&mut app, 72, 12);
+        assert!(!screen.contains("Python: omitted Python"), "{screen}");
+        assert!(screen.contains("Kiki: retained reply"), "{screen}");
+    }
+
+    #[test]
+    fn tree_picker_left_and_right_reach_the_navigator_before_prompt_controls() {
+        let mut app = app_with_prompt("preserved draft");
+        let revision = tree_request(&mut app, "");
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(1),
+                entries: vec![
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(1),
+                        parent_id: None,
+                        revision: 1,
+                        kind: SessionCatalogueKind::Start,
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(2),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 2,
+                        kind: SessionCatalogueKind::Request {
+                            text: "first branch".to_owned(),
+                        },
+                    },
+                    SessionCatalogueEntry {
+                        entry_id: SessionEntryId(3),
+                        parent_id: Some(SessionEntryId(1)),
+                        revision: 3,
+                        kind: SessionCatalogueKind::Request {
+                            text: "second branch".to_owned(),
+                        },
+                    },
+                ],
+            }),
+        }));
+
+        let left = app.handle_key(key(KeyCode::Left));
+        assert!(left.visible_changed);
+        assert!(left.commands.is_empty());
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let folded = rendered(&mut app, 72, 12);
+        assert!(folded.contains("⊞ ● Session start"), "{folded}");
+        assert!(!folded.contains("first branch"), "{folded}");
+
+        let right = app.handle_key(key(KeyCode::Right));
+        assert!(right.visible_changed);
+        assert!(right.commands.is_empty());
+        assert_eq!(app.prompt.text(), "preserved draft");
+        let expanded = rendered(&mut app, 72, 12);
+        assert!(expanded.contains("first branch"), "{expanded}");
+        assert!(expanded.contains("second branch"), "{expanded}");
+    }
+
+    #[test]
+    fn tree_picker_loading_ignores_input_and_stale_catalogues() {
+        let now = Instant::now();
+        let mut bare = App::default();
+        assert_eq!(
+            enter_at(&mut bare, "/tree", now).commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert!(rendered(&mut bare, 72, 12).contains("Session tree"));
+        let loading = rendered_buffer(&mut bare, 72, 12);
+        let (_, header_row) = cell_start(&loading, "Session tree");
+        assert_eq!(loading[(0, header_row.saturating_sub(1))].symbol(), "─");
+
+        let mut app = App::default();
+        let update = enter_at(&mut app, "/tree auth", now);
+        let [RuntimeCommand::RequestTree { revision }] = update.commands.as_slice() else {
+            panic!("expected tree request, got {:?}", update.commands);
+        };
+        let screen = rendered(&mut app, 72, 12);
+        assert!(screen.contains("Session tree"), "{screen}");
+        assert!(screen.contains("Loading…"), "{screen}");
+        assert!(!screen.contains("authorise access"), "{screen}");
+        assert!(app.prompt.is_empty());
+
+        for key in [
+            key(KeyCode::Enter),
+            key(KeyCode::Char('x')),
+            modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        ] {
+            let update = app.handle_key_at(key, now);
+            assert!(update.commands.is_empty());
+            assert!(!update.visible_changed);
+            assert!(app.notice().is_none());
+        }
+        assert!(!app.handle_paste("ignored").visible_changed);
+        assert!(app.prompt.is_empty());
+        app.set_notice("keep loading notice".to_owned());
+        assert!(
+            !app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 0, 0), now)
+                .visible_changed
+        );
+        assert_eq!(app.notice(), Some("keep loading notice"));
+        assert!(app.clear_notice());
+
+        assert!(app.handle_key_at(key(KeyCode::Esc), now).visible_changed);
+        assert!(app.picker.is_none());
+        assert!(app.tree_navigator.is_none());
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision: *revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        assert!(app.picker.is_none());
+        assert!(app.notice().is_none());
+
+        let first = tree_request(&mut app, "first");
+        let second = tree_request(&mut app, "auth");
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision: first,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        assert!(rendered(&mut app, 72, 12).contains("Loading…"));
+        load_tree(&mut app, second);
+        let screen = rendered(&mut app, 72, 12);
+        assert!(screen.contains("Search: auth"), "{screen}");
+        assert!(screen.contains("authorise access"), "{screen}");
+        assert!(!screen.contains("Loading…"), "{screen}");
+
+        let mut no_matches = App::default();
+        let revision = tree_request(&mut no_matches, "missing");
+        assert!(no_matches.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(SessionCatalogue {
+                active_entry: SessionEntryId(1),
+                entries: vec![SessionCatalogueEntry {
+                    entry_id: SessionEntryId(1),
+                    parent_id: None,
+                    revision: 1,
+                    kind: SessionCatalogueKind::Start,
+                }],
+            }),
+        }));
+        assert!(rendered(&mut no_matches, 72, 12).contains("No matching session entries"));
+
+        for (outcome, notice) in [
+            (
+                TreeRequestOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                TreeRequestOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (TreeRequestOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = App::default();
+            app.transcript.append_restoration_card();
+            let revision = tree_request(&mut app, "");
+            assert!(app.handle_event(RuntimeEvent::TreeCatalogue { revision, outcome }));
+            assert!(app.picker.is_none());
+            assert_eq!(app.notice(), Some(notice));
+            assert!(rendered(&mut app, 72, 12).contains("Session restored."));
+            assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+                revision,
+                outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+            }));
+            assert!(app.picker.is_none());
+        }
+
+        let mut loaded = App::default();
+        let revision = tree_request(&mut loaded, "");
+        load_tree(&mut loaded, revision);
+        assert!(
+            loaded
+                .handle_key(modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .commands
+                .is_empty()
+        );
+        assert!(loaded.handle_key(key(KeyCode::Esc)).commands.is_empty());
+        assert!(!loaded.manual_navigation_pending);
+    }
+
+    #[test]
+    fn tree_loading_rejections_preserve_status_notices_across_prompt_geometry() {
+        for (outcome, notice) in [
+            (
+                TreeRequestOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                TreeRequestOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (TreeRequestOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = App::default();
+            let revision = tree_request(&mut app, "");
+            rendered(&mut app, 120, 12);
+
+            assert!(app.handle_event(RuntimeEvent::TreeCatalogue { revision, outcome }));
+            for _ in 0..2 {
+                let screen = rendered(&mut app, 120, 12);
+                assert!(screen.contains(notice), "{screen}");
+                assert_eq!(app.notice(), Some(notice));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_subagent_projections_stay_operational_until_settlement() {
+        let now = Instant::now();
+        let terminal = TaskRecord::for_test(
+            "c1",
+            2,
+            ModelSelection::new(&TERRA, TERRA.default_thinking).expect("select test model"),
+            None,
+            1,
+            Vec::new(),
+        );
+        for event in [
+            RuntimeEvent::SubagentRecord {
+                record: terminal.clone(),
+            },
+            RuntimeEvent::SubagentStatus {
+                id: terminal.id().clone(),
+                revision: terminal.revision(),
+                observation: terminal.observation().clone(),
+            },
+        ] {
+            let mut app = App::default();
+            app.subagent_monitor
+                .insert_for_test(terminal.id().as_str(), TaskState::Running, now);
+
+            assert!(app.handle_event_at(event, now));
+            assert!(app.subagent_monitor.has_active_entries());
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), now).commands,
+                [RuntimeCommand::CancelBackground]
+            );
+            assert_eq!(app.settled_escape_at, None);
+
+            assert!(app.handle_event_at(
+                RuntimeEvent::SubagentFinished {
+                    record: terminal.clone(),
+                },
+                now,
+            ));
+            assert!(app.subagent_monitor.has_active_entries());
+
+            assert!(app.handle_event_at(
+                RuntimeEvent::SubagentOperationSettled {
+                    id: terminal.id().clone(),
+                },
+                now,
+            ));
+            assert!(!app.subagent_monitor.has_active_entries());
+            assert!(!app.handle_event_at(
+                RuntimeEvent::SubagentStatus {
+                    id: terminal.id().clone(),
+                    revision: terminal.revision(),
+                    observation: terminal.observation().clone(),
+                },
+                now,
+            ));
+            assert!(!app.subagent_monitor.has_active_entries());
+            assert!(
+                app.handle_key_at(key(KeyCode::Esc), now)
+                    .commands
+                    .is_empty()
+            );
+            assert_eq!(app.settled_escape_at, Some(now));
+        }
+    }
+
+    #[test]
+    fn tree_picker_filters_without_resetting_on_duplicate_catalogues() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+
+        for character in "credentials".chars() {
+            assert!(
+                app.handle_key(key(KeyCode::Char(character)))
+                    .visible_changed
+            );
+        }
+        let filtered = rendered(&mut app, 72, 12);
+        let filtered_rows = filtered.lines().collect::<Vec<_>>();
+        assert_eq!(filtered_rows[8].trim_end(), "  • Session start");
+        assert_eq!(filtered_rows[9].trim_end(), "  └─ • User: authorise access");
+        assert_eq!(
+            filtered_rows[10].trim_end(),
+            "›    ● Python: inspect credentials"
+        );
+
+        for _ in "credentials".chars() {
+            assert!(app.handle_key(key(KeyCode::Backspace)).visible_changed);
+        }
+        let restored = rendered(&mut app, 72, 12);
+        let restored_rows = restored.lines().collect::<Vec<_>>();
+        assert_eq!(restored_rows[9].trim_end(), "  └─ • User: authorise access");
+        assert_eq!(
+            restored_rows[10].trim_end(),
+            "›    ● Python: inspect credentials"
+        );
+
+        for character in "access".chars() {
+            assert!(
+                app.handle_key(key(KeyCode::Char(character)))
+                    .visible_changed
+            );
+        }
+        assert!(!app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(session_tree_catalogue()),
+        }));
+        let duplicate = rendered(&mut app, 72, 12);
+        assert!(duplicate.contains("Search: access"), "{duplicate}");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Navigate {
+                entry: SessionEntryId(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn tree_navigation_to_current_point_redraws_closed_tree_before_quit() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+        let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter))), Some(quit_event())]);
+        let (commands, mut received) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        event_sender
+            .send(RuntimeEvent::NavigationCompleted {
+                outcome: NavigationOutcome::Unchanged {
+                    request_prefill: None,
+                },
+            })
+            .unwrap();
+        let (_progress_sender, mut progress) = mpsc::channel(8);
+        let mut clipboard = FakeClipboard::available();
+
+        let redraws = super::run_loop(
+            &mut terminal,
+            &mut app,
+            &mut input,
+            &commands,
+            &mut events,
+            &mut progress,
+            &mut clipboard,
+        )
+        .unwrap();
+
+        assert_eq!(redraws, 2);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            RuntimeCommand::Navigate {
+                entry: SessionEntryId(3)
+            }
+        );
+        assert_eq!(received.try_recv().unwrap(), RuntimeCommand::Shutdown);
+        assert!(app.tree_navigator.is_none());
+        assert!(!app.manual_navigation_pending);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(72)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Status: idle"), "{screen}");
+        assert!(!screen.contains("Session tree"), "{screen}");
+    }
+
+    #[test]
+    fn tree_navigation_preserves_pending_drafts_and_replaces_the_projection() {
+        let mut app = app_with_history(App::default());
+        rendered(&mut app, 80, 12);
+        app.history_position = HistoryPosition::Anchored(0);
+        app.selection = Some(Selection::new(
+            DocumentPosition::new(0, 0),
+            DocumentPosition::new(0, 1),
+        ));
+        select_tree_request(&mut app);
+
+        type_prompt(&mut app, "draft");
+        assert!(app.handle_key(shifted_key(KeyCode::Enter)).visible_changed);
+        assert!(app.handle_paste("after selection").visible_changed);
+        let blocked = app.handle_key(key(KeyCode::Enter));
+        assert!(blocked.commands.is_empty());
+        assert_eq!(
+            app.notice(),
+            Some("Session restoration is still in progress.")
+        );
+        assert_eq!(app.prompt.text(), "draft\nafter selection");
+
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("restored branch"),
+                request_prefill: Some("prefill must not replace a draft".to_owned()),
+            },
+        }));
+        assert!(!app.manual_navigation_pending);
+        assert_eq!(app.notice(), None);
+        assert_eq!(app.prompt.text(), "draft\nafter selection");
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert!(app.history_viewport.is_none());
+        assert!(app.selection.is_none());
+        let screen = rendered(&mut app, 80, 30);
+        assert!(screen.contains("restored branch"), "{screen}");
+        assert!(screen.contains("Session restored."), "{screen}");
+        assert!(!screen.contains("request 8"), "{screen}");
+    }
+
+    #[test]
+    fn tree_navigation_applies_request_prefill_only_after_each_outcome() {
+        let mut replaced = App::default();
+        select_tree_request(&mut replaced);
+        assert!(replaced.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("replacement"),
+                request_prefill: Some("selected request".to_owned()),
+            },
+        }));
+        assert_eq!(replaced.prompt.text(), "selected request");
+        assert!(rendered(&mut replaced, 80, 12).contains("Session restored."));
+
+        let mut non_request = App::default();
+        select_tree_request(&mut non_request);
+        assert!(non_request.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: restored_state("replacement"),
+                request_prefill: None,
+            },
+        }));
+        assert!(non_request.prompt.is_empty());
+
+        let mut unchanged = app_with_history(App::default());
+        select_tree_request(&mut unchanged);
+        unchanged.set_notice("Session restoration is still in progress.".to_owned());
+        assert!(unchanged.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Unchanged {
+                request_prefill: Some("current request".to_owned()),
+            },
+        }));
+        assert!(!unchanged.manual_navigation_pending);
+        assert_eq!(unchanged.notice(), None);
+        assert_eq!(unchanged.prompt.text(), "current request");
+        let screen = rendered(&mut unchanged, 80, 12);
+        assert!(screen.contains("request 8"), "{screen}");
+        assert!(!screen.contains("Session restored."), "{screen}");
+
+        for (outcome, notice) in [
+            (
+                NavigationOutcome::RejectedBusy,
+                "Session tree is unavailable while work is active.",
+            ),
+            (
+                NavigationOutcome::RejectedReadOnly,
+                "Session tree is unavailable while the session is read-only.",
+            ),
+            (NavigationOutcome::Failed, "Session could not be restored."),
+        ] {
+            let mut app = app_with_history(App::default());
+            select_tree_request(&mut app);
+            assert!(app.handle_event(RuntimeEvent::NavigationCompleted { outcome }));
+            assert!(!app.manual_navigation_pending);
+            assert_eq!(app.notice(), Some(notice));
+            let screen = rendered(&mut app, 80, 12);
+            assert!(screen.contains("request 8"), "{screen}");
+            assert!(!screen.contains("Session restored."), "{screen}");
+        }
+    }
+
+    #[test]
+    fn tree_navigation_rebuilds_the_subagent_monitor_from_the_restored_timeline() {
+        let mut app = App::default();
+        select_tree_request(&mut app);
+        let task = TaskRecord::for_test(
+            "00",
+            1,
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            None,
+            1,
+            Vec::new(),
+        );
+        let mut state = restored_state("restored request");
+        state
+            .timeline
+            .push(RestoredTimelineItem::SubagentSpawned(task.clone()));
+        state
+            .timeline
+            .push(RestoredTimelineItem::SubagentFinished(task));
+
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            },
+        }));
+        let screen = rendered(&mut app, 80, 20);
+        assert!(screen.contains("✓ subagent:00"), "{screen}");
+        assert!(screen.contains("Session restored."), "{screen}");
+    }
+
+    #[test]
     fn model_argument_opens_a_filtered_picker_without_submitting() {
         let mut app = App::default();
         type_prompt(&mut app, "/model terra");
@@ -3694,24 +5039,16 @@ mod tests {
     #[test]
     fn unrecognised_or_multiline_slash_input_remains_an_ordinary_prompt() {
         let now = Instant::now();
-        let mut app = App::default();
-
-        let update = enter_at(&mut app, "/future task", now);
-        assert_eq!(
-            update.commands,
-            [RuntimeCommand::Submit {
-                request: "/future task".to_owned()
-            }]
-        );
-
-        let mut multiline = App::default();
-        let update = enter_at(&mut multiline, "/model\nterra", now);
-        assert_eq!(
-            update.commands,
-            [RuntimeCommand::Submit {
-                request: "/model\nterra".to_owned()
-            }]
-        );
+        for draft in ["/future task", "/tree-more", "/model\nterra", "/tree\nauth"] {
+            let mut app = App::default();
+            assert_eq!(
+                enter_at(&mut app, draft, now).commands,
+                [RuntimeCommand::Submit {
+                    request: draft.to_owned()
+                }],
+                "{draft}"
+            );
+        }
     }
 
     #[test]
@@ -3734,7 +5071,7 @@ mod tests {
         assert!(app.picker.is_none());
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
     }
 
@@ -3823,14 +5160,17 @@ mod tests {
         let trace_owner = TraceOwner::open(&trace_file).expect("open trace");
         let (sender, mut receiver) = mpsc::channel(3);
         let update = super::Update::with_commands([
-            RuntimeCommand::Cancel,
+            RuntimeCommand::Cancel { correction: false },
             RuntimeCommand::CancelBackground,
             RuntimeCommand::Shutdown,
         ]);
 
         super::dispatch_commands(&sender, &update, &trace_owner.handle())
             .expect("dispatch cancellation commands");
-        assert!(matches!(receiver.try_recv(), Ok(RuntimeCommand::Cancel)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::Cancel { correction: false })
+        ));
         assert!(matches!(
             receiver.try_recv(),
             Ok(RuntimeCommand::CancelBackground)
@@ -4221,7 +5561,7 @@ mod tests {
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(2) });
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
         assert!(std::ptr::eq(app.settings_selection.model(), &TERRA));
     }
@@ -5420,7 +6760,7 @@ mod tests {
         assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
         assert_eq!(
             app.handle_key(key(KeyCode::Esc)).commands,
-            [RuntimeCommand::Cancel]
+            [RuntimeCommand::Cancel { correction: false }]
         );
     }
 
@@ -6372,6 +7712,7 @@ mod tests {
         )
         .unwrap();
         assert!(resized.selection.is_none());
+        assert!(resized.notice().is_none());
 
         let (mut tiny, _) = app_with_pending_copy("tiny history");
         rendered_buffer(&mut tiny, 3, 3);
@@ -7217,14 +8558,505 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_foreground_once_then_background_except_in_configuration() {
+    fn released_escape_does_not_change_keypress_anchored_correction_timing() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "delayed admission", submitted_at);
+
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(
+            app.handle_key_at(release, submitted_at + Duration::from_secs(1))
+                .commands
+                .is_empty()
+        );
+        assert!(!app.foreground_cancellation_requested);
+        assert!(!app.correction_pending);
+        assert_eq!(app.submission_at, Some(submitted_at));
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_secs(2))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+    }
+
+    #[test]
+    fn settled_double_escape_opens_an_unfiltered_tree_within_499ms() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        let first = app.handle_key_at(key(KeyCode::Esc), now);
+        assert!(first.commands.is_empty());
+        assert!(!first.visible_changed);
+
+        let second = app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499));
+        assert_eq!(
+            second.commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert!(app.tree_navigator.is_some());
+        assert_eq!(app.settled_escape_at, None);
+    }
+
+    #[test]
+    fn settled_double_escape_at_the_same_instant_opens_like_pi() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now).commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn settled_double_escape_at_500ms_rearms_before_opening() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert!(
+            app.tick(now + Duration::from_millis(500))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(500))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.settled_escape_at,
+            Some(now + Duration::from_millis(500))
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(999))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.settled_escape_at, None);
+    }
+
+    #[test]
+    fn settled_double_escape_accepts_whitespace_only_prompts() {
+        let now = Instant::now();
+        let mut app = app_with_prompt(" \n ");
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+        assert_eq!(app.prompt.text(), " \n ");
+    }
+
+    #[test]
+    fn settled_double_escape_survives_intervening_typing_and_clearing() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        assert!(
+            app.handle_key_at(key(KeyCode::Char('x')), now + Duration::from_millis(1))
+                .visible_changed
+        );
+        assert!(
+            app.handle_key_at(
+                modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                now + Duration::from_millis(2),
+            )
+            .visible_changed
+        );
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn nonqualifying_escape_paths_preserve_settled_double_escape_state() {
+        let now = Instant::now();
+
+        let mut background = armed_settled_escape(now);
+        background
+            .subagent_monitor
+            .insert_for_test("child", TaskState::Running, now);
+        assert_nonqualifying_escape(&mut background, now, &[RuntimeCommand::CancelBackground]);
+
+        let mut foreground = armed_settled_escape(now);
+        foreground.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        assert_nonqualifying_escape(
+            &mut foreground,
+            now,
+            &[RuntimeCommand::Cancel { correction: false }],
+        );
+
+        let mut nonempty_prompt = armed_settled_escape(now);
+        set_prompt(&mut nonempty_prompt, "draft");
+        assert_nonqualifying_escape(
+            &mut nonempty_prompt,
+            now,
+            &[RuntimeCommand::CancelBackground],
+        );
+
+        let mut configuration = armed_settled_escape(now);
+        configuration.mode = super::AppMode::ConfigurationOnly;
+        assert_nonqualifying_escape(&mut configuration, now, &[]);
+
+        let mut read_only = armed_settled_escape(now);
+        read_only.handle_event_at(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::OpenAiAuthentication,
+            },
+            now,
+        );
+        assert_nonqualifying_escape(&mut read_only, now, &[RuntimeCommand::CancelBackground]);
+
+        for pending in ["foreground cancellation", "manual navigation", "correction"] {
+            let mut app = armed_settled_escape(now);
+            match pending {
+                "foreground cancellation" => app.foreground_cancellation_requested = true,
+                "manual navigation" => app.manual_navigation_pending = true,
+                "correction" => app.correction_pending = true,
+                _ => unreachable!("unknown pending state"),
+            }
+            assert_nonqualifying_escape(&mut app, now, &[RuntimeCommand::CancelBackground]);
+        }
+    }
+
+    #[test]
+    fn released_escape_does_not_reset_settled_double_escape_state() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(
+            app.handle_key_at(release, now + Duration::from_millis(1))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn picker_escape_precedes_settled_double_escape() {
+        let now = Instant::now();
+        let mut app = App::default();
+
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now)
+                .commands
+                .is_empty()
+        );
+        set_prompt(&mut app, "/model");
+        assert!(
+            app.handle_key_at(key(KeyCode::Enter), now + Duration::from_millis(1))
+                .commands
+                .is_empty()
+        );
+        assert!(app.picker.is_some());
+        assert!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(2))
+                .commands
+                .is_empty()
+        );
+        assert!(app.picker.is_none());
+        assert_eq!(app.settled_escape_at, Some(now));
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(499))
+                .commands,
+            [RuntimeCommand::RequestTree { revision: 1 }]
+        );
+    }
+
+    #[test]
+    fn correction_restoration_keeps_drafts_prefills_and_retains_its_card_until_request_commit() {
+        let now = Instant::now();
+        let replacement = CorrectionOutcome::Replaced {
+            state: restored_state("restored parent"),
+            request_prefill: Some("original request".to_owned()),
+        };
+
+        let mut drafted = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        set_prompt(&mut drafted, "draft wins");
+        drafted.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: replacement.clone(),
+            },
+            now,
+        );
+        drafted.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert_eq!(drafted.prompt.text(), "draft wins");
+        assert!(rendered_at(&mut drafted, 80, 20, now).contains("Session restored."));
+
+        let mut prefilled = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        prefilled.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: replacement,
+            },
+            now,
+        );
+        prefilled.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(2) }, now);
+        assert_eq!(prefilled.prompt.text(), "original request");
+        assert!(rendered_at(&mut prefilled, 80, 20, now).contains("Session restored."));
+        prefilled.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "corrected request".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(!rendered_at(&mut prefilled, 80, 20, now).contains("Session restored."));
+    }
+
+    #[test]
+    fn early_escape_carries_correction_intent_but_late_escape_only_cancels() {
+        let submitted_at = Instant::now();
+
+        for (elapsed, correction) in [
+            (Duration::from_millis(1_999), true),
+            (Duration::from_secs(2), true),
+            (Duration::from_millis(2_001), false),
+        ] {
+            let mut app = App::default();
+            assert_eq!(
+                enter_at(&mut app, "correct this", submitted_at).commands,
+                [RuntimeCommand::Submit {
+                    request: "correct this".to_owned(),
+                }]
+            );
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), submitted_at + elapsed)
+                    .commands,
+                [RuntimeCommand::Cancel { correction }],
+                "Esc at {elapsed:?}"
+            );
+            assert_eq!(
+                app.handle_key_at(key(KeyCode::Esc), submitted_at + elapsed)
+                    .commands,
+                [RuntimeCommand::CancelBackground],
+                "repeated Esc at {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn correction_replacement_ignores_progress_after_reliable_settlement() {
+        let now = Instant::now();
+        let mut app = App::default();
+        assert_eq!(
+            enter_at(&mut app, "correct this", now).commands,
+            [RuntimeCommand::Submit {
+                request: "correct this".to_owned()
+            }]
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "correct this".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), now + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+        set_prompt(&mut app, "draft wins");
+        assert!(
+            app.handle_key_at(key(KeyCode::Enter), now)
+                .commands
+                .is_empty()
+        );
+        assert_eq!(
+            app.notice(),
+            Some("Session restoration is still in progress.")
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: terminal(None, vec![]),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(app.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced {
+                    state: restored_state("restored parent"),
+                    request_prefill: Some("correct this".to_owned()),
+                },
+            },
+            now,
+        ));
+        assert_eq!(app.prompt.text(), "draft wins");
+        let restored = rendered_at(&mut app, 80, 20, now);
+        assert!(restored.contains("restored parent"), "{restored}");
+        assert!(restored.contains("Session restored."), "{restored}");
+        assert!(!restored.contains("correct this"), "{restored}");
+        app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
+        assert!(!app.correction_pending);
+        assert_eq!(app.ignored_progress_run_id, Some(RunId(1)));
+        assert!(!app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "stale progress".to_owned(),
+                },
+            },
+            gap_before: false,
+        }));
+        assert!(!rendered_at(&mut app, 80, 20, now).contains("stale progress"));
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::RunStarted { run_id: RunId(5) },
+            gap_before: false,
+        });
+        app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id: RunId(5),
+                step_id: ModelStepId(1),
+            },
+            gap_before: false,
+        });
+        assert!(app.handle_progress(ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id: RunId(5),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "fresh progress".to_owned(),
+                },
+            },
+            gap_before: false,
+        }));
+        assert!(rendered_at(&mut app, 80, 20, now).contains("fresh progress"));
+
+        let mut refill = App {
+            correction_pending: true,
+            correction_run_id: Some(RunId(1)),
+            ..App::default()
+        };
+        assert!(refill.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced {
+                    state: restored_state("refilled parent"),
+                    request_prefill: Some("correct this".to_owned()),
+                },
+            },
+            now,
+        ));
+        assert_eq!(refill.prompt.text(), "correct this");
+        assert!(rendered_at(&mut refill, 80, 20, now).contains("Session restored."));
+        refill.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(2),
+                    record: Record::UserRequest {
+                        request: "correct this".to_owned(),
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(!rendered_at(&mut refill, 80, 20, now).contains("Session restored."));
+    }
+
+    #[test]
+    fn correction_failure_notices_survive_settlement_transcript_mutation() {
+        for (outcome, notice) in [
+            (CorrectionOutcome::Failed, "Session could not be restored."),
+            (
+                CorrectionOutcome::SkippedBackground,
+                "Session was not restored because background work is active.",
+            ),
+        ] {
+            let mut app = App {
+                correction_pending: true,
+                correction_run_id: Some(RunId(1)),
+                ..App::default()
+            };
+            assert!(app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) }));
+            assert!(app.handle_event(RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome,
+            }));
+            assert_eq!(app.notice(), Some(notice));
+            assert!(app.correction_pending);
+
+            assert!(app.handle_event(RuntimeEvent::RunSettled { run_id: RunId(1) }));
+            assert_eq!(app.notice(), Some(notice));
+            assert!(!app.correction_pending);
+        }
+    }
+
+    #[test]
+    fn escape_preserves_foreground_and_background_cancellation_outside_configuration() {
         let now = Instant::now();
         let mut app = App::default();
         app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
 
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::Cancel]
+            vec![RuntimeCommand::Cancel { correction: false }]
         );
         app.handle_event_at(RuntimeEvent::RunSettled { run_id: RunId(1) }, now);
         assert_eq!(
@@ -7235,7 +9067,7 @@ mod tests {
         );
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::Cancel]
+            vec![RuntimeCommand::Cancel { correction: true }]
         );
         app.handle_event_at(
             RuntimeEvent::RecordAppended {
@@ -7251,12 +9083,6 @@ mod tests {
         );
         assert_eq!(
             app.handle_key_at(key(KeyCode::Esc), now).commands,
-            vec![RuntimeCommand::CancelBackground]
-        );
-
-        let mut idle = App::default();
-        assert_eq!(
-            idle.handle_key_at(key(KeyCode::Esc), now).commands,
             vec![RuntimeCommand::CancelBackground]
         );
 

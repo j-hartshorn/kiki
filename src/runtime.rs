@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
@@ -14,8 +14,8 @@ use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session, SessionError,
-    SessionMetadata, SessionRestore, SessionWriter,
+    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session,
+    SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -46,7 +46,15 @@ pub(crate) enum RuntimeCommand {
         name: String,
         revision: u64,
     },
-    Cancel,
+    Navigate {
+        entry: SessionEntryId,
+    },
+    RequestTree {
+        revision: u64,
+    },
+    Cancel {
+        correction: bool,
+    },
     CancelBackground,
     Shutdown,
 }
@@ -126,6 +134,38 @@ pub(crate) struct RuntimeInitialState {
     pub(crate) disabled_reason: Option<RuntimeDisabledReason>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TreeRequestOutcome {
+    Catalogue(SessionCatalogue),
+    RejectedBusy,
+    RejectedReadOnly,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NavigationOutcome {
+    Replaced {
+        state: RuntimeInitialState,
+        request_prefill: Option<String>,
+    },
+    Unchanged {
+        request_prefill: Option<String>,
+    },
+    RejectedBusy,
+    RejectedReadOnly,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CorrectionOutcome {
+    Replaced {
+        state: RuntimeInitialState,
+        request_prefill: Option<String>,
+    },
+    SkippedBackground,
+    Failed,
+}
+
 impl RuntimeInitialState {
     pub(crate) fn empty() -> Self {
         Self {
@@ -196,6 +236,9 @@ pub(crate) enum RuntimeEvent {
     SubagentFinished {
         record: TaskRecord,
     },
+    SubagentOperationSettled {
+        id: TaskId,
+    },
     RunSettled {
         run_id: RunId,
     },
@@ -205,6 +248,17 @@ pub(crate) enum RuntimeEvent {
     NameAccepted {
         revision: u64,
         name: String,
+    },
+    NavigationCompleted {
+        outcome: NavigationOutcome,
+    },
+    CorrectionCompleted {
+        run_id: RunId,
+        outcome: CorrectionOutcome,
+    },
+    TreeCatalogue {
+        revision: u64,
+        outcome: TreeRequestOutcome,
     },
     SubmissionRejectedBusy {
         active_run_id: RunId,
@@ -299,6 +353,9 @@ pub(crate) struct RuntimeController<M: Model> {
 
 struct ActiveRun<M: Model> {
     run_id: Option<RunId>,
+    request_entry: Option<SessionEntryId>,
+    correction_requested: bool,
+    persisted_model_steps: BTreeSet<u64>,
     pending_busy_submissions: usize,
     caller: Caller,
     cancellation: CancellationToken,
@@ -312,6 +369,7 @@ struct ActiveRun<M: Model> {
 enum WorkerMessage<M: Model> {
     RequestCommitted {
         run_id: u64,
+        request_entry: SessionEntryId,
         request: String,
     },
     PersistedModelStepStarted {
@@ -393,12 +451,14 @@ enum ControllerInput<M: Model> {
 
 pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand> {
     match command {
-        RuntimeCommand::Cancel => Some(ControlCommand::Cancel),
+        RuntimeCommand::Cancel { .. } => Some(ControlCommand::Cancel),
         RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
         RuntimeCommand::Submit { .. }
         | RuntimeCommand::ApplySettings { .. }
-        | RuntimeCommand::SetSessionName { .. } => None,
+        | RuntimeCommand::SetSessionName { .. }
+        | RuntimeCommand::Navigate { .. }
+        | RuntimeCommand::RequestTree { .. } => None,
     }
 }
 
@@ -476,9 +536,13 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SubagentStatus { .. }
         | RuntimeEvent::SubagentRecord { .. }
         | RuntimeEvent::SubagentFinished { .. }
+        | RuntimeEvent::SubagentOperationSettled { .. }
         | RuntimeEvent::RunSettled { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
+        | RuntimeEvent::NavigationCompleted { .. }
+        | RuntimeEvent::CorrectionCompleted { .. }
+        | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
@@ -651,7 +715,12 @@ impl<M: Model> RuntimeController<M> {
             .cloned()
             .map(restored_stored_record)
             .collect();
-        let restored_tasks = restore.tasks.iter().map(|task| task.record.clone());
+        let selected_origins = restore
+            .tasks
+            .iter()
+            .filter_map(|task| task.record.origin_step_id())
+            .collect::<Vec<_>>();
+        let restored_tasks = restore.all_tasks.iter().map(|task| task.record.clone());
         let subagents = subagents.with_session(session.writer());
         subagents
             .restore_terminal_tasks(
@@ -660,6 +729,10 @@ impl<M: Model> RuntimeController<M> {
                 restore.reserved_task_ids.clone(),
             )
             .await;
+        assert!(
+            subagents.replace_selected_origins(selected_origins).await,
+            "restoration has no tracked subagent operations"
+        );
         let accepted_thinking = AcceptedThinking::new(
             *settings.borrow(),
             persisted_settings,
@@ -741,7 +814,7 @@ impl<M: Model> RuntimeController<M> {
             home.path(),
             std::path::Path::new("/"),
             selection,
-            agent.checkpoint_for_test(),
+            agent.checkpoint(),
         )
         .expect("create persisted runtime session");
         let mut controller = Self::with_session(
@@ -978,13 +1051,188 @@ impl<M: Model> RuntimeController<M> {
                     }
                 }
             }
-            RuntimeCommand::Cancel => self.request_active_cancellation(),
+            RuntimeCommand::Navigate { entry } => {
+                let outcome = if self.disabled_reason.is_some() {
+                    NavigationOutcome::RejectedReadOnly
+                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                    NavigationOutcome::RejectedBusy
+                } else {
+                    self.drain_coordinator_events(events, progress).await;
+                    let (outcome, disabled) = self.restore_selected_entry(entry).await;
+                    self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
+                    self.disable_after_restoration(events, disabled).await;
+                    return;
+                };
+                self.emit(events, RuntimeEvent::NavigationCompleted { outcome });
+            }
+            RuntimeCommand::RequestTree { revision } => {
+                let storage_failure = self.subagents.storage_failure_token().is_cancelled();
+                let outcome = if storage_failure || self.disabled_reason.is_some() {
+                    TreeRequestOutcome::RejectedReadOnly
+                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                    TreeRequestOutcome::RejectedBusy
+                } else {
+                    self.drain_coordinator_events(events, progress).await;
+                    match self.session.catalogue().await {
+                        Ok(catalogue) => TreeRequestOutcome::Catalogue(catalogue),
+                        Err(_) => TreeRequestOutcome::Failed,
+                    }
+                };
+                self.emit(events, RuntimeEvent::TreeCatalogue { revision, outcome });
+            }
+            RuntimeCommand::Cancel { correction } => self.request_active_cancellation(correction),
             RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
             RuntimeCommand::Shutdown => {
                 *shutdown_requested = true;
                 self.request_shutdown().await;
             }
         }
+    }
+
+    async fn restore_selected_entry(
+        &mut self,
+        entry: SessionEntryId,
+    ) -> (NavigationOutcome, Option<RuntimeDisabledReason>) {
+        debug_assert!(self.agent.is_some(), "navigation requires the idle agent");
+        debug_assert_eq!(
+            self.subagents.operation_count(),
+            0,
+            "navigation requires settled child operations"
+        );
+
+        let restore = match self.session.restore_at(entry).await {
+            Ok(restore) => restore,
+            Err(_) => return (NavigationOutcome::Failed, None),
+        };
+        if restore.effective_entry == restore.observed_active_entry {
+            return (
+                NavigationOutcome::Unchanged {
+                    request_prefill: restore.request_prefill,
+                },
+                None,
+            );
+        }
+        let Some(executable) = restore.executable.as_ref() else {
+            return (NavigationOutcome::Failed, None);
+        };
+        let Some(agent) = self.agent.as_ref() else {
+            return (NavigationOutcome::Failed, None);
+        };
+        if agent
+            .validate_restored_history(&executable.history)
+            .is_err()
+        {
+            return (NavigationOutcome::Failed, None);
+        }
+        let initial = restored_initial_state(&restore);
+        let executable = restore
+            .executable
+            .expect("navigation validated executable state");
+        let previous_checkpoint = agent.checkpoint();
+        let target_restore = self
+            .agent
+            .as_mut()
+            .expect("navigation checked the idle agent")
+            .restore_arena(executable.checkpoint)
+            .await;
+        if let Err(error) = target_restore {
+            if !matches!(
+                error,
+                crate::arena::ArenaError::IncompatibleCheckpoint { .. }
+            ) && self
+                .agent
+                .as_mut()
+                .expect("navigation retains its agent after a failed restore")
+                .restore_arena(previous_checkpoint)
+                .await
+                .is_err()
+            {
+                return (
+                    NavigationOutcome::Failed,
+                    Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed),
+                );
+            }
+            return (NavigationOutcome::Failed, None);
+        }
+        if self
+            .session
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .agent
+                .as_mut()
+                .expect("navigation retains its agent after persistence failure")
+                .restore_arena(previous_checkpoint)
+                .await;
+            return (
+                NavigationOutcome::Failed,
+                Some(RuntimeDisabledReason::SessionStorageWriteFailed),
+            );
+        }
+
+        let selected_origins = restore
+            .tasks
+            .iter()
+            .filter_map(|task| task.record.origin_step_id())
+            .collect::<Vec<_>>();
+        assert!(
+            self.subagents
+                .replace_selected_origins(selected_origins)
+                .await,
+            "navigation has no tracked child operations"
+        );
+        let request_prefill = restore.request_prefill;
+        self.agent
+            .as_mut()
+            .expect("navigation retains its agent after persistence")
+            .replace_idle_state(executable.history);
+        self.records = restore
+            .records
+            .into_iter()
+            .map(restored_stored_record)
+            .collect();
+        (
+            NavigationOutcome::Replaced {
+                state: initial,
+                request_prefill,
+            },
+            None,
+        )
+    }
+
+    async fn disable_after_restoration(
+        &mut self,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+        disabled: Option<RuntimeDisabledReason>,
+    ) {
+        let Some(reason) = disabled else {
+            return;
+        };
+        match reason {
+            RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
+                self.disable_arena_checkpoint_recovery(events);
+            }
+            RuntimeDisabledReason::SessionStorageWriteFailed => {
+                self.subagents.latch_storage_failure().await;
+                self.disable_session_storage(events).await;
+            }
+            RuntimeDisabledReason::OpenAiAuthentication
+            | RuntimeDisabledReason::SessionRestoreFailed => {
+                unreachable!("restoration only disables for Arena or storage recovery")
+            }
+        }
+    }
+
+    fn disable_arena_checkpoint_recovery(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+        self.disabled_reason = Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed);
+        self.emit(
+            events,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            },
+        );
     }
 
     async fn handle_coordinator_event(
@@ -1008,7 +1256,7 @@ impl<M: Model> RuntimeController<M> {
                 let Some(record) = self.subagents.record(&id).await else {
                     return;
                 };
-                if record.revision() < revision {
+                if record.revision() < revision || record.observation().state().is_terminal() {
                     return;
                 }
                 self.publish_subagent_record(events, &record);
@@ -1018,6 +1266,9 @@ impl<M: Model> RuntimeController<M> {
                 self.publish_subagent_record(events, &record);
                 self.publish_subagent_status(progress, &record);
                 self.emit(events, RuntimeEvent::SubagentFinished { record });
+            }
+            CoordinatorEvent::OperationSettled { id } => {
+                self.emit(events, RuntimeEvent::SubagentOperationSettled { id });
             }
         }
     }
@@ -1128,9 +1379,16 @@ impl<M: Model> RuntimeController<M> {
             let mut settled_tool_updates = Vec::new();
             let result = {
                 let mut event = |event| match event {
-                    PersistedAgentEvent::RequestCommitted { run_id, request } => {
-                        let _ = completion_sender
-                            .send(WorkerMessage::RequestCommitted { run_id, request });
+                    PersistedAgentEvent::RequestCommitted {
+                        run_id,
+                        request_entry,
+                        request,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::RequestCommitted {
+                            run_id,
+                            request_entry,
+                            request,
+                        });
                     }
                     PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
                         let _ = completion_sender
@@ -1304,6 +1562,9 @@ impl<M: Model> RuntimeController<M> {
         drop(worker_task);
         self.active = Some(ActiveRun {
             run_id: None,
+            request_entry: None,
+            correction_requested: false,
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 0,
             caller,
             cancellation,
@@ -1314,12 +1575,16 @@ impl<M: Model> RuntimeController<M> {
         });
     }
 
-    fn request_active_cancellation(&mut self) {
+    fn request_active_cancellation(&mut self, correction: bool) {
         if let Some(active) = &mut self.active {
             self.trace
                 .emit(|| TraceEvent::ForegroundCancellationRequested);
+            let first_cancellation = !active.cancellation_requested;
             active.cancellation_requested = true;
             active.cancellation.cancel();
+            if first_cancellation {
+                active.correction_requested = correction;
+            }
         }
     }
 
@@ -1334,7 +1599,7 @@ impl<M: Model> RuntimeController<M> {
     }
 
     async fn request_shutdown(&mut self) {
-        self.request_active_cancellation();
+        self.request_active_cancellation(false);
         self.request_background_cancellation().await;
     }
 
@@ -1345,7 +1610,11 @@ impl<M: Model> RuntimeController<M> {
         progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
         match message {
-            WorkerMessage::RequestCommitted { run_id, request } => {
+            WorkerMessage::RequestCommitted {
+                run_id,
+                request_entry,
+                request,
+            } => {
                 let run_id = RunId(run_id);
                 let pending_busy_submissions = std::mem::take(
                     &mut self
@@ -1354,10 +1623,12 @@ impl<M: Model> RuntimeController<M> {
                         .expect("request commit requires an active run")
                         .pending_busy_submissions,
                 );
-                self.active
+                let active = self
+                    .active
                     .as_mut()
-                    .expect("request commit requires an active run")
-                    .run_id = Some(run_id);
+                    .expect("request commit requires an active run");
+                active.run_id = Some(run_id);
+                active.request_entry = Some(request_entry);
                 self.trace
                     .emit(|| TraceEvent::RootRunStarted { run_id: run_id.0 });
                 self.publish_progress(progress, RuntimeEvent::RunStarted { run_id }, false);
@@ -1386,6 +1657,7 @@ impl<M: Model> RuntimeController<M> {
                 if active.run_id != Some(run_id) {
                     return;
                 }
+                active.persisted_model_steps.insert(step_id.0);
                 self.publish_progress(
                     progress,
                     RuntimeEvent::ModelStepStarted { run_id, step_id },
@@ -1465,6 +1737,23 @@ impl<M: Model> RuntimeController<M> {
                                     .authentication_failure
                                     .then_some(RuntimeDisabledReason::OpenAiAuthentication)
                             });
+                        let (correction_requested, request_entry, caller, persisted_model_steps) = {
+                            let active = self
+                                .active
+                                .as_ref()
+                                .expect("finished run remains active until settlement");
+                            (
+                                active.correction_requested,
+                                active.request_entry,
+                                active.caller.clone(),
+                                active.persisted_model_steps.clone(),
+                            )
+                        };
+                        let correction = correction_requested
+                            && matches!(&record, Record::CancelledRun { .. })
+                            && self.disabled_reason.is_none()
+                            && disabled_reason.is_none()
+                            && request_entry.is_some();
                         if disabled_reason.is_none() {
                             self.agent = Some(agent);
                         }
@@ -1477,6 +1766,42 @@ impl<M: Model> RuntimeController<M> {
                         if let Some(reason) = disabled_reason {
                             self.disabled_reason = Some(reason.clone());
                             self.emit(events, RuntimeEvent::RuntimeDisabled { reason });
+                        }
+                        self.subagents
+                            .settle_root_run(&caller, persisted_model_steps)
+                            .await;
+                        if correction {
+                            let (outcome, disabled) = if self.subagents.operation_count() != 0 {
+                                (CorrectionOutcome::SkippedBackground, None)
+                            } else {
+                                self.drain_coordinator_events(events, progress).await;
+                                let (outcome, disabled) = self
+                                    .restore_selected_entry(
+                                        request_entry.expect("eligible correction has a request"),
+                                    )
+                                    .await;
+                                (
+                                    match outcome {
+                                        NavigationOutcome::Replaced {
+                                            state,
+                                            request_prefill,
+                                        } => CorrectionOutcome::Replaced {
+                                            state,
+                                            request_prefill,
+                                        },
+                                        NavigationOutcome::Unchanged { .. }
+                                        | NavigationOutcome::RejectedBusy
+                                        | NavigationOutcome::RejectedReadOnly
+                                        | NavigationOutcome::Failed => CorrectionOutcome::Failed,
+                                    },
+                                    disabled,
+                                )
+                            };
+                            self.emit(
+                                events,
+                                RuntimeEvent::CorrectionCompleted { run_id, outcome },
+                            );
+                            self.disable_after_restoration(events, disabled).await;
                         }
                         self.trace.emit(|| TraceEvent::RootRunSettled {
                             run_id: run_id.0,
@@ -1502,7 +1827,7 @@ impl<M: Model> RuntimeController<M> {
             return;
         }
         self.disabled_reason = Some(RuntimeDisabledReason::SessionStorageWriteFailed);
-        self.request_active_cancellation();
+        self.request_active_cancellation(false);
         self.request_background_cancellation().await;
         self.emit(
             events,
@@ -1662,13 +1987,13 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        AcceptedThinking, ActiveRun, CoordinatorEvent, ModelStepId, PROGRESS_CHANNEL_CAPACITY,
-        ProgressEnvelope, ProgressPublisher, Record, RestoredTimelineItem, RunId, RuntimeCommand,
-        RuntimeController, RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver,
-        StoredRecord, TerminalDetails, WorkerMessage, restored_initial_state,
-        runtime_event_payload_bytes,
+        AcceptedThinking, ActiveRun, CoordinatorEvent, CorrectionOutcome, ModelStepId,
+        PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
+        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
+        RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails, WorkerMessage,
+        restored_initial_state, runtime_event_payload_bytes,
     };
-    use crate::agent::{Agent, ExecutionFailure, TerminalEvidence};
+    use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
         ToolCall, ToolCallSummary, ToolName,
@@ -1685,13 +2010,14 @@ mod tests {
     };
     use crate::session::{
         PersistedCode, PersistedTerminal, RestoredRecord, RestoredRecordKind, RestoredTask,
-        Session, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission, TaskTerminal,
+        Session, SessionEntryId, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission,
+        TaskTerminal,
     };
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
         CompleteChildRunner, RunnerFuture, SessionSubagents, StartSubagentTestGate,
         SubagentCoordinator, SubagentPolicy, TaskAttempt, TaskExecution, TaskOutcome,
-        TaskPersistedDetails, TaskRecord, TaskState,
+        TaskPersistedDetails, TaskRecord, TaskState, TerminalSettlementTestGate,
     };
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
@@ -2418,7 +2744,10 @@ mod tests {
         gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         commands
             .send(RuntimeCommand::ApplySettings {
                 selection,
@@ -2525,7 +2854,10 @@ mod tests {
         timeout(TEST_TIMEOUT, provider_called.notified())
             .await
             .expect("provider should begin after the step commit");
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, controller).await;
         session.close().unwrap();
@@ -2644,7 +2976,10 @@ mod tests {
             .unwrap();
         gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         commands
             .send(RuntimeCommand::ApplySettings {
                 selection,
@@ -2747,7 +3082,10 @@ mod tests {
             .await
             .unwrap();
         gate.wait_until_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         commands
             .send(RuntimeCommand::ApplySettings {
                 selection,
@@ -3867,7 +4205,10 @@ mod tests {
                 }
             );
         }
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, controller).await;
         session.close().unwrap();
@@ -3882,6 +4223,9 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: None,
+            request_entry: None,
+            correction_requested: false,
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 1,
             caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
@@ -3957,6 +4301,50 @@ mod tests {
                 return collected;
             }
         }
+    }
+
+    fn assert_restore_unchanged(before: &SessionRestore, after: &SessionRestore) {
+        assert_eq!(after.effective_entry, before.effective_entry);
+        assert_eq!(after.observed_active_entry, before.observed_active_entry);
+        assert_eq!(after.request_prefill, before.request_prefill);
+        assert_eq!(after.metadata, before.metadata);
+        assert_eq!(after.records, before.records);
+        assert_eq!(after.tasks, before.tasks);
+        assert_eq!(after.all_tasks, before.all_tasks);
+        assert_eq!(after.footer_adjustment, before.footer_adjustment);
+        assert_eq!(after.next_task, before.next_task);
+        assert_eq!(
+            after
+                .executable
+                .as_ref()
+                .map(|state| (&state.checkpoint, &state.history)),
+            before
+                .executable
+                .as_ref()
+                .map(|state| (&state.checkpoint, &state.history))
+        );
+    }
+
+    fn session_database_snapshot(session: &Session) -> (i64, i64, i64, i64, i64, i64, i64) {
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT active_entry_id, revision, updated_at_ms, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps), (SELECT COUNT(*) FROM subagent_tasks) FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("snapshot session database")
     }
 
     async fn progress_until_execution_started(
@@ -4041,9 +4429,15 @@ mod tests {
             RuntimeEvent::SubagentFinished { record } => {
                 format!("subagent-finished:{}", record.id())
             }
+            RuntimeEvent::SubagentOperationSettled { id } => {
+                format!("subagent-operation-settled:{id}")
+            }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
+            RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
+            RuntimeEvent::CorrectionCompleted { .. } => "correction-completed".to_owned(),
+            RuntimeEvent::TreeCatalogue { revision, .. } => format!("tree-catalogue:{revision}"),
             RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
                 format!("busy:{}", active_run_id.0)
             }
@@ -4501,7 +4895,10 @@ mod tests {
             "background cancellation settled the foreground request"
         );
 
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, task).await;
     }
@@ -4558,7 +4955,10 @@ mod tests {
             .await
             .unwrap();
         foreground_ready.notified().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         events_until_settled(&mut events).await;
         commands
             .send(RuntimeCommand::CancelBackground)
@@ -6279,7 +6679,10 @@ mod tests {
             next_event(&mut events).await,
             RuntimeEvent::SettingsAccepted { revision: 1 }
         );
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let cancelled = events_until_settled(&mut events).await;
         assert!(matches!(
             cancelled.as_slice(),
@@ -6388,6 +6791,11 @@ mod tests {
         partial: bool,
     }
 
+    struct CorrectionChildModel {
+        ready: Arc<Notify>,
+        step: usize,
+    }
+
     impl Model for WaitingCancellationModel {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
@@ -6416,6 +6824,45 @@ mod tests {
                     ModelError::Cancelled,
                     vec![AttemptAccounting::UsageUnavailable],
                 ))
+            }
+        }
+    }
+
+    impl Model for CorrectionChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "cancelled_task = await start_subagent('cancelled child')"
+                            .to_owned(),
+                        call_id: ModelCallId::new("cancelled-child"),
+                        commentary: None,
+                    },
+                    1 => {
+                        self.ready.notify_one();
+                        cancellation.cancelled().await;
+                        return Err(ModelError::Cancelled.into());
+                    }
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: Some(
+                        ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                            .expect("default selection is valid"),
+                    ),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
             }
         }
     }
@@ -7143,7 +7590,10 @@ mod tests {
             .await
             .unwrap();
         gate.wait_until_read_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let events = events_until_settled(&mut events).await;
         let records = shutdown_controller(commands, task).await;
 
@@ -7332,6 +7782,9 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             run_id: Some(RunId(1)),
+            request_entry: None,
+            correction_requested: false,
+            persisted_model_steps: BTreeSet::new(),
             pending_busy_submissions: 0,
             caller: controller.subagents.root_caller().await,
             cancellation: CancellationToken::new(),
@@ -7732,7 +8185,10 @@ mod tests {
                 active_run_id: RunId(1)
             }
         );
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let first_settled = events_until_settled(&mut events).await;
 
         commands
@@ -7854,8 +8310,14 @@ mod tests {
             .await
             .unwrap();
         let progress_events = progress_until_execution_started(&mut progress, ModelStepId(1)).await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let reliable_events = events_until_settled(&mut events).await;
 
         assert_eq!(
@@ -7907,7 +8369,10 @@ mod tests {
             .await
             .unwrap();
         let first_started = progress_until_execution_started(&mut progress, ModelStepId(2)).await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let first_settled = events_until_settled(&mut events).await;
         commands
             .send(RuntimeCommand::Submit {
@@ -8062,6 +8527,1132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn correction_restores_the_cancelled_request_parent_before_settlement() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let ready = Arc::new(Notify::new());
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                WaitingCancellationModel {
+                    ready: ready.clone(),
+                    partial: true,
+                },
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "original request".to_owned(),
+            })
+            .await
+            .expect("submit original request");
+        ready.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("cancel for correction");
+        gate.wait_until_started().await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(events.try_recv().is_err());
+        gate.release();
+        let first = events_until_settled(&mut events).await;
+        let correction = first
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::CorrectionCompleted {
+                    run_id,
+                    outcome:
+                        CorrectionOutcome::Replaced {
+                            state,
+                            request_prefill,
+                        },
+                } => Some((*run_id, state, request_prefill)),
+                _ => None,
+            })
+            .expect("cancelled request should restore its parent");
+        assert_eq!(correction.0, RunId(1));
+        assert!(correction.1.timeline.is_empty());
+        assert_eq!(correction.2.as_deref(), Some("original request"));
+        let terminal = first
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord {
+                            record: Record::CancelledRun { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("cancelled terminal record");
+        let restored = first
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::CorrectionCompleted { .. }))
+            .expect("correction outcome");
+        let settled = first
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { run_id: RunId(1) }))
+            .expect("run settlement");
+        assert!(terminal < restored && restored < settled);
+        assert_eq!(active_entry_id(&session), root.0 as i64);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "corrected request".to_owned(),
+            })
+            .await
+            .expect("submit corrected request");
+        ready.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel corrected request");
+        events_until_settled(&mut events).await;
+        {
+            let connection = session.connection_for_test().expect("lock session");
+            let parents = connection
+                .prepare("SELECT parent_id FROM entries WHERE kind = 'user_request' ORDER BY id")
+                .expect("prepare request parent query")
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query request parents")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read request parents");
+            assert_eq!(parents, [root.0 as i64, root.0 as i64]);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE kind = 'cancelled'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count cancelled terminals"),
+                2
+            );
+        }
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_restores_after_python_execution_cancellation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host")
+                .with_test_gate(gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ScriptedModel::new(vec![ModelAction::Code {
+                    source: "print('before correction')\nawait read('blocked')".to_owned(),
+                }]),
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "correct after execution".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        gate.wait_until_read_started().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("cancel execution for correction");
+        let settled = events_until_settled(&mut events).await;
+        assert!(settled.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CancelledRun { terminal },
+                    ..
+                },
+                ..
+            } if matches!(
+                terminal.evidence,
+                Some(TerminalEvidence::Execution(ref evidence))
+                    if evidence.stdout.head == "before correction\n"
+            )
+        )));
+        assert!(settled.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced { state, .. },
+            } if state.timeline.is_empty()
+        )));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_restores_after_cancellation_precedes_request_admission() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Request);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                WaitingCancellationModel {
+                    ready: Arc::new(Notify::new()),
+                    partial: false,
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "admit before correcting".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        gate.wait_until_started().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("cancel before request admission");
+        gate.release();
+        let settled = events_until_settled(&mut events).await;
+        assert!(matches!(
+            settled.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { request },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::CancelledRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::CorrectionCompleted {
+                    outcome:
+                        CorrectionOutcome::Replaced {
+                            request_prefill: Some(prefill),
+                            ..
+                        },
+                    ..
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ] if request == "admit before correcting" && prefill == "admit before correcting"
+        ));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_intent_does_not_restore_final_or_failed_terminals() {
+        for (terminal, expected) in [
+            (
+                PersistedTerminal::Final {
+                    step_id: 1,
+                    text: "final wins".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                "final",
+            ),
+            (
+                PersistedTerminal::Failed {
+                    message: "failed wins".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                "failed",
+            ),
+        ] {
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let gate = ArenaRestoreTestGate::new();
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path())
+                    .await
+                    .expect("open tool host"),
+            )
+            .await
+            .expect("create arena");
+            let selection =
+                ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+            let (settings, _) = watch::channel(selection);
+            let mut controller = RuntimeController::new_for_test(
+                Agent::new(arena, ScriptedModel::new(Vec::new()))
+                    .with_restore_test_gate(gate.clone()),
+                settings,
+                crate::config::ready_snapshot_for_test().settings().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+            );
+            let agent = controller.agent.take().expect("controller owns idle agent");
+            let (_worker_sender, worker) = mpsc::unbounded_channel();
+            let (_progress_sender, progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+            controller.active = Some(ActiveRun {
+                run_id: Some(RunId(1)),
+                request_entry: Some(SessionEntryId(1)),
+                correction_requested: false,
+                persisted_model_steps: BTreeSet::new(),
+                pending_busy_submissions: 0,
+                caller: controller.subagents.root_caller().await,
+                cancellation: CancellationToken::new(),
+                worker,
+                progress,
+                progress_open: false,
+                cancellation_requested: false,
+            });
+            controller.request_active_cancellation(true);
+            assert!(
+                controller
+                    .active
+                    .as_ref()
+                    .expect("foreground run remains active")
+                    .correction_requested
+            );
+            let (events_sender, mut events) = mpsc::unbounded_channel();
+            let (progress_sender, _) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+            let mut progress = ProgressPublisher::new(progress_sender);
+
+            controller
+                .handle_worker_message(
+                    WorkerMessage::PersistedFinished {
+                        agent,
+                        result: Ok(crate::agent::PersistedRunOutcome {
+                            run_id: 1,
+                            terminal,
+                            authentication_failure: false,
+                            recovery_failure: false,
+                        }),
+                        progress_gap: false,
+                    },
+                    &events_sender,
+                    &mut progress,
+                )
+                .await;
+
+            let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+            assert!(matches!(
+                emitted.as_slice(),
+                [
+                    RuntimeEvent::RecordAppended {
+                        record: StoredRecord { record, .. },
+                        ..
+                    },
+                    RuntimeEvent::RunSettled { run_id: RunId(1) },
+                ] if matches!(
+                    (expected, record),
+                    ("final", Record::FinalMessage { .. }) | ("failed", Record::FailedRun { .. })
+                )
+            ));
+            assert!(gate.attempts().is_empty());
+            assert!(controller.active.is_none());
+        }
+    }
+
+    async fn correction_restore_fixture(
+        workspace: &tempfile::TempDir,
+        gate: ArenaRestoreTestGate,
+    ) -> (
+        tempfile::TempDir,
+        Session,
+        SessionEntryId,
+        Checkpoint,
+        Arc<Notify>,
+        RuntimeController<WaitingCancellationModel>,
+    ) {
+        let (home, session, live_arena, old_history, _root, old_entry, _target_entry) =
+            navigation_fixture(workspace).await;
+        let old_checkpoint = live_arena.checkpoint();
+        let ready = Arc::new(Notify::new());
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            WaitingCancellationModel {
+                ready: ready.clone(),
+                partial: false,
+            },
+            gate,
+        );
+        (home, session, old_entry, old_checkpoint, ready, controller)
+    }
+
+    async fn submit_correction(commands: &mpsc::Sender<RuntimeCommand>, ready: &Arc<Notify>) {
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "correct this request".to_owned(),
+            })
+            .await
+            .expect("submit correction request");
+        ready.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("request correction");
+    }
+
+    #[tokio::test]
+    async fn correction_incompatible_target_keeps_cancelled_selection_enabled() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = ArenaRestoreTestGate::new();
+        let (_home, session, old_entry, _old_checkpoint, ready, controller) =
+            correction_restore_fixture(&workspace, gate.clone()).await;
+        replace_entry_checkpoint_identity(&session, old_entry, "incompatible correction runtime");
+        let target_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let emitted = events_until_settled(&mut events).await;
+
+        let completed = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CorrectionCompleted {
+                        run_id: RunId(3),
+                        outcome: CorrectionOutcome::Failed,
+                    }
+                )
+            })
+            .expect("failed correction outcome");
+        let settled = emitted
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { run_id: RunId(3) }))
+            .expect("correction run settlement");
+        assert!(completed < settled);
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::RuntimeDisabled { .. }))
+        );
+        assert_eq!(gate.attempts(), [target_checkpoint]);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT kind FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read active entry kind"),
+            "cancelled"
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_recovers_from_target_load_failure_without_disabling() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = ArenaRestoreTestGate::new();
+        let (_home, session, old_entry, old_checkpoint, ready, controller) =
+            correction_restore_fixture(&workspace, gate.clone()).await;
+        replace_entry_checkpoint_state(&session, old_entry, vec![0]);
+        let target_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let emitted = events_until_settled(&mut events).await;
+
+        let completed = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CorrectionCompleted {
+                        run_id: RunId(3),
+                        outcome: CorrectionOutcome::Failed,
+                    }
+                )
+            })
+            .expect("failed correction outcome");
+        let settled = emitted
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { run_id: RunId(3) }))
+            .expect("correction run settlement");
+        assert!(completed < settled);
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::RuntimeDisabled { .. }))
+        );
+        assert_eq!(gate.attempts(), [target_checkpoint, old_checkpoint]);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT kind FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read active entry kind"),
+            "cancelled"
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_disables_when_target_and_compensation_restore_fail() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = ArenaRestoreTestGate::new();
+        let (_home, session, old_entry, old_checkpoint, ready, controller) =
+            correction_restore_fixture(&workspace, gate.clone()).await;
+        replace_entry_checkpoint_state(&session, old_entry, vec![0]);
+        let target_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        gate.fail_attempt(2);
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let emitted = events_until_settled(&mut events).await;
+
+        let completed = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CorrectionCompleted {
+                        run_id: RunId(3),
+                        outcome: CorrectionOutcome::Failed,
+                    }
+                )
+            })
+            .expect("failed correction outcome");
+        let disabled = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+                    }
+                )
+            })
+            .expect("Arena recovery disable");
+        let settled = emitted
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { run_id: RunId(3) }))
+            .expect("correction run settlement");
+        assert!(completed < disabled && disabled < settled);
+        assert_eq!(gate.attempts(), [target_checkpoint, old_checkpoint]);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT kind FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read active entry kind"),
+            "cancelled"
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_selection_failure_compensates_arena_and_disables_storage() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = ArenaRestoreTestGate::new();
+        let (_home, session, _old_entry, old_checkpoint, ready, controller) =
+            correction_restore_fixture(&workspace, gate.clone()).await;
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_correction_selection BEFORE UPDATE OF active_entry_id ON session WHEN (SELECT kind FROM entries WHERE id = OLD.active_entry_id) = 'cancelled' BEGIN SELECT RAISE(ABORT, 'reject correction selection'); END;",
+            )
+            .expect("reject correction selection");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let emitted = events_until_settled(&mut events).await;
+
+        let completed = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CorrectionCompleted {
+                        run_id: RunId(3),
+                        outcome: CorrectionOutcome::Failed,
+                    }
+                )
+            })
+            .expect("failed correction outcome");
+        let disabled = emitted
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                    }
+                )
+            })
+            .expect("storage disable");
+        let settled = emitted
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { run_id: RunId(3) }))
+            .expect("correction run settlement");
+        assert!(completed < disabled && disabled < settled);
+        assert_eq!(gate.attempts(), [old_checkpoint.clone(), old_checkpoint]);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT kind FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read active entry kind"),
+            "cancelled"
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_skips_active_background_work_without_restoring_later() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        let foreground_ready = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            WaitingCancellationModel {
+                ready: foreground_ready.clone(),
+                partial: false,
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel but retain child".to_owned(),
+            })
+            .await
+            .expect("submit foreground request");
+        foreground_ready.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("request correction");
+        let foreground = events_until_settled(&mut events).await;
+        assert!(matches!(
+            foreground.as_slice(),
+            [
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::UserRequest { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::CancelledRun { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::CorrectionCompleted {
+                    run_id: RunId(1),
+                    outcome: CorrectionOutcome::SkippedBackground,
+                },
+                RuntimeEvent::RunSettled { run_id: RunId(1) },
+            ]
+        ));
+        assert_eq!(
+            coordinator
+                .get(&caller, child.id())
+                .await
+                .expect("child remains accessible")
+                .state(),
+            TaskState::Running
+        );
+
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .expect("explicitly cancel background child");
+        assert!(matches!(
+            coordinator.wait(&caller, child.id()).await,
+            Err(crate::subagents::WaitError::Cancelled { .. })
+        ));
+        let mut later = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            let finished = matches!(event, RuntimeEvent::SubagentFinished { .. });
+            later.push(event);
+            if finished {
+                break;
+            }
+        }
+        assert!(
+            !later
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::CorrectionCompleted { .. }))
+        );
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn correction_skips_stopping_background_work_without_later_restoration() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let operation_gate = TerminalSettlementTestGate::new();
+        let factory = CleanupGatedChildFactory {
+            started: Arc::new(Notify::new()),
+            cleanup_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            returned: Arc::new(Notify::new()),
+        };
+        let coordinator = complete_child_coordinator(factory.clone())
+            .with_terminal_settlement_test_gate(operation_gate.clone());
+        let caller = coordinator.root_caller().await;
+        let child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        coordinator.request_background_cancellation(None).await;
+        factory.cleanup_started.notified().await;
+        assert_eq!(
+            coordinator
+                .get(&caller, child.id())
+                .await
+                .expect("read stopping child")
+                .state(),
+            TaskState::Stopping
+        );
+        let ready = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            WaitingCancellationModel {
+                ready: ready.clone(),
+                partial: false,
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let foreground = events_until_settled(&mut events).await;
+        assert_eq!(
+            foreground
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::CorrectionCompleted { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [CorrectionOutcome::SkippedBackground]
+        );
+
+        factory.release.notify_one();
+        operation_gate.wait_until_terminal_settled().await;
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
+        assert_eq!(coordinator.operation_count(), 0);
+        let mut later = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            let finished = matches!(event, RuntimeEvent::SubagentFinished { .. });
+            later.push(event);
+            if finished {
+                break;
+            }
+        }
+        assert!(
+            !later
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::CorrectionCompleted { .. }))
+        );
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn correction_skips_terminal_settlement_pending_background_work() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let operation_gate = TerminalSettlementTestGate::new();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: Vec::new(),
+        };
+        let coordinator = complete_child_coordinator(factory.clone())
+            .with_terminal_settlement_test_gate(operation_gate.clone());
+        let caller = coordinator.root_caller().await;
+        coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        factory.release.notify_one();
+        operation_gate.wait_until_terminal_settled().await;
+        assert_eq!(coordinator.operation_count(), 1);
+        let ready = Arc::new(Notify::new());
+        let controller = controller_with_subagents(
+            &workspace,
+            WaitingCancellationModel {
+                ready: ready.clone(),
+                partial: false,
+            },
+            coordinator.clone(),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        let foreground = events_until_settled(&mut events).await;
+        assert_eq!(
+            foreground
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEvent::CorrectionCompleted { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [CorrectionOutcome::SkippedBackground]
+        );
+
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
+        assert_eq!(coordinator.operation_count(), 0);
+        assert!(!foreground.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CorrectionCompleted {
+                outcome: CorrectionOutcome::Replaced { .. },
+                ..
+            }
+        )));
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn correction_restores_after_repeated_escape_settles_background_work_first() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let closure_gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let operation_gate = TerminalSettlementTestGate::new();
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: Vec::new(),
+        };
+        let coordinator = complete_child_coordinator(factory.clone())
+            .with_terminal_settlement_test_gate(operation_gate.clone());
+        let caller = coordinator.root_caller().await;
+        coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            closure_gate.clone(),
+        )
+        .expect("create session");
+        let ready = Arc::new(Notify::new());
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                WaitingCancellationModel {
+                    ready: ready.clone(),
+                    partial: false,
+                },
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            coordinator.clone(),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        submit_correction(&commands, &ready).await;
+        closure_gate.wait_until_started().await;
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .expect("repeat Escape cancels background work");
+        operation_gate.wait_until_terminal_settled().await;
+        operation_gate.allow_operation_drop();
+        operation_gate.wait_until_operation_dropped().await;
+        assert_eq!(coordinator.operation_count(), 0);
+        closure_gate.release();
+        let foreground = events_until_settled(&mut events).await;
+        assert!(foreground.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::Replaced { .. },
+            }
+        )));
+        assert!(!foreground.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CorrectionCompleted {
+                outcome: CorrectionOutcome::SkippedBackground,
+                ..
+            }
+        )));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn correction_hides_cancelled_run_tasks_until_manual_return() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let operation_gate = TerminalSettlementTestGate::new();
+        let child_attempt = known_usage(DEFAULT_MODEL, 7, 3, 0);
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: vec![child_attempt.clone()],
+        };
+        let coordinator = complete_child_coordinator(factory.clone())
+            .with_terminal_settlement_test_gate(operation_gate.clone());
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let ready = Arc::new(Notify::new());
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                CorrectionChildModel {
+                    ready: ready.clone(),
+                    step: 0,
+                },
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            coordinator.clone(),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel with a child".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        timeout(TEST_TIMEOUT, factory.started.notified())
+            .await
+            .expect("child should start");
+        factory.release.notify_one();
+        timeout(TEST_TIMEOUT, operation_gate.wait_until_terminal_settled())
+            .await
+            .expect("child terminal should settle");
+        operation_gate.allow_operation_drop();
+        timeout(TEST_TIMEOUT, operation_gate.wait_until_operation_dropped())
+            .await
+            .expect("child operation should drop");
+        timeout(TEST_TIMEOUT, ready.notified())
+            .await
+            .expect("foreground should wait for correction");
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("request correction");
+        let correction_events = events_until_settled(&mut events).await;
+        let restored = correction_events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::CorrectionCompleted {
+                    outcome: CorrectionOutcome::Replaced { state, .. },
+                    ..
+                } => Some(state),
+                _ => None,
+            })
+            .expect("restore cancelled request parent");
+        assert!(restored.footer_adjustment.contains(&child_attempt));
+        let task_id = coordinator
+            .records()
+            .await
+            .into_iter()
+            .next()
+            .expect("retain cancelled child")
+            .id()
+            .clone();
+        let hidden_caller = coordinator.root_caller().await;
+        assert!(matches!(
+            coordinator.get(&hidden_caller, &task_id).await,
+            Err(crate::subagents::AccessError::Denied(id)) if id == task_id
+        ));
+        let cancelled_leaf = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT terminal_entry_id FROM runs WHERE id = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read cancelled terminal"),
+            )
+            .expect("terminal entry fits u64"),
+        );
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: cancelled_leaf,
+            })
+            .await
+            .expect("return to cancelled leaf");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced { .. }
+        ));
+        let returned_caller = coordinator.root_caller().await;
+        assert_eq!(
+            coordinator
+                .get(&returned_caller, &task_id)
+                .await
+                .expect("cancelled child is visible again")
+                .state(),
+            TaskState::Completed
+        );
+        assert_eq!(coordinator.records().await.len(), 1);
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn terminal_cancellation_before_provider_output_has_no_generation_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         let ready = Arc::new(Notify::new());
@@ -8082,7 +9673,10 @@ mod tests {
             .await
             .unwrap();
         ready.notified().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let events = events_until_settled(&mut events).await;
         let records = shutdown_controller(commands, task).await;
 
@@ -8122,7 +9716,10 @@ mod tests {
             .await
             .unwrap();
         ready.notified().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let _events = events_until_settled(&mut events).await;
         let records = shutdown_controller(commands, task).await;
 
@@ -8170,7 +9767,10 @@ mod tests {
             .await
             .unwrap();
         gate.wait_until_read_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let _events = events_until_settled(&mut events).await;
         let records = shutdown_controller(commands, task).await;
 
@@ -8419,7 +10019,10 @@ mod tests {
             .await
             .unwrap();
         let events = events_until_settled(&mut events).await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let records = shutdown_controller(commands, task).await;
 
         assert_eq!(
@@ -8501,7 +10104,10 @@ mod tests {
                 break;
             }
         }
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         first_events.extend(events_until_settled(&mut events).await);
 
         commands
@@ -8601,7 +10207,10 @@ mod tests {
             .await
             .unwrap();
         gate.wait_until_read_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let first_events = events_until_settled(&mut events).await;
         assert!(matches!(
             first_events.as_slice(),
@@ -8855,7 +10464,10 @@ mod tests {
             .await
             .unwrap();
         read_gate.wait_until_read_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         closure_gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         commands
@@ -9021,9 +10633,15 @@ mod tests {
             .await
             .unwrap();
         read_gate.wait_until_read_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         recovery_gate.wait_until_recovery_started().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
         recovery_gate.resume_recovery();
 
@@ -9145,7 +10763,10 @@ mod tests {
             .await
             .unwrap();
         ready.notified().await;
-        commands.send(RuntimeCommand::Cancel).await.unwrap();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .unwrap();
         let cancelled_events = events_until_settled(&mut events).await;
         assert!(matches!(
             cancelled_events.as_slice(),
@@ -9671,6 +11292,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_child_changes_emit_no_record_or_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let terminal = TaskRecord::for_test("c1", 2, selection, None, 1, Vec::new());
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        coordinator
+            .restore_terminal_tasks([terminal.clone()], Some(1), std::iter::empty())
+            .await;
+        let mut controller =
+            controller_with_subagents(&workspace, ScriptedModel::default(), coordinator).await;
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut statuses) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+
+        controller
+            .handle_coordinator_event(
+                CoordinatorEvent::Changed {
+                    id: terminal.id().clone(),
+                    revision: terminal.revision(),
+                },
+                &event_sender,
+                &mut progress,
+            )
+            .await;
+
+        assert!(events.try_recv().is_err());
+        assert!(statuses.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn finished_children_emit_one_new_authoritative_record_before_each_snapshot() {
         let workspace = tempfile::tempdir().unwrap();
         let mut controller = controller(&workspace, Vec::new()).await;
@@ -10110,6 +11764,9 @@ mod tests {
             Vec::new(),
         );
         let initial = restored_initial_state(&SessionRestore {
+            effective_entry: SessionEntryId(1),
+            observed_active_entry: SessionEntryId(1),
+            request_prefill: None,
             metadata: None,
             records: vec![
                 RestoredRecord {
@@ -10135,6 +11792,13 @@ mod tests {
                 },
             ],
             tasks: vec![RestoredTask {
+                record: task.clone(),
+                admission_anchor_revision: 5,
+                terminal_anchor_revision: 5,
+                admitted_revision: 3,
+                terminal_revision: 4,
+            }],
+            all_tasks: vec![RestoredTask {
                 record: task,
                 admission_anchor_revision: 5,
                 terminal_anchor_revision: 5,
@@ -10175,6 +11839,9 @@ mod tests {
             Vec::new(),
         );
         let initial = restored_initial_state(&SessionRestore {
+            effective_entry: SessionEntryId(1),
+            observed_active_entry: SessionEntryId(1),
+            request_prefill: None,
             metadata: None,
             records: vec![
                 RestoredRecord {
@@ -10213,6 +11880,7 @@ mod tests {
                 admitted_revision: 3,
                 terminal_revision: 7,
             }],
+            all_tasks: Vec::new(),
             reserved_task_ids: Vec::new(),
             footer_adjustment: Vec::new(),
             next_task: Some(1),
@@ -10261,6 +11929,9 @@ mod tests {
             },
         };
         let initial = restored_initial_state(&SessionRestore {
+            effective_entry: SessionEntryId(1),
+            observed_active_entry: SessionEntryId(1),
+            request_prefill: None,
             metadata: None,
             records: vec![
                 RestoredRecord {
@@ -10295,6 +11966,7 @@ mod tests {
                 admitted_revision: 3,
                 terminal_revision: 7,
             }],
+            all_tasks: Vec::new(),
             reserved_task_ids: Vec::new(),
             footer_adjustment: Vec::new(),
             next_task: Some(1),
@@ -10353,7 +12025,8 @@ mod tests {
         let run_id = writer
             .commit_request("readable saved request".to_owned())
             .await
-            .expect("commit readable request");
+            .expect("commit readable request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -10587,10 +12260,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct BranchedResumeFixture {
+        footer_adjustment: Vec<AttemptAccounting>,
+        selected_leaf: SessionEntryId,
+        sibling_leaf: SessionEntryId,
+    }
+
+    #[cfg(unix)]
     async fn append_branched_resume_fixture(
         session: &Session,
         workspace: &Path,
-    ) -> Vec<AttemptAccounting> {
+    ) -> BranchedResumeFixture {
         let writer = session.writer();
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let selected_origin_step = u64::try_from(
@@ -10653,7 +12333,8 @@ mod tests {
         let sibling_run = writer
             .commit_request("sibling request".to_owned())
             .await
-            .expect("commit sibling request");
+            .expect("commit sibling request")
+            .run_id;
         let sibling_step = writer
             .start_model_step(sibling_run)
             .await
@@ -10732,6 +12413,9 @@ mod tests {
             )
             .await
             .expect("close sibling run");
+        let sibling_leaf = SessionEntryId(
+            u64::try_from(active_entry_id(session)).expect("sibling entry ID fits u64"),
+        );
 
         let hidden_attempt = known_usage(DEFAULT_MODEL, 55, 5, 50);
         let mut hidden = completed_fixture_task(
@@ -10780,12 +12464,18 @@ mod tests {
         assert!(hidden_task_revision > origin_revision);
         set_active_entry_for_fixture(session, selected_leaf);
 
-        vec![
-            sibling_execution_attempt,
-            sibling_terminal_attempt,
-            hidden_attempt.clone(),
-            hidden_attempt,
-        ]
+        BranchedResumeFixture {
+            footer_adjustment: vec![
+                sibling_execution_attempt,
+                sibling_terminal_attempt,
+                hidden_attempt.clone(),
+                hidden_attempt,
+            ],
+            selected_leaf: SessionEntryId(
+                u64::try_from(selected_leaf).expect("selected entry ID fits u64"),
+            ),
+            sibling_leaf,
+        }
     }
 
     #[cfg(unix)]
@@ -10893,7 +12583,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn resume_in_fresh_process_child() {
+    async fn resume_restores_hierarchical_task_ids_in_fresh_process() {
         let home = PathBuf::from(env::var("KIKI_RESUME_HOME").expect("resume home"));
         let workspace = PathBuf::from(env::var("KIKI_RESUME_WORKSPACE").expect("resume workspace"));
         let session_id = env::var("KIKI_RESUME_SESSION").expect("resume session ID");
@@ -10901,6 +12591,18 @@ mod tests {
         let mut socket = UnixStream::connect(socket_path).expect("connect to parent");
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session = Session::open(&home, &session_id).expect("open session through normal path");
+        let resumed_run_id = RunId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("read resumed run ID"),
+            )
+            .expect("resumed run ID fits u64"),
+        );
         let mut expected_history = session
             .restore()
             .expect("restore session")
@@ -10930,7 +12632,7 @@ mod tests {
                 calls: calls.clone(),
                 actions: vec![
                     RestoredModelAction::Code {
-                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'unknown subagent `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\nvisible = await get_subagent('0.0')\nvisible_result = await visible.wait()\nassert visible_result['message'] == 'late selected result'\nassert visible_result['values']['visible'] == 62\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
                             .to_owned(),
                         commentary: None,
                         attempts: Vec::new(),
@@ -10958,13 +12660,27 @@ mod tests {
         .await
         .expect("restore runtime");
         assert!(initial.disabled_reason.is_none());
+        assert!(initial.timeline.iter().all(|item| match item {
+            RestoredTimelineItem::Record(_) => true,
+            RestoredTimelineItem::SubagentSpawned(record)
+            | RestoredTimelineItem::SubagentFinished(record) => record.id().as_str() != "63",
+        }));
         let restored_tasks = controller.subagents.records().await;
         assert_eq!(
             restored_tasks
                 .iter()
                 .map(|task| task.id().as_str())
                 .collect::<Vec<_>>(),
-            ["0", "0.0"]
+            ["0", "0.0", "63"]
+        );
+        assert_eq!(restored_tasks[0].parent(), None);
+        assert_eq!(
+            restored_tasks[1].parent().map(|parent| parent.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            restored_tasks[1].parent_storage_id(),
+            Some(restored_tasks[0].storage_id())
         );
         assert!(matches!(
             restored_tasks[0].outcome(),
@@ -10975,6 +12691,12 @@ mod tests {
             Some(TaskOutcome::Completed(result))
                 if result.message() == "late selected result"
                     && result.values().get("visible") == Some(&ToolValue::Integer(62))
+        ));
+        assert!(matches!(
+            restored_tasks[2].outcome(),
+            Some(TaskOutcome::Completed(result))
+                if result.message() == "hidden high result"
+                    && result.values().get("hidden") == Some(&ToolValue::Integer(63))
         ));
         let (commands, mut events, mut progress, controller) = start_controller(controller);
         assert!(matches!(
@@ -11011,13 +12733,13 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(resumed_events.iter().all(|event| match event {
             RuntimeEvent::RunStarted { run_id } | RuntimeEvent::RunSettled { run_id } => {
-                *run_id == RunId(3)
+                *run_id == resumed_run_id
             }
             RuntimeEvent::ModelStepStarted { run_id, .. }
             | RuntimeEvent::RecordAppended {
                 record: StoredRecord { run_id, .. },
                 ..
-            } => *run_id == RunId(3),
+            } => *run_id == resumed_run_id,
             RuntimeEvent::SubagentSpawned { record }
             | RuntimeEvent::SubagentRecord { record }
             | RuntimeEvent::SubagentFinished { record } => record.id().as_str() == "1",
@@ -11042,9 +12764,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resume_restores_context_arena_and_task_handles() {
+    async fn resume_restores_hierarchical_task_ids_and_handles() {
         if env::var_os("KIKI_RESUME_CHILD").is_some() {
-            resume_in_fresh_process_child().await;
+            resume_restores_hierarchical_task_ids_in_fresh_process().await;
             return;
         }
 
@@ -11111,8 +12833,8 @@ mod tests {
         shutdown_controller(commands, controller).await;
         assert_eq!(starts.load(Ordering::SeqCst), 1, "{saved_events:?}");
 
-        let expected_footer_adjustment =
-            append_branched_resume_fixture(&session, workspace.path()).await;
+        let fixture = append_branched_resume_fixture(&session, workspace.path()).await;
+        let expected_footer_adjustment = fixture.footer_adjustment.clone();
         let (sibling_payload, sibling_replay): (String, Vec<u8>) = session
             .connection_for_test()
             .expect("lock session connection")
@@ -11190,14 +12912,217 @@ mod tests {
         assert!(footer.contains("CH0.0%"), "{footer}");
         assert!(footer.contains("0.0%/272k"), "{footer}");
 
+        let mut sibling_context = session
+            .writer()
+            .restore_at(fixture.sibling_leaf)
+            .await
+            .expect("restore sibling branch")
+            .executable
+            .expect("sibling branch is executable")
+            .history;
+        sibling_context.append_user_request("continue sibling");
+        let mut original_context = session
+            .writer()
+            .restore_at(fixture.selected_leaf)
+            .await
+            .expect("restore original branch")
+            .executable
+            .expect("original branch is executable")
+            .history;
+        original_context.append_user_request("probe original");
+        let root = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT id FROM entries WHERE kind = 'session_start'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read root entry"),
+            )
+            .expect("root entry ID fits u64"),
+        );
+        let navigation_contexts = Arc::new(Mutex::new(Vec::new()));
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create navigation tool host"),
+        )
+        .await
+        .expect("create navigation arena");
+        let (settings, _) = watch::channel(selection);
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            NavigationBranchesModel {
+                contexts: navigation_contexts.clone(),
+                step: 0,
+            },
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(Arc::new(AtomicUsize::new(0)))),
+            ),
+            None,
+        )
+        .await
+        .expect("restore navigation runtime");
+        assert_eq!(
+            initial,
+            restored_initial_state(&session.restore().expect("restore original"))
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("rewind to root");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: fixture.sibling_leaf,
+            })
+            .await
+            .expect("select sibling branch");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                request_prefill: None,
+                ..
+            }
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue sibling".to_owned(),
+            })
+            .await
+            .expect("continue sibling");
+        events_until_settled(&mut events).await;
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: fixture.selected_leaf,
+            })
+            .await
+            .expect("return original branch");
+        let returned_state = match next_navigation_outcome(&mut events).await {
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } => state,
+            outcome => panic!("unexpected original-branch outcome: {outcome:?}"),
+        };
+        let expected_returned_state =
+            restored_initial_state(&session.restore().expect("restore returned original branch"));
+        assert_eq!(returned_state, expected_returned_state);
+        assert_eq!(active_entry_id(&session), fixture.selected_leaf.0 as i64);
+        let visible_task_ids = returned_state
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::SubagentSpawned(record)
+                | RestoredTimelineItem::SubagentFinished(record) => {
+                    Some(record.id().as_str().to_owned())
+                }
+                RestoredTimelineItem::Record(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            visible_task_ids,
+            BTreeSet::from(["0".to_owned(), "0.0".to_owned()])
+        );
+        let returned_footer =
+            Transcript::restored(crate::config::ready_snapshot_for_test(), &returned_state)
+                .layout(160)
+                .footer_rule(160)
+                .to_string();
+        assert!(returned_footer.contains("↑220 ↓20"), "{returned_footer}");
+        assert!(returned_footer.contains("CH0.0%"), "{returned_footer}");
+        assert!(returned_footer.contains("0.0%/272k"), "{returned_footer}");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("authorised"))
+                .expect("read retained external effect"),
+            "original"
+        );
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "probe original".to_owned(),
+            })
+            .await
+            .expect("probe original branch");
+        let probe_events = events_until_settled(&mut events).await;
+        assert!(probe_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if result_head(execution) == "41"
+        )));
+        assert_eq!(
+            navigation_contexts
+                .lock()
+                .expect("navigation model contexts lock")[0],
+            sibling_context.entries()
+        );
+        assert_eq!(
+            navigation_contexts
+                .lock()
+                .expect("navigation model contexts lock")[2],
+            original_context.entries()
+        );
+        shutdown_controller(commands, controller).await;
+        let final_restore = session.restore().expect("restore final selected branch");
+        let final_checkpoint = final_restore
+            .executable
+            .as_ref()
+            .expect("final selected branch is executable")
+            .checkpoint
+            .clone();
+        let final_history = final_restore
+            .executable
+            .as_ref()
+            .expect("final selected branch is executable")
+            .history
+            .clone();
+        let final_leaf = final_restore.effective_entry;
+
         let session_id = session.id().to_owned();
         let id_bounds = stored_id_bounds(home.path(), &session_id);
         session.close().expect("close original session");
+        let reopened =
+            Session::open(home.path(), &session_id).expect("reopen final selected session");
+        let reopened_restore = reopened
+            .restore()
+            .expect("restore reopened selected branch");
+        assert_eq!(reopened_restore.effective_entry, final_leaf);
+        let reopened_executable = reopened_restore
+            .executable
+            .expect("reopened selected branch is executable");
+        assert_eq!(reopened_executable.checkpoint, final_checkpoint);
+        assert_eq!(reopened_executable.history, final_history);
+        assert_eq!(
+            reopened_restore.footer_adjustment,
+            final_restore.footer_adjustment
+        );
+        assert_eq!(reopened_restore.records, final_restore.records);
+        assert_eq!(reopened_restore.tasks, final_restore.tasks);
+        reopened.close().expect("close reopened selected session");
         let socket_path = home.path().join("resume.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind resume socket");
         let mut child = Command::new(env::current_exe().expect("test executable"))
             .arg("--exact")
-            .arg("runtime::tests::resume_restores_context_arena_and_task_handles")
+            .arg("runtime::tests::resume_restores_hierarchical_task_ids_and_handles")
             .arg("--nocapture")
             .env("KIKI_RESUME_CHILD", "1")
             .env("KIKI_RESUME_HOME", home.path())
@@ -11235,6 +13160,1977 @@ mod tests {
             fs::read_to_string(workspace.path().join("authorised")).expect("read restored write"),
             "changed without reread"
         );
+    }
+
+    async fn persist_navigation_branch(
+        session: &Session,
+        arena: &mut Arena,
+        request: &str,
+        source: &str,
+        final_text: &str,
+    ) -> (SessionEntryId, ModelHistory, Checkpoint) {
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let writer = session.writer();
+        let run_id = writer
+            .commit_request(request.to_owned())
+            .await
+            .expect("commit branch request")
+            .run_id;
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start branch execution");
+        let execution = arena
+            .execute(source, &CancellationToken::new())
+            .await
+            .expect("execute branch state");
+        let checkpoint = arena.checkpoint();
+        writer
+            .settle_execution(
+                run_id,
+                step_id,
+                PersistedCode {
+                    source: source.to_owned(),
+                    call_id: ModelCallId::new(format!("{request}-code")),
+                    commentary: None,
+                    reasoning_summary: String::new(),
+                    selection: Some(selection),
+                    replay: fixture_replay(&format!("{request} execution")),
+                    result: CodeResult::execution(String::new()),
+                    execution: Some(execution),
+                    attempts: Vec::new(),
+                },
+                checkpoint.clone(),
+            )
+            .await
+            .expect("settle branch execution");
+        let terminal_step = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start branch terminal");
+        let terminal_text = final_text.to_owned();
+        let terminal_replay = fixture_replay(&format!("{request} final"));
+        writer
+            .close_run(
+                run_id,
+                Some(terminal_step),
+                move || PersistedTerminal::Final {
+                    step_id: terminal_step,
+                    text: terminal_text,
+                    reasoning_summary: String::new(),
+                    replay: terminal_replay,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close branch run");
+        let terminal_entry = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT terminal_entry_id FROM runs WHERE id = ?1",
+                params![i64::try_from(run_id).expect("run ID fits SQLite")],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read branch terminal");
+        let mut history = ModelHistory::new();
+        history.append_user_request(request);
+        history
+            .append_completed_code(
+                source.to_owned(),
+                ModelCallId::new(format!("{request}-code")),
+                None,
+                String::new(),
+                fixture_replay(&format!("{request} execution")),
+                CodeResult::execution(String::new()),
+            )
+            .expect("append branch code");
+        history.append_final_message(
+            final_text.to_owned(),
+            String::new(),
+            fixture_replay(&format!("{request} final")),
+        );
+        (
+            SessionEntryId(u64::try_from(terminal_entry).expect("entry ID fits u64")),
+            history,
+            checkpoint,
+        )
+    }
+
+    struct NavigationStateModel {
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        step: usize,
+    }
+
+    struct RejectTargetHistoryModel;
+
+    impl Model for RejectTargetHistoryModel {
+        fn validate_history(&self, history: &ModelHistory) -> Result<(), ModelError> {
+            if history.entries().iter().any(|entry| {
+                matches!(entry, ModelContextEntry::UserRequest { text } if text == "target branch")
+            }) {
+                return Err(ModelError::InvalidResponse("rejected target history"));
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    struct NavigationBranchesModel {
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+        step: usize,
+    }
+
+    impl Model for NavigationBranchesModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .expect("navigation model contexts lock")
+                    .push(history.entries().to_vec());
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "assert sibling_value == 99\nsibling_value".to_owned(),
+                        call_id: ModelCallId::new("continue-sibling"),
+                        commentary: None,
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "sibling continuation".to_owned(),
+                    },
+                    2 => CompletedModelAction::Code {
+                        source: "assert saved_value == 41\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('0.0')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
+                        call_id: ModelCallId::new("probe-original"),
+                        commentary: None,
+                    },
+                    3 => CompletedModelAction::Message {
+                        text: "original branch verified".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    impl Model for NavigationStateModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .push(history.entries().to_vec());
+                let action = match self.step {
+                    0 => CompletedModelAction::Code {
+                        source: "assert branch_value == 'target'\nbranch_value".to_owned(),
+                        call_id: ModelCallId::new("navigation-continuation"),
+                        commentary: None,
+                    },
+                    1 => CompletedModelAction::Message {
+                        text: "continued target branch".to_owned(),
+                    },
+                    _ => return Err(ModelError::Exhausted.into()),
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_arena_and_context_before_publishing_history() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let initial_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create initial arena");
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            selection,
+            initial_arena.checkpoint(),
+        )
+        .expect("create session");
+        let root = session.restore().expect("restore root").effective_entry;
+        let mut fixture_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create fixture tool host"),
+        )
+        .await
+        .expect("create fixture arena");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore root checkpoint");
+        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "old branch",
+            "branch_value = 'old'",
+            "old branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(root, old_entry)
+            .await
+            .expect("return fixture to root");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (target_entry, target_history, _) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "target branch",
+            "branch_value = 'target'",
+            "target branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(old_entry, target_entry)
+            .await
+            .expect("select old branch for navigation");
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create live tool host"),
+        )
+        .await
+        .expect("create live arena");
+        live_arena
+            .restore(old_checkpoint)
+            .await
+            .expect("restore old branch live state");
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(
+                live_arena,
+                NavigationStateModel {
+                    contexts: contexts.clone(),
+                    step: 0,
+                },
+                old_history,
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("navigate to target branch");
+        let navigation = next_event(&mut events).await;
+        assert!(matches!(
+            navigation,
+            RuntimeEvent::NavigationCompleted {
+                outcome: super::NavigationOutcome::Replaced {
+                    ref state,
+                    request_prefill: None,
+                },
+            } if state.timeline.len() == 3
+        ));
+        assert_eq!(
+            session
+                .restore()
+                .expect("persist selected target")
+                .effective_entry,
+            target_entry
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue".to_owned(),
+            })
+            .await
+            .expect("submit after navigation");
+        let continued = events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let mut expected_context = target_history;
+        expected_context.append_user_request("continue");
+        assert_eq!(contexts.lock().unwrap()[0], expected_context.entries());
+        assert!(continued.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if matches!(execution.outcome, ExecutionOutcome::Complete { .. })
+        )));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        session.close().expect("close session");
+    }
+
+    async fn next_navigation_outcome(
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> super::NavigationOutcome {
+        loop {
+            if let RuntimeEvent::NavigationCompleted { outcome } = next_event(events).await {
+                return outcome;
+            }
+        }
+    }
+
+    async fn next_tree_outcome(
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> (u64, super::TreeRequestOutcome) {
+        loop {
+            if let RuntimeEvent::TreeCatalogue { revision, outcome } = next_event(events).await {
+                return (revision, outcome);
+            }
+        }
+    }
+
+    async fn navigation_fixture(
+        workspace: &tempfile::TempDir,
+    ) -> (
+        tempfile::TempDir,
+        Session,
+        Arena,
+        ModelHistory,
+        SessionEntryId,
+        SessionEntryId,
+        SessionEntryId,
+    ) {
+        let home = tempfile::tempdir().expect("create home");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let initial_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create initial tool host"),
+        )
+        .await
+        .expect("create initial arena");
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            selection,
+            initial_arena.checkpoint(),
+        )
+        .expect("create session");
+        let root = session.restore().expect("restore root").effective_entry;
+        let mut fixture_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create fixture tool host"),
+        )
+        .await
+        .expect("create fixture arena");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "old branch",
+            "branch_value = 'old'",
+            "old branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(root, old_entry)
+            .await
+            .expect("return fixture to root");
+        fixture_arena
+            .restore(session.initial_checkpoint().expect("load root checkpoint"))
+            .await
+            .expect("restore fixture root checkpoint");
+        let (target_entry, _, _) = persist_navigation_branch(
+            &session,
+            &mut fixture_arena,
+            "target branch",
+            "branch_value = 'target'",
+            "target branch final",
+        )
+        .await;
+        session
+            .writer()
+            .select_active_entry(old_entry, target_entry)
+            .await
+            .expect("select old fixture branch");
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create live tool host"),
+        )
+        .await
+        .expect("create live arena");
+        live_arena
+            .restore(old_checkpoint)
+            .await
+            .expect("restore old live state");
+        (
+            home,
+            session,
+            live_arena,
+            old_history,
+            root,
+            old_entry,
+            target_entry,
+        )
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_root_request_execution_and_terminal_points() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        fs::write(workspace.path().join("effect"), "retained").expect("write external effect");
+        let (_home, session, live_arena, old_history, root, _old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_execution = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE id = ?1",
+                        [i64::try_from(target_entry.0).expect("target entry fits SQLite")],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read target execution"),
+            )
+            .expect("execution entry fits u64"),
+        );
+        let target_request = SessionEntryId(
+            u64::try_from(
+                session
+                    .connection_for_test()
+                    .expect("lock session")
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE id = ?1",
+                        [i64::try_from(target_execution.0).expect("execution entry fits SQLite")],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("read target request"),
+            )
+            .expect("request entry fits u64"),
+        );
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let controller = RuntimeController::with_session(
+            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CountingChildRunner(starts.clone())),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("navigate to root");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_execution,
+            })
+            .await
+            .expect("navigate to execution");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.len() == 2
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_request,
+            })
+            .await
+            .expect("navigate to request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: Some(request),
+            } if state.timeline.is_empty() && request == "target branch"
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_request,
+            })
+            .await
+            .expect("navigate to current request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: Some(request),
+            } if request == "target branch"
+        ));
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("navigate to terminal");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.len() == 3
+        ));
+        shutdown_controller(commands, controller).await;
+
+        assert_eq!(active_entry_id(&session), target_entry.0 as i64);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("effect")).expect("read external effect"),
+            "retained"
+        );
+        session.close().expect("close session");
+    }
+
+    fn replace_entry_checkpoint_state(session: &Session, entry: SessionEntryId, state: Vec<u8>) {
+        let connection = session.connection_for_test().expect("lock session");
+        connection
+            .execute_batch("DROP TRIGGER checkpoints_are_immutable_before_update")
+            .expect("allow corrupt checkpoint fixture");
+        connection
+            .execute(
+                "UPDATE checkpoints SET arena_state = ?1 WHERE id = (SELECT checkpoint_id FROM entries WHERE id = ?2)",
+                params![state, i64::try_from(entry.0).expect("entry ID fits SQLite")],
+            )
+            .expect("replace target checkpoint state");
+    }
+
+    fn replace_entry_checkpoint_identity(session: &Session, entry: SessionEntryId, identity: &str) {
+        let connection = session.connection_for_test().expect("lock session");
+        connection
+            .execute_batch("DROP TRIGGER checkpoints_are_immutable_before_update")
+            .expect("allow incompatible checkpoint fixture");
+        connection
+            .execute(
+                "UPDATE checkpoints SET runtime_identity = ?1 WHERE id = (SELECT checkpoint_id FROM entries WHERE id = ?2)",
+                params![identity, i64::try_from(entry.0).expect("entry ID fits SQLite")],
+            )
+            .expect("replace target checkpoint identity");
+    }
+
+    async fn navigation_checkpoint(session: &Session, entry: SessionEntryId) -> Checkpoint {
+        session
+            .writer()
+            .restore_at(entry)
+            .await
+            .expect("restore navigation entry")
+            .executable
+            .expect("navigation entry is executable")
+            .checkpoint
+    }
+
+    fn navigation_controller<M: Model>(
+        session: &Session,
+        arena: Arena,
+        history: ModelHistory,
+        model: M,
+        gate: ArenaRestoreTestGate,
+    ) -> RuntimeController<M> {
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        RuntimeController::with_session(
+            Agent::restored(arena, model, history).with_restore_test_gate(gate),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        )
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_invalid_history_without_restoring_arena() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            RejectTargetHistoryModel,
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert!(gate.attempts().is_empty());
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Navigate { entry: old_entry })
+            .await
+            .expect("navigate at unchanged entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_does_not_compensate_an_incompatible_checkpoint() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_identity(
+            &session,
+            target_entry,
+            "incompatible navigation runtime",
+        );
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(gate.attempts(), vec![target_checkpoint]);
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Navigate { entry: old_entry })
+            .await
+            .expect("navigate at unchanged entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_recovers_after_a_compatible_checkpoint_load_failure() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_state(&session, target_entry, vec![0]);
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "assert branch_value == 'old'\nbranch_value".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "old branch remains active".to_owned(),
+                },
+            ]),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "continue old branch".to_owned(),
+            })
+            .await
+            .expect("submit after recovered navigation");
+        let events_after_recovery = events_until_settled(&mut events).await;
+        assert!(events_after_recovery.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::CompletedExecution { execution, .. },
+                    ..
+                },
+                ..
+            } if result_head(execution) == "'old'"
+        )));
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_disables_when_checkpoint_compensation_fails() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        replace_entry_checkpoint_state(&session, target_entry, vec![0]);
+        let gate = ArenaRestoreTestGate::new();
+        gate.fail_attempt(2);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        assert_eq!(
+            gate.attempts(),
+            vec![
+                session
+                    .writer()
+                    .restore_at(target_entry)
+                    .await
+                    .expect("restore target")
+                    .executable
+                    .expect("target history is executable")
+                    .checkpoint,
+                session
+                    .writer()
+                    .restore_at(old_entry)
+                    .await
+                    .expect("restore old")
+                    .executable
+                    .expect("old history is executable")
+                    .checkpoint,
+            ]
+        );
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must remain disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::ArenaCheckpointRecoveryFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_compensates_after_an_active_leaf_conflict() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        gate.pause_attempt(1);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            old_history,
+            ScriptedModel::new(Vec::new()),
+            gate.clone(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        gate.wait_until_paused().await;
+        set_active_entry_for_fixture(&session, target_entry.0 as i64);
+        gate.resume();
+
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        assert_eq!(active_entry_id(&session), target_entry.0 as i64);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must remain disabled".to_owned(),
+            })
+            .await
+            .expect("submit disabled request");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_foreground_and_background_work() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "active request".to_owned(),
+            })
+            .await
+            .expect("submit active request");
+        provider_called.notified().await;
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            })
+            .await
+            .expect("request navigation during foreground work");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::RejectedBusy
+        ));
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel foreground work");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let subagents = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CancellationOnlyChildRunner),
+        );
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let controller = controller_with_subagents(
+            &workspace,
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('background')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection,
+                message_waiting: None,
+            },
+            subagents,
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start background work".to_owned(),
+            })
+            .await
+            .expect("submit child request");
+        let settled = events_until_settled(&mut events).await;
+        assert!(
+            settled
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SubagentSpawned { .. })),
+            "child was not admitted: {settled:?}"
+        );
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            })
+            .await
+            .expect("request navigation during child work");
+        let outcome = next_navigation_outcome(&mut events).await;
+        assert!(
+            matches!(outcome, super::NavigationOutcome::RejectedBusy),
+            "unexpected navigation outcome: {outcome:?}"
+        );
+        commands
+            .send(RuntimeCommand::CancelBackground)
+            .await
+            .expect("cancel background work");
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum BusyCommand {
+        Navigation,
+        TreeRequest,
+    }
+
+    async fn assert_command_is_rejected_busy(
+        command: BusyCommand,
+        commands: &mpsc::Sender<RuntimeCommand>,
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) {
+        match command {
+            BusyCommand::Navigation => {
+                commands
+                    .send(RuntimeCommand::Navigate {
+                        entry: SessionEntryId(1),
+                    })
+                    .await
+                    .expect("request navigation while work is active");
+                assert!(matches!(
+                    next_navigation_outcome(events).await,
+                    super::NavigationOutcome::RejectedBusy
+                ));
+            }
+            BusyCommand::TreeRequest => {
+                commands
+                    .send(RuntimeCommand::RequestTree { revision: 1 })
+                    .await
+                    .expect("request session tree while work is active");
+                assert!(matches!(
+                    next_tree_outcome(events).await,
+                    (1, super::TreeRequestOutcome::RejectedBusy)
+                ));
+            }
+        }
+    }
+
+    async fn controller_with_write_gate<M: Model>(
+        workspace: &tempfile::TempDir,
+        gate: SessionWriteGate,
+        model: M,
+        subagents: SessionSubagents,
+    ) -> (tempfile::TempDir, Session, RuntimeController<M>) {
+        let home = tempfile::tempdir().expect("create session home");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate,
+        )
+        .expect("create session");
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, model),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            subagents,
+            session.writer(),
+        );
+        (home, session, controller)
+    }
+
+    async fn assert_each_busy_phase_rejects(command: BusyCommand) {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let policy = SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents());
+
+        let request_gate = SessionWriteGate::new(SessionWriteKind::Request);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            request_gate.clone(),
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: Arc::new(Notify::new()),
+            },
+            SubagentCoordinator::new(policy, Arc::new(CancellationOnlyChildRunner)),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold request admission".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        request_gate.wait_until_started().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        request_gate.release();
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold generation".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        provider_called.notified().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let read_gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host")
+                .with_test_gate(read_gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let controller = RuntimeController::for_test(Agent::new(
+            arena,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await read('blocked')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "unreachable".to_owned(),
+                },
+            ]),
+        ));
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold execution".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        read_gate.wait_until_read_started().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel run");
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+
+        let closure_gate = SessionWriteGate::new(SessionWriteKind::Closure);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            closure_gate.clone(),
+            CountingMessageModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            SubagentCoordinator::new(policy, Arc::new(CancellationOnlyChildRunner)),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold closure".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        closure_gate.wait_until_started().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        closure_gate.release();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            admission_gate.clone(),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold admission')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child admission".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        admission_gate.wait_until_started().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        admission_gate.release();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let child_started = Arc::new(Notify::new());
+        let child_release = Arc::new(Notify::new());
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            SessionWriteGate::new(SessionWriteKind::Preferences),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold child execution')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: child_started.clone(),
+                release: child_release.clone(),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child execution".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        child_started.notified().await;
+        events_until_settled(&mut events).await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        child_release.notify_one();
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+
+        let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
+        let child_started = Arc::new(Notify::new());
+        let child_release = Arc::new(Notify::new());
+        let (_home, session, controller) = controller_with_write_gate(
+            &workspace,
+            terminal_gate.clone(),
+            SelectedScriptedModel {
+                model: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('hold child terminal')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground settled".to_owned(),
+                    },
+                ]),
+                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .unwrap(),
+                message_waiting: None,
+            },
+            complete_child_coordinator(GatedChildFactory {
+                started: child_started.clone(),
+                release: child_release.clone(),
+                attempts: Vec::new(),
+            }),
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold child terminal".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        child_started.notified().await;
+        events_until_settled(&mut events).await;
+        child_release.notify_one();
+        terminal_gate.wait_until_started().await;
+        assert_command_is_rejected_busy(command, &commands, &mut events).await;
+        terminal_gate.release();
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_rejects_each_busy_phase() {
+        assert_each_busy_phase_rejects(BusyCommand::Navigation).await;
+    }
+
+    #[tokio::test]
+    async fn tree_request_rejects_each_busy_phase() {
+        assert_each_busy_phase_rejects(BusyCommand::TreeRequest).await;
+    }
+
+    #[tokio::test]
+    async fn navigation_failure_preserves_selection_and_latches_storage() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
+        let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
+        let gate = ArenaRestoreTestGate::new();
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch(
+                "CREATE TRIGGER reject_navigation_selection BEFORE UPDATE OF active_entry_id ON session WHEN NEW.active_entry_id != OLD.active_entry_id BEGIN SELECT RAISE(ABORT, 'reject navigation selection'); END;",
+            )
+            .expect("reject navigation selection");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history)
+                .with_restore_test_gate(gate.clone()),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Failed
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation after storage failure");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::RejectedReadOnly
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "after storage failure".to_owned(),
+            })
+            .await
+            .expect("submit after storage failure");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            }
+        );
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn navigation_waits_for_selection_persistence_before_later_commands() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let mut live_arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            live_arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let (_, history, _) = persist_navigation_branch(
+            &session,
+            &mut live_arena,
+            "selected branch",
+            "branch_value = 'selected'",
+            "selected final",
+        )
+        .await;
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::restored(
+                live_arena,
+                CountingMessageModel {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+                history,
+            ),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: root })
+            .await
+            .expect("request navigation");
+        gate.wait_until_started().await;
+        assert!(events.try_recv().is_err());
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "queued after navigation".to_owned(),
+            })
+            .await
+            .expect("queue request after navigation");
+        assert!(events.try_recv().is_err());
+        gate.release();
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced {
+                state,
+                request_prefill: None,
+            } if state.timeline.is_empty()
+        ));
+        let submitted = events_until_settled(&mut events).await;
+        assert!(submitted.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { request },
+                    ..
+                },
+                ..
+            } if request == "queued after navigation"
+        )));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE kind = 'user_request' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read queued request parent"),
+            root.0 as i64
+        );
+        shutdown_controller(commands, controller).await;
+
+        let selected_after_submission = SessionEntryId(active_entry_id(&session) as u64);
+        let id = session.id().to_owned();
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        assert_eq!(
+            reopened
+                .restore()
+                .expect("restore persisted navigation")
+                .effective_entry,
+            selected_after_submission
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    async fn navigation_short_circuits_a_current_request_before_arena_restore() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("create tool host"),
+        )
+        .await
+        .expect("create arena");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let writer = session.writer();
+        let run = writer
+            .commit_request("prefilled request".to_owned())
+            .await
+            .expect("commit request")
+            .run_id;
+        let request = SessionEntryId(active_entry_id(&session) as u64);
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request");
+        set_active_entry_for_fixture(&session, root.0 as i64);
+        drop(writer);
+        let (settings, _) = watch::channel(selection);
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, ScriptedModel::new(Vec::new())),
+            settings,
+            crate::config::ready_snapshot_for_test().settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+                Arc::new(CancellationOnlyChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Navigate { entry: request })
+            .await
+            .expect("request current request");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: Some(request),
+            } if request == "prefilled request"
+        ));
+        assert!(!gate.has_started());
+        assert_eq!(active_entry_id(&session), root.0 as i64);
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn tree_request_returns_catalogue_only_when_fully_settled() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, history, root, active_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let before = session.restore().expect("snapshot selected session");
+        let database_before = session_database_snapshot(&session);
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            history,
+            ScriptedModel::new(Vec::new()),
+            ArenaRestoreTestGate::new(),
+        );
+        let records_before = controller.records.clone();
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 72 })
+            .await
+            .expect("request session tree");
+        let catalogue = match next_event(&mut events).await {
+            RuntimeEvent::TreeCatalogue {
+                revision: 72,
+                outcome: super::TreeRequestOutcome::Catalogue(catalogue),
+            } => catalogue,
+            event => panic!("unexpected tree response: {event:?}"),
+        };
+        assert_eq!(catalogue.active_entry, active_entry);
+        assert_eq!(catalogue.active_entry, before.effective_entry);
+        assert_eq!(catalogue.active_entry, before.observed_active_entry);
+        assert_eq!(catalogue.entries.len(), 7);
+        assert!(matches!(
+            catalogue.entries[0].kind,
+            crate::session::SessionCatalogueKind::Start
+        ));
+        assert!(matches!(
+            &catalogue.entries[1].kind,
+            crate::session::SessionCatalogueKind::Request { text } if text == "old branch"
+        ));
+        assert!(matches!(
+            catalogue.entries[2].kind,
+            crate::session::SessionCatalogueKind::Execution {
+                commentary: None,
+                ref execution,
+                ..
+            } if execution.tool_calls.is_empty()
+        ));
+        assert!(matches!(
+            &catalogue.entries[3].kind,
+            crate::session::SessionCatalogueKind::Final { text } if text == "old branch final"
+        ));
+        assert!(matches!(
+            &catalogue.entries[4].kind,
+            crate::session::SessionCatalogueKind::Request { text } if text == "target branch"
+        ));
+        assert!(matches!(
+            catalogue.entries[5].kind,
+            crate::session::SessionCatalogueKind::Execution {
+                commentary: None,
+                ref execution,
+                ..
+            } if execution.tool_calls.is_empty()
+        ));
+        assert!(matches!(
+            &catalogue.entries[6].kind,
+            crate::session::SessionCatalogueKind::Final { text } if text == "target branch final"
+        ));
+        assert_eq!(catalogue.entries[0].entry_id, root);
+        assert_eq!(catalogue.entries[3].entry_id, active_entry);
+        assert_eq!(catalogue.entries[6].entry_id, target_entry);
+        assert_eq!(catalogue.entries[1].parent_id, Some(root));
+        assert_eq!(catalogue.entries[4].parent_id, Some(root));
+
+        let after = session.restore().expect("snapshot selected session");
+        assert_restore_unchanged(&before, &after);
+        assert_eq!(session_database_snapshot(&session), database_before);
+        assert_eq!(
+            shutdown_controller(commands, controller).await,
+            records_before
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn idle_tree_and_navigation_commands_drain_finished_before_responding() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+
+        for command in [
+            RuntimeCommand::RequestTree { revision: 1 },
+            RuntimeCommand::Navigate {
+                entry: SessionEntryId(1),
+            },
+        ] {
+            let mut controller = controller(&workspace, Vec::new()).await;
+            let (coordinator_events, receiver) = mpsc::unbounded_channel();
+            controller.subagent_events = Some(receiver);
+            let record = TaskRecord::for_test("00", 2, selection, None, 1, Vec::new());
+            coordinator_events
+                .send(CoordinatorEvent::Finished {
+                    record: record.clone(),
+                })
+                .expect("queue finished child");
+            let (event_sender, mut events) = mpsc::unbounded_channel();
+            let (progress_sender, _) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+            let mut progress = ProgressPublisher::new(progress_sender);
+            let mut shutdown_requested = false;
+            let tree_request = matches!(command, RuntimeCommand::RequestTree { .. });
+
+            controller
+                .handle_command(
+                    command,
+                    &event_sender,
+                    &mut progress,
+                    &mut shutdown_requested,
+                )
+                .await;
+
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentRecord { record: emitted }) if emitted == record
+            ));
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentFinished { record: emitted }) if emitted == record
+            ));
+            if tree_request {
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(RuntimeEvent::TreeCatalogue { revision: 1, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(RuntimeEvent::NavigationCompleted {
+                        outcome: super::NavigationOutcome::Unchanged { .. }
+                    })
+                ));
+            }
+            assert!(events.try_recv().is_err());
+
+            coordinator_events
+                .send(CoordinatorEvent::OperationSettled {
+                    id: record.id().clone(),
+                })
+                .expect("queue operation settlement");
+            controller
+                .drain_coordinator_events(&event_sender, &mut progress)
+                .await;
+            assert!(matches!(
+                events.try_recv(),
+                Ok(RuntimeEvent::SubagentOperationSettled { ref id }) if id == record.id()
+            ));
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_request_busy_reply_is_not_deferred_until_settlement() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let provider_called = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            AdmissionGatedModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                provider_called: provider_called.clone(),
+            },
+        )
+        .await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "hold generation".to_owned(),
+            })
+            .await
+            .expect("submit request");
+        provider_called.notified().await;
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 73 })
+            .await
+            .expect("request session tree while busy");
+        assert!(matches!(
+            next_tree_outcome(&mut events).await,
+            (73, super::TreeRequestOutcome::RejectedBusy)
+        ));
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel request");
+        let settlement = events_until_settled(&mut events).await;
+        assert!(
+            !settlement
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TreeCatalogue { .. }))
+        );
+        assert!(events.try_recv().is_err());
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn tree_request_distinguishes_read_only_and_catalogue_failure() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut controller =
+            controller_with_model(&workspace, ScriptedModel::new(Vec::new())).await;
+        controller.disabled_reason = Some(RuntimeDisabledReason::SessionRestoreFailed);
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 74 })
+            .await
+            .expect("request session tree while read-only");
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 74,
+                outcome: super::TreeRequestOutcome::RejectedReadOnly,
+            }
+        ));
+        shutdown_controller(commands, controller).await;
+
+        let (_home, session, live_arena, history, _root, active_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let target_request: i64 = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = (SELECT parent_id FROM entries WHERE id = ?1)",
+                params![i64::try_from(target_entry.0).expect("target entry fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read target request");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE entries SET payload_json = '{}' WHERE id = ?1",
+                params![target_request],
+            )
+            .expect("corrupt non-selected request");
+        let before = session.restore().expect("restore selected branch");
+        assert!(before.executable.is_some());
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            history,
+            ScriptedModel::new(Vec::new()),
+            ArenaRestoreTestGate::new(),
+        );
+        let records_before = controller.records.clone();
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 75 })
+            .await
+            .expect("request corrupt session tree");
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 75,
+                outcome: super::TreeRequestOutcome::Failed,
+            }
+        ));
+        let after = session.restore().expect("restore selected branch");
+        assert_restore_unchanged(&before, &after);
+        assert!(after.executable.is_some());
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: active_entry,
+            })
+            .await
+            .expect("navigate to unchanged selected entry");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Unchanged {
+                request_prefill: None,
+            }
+        ));
+        assert_eq!(
+            shutdown_controller(commands, controller).await,
+            records_before
+        );
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn tree_request_observes_latched_storage_failure_before_loading() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(super::UnavailableChildRunner),
+        );
+        let mut controller = controller_with_subagents(
+            &workspace,
+            ScriptedModel::new(Vec::new()),
+            coordinator.clone(),
+        )
+        .await;
+        coordinator.latch_storage_failure().await;
+        let (events_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, _) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let mut progress = ProgressPublisher::new(progress_sender);
+        let mut shutdown_requested = false;
+
+        controller
+            .handle_command(
+                RuntimeCommand::RequestTree { revision: 76 },
+                &events_sender,
+                &mut progress,
+                &mut shutdown_requested,
+            )
+            .await;
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 76,
+                outcome: super::TreeRequestOutcome::RejectedReadOnly,
+            }
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(controller.disabled_reason, None);
+        assert!(controller.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn tree_request_preserves_correlation_and_command_ordering() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let controller = controller_with_model(&workspace, ScriptedModel::new(Vec::new())).await;
+        let selection = ModelSelection::new(&TERRA, TERRA.default_thinking).expect("select Terra");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        for revision in [76, 77] {
+            commands
+                .send(RuntimeCommand::RequestTree { revision })
+                .await
+                .expect("request session tree");
+        }
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection,
+                revision: 78,
+            })
+            .await
+            .expect("apply settings");
+        commands
+            .send(RuntimeCommand::Shutdown)
+            .await
+            .expect("request shutdown");
+
+        for revision in [76, 77] {
+            assert!(matches!(
+                next_event(&mut events).await,
+                RuntimeEvent::TreeCatalogue {
+                    revision: actual_revision,
+                    outcome: super::TreeRequestOutcome::Catalogue(_),
+                } if actual_revision == revision
+            ));
+        }
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 78 }
+        );
+        assert!(
+            timeout(TEST_TIMEOUT, controller)
+                .await
+                .expect("controller should stop")
+                .expect("controller task should not panic")
+                .is_empty()
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

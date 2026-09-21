@@ -154,7 +154,7 @@ pub(crate) enum PersistedTerminal {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReadableCode {
     source: String,
     commentary: Option<String>,
@@ -226,7 +226,48 @@ pub(crate) struct RestoredTask {
     pub(crate) terminal_revision: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SessionEntryId(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestAdmission {
+    pub(crate) run_id: u64,
+    pub(crate) request_entry: SessionEntryId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionCatalogueKind {
+    Start,
+    Request {
+        text: String,
+    },
+    Execution {
+        source: String,
+        commentary: Option<String>,
+        execution: Box<Execution>,
+    },
+    Final {
+        text: String,
+    },
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionCatalogueEntry {
+    pub(crate) entry_id: SessionEntryId,
+    pub(crate) parent_id: Option<SessionEntryId>,
+    pub(crate) revision: u64,
+    pub(crate) kind: SessionCatalogueKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionCatalogue {
+    pub(crate) active_entry: SessionEntryId,
+    pub(crate) entries: Vec<SessionCatalogueEntry>,
+}
+
+#[derive(Debug)]
 pub(crate) struct RestoredExecutableState {
     pub(crate) checkpoint: Checkpoint,
     pub(crate) history: ModelHistory,
@@ -256,11 +297,15 @@ impl SessionMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SessionRestore {
+    pub(crate) effective_entry: SessionEntryId,
+    pub(crate) observed_active_entry: SessionEntryId,
+    pub(crate) request_prefill: Option<String>,
     pub(crate) metadata: Option<SessionMetadata>,
     pub(crate) records: Vec<RestoredRecord>,
     pub(crate) tasks: Vec<RestoredTask>,
+    pub(crate) all_tasks: Vec<RestoredTask>,
     pub(crate) reserved_task_ids: Vec<TaskId>,
     pub(crate) footer_adjustment: Vec<AttemptAccounting>,
     pub(crate) next_task: Option<u64>,
@@ -284,6 +329,7 @@ pub(crate) enum SessionWriteKind {
     TaskAdmission,
     TaskStep,
     TaskTerminal,
+    Selection,
 }
 
 pub(crate) struct TaskAdmission {
@@ -752,6 +798,32 @@ impl Session {
 }
 
 impl SessionWriter {
+    pub(crate) async fn restore_at(
+        &self,
+        requested_entry: SessionEntryId,
+    ) -> Result<SessionRestore, SessionError> {
+        self.read(move |connection| load_session_restore_at(connection, requested_entry))
+            .await
+    }
+
+    pub(crate) async fn catalogue(&self) -> Result<SessionCatalogue, SessionError> {
+        self.read(load_session_catalogue).await
+    }
+
+    pub(crate) async fn select_active_entry(
+        &self,
+        effective_entry: SessionEntryId,
+        observed_active_entry: SessionEntryId,
+    ) -> Result<(), SessionError> {
+        if effective_entry == observed_active_entry {
+            return Ok(());
+        }
+        self.write(SessionWriteKind::Selection, move |connection| {
+            select_active_entry(connection, effective_entry, observed_active_entry)
+        })
+        .await
+    }
+
     pub(crate) fn mark_execution_started(&self, step_id: u64) {
         *self
             .state
@@ -827,7 +899,10 @@ impl SessionWriter {
         .await
     }
 
-    pub(crate) async fn commit_request(&self, request: String) -> Result<u64, SessionError> {
+    pub(crate) async fn commit_request(
+        &self,
+        request: String,
+    ) -> Result<RequestAdmission, SessionError> {
         self.write(SessionWriteKind::Request, move |connection| {
             commit_request(connection, &request)
         })
@@ -915,6 +990,22 @@ impl SessionWriter {
         .await
     }
 
+    async fn read<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, SessionError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let state = Arc::clone(&self.state);
+        task::spawn_blocking(move || {
+            let mut connection = state
+                .connection
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            operation(&mut connection)
+        })
+        .await
+        .map_err(|_| SessionError::WriterUnavailable)?
+    }
+
     async fn write<T: Send + 'static>(
         &self,
         kind: SessionWriteKind,
@@ -989,7 +1080,56 @@ fn commit_name(connection: &mut Connection, name: &str) -> Result<(), SessionErr
     Ok(())
 }
 
-fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, SessionError> {
+fn select_active_entry(
+    connection: &mut Connection,
+    effective_entry: SessionEntryId,
+    observed_active_entry: SessionEntryId,
+) -> Result<(), SessionError> {
+    let effective_entry = i64::try_from(effective_entry.0).map_err(|_| SessionError::IdOverflow)?;
+    let observed_active_entry =
+        i64::try_from(observed_active_entry.0).map_err(|_| SessionError::IdOverflow)?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (active_entry, revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if active_entry != observed_active_entry {
+        return Err(SessionError::InvalidTransition);
+    }
+    let target_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)",
+        params![effective_entry],
+        |row| row.get(0),
+    )?;
+    if !target_exists {
+        return Err(SessionError::InvalidTransition);
+    }
+    let has_unfinished_work: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE terminal_entry_id IS NULL) OR EXISTS(SELECT 1 FROM model_steps WHERE settled_entry_id IS NULL) OR EXISTS(SELECT 1 FROM subagent_tasks WHERE terminal_revision IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_unfinished_work {
+        return Err(SessionError::InvalidTransition);
+    }
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    if transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1 AND active_entry_id = ?4",
+        params![effective_entry, now, next_revision, observed_active_entry],
+    )? != 1
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn commit_request(
+    connection: &mut Connection,
+    request: &str,
+) -> Result<RequestAdmission, SessionError> {
     let payload =
         codec::encode_request(request).map_err(|error| SessionError::Codec(error.to_string()))?;
     let now = now_ms()?;
@@ -1016,8 +1156,12 @@ fn commit_request(connection: &mut Connection, request: &str) -> Result<u64, Ses
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
         params![entry_id, now, next_revision],
     )?;
+    let admission = RequestAdmission {
+        run_id: u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?,
+        request_entry: session_entry_id(entry_id)?,
+    };
     transaction.commit()?;
-    u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)
+    Ok(admission)
 }
 
 fn start_model_step(connection: &mut Connection, run_id: u64) -> Result<u64, SessionError> {
@@ -1633,6 +1777,14 @@ struct RestoreEntryRow {
     revision: i64,
 }
 
+struct CatalogueEntryRow {
+    id: i64,
+    parent_id: Option<i64>,
+    kind: String,
+    payload_json: String,
+    revision: i64,
+}
+
 struct RestoreRunRow {
     id: i64,
     terminal_entry_id: Option<i64>,
@@ -1685,8 +1837,24 @@ fn session_metadata(
 }
 
 fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
+    load_session_restore_for_entry(connection, None)
+}
+
+fn load_session_restore_at(
+    connection: &mut Connection,
+    requested_entry: SessionEntryId,
+) -> Result<SessionRestore, SessionError> {
+    let requested_entry =
+        i64::try_from(requested_entry.0).map_err(|_| SessionError::InvalidTransition)?;
+    load_session_restore_for_entry(connection, Some(requested_entry))
+}
+
+fn load_session_restore_for_entry(
+    connection: &mut Connection,
+    requested_entry: Option<i64>,
+) -> Result<SessionRestore, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    let (active_entry_id, name, preferences_json, session_revision): (
+    let (observed_active_entry_id, name, preferences_json, session_revision): (
         i64,
         Option<String>,
         String,
@@ -1715,6 +1883,16 @@ fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, S
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
+    };
+    let requested_entry_id = requested_entry.unwrap_or(observed_active_entry_id);
+    let requested = entries
+        .iter()
+        .find(|entry| entry.id == requested_entry_id)
+        .ok_or(SessionError::InvalidTransition)?;
+    let effective_entry_id = if requested_entry.is_some() && requested.kind == "user_request" {
+        requested.parent_id.ok_or(SessionError::InvalidTransition)?
+    } else {
+        requested_entry_id
     };
     let runs = {
         let mut statement =
@@ -1763,25 +1941,126 @@ fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, S
     let checkpoint = transaction
         .query_row(
             "SELECT checkpoints.runtime_identity, checkpoints.arena_state, checkpoints.authorisations_json FROM entries JOIN checkpoints ON checkpoints.id = entries.checkpoint_id WHERE entries.id = ?1",
-            params![active_entry_id],
+            params![effective_entry_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     transaction.commit()?;
-    Ok(restore_projection(RestoreSnapshot {
-        active_entry_id,
-        session_revision,
-        metadata,
-        entries,
-        runs,
-        steps,
-        tasks,
-        checkpoint,
-    }))
+    Ok(restore_projection_at(
+        RestoreSnapshot {
+            active_entry_id: observed_active_entry_id,
+            session_revision,
+            metadata,
+            entries,
+            runs,
+            steps,
+            tasks,
+            checkpoint,
+        },
+        requested_entry_id,
+        effective_entry_id,
+    ))
 }
 
+fn load_session_catalogue(connection: &mut Connection) -> Result<SessionCatalogue, SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let active_entry_id: i64 = transaction.query_row(
+        "SELECT active_entry_id FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let entries = {
+        let mut statement = transaction.prepare(
+            "SELECT id, parent_id, kind, payload_json, revision FROM entries ORDER BY revision",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(CatalogueEntryRow {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    revision: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let active_entry = session_entry_id(active_entry_id)?;
+    let entries = entries
+        .iter()
+        .map(session_catalogue_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !entries.iter().any(|entry| entry.entry_id == active_entry) {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    Ok(SessionCatalogue {
+        active_entry,
+        entries,
+    })
+}
+
+fn session_entry_id(value: i64) -> Result<SessionEntryId, SessionError> {
+    u64::try_from(value)
+        .map(SessionEntryId)
+        .map_err(|_| SessionError::InvalidTransition)
+}
+
+fn session_catalogue_entry(
+    entry: &CatalogueEntryRow,
+) -> Result<SessionCatalogueEntry, SessionError> {
+    let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let kind = match codec::decoded_entry_kind(&decoded) {
+        codec::DecodedEntryKind::SessionStart => SessionCatalogueKind::Start,
+        codec::DecodedEntryKind::UserRequest => SessionCatalogueKind::Request {
+            text: codec::decoded_request(&decoded)
+                .expect("decoded request kind has request text")
+                .to_owned(),
+        },
+        codec::DecodedEntryKind::Execution => {
+            let (code, execution) = codec::decoded_readable_execution(&decoded)
+                .map_err(|error| SessionError::Codec(error.to_string()))?
+                .ok_or(SessionError::InvalidTransition)?;
+            if !matches!(&code.result, crate::model::CodeResult::Execution { .. }) {
+                return Err(SessionError::InvalidTransition);
+            }
+            SessionCatalogueKind::Execution {
+                source: code.source,
+                commentary: code.commentary,
+                execution: Box::new(execution),
+            }
+        }
+        codec::DecodedEntryKind::FinalReply => SessionCatalogueKind::Final {
+            text: codec::decoded_final_text(&decoded)
+                .ok_or(SessionError::InvalidTransition)?
+                .to_owned(),
+        },
+        codec::DecodedEntryKind::Cancelled => SessionCatalogueKind::Cancelled,
+        codec::DecodedEntryKind::Failed => SessionCatalogueKind::Failed,
+    };
+    Ok(SessionCatalogueEntry {
+        entry_id: session_entry_id(entry.id)?,
+        parent_id: entry.parent_id.map(session_entry_id).transpose()?,
+        revision: u64::try_from(entry.revision).map_err(|_| SessionError::InvalidTransition)?,
+        kind,
+    })
+}
+
+#[cfg(test)]
 fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
-    let metadata = snapshot.metadata.clone();
+    let active_entry_id = snapshot.active_entry_id;
+    restore_projection_at(snapshot, active_entry_id, active_entry_id)
+}
+
+fn restore_projection_at(
+    snapshot: RestoreSnapshot,
+    requested_entry_id: i64,
+    effective_entry_id: i64,
+) -> SessionRestore {
+    let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
+    let observed_active_entry =
+        session_entry_id(snapshot.active_entry_id).unwrap_or(SessionEntryId(0));
     let next_task = next_task_after(
         snapshot
             .tasks
@@ -1813,19 +2092,55 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let ancestry = selected_ancestry(&entries, snapshot.active_entry_id);
-    if ancestry.entries.is_empty() {
-        return SessionRestore {
-            metadata,
-            records: Vec::new(),
-            tasks: Vec::new(),
-            reserved_task_ids: Vec::new(),
-            footer_adjustment: Vec::new(),
-            next_task,
-            executable: None,
-        };
+    let ancestry = selected_ancestry(&entries, effective_entry_id);
+    let mut decoded_entries = BTreeMap::new();
+    let mut required_entries = ancestry
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<BTreeSet<_>>();
+    required_entries.insert(requested_entry_id);
+    required_entries.extend(
+        entries
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.kind.as_str(),
+                    "execution" | "final_reply" | "cancelled" | "failed"
+                )
+            })
+            .map(|entry| entry.id),
+    );
+    for entry_id in required_entries {
+        if let Some(entry) = entries.get(&entry_id) {
+            decoded_entries.insert(
+                entry_id,
+                codec::decode_entry(&entry.kind, &entry.payload_json).map_err(|_| ()),
+            );
+        }
     }
-    let mut executable = metadata.is_some() && ancestry.intact && valid_timeline(&snapshot);
+    let request_prefill = if requested_entry_id == effective_entry_id {
+        None
+    } else {
+        entries
+            .get(&requested_entry_id)
+            .filter(|entry| entry.kind == "user_request")
+            .and_then(|entry| {
+                decoded_restore_entry(&decoded_entries, entry.id)
+                    .ok()
+                    .and_then(codec::decoded_request)
+                    .map(str::to_owned)
+            })
+    };
+    let requested_is_valid = entries.get(&requested_entry_id).is_some_and(|entry| {
+        decoded_restore_entry(&decoded_entries, entry.id).is_ok()
+            && (entry.kind != "user_request" || entry.provider_replay.is_none())
+    });
+    let mut executable = snapshot.metadata.is_some()
+        && ancestry.intact
+        && !ancestry.entries.is_empty()
+        && requested_is_valid
+        && valid_timeline(&snapshot);
     let mut verified = Vec::new();
     let mut records = Vec::new();
     for entry in ancestry.entries {
@@ -1833,7 +2148,14 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             executable = false;
             break;
         }
-        match readable_record(&entry, &snapshot.entries, &snapshot.steps, &runs) {
+        let decoded = match decoded_restore_entry(&decoded_entries, entry.id) {
+            Ok(decoded) => decoded,
+            Err(()) => {
+                executable = false;
+                break;
+            }
+        };
+        match readable_record(&entry, &snapshot.entries, &snapshot.steps, &runs, decoded) {
             Ok(Some(record)) => {
                 verified.push(entry);
                 records.push(record);
@@ -1851,26 +2173,25 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
         .collect::<BTreeSet<_>>();
 
     let mut footer_adjustment = Vec::new();
-    for entry in entries.values() {
-        let attempts = match entry.kind.as_str() {
-            "execution" => {
-                codec::decode_readable_execution(&entry.payload_json).map(|(code, _)| code.attempts)
+    for entry in entries
+        .values()
+        .filter(|entry| !selected_ids.contains(&entry.id))
+    {
+        match entry.kind.as_str() {
+            "execution" | "final_reply" | "cancelled" | "failed" => {
+                let Ok(decoded) = decoded_restore_entry(&decoded_entries, entry.id) else {
+                    executable = false;
+                    continue;
+                };
+                footer_adjustment.extend(codec::decoded_attempts(decoded));
             }
-            "final_reply" | "cancelled" | "failed" => {
-                codec::decode_readable_terminal(&entry.payload_json)
-                    .map(|(terminal, _)| terminal_attempts(&terminal).to_vec())
-            }
-            "session_start" | "user_request" => Ok(Vec::new()),
-            _ => Err(codec::CodecError::InvalidPayload),
-        };
-        match attempts {
-            Ok(attempts) if !selected_ids.contains(&entry.id) => footer_adjustment.extend(attempts),
-            Ok(_) => {}
-            Err(_) => executable = false,
+            "session_start" | "user_request" => {}
+            _ => executable = false,
         }
     }
 
     let mut tasks = Vec::new();
+    let mut all_tasks = Vec::new();
     let mut restored_task_ids = BTreeMap::new();
     let mut visible_task_ids = BTreeSet::new();
     for task in snapshot.tasks {
@@ -1975,7 +2296,6 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             attempts: decoded.attempts.clone(),
             details,
         });
-        restored_task_ids.insert(task.id, id.clone());
         let Some(origin_entry) = origin_step
             .settled_entry_id
             .and_then(|entry_id| entries.get(&entry_id))
@@ -1989,45 +2309,47 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             footer_adjustment.extend(decoded.attempts);
             continue;
         };
+        restored_task_ids.insert(task.id, id.clone());
         let origin_is_selected = selected_ids.contains(&origin_entry.id)
             && origin_entry.run_id == Some(origin_step.run_id);
+        let admission_anchor_revision = selected_step_revision(
+            record.admission_history_step_id(),
+            &snapshot.steps,
+            &entries,
+            &selected_ids,
+        )
+        .unwrap_or(origin_revision);
+        let terminal_anchor_revision = selected_step_revision(
+            record.terminal_history_step_id(),
+            &snapshot.steps,
+            &entries,
+            &selected_ids,
+        )
+        .unwrap_or(origin_revision);
+        let restored = RestoredTask {
+            record,
+            admission_anchor_revision,
+            terminal_anchor_revision,
+            admitted_revision,
+            terminal_revision,
+        };
         let parent_is_visible = parent
             .as_ref()
             .is_none_or(|parent| visible_task_ids.contains(parent));
         if origin_is_selected && parent_is_visible {
-            let admission_anchor_revision = selected_step_revision(
-                record.admission_history_step_id(),
-                &snapshot.steps,
-                &entries,
-                &selected_ids,
-            )
-            .unwrap_or(origin_revision);
-            let terminal_anchor_revision = selected_step_revision(
-                record.terminal_history_step_id(),
-                &snapshot.steps,
-                &entries,
-                &selected_ids,
-            )
-            .unwrap_or(origin_revision);
             visible_task_ids.insert(id);
-            tasks.push(RestoredTask {
-                record,
-                admission_anchor_revision,
-                terminal_anchor_revision,
-                admitted_revision,
-                terminal_revision,
-            });
+            tasks.push(restored.clone());
         } else {
             if origin_is_selected && parent.is_some() {
                 executable = false;
             }
             footer_adjustment.extend(decoded.attempts);
         }
+        all_tasks.push(restored);
     }
-
     let reserved_task_ids = restored_task_ids.into_values().collect();
     let history = executable
-        .then(|| restored_history(&verified, &snapshot.steps, &runs))
+        .then(|| restored_history(&verified, &decoded_entries, &snapshot.steps, &runs))
         .flatten();
     let checkpoint = snapshot
         .checkpoint
@@ -2041,14 +2363,28 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
             history,
         });
     SessionRestore {
-        metadata,
+        effective_entry,
+        observed_active_entry,
+        request_prefill,
+        metadata: snapshot.metadata,
         records,
         tasks,
+        all_tasks,
         reserved_task_ids,
         footer_adjustment,
         next_task,
         executable,
     }
+}
+
+fn decoded_restore_entry(
+    entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
+    entry_id: i64,
+) -> Result<&codec::DecodedEntry, ()> {
+    entries
+        .get(&entry_id)
+        .and_then(|entry| entry.as_ref().ok())
+        .ok_or(())
 }
 
 fn next_task_after(maximum: Option<u64>) -> Option<u64> {
@@ -2269,12 +2605,13 @@ fn readable_record(
     entries: &[RestoreEntryRow],
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
+    decoded: &codec::DecodedEntry,
 ) -> Result<Option<RestoredRecord>, ()> {
     if entry.kind == "session_start" {
         return (entry.run_id.is_none()
             && entry.parent_id.is_none()
             && entry.provider_replay.is_none()
-            && entry.payload_json == "{}")
+            && codec::decoded_entry_kind(decoded) == codec::DecodedEntryKind::SessionStart)
             .then_some(None)
             .ok_or(());
     }
@@ -2295,13 +2632,14 @@ fn readable_record(
                 return Err(());
             }
             RestoredRecordKind::UserRequest {
-                request: codec::decode_request(&entry.payload_json).map_err(|_| ())?,
+                request: codec::decoded_request(decoded).ok_or(())?.to_owned(),
             }
         }
         "execution" => {
             let step_id = settled_step_id(entry, steps)?;
-            let (code, execution) =
-                codec::decode_readable_execution(&entry.payload_json).map_err(|_| ())?;
+            let (code, execution) = codec::decoded_readable_execution(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             if !matches!(code.result, crate::model::CodeResult::Execution { .. }) {
                 return Err(());
             }
@@ -2316,8 +2654,10 @@ fn readable_record(
         }
         "final_reply" => {
             let step_id = settled_step_id(entry, steps)?;
-            let (terminal, code) =
-                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             let ReadableTerminal::Final {
                 text,
                 reasoning_summary,
@@ -2339,15 +2679,16 @@ fn readable_record(
             }
         }
         "cancelled" => {
-            let (terminal, code) =
-                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             if !matches!(terminal, ReadableTerminal::Cancelled { .. })
                 || runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
-                || code.as_ref().is_some_and(|code| {
+                || code.is_some_and(|code| {
                     !matches!(
-                        code.result,
-                        crate::model::CodeResult::Cancelled { .. }
-                            | crate::model::CodeResult::Failure { .. }
+                        code,
+                        codec::DecodedCodeResult::Cancelled | codec::DecodedCodeResult::Failure
                     )
                 })
             {
@@ -2359,15 +2700,15 @@ fn readable_record(
             RestoredRecordKind::CancelledRun { terminal }
         }
         "failed" => {
-            let (terminal, code) =
-                codec::decode_readable_terminal(&entry.payload_json).map_err(|_| ())?;
+            let code = codec::decoded_terminal_code_result(decoded).ok_or(())?;
+            let terminal = codec::decoded_readable_terminal(decoded)
+                .map_err(|_| ())?
+                .ok_or(())?;
             let ReadableTerminal::Failed { message, .. } = &terminal else {
                 return Err(());
             };
             if runs.get(&entry.run_id.unwrap_or_default()) != Some(&Some(entry.id))
-                || code.as_ref().is_some_and(|code| {
-                    !matches!(code.result, crate::model::CodeResult::Failure { .. })
-                })
+                || code.is_some_and(|code| code != codec::DecodedCodeResult::Failure)
             {
                 return Err(());
             }
@@ -2412,19 +2753,21 @@ fn settled_step_id(entry: &RestoreEntryRow, steps: &[RestoreStepRow]) -> Result<
 
 fn restored_history(
     selected: &[RestoreEntryRow],
+    decoded_entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
 ) -> Option<ModelHistory> {
     let mut history = ModelHistory::new();
     for entry in selected {
+        let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
         match entry.kind.as_str() {
             "session_start" => {
-                if readable_record(entry, selected, steps, runs).is_err() {
+                if readable_record(entry, selected, steps, runs, decoded).is_err() {
                     return None;
                 }
             }
             "user_request" => {
-                let request = codec::decode_request(&entry.payload_json).ok()?;
+                let request = codec::decoded_request(decoded)?.to_owned();
                 if entry.provider_replay.is_some() {
                     return None;
                 }
@@ -2432,58 +2775,55 @@ fn restored_history(
             }
             "execution" => {
                 settled_step_id(entry, steps).ok()?;
-                let code = codec::decode_execution_entry(
-                    &entry.payload_json,
-                    entry.provider_replay.as_deref(),
-                )
-                .ok()?;
-                if code.execution.is_none()
-                    || !matches!(code.result, crate::model::CodeResult::Execution { .. })
+                let code =
+                    codec::decoded_execution_history(decoded, entry.provider_replay.as_deref())
+                        .ok()?;
+                if !matches!(code.result, crate::model::CodeResult::Execution { .. })
                     || append_history_code(&mut history, code).is_err()
                 {
                     return None;
                 }
             }
             "final_reply" | "cancelled" | "failed" => {
-                let (terminal, code) = codec::decode_terminal_entry(
-                    &entry.payload_json,
-                    entry.provider_replay.as_deref(),
-                )
-                .ok()?;
-                match (entry.kind.as_str(), terminal, code) {
-                    (
-                        "final_reply",
-                        PersistedTerminal::Final {
-                            text,
-                            reasoning_summary,
-                            replay,
-                            ..
-                        },
-                        None,
-                    ) => {
+                match codec::decoded_terminal_history(decoded, entry.provider_replay.as_deref())
+                    .ok()?
+                {
+                    codec::DecodedTerminalHistory::Final {
+                        text,
+                        reasoning_summary,
+                        replay,
+                    } if entry.kind == "final_reply" => {
                         settled_step_id(entry, steps).ok()?;
                         history.append_final_message(text, reasoning_summary, replay);
                     }
-                    ("cancelled", PersistedTerminal::Cancelled { .. }, Some(code))
-                        if code.execution.is_none()
-                            && matches!(
-                                code.result,
-                                crate::model::CodeResult::Cancelled { .. }
-                                    | crate::model::CodeResult::Failure { .. }
-                            ) =>
+                    codec::DecodedTerminalHistory::Cancelled { code }
+                        if entry.kind == "cancelled" =>
                     {
-                        settled_step_id(entry, steps).ok()?;
-                        append_history_code(&mut history, code).ok()?;
+                        if let Some(code) = code {
+                            if code.execution.is_some()
+                                || !matches!(
+                                    code.result,
+                                    crate::model::CodeResult::Cancelled { .. }
+                                        | crate::model::CodeResult::Failure { .. }
+                                )
+                            {
+                                return None;
+                            }
+                            settled_step_id(entry, steps).ok()?;
+                            append_history_code(&mut history, code).ok()?;
+                        }
                     }
-                    ("failed", PersistedTerminal::Failed { .. }, Some(code))
-                        if code.execution.is_none()
-                            && matches!(code.result, crate::model::CodeResult::Failure { .. }) =>
-                    {
-                        settled_step_id(entry, steps).ok()?;
-                        append_history_code(&mut history, code).ok()?;
+                    codec::DecodedTerminalHistory::Failed { code } if entry.kind == "failed" => {
+                        if let Some(code) = code {
+                            if code.execution.is_some()
+                                || !matches!(code.result, crate::model::CodeResult::Failure { .. })
+                            {
+                                return None;
+                            }
+                            settled_step_id(entry, steps).ok()?;
+                            append_history_code(&mut history, code).ok()?;
+                        }
                     }
-                    ("cancelled", PersistedTerminal::Cancelled { .. }, None)
-                    | ("failed", PersistedTerminal::Failed { .. }, None) => {}
                     _ => return None,
                 }
             }
@@ -2504,14 +2844,6 @@ fn append_history_code(history: &mut ModelHistory, code: PersistedCode) -> Resul
             code.result,
         )
         .map_err(|_| ())
-}
-
-fn terminal_attempts(terminal: &ReadableTerminal) -> &[AttemptAccounting] {
-    match terminal {
-        ReadableTerminal::Final { attempts, .. }
-        | ReadableTerminal::Cancelled { attempts, .. }
-        | ReadableTerminal::Failed { attempts, .. } => attempts,
-    }
 }
 
 fn task_outcome_matches_state(
@@ -2568,10 +2900,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        PersistedCode, PersistedTerminal, Session, SessionError, SessionId, TaskAdmission,
-        TaskSnapshot, TaskStepCommit, TaskTerminal,
+        PersistedCode, PersistedTerminal, Session, SessionEntryId, SessionError, SessionId,
+        SessionWriteGate, SessionWriteKind, TaskAdmission, TaskSnapshot, TaskStepCommit,
+        TaskTerminal,
     };
-    use crate::arena::{Arena, Checkpoint, ExecutionOutcome, RuntimeIdentity};
+    use crate::arena::{
+        Arena, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity, ToolCall, ToolCallSummary,
+        ToolName,
+    };
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
@@ -2620,20 +2956,24 @@ mod tests {
         home.join(".kiki/sessions").join(format!("{id}.lock"))
     }
 
-    fn empty_observation() -> crate::arena::Observation {
+    fn observation(text: &str) -> crate::arena::Observation {
         crate::arena::Observation {
-            head: String::new(),
+            head: text.to_owned(),
             tail: None,
-            head_lines: 0,
+            head_lines: usize::from(!text.is_empty()),
             tail_lines: 0,
-            total_lines: 0,
-            total_bytes: 0,
+            total_lines: usize::from(!text.is_empty()),
+            total_bytes: text.len(),
             omitted_lines: 0,
             omitted_bytes: 0,
             head_ends_mid_line: false,
             tail_starts_mid_line: false,
             partial_lines: false,
         }
+    }
+
+    fn empty_observation() -> crate::arena::Observation {
+        observation("")
     }
 
     fn insert_entry(
@@ -2701,6 +3041,193 @@ mod tests {
             provider_replay: None,
             revision,
         }
+    }
+
+    #[cfg(unix)]
+    fn active_entry_id(session: &Session) -> i64 {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT active_entry_id FROM session", [], |row| row.get(0))
+            .expect("read active entry")
+    }
+
+    #[cfg(unix)]
+    fn set_active_entry(session: &Session, entry_id: i64) {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1",
+                params![entry_id],
+            )
+            .expect("set fixture active entry");
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct SelectionSnapshot {
+        id: String,
+        created_at_ms: i64,
+        cwd: String,
+        name: Option<String>,
+        preferences_json: String,
+        active_entry_id: i64,
+        updated_at_ms: i64,
+        revision: i64,
+        entries: i64,
+        checkpoints: i64,
+        runs: i64,
+        steps: i64,
+        tasks: i64,
+    }
+
+    #[cfg(unix)]
+    fn selection_snapshot(session: &Session) -> SelectionSnapshot {
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT id, created_at_ms, cwd, name, preferences_json, active_entry_id, updated_at_ms, revision, (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps), (SELECT COUNT(*) FROM subagent_tasks) FROM session WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(SelectionSnapshot {
+                        id: row.get(0)?,
+                        created_at_ms: row.get(1)?,
+                        cwd: row.get(2)?,
+                        name: row.get(3)?,
+                        preferences_json: row.get(4)?,
+                        active_entry_id: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                        revision: row.get(7)?,
+                        entries: row.get(8)?,
+                        checkpoints: row.get(9)?,
+                        runs: row.get(10)?,
+                        steps: row.get(11)?,
+                        tasks: row.get(12)?,
+                    })
+                },
+            )
+            .expect("read selection snapshot")
+    }
+
+    #[cfg(unix)]
+    fn selection_database_bytes(home: &Path, session: &Session) -> Vec<u8> {
+        fs::read(database_path(home, session.id())).expect("read selection database")
+    }
+
+    #[cfg(unix)]
+    async fn settle_fixture_execution(
+        session: &Session,
+        writer: &super::SessionWriter,
+        run_id: u64,
+        source: &str,
+        commentary: Option<&str>,
+        tool_calls: Vec<ToolCall>,
+    ) -> (u64, i64) {
+        settle_fixture_execution_with(
+            session,
+            writer,
+            run_id,
+            source,
+            commentary,
+            Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls,
+            },
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn settle_fixture_execution_with(
+        session: &Session,
+        writer: &super::SessionWriter,
+        run_id: u64,
+        source: &str,
+        commentary: Option<&str>,
+        execution: Execution,
+    ) -> (u64, i64) {
+        let step_id = writer
+            .start_model_step(run_id)
+            .await
+            .expect("start fixture step");
+        let code = PersistedCode {
+            source: source.to_owned(),
+            call_id: crate::model::ModelCallId::new(format!("fixture-{run_id}")),
+            commentary: commentary.map(str::to_owned),
+            reasoning_summary: String::new(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(execution),
+            attempts: Vec::new(),
+        };
+        writer
+            .settle_execution(
+                run_id,
+                step_id,
+                code,
+                session
+                    .initial_checkpoint()
+                    .expect("load fixture checkpoint"),
+            )
+            .await
+            .expect("settle fixture execution");
+        (step_id, active_entry_id(session))
+    }
+
+    #[cfg(unix)]
+    async fn persist_completed_task(
+        writer: &super::SessionWriter,
+        id: &str,
+        origin_step_id: u64,
+        attempts: Vec<crate::model::AttemptAccounting>,
+    ) {
+        let admitted = TaskRecord::for_test(id, 1, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: None,
+                state: TaskState::Starting,
+                step_count: 0,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 1,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: None,
+            });
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&admitted, origin_step_id).expect("encode task"),
+                    || false,
+                )
+                .await
+                .expect("persist task admission")
+        );
+        let terminal = TaskRecord::for_test(id, 2, selection(), None, 1, attempts)
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: Some(2),
+                state: TaskState::Completed,
+                step_count: 1,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 2,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: Some(TaskOutcome::Completed(ChildResult::new(
+                    format!("{id} result"),
+                    BTreeMap::new(),
+                ))),
+            });
+        writer
+            .terminal_subagent_task(TaskTerminal::from_record(&terminal).expect("encode task"))
+            .await
+            .expect("persist terminal task");
     }
 
     #[test]
@@ -2997,6 +3524,1823 @@ mod tests {
                     if result.message() == "late selected result"
                         && result.values().get("value") == Some(&ToolValue::Integer(7)))
         ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_at_projects_selected_history_checkpoint_and_tasks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root_entry: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT active_entry_id FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read root entry");
+
+        let first_run = writer
+            .commit_request("first branch request".to_owned())
+            .await
+            .expect("commit first request")
+            .run_id;
+        let first_step = writer
+            .start_model_step(first_run)
+            .await
+            .expect("start first step");
+        let mut first_arena = restored_arena(&session, workspace.path()).await;
+        let first_execution = first_arena
+            .execute("first_value = 1", &CancellationToken::new())
+            .await
+            .expect("execute first branch");
+        let first_checkpoint = first_arena.checkpoint();
+        writer
+            .settle_execution(
+                first_run,
+                first_step,
+                persisted_execution("first_value = 1", first_execution),
+                first_checkpoint.clone(),
+            )
+            .await
+            .expect("settle first execution");
+        let first_entry: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT active_entry_id FROM session", [], |row| row.get(0))
+            .expect("read first execution entry");
+        let final_step = writer
+            .start_model_step(first_run)
+            .await
+            .expect("start final step");
+        writer
+            .close_run(
+                first_run,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "first branch final".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close first run");
+        let saved_active: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT active_entry_id FROM session", [], |row| row.get(0))
+            .expect("read saved active entry");
+
+        let admitted = TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: None,
+                state: TaskState::Starting,
+                step_count: 0,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 1,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: None,
+            });
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&admitted, first_step).expect("encode task"),
+                    || false,
+                )
+                .await
+                .expect("persist task admission")
+        );
+        let terminal_task = TaskRecord::for_test("00", 2, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: Some(2),
+                state: TaskState::Completed,
+                step_count: 1,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 2,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: Some(TaskOutcome::Completed(ChildResult::new(
+                    "first task result".to_owned(),
+                    BTreeMap::new(),
+                ))),
+            });
+        writer
+            .terminal_subagent_task(TaskTerminal::from_record(&terminal_task).expect("encode task"))
+            .await
+            .expect("persist terminal task");
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1",
+                params![root_entry],
+            )
+            .expect("select root fixture branch");
+        let sibling_run = writer
+            .commit_request("sibling branch request".to_owned())
+            .await
+            .expect("commit sibling request")
+            .run_id;
+        let sibling_step = writer
+            .start_model_step(sibling_run)
+            .await
+            .expect("start sibling step");
+        let mut sibling_arena = restored_arena(&session, workspace.path()).await;
+        let sibling_execution = sibling_arena
+            .execute("sibling_value = 2", &CancellationToken::new())
+            .await
+            .expect("execute sibling branch");
+        writer
+            .settle_execution(
+                sibling_run,
+                sibling_step,
+                persisted_execution("sibling_value = 2", sibling_execution),
+                sibling_arena.checkpoint(),
+            )
+            .await
+            .expect("settle sibling execution");
+        writer
+            .close_run(
+                sibling_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "sibling failed".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close sibling run");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1",
+                params![saved_active],
+            )
+            .expect("restore saved active fixture branch");
+
+        let restore = writer
+            .restore_at(SessionEntryId(first_entry as u64))
+            .await
+            .expect("project first execution");
+
+        assert_eq!(restore.effective_entry, SessionEntryId(first_entry as u64));
+        assert_eq!(
+            restore.observed_active_entry,
+            SessionEntryId(saved_active as u64)
+        );
+        assert_eq!(restore.request_prefill, None);
+        assert_eq!(restore.records.len(), 2);
+        assert_eq!(
+            restore
+                .executable
+                .as_ref()
+                .expect("projected execution is executable")
+                .checkpoint,
+            first_checkpoint
+        );
+        assert_eq!(
+            restore
+                .executable
+                .as_ref()
+                .expect("projected execution is executable")
+                .history
+                .entries()
+                .len(),
+            2
+        );
+        assert_eq!(
+            restore
+                .tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00"]
+        );
+        assert_eq!(
+            restore
+                .all_tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00"]
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_persists_and_next_request_branches_from_it() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run = writer
+            .commit_request("original request".to_owned())
+            .await
+            .expect("commit original request")
+            .run_id;
+        let (_, execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            run,
+            "original_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        let final_step = writer
+            .start_model_step(run)
+            .await
+            .expect("start original terminal step");
+        writer
+            .close_run(
+                run,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "original future".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close original run");
+        let original_future = active_entry_id(&session);
+        let restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("project older execution");
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE session SET updated_at_ms = 0, revision = revision + 1",
+                [],
+            )
+            .expect("rewind fixture timestamp");
+        let before_selection = selection_snapshot(&session);
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select older execution");
+        let after_selection = selection_snapshot(&session);
+        assert_eq!(after_selection.active_entry_id, execution);
+        assert_eq!(after_selection.revision, before_selection.revision + 1);
+        assert!(after_selection.updated_at_ms > before_selection.updated_at_ms);
+        assert_eq!(after_selection.id, before_selection.id);
+        assert_eq!(
+            after_selection.created_at_ms,
+            before_selection.created_at_ms
+        );
+        assert_eq!(after_selection.cwd, before_selection.cwd);
+        assert_eq!(after_selection.name, before_selection.name);
+        assert_eq!(
+            after_selection.preferences_json,
+            before_selection.preferences_json
+        );
+        assert_eq!(after_selection.entries, before_selection.entries);
+        assert_eq!(after_selection.checkpoints, before_selection.checkpoints);
+        assert_eq!(after_selection.runs, before_selection.runs);
+        assert_eq!(after_selection.steps, before_selection.steps);
+        assert_eq!(after_selection.tasks, before_selection.tasks);
+
+        drop(writer);
+        session.close().expect("close selected session");
+        let session = Session::open(home.path(), &id).expect("reopen selected session");
+        assert_eq!(selection_snapshot(&session), after_selection);
+        let writer = session.writer();
+        writer
+            .commit_request("branched request".to_owned())
+            .await
+            .expect("commit branched request");
+        let connection = session
+            .connection_for_test()
+            .expect("lock selected session connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read branched request parent"),
+            execution
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = ?1",
+                    params![original_future],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read original future parent"),
+            execution
+        );
+        drop(connection);
+        drop(writer);
+        session.close().expect("close branched session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrected_request_admission_returns_the_committed_sibling_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+
+        let original = writer
+            .commit_request("original request".to_owned())
+            .await
+            .expect("commit original request");
+        assert_eq!(
+            original.request_entry,
+            SessionEntryId(active_entry_id(&session) as u64)
+        );
+        writer
+            .close_run(
+                original.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close original request");
+
+        let restore = writer
+            .restore_at(original.request_entry)
+            .await
+            .expect("project original request parent");
+        assert_eq!(restore.effective_entry, root);
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select original request parent");
+
+        let corrected = writer
+            .commit_request("corrected request".to_owned())
+            .await
+            .expect("commit corrected request");
+        assert_eq!(
+            corrected.request_entry,
+            SessionEntryId(active_entry_id(&session) as u64)
+        );
+        {
+            let connection = session.connection_for_test().expect("lock session");
+            let parents = connection
+                .prepare("SELECT parent_id FROM entries WHERE id IN (?1, ?2) ORDER BY id")
+                .expect("prepare sibling query")
+                .query_map(
+                    params![
+                        i64::try_from(original.request_entry.0)
+                            .expect("original entry fits SQLite"),
+                        i64::try_from(corrected.request_entry.0)
+                            .expect("corrected entry fits SQLite"),
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("query sibling parents")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read sibling parents");
+            assert_eq!(parents, [root.0 as i64, root.0 as i64]);
+        }
+
+        writer
+            .close_run(
+                corrected.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close corrected request");
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_selects_a_requests_projected_parent() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("request to correct".to_owned())
+            .await
+            .expect("commit request")
+            .run_id;
+        let request = active_entry_id(&session);
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request run");
+        let restore = writer
+            .restore_at(SessionEntryId(request as u64))
+            .await
+            .expect("project request parent");
+        assert_eq!(restore.effective_entry, SessionEntryId(root as u64));
+
+        writer
+            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .await
+            .expect("select request parent");
+        let selected = session.restore().expect("restore selected parent");
+        assert_eq!(selected.effective_entry, SessionEntryId(root as u64));
+        assert!(selected.records.is_empty());
+        writer
+            .commit_request("corrected request".to_owned())
+            .await
+            .expect("commit corrected request");
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock selected session connection")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = (SELECT active_entry_id FROM session)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read corrected request parent"),
+            root
+        );
+
+        drop(writer);
+        session.close().expect("close selected session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_no_op_bypasses_the_write_gate() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection(),
+            checkpoint(&workspace).await,
+            gate.clone(),
+        )
+        .expect("create gated session");
+        let writer = session.writer();
+        let active = SessionEntryId(active_entry_id(&session) as u64);
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        writer
+            .select_active_entry(active, active)
+            .await
+            .expect("select current entry");
+
+        assert!(!gate.has_started());
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        drop(writer);
+        session.close().expect("close gated session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_stale_unknown_overflow_and_open_runs() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let completed_run = writer
+            .commit_request("completed request".to_owned())
+            .await
+            .expect("commit completed request")
+            .run_id;
+        writer
+            .close_run(
+                completed_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close completed request");
+        let stale = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root before stale selection");
+        writer
+            .select_active_entry(stale.effective_entry, stale.observed_active_entry)
+            .await
+            .expect("move active leaf to root");
+        let before_stale = selection_snapshot(&session);
+        let before_stale_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(stale.effective_entry, stale.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_stale);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_stale_database
+        );
+
+        let active = SessionEntryId(active_entry_id(&session) as u64);
+        let before_unknown = selection_snapshot(&session);
+        let before_unknown_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(SessionEntryId(999), active)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_unknown);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_unknown_database
+        );
+        assert!(matches!(
+            writer
+                .select_active_entry(SessionEntryId(u64::MAX), active)
+                .await,
+            Err(SessionError::IdOverflow)
+        ));
+        assert_eq!(selection_snapshot(&session), before_unknown);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_unknown_database
+        );
+
+        let open_run = writer
+            .commit_request("open request".to_owned())
+            .await
+            .expect("commit open request")
+            .run_id;
+        let open = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with open run");
+        let before_open = selection_snapshot(&session);
+        let before_open_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(open.effective_entry, open.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_open);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_open_database
+        );
+        writer
+            .close_run(
+                open_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close open request");
+
+        drop(writer);
+        session.close().expect("close rejection session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_pending_model_steps() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("pending step request".to_owned())
+            .await
+            .expect("commit pending step request")
+            .run_id;
+        writer
+            .start_model_step(run)
+            .await
+            .expect("start pending step");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER runs_cannot_close_with_pending_steps")
+            .expect("allow unreachable pending-step fixture");
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "closed with a pending step".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close pending-step fixture");
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock pending-step session connection");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL)",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .expect("read pending-step fixture"),
+                (0, 1)
+            );
+        }
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with pending step");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close pending-step session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rejects_unfinished_subagent_tasks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("task request".to_owned())
+            .await
+            .expect("commit task request")
+            .run_id;
+        let (step, _) =
+            settle_fixture_execution(&session, &writer, run, "task_value = 1", None, Vec::new())
+                .await;
+        let task = TaskRecord::for_test("00", 1, selection(), None, 1, Vec::new())
+            .with_persisted_details_for_test(TaskPersistedDetails {
+                admitted_at_ms: 1,
+                terminal_at_ms: None,
+                state: TaskState::Starting,
+                step_count: 0,
+                elapsed: Duration::ZERO,
+                observed_at_ms: 1,
+                attempt_evidence: Vec::new(),
+                executions: Vec::new(),
+                outcome: None,
+            });
+        assert!(
+            writer
+                .admit_subagent_task(
+                    TaskAdmission::from_record(&task, step).expect("encode unfinished task"),
+                    || false,
+                )
+                .await
+                .expect("admit unfinished task")
+        );
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close task run");
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock unfinished-task session connection");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE settled_entry_id IS NULL), (SELECT COUNT(*) FROM subagent_tasks WHERE terminal_revision IS NULL)",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .expect("read unfinished-task fixture"),
+                (0, 0, 1)
+            );
+        }
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root with unfinished task");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close unfinished-task session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_uses_its_own_write_gate() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Selection);
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection(),
+            checkpoint(&workspace).await,
+            gate.clone(),
+        )
+        .expect("create gated session");
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("gated request".to_owned())
+            .await
+            .expect("commit gated request")
+            .run_id;
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close gated request");
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project gated selection");
+        let before = selection_snapshot(&session);
+        let selection = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                writer
+                    .select_active_entry(
+                        projection.effective_entry,
+                        projection.observed_active_entry,
+                    )
+                    .await
+            }
+        });
+
+        gate.wait_until_started().await;
+        assert_eq!(selection_snapshot(&session), before);
+        gate.release();
+        selection
+            .await
+            .expect("join gated selection")
+            .expect("persist gated selection");
+        assert_eq!(active_entry_id(&session), root);
+
+        drop(writer);
+        session.close().expect("close gated session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn select_active_entry_rolls_back_a_failed_transaction() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let run = writer
+            .commit_request("failing selection request".to_owned())
+            .await
+            .expect("commit failing selection request")
+            .run_id;
+        writer
+            .close_run(
+                run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selection failure fixture".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close failing selection request");
+        let projection = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project failed selection target");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_active_entry_selection BEFORE UPDATE OF active_entry_id ON session BEGIN SELECT RAISE(ABORT, 'reject active-entry selection'); END;",
+            )
+            .expect("install selection rollback trigger");
+        let before = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+
+        assert!(matches!(
+            writer
+                .select_active_entry(projection.effective_entry, projection.observed_active_entry)
+                .await,
+            Err(SessionError::Sqlite(_))
+        ));
+        assert_eq!(selection_snapshot(&session), before);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+
+        drop(writer);
+        session.close().expect("close rollback session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_at_projects_root_request_execution_and_terminal_entries() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let root_checkpoint = session.initial_checkpoint().expect("load root checkpoint");
+
+        let final_run = writer
+            .commit_request("final request".to_owned())
+            .await
+            .expect("commit final request")
+            .run_id;
+        let request = active_entry_id(&session);
+        let (_, execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            final_run,
+            "final_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        let final_step = writer
+            .start_model_step(final_run)
+            .await
+            .expect("start final step");
+        writer
+            .close_run(
+                final_run,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "final text".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close final run");
+        let final_entry = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let cancelled_run = writer
+            .commit_request("cancelled request".to_owned())
+            .await
+            .expect("commit cancelled request")
+            .run_id;
+        writer
+            .close_run(
+                cancelled_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close cancelled run");
+        let cancelled = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let failed_run = writer
+            .commit_request("failed request".to_owned())
+            .await
+            .expect("commit failed request")
+            .run_id;
+        writer
+            .close_run(
+                failed_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "failure".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close failed run");
+        let failed = active_entry_id(&session);
+        set_active_entry(&session, final_entry);
+        let saved_selection: (i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT active_entry_id, revision FROM session", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("read saved selection");
+
+        let root_restore = writer
+            .restore_at(SessionEntryId(root as u64))
+            .await
+            .expect("project root");
+        assert_eq!(root_restore.effective_entry, SessionEntryId(root as u64));
+        assert!(root_restore.records.is_empty());
+        assert_eq!(
+            root_restore
+                .executable
+                .expect("root is executable")
+                .checkpoint,
+            root_checkpoint
+        );
+
+        let request_restore = writer
+            .restore_at(SessionEntryId(request as u64))
+            .await
+            .expect("project request parent");
+        assert_eq!(request_restore.effective_entry, SessionEntryId(root as u64));
+        assert_eq!(
+            request_restore.request_prefill.as_deref(),
+            Some("final request")
+        );
+        assert!(request_restore.records.is_empty());
+
+        let execution_restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("project execution");
+        assert_eq!(
+            execution_restore.effective_entry,
+            SessionEntryId(execution as u64)
+        );
+        assert_eq!(execution_restore.records.len(), 2);
+
+        for (entry, expected) in [
+            (final_entry, "final"),
+            (cancelled, "cancelled"),
+            (failed, "failed"),
+        ] {
+            let restore = writer
+                .restore_at(SessionEntryId(entry as u64))
+                .await
+                .expect("project terminal");
+            assert_eq!(restore.effective_entry, SessionEntryId(entry as u64));
+            assert_eq!(restore.request_prefill, None);
+            assert!(
+                match (expected, restore.records.last().map(|record| &record.kind)) {
+                    ("final", Some(super::RestoredRecordKind::FinalMessage { text, .. })) => {
+                        text == "final text"
+                    }
+                    ("cancelled", Some(super::RestoredRecordKind::CancelledRun { .. })) => true,
+                    ("failed", Some(super::RestoredRecordKind::FailedRun { message, .. })) => {
+                        message == "failure"
+                    }
+                    _ => false,
+                }
+            );
+        }
+
+        let ordinary = session.restore().expect("restore saved active leaf");
+        assert_eq!(ordinary.effective_entry, SessionEntryId(final_entry as u64));
+        assert_eq!(
+            ordinary.observed_active_entry,
+            SessionEntryId(final_entry as u64)
+        );
+        assert!(matches!(
+            ordinary.records.last().map(|record| &record.kind),
+            Some(super::RestoredRecordKind::FinalMessage { text, .. }) if text == "final text"
+        ));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT active_entry_id, revision FROM session", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .expect("read unchanged saved selection"),
+            saved_selection
+        );
+
+        set_active_entry(&session, request);
+        let ordinary_request = session.restore().expect("restore saved request");
+        assert_eq!(
+            ordinary_request.effective_entry,
+            SessionEntryId(request as u64)
+        );
+        assert_eq!(
+            ordinary_request.observed_active_entry,
+            SessionEntryId(request as u64)
+        );
+        assert_eq!(ordinary_request.request_prefill, None);
+        assert!(matches!(
+            ordinary_request.records.as_slice(),
+            [super::RestoredRecord {
+                kind: super::RestoredRecordKind::UserRequest { request: text },
+                ..
+            }] if text == "final request"
+        ));
+        assert_eq!(
+            ordinary_request
+                .executable
+                .expect("saved request is executable")
+                .checkpoint,
+            root_checkpoint
+        );
+        assert_eq!(active_entry_id(&session), request);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_at_rejects_unknown_entries_without_mutating_session() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        writer
+            .commit_request("known request".to_owned())
+            .await
+            .expect("commit request");
+        let before: (i64, i64, i64) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT active_entry_id, revision, (SELECT COUNT(*) FROM entries) FROM session",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read session state");
+
+        for unknown in [SessionEntryId(999), SessionEntryId(u64::MAX)] {
+            assert!(matches!(
+                writer.restore_at(unknown).await,
+                Err(SessionError::InvalidTransition)
+            ));
+            let after: (i64, i64, i64) = session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT active_entry_id, revision, (SELECT COUNT(*) FROM entries) FROM session",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read unchanged session state");
+            assert_eq!(after, before);
+        }
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn catalogue_retains_complete_execution_for_tree_copy() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+
+        let final_run = writer
+            .commit_request("catalogue request".to_owned())
+            .await
+            .expect("commit request")
+            .run_id;
+        let expected_execution = Execution {
+            stdout: observation("catalogue stdout"),
+            stderr: observation("catalogue stderr"),
+            outcome: ExecutionOutcome::Complete {
+                result: Some(observation("catalogue result")),
+            },
+            tool_calls: vec![
+                ToolCall {
+                    tool: ToolName::Run,
+                    summary: ToolCallSummary::Exit(7),
+                },
+                ToolCall {
+                    tool: ToolName::Read,
+                    summary: ToolCallSummary::Failed,
+                },
+                ToolCall {
+                    tool: ToolName::Write,
+                    summary: ToolCallSummary::Created,
+                },
+            ],
+        };
+        let (_, execution) = settle_fixture_execution_with(
+            &session,
+            &writer,
+            final_run,
+            "catalogue_value = 1",
+            Some("catalogue commentary"),
+            expected_execution.clone(),
+        )
+        .await;
+        let final_step = writer
+            .start_model_step(final_run)
+            .await
+            .expect("start final step");
+        writer
+            .close_run(
+                final_run,
+                Some(final_step),
+                move || PersistedTerminal::Final {
+                    step_id: final_step,
+                    text: "catalogue final".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close final run");
+        let final_entry = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let cancelled_run = writer
+            .commit_request("catalogue cancelled".to_owned())
+            .await
+            .expect("commit cancelled request")
+            .run_id;
+        writer
+            .close_run(
+                cancelled_run,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close cancelled run");
+        let cancelled = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let failed_run = writer
+            .commit_request("catalogue failed".to_owned())
+            .await
+            .expect("commit failed request")
+            .run_id;
+        writer
+            .close_run(
+                failed_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "catalogue failure".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close failed run");
+        let failed = active_entry_id(&session);
+
+        let catalogue = writer.catalogue().await.expect("load catalogue");
+        assert_eq!(catalogue.active_entry, SessionEntryId(failed as u64));
+        assert_eq!(catalogue.entries.len(), 8);
+        assert!(matches!(
+            catalogue.entries[0],
+            super::SessionCatalogueEntry {
+                entry_id: SessionEntryId(id),
+                parent_id: None,
+                revision: 1,
+                kind: super::SessionCatalogueKind::Start,
+            } if id == root as u64
+        ));
+        assert!(matches!(
+            &catalogue.entries[1].kind,
+            super::SessionCatalogueKind::Request { text } if text == "catalogue request"
+        ));
+        assert_eq!(
+            catalogue.entries[2].entry_id,
+            SessionEntryId(execution as u64)
+        );
+        let super::SessionCatalogueKind::Execution {
+            source,
+            commentary,
+            execution,
+        } = &catalogue.entries[2].kind
+        else {
+            panic!("expected execution entry");
+        };
+        assert_eq!(source, "catalogue_value = 1");
+        assert_eq!(commentary.as_deref(), Some("catalogue commentary"));
+        assert_eq!(execution.as_ref(), &expected_execution);
+        assert!(matches!(
+            &catalogue.entries[3].kind,
+            super::SessionCatalogueKind::Final { text } if text == "catalogue final"
+        ));
+        assert!(matches!(
+            catalogue.entries[5].kind,
+            super::SessionCatalogueKind::Cancelled
+        ));
+        assert!(matches!(
+            catalogue.entries[7].kind,
+            super::SessionCatalogueKind::Failed
+        ));
+        assert!(
+            catalogue
+                .entries
+                .windows(2)
+                .all(|entries| entries[0].revision < entries[1].revision)
+        );
+        assert_eq!(
+            catalogue.entries[3].entry_id,
+            SessionEntryId(final_entry as u64)
+        );
+        assert_eq!(
+            catalogue.entries[5].entry_id,
+            SessionEntryId(cancelled as u64)
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_at_retains_all_terminal_tasks_but_projects_selected_tasks() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+
+        let selected_run = writer
+            .commit_request("selected request".to_owned())
+            .await
+            .expect("commit selected request")
+            .run_id;
+        let (selected_step, _) = settle_fixture_execution(
+            &session,
+            &writer,
+            selected_run,
+            "selected_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        let selected_terminal_step = writer
+            .start_model_step(selected_run)
+            .await
+            .expect("start selected terminal");
+        writer
+            .close_run(
+                selected_run,
+                Some(selected_terminal_step),
+                move || PersistedTerminal::Final {
+                    step_id: selected_terminal_step,
+                    text: "selected final".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close selected run");
+        let selected_leaf = active_entry_id(&session);
+        persist_completed_task(
+            &writer,
+            "00",
+            selected_step,
+            vec![crate::model::AttemptAccounting::UsageUnavailable],
+        )
+        .await;
+
+        set_active_entry(&session, root);
+        let hidden_run = writer
+            .commit_request("hidden request".to_owned())
+            .await
+            .expect("commit hidden request")
+            .run_id;
+        let (hidden_step, _) = settle_fixture_execution(
+            &session,
+            &writer,
+            hidden_run,
+            "hidden_value = 2",
+            None,
+            Vec::new(),
+        )
+        .await;
+        let hidden_terminal_step = writer
+            .start_model_step(hidden_run)
+            .await
+            .expect("start hidden terminal");
+        writer
+            .close_run(
+                hidden_run,
+                Some(hidden_terminal_step),
+                move || PersistedTerminal::Final {
+                    step_id: hidden_terminal_step,
+                    text: "hidden final".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close hidden run");
+        persist_completed_task(
+            &writer,
+            "01",
+            hidden_step,
+            vec![crate::model::AttemptAccounting::UsageUnavailable],
+        )
+        .await;
+        set_active_entry(&session, selected_leaf);
+
+        let restore = writer
+            .restore_at(SessionEntryId(selected_leaf as u64))
+            .await
+            .expect("project selected branch");
+        assert_eq!(
+            restore
+                .tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00"]
+        );
+        assert_eq!(
+            restore
+                .all_tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00", "01"]
+        );
+        assert_eq!(
+            restore.footer_adjustment,
+            [crate::model::AttemptAccounting::UsageUnavailable]
+        );
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "DROP TRIGGER subagent_tasks_parent_is_immutable;\
+                 DROP TRIGGER subagent_tasks_settled_are_immutable;",
+            )
+            .expect("remove task immutability triggers");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE subagent_tasks SET parent_task_id = id, task_revision = task_revision + 1 WHERE id = 1",
+                [],
+            )
+            .expect("corrupt hidden task ancestry");
+        let malformed = writer
+            .restore_at(SessionEntryId(selected_leaf as u64))
+            .await
+            .expect("read malformed task ancestry");
+        assert!(malformed.executable.is_none());
+        assert_eq!(
+            malformed
+                .all_tasks
+                .iter()
+                .map(|task| task.record.id().as_str())
+                .collect::<Vec<_>>(),
+            ["00"]
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrupt_non_selected_request_fails_catalogue_but_not_saved_restore() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let selected_run = writer
+            .commit_request("selected request".to_owned())
+            .await
+            .expect("commit selected request")
+            .run_id;
+        let _ = settle_fixture_execution(
+            &session,
+            &writer,
+            selected_run,
+            "selected_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        writer
+            .close_run(
+                selected_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selected terminal".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close selected run");
+        let selected_leaf = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        writer
+            .commit_request("corrupt sibling request".to_owned())
+            .await
+            .expect("commit sibling request");
+        let corrupt_request = active_entry_id(&session);
+        set_active_entry(&session, selected_leaf);
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET payload_json = '{}' WHERE id = ?1",
+                params![corrupt_request],
+            )
+            .expect("corrupt sibling request");
+
+        let restore = session.restore().expect("restore saved branch");
+        assert!(restore.executable.is_some());
+        assert_eq!(
+            restore.observed_active_entry,
+            SessionEntryId(selected_leaf as u64)
+        );
+        assert!(matches!(
+            writer.catalogue().await,
+            Err(SessionError::Codec(_))
+        ));
+        assert_eq!(active_entry_id(&session), selected_leaf);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrupt_non_selected_execution_tool_call_fails_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+        let selected_run = writer
+            .commit_request("selected request".to_owned())
+            .await
+            .expect("commit selected request")
+            .run_id;
+        let _ = settle_fixture_execution(
+            &session,
+            &writer,
+            selected_run,
+            "selected_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        writer
+            .close_run(
+                selected_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selected terminal".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close selected run");
+        let selected_leaf = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let sibling_run = writer
+            .commit_request("sibling request".to_owned())
+            .await
+            .expect("commit sibling request")
+            .run_id;
+        let (_, sibling_execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            sibling_run,
+            "sibling_value = 2",
+            None,
+            vec![ToolCall {
+                tool: ToolName::StartSubagent,
+                summary: ToolCallSummary::Subagent("00".to_owned()),
+            }],
+        )
+        .await;
+        set_active_entry(&session, selected_leaf);
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            let payload_json: String = connection
+                .query_row(
+                    "SELECT payload_json FROM entries WHERE id = ?1",
+                    params![sibling_execution],
+                    |row| row.get(0),
+                )
+                .expect("read sibling execution");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&payload_json).expect("decode sibling execution");
+            payload["Execution"]["execution"]["tool_calls"][0]["tool"] =
+                serde_json::Value::String("Read".to_owned());
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                    params![payload.to_string(), sibling_execution],
+                )
+                .expect("corrupt sibling tool call");
+        }
+
+        assert!(matches!(
+            writer.catalogue().await,
+            Err(SessionError::Codec(_))
+        ));
+        assert_eq!(active_entry_id(&session), selected_leaf);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrupt_non_selected_accounting_entry_disables_saved_restore() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = active_entry_id(&session);
+
+        let selected_run = writer
+            .commit_request("selected request".to_owned())
+            .await
+            .expect("commit selected request")
+            .run_id;
+        let _ = settle_fixture_execution(
+            &session,
+            &writer,
+            selected_run,
+            "selected_value = 1",
+            None,
+            Vec::new(),
+        )
+        .await;
+        writer
+            .close_run(
+                selected_run,
+                None,
+                || PersistedTerminal::Failed {
+                    message: "selected terminal".to_owned(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close selected run");
+        let selected_leaf = active_entry_id(&session);
+
+        set_active_entry(&session, root);
+        let sibling_run = writer
+            .commit_request("sibling request".to_owned())
+            .await
+            .expect("commit sibling request")
+            .run_id;
+        let (_, sibling_execution) = settle_fixture_execution(
+            &session,
+            &writer,
+            sibling_run,
+            "sibling_value = 2",
+            None,
+            Vec::new(),
+        )
+        .await;
+        set_active_entry(&session, selected_leaf);
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET payload_json = '{}' WHERE id = ?1",
+                params![sibling_execution],
+            )
+            .expect("corrupt sibling execution payload");
+
+        let restore = session.restore().expect("read saved branch");
+        assert_eq!(restore.records.len(), 3);
+        assert!(restore.executable.is_none());
+        assert_eq!(active_entry_id(&session), selected_leaf);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_at_rejects_malformed_replay_checkpoint_and_ancestry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("restore target".to_owned())
+            .await
+            .expect("commit request")
+            .run_id;
+        let (_, execution) =
+            settle_fixture_execution(&session, &writer, run, "target_value = 1", None, Vec::new())
+                .await;
+        let (replay, checkpoint_id, authorisations): (Vec<u8>, i64, String) = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT provider_replay, checkpoint_id, checkpoints.authorisations_json FROM entries JOIN checkpoints ON checkpoints.id = entries.checkpoint_id WHERE entries.id = ?1",
+                params![execution],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read target storage");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "DROP TRIGGER entries_are_immutable_before_update;\
+                 DROP TRIGGER checkpoints_are_immutable_before_update;",
+            )
+            .expect("remove fixture immutability triggers");
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET provider_replay = X'00' WHERE id = ?1",
+                params![execution],
+            )
+            .expect("corrupt target replay");
+        let replay_restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("read corrupt replay target");
+        assert_eq!(replay_restore.records.len(), 2);
+        assert!(replay_restore.executable.is_none());
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET provider_replay = ?1 WHERE id = ?2",
+                params![replay, execution],
+            )
+            .expect("restore target replay");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE checkpoints SET authorisations_json = '{}' WHERE id = ?1",
+                params![checkpoint_id],
+            )
+            .expect("corrupt target checkpoint");
+        let checkpoint_restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("read corrupt checkpoint target");
+        assert_eq!(checkpoint_restore.records.len(), 2);
+        assert!(checkpoint_restore.executable.is_none());
+
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE checkpoints SET authorisations_json = ?1 WHERE id = ?2",
+                params![authorisations, checkpoint_id],
+            )
+            .expect("restore target checkpoint");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET parent_id = id WHERE id = ?1",
+                params![execution],
+            )
+            .expect("corrupt target ancestry");
+        let ancestry_restore = writer
+            .restore_at(SessionEntryId(execution as u64))
+            .await
+            .expect("read corrupt ancestry target");
+        assert!(ancestry_restore.records.is_empty());
+        assert!(ancestry_restore.executable.is_none());
+
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]
@@ -4014,7 +6358,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("generation interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             writer
                                 .start_model_step(run_id)
                                 .await
@@ -4025,7 +6370,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("execution interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             writer
                                 .start_model_step(run_id)
                                 .await
@@ -4049,7 +6395,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("committed step interruption".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             let settled_step = writer
                                 .start_model_step(run_id)
                                 .await
@@ -4095,7 +6442,8 @@ mod tests {
                             let run_id = writer
                                 .commit_request("closed foreground".to_owned())
                                 .await
-                                .expect("commit request");
+                                .expect("commit request")
+                                .run_id;
                             let origin_step_id = writer
                                 .start_model_step(run_id)
                                 .await
@@ -4294,7 +6642,8 @@ mod tests {
         let run_id = writer
             .commit_request("interrupted request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -4405,7 +6754,8 @@ mod tests {
         let run_id = writer
             .commit_request("closed foreground".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await
@@ -4711,7 +7061,8 @@ mod tests {
         let run_id = writer
             .commit_request("combined interruption".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -4978,7 +7329,8 @@ mod tests {
         let run_id = writer
             .commit_request("interrupted request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -5074,7 +7426,8 @@ mod tests {
         let run_id = writer
             .commit_request("persist this request".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let code_step = writer
             .start_model_step(run_id)
             .await
@@ -5187,7 +7540,8 @@ mod tests {
         let run_id = writer
             .commit_request("rollback allocation".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         writer
             .start_model_step(run_id)
             .await
@@ -5232,7 +7586,8 @@ mod tests {
         let run_id = writer
             .commit_request("rollback".to_owned())
             .await
-            .expect("commit request");
+            .expect("commit request")
+            .run_id;
         let step_id = writer
             .start_model_step(run_id)
             .await
@@ -5296,7 +7651,8 @@ mod tests {
         let run_id = writer
             .commit_request("parent".to_owned())
             .await
-            .expect("start parent run");
+            .expect("start parent run")
+            .run_id;
         let origin_step_id = writer
             .start_model_step(run_id)
             .await

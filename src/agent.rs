@@ -2,15 +2,17 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::arena::{
-    Arena, ArenaError, ArenaProgress, Execution, ExecutionOutcome, InterruptedExecution,
-    Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
+    Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
+    InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
 use crate::config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
-    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelFailure, ModelHistory,
-    ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
+    AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
+    ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
-use crate::session::{PersistedCode, PersistedTerminal, SessionError, SessionWriter};
+use crate::session::{
+    PersistedCode, PersistedTerminal, SessionEntryId, SessionError, SessionWriter,
+};
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
@@ -107,6 +109,7 @@ pub enum AgentRunOutcome {
 pub(crate) enum PersistedAgentEvent {
     RequestCommitted {
         run_id: u64,
+        request_entry: SessionEntryId,
         request: String,
     },
     ModelStepStarted {
@@ -457,12 +460,88 @@ impl PendingCode {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ArenaRestoreTestGate {
+    attempts: std::sync::Arc<std::sync::Mutex<Vec<Checkpoint>>>,
+    failed_attempt: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    paused_attempt: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    paused: std::sync::Arc<tokio::sync::Semaphore>,
+    resume: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl ArenaRestoreTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            failed_attempt: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            paused_attempt: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            paused: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+            resume: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    pub(crate) fn fail_attempt(&self, attempt: usize) {
+        self.failed_attempt
+            .store(attempt, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn pause_attempt(&self, attempt: usize) {
+        self.paused_attempt
+            .store(attempt, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        self.paused
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("restore gate semaphore remains open")
+            .forget();
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.add_permits(1);
+    }
+
+    pub(crate) fn attempts(&self) -> Vec<Checkpoint> {
+        self.attempts.lock().expect("restore gate lock").clone()
+    }
+
+    async fn record(&self, checkpoint: Checkpoint) -> bool {
+        let attempt = {
+            let mut attempts = self.attempts.lock().expect("restore gate lock");
+            attempts.push(checkpoint);
+            attempts.len()
+        };
+        if self
+            .paused_attempt
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == attempt
+        {
+            self.paused.add_permits(1);
+            self.resume
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("restore gate semaphore remains open")
+                .forget();
+        }
+        self.failed_attempt
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == attempt
+    }
+}
+
 pub struct Agent<M: Model> {
     arena: Arena,
     model: M,
     model_context: ModelHistory,
     staged_final_message: Option<StagedFinalMessage>,
     invocation_context: Option<AgentInvocationContext>,
+    #[cfg(test)]
+    restore_test_gate: Option<ArenaRestoreTestGate>,
 }
 
 impl<M: Model> Agent<M> {
@@ -473,6 +552,8 @@ impl<M: Model> Agent<M> {
             model_context: ModelHistory::new(),
             staged_final_message: None,
             invocation_context: None,
+            #[cfg(test)]
+            restore_test_gate: None,
         }
     }
 
@@ -483,16 +564,49 @@ impl<M: Model> Agent<M> {
             model_context,
             staged_final_message: None,
             invocation_context: None,
+            #[cfg(test)]
+            restore_test_gate: None,
         }
+    }
+
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        self.arena.checkpoint()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_restore_test_gate(mut self, gate: ArenaRestoreTestGate) -> Self {
+        self.restore_test_gate = Some(gate);
+        self
+    }
+
+    pub(crate) fn validate_restored_history(
+        &self,
+        history: &ModelHistory,
+    ) -> Result<(), ModelError> {
+        self.model.validate_history(history)
+    }
+
+    pub(crate) async fn restore_arena(&mut self, checkpoint: Checkpoint) -> Result<(), ArenaError> {
+        #[cfg(test)]
+        if let Some(gate) = &self.restore_test_gate
+            && gate.record(checkpoint.clone()).await
+        {
+            return Err(ArenaError::Infrastructure {
+                message: "test arena restore failure".to_owned(),
+                execution: None,
+            });
+        }
+        self.arena.restore(checkpoint).await
+    }
+
+    pub(crate) fn replace_idle_state(&mut self, model_context: ModelHistory) {
+        self.model_context = model_context;
+        self.staged_final_message = None;
+        self.invocation_context = None;
     }
 
     pub(crate) fn set_invocation_context(&mut self, context: AgentInvocationContext) {
         self.invocation_context = Some(context);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn checkpoint_for_test(&self) -> crate::arena::Checkpoint {
-        self.arena.checkpoint()
     }
 
     pub(crate) async fn collect_child_result_values(
@@ -527,9 +641,14 @@ impl<M: Model> Agent<M> {
         if self.staged_final_message.is_some() {
             return Err(SessionError::InvalidTransition);
         }
-        let run_id = writer.commit_request(request.clone()).await?;
+        let admission = writer.commit_request(request.clone()).await?;
+        let run_id = admission.run_id;
         self.model_context.append_user_request(request.clone());
-        event(PersistedAgentEvent::RequestCommitted { run_id, request });
+        event(PersistedAgentEvent::RequestCommitted {
+            run_id,
+            request_entry: admission.request_entry,
+            request,
+        });
 
         let mut attempts = Vec::new();
         let mut committed_attempts = 0;
@@ -1344,7 +1463,7 @@ mod tests {
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
     };
-    use crate::session::{Session, SessionWriteGate, SessionWriteKind};
+    use crate::session::{Session, SessionEntryId, SessionWriteGate, SessionWriteKind};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -1466,6 +1585,72 @@ mod tests {
             tail_starts_mid_line: metadata.tail_starts_mid_line,
             partial_lines: metadata.head_ends_mid_line || metadata.tail_starts_mid_line,
         }
+    }
+
+    #[tokio::test]
+    async fn restored_state_replaces_arena_and_context_atomically() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "agent_value = 'old'".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "old final".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            agent.run("old request", &cancellation).await.unwrap(),
+            AgentRunOutcome::FinalMessageStaged
+        );
+        agent.admit_staged_final_message().unwrap();
+        let old_checkpoint = agent.arena.checkpoint();
+        let old_history = agent.model_context.clone();
+        agent
+            .arena
+            .execute("agent_value = 'target'", &cancellation)
+            .await
+            .expect("create target arena state");
+        let target_checkpoint = agent.arena.checkpoint();
+        let mut target_history = old_history.clone();
+        target_history.append_user_request("target request");
+        agent
+            .arena
+            .restore(old_checkpoint)
+            .await
+            .expect("restore old arena state");
+        agent.model_context = old_history;
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let coordinator: SessionSubagents = SubagentCoordinator::new(
+            SubagentPolicy::from(snapshot.subagents()),
+            Arc::new(ImmediateChildResultRunner),
+        );
+        agent.set_invocation_context(AgentInvocationContext::new(
+            coordinator.root_caller().await,
+            coordinator,
+        ));
+
+        agent
+            .restore_arena(target_checkpoint.clone())
+            .await
+            .expect("restore target arena state");
+        agent.replace_idle_state(target_history.clone());
+
+        assert_eq!(agent.arena.checkpoint(), target_checkpoint);
+        assert_eq!(agent.model_context, target_history);
+        assert!(agent.staged_final_message.is_none());
+        assert!(agent.invocation_context.is_none());
+        let execution = agent
+            .arena
+            .execute("agent_value", &CancellationToken::new())
+            .await
+            .expect("evaluate restored value");
+        assert_eq!(result_head(&execution), "'target'");
     }
 
     #[tokio::test]
@@ -2844,6 +3029,55 @@ mod tests {
 
         drop(writer);
         session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_request_admission_carries_its_committed_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent(
+            &workspace,
+            vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }],
+        )
+        .await;
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let mut events = Vec::new();
+        let outcome = {
+            let mut event = |event| events.push(event);
+            agent
+                .run_persisted(
+                    "request entry".to_owned(),
+                    &CancellationToken::new(),
+                    &session.writer(),
+                    &mut event,
+                )
+                .await
+                .expect("run persisted agent")
+        };
+        let request_entry = events
+            .into_iter()
+            .find_map(|event| match event {
+                super::PersistedAgentEvent::RequestCommitted { request_entry, .. } => {
+                    Some(request_entry)
+                }
+                _ => None,
+            })
+            .expect("request admission event");
+        let committed_entry: i64 = session
+            .connection_for_test()
+            .expect("lock session")
+            .query_row(
+                "SELECT id FROM entries WHERE run_id = ?1 AND kind = 'user_request'",
+                [i64::try_from(outcome.run_id).expect("run ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read committed request entry");
+        assert_eq!(request_entry, SessionEntryId(committed_entry as u64));
+        session.close().expect("close session");
     }
 
     #[tokio::test]

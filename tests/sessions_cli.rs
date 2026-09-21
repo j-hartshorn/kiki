@@ -7,6 +7,8 @@ use rusqlite::{Connection, params};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use tempfile::tempdir;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -105,6 +107,22 @@ fn create_session_fixture(
     database
 }
 
+#[cfg(unix)]
+fn detach_controlling_terminal(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_controlling_terminal(_command: &mut Command) {}
+
 fn invoke(home: &Path, workspace: &Path, arguments: &[&str], trace: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kiki"));
     command
@@ -115,6 +133,7 @@ fn invoke(home: &Path, workspace: &Path, arguments: &[&str], trace: Option<&Path
     if let Some(trace) = trace {
         command.env("KIKI_TRACE_FILE", trace);
     }
+    detach_controlling_terminal(&mut command);
     command.output().expect("run kiki")
 }
 
@@ -146,6 +165,7 @@ fn invoke_ready(
             .env("KIKI_MODEL", model)
             .env("KIKI_THINKING", thinking);
     }
+    detach_controlling_terminal(&mut command);
     command.output().expect("run configured kiki")
 }
 
