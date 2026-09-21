@@ -1249,7 +1249,6 @@ impl App {
         self.selection = None;
         self.drag = None;
         self.pending_copy = false;
-        self.pending_copy_text = None;
         if !preserve_status {
             self.notice = None;
         }
@@ -4324,6 +4323,32 @@ mod tests {
         );
         assert_eq!(app.notice(), Some("Copied"));
         assert!(app.flash.is_some());
+        assert!(app.tree_navigator.is_some());
+    }
+
+    #[test]
+    fn copying_from_tree_survives_unavailable_history_geometry() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        let mut catalogue = long_session_tree_catalogue(3);
+        catalogue.active_entry = SessionEntryId(4);
+        assert!(app.handle_event(RuntimeEvent::TreeCatalogue {
+            revision,
+            outcome: TreeRequestOutcome::Catalogue(catalogue),
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(72, 8)).unwrap();
+        let mut clipboard = FakeClipboard::available();
+
+        assert!(!super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert!(app.history_viewport.is_none());
+
+        assert!(
+            app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert!(super::draw_frame(&mut terminal, &mut app, &mut clipboard).unwrap());
+        assert_eq!(clipboard.writes, ["entry 3"]);
+        assert_eq!(app.notice(), Some("Copied"));
         assert!(app.tree_navigator.is_some());
     }
 
