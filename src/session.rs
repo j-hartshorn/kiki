@@ -3263,6 +3263,29 @@ mod tests {
         observation("")
     }
 
+    fn projection_execution() -> Execution {
+        Execution {
+            stdout: empty_observation(),
+            stderr: empty_observation(),
+            outcome: ExecutionOutcome::Complete { result: None },
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn projection_code(result: crate::model::CodeResult, execution: bool) -> PersistedCode {
+        PersistedCode {
+            source: "projection code".to_owned(),
+            call_id: crate::model::ModelCallId::new("projection"),
+            commentary: None,
+            reasoning_summary: String::new(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            result,
+            execution: execution.then(projection_execution),
+            attempts: Vec::new(),
+        }
+    }
+
     fn insert_entry(
         connection: &Connection,
         parent_id: i64,
@@ -7984,229 +8007,239 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn rejected_terminal_shapes_leave_the_active_leaf_and_history_unchanged() {
-        for case in 0..9 {
-            let home = tempfile::tempdir().expect("create home");
-            let workspace = tempfile::tempdir().expect("create workspace");
-            let session = create_session(&home, &workspace).await;
-            let writer = session.writer();
-            let run = writer
-                .commit_request(format!("invalid terminal shape {case}"))
-                .await
-                .expect("commit request");
-            let needs_step = !matches!(case, 0 | 2 | 5);
-            let pending_step = if needs_step {
-                Some(
-                    writer
-                        .start_model_step(run.run_id)
-                        .await
-                        .expect("start pending step"),
-                )
-            } else {
-                None
-            };
-            let execution = || Execution {
-                stdout: empty_observation(),
-                stderr: empty_observation(),
-                outcome: ExecutionOutcome::Complete { result: None },
-                tool_calls: Vec::new(),
-            };
-            let code = |result, execution| PersistedCode {
-                source: "invalid terminal code".to_owned(),
-                call_id: crate::model::ModelCallId::new(format!("invalid-terminal-{case}")),
-                commentary: None,
-                reasoning_summary: String::new(),
-                selection: None,
-                replay: crate::model::ProviderReplay::new("test", Vec::new()),
-                result,
-                execution,
-                attempts: Vec::new(),
-            };
-            let (terminal, code) = match case {
-                0 => (
-                    PersistedTerminal::Final {
-                        step_id: 1,
-                        text: "missing pending step".to_owned(),
-                        reasoning_summary: String::new(),
-                        replay: crate::model::ProviderReplay::new("test", Vec::new()),
-                        attempts: Vec::new(),
-                    },
-                    None,
-                ),
-                1 => (
-                    PersistedTerminal::Final {
-                        step_id: pending_step.expect("pending step"),
-                        text: "final cannot contain code".to_owned(),
-                        reasoning_summary: String::new(),
-                        replay: crate::model::ProviderReplay::new("test", Vec::new()),
-                        attempts: Vec::new(),
-                    },
-                    Some(code(crate::model::CodeResult::failure(String::new()), None)),
-                ),
-                2 => (
-                    PersistedTerminal::Cancelled {
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::cancelled(String::new()),
-                        None,
-                    )),
-                ),
-                3 => (
-                    PersistedTerminal::Cancelled {
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::cancelled(String::new()),
-                        Some(execution()),
-                    )),
-                ),
-                4 => (
-                    PersistedTerminal::Cancelled {
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::execution(String::new()),
-                        None,
-                    )),
-                ),
-                5 => (
-                    PersistedTerminal::Failed {
-                        message: "missing pending step".to_owned(),
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(crate::model::CodeResult::failure(String::new()), None)),
-                ),
-                6 => (
-                    PersistedTerminal::Failed {
-                        message: "terminal code cannot execute".to_owned(),
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::failure(String::new()),
-                        Some(execution()),
-                    )),
-                ),
-                7 => (
-                    PersistedTerminal::Failed {
-                        message: "failed terminal code must fail".to_owned(),
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::cancelled(String::new()),
-                        None,
-                    )),
-                ),
-                8 => (
-                    PersistedTerminal::Failed {
-                        message: "failed terminal code must fail".to_owned(),
-                        evidence: None,
-                        attempts: Vec::new(),
-                    },
-                    Some(code(
-                        crate::model::CodeResult::execution(String::new()),
-                        None,
-                    )),
-                ),
-                _ => unreachable!(),
-            };
-            let before_selection = selection_snapshot(&session);
-            let before_history = writer.model_history().expect("read live history");
+    #[test]
+    fn terminal_projection_validation_covers_every_shape() {
+        let terminals = [
+            (
+                "final",
+                PersistedTerminal::Final {
+                    step_id: 1,
+                    text: String::new(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+            ),
+            (
+                "cancelled",
+                PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+            ),
+            (
+                "failed",
+                PersistedTerminal::Failed {
+                    message: String::new(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+            ),
+        ];
+        let codes = [
+            ("no code", None),
+            (
+                "execution result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::execution(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "execution result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::execution(String::new()),
+                    true,
+                )),
+            ),
+            (
+                "cancelled result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::cancelled(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "cancelled result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::cancelled(String::new()),
+                    true,
+                )),
+            ),
+            (
+                "failure result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::failure(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "failure result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::failure(String::new()),
+                    true,
+                )),
+            ),
+        ];
+        let valid = [
+            (true, "final", "no code"),
+            (false, "cancelled", "no code"),
+            (true, "cancelled", "no code"),
+            (true, "cancelled", "cancelled result without execution"),
+            (true, "cancelled", "failure result without execution"),
+            (false, "failed", "no code"),
+            (true, "failed", "no code"),
+            (true, "failed", "failure result without execution"),
+        ];
 
-            assert!(matches!(
-                writer
-                    .close_run(run.run_id, pending_step, move || terminal, code)
-                    .await,
-                Err(SessionError::InvalidTransition)
-            ));
-            assert_eq!(selection_snapshot(&session), before_selection);
+        for pending_step_id in [None, Some(1)] {
+            for (terminal_kind, terminal) in &terminals {
+                for (code_kind, code) in &codes {
+                    let expected =
+                        valid.contains(&(pending_step_id.is_some(), *terminal_kind, *code_kind));
+                    assert_eq!(
+                        super::validate_terminal_projection(
+                            pending_step_id,
+                            terminal,
+                            code.as_ref()
+                        )
+                        .is_ok(),
+                        expected,
+                        "pending step: {}, terminal: {terminal_kind}, code: {code_kind}",
+                        pending_step_id.is_some(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execution_projection_validation_covers_every_shape() {
+        for (description, code, expected) in [
+            (
+                "execution result without execution",
+                projection_code(crate::model::CodeResult::execution(String::new()), false),
+                false,
+            ),
+            (
+                "execution result with execution",
+                projection_code(crate::model::CodeResult::execution(String::new()), true),
+                true,
+            ),
+            (
+                "cancelled result without execution",
+                projection_code(crate::model::CodeResult::cancelled(String::new()), false),
+                false,
+            ),
+            (
+                "cancelled result with execution",
+                projection_code(crate::model::CodeResult::cancelled(String::new()), true),
+                false,
+            ),
+            (
+                "failure result without execution",
+                projection_code(crate::model::CodeResult::failure(String::new()), false),
+                false,
+            ),
+            (
+                "failure result with execution",
+                projection_code(crate::model::CodeResult::failure(String::new()), true),
+                false,
+            ),
+        ] {
             assert_eq!(
-                writer.model_history().expect("read unchanged history"),
-                before_history
+                super::validate_execution_projection(&code).is_ok(),
+                expected,
+                "{description}",
             );
-
-            drop(writer);
-            session.close().expect("close session");
         }
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn rejected_execution_shapes_leave_the_active_leaf_and_history_unchanged() {
-        for case in 0..3 {
-            let home = tempfile::tempdir().expect("create home");
-            let workspace = tempfile::tempdir().expect("create workspace");
-            let session = create_session(&home, &workspace).await;
-            let writer = session.writer();
-            let run = writer
-                .commit_request(format!("invalid execution shape {case}"))
-                .await
-                .expect("commit request");
-            let step = writer
-                .start_model_step(run.run_id)
-                .await
-                .expect("start pending step");
-            let execution = || Execution {
-                stdout: empty_observation(),
-                stderr: empty_observation(),
-                outcome: ExecutionOutcome::Complete { result: None },
-                tool_calls: Vec::new(),
-            };
-            let (result, execution) = match case {
-                0 => (crate::model::CodeResult::execution(String::new()), None),
-                1 => (
-                    crate::model::CodeResult::cancelled(String::new()),
-                    Some(execution()),
-                ),
-                2 => (
-                    crate::model::CodeResult::failure(String::new()),
-                    Some(execution()),
-                ),
-                _ => unreachable!(),
-            };
-            let before_selection = selection_snapshot(&session);
-            let before_history = writer.model_history().expect("read live history");
+    async fn writer_rejects_invalid_execution_projection_without_mutation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("invalid execution projection".to_owned())
+            .await
+            .expect("commit request");
+        let step = writer
+            .start_model_step(run.run_id)
+            .await
+            .expect("start pending step");
+        let checkpoint = session.initial_checkpoint().expect("load checkpoint");
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
 
-            assert!(matches!(
-                writer
-                    .settle_execution(
-                        run.run_id,
-                        step,
-                        PersistedCode {
-                            source: "invalid execution code".to_owned(),
-                            call_id: crate::model::ModelCallId::new(format!(
-                                "invalid-execution-{case}"
-                            )),
-                            commentary: None,
-                            reasoning_summary: String::new(),
-                            selection: None,
-                            replay: crate::model::ProviderReplay::new("test", Vec::new()),
-                            result,
-                            execution,
-                            attempts: Vec::new(),
-                        },
-                        session.initial_checkpoint().expect("load checkpoint"),
-                    )
-                    .await,
-                Err(SessionError::InvalidTransition)
-            ));
-            assert_eq!(selection_snapshot(&session), before_selection);
-            assert_eq!(
-                writer.model_history().expect("read unchanged history"),
-                before_history
-            );
+        assert!(matches!(
+            writer
+                .settle_execution(
+                    run.run_id,
+                    step,
+                    projection_code(crate::model::CodeResult::execution(String::new()), false),
+                    checkpoint,
+                )
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
 
-            drop(writer);
-            session.close().expect("close session");
-        }
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writer_rejects_invalid_terminal_projection_without_mutation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("invalid terminal projection".to_owned())
+            .await
+            .expect("commit request");
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+        let terminal = PersistedTerminal::Final {
+            step_id: 1,
+            text: String::new(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            attempts: Vec::new(),
+        };
+
+        assert!(matches!(
+            writer
+                .close_run(run.run_id, None, move || terminal, None)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]
