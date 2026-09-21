@@ -748,7 +748,9 @@ impl App {
             TreeNavigatorAction::Navigate(entry) => {
                 self.tree_navigator = None;
                 self.manual_navigation_pending = true;
-                Update::with_commands([RuntimeCommand::Navigate { entry }])
+                let mut update = Update::with_commands([RuntimeCommand::Navigate { entry }]);
+                update.visible_changed = true;
+                update
             }
         }
     }
@@ -4714,6 +4716,58 @@ mod tests {
                 entry: SessionEntryId(2)
             }]
         );
+    }
+
+    #[test]
+    fn tree_navigation_to_current_point_redraws_closed_tree_before_quit() {
+        let mut app = App::default();
+        let revision = tree_request(&mut app, "");
+        load_tree(&mut app, revision);
+        let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter))), Some(quit_event())]);
+        let (commands, mut received) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        event_sender
+            .send(RuntimeEvent::NavigationCompleted {
+                outcome: NavigationOutcome::Unchanged {
+                    request_prefill: None,
+                },
+            })
+            .unwrap();
+        let (_progress_sender, mut progress) = mpsc::channel(8);
+        let mut clipboard = FakeClipboard::available();
+
+        let redraws = super::run_loop(
+            &mut terminal,
+            &mut app,
+            &mut input,
+            &commands,
+            &mut events,
+            &mut progress,
+            &mut clipboard,
+        )
+        .unwrap();
+
+        assert_eq!(redraws, 2);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            RuntimeCommand::Navigate {
+                entry: SessionEntryId(3)
+            }
+        );
+        assert_eq!(received.try_recv().unwrap(), RuntimeCommand::Shutdown);
+        assert!(app.tree_navigator.is_none());
+        assert!(!app.manual_navigation_pending);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(72)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Status: idle"), "{screen}");
+        assert!(!screen.contains("Session tree"), "{screen}");
     }
 
     #[test]
