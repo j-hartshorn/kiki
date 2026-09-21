@@ -735,13 +735,15 @@ mod tests {
         (dir, OwnedFd::from(file))
     }
 
-    async fn assert_signal_esrch(target: libc::pid_t) {
+    async fn assert_test_target_absent(target: libc::pid_t) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if unsafe { libc::kill(target, 0) } == -1 {
-                    assert_eq!(
-                        std::io::Error::last_os_error().raw_os_error(),
-                        Some(libc::ESRCH)
+                    let error = std::io::Error::last_os_error().raw_os_error();
+                    // EPERM means the same-user test target exited and its ID was reused.
+                    assert!(
+                        matches!(error, Some(libc::ESRCH) | Some(libc::EPERM)),
+                        "unexpected process probe error: {error:?}"
                     );
                     return;
                 }
@@ -753,11 +755,11 @@ mod tests {
     }
 
     async fn assert_process_absent(pid: libc::pid_t) {
-        assert_signal_esrch(pid).await;
+        assert_test_target_absent(pid).await;
     }
 
     async fn assert_group_absent(pgid: libc::pid_t) {
-        assert_signal_esrch(-pgid).await;
+        assert_test_target_absent(-pgid).await;
     }
 
     #[tokio::test]
@@ -955,14 +957,24 @@ mod tests {
     #[tokio::test]
     async fn omitted_byte_accounting_in_diagnostic() {
         let (_dir, cwd) = test_cwd();
-        let err = execute_command_bounded(
-            "printf '1234567890' && printf 'abcdefghij' >&2",
-            cwd,
-            5,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let gate = CommandTestGate::new();
+        gate.hold_read();
+        let gate_clone = gate.clone();
+        let handle = tokio::spawn(async move {
+            execute_command_bounded(
+                "printf '1234567890' && printf 'abcdefghij' >&2",
+                cwd,
+                5,
+                Some(gate_clone),
+            )
+            .await
+        });
+
+        let pgid = gate.wait_until_started().await;
+        gate.wait_until_kill_sent(pgid).await;
+        gate.release_read();
+
+        let err = handle.await.unwrap().unwrap_err();
         match err {
             CommandError::Overflow(msg) => {
                 assert!(msg.contains("stdout and stderr exceeded the 5-byte limit by 10 bytes"));
