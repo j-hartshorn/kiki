@@ -1,3 +1,6 @@
+use std::fmt;
+use std::path::PathBuf;
+
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -40,7 +43,7 @@ impl GenerationEvidence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecutionEvidence {
     pub(crate) source: String,
     pub(crate) commentary: Option<String>,
@@ -49,8 +52,27 @@ pub struct ExecutionEvidence {
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) modified_paths: Vec<PathBuf>,
     pub(crate) cancellation_warning: Option<String>,
     pub(crate) failure: Option<ExecutionFailure>,
+}
+
+impl fmt::Debug for ExecutionEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionEvidence")
+            .field("source", &self.source)
+            .field("commentary", &self.commentary)
+            .field("reasoning_summary", &self.reasoning_summary)
+            .field("began", &self.began)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("tool_calls", &self.tool_calls)
+            .field("cancellation_warning", &self.cancellation_warning)
+            .field("failure", &self.failure)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +316,8 @@ impl ExecutionEvidence {
             stdout: interrupted.stdout,
             stderr: interrupted.stderr,
             tool_calls: interrupted.tool_calls,
+            read_paths: interrupted.read_paths,
+            modified_paths: interrupted.modified_paths,
             cancellation_warning: cancellation_warning.then(|| CANCELLATION_WARNING.to_owned()),
             failure: error.map(failure_evidence),
         }
@@ -323,6 +347,8 @@ fn empty_interrupted_execution() -> InterruptedExecution {
         stdout: empty_observation(),
         stderr: empty_observation(),
         tool_calls: Vec::new(),
+        read_paths: Vec::new(),
+        modified_paths: Vec::new(),
     }
 }
 
@@ -2547,6 +2573,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_cancellation_evidence_keeps_settled_file_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("set")).unwrap();
+        fs::write(workspace.path().join("set/tled"), "contents").unwrap();
+        let gate = ReadTestGate::new();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host")
+                .with_test_gate(gate.clone()),
+        )
+        .await
+        .expect("create arena");
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![ModelAction::Code {
+                source: "value = 'discarded'\nawait read('./set//tled')".to_owned(),
+            }]),
+        );
+        agent
+            .arena
+            .execute("value = 'before'", &CancellationToken::new())
+            .await
+            .expect("set checkpoint state");
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(agent.run("cancel", &cancellation));
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut run => panic!("agent returned before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut run => panic!("agent returned before its read settled: {result:?}"),
+        }
+        cancellation.cancel();
+        let AgentError::Arena { evidence, .. } = run.await.unwrap_err() else {
+            panic!("expected cancelled Arena evidence");
+        };
+        assert_eq!(evidence.read_paths, [PathBuf::from("set/tled")]);
+        assert!(evidence.modified_paths.is_empty());
+        assert!(!format!("{evidence:?}").contains("set/tled"));
+        let restored = agent
+            .arena
+            .execute("value", &CancellationToken::new())
+            .await
+            .expect("arena restores checkpoint state");
+        assert_eq!(result_head(&restored), "'before'");
+    }
+
+    #[tokio::test]
     async fn agent_returns_arena_failure_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         let mut agent = agent_with_model(
@@ -2886,10 +2964,15 @@ mod tests {
                 )),
             },
             tool_calls: Vec::new(),
+            read_paths: vec![PathBuf::from("private/effect-sentinel")],
+            modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
         };
 
+        let feedback = super::execution_feedback(&execution);
+        assert!(!feedback.contains("private/effect-sentinel"));
+        assert!(!feedback.contains("private/mutation-sentinel"));
         assert_eq!(
-            super::execution_feedback(&execution),
+            feedback,
             concat!(
                 "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n",
                 "<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\n",
@@ -3006,6 +3089,8 @@ mod tests {
                 omitted_bytes: 3,
             }),
             tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
         };
 
         assert_eq!(

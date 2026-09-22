@@ -27,7 +27,7 @@ const DATABASE_SUFFIX: &str = ".sqlite3";
 const LOCK_SUFFIX: &str = ".lock";
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_SIGNATURE: &[u8] = b"SQLite format 3\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const INTERRUPTION_MESSAGE: &str = "Interrupted by previous process exit";
 
 #[derive(Debug, Error)]
@@ -3269,6 +3269,8 @@ mod tests {
             stderr: empty_observation(),
             outcome: ExecutionOutcome::Complete { result: None },
             tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
         }
     }
 
@@ -3449,6 +3451,8 @@ mod tests {
                 stderr: empty_observation(),
                 outcome: ExecutionOutcome::Complete { result: None },
                 tool_calls,
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             },
         )
         .await
@@ -5040,6 +5044,8 @@ mod tests {
                     summary: ToolCallSummary::Created,
                 },
             ],
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
         };
         let (_, execution) = settle_fixture_execution_with(
             &session,
@@ -6088,6 +6094,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_one_database_is_rejected_before_opening_without_mutation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let database = database_path(home.path(), &id);
+        session.close().expect("close format-two session");
+        Connection::open(&database)
+            .expect("open database to create version-one fixture")
+            .execute_batch("PRAGMA user_version = 1;")
+            .expect("set version-one fixture");
+        let before = fs::read(&database).expect("read version-one database");
+
+        assert!(matches!(
+            Session::open(home.path(), &id),
+            Err(SessionError::UnsupportedVersion { found: 1 })
+        ));
+        assert_eq!(fs::read(&database).expect("read rejected database"), before);
+    }
+
+    #[tokio::test]
+    async fn execution_file_operations_round_trip_through_restart() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let run = writer
+            .commit_request("persist file operations".to_owned())
+            .await
+            .expect("commit request");
+        settle_fixture_execution_with(
+            &session,
+            &writer,
+            run.run_id,
+            "pass",
+            None,
+            Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+                read_paths: vec![PathBuf::from("a-b"), PathBuf::from("a/b")],
+                modified_paths: vec![PathBuf::from("m-n"), PathBuf::from("m/n")],
+            },
+        )
+        .await;
+        drop(writer);
+        session.close().expect("close session");
+
+        let reopened = Session::open(home.path(), &id).expect("reopen format-two session");
+        let restore = reopened.restore().expect("restore session");
+        let execution = restore
+            .records
+            .iter()
+            .find_map(|record| match &record.kind {
+                super::RestoredRecordKind::CompletedExecution { execution, .. } => Some(execution),
+                _ => None,
+            })
+            .expect("restored execution");
+        assert_eq!(
+            execution.read_paths,
+            [PathBuf::from("a/b"), PathBuf::from("a-b")]
+        );
+        assert_eq!(
+            execution.modified_paths,
+            [PathBuf::from("m/n"), PathBuf::from("m-n")]
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
     async fn schema_enforces_the_session_tree_and_lifecycle_guards() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -6127,7 +6205,7 @@ mod tests {
             connection
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .expect("read storage version"),
-            1
+            2
         );
         assert!(
             connection
@@ -6588,7 +6666,7 @@ mod tests {
             ("44444444444444444444444444444444", vec![0; 100]),
             ("55555555555555555555555555555555", {
                 let mut header = valid_header;
-                header[60..64].copy_from_slice(&2_u32.to_be_bytes());
+                header[60..64].copy_from_slice(&1_u32.to_be_bytes());
                 header.to_vec()
             }),
             ("66666666666666666666666666666666", {
@@ -7128,6 +7206,8 @@ mod tests {
                     stderr: empty_observation(),
                     outcome: crate::arena::ExecutionOutcome::Complete { result: None },
                     tool_calls: Vec::new(),
+                    read_paths: Vec::new(),
+                    modified_paths: Vec::new(),
                 },
                 vec![crate::model::AttemptAccounting::UsageUnavailable],
             )],
@@ -7942,6 +8022,8 @@ mod tests {
                                     stderr: empty_observation(),
                                     outcome: ExecutionOutcome::Complete { result: None },
                                     tool_calls: Vec::new(),
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                 }),
                                 attempts: Vec::new(),
                             },
@@ -8301,6 +8383,8 @@ mod tests {
                             stderr: empty_observation(),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         }),
                         attempts: Vec::new(),
                     },
@@ -8439,6 +8523,8 @@ mod tests {
                 stderr: empty_observation(),
                 outcome: crate::arena::ExecutionOutcome::Complete { result: None },
                 tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             }),
             attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
         };
@@ -8604,6 +8690,8 @@ mod tests {
                 stderr: empty_observation(),
                 outcome: crate::arena::ExecutionOutcome::Complete { result: None },
                 tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             }),
             attempts: Vec::new(),
         };

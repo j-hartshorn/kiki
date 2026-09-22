@@ -4124,6 +4124,7 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use ratatui::buffer::Buffer;
@@ -5446,6 +5447,8 @@ mod tests {
                             result: Some(observation("42")),
                         },
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts,
                 },
@@ -5476,6 +5479,8 @@ mod tests {
                             result: Some(observation("result")),
                         },
                         tool_calls,
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -6436,6 +6441,8 @@ store: false disables retained Response objects but does not prevent user reques
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "failure body".to_owned(),
                                     }),
@@ -6523,6 +6530,8 @@ warning body"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![usage(1, 1)],
                     },
@@ -7903,6 +7912,44 @@ truncated"
     }
 
     #[test]
+    fn execution_paths_remain_private_in_collapsed_and_expanded_cards() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        commentary: None,
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                            tool_calls: Vec::new(),
+                            read_paths: vec![PathBuf::from("private/effect-sentinel")],
+                            modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        for expanded in [false, true] {
+            if expanded {
+                assert!(transcript.toggle_arena_expansion());
+            }
+            let rendered = rendered_layout_text(&mut transcript);
+            assert!(!rendered.contains("private/effect-sentinel"));
+            assert!(!rendered.contains("private/mutation-sentinel"));
+        }
+    }
+
+    #[test]
     fn projection_formats_execution_and_interrupted_evidence() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -7922,6 +7969,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -7948,6 +7997,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "interrupted".to_owned(),
                                     }),
@@ -8336,6 +8387,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -8366,6 +8419,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             failure: None,
                             cancellation_warning: None,
                         }))),
@@ -8583,6 +8638,8 @@ truncated"
                                 result: Some(observation("**literal result**")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::UsageUnavailable],
                     },
@@ -8660,6 +8717,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::KnownUsage(ModelUsage {
                             model: hostile.to_owned(),
@@ -8730,6 +8789,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::RecoveryFailed {
                                         original: hostile.to_owned(),
                                         recovery: hostile.to_owned(),
@@ -9158,6 +9219,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9189,6 +9252,8 @@ truncated"
                                 result: Some(observation("done")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9264,6 +9329,8 @@ truncated"
                                 result: Some(observation("result-tail")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9382,6 +9449,8 @@ truncated"
                                 result: Some(observation("done")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9448,6 +9517,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10216,6 +10287,8 @@ truncated"
                                 result: Some(observation("UVW")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10288,6 +10361,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10310,6 +10385,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             cancellation_warning: Some("cancelled".to_owned()),
                             failure: None,
                         }))),
@@ -10331,6 +10408,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             cancellation_warning: None,
                             failure: Some(ExecutionFailure::Arena {
                                 message: "failed".to_owned(),
@@ -10419,6 +10498,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![usage(1, 1)],
                     },
@@ -10470,6 +10551,8 @@ truncated"
                                 result: Some(observation("fourth")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10510,6 +10593,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "failure".to_owned(),
                                     }),
@@ -10586,6 +10671,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },

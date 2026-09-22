@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -25,6 +25,8 @@ pub(super) enum CodecError {
     Json(#[from] serde_json::Error),
     #[error("stored session path is not hexadecimal")]
     InvalidPath,
+    #[error("stored execution path is not normalised workspace-relative")]
+    InvalidExecutionPath,
     #[error("stored content fingerprint is not a 32-byte hexadecimal value")]
     InvalidFingerprint,
     #[error("stored session model selection is invalid")]
@@ -160,6 +162,8 @@ struct StoredExecution {
     stderr: StoredObservation,
     outcome: StoredExecutionOutcome,
     tool_calls: Vec<StoredToolCall>,
+    read_paths: Vec<String>,
+    modified_paths: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -259,6 +263,8 @@ struct StoredExecutionEvidence {
     stdout: StoredObservation,
     stderr: StoredObservation,
     tool_calls: Vec<StoredToolCall>,
+    read_paths: Vec<String>,
+    modified_paths: Vec<String>,
     cancellation_warning: Option<String>,
     failure: Option<StoredExecutionFailure>,
 }
@@ -637,14 +643,16 @@ pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecEr
         executions: record
             .executions()
             .iter()
-            .map(|execution| StoredTaskExecution {
-                model_step: execution.model_step(),
-                source: execution.source().to_owned(),
-                reasoning_summary: execution.reasoning_summary().to_owned(),
-                execution: encode_execution_value(execution.execution()),
-                attempts: execution.attempts().iter().map(encode_attempt).collect(),
+            .map(|execution| {
+                Ok(StoredTaskExecution {
+                    model_step: execution.model_step(),
+                    source: execution.source().to_owned(),
+                    reasoning_summary: execution.reasoning_summary().to_owned(),
+                    execution: encode_execution_value(execution.execution())?,
+                    attempts: execution.attempts().iter().map(encode_attempt).collect(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, CodecError>>()?,
         outcome: record.outcome().map(|outcome| match outcome {
             TaskOutcome::Completed(result) => StoredTaskOutcome::Completed {
                 message: result.message().to_owned(),
@@ -755,7 +763,7 @@ pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, Code
         kind: "execution",
         payload_json: serde_json::to_string(&StoredPayload::Execution {
             code: encode_code(code),
-            execution: encode_execution_value(execution),
+            execution: encode_execution_value(execution)?,
         })?,
         provider_replay: Some(encode_replay(&code.replay)?),
     })
@@ -779,7 +787,7 @@ pub(super) fn encode_terminal(
     Ok(StoredEntry {
         kind,
         payload_json: serde_json::to_string(&StoredPayload::Terminal {
-            terminal: encode_terminal_value(terminal),
+            terminal: encode_terminal_value(terminal)?,
             code: code.map(|code| {
                 let mut code = encode_code(code);
                 code.attempts.clear();
@@ -923,8 +931,8 @@ fn decode_code_result(result: &StoredCodeResult) -> CodeResult {
     }
 }
 
-fn encode_execution_value(execution: &Execution) -> StoredExecution {
-    StoredExecution {
+fn encode_execution_value(execution: &Execution) -> Result<StoredExecution, CodecError> {
+    Ok(StoredExecution {
         stdout: encode_observation(&execution.stdout),
         stderr: encode_observation(&execution.stderr),
         outcome: match &execution.outcome {
@@ -937,7 +945,9 @@ fn encode_execution_value(execution: &Execution) -> StoredExecution {
             },
         },
         tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
-    }
+        read_paths: encode_effect_paths(&execution.read_paths)?,
+        modified_paths: encode_effect_paths(&execution.modified_paths)?,
+    })
 }
 
 fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, CodecError> {
@@ -961,7 +971,54 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
             .iter()
             .map(decode_tool_call)
             .collect::<Result<Vec<_>, _>>()?,
+        read_paths: decode_effect_paths(&execution.read_paths)?,
+        modified_paths: decode_effect_paths(&execution.modified_paths)?,
     })
+}
+
+fn encode_effect_paths(paths: &[PathBuf]) -> Result<Vec<String>, CodecError> {
+    paths
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|path| {
+            if !normalised_workspace_relative(path) {
+                return Err(CodecError::InvalidExecutionPath);
+            }
+            encode_path(path)
+        })
+        .collect()
+}
+
+fn decode_effect_paths(paths: &[String]) -> Result<Vec<PathBuf>, CodecError> {
+    let paths = paths
+        .iter()
+        .map(|path| {
+            let path = decode_path(path)?;
+            normalised_workspace_relative(&path)
+                .then_some(path)
+                .ok_or(CodecError::InvalidExecutionPath)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+        .then_some(paths)
+        .ok_or(CodecError::InvalidExecutionPath)
+}
+
+fn normalised_workspace_relative(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    let mut normalised = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return false;
+        };
+        normalised.push(component);
+    }
+    normalised.as_os_str() == path.as_os_str()
 }
 
 fn encode_observation(observation: &Observation) -> StoredObservation {
@@ -1093,8 +1150,8 @@ fn decode_tool_call_summary(summary: &StoredToolCallSummary) -> ToolCallSummary 
     }
 }
 
-fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
-    match terminal {
+fn encode_terminal_value(terminal: &PersistedTerminal) -> Result<StoredTerminal, CodecError> {
+    Ok(match terminal {
         PersistedTerminal::Final {
             text,
             reasoning_summary,
@@ -1106,7 +1163,7 @@ fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
         PersistedTerminal::Cancelled { evidence, attempts } => StoredTerminal::Cancelled {
-            evidence: evidence.as_ref().map(encode_evidence),
+            evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
         PersistedTerminal::Failed {
@@ -1115,24 +1172,24 @@ fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
             attempts,
         } => StoredTerminal::Failed {
             message: message.clone(),
-            evidence: evidence.as_ref().map(encode_evidence),
+            evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
-    }
+    })
 }
 
-fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
+fn encode_evidence(evidence: &TerminalEvidence) -> Result<StoredTerminalEvidence, CodecError> {
     match evidence {
-        TerminalEvidence::Generation(evidence) => {
-            StoredTerminalEvidence::Generation(StoredGenerationEvidence {
+        TerminalEvidence::Generation(evidence) => Ok(StoredTerminalEvidence::Generation(
+            StoredGenerationEvidence {
                 reasoning_summary: evidence.reasoning_summary.clone(),
                 reasoning: evidence.reasoning.clone(),
                 assistant_text: evidence.assistant_text.clone(),
                 decoded_python: evidence.decoded_python.clone(),
-            })
-        }
-        TerminalEvidence::Execution(evidence) => {
-            StoredTerminalEvidence::Execution(Box::new(StoredExecutionEvidence {
+            },
+        )),
+        TerminalEvidence::Execution(evidence) => Ok(StoredTerminalEvidence::Execution(Box::new(
+            StoredExecutionEvidence {
                 source: evidence.source.clone(),
                 commentary: evidence.commentary.clone(),
                 reasoning_summary: evidence.reasoning_summary.clone(),
@@ -1140,6 +1197,8 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
                 stdout: encode_observation(&evidence.stdout),
                 stderr: encode_observation(&evidence.stderr),
                 tool_calls: evidence.tool_calls.iter().map(encode_tool_call).collect(),
+                read_paths: encode_effect_paths(&evidence.read_paths)?,
+                modified_paths: encode_effect_paths(&evidence.modified_paths)?,
                 cancellation_warning: evidence.cancellation_warning.clone(),
                 failure: evidence.failure.as_ref().map(|failure| match failure {
                     ExecutionFailure::Arena { message } => StoredExecutionFailure::Arena {
@@ -1152,8 +1211,8 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
                         }
                     }
                 }),
-            }))
-        }
+            },
+        ))),
     }
 }
 
@@ -1180,6 +1239,8 @@ fn decode_evidence(evidence: &StoredTerminalEvidence) -> Result<TerminalEvidence
                     .iter()
                     .map(decode_tool_call)
                     .collect::<Result<Vec<_>, _>>()?,
+                read_paths: decode_effect_paths(&evidence.read_paths)?,
+                modified_paths: decode_effect_paths(&evidence.modified_paths)?,
                 cancellation_warning: evidence.cancellation_warning.clone(),
                 failure: evidence.failure.as_ref().map(|failure| match failure {
                     StoredExecutionFailure::Arena { message } => ExecutionFailure::Arena {
@@ -1488,12 +1549,60 @@ mod tests {
                 omitted_bytes: 9,
             }),
             tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
         };
 
         assert_eq!(
-            decode_execution_value(&encode_execution_value(&execution)).expect("decode execution"),
+            decode_execution_value(&encode_execution_value(&execution).expect("encode execution"))
+                .expect("decode execution"),
             execution
         );
+    }
+
+    #[test]
+    fn execution_file_path_codec_sorts_deduplicates_and_rejects_malformed_paths() {
+        let mut execution = task_execution();
+        execution.read_paths = vec![
+            PathBuf::from("nested/z"),
+            PathBuf::from("a-b"),
+            PathBuf::from("a/b"),
+            PathBuf::from("nested/a"),
+            PathBuf::from("nested/z"),
+        ];
+        execution.modified_paths = vec![PathBuf::from("nested/b")];
+        let stored = encode_execution_value(&execution).expect("encode execution");
+        let decoded = decode_execution_value(&stored).expect("decode execution");
+        assert_eq!(
+            decoded.read_paths,
+            [
+                PathBuf::from("a/b"),
+                PathBuf::from("a-b"),
+                PathBuf::from("nested/a"),
+                PathBuf::from("nested/z"),
+            ]
+        );
+        assert_eq!(decoded.modified_paths, [PathBuf::from("nested/b")]);
+
+        for paths in [
+            serde_json::json!(["2e2f6e65737465642f61"]),
+            serde_json::json!(["6e65737465642f61", "6e65737465642f61"]),
+            serde_json::json!(["612d62", "612f62"]),
+            serde_json::json!(["not-hex"]),
+        ] {
+            let mut value = serde_json::to_value(&stored).expect("serialise execution");
+            value["read_paths"] = paths;
+            let stored: super::StoredExecution =
+                serde_json::from_value(value).expect("decode stored execution");
+            assert!(decode_execution_value(&stored).is_err());
+        }
+
+        let mut value = serde_json::to_value(&stored).expect("serialise execution");
+        value
+            .as_object_mut()
+            .expect("stored execution object")
+            .remove("modified_paths");
+        assert!(serde_json::from_value::<super::StoredExecution>(value).is_err());
     }
 
     #[test]
@@ -1538,6 +1647,8 @@ mod tests {
                     stdout: execution.stdout.clone(),
                     stderr: execution.stderr.clone(),
                     tool_calls: execution.tool_calls.clone(),
+                    read_paths: execution.read_paths.clone(),
+                    modified_paths: execution.modified_paths.clone(),
                     cancellation_warning: None,
                     failure: None,
                 },
@@ -1626,6 +1737,8 @@ mod tests {
                 tool: crate::arena::ToolName::Run,
                 summary: crate::arena::ToolCallSummary::Exit(7),
             }],
+            read_paths: vec![PathBuf::from("nested/read")],
+            modified_paths: vec![PathBuf::from("nested/modified")],
         };
         let attempts = vec![
             crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(
@@ -1723,6 +1836,8 @@ mod tests {
                     stdout: execution.stdout.clone(),
                     stderr: execution.stderr.clone(),
                     tool_calls: execution.tool_calls.clone(),
+                    read_paths: execution.read_paths.clone(),
+                    modified_paths: execution.modified_paths.clone(),
                     cancellation_warning: Some("cancelled".to_owned()),
                     failure: Some(crate::agent::ExecutionFailure::RecoveryFailed {
                         original: "original".to_owned(),
@@ -1851,6 +1966,8 @@ mod tests {
             },
             outcome: ExecutionOutcome::Complete { result: None },
             tool_calls: Vec::new(),
+            read_paths: vec![PathBuf::from("nested/read")],
+            modified_paths: vec![PathBuf::from("nested/modified")],
         }
     }
 
@@ -1948,6 +2065,26 @@ mod tests {
         assert_eq!(details.executions[0].source, "value = 1");
         assert_eq!(details.executions[0].reasoning_summary, "reasoning");
         assert_eq!(details.executions[0].execution.stdout.head, "stdout");
+        assert_eq!(
+            details.executions[0].execution.read_paths,
+            ["6e65737465642f72656164"]
+        );
+        assert_eq!(
+            details.executions[0].execution.modified_paths,
+            ["6e65737465642f6d6f646966696564"]
+        );
+        let restored = decode_task_record_details(
+            &encode_task_details(&record).expect("encode child task execution"),
+        )
+        .expect("decode child task execution");
+        assert_eq!(
+            restored.details.executions[0].execution().read_paths,
+            [PathBuf::from("nested/read")]
+        );
+        assert_eq!(
+            restored.details.executions[0].execution().modified_paths,
+            [PathBuf::from("nested/modified")]
+        );
         assert!(matches!(
             details.executions[0].execution.outcome,
             super::StoredExecutionOutcome::Complete { result: None }

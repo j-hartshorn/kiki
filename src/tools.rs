@@ -235,6 +235,25 @@ impl ToolResult {
             .then(|| self.effect.as_ref().and_then(ToolEffect::mutation_status))
             .flatten()
     }
+
+    pub(crate) fn record_observed_file_operation(
+        &self,
+        read_paths: &mut BTreeSet<PathBuf>,
+        modified_paths: &mut BTreeSet<PathBuf>,
+    ) {
+        if !self.result.is_ok() {
+            return;
+        }
+        match self.effect.as_ref() {
+            Some(ToolEffect::Read { path, .. }) => {
+                read_paths.insert(path.clone());
+            }
+            Some(ToolEffect::Write { path, .. } | ToolEffect::Edit { path, .. }) => {
+                modified_paths.insert(path.clone());
+            }
+            None => {}
+        }
+    }
 }
 
 impl fmt::Debug for ToolResult {
@@ -5913,6 +5932,40 @@ mod tests {
                 Some(fingerprint("written"))
             );
         }
+    }
+
+    #[test]
+    fn observed_file_operations_keep_reads_and_mutations_independent() {
+        let path = normalise_path("nested/./file").unwrap();
+        let read = ToolResult {
+            call_id: 1,
+            result: Ok(ToolValue::String("contents".to_owned())),
+            effect: Some(ToolEffect::Read {
+                path: path.clone(),
+                fingerprint: fingerprint("contents"),
+            }),
+        };
+        let write = ToolResult {
+            call_id: 2,
+            result: Ok(ToolValue::None),
+            effect: Some(ToolEffect::Write {
+                path: path.clone(),
+                outcome: super::WholeFileWriteOutcome::Replaced,
+                fingerprint: fingerprint("new contents"),
+            }),
+        };
+        let failed = ToolResult::from_result(
+            3,
+            Err(ToolError::runtime("failed before an effect was observed")),
+        );
+        let mut reads = BTreeSet::new();
+        let mut modifications = BTreeSet::new();
+        for result in [&read, &write, &failed] {
+            result.record_observed_file_operation(&mut reads, &mut modifications);
+        }
+
+        assert_eq!(reads, BTreeSet::from([path.clone()]));
+        assert_eq!(modifications, BTreeSet::from([path]));
     }
 
     #[tokio::test]

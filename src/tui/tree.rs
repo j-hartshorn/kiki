@@ -1263,6 +1263,7 @@ fn normalise_header_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1571,6 +1572,47 @@ mod tests {
                 TreeNavigatorAction::Copy(expected.to_owned())
             );
         }
+    }
+
+    #[test]
+    fn execution_paths_remain_private_in_rows_search_and_copy() {
+        let kind = SessionCatalogueKind::Execution {
+            source: "pass".to_owned(),
+            commentary: None,
+            execution: Box::new(Execution {
+                stdout: observation(""),
+                stderr: observation(""),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+                read_paths: vec![PathBuf::from("private/effect-sentinel")],
+                modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+            }),
+        };
+        let catalogue = catalogue(
+            2,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, kind.clone()),
+            ],
+        );
+        let tree = SessionTree::from_catalogue(&catalogue);
+        let mut picker = tree.picker();
+        let rows = tree_rows(&mut picker);
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("private/effect-sentinel"))
+        );
+        assert!(
+            tree.nodes[1]
+                .canonical_search_text
+                .find("private/effect-sentinel")
+                .is_none()
+        );
+        let TreeNavigatorAction::Copy(copy) = copy_action(kind) else {
+            panic!("execution must be copyable");
+        };
+        assert!(!copy.contains("private/effect-sentinel"));
+        assert!(!copy.contains("private/mutation-sentinel"));
     }
 
     #[test]
@@ -3114,6 +3156,8 @@ mod tests {
                 stderr,
                 outcome,
                 tool_calls,
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             }),
         }
     }
@@ -3165,6 +3209,8 @@ mod tests {
                         summary,
                     })
                     .collect(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             }),
         }
     }
