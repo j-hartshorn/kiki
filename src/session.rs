@@ -62,6 +62,8 @@ pub(crate) enum SessionError {
     Sqlite(#[from] rusqlite::Error),
     #[error("session writer is unavailable")]
     WriterUnavailable,
+    #[error("session model context is unavailable")]
+    ModelContextUnavailable,
     #[error("session still has active write handles")]
     ActiveWriteHandles,
     #[error("session database identifier overflowed")]
@@ -329,6 +331,7 @@ pub(crate) enum SessionWriteKind {
     TaskAdmission,
     TaskStep,
     TaskTerminal,
+    #[cfg(test)]
     Selection,
 }
 
@@ -477,8 +480,14 @@ impl SessionWriteGate {
     }
 }
 
+struct LiveSessionContext {
+    effective_entry: SessionEntryId,
+    history: ModelHistory,
+}
+
 struct SessionState {
     connection: Mutex<Connection>,
+    model_context: Mutex<Option<LiveSessionContext>>,
     active_execution_step: Mutex<Option<u64>>,
     _writer_lock: File,
     #[cfg(test)]
@@ -713,6 +722,7 @@ impl Session {
             id,
             state: Arc::new(SessionState {
                 connection: Mutex::new(connection),
+                model_context: Mutex::new(None),
                 active_execution_step: Mutex::new(None),
                 _writer_lock: writer_lock,
                 #[cfg(test)]
@@ -766,6 +776,21 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub(crate) fn sync_model_context_for_test(&self) -> Result<(), SessionError> {
+        let restore = self.restore()?;
+        let executable = restore.executable.ok_or(SessionError::InvalidTransition)?;
+        *self
+            .state
+            .model_context
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)? = Some(LiveSessionContext {
+            effective_entry: restore.effective_entry,
+            history: executable.history,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn connection_for_test(&self) -> Result<MutexGuard<'_, Connection>, SessionError> {
         self.connection()
     }
@@ -810,18 +835,68 @@ impl SessionWriter {
         self.read(load_session_catalogue).await
     }
 
+    pub(crate) fn model_history(&self) -> Result<ModelHistory, SessionError> {
+        self.state
+            .model_context
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .as_ref()
+            .map(|context| context.history.clone())
+            .ok_or(SessionError::ModelContextUnavailable)
+    }
+
+    pub(crate) async fn activate(
+        &self,
+        effective_entry: SessionEntryId,
+        observed_active_entry: SessionEntryId,
+        history: ModelHistory,
+    ) -> Result<(), SessionError> {
+        let state = Arc::clone(&self.state);
+        task::spawn_blocking(move || {
+            #[cfg(test)]
+            if effective_entry != observed_active_entry
+                && let Some(gate) = &state.write_gate
+            {
+                gate.wait(SessionWriteKind::Selection);
+            }
+            let mut context = state
+                .model_context
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            if context
+                .as_ref()
+                .is_some_and(|context| context.effective_entry != observed_active_entry)
+            {
+                return Err(SessionError::InvalidTransition);
+            }
+            let mut connection = state
+                .connection
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            activate_entry(&mut connection, effective_entry, observed_active_entry)?;
+            *context = Some(LiveSessionContext {
+                effective_entry,
+                history,
+            });
+            Ok(())
+        })
+        .await
+        .map_err(|_| SessionError::WriterUnavailable)?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn select_active_entry(
         &self,
         effective_entry: SessionEntryId,
         observed_active_entry: SessionEntryId,
     ) -> Result<(), SessionError> {
-        if effective_entry == observed_active_entry {
-            return Ok(());
-        }
-        self.write(SessionWriteKind::Selection, move |connection| {
-            select_active_entry(connection, effective_entry, observed_active_entry)
-        })
-        .await
+        let restore = self.restore_at(effective_entry).await?;
+        let history = restore
+            .executable
+            .ok_or(SessionError::InvalidTransition)?
+            .history;
+        self.activate(effective_entry, observed_active_entry, history)
+            .await
     }
 
     pub(crate) fn mark_execution_started(&self, step_id: u64) {
@@ -903,8 +978,13 @@ impl SessionWriter {
         &self,
         request: String,
     ) -> Result<RequestAdmission, SessionError> {
-        self.write(SessionWriteKind::Request, move |connection| {
-            commit_request(connection, &request)
+        self.write_context(SessionWriteKind::Request, move |connection, context| {
+            let mut history = context.history.clone();
+            history.append_user_request(request.clone());
+            let admission = commit_request(connection, &request, context.effective_entry)?;
+            context.effective_entry = admission.request_entry;
+            context.history = history;
+            Ok(admission)
         })
         .await
     }
@@ -923,8 +1003,21 @@ impl SessionWriter {
         code: PersistedCode,
         checkpoint: Checkpoint,
     ) -> Result<(), SessionError> {
-        self.write(SessionWriteKind::Settlement, move |connection| {
-            settle_execution(connection, run_id, step_id, &code, &checkpoint)
+        self.write_context(SessionWriteKind::Settlement, move |connection, context| {
+            validate_execution_projection(&code)?;
+            let mut history = context.history.clone();
+            append_persisted_code(&mut history, &code)?;
+            let entry = settle_execution(
+                connection,
+                run_id,
+                step_id,
+                &code,
+                &checkpoint,
+                context.effective_entry,
+            )?;
+            context.effective_entry = entry;
+            context.history = history;
+            Ok(())
         })
         .await
     }
@@ -936,15 +1029,20 @@ impl SessionWriter {
         terminal: impl FnOnce() -> PersistedTerminal + Send + 'static,
         code: Option<PersistedCode>,
     ) -> Result<PersistedTerminal, SessionError> {
-        self.write(SessionWriteKind::Closure, move |connection| {
+        self.write_context(SessionWriteKind::Closure, move |connection, context| {
             let terminal = terminal();
-            close_run(
+            validate_terminal_projection(pending_step_id, &terminal, code.as_ref())?;
+            let history = terminal_history(&context.history, &terminal, code.as_ref())?;
+            let entry = close_run(
                 connection,
                 run_id,
                 pending_step_id,
                 &terminal,
                 code.as_ref(),
+                context.effective_entry,
             )?;
+            context.effective_entry = entry;
+            context.history = history;
             Ok(terminal)
         })
         .await
@@ -1001,6 +1099,38 @@ impl SessionWriter {
                 .lock()
                 .map_err(|_| SessionError::WriterUnavailable)?;
             operation(&mut connection)
+        })
+        .await
+        .map_err(|_| SessionError::WriterUnavailable)?
+    }
+
+    async fn write_context<T: Send + 'static>(
+        &self,
+        kind: SessionWriteKind,
+        operation: impl FnOnce(&mut Connection, &mut LiveSessionContext) -> Result<T, SessionError>
+        + Send
+        + 'static,
+    ) -> Result<T, SessionError> {
+        let state = Arc::clone(&self.state);
+        task::spawn_blocking(move || {
+            #[cfg(not(test))]
+            let _ = kind;
+            #[cfg(test)]
+            if let Some(gate) = &state.write_gate {
+                gate.wait(kind);
+            }
+            let mut context = state
+                .model_context
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            let context = context
+                .as_mut()
+                .ok_or(SessionError::ModelContextUnavailable)?;
+            let mut connection = state
+                .connection
+                .lock()
+                .map_err(|_| SessionError::WriterUnavailable)?;
+            operation(&mut connection, context)
         })
         .await
         .map_err(|_| SessionError::WriterUnavailable)?
@@ -1080,7 +1210,7 @@ fn commit_name(connection: &mut Connection, name: &str) -> Result<(), SessionErr
     Ok(())
 }
 
-fn select_active_entry(
+fn activate_entry(
     connection: &mut Connection,
     effective_entry: SessionEntryId,
     observed_active_entry: SessionEntryId,
@@ -1088,7 +1218,6 @@ fn select_active_entry(
     let effective_entry = i64::try_from(effective_entry.0).map_err(|_| SessionError::IdOverflow)?;
     let observed_active_entry =
         i64::try_from(observed_active_entry.0).map_err(|_| SessionError::IdOverflow)?;
-    let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (active_entry, revision): (i64, i64) = transaction.query_row(
         "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
@@ -1114,13 +1243,16 @@ fn select_active_entry(
     if has_unfinished_work {
         return Err(SessionError::InvalidTransition);
     }
-    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
-    if transaction.execute(
-        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1 AND active_entry_id = ?4",
-        params![effective_entry, now, next_revision, observed_active_entry],
-    )? != 1
-    {
-        return Err(SessionError::InvalidTransition);
+    if effective_entry != observed_active_entry {
+        let now = now_ms()?;
+        let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+        if transaction.execute(
+            "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1 AND active_entry_id = ?4",
+            params![effective_entry, now, next_revision, observed_active_entry],
+        )? != 1
+        {
+            return Err(SessionError::InvalidTransition);
+        }
     }
     transaction.commit()?;
     Ok(())
@@ -1129,9 +1261,11 @@ fn select_active_entry(
 fn commit_request(
     connection: &mut Connection,
     request: &str,
+    expected_parent: SessionEntryId,
 ) -> Result<RequestAdmission, SessionError> {
     let payload =
         codec::encode_request(request).map_err(|error| SessionError::Codec(error.to_string()))?;
+    let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (parent_id, revision): (i64, i64) = transaction.query_row(
@@ -1139,6 +1273,9 @@ fn commit_request(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if parent_id != expected_parent {
+        return Err(SessionError::InvalidTransition);
+    }
     let checkpoint_id: i64 = transaction.query_row(
         "SELECT checkpoint_id FROM entries WHERE id = ?1",
         params![parent_id],
@@ -1193,9 +1330,11 @@ fn settle_execution(
     step_id: u64,
     code: &PersistedCode,
     checkpoint: &Checkpoint,
-) -> Result<(), SessionError> {
+    expected_parent: SessionEntryId,
+) -> Result<SessionEntryId, SessionError> {
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
     let step_id = i64::try_from(step_id).map_err(|_| SessionError::IdOverflow)?;
+    let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
     let stored_code =
         codec::encode_execution(code).map_err(|error| SessionError::Codec(error.to_string()))?;
     let stored_checkpoint = codec::encode_checkpoint(checkpoint)
@@ -1207,6 +1346,9 @@ fn settle_execution(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if parent_id != expected_parent {
+        return Err(SessionError::InvalidTransition);
+    }
     let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
     transaction.execute(
         "INSERT INTO checkpoints (runtime_identity, arena_state, authorisations_json) VALUES (?1, ?2, ?3)",
@@ -1241,7 +1383,7 @@ fn settle_execution(
         params![entry_id, now, next_revision],
     )?;
     transaction.commit()?;
-    Ok(())
+    session_entry_id(entry_id)
 }
 
 fn close_run(
@@ -1250,8 +1392,10 @@ fn close_run(
     pending_step_id: Option<u64>,
     terminal: &PersistedTerminal,
     code: Option<&PersistedCode>,
-) -> Result<(), SessionError> {
+    expected_parent: SessionEntryId,
+) -> Result<SessionEntryId, SessionError> {
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
+    let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
     let pending_step_id = pending_step_id
         .map(i64::try_from)
         .transpose()
@@ -1265,6 +1409,9 @@ fn close_run(
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    if parent_id != expected_parent {
+        return Err(SessionError::InvalidTransition);
+    }
     let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
     transaction.execute(
         "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1300,7 +1447,78 @@ fn close_run(
         params![entry_id, now, next_revision],
     )?;
     transaction.commit()?;
-    Ok(())
+    session_entry_id(entry_id)
+}
+
+fn validate_execution_projection(code: &PersistedCode) -> Result<(), SessionError> {
+    if matches!(code.result, crate::model::CodeResult::Execution { .. }) && code.execution.is_some()
+    {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidTransition)
+    }
+}
+
+fn validate_terminal_projection(
+    pending_step_id: Option<u64>,
+    terminal: &PersistedTerminal,
+    code: Option<&PersistedCode>,
+) -> Result<(), SessionError> {
+    let valid = match terminal {
+        PersistedTerminal::Final { .. } => pending_step_id.is_some() && code.is_none(),
+        PersistedTerminal::Cancelled { .. } => code.is_none_or(|code| {
+            pending_step_id.is_some()
+                && code.execution.is_none()
+                && matches!(
+                    code.result,
+                    crate::model::CodeResult::Cancelled { .. }
+                        | crate::model::CodeResult::Failure { .. }
+                )
+        }),
+        PersistedTerminal::Failed { .. } => code.is_none_or(|code| {
+            pending_step_id.is_some()
+                && code.execution.is_none()
+                && matches!(code.result, crate::model::CodeResult::Failure { .. })
+        }),
+    };
+    valid.then_some(()).ok_or(SessionError::InvalidTransition)
+}
+
+fn append_persisted_code(
+    history: &mut ModelHistory,
+    code: &PersistedCode,
+) -> Result<(), SessionError> {
+    history
+        .append_completed_code(
+            code.source.clone(),
+            code.call_id.clone(),
+            code.commentary.clone(),
+            code.reasoning_summary.clone(),
+            code.replay.clone(),
+            code.result.clone(),
+        )
+        .map_err(|error| SessionError::Codec(error.to_string()))
+}
+
+fn terminal_history(
+    history: &ModelHistory,
+    terminal: &PersistedTerminal,
+    code: Option<&PersistedCode>,
+) -> Result<ModelHistory, SessionError> {
+    let mut history = history.clone();
+    if let Some(code) = code {
+        append_persisted_code(&mut history, code)?;
+    }
+    if let PersistedTerminal::Final {
+        text,
+        reasoning_summary,
+        replay,
+        ..
+    } = terminal
+    {
+        history.append_final_message(text.clone(), reasoning_summary.clone(), replay.clone());
+    }
+    Ok(history)
 }
 
 fn admit_subagent_task(
@@ -1570,6 +1788,10 @@ fn initialise(
         id,
         state: Arc::new(SessionState {
             connection: Mutex::new(connection),
+            model_context: Mutex::new(Some(LiveSessionContext {
+                effective_entry: session_entry_id(root_entry_id)?,
+                history: ModelHistory::new(),
+            })),
             active_execution_step: Mutex::new(None),
             _writer_lock: writer_lock,
             #[cfg(test)]
@@ -2948,6 +3170,71 @@ mod tests {
         .expect("create session")
     }
 
+    async fn activate_session(session: &Session) {
+        let restore = session.restore().expect("restore session");
+        let executable = restore.executable.expect("restore executable state");
+        session
+            .writer()
+            .activate(
+                restore.effective_entry,
+                restore.observed_active_entry,
+                executable.history,
+            )
+            .await
+            .expect("activate session context");
+    }
+
+    #[cfg(unix)]
+    async fn stale_parent_fixture(
+        home: &TempDir,
+        workspace: &TempDir,
+    ) -> (Session, super::SessionWriter, SessionEntryId) {
+        let session = create_session(home, workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let completed = writer
+            .commit_request("completed branch".to_owned())
+            .await
+            .expect("commit completed branch");
+        writer
+            .close_run(
+                completed.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close completed branch");
+        let branch = SessionEntryId(active_entry_id(&session) as u64);
+        let history = writer
+            .restore_at(root)
+            .await
+            .expect("restore root")
+            .executable
+            .expect("root is executable")
+            .history;
+        writer
+            .activate(root, branch, history)
+            .await
+            .expect("activate root");
+        (session, writer, branch)
+    }
+
+    #[cfg(unix)]
+    fn move_durable_active_entry(session: &Session, entry: SessionEntryId) {
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1",
+                params![i64::try_from(entry.0).expect("entry ID fits SQLite")],
+            )
+            .expect("move durable active leaf without changing live context");
+    }
+
     fn database_path(home: &Path, id: &str) -> PathBuf {
         home.join(".kiki/sessions").join(format!("{id}.sqlite3"))
     }
@@ -2974,6 +3261,29 @@ mod tests {
 
     fn empty_observation() -> crate::arena::Observation {
         observation("")
+    }
+
+    fn projection_execution() -> Execution {
+        Execution {
+            stdout: empty_observation(),
+            stderr: empty_observation(),
+            outcome: ExecutionOutcome::Complete { result: None },
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn projection_code(result: crate::model::CodeResult, execution: bool) -> PersistedCode {
+        PersistedCode {
+            source: "projection code".to_owned(),
+            call_id: crate::model::ModelCallId::new("projection"),
+            commentary: None,
+            reasoning_summary: String::new(),
+            selection: None,
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            result,
+            execution: execution.then(projection_execution),
+            attempts: Vec::new(),
+        }
     }
 
     fn insert_entry(
@@ -3062,6 +3372,9 @@ mod tests {
                 params![entry_id],
             )
             .expect("set fixture active entry");
+        session
+            .sync_model_context_for_test()
+            .expect("sync fixture model context");
     }
 
     #[cfg(unix)]
@@ -3646,6 +3959,9 @@ mod tests {
                 params![root_entry],
             )
             .expect("select root fixture branch");
+        session
+            .sync_model_context_for_test()
+            .expect("sync root fixture context");
         let sibling_run = writer
             .commit_request("sibling branch request".to_owned())
             .await
@@ -3690,6 +4006,9 @@ mod tests {
                 params![saved_active],
             )
             .expect("restore saved active fixture branch");
+        session
+            .sync_model_context_for_test()
+            .expect("sync saved fixture context");
 
         let restore = writer
             .restore_at(SessionEntryId(first_entry as u64))
@@ -3826,6 +4145,7 @@ mod tests {
         drop(writer);
         session.close().expect("close selected session");
         let session = Session::open(home.path(), &id).expect("reopen selected session");
+        activate_session(&session).await;
         assert_eq!(selection_snapshot(&session), after_selection);
         let writer = session.writer();
         writer
@@ -4039,7 +4359,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn select_active_entry_rejects_stale_unknown_overflow_and_open_runs() {
+    async fn select_active_entry_rejects_stale_unknown_and_open_runs() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
         let session = create_session(&home, &workspace).await;
@@ -4102,7 +4422,7 @@ mod tests {
             writer
                 .select_active_entry(SessionEntryId(u64::MAX), active)
                 .await,
-            Err(SessionError::IdOverflow)
+            Err(SessionError::InvalidTransition)
         ));
         assert_eq!(selection_snapshot(&session), before_unknown);
         assert_eq!(
@@ -4415,6 +4735,7 @@ mod tests {
             .expect("install selection rollback trigger");
         let before = selection_snapshot(&session);
         let before_database = selection_database_bytes(home.path(), &session);
+        let before_context = writer.model_history().expect("read live context");
 
         assert!(matches!(
             writer
@@ -4426,6 +4747,10 @@ mod tests {
         assert_eq!(
             selection_database_bytes(home.path(), &session),
             before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            before_context
         );
 
         drop(writer);
@@ -6351,6 +6676,7 @@ mod tests {
             .expect("create test runtime")
             .block_on(async {
                 let session = Session::open(&home, &id).expect("open session in recovery process");
+                activate_session(&session).await;
                 let writer = session.writer();
                 let signal =
                     match milestone.as_str() {
@@ -7418,6 +7744,669 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_context_is_shared_by_clones_and_opened_sessions_require_activation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let clone = writer.clone();
+        assert!(
+            writer
+                .model_history()
+                .expect("read fresh context")
+                .entries()
+                .is_empty()
+        );
+
+        let admission = writer
+            .commit_request("saved request".to_owned())
+            .await
+            .expect("commit request");
+        let step = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start final step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step),
+                move || PersistedTerminal::Final {
+                    step_id: step,
+                    text: "saved reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request");
+        let expected = writer.model_history().expect("read saved context");
+        assert_eq!(
+            clone.model_history().expect("read cloned context"),
+            expected
+        );
+
+        let id = session.id().to_owned();
+        drop(clone);
+        drop(writer);
+        session.close().expect("close session");
+        let session = Session::open(home.path(), &id).expect("open session");
+        let writer = session.writer();
+        assert!(matches!(
+            writer.model_history(),
+            Err(SessionError::ModelContextUnavailable)
+        ));
+        let restore = session.restore().expect("restore session");
+        let executable = restore.executable.expect("restore executable state");
+        writer
+            .activate(
+                restore.effective_entry,
+                restore.observed_active_entry,
+                executable.history.clone(),
+            )
+            .await
+            .expect("activate restored context");
+        assert_eq!(
+            writer.model_history().expect("read activated context"),
+            executable.history
+        );
+
+        drop(writer);
+        session.close().expect("close activated session");
+    }
+
+    #[tokio::test]
+    async fn activation_keeps_live_context_when_durable_or_live_identity_is_stale() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let admission = writer
+            .commit_request("branch request".to_owned())
+            .await
+            .expect("commit request");
+        writer
+            .close_run(
+                admission.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request");
+        let branch = SessionEntryId(active_entry_id(&session) as u64);
+        let root_restore = writer.restore_at(root).await.expect("restore root");
+        let root_history = root_restore.executable.expect("root executable").history;
+        writer
+            .activate(root, branch, root_history)
+            .await
+            .expect("activate root");
+        let before = writer.model_history().expect("read root context");
+        let branch_restore = writer.restore_at(branch).await.expect("restore branch");
+        let branch_history = branch_restore
+            .executable
+            .expect("branch executable")
+            .history;
+        session
+            .connection_for_test()
+            .expect("lock session")
+            .execute(
+                "UPDATE session SET active_entry_id = ?1, revision = revision + 1",
+                params![i64::try_from(branch.0).expect("branch ID fits SQLite")],
+            )
+            .expect("make stale durable selection");
+
+        assert!(matches!(
+            writer.activate(branch, root, branch_history.clone()).await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            before
+        );
+        assert!(matches!(
+            writer.activate(branch, branch, branch_history).await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            before
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn activation_rejects_same_leaf_with_unfinished_work() {
+        for unfinished in ["run", "step", "task"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let session = create_session(&home, &workspace).await;
+            let writer = session.writer();
+            let run = writer
+                .commit_request(format!("unfinished {unfinished}"))
+                .await
+                .expect("commit request");
+            match unfinished {
+                "run" => {}
+                "step" => {
+                    writer
+                        .start_model_step(run.run_id)
+                        .await
+                        .expect("start pending step");
+                    session
+                        .connection_for_test()
+                        .expect("lock session")
+                        .execute_batch("DROP TRIGGER runs_cannot_close_with_pending_steps")
+                        .expect("allow pending-step fixture");
+                    writer
+                        .close_run(
+                            run.run_id,
+                            None,
+                            || PersistedTerminal::Failed {
+                                message: "close with a pending step".to_owned(),
+                                evidence: None,
+                                attempts: Vec::new(),
+                            },
+                            None,
+                        )
+                        .await
+                        .expect("close pending-step fixture");
+                }
+                "task" => {
+                    let step = writer
+                        .start_model_step(run.run_id)
+                        .await
+                        .expect("start task origin step");
+                    writer
+                        .settle_execution(
+                            run.run_id,
+                            step,
+                            PersistedCode {
+                                source: "task_value = 1".to_owned(),
+                                call_id: crate::model::ModelCallId::new("unfinished-task"),
+                                commentary: None,
+                                reasoning_summary: String::new(),
+                                selection: None,
+                                replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                                result: crate::model::CodeResult::execution(String::new()),
+                                execution: Some(Execution {
+                                    stdout: empty_observation(),
+                                    stderr: empty_observation(),
+                                    outcome: ExecutionOutcome::Complete { result: None },
+                                    tool_calls: Vec::new(),
+                                }),
+                                attempts: Vec::new(),
+                            },
+                            session.initial_checkpoint().expect("load checkpoint"),
+                        )
+                        .await
+                        .expect("settle task origin step");
+                    writer
+                        .admit_subagent_task(
+                            TaskAdmission::from_record(
+                                &TaskRecord::for_test("0", 1, selection(), None, 1, Vec::new())
+                                    .with_persisted_details_for_test(TaskPersistedDetails {
+                                        admitted_at_ms: 1,
+                                        terminal_at_ms: None,
+                                        state: TaskState::Starting,
+                                        step_count: 0,
+                                        elapsed: Duration::ZERO,
+                                        observed_at_ms: 1,
+                                        attempt_evidence: Vec::new(),
+                                        executions: Vec::new(),
+                                        outcome: None,
+                                    }),
+                                step,
+                            )
+                            .expect("encode unfinished task"),
+                            || false,
+                        )
+                        .await
+                        .expect("admit unfinished task");
+                    writer
+                        .close_run(
+                            run.run_id,
+                            None,
+                            || PersistedTerminal::Cancelled {
+                                evidence: None,
+                                attempts: Vec::new(),
+                            },
+                            None,
+                        )
+                        .await
+                        .expect("close task run");
+                }
+                _ => unreachable!(),
+            }
+
+            let active = SessionEntryId(active_entry_id(&session) as u64);
+            let before_selection = selection_snapshot(&session);
+            let before_history = writer.model_history().expect("read live history");
+            assert!(matches!(
+                writer
+                    .activate(active, active, before_history.clone())
+                    .await,
+                Err(SessionError::InvalidTransition)
+            ));
+            assert_eq!(selection_snapshot(&session), before_selection);
+            assert_eq!(
+                writer.model_history().expect("read unchanged history"),
+                before_history
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[test]
+    fn terminal_projection_validation_covers_every_shape() {
+        let terminals = [
+            (
+                "final",
+                PersistedTerminal::Final {
+                    step_id: 1,
+                    text: String::new(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                },
+            ),
+            (
+                "cancelled",
+                PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+            ),
+            (
+                "failed",
+                PersistedTerminal::Failed {
+                    message: String::new(),
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+            ),
+        ];
+        let codes = [
+            ("no code", None),
+            (
+                "execution result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::execution(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "execution result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::execution(String::new()),
+                    true,
+                )),
+            ),
+            (
+                "cancelled result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::cancelled(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "cancelled result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::cancelled(String::new()),
+                    true,
+                )),
+            ),
+            (
+                "failure result without execution",
+                Some(projection_code(
+                    crate::model::CodeResult::failure(String::new()),
+                    false,
+                )),
+            ),
+            (
+                "failure result with execution",
+                Some(projection_code(
+                    crate::model::CodeResult::failure(String::new()),
+                    true,
+                )),
+            ),
+        ];
+        let valid = [
+            (true, "final", "no code"),
+            (false, "cancelled", "no code"),
+            (true, "cancelled", "no code"),
+            (true, "cancelled", "cancelled result without execution"),
+            (true, "cancelled", "failure result without execution"),
+            (false, "failed", "no code"),
+            (true, "failed", "no code"),
+            (true, "failed", "failure result without execution"),
+        ];
+
+        for pending_step_id in [None, Some(1)] {
+            for (terminal_kind, terminal) in &terminals {
+                for (code_kind, code) in &codes {
+                    let expected =
+                        valid.contains(&(pending_step_id.is_some(), *terminal_kind, *code_kind));
+                    assert_eq!(
+                        super::validate_terminal_projection(
+                            pending_step_id,
+                            terminal,
+                            code.as_ref()
+                        )
+                        .is_ok(),
+                        expected,
+                        "pending step: {}, terminal: {terminal_kind}, code: {code_kind}",
+                        pending_step_id.is_some(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execution_projection_validation_covers_every_shape() {
+        for (description, code, expected) in [
+            (
+                "execution result without execution",
+                projection_code(crate::model::CodeResult::execution(String::new()), false),
+                false,
+            ),
+            (
+                "execution result with execution",
+                projection_code(crate::model::CodeResult::execution(String::new()), true),
+                true,
+            ),
+            (
+                "cancelled result without execution",
+                projection_code(crate::model::CodeResult::cancelled(String::new()), false),
+                false,
+            ),
+            (
+                "cancelled result with execution",
+                projection_code(crate::model::CodeResult::cancelled(String::new()), true),
+                false,
+            ),
+            (
+                "failure result without execution",
+                projection_code(crate::model::CodeResult::failure(String::new()), false),
+                false,
+            ),
+            (
+                "failure result with execution",
+                projection_code(crate::model::CodeResult::failure(String::new()), true),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                super::validate_execution_projection(&code).is_ok(),
+                expected,
+                "{description}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writer_rejects_invalid_execution_projection_without_mutation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("invalid execution projection".to_owned())
+            .await
+            .expect("commit request");
+        let step = writer
+            .start_model_step(run.run_id)
+            .await
+            .expect("start pending step");
+        let checkpoint = session.initial_checkpoint().expect("load checkpoint");
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+
+        assert!(matches!(
+            writer
+                .settle_execution(
+                    run.run_id,
+                    step,
+                    projection_code(crate::model::CodeResult::execution(String::new()), false),
+                    checkpoint,
+                )
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn writer_rejects_invalid_terminal_projection_without_mutation() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("invalid terminal projection".to_owned())
+            .await
+            .expect("commit request");
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+        let terminal = PersistedTerminal::Final {
+            step_id: 1,
+            text: String::new(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("test", Vec::new()),
+            attempts: Vec::new(),
+        };
+
+        assert!(matches!(
+            writer
+                .close_run(run.run_id, None, move || terminal, None)
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stale_parent_guards_request_settlement_and_closure() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
+        move_durable_active_entry(&session, branch);
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+        assert!(matches!(
+            writer.commit_request("stale request".to_owned()).await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+        drop(writer);
+        session.close().expect("close request fixture");
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
+        let request = writer
+            .commit_request("stale settlement".to_owned())
+            .await
+            .expect("commit settlement request");
+        let step = writer
+            .start_model_step(request.run_id)
+            .await
+            .expect("start settlement step");
+        move_durable_active_entry(&session, branch);
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+        assert!(matches!(
+            writer
+                .settle_execution(
+                    request.run_id,
+                    step,
+                    PersistedCode {
+                        source: "stale settlement code".to_owned(),
+                        call_id: crate::model::ModelCallId::new("stale-settlement"),
+                        commentary: None,
+                        reasoning_summary: String::new(),
+                        selection: None,
+                        replay: crate::model::ProviderReplay::new("test", Vec::new()),
+                        result: crate::model::CodeResult::execution(String::new()),
+                        execution: Some(Execution {
+                            stdout: empty_observation(),
+                            stderr: empty_observation(),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                            tool_calls: Vec::new(),
+                        }),
+                        attempts: Vec::new(),
+                    },
+                    session.initial_checkpoint().expect("load checkpoint"),
+                )
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+        drop(writer);
+        session.close().expect("close settlement fixture");
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
+        let request = writer
+            .commit_request("stale closure".to_owned())
+            .await
+            .expect("commit closure request");
+        move_durable_active_entry(&session, branch);
+        let before_selection = selection_snapshot(&session);
+        let before_database = selection_database_bytes(home.path(), &session);
+        let before_history = writer.model_history().expect("read live history");
+        assert!(matches!(
+            writer
+                .close_run(
+                    request.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await,
+            Err(SessionError::InvalidTransition)
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            selection_database_bytes(home.path(), &session),
+            before_database
+        );
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+        drop(writer);
+        session.close().expect("close closure fixture");
+    }
+
+    #[tokio::test]
+    async fn context_neutral_writes_leave_model_context_unchanged() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let admission = writer
+            .commit_request("context request".to_owned())
+            .await
+            .expect("commit request");
+        let before = writer.model_history().expect("read request context");
+
+        writer
+            .commit_preferences(SessionPreferences::initial(selection()))
+            .await
+            .expect("commit preferences");
+        let step = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start model step");
+        writer.mark_execution_started(step);
+        writer.clear_execution(step);
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            before
+        );
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step),
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close request");
+        assert_eq!(
+            writer.model_history().expect("read terminal context"),
+            before
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn foreground_writes_settle_entries_and_runs_atomically() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -7592,6 +8581,7 @@ mod tests {
             .start_model_step(run_id)
             .await
             .expect("allocate step");
+        let before_context = writer.model_history().expect("read request context");
         session
             .connection_for_test()
             .expect("lock session connection")
@@ -7638,6 +8628,10 @@ mod tests {
             (2, 1, 3, 1)
         );
         drop(connection);
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            before_context
+        );
         drop(writer);
         session.close().expect("close session");
     }

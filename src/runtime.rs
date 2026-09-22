@@ -752,15 +752,31 @@ impl<M: Model> RuntimeController<M> {
                     .commit_startup_preferences(preferences.clone(), relocated_cwd)
                     .await
                 {
-                    Ok(()) => {
-                        accepted_thinking.accept(selection);
-                        initial
-                            .metadata
-                            .as_mut()
-                            .expect("executable session restore must have metadata")
-                            .update_preferences(preferences);
-                        Some(Agent::restored(arena, model, state.history))
-                    }
+                    Ok(()) => match session
+                        .writer()
+                        .activate(
+                            restore.effective_entry,
+                            restore.observed_active_entry,
+                            state.history,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            accepted_thinking.accept(selection);
+                            initial
+                                .metadata
+                                .as_mut()
+                                .expect("executable session restore must have metadata")
+                                .update_preferences(preferences);
+                            Some(Agent::new(arena, model))
+                        }
+                        Err(_) => {
+                            subagents.latch_storage_failure().await;
+                            initial.disabled_reason =
+                                Some(RuntimeDisabledReason::SessionStorageWriteFailed);
+                            None
+                        }
+                    },
                     Err(_) => {
                         subagents.latch_storage_failure().await;
                         initial.disabled_reason =
@@ -1156,7 +1172,11 @@ impl<M: Model> RuntimeController<M> {
         }
         if self
             .session
-            .select_active_entry(restore.effective_entry, restore.observed_active_entry)
+            .activate(
+                restore.effective_entry,
+                restore.observed_active_entry,
+                executable.history,
+            )
             .await
             .is_err()
         {
@@ -1184,10 +1204,6 @@ impl<M: Model> RuntimeController<M> {
             "navigation has no tracked child operations"
         );
         let request_prefill = restore.request_prefill;
-        self.agent
-            .as_mut()
-            .expect("navigation retains its agent after persistence")
-            .replace_idle_state(executable.history);
         self.records = restore
             .records
             .into_iter()
@@ -2693,6 +2709,105 @@ mod tests {
         }
     }
 
+    struct ContextCapturingMessageModel {
+        contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
+    }
+
+    impl Model for ContextCapturingMessageModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.contexts
+                    .lock()
+                    .expect("contexts lock")
+                    .push(history.entries().to_vec());
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "next response".to_owned(),
+                    },
+                    selection: None,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_agent_reads_context_from_session_model() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        let prior = writer
+            .commit_request("saved request".to_owned())
+            .await
+            .expect("commit saved request");
+        writer
+            .close_run(
+                prior.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close saved request");
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(
+            arena,
+            ContextCapturingMessageModel {
+                contexts: contexts.clone(),
+            },
+        );
+        let mut event = |_| {};
+
+        agent
+            .run_persisted(
+                "next request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut event,
+            )
+            .await
+            .expect("run persisted agent");
+
+        assert_eq!(
+            contexts.lock().expect("contexts lock")[0],
+            [
+                ModelContextEntry::UserRequest {
+                    text: "saved request".to_owned(),
+                },
+                ModelContextEntry::UserRequest {
+                    text: "next request".to_owned(),
+                },
+            ]
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
     #[tokio::test]
     async fn request_commit_precedes_provider_call() {
         let home = tempfile::tempdir().unwrap();
@@ -2743,6 +2858,14 @@ mod tests {
             .unwrap();
         gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            session
+                .writer()
+                .model_history()
+                .expect("read uncommitted context")
+                .entries()
+                .is_empty()
+        );
 
         commands
             .send(RuntimeCommand::Cancel { correction: false })
@@ -2917,12 +3040,29 @@ mod tests {
             .expect("first provider call");
         gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            session
+                .writer()
+                .model_history()
+                .expect("read uncommitted context")
+                .entries(),
+            [ModelContextEntry::UserRequest { .. }]
+        ));
 
         gate.release();
         timeout(TEST_TIMEOUT, provider_called.notified())
             .await
             .expect("second provider call after settlement");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            session
+                .writer()
+                .model_history()
+                .expect("read committed context")
+                .entries()
+                .get(1),
+            Some(ModelContextEntry::CompletedCode(_))
+        ));
         events_until_settled(&mut events).await;
         shutdown_controller(commands, controller).await;
         session.close().unwrap();
@@ -2976,6 +3116,14 @@ mod tests {
             .unwrap();
         gate.wait_until_started().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            session
+                .writer()
+                .model_history()
+                .expect("read uncommitted context")
+                .entries(),
+            [ModelContextEntry::UserRequest { .. }]
+        ));
         commands
             .send(RuntimeCommand::Cancel { correction: false })
             .await
@@ -8802,6 +8950,15 @@ mod tests {
             .expect("cancel before request admission");
         gate.release();
         let settled = events_until_settled(&mut events).await;
+        assert!(
+            session
+                .writer()
+                .model_history()
+                .expect("read corrected context")
+                .entries()
+                .is_empty(),
+            "correction must republish the request parent context"
+        );
         assert!(matches!(
             settled.as_slice(),
             [
@@ -8954,14 +9111,13 @@ mod tests {
         Arc<Notify>,
         RuntimeController<WaitingCancellationModel>,
     ) {
-        let (home, session, live_arena, old_history, _root, old_entry, _target_entry) =
+        let (home, session, live_arena, _root, old_entry, _target_entry) =
             navigation_fixture(workspace).await;
         let old_checkpoint = live_arena.checkpoint();
         let ready = Arc::new(Notify::new());
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             WaitingCancellationModel {
                 ready: ready.clone(),
                 partial: false,
@@ -12184,6 +12340,9 @@ mod tests {
                 params![entry_id],
             )
             .expect("move fixture active entry");
+        session
+            .sync_model_context_for_test()
+            .expect("sync fixture model context");
     }
 
     #[cfg(unix)]
@@ -13407,7 +13566,7 @@ mod tests {
             .restore(session.initial_checkpoint().expect("load root checkpoint"))
             .await
             .expect("restore root checkpoint");
-        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+        let (old_entry, _, old_checkpoint) = persist_navigation_branch(
             &session,
             &mut fixture_arena,
             "old branch",
@@ -13453,13 +13612,12 @@ mod tests {
         let starts = Arc::new(AtomicUsize::new(0));
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(
+            Agent::new(
                 live_arena,
                 NavigationStateModel {
                     contexts: contexts.clone(),
                     step: 0,
                 },
-                old_history,
             ),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -13547,7 +13705,6 @@ mod tests {
         tempfile::TempDir,
         Session,
         Arena,
-        ModelHistory,
         SessionEntryId,
         SessionEntryId,
         SessionEntryId,
@@ -13582,7 +13739,7 @@ mod tests {
             .restore(session.initial_checkpoint().expect("load root checkpoint"))
             .await
             .expect("restore fixture root checkpoint");
-        let (old_entry, old_history, old_checkpoint) = persist_navigation_branch(
+        let (old_entry, _, old_checkpoint) = persist_navigation_branch(
             &session,
             &mut fixture_arena,
             "old branch",
@@ -13624,22 +13781,14 @@ mod tests {
             .restore(old_checkpoint)
             .await
             .expect("restore old live state");
-        (
-            home,
-            session,
-            live_arena,
-            old_history,
-            root,
-            old_entry,
-            target_entry,
-        )
+        (home, session, live_arena, root, old_entry, target_entry)
     }
 
     #[tokio::test]
     async fn navigation_restores_root_request_execution_and_terminal_points() {
         let workspace = tempfile::tempdir().expect("create workspace");
         fs::write(workspace.path().join("effect"), "retained").expect("write external effect");
-        let (_home, session, live_arena, old_history, root, _old_entry, target_entry) =
+        let (_home, session, live_arena, root, _old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_execution = SessionEntryId(
             u64::try_from(
@@ -13673,7 +13822,7 @@ mod tests {
         let (settings, _) = watch::channel(selection);
         let starts = Arc::new(AtomicUsize::new(0));
         let controller = RuntimeController::with_session(
-            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history),
+            Agent::new(live_arena, ScriptedModel::new(Vec::new())),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
@@ -13797,14 +13946,13 @@ mod tests {
     fn navigation_controller<M: Model>(
         session: &Session,
         arena: Arena,
-        history: ModelHistory,
         model: M,
         gate: ArenaRestoreTestGate,
     ) -> RuntimeController<M> {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let (settings, _) = watch::channel(selection);
         RuntimeController::with_session(
-            Agent::restored(arena, model, history).with_restore_test_gate(gate),
+            Agent::new(arena, model).with_restore_test_gate(gate),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
@@ -13818,16 +13966,11 @@ mod tests {
     #[tokio::test]
     async fn navigation_rejects_invalid_history_without_restoring_arena() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let gate = ArenaRestoreTestGate::new();
-        let controller = navigation_controller(
-            &session,
-            live_arena,
-            old_history,
-            RejectTargetHistoryModel,
-            gate.clone(),
-        );
+        let controller =
+            navigation_controller(&session, live_arena, RejectTargetHistoryModel, gate.clone());
         let (commands, mut events, _progress, controller) = start_controller(controller);
 
         commands
@@ -13859,7 +14002,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_does_not_compensate_an_incompatible_checkpoint() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_identity(
             &session,
@@ -13871,7 +14014,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -13906,7 +14048,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_recovers_after_a_compatible_checkpoint_load_failure() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_state(&session, target_entry, vec![0]);
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
@@ -13915,7 +14057,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(vec![
                 ModelAction::Code {
                     source: "assert branch_value == 'old'\nbranch_value".to_owned(),
@@ -13964,7 +14105,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_disables_when_checkpoint_compensation_fails() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         replace_entry_checkpoint_state(&session, target_entry, vec![0]);
         let gate = ArenaRestoreTestGate::new();
@@ -13972,7 +14113,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -14035,7 +14175,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_compensates_after_an_active_leaf_conflict() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
         let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
@@ -14044,7 +14184,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            old_history,
             ScriptedModel::new(Vec::new()),
             gate.clone(),
         );
@@ -14503,7 +14642,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_failure_preserves_selection_and_latches_storage() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, old_history, _root, old_entry, target_entry) =
+        let (_home, session, live_arena, _root, old_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_checkpoint = navigation_checkpoint(&session, target_entry).await;
         let old_checkpoint = navigation_checkpoint(&session, old_entry).await;
@@ -14518,7 +14657,7 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(live_arena, ScriptedModel::new(Vec::new()), old_history)
+            Agent::new(live_arena, ScriptedModel::new(Vec::new()))
                 .with_restore_test_gate(gate.clone()),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -14528,6 +14667,10 @@ mod tests {
             ),
             session.writer(),
         );
+        let before_context = session
+            .writer()
+            .model_history()
+            .expect("read context before rejected navigation");
         let (commands, mut events, _progress, controller) = start_controller(controller);
 
         commands
@@ -14547,6 +14690,13 @@ mod tests {
             }
         );
         assert_eq!(active_entry_id(&session), old_entry.0 as i64);
+        assert_eq!(
+            session
+                .writer()
+                .model_history()
+                .expect("read context after rejected navigation"),
+            before_context
+        );
         assert_eq!(gate.attempts(), vec![target_checkpoint, old_checkpoint]);
         commands
             .send(RuntimeCommand::Navigate {
@@ -14597,7 +14747,7 @@ mod tests {
         )
         .expect("create session");
         let root = SessionEntryId(active_entry_id(&session) as u64);
-        let (_, history, _) = persist_navigation_branch(
+        let (_, _, _) = persist_navigation_branch(
             &session,
             &mut live_arena,
             "selected branch",
@@ -14605,14 +14755,17 @@ mod tests {
             "selected final",
         )
         .await;
+        let before_context = session
+            .writer()
+            .model_history()
+            .expect("read selected branch context");
         let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
-            Agent::restored(
+            Agent::new(
                 live_arena,
                 CountingMessageModel {
                     calls: Arc::new(AtomicUsize::new(0)),
                 },
-                history,
             ),
             settings,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -14630,6 +14783,13 @@ mod tests {
             .expect("request navigation");
         gate.wait_until_started().await;
         assert!(events.try_recv().is_err());
+        assert_eq!(
+            session
+                .writer()
+                .model_history()
+                .expect("read context while selection is pending"),
+            before_context
+        );
         commands
             .send(RuntimeCommand::Submit {
                 request: "queued after navigation".to_owned(),
@@ -14645,6 +14805,15 @@ mod tests {
                 request_prefill: None,
             } if state.timeline.is_empty()
         ));
+        assert!(
+            !session
+                .writer()
+                .model_history()
+                .expect("read published root context")
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::UserRequest { text } if text == "selected branch"))
+        );
         let submitted = events_until_settled(&mut events).await;
         assert!(submitted.iter().any(|event| matches!(
             event,
@@ -14760,14 +14929,13 @@ mod tests {
     #[tokio::test]
     async fn tree_request_returns_catalogue_only_when_fully_settled() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let (_home, session, live_arena, history, root, active_entry, target_entry) =
+        let (_home, session, live_arena, root, active_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let before = session.restore().expect("snapshot selected session");
         let database_before = session_database_snapshot(&session);
         let controller = navigation_controller(
             &session,
             live_arena,
-            history,
             ScriptedModel::new(Vec::new()),
             ArenaRestoreTestGate::new(),
         );
@@ -14978,7 +15146,7 @@ mod tests {
         ));
         shutdown_controller(commands, controller).await;
 
-        let (_home, session, live_arena, history, _root, active_entry, target_entry) =
+        let (_home, session, live_arena, _root, active_entry, target_entry) =
             navigation_fixture(&workspace).await;
         let target_request: i64 = session
             .connection_for_test()
@@ -15007,7 +15175,6 @@ mod tests {
         let controller = navigation_controller(
             &session,
             live_arena,
-            history,
             ScriptedModel::new(Vec::new()),
             ArenaRestoreTestGate::new(),
         );
