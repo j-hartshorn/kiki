@@ -145,6 +145,14 @@ impl CodeResult {
         Self::Failure { feedback }.bounded()
     }
 
+    pub(crate) fn feedback(&self) -> &str {
+        match self {
+            Self::Execution { feedback }
+            | Self::Cancelled { feedback }
+            | Self::Failure { feedback } => feedback,
+        }
+    }
+
     fn bounded(mut self) -> Self {
         let feedback = match &mut self {
             Self::Execution { feedback }
@@ -209,6 +217,13 @@ pub enum ModelContextEntry {
 }
 
 impl ModelContextEntry {
+    pub(crate) fn user_request(&self) -> Option<&str> {
+        match self {
+            Self::UserRequest { text } => Some(text),
+            _ => None,
+        }
+    }
+
     pub fn completed_code(&self) -> Option<&CompletedCode> {
         match self {
             Self::CompletedCode(completed) => Some(completed),
@@ -219,6 +234,17 @@ impl ModelContextEntry {
     pub fn compaction_summary(&self) -> Option<&str> {
         match self {
             Self::CompactionSummary { summary } => Some(summary),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn final_message(&self) -> Option<(&str, &str, &ProviderReplay)> {
+        match self {
+            Self::FinalMessage {
+                text,
+                reasoning_summary,
+                replay,
+            } => Some((text, reasoning_summary, replay)),
             _ => None,
         }
     }
@@ -902,6 +928,7 @@ mod tests {
         assert_eq!(completed.call_id(), &call_id);
         assert_eq!(completed.commentary(), Some("I’ll inspect first."));
         assert_eq!(completed.reasoning_summary(), "checked source");
+        assert_eq!(completed.result().feedback(), "1");
         assert_eq!(completed.replay(), &replay("opaque-call"));
         assert_eq!(
             completed.result(),
@@ -936,13 +963,18 @@ mod tests {
             replay("opaque-message"),
         );
 
+        let entry = history.entries().last().unwrap();
         assert_eq!(
-            history.entries().last(),
-            Some(&ModelContextEntry::FinalMessage {
+            entry,
+            &ModelContextEntry::FinalMessage {
                 text: "answer".to_owned(),
                 reasoning_summary: "checked result".to_owned(),
                 replay: replay("opaque-message"),
-            })
+            }
+        );
+        assert_eq!(
+            entry.final_message(),
+            Some(("answer", "checked result", &replay("opaque-message")))
         );
     }
 
