@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use thiserror::Error;
 
-use super::{PersistedCode, PersistedTerminal, ReadableCode, ReadableTerminal};
+use super::{
+    CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, ReadableCode,
+    ReadableTerminal, SessionEntryId,
+};
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{
     Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -39,6 +42,8 @@ pub(super) enum CodecError {
     TerminalTaskDetails,
     #[error("stored session replay is missing")]
     MissingReplay,
+    #[error("stored compaction diagnostic exceeds 4096 bytes")]
+    OversizedCompactionDiagnostic,
     #[cfg(not(unix))]
     #[error("session paths are supported only on Unix")]
     UnsupportedPath,
@@ -63,6 +68,7 @@ pub(super) struct StoredEntry {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum StoredPayload {
     UserRequest {
         request: String,
@@ -75,6 +81,42 @@ enum StoredPayload {
         terminal: StoredTerminal,
         code: Option<StoredCode>,
     },
+    Compaction(StoredCompaction),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCompaction {
+    compaction: StoredCompactionOutcome,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredCompactionOutcome {
+    Applied {
+        summary: String,
+        first_retained: u64,
+        context_tokens: u64,
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Failed {
+        diagnostic: String,
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Cancelled {
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredCompactionReason {
+    Manual,
+    AutomaticThreshold,
+    ContextOverflow,
 }
 
 pub(super) struct DecodedEntry(DecodedEntryPayload);
@@ -92,6 +134,7 @@ enum DecodedEntryPayload {
         terminal: StoredTerminal,
         code: Option<StoredCode>,
     },
+    Compaction(StoredCompactionOutcome),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +145,7 @@ pub(super) enum DecodedEntryKind {
     FinalReply,
     Cancelled,
     Failed,
+    Compaction,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -471,6 +515,10 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
                 code,
             }))
         }
+        ("compaction", StoredPayload::Compaction(StoredCompaction { compaction })) => {
+            validate_stored_compaction(&compaction)?;
+            Ok(DecodedEntry(DecodedEntryPayload::Compaction(compaction)))
+        }
         _ => Err(CodecError::InvalidPayload),
     }
 }
@@ -485,6 +533,7 @@ pub(super) fn decoded_entry_kind(entry: &DecodedEntry) -> DecodedEntryKind {
             StoredTerminal::Cancelled { .. } => DecodedEntryKind::Cancelled,
             StoredTerminal::Failed { .. } => DecodedEntryKind::Failed,
         },
+        DecodedEntryPayload::Compaction(_) => DecodedEntryKind::Compaction,
     }
 }
 
@@ -531,6 +580,86 @@ pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
                 attempts.iter().map(decode_attempt).collect()
             }
         },
+        DecodedEntryPayload::Compaction(outcome) => stored_compaction_attempts(outcome)
+            .iter()
+            .map(decode_attempt)
+            .collect(),
+    }
+}
+
+pub(super) fn decoded_compaction(entry: &DecodedEntry) -> Option<CompactionOutcome> {
+    let DecodedEntryPayload::Compaction(outcome) = &entry.0 else {
+        return None;
+    };
+    Some(decode_compaction_outcome(outcome))
+}
+
+fn validate_stored_compaction(outcome: &StoredCompactionOutcome) -> Result<(), CodecError> {
+    match outcome {
+        StoredCompactionOutcome::Applied { first_retained, .. } if *first_retained == 0 => {
+            Err(CodecError::InvalidPayload)
+        }
+        StoredCompactionOutcome::Failed { diagnostic, .. } if diagnostic.len() > 4_096 => {
+            Err(CodecError::OversizedCompactionDiagnostic)
+        }
+        StoredCompactionOutcome::Applied { .. }
+        | StoredCompactionOutcome::Failed { .. }
+        | StoredCompactionOutcome::Cancelled { .. } => Ok(()),
+    }
+}
+
+fn stored_compaction_attempts(outcome: &StoredCompactionOutcome) -> &[StoredAttemptAccounting] {
+    match outcome {
+        StoredCompactionOutcome::Applied { attempts, .. }
+        | StoredCompactionOutcome::Failed { attempts, .. }
+        | StoredCompactionOutcome::Cancelled { attempts, .. } => attempts,
+    }
+}
+
+fn decode_compaction_outcome(outcome: &StoredCompactionOutcome) -> CompactionOutcome {
+    match outcome {
+        StoredCompactionOutcome::Applied {
+            summary,
+            first_retained,
+            context_tokens,
+            reason,
+            attempts,
+        } => CompactionOutcome::Applied {
+            summary: summary.clone(),
+            first_retained: SessionEntryId(*first_retained),
+            context_tokens: *context_tokens,
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+        StoredCompactionOutcome::Failed {
+            diagnostic,
+            reason,
+            attempts,
+        } => CompactionOutcome::Failed {
+            diagnostic: diagnostic.clone(),
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+        StoredCompactionOutcome::Cancelled { reason, attempts } => CompactionOutcome::Cancelled {
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+    }
+}
+
+fn decode_compaction_reason(reason: &StoredCompactionReason) -> CompactionReason {
+    match reason {
+        StoredCompactionReason::Manual => CompactionReason::Manual,
+        StoredCompactionReason::AutomaticThreshold => CompactionReason::AutomaticThreshold,
+        StoredCompactionReason::ContextOverflow => CompactionReason::ContextOverflow,
+    }
+}
+
+fn encode_compaction_reason(reason: CompactionReason) -> StoredCompactionReason {
+    match reason {
+        CompactionReason::Manual => StoredCompactionReason::Manual,
+        CompactionReason::AutomaticThreshold => StoredCompactionReason::AutomaticThreshold,
+        CompactionReason::ContextOverflow => StoredCompactionReason::ContextOverflow,
     }
 }
 
@@ -752,6 +881,46 @@ pub(super) fn decode_task_record_details(value: &str) -> Result<DecodedTaskDetai
 #[cfg(test)]
 fn decode_task_details(value: &str) -> Result<StoredTaskDetails, CodecError> {
     serde_json::from_str(value).map_err(CodecError::from)
+}
+
+pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEntry, CodecError> {
+    let compaction = match outcome {
+        CompactionOutcome::Applied {
+            summary,
+            first_retained,
+            context_tokens,
+            reason,
+            attempts,
+        } if first_retained.0 != 0 => StoredCompactionOutcome::Applied {
+            summary: summary.clone(),
+            first_retained: first_retained.0,
+            context_tokens: *context_tokens,
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        CompactionOutcome::Failed {
+            diagnostic,
+            reason,
+            attempts,
+        } if diagnostic.len() <= 4_096 => StoredCompactionOutcome::Failed {
+            diagnostic: diagnostic.clone(),
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        CompactionOutcome::Cancelled { reason, attempts } => StoredCompactionOutcome::Cancelled {
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        CompactionOutcome::Applied { .. } => return Err(CodecError::InvalidPayload),
+        CompactionOutcome::Failed { .. } => return Err(CodecError::OversizedCompactionDiagnostic),
+    };
+    Ok(StoredEntry {
+        kind: "compaction",
+        payload_json: serde_json::to_string(&StoredPayload::Compaction(StoredCompaction {
+            compaction,
+        }))?,
+        provider_replay: None,
+    })
 }
 
 pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, CodecError> {
@@ -1464,18 +1633,118 @@ mod tests {
     use super::{
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
         decode_path, decode_session_preferences, decode_task_details, decode_task_record_details,
-        decode_tool_value, decoded_execution_history, decoded_readable_execution,
-        decoded_readable_terminal, decoded_terminal_history, encode_checkpoint, encode_execution,
-        encode_execution_value, encode_path, encode_request, encode_session_preferences,
-        encode_task_details, encode_terminal, encode_tool_value, fail_unfinished_task_details,
+        decode_tool_value, decoded_compaction, decoded_execution_history,
+        decoded_readable_execution, decoded_readable_terminal, decoded_terminal_history,
+        encode_checkpoint, encode_compaction, encode_execution, encode_execution_value,
+        encode_path, encode_request, encode_session_preferences, encode_task_details,
+        encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
         ModelSelection, SessionPreferences,
         models::{SOL, TERRA},
     };
+    use crate::model::{AttemptAccounting, ModelUsage};
+    use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
     use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
+
+    #[test]
+    fn compaction_codec_round_trips_attempts_and_rejects_invalid_payloads() {
+        let usage = ModelUsage {
+            model: "openai/gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(1),
+            cached_input_tokens: Some(2),
+            cache_write_input_tokens: Some(3),
+            output_tokens: Some(4),
+            reasoning_output_tokens: Some(5),
+            total_tokens: Some(6),
+        };
+        let attempts = vec![
+            AttemptAccounting::KnownUsage(usage.clone()),
+            AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
+            AttemptAccounting::UsageUnavailable,
+        ];
+        let outcomes = [
+            CompactionOutcome::Applied {
+                summary: "summary".to_owned(),
+                first_retained: SessionEntryId(42),
+                context_tokens: 1_500,
+                reason: CompactionReason::Manual,
+                attempts: attempts.clone(),
+            },
+            CompactionOutcome::Failed {
+                diagnostic: "diagnostic".to_owned(),
+                reason: CompactionReason::AutomaticThreshold,
+                attempts: attempts.clone(),
+            },
+            CompactionOutcome::Cancelled {
+                reason: CompactionReason::ContextOverflow,
+                attempts,
+            },
+        ];
+
+        for outcome in outcomes {
+            let stored = encode_compaction(&outcome).expect("encode compaction");
+            let decoded = decode_entry(&stored.kind, &stored.payload_json)
+                .expect("decode compaction outcome");
+            assert_eq!(decoded_compaction(&decoded), Some(outcome));
+            assert!(decode_entry("execution", &stored.payload_json).is_err());
+        }
+
+        for diagnostic in ["x".repeat(4_096), "é".repeat(2_048)] {
+            let outcome = CompactionOutcome::Failed {
+                diagnostic: diagnostic.clone(),
+                reason: CompactionReason::Manual,
+                attempts: Vec::new(),
+            };
+            let stored = encode_compaction(&outcome).expect("encode boundary diagnostic");
+            let decoded = decode_entry(&stored.kind, &stored.payload_json)
+                .expect("decode boundary diagnostic");
+            assert_eq!(decoded_compaction(&decoded), Some(outcome));
+        }
+
+        let applied = encode_compaction(&CompactionOutcome::Applied {
+            summary: "summary".to_owned(),
+            first_retained: SessionEntryId(42),
+            context_tokens: 1,
+            reason: CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode applied compaction");
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&applied.payload_json).expect("decode applied JSON");
+        invalid["Compaction"]["compaction"]["first_retained"] = serde_json::json!(0);
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        invalid["Compaction"]["compaction"]["first_retained"] = serde_json::json!(42);
+        invalid["Compaction"]["compaction"]["reason"] = serde_json::json!("unknown");
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        invalid["Compaction"]["compaction"]["reason"] = serde_json::json!("manual");
+        invalid["Compaction"]["compaction"]["diagnostic"] = serde_json::json!("forbidden");
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+
+        let failed = encode_compaction(&CompactionOutcome::Failed {
+            diagnostic: "diagnostic".to_owned(),
+            reason: CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode failed compaction");
+        for diagnostic in ["x".repeat(4_097), "é".repeat(2_049)] {
+            let mut invalid: serde_json::Value =
+                serde_json::from_str(&failed.payload_json).expect("decode failed JSON");
+            invalid["Compaction"]["compaction"]["diagnostic"] = serde_json::json!(diagnostic);
+            assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        }
+        assert!(
+            encode_compaction(&CompactionOutcome::Failed {
+                diagnostic: "x".repeat(4_097),
+                reason: CompactionReason::Manual,
+                attempts: Vec::new(),
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn session_preferences_codec_round_trips_and_rejects_invalid_metadata() {

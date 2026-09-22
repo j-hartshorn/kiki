@@ -11,9 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::session::{SessionCatalogue, SessionCatalogueKind, SessionEntryId};
+use crate::session::{
+    CompactionOutcome, CompactionReason, SessionCatalogue, SessionCatalogueKind, SessionEntryId,
+};
 use crate::transcript::{
-    normalise_terminal_text, observation_text, tool_call_label, truncate_front,
+    format_token_count, normalise_terminal_text, observation_text, tool_call_label, truncate_front,
 };
 
 use super::picker::{
@@ -30,6 +32,7 @@ const ACCENT: Color = Color::Rgb(138, 190, 183);
 const SUCCESS: Color = Color::Rgb(181, 189, 104);
 const ERROR: Color = Color::Rgb(204, 102, 102);
 const WARNING: Color = Color::Rgb(255, 255, 0);
+const COMPACTION: Color = Color::Rgb(118, 150, 86);
 const MUTED: Color = Color::Rgb(128, 128, 128);
 const DIM: Color = Color::Rgb(102, 102, 102);
 const SELECTED_BACKGROUND: Color = Color::Rgb(58, 58, 74);
@@ -1051,6 +1054,9 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
         }
         SessionCatalogueKind::Cancelled => row.push("Cancelled", colour_style(WARNING)),
         SessionCatalogueKind::Failed => row.push("Failed", colour_style(ERROR)),
+        SessionCatalogueKind::Compaction { outcome } => {
+            row.push(&compaction_row(outcome), colour_style(COMPACTION));
+        }
     }
 }
 
@@ -1160,6 +1166,38 @@ fn row_text(kind: &SessionCatalogueKind) -> String {
         SessionCatalogueKind::Final { text } => preview("Kiki", text),
         SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
         SessionCatalogueKind::Failed => "Failed".to_owned(),
+        SessionCatalogueKind::Compaction { outcome } => compaction_row(outcome),
+    }
+}
+
+fn compaction_row(outcome: &CompactionOutcome) -> String {
+    match outcome {
+        CompactionOutcome::Applied {
+            context_tokens,
+            reason,
+            ..
+        } => format!(
+            "Compaction · {} · applied · {} tokens",
+            compaction_reason_label(*reason),
+            format_token_count(u128::from(*context_tokens))
+        ),
+        CompactionOutcome::Failed { reason, .. } => {
+            format!("Compaction · {} · failed", compaction_reason_label(*reason))
+        }
+        CompactionOutcome::Cancelled { reason, .. } => {
+            format!(
+                "Compaction · {} · cancelled",
+                compaction_reason_label(*reason)
+            )
+        }
+    }
+}
+
+fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+    match reason {
+        CompactionReason::Manual => "manual",
+        CompactionReason::AutomaticThreshold => "automatic threshold",
+        CompactionReason::ContextOverflow => "context overflow",
     }
 }
 
@@ -1202,6 +1240,13 @@ fn copy_text(kind: &SessionCatalogueKind) -> String {
         }
         SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
         SessionCatalogueKind::Failed => "Failed".to_owned(),
+        SessionCatalogueKind::Compaction { outcome } => match outcome {
+            CompactionOutcome::Applied { summary, .. } => normalise_terminal_text(summary),
+            CompactionOutcome::Failed { diagnostic, .. } => normalise_terminal_text(diagnostic),
+            CompactionOutcome::Cancelled { reason, .. } => {
+                normalise_terminal_text(compaction_reason_label(*reason))
+            }
+        },
         SessionCatalogueKind::Execution {
             source,
             commentary,
@@ -1278,7 +1323,8 @@ mod tests {
         Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary, ToolName,
     };
     use crate::session::{
-        SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
+        CompactionOutcome, CompactionReason, SessionCatalogue, SessionCatalogueEntry,
+        SessionCatalogueKind, SessionEntryId,
     };
     use crate::tui::picker::{Picker, PickerAction};
 
@@ -1572,6 +1618,151 @@ mod tests {
                 TreeNavigatorAction::Copy(expected.to_owned())
             );
         }
+    }
+
+    #[test]
+    fn compaction_rows_search_and_copy_use_only_the_durable_outcome_fields() {
+        let kinds = [
+            (
+                SessionCatalogueKind::Compaction {
+                    outcome: CompactionOutcome::Applied {
+                        summary: "summary\u{1b}".to_owned(),
+                        first_retained: SessionEntryId(2),
+                        context_tokens: 1_250,
+                        reason: CompactionReason::Manual,
+                        attempts: Vec::new(),
+                    },
+                },
+                "Compaction · manual · applied · 1.25k tokens",
+                "summary\\x1B",
+            ),
+            (
+                SessionCatalogueKind::Compaction {
+                    outcome: CompactionOutcome::Failed {
+                        diagnostic: "failed\u{1b}".to_owned(),
+                        reason: CompactionReason::AutomaticThreshold,
+                        attempts: Vec::new(),
+                    },
+                },
+                "Compaction · automatic threshold · failed",
+                "failed\\x1B",
+            ),
+            (
+                SessionCatalogueKind::Compaction {
+                    outcome: CompactionOutcome::Cancelled {
+                        reason: CompactionReason::ContextOverflow,
+                        attempts: Vec::new(),
+                    },
+                },
+                "Compaction · context overflow · cancelled",
+                "context overflow",
+            ),
+        ];
+
+        for (kind, row, copy) in kinds {
+            assert_eq!(
+                super::compaction_row(match &kind {
+                    SessionCatalogueKind::Compaction { outcome } => outcome,
+                    _ => unreachable!("compaction kind"),
+                }),
+                row
+            );
+            let tree = SessionTree::from_catalogue(&catalogue(
+                2,
+                [
+                    entry(1, None, 1, SessionCatalogueKind::Start),
+                    entry(2, Some(1), 2, kind.clone()),
+                ],
+            ));
+            assert_eq!(
+                tree.nodes[1].canonical_search_text,
+                super::canonical_search(row)
+            );
+            let TreeNavigatorAction::Copy(copied) = copy_action(kind) else {
+                panic!("compaction must be copyable")
+            };
+            assert_eq!(copied, copy);
+        }
+    }
+
+    #[test]
+    fn compaction_outcomes_are_tree_entries_in_both_modes() {
+        let outcomes = [
+            SessionCatalogueKind::Compaction {
+                outcome: CompactionOutcome::Applied {
+                    summary: "hidden summary".to_owned(),
+                    first_retained: SessionEntryId(2),
+                    context_tokens: 1_250,
+                    reason: CompactionReason::Manual,
+                    attempts: Vec::new(),
+                },
+            },
+            SessionCatalogueKind::Compaction {
+                outcome: CompactionOutcome::Failed {
+                    diagnostic: "hidden diagnostic".to_owned(),
+                    reason: CompactionReason::AutomaticThreshold,
+                    attempts: Vec::new(),
+                },
+            },
+            SessionCatalogueKind::Compaction {
+                outcome: CompactionOutcome::Cancelled {
+                    reason: CompactionReason::ContextOverflow,
+                    attempts: Vec::new(),
+                },
+            },
+        ];
+        let catalogue = catalogue(
+            5,
+            [
+                entry(1, None, 1, SessionCatalogueKind::Start),
+                entry(2, Some(1), 2, request("compact")),
+                entry(3, Some(2), 3, outcomes[0].clone()),
+                entry(4, Some(3), 4, outcomes[1].clone()),
+                entry(5, Some(4), 5, outcomes[2].clone()),
+            ],
+        );
+        let mut navigator = TreeNavigator::new(5, "");
+        assert!(navigator.install_catalogue(5, &catalogue));
+        for expected in ["applied", "failed", "cancelled"] {
+            assert!(
+                tree_rows(navigator.picker_mut())
+                    .iter()
+                    .any(|row| row.contains(expected))
+            );
+        }
+        assert!(navigator.picker_mut().focus_value(SessionEntryId(4)));
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TreeNavigatorAction::Navigate(SessionEntryId(4))
+        );
+        assert_eq!(
+            navigator.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            TreeNavigatorAction::Changed
+        );
+        for expected in ["applied", "failed", "cancelled"] {
+            assert!(
+                tree_rows(navigator.picker_mut())
+                    .iter()
+                    .any(|row| row.contains(expected))
+            );
+        }
+
+        let mut hidden = TreeNavigator::new(5, "hidden summary");
+        assert!(hidden.install_catalogue(5, &catalogue));
+        assert!(tree_rows(hidden.picker_mut()).is_empty());
+
+        let mut row = super::StyledRow::new(PICKER_ROW_WIDTH);
+        super::append_kind_row(&mut row, &outcomes[0], super::colour_style(super::TEXT));
+        assert_eq!(super::COMPACTION, Color::Rgb(118, 150, 86));
+        assert_ne!(super::COMPACTION, super::ACCENT);
+        assert_ne!(super::COMPACTION, super::SUCCESS);
+        assert_ne!(super::COMPACTION, super::ERROR);
+        assert_ne!(super::COMPACTION, super::WARNING);
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.fg == Some(super::COMPACTION))
+        );
     }
 
     #[test]
@@ -3261,6 +3452,7 @@ mod tests {
                     "Kiki:",
                     "Cancelled",
                     "Failed",
+                    "Compaction",
                 ]
                 .iter()
                 .any(|label| row.contains(label))

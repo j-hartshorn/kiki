@@ -31,6 +31,7 @@ use crate::runtime::{
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
+use crate::session::{CompactionOutcome, CompactionReason};
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 
 #[derive(Clone, Copy)]
@@ -95,6 +96,29 @@ struct SubagentFinishedCard {
     outcome: String,
     measures: String,
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactionCard {
+    heading: String,
+    collapsed: String,
+    expanded: CompactionContent,
+    accounting: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompactionContent {
+    Markdown(String),
+    Plain(String),
+}
+
+impl CompactionContent {
+    fn normalise(self) -> Self {
+        match self {
+            Self::Markdown(text) => Self::Markdown(normalise_terminal_text(&text)),
+            Self::Plain(text) => Self::Plain(normalise_terminal_text(&text)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +214,7 @@ enum TranscriptBlock {
     },
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
+    Compaction(CompactionCard),
     Reasoning {
         markdown: String,
     },
@@ -246,6 +271,7 @@ enum NormalisedBlock {
     },
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
+    Compaction(CompactionCard),
     Reasoning {
         markdown: String,
     },
@@ -307,6 +333,14 @@ impl TranscriptBlock {
                         .map(|message| bounded_terminal_text(&message, 4 * 1024)),
                 })
             }
+            Self::Compaction(card) => NormalisedBlock::Compaction(CompactionCard {
+                heading: normalise_terminal_text(&card.heading),
+                collapsed: normalise_terminal_text(&card.collapsed),
+                expanded: card.expanded.normalise(),
+                accounting: card
+                    .accounting
+                    .map(|accounting| normalise_terminal_text(&accounting)),
+            }),
             Self::Reasoning { markdown } => NormalisedBlock::Reasoning {
                 markdown: normalise_terminal_text(&markdown),
             },
@@ -1394,6 +1428,7 @@ impl NormalisedBlock {
             Self::User { request } => request.clone(),
             Self::SubagentSpawned(card) => subagent_spawned_plain_text(card),
             Self::SubagentFinished(card) => subagent_finished_plain_text(card),
+            Self::Compaction(card) => format!("{}\n{}", card.heading, card.collapsed),
             Self::Arena(arena) => arena.plain_text(),
             Self::Status { text } => text.clone(),
             Self::SessionRestored => "Session restored.".to_owned(),
@@ -2002,6 +2037,7 @@ impl SettledBlock {
             NormalisedBlock::Arena(..)
                 | NormalisedBlock::SubagentSpawned(..)
                 | NormalisedBlock::SubagentFinished(..)
+                | NormalisedBlock::Compaction(..)
         )
     }
 }
@@ -2912,13 +2948,19 @@ impl Transcript {
 
     fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
         let mut foreground_attempts = Vec::new();
+        let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
             append_record_attempts(&displayed.record.record, &mut foreground_attempts);
+            append_normal_record_attempts(
+                &displayed.record.record,
+                &mut normal_foreground_attempts,
+            );
         }
         if let Some(live) = &self.live_step {
             foreground_attempts.extend(&live.settled_attempts);
+            normal_foreground_attempts.extend(&live.settled_attempts);
         }
-        let latest_foreground_attempt = foreground_attempts.last().copied();
+        let latest_foreground_attempt = normal_foreground_attempts.last().copied();
         let mut attempts = foreground_attempts;
         attempts.extend(
             self.subagent_records
@@ -3080,7 +3122,8 @@ impl Transcript {
             Record::UserRequest { .. }
             | Record::FinalMessage { .. }
             | Record::CancelledRun { .. }
-            | Record::FailedRun { .. } => None,
+            | Record::FailedRun { .. }
+            | Record::Compaction { .. } => None,
         };
         let settles_run = matches!(
             &record.record,
@@ -3124,7 +3167,7 @@ impl Transcript {
                 }
                 self.mark_terminal_run(record.run_id);
             }
-            Record::UserRequest { .. } => {}
+            Record::UserRequest { .. } | Record::Compaction { .. } => {}
         }
         let displayed = DisplayedRecord {
             record,
@@ -3255,6 +3298,29 @@ fn build_render_block(
                 SUBAGENT_CARD_HORIZONTAL_PADDING,
                 1,
             )
+        }
+        NormalisedBlock::Compaction(card) => {
+            let style = card_style(COMPLETE_ARENA);
+            let mut text = if expand_arenas {
+                match &card.expanded {
+                    CompactionContent::Markdown(source) => markdown(
+                        source,
+                        #[cfg(test)]
+                        construction_counts,
+                    ),
+                    CompactionContent::Plain(source) => literal_text(source, style),
+                }
+            } else {
+                Text::raw(card.collapsed.clone())
+            };
+            text.lines.insert(0, Line::raw(card.heading.clone()));
+            if expand_arenas && let Some(accounting) = &card.accounting {
+                text.lines.push(accounting_line(
+                    accounting.clone(),
+                    muted_card_style(COMPLETE_ARENA),
+                ));
+            }
+            RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
         }
         NormalisedBlock::Reasoning { markdown: source } => {
             let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
@@ -3416,7 +3482,24 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
         Record::FinalMessage { terminal, .. }
         | Record::CancelledRun { terminal }
         | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
+        Record::Compaction { outcome } => attempts.extend(outcome.attempts()),
         Record::UserRequest { .. } => {}
+    }
+}
+
+fn append_normal_record_attempts<'a>(
+    record: &'a Record,
+    attempts: &mut Vec<&'a AttemptAccounting>,
+) {
+    match record {
+        Record::Compaction { .. } | Record::UserRequest { .. } => {}
+        Record::CompletedExecution {
+            attempts: record_attempts,
+            ..
+        } => attempts.extend(record_attempts),
+        Record::FinalMessage { terminal, .. }
+        | Record::CancelledRun { terminal }
+        | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
     }
 }
 
@@ -3477,6 +3560,49 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
             terminal,
             displayed.progress_gap,
         ),
+        Record::Compaction { outcome } => {
+            vec![TranscriptBlock::Compaction(compaction_card(outcome))]
+        }
+    }
+}
+
+fn compaction_card(outcome: &CompactionOutcome) -> CompactionCard {
+    let heading = format!("compaction · {}", compaction_reason_label(outcome.reason()));
+    let accounting = step_accounting(outcome.attempts());
+    match outcome {
+        CompactionOutcome::Applied {
+            summary,
+            context_tokens,
+            ..
+        } => CompactionCard {
+            heading,
+            collapsed: format!(
+                "Compacted {} tokens · Ctrl-O to expand",
+                format_token_count(u128::from(*context_tokens))
+            ),
+            expanded: CompactionContent::Markdown(summary.clone()),
+            accounting,
+        },
+        CompactionOutcome::Failed { diagnostic, .. } => CompactionCard {
+            heading,
+            collapsed: "Failed · Ctrl-O to expand".to_owned(),
+            expanded: CompactionContent::Plain(diagnostic.clone()),
+            accounting,
+        },
+        CompactionOutcome::Cancelled { .. } => CompactionCard {
+            heading,
+            collapsed: "Cancelled · Ctrl-O to expand".to_owned(),
+            expanded: CompactionContent::Plain("Cancelled".to_owned()),
+            accounting,
+        },
+    }
+}
+
+fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+    match reason {
+        CompactionReason::Manual => "manual",
+        CompactionReason::AutomaticThreshold => "automatic threshold",
+        CompactionReason::ContextOverflow => "context overflow",
     }
 }
 
@@ -3900,7 +4026,7 @@ fn footer_accounting_fields(accounting: &SessionAccounting) -> Vec<String> {
     .collect()
 }
 
-fn format_token_count(value: u128) -> String {
+pub(crate) fn format_token_count(value: u128) -> String {
     const K: u128 = 1_000;
     const M: u128 = 1_000_000;
     if value < K {
@@ -4139,7 +4265,7 @@ mod tests {
         NormalisedBlock, RenderBlock, SubagentCardPhase, SubagentFinishedCard, SubagentSpawnedCard,
         TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
         format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
-        own_styled_text, page_style, subagent_preview, tool_call_label,
+        own_styled_text, page_style, step_accounting, subagent_preview, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -4156,6 +4282,7 @@ mod tests {
         RuntimeInitialState, StoredRecord, TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
+    use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
     use crate::subagents::TaskRecord;
 
     #[test]
@@ -4176,6 +4303,72 @@ mod tests {
             false,
         ));
         assert!(transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn compaction_cards_expand_durable_content_before_accounting() {
+        let attempts = vec![usage(3, 2)];
+        let accounting = step_accounting(&attempts).expect("known usage accounting");
+        let cases = [
+            (
+                CompactionOutcome::Applied {
+                    summary: "## Applied detail\n\n[guide](https://example.com)".to_owned(),
+                    first_retained: SessionEntryId(4),
+                    context_tokens: 1_250,
+                    reason: CompactionReason::Manual,
+                    attempts: attempts.clone(),
+                },
+                "Compacted 1.25k tokens · Ctrl-O to expand",
+                "guide (https://example.com)",
+                true,
+            ),
+            (
+                CompactionOutcome::Failed {
+                    diagnostic: "first line\n[plain](https://example.com)".to_owned(),
+                    reason: CompactionReason::AutomaticThreshold,
+                    attempts: attempts.clone(),
+                },
+                "Failed · Ctrl-O to expand",
+                "[plain](https://example.com)",
+                true,
+            ),
+            (
+                CompactionOutcome::Cancelled {
+                    reason: CompactionReason::ContextOverflow,
+                    attempts: attempts.clone(),
+                },
+                "Cancelled · Ctrl-O to expand",
+                "Cancelled",
+                false,
+            ),
+        ];
+
+        for (outcome, collapsed_line, expanded_content, hides_expanded_content) in cases {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(3),
+                        record: Record::Compaction { outcome },
+                    },
+                    progress_gap: false,
+                },
+                false,
+            );
+
+            let collapsed = rendered_layout_text(&mut transcript);
+            assert!(collapsed.contains("compaction ·"), "{collapsed}");
+            assert!(collapsed.contains(collapsed_line), "{collapsed}");
+            if hides_expanded_content {
+                assert!(!collapsed.contains(expanded_content), "{collapsed}");
+            }
+            assert!(!collapsed.contains(&accounting), "{collapsed}");
+
+            assert!(transcript.toggle_arena_expansion());
+            let expanded = rendered_layout_text(&mut transcript);
+            assert!(expanded.contains(expanded_content), "{expanded}");
+            assert!(expanded.contains(&accounting), "{expanded}");
+        }
     }
 
     #[test]
@@ -7288,6 +7481,40 @@ truncated"
     }
 
     #[test]
+    fn footer_counts_compaction_attempts_without_replacing_normal_context_measurement() {
+        let normal = detailed_usage(Some(100), Some(10), Some(75), Some(0), Some(0), Some(110));
+        let summary = detailed_usage(Some(20), Some(5), Some(5), Some(0), Some(0), Some(25));
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "normal()", "", vec![normal]),
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::Compaction {
+                        outcome: CompactionOutcome::Applied {
+                            summary: "summary".to_owned(),
+                            first_retained: SessionEntryId(2),
+                            context_tokens: 1,
+                            reason: CompactionReason::Manual,
+                            attempts: vec![summary],
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let footer = footer_text(&transcript.layout(128)).expect("footer");
+        assert!(footer.contains("↑120 ↓15 R80 W0"), "{footer}");
+        assert!(footer.contains("CH75.0%"), "{footer}");
+        assert!(!footer.contains("CH25.0%"), "{footer}");
+    }
+
+    #[test]
     fn footer_uses_the_latest_settled_attempt_during_streaming() {
         let first = detailed_usage(
             Some(100_000),
@@ -8136,6 +8363,7 @@ truncated"
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
+                TranscriptBlock::Compaction(..) => "compaction",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
@@ -8253,6 +8481,7 @@ truncated"
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
+                TranscriptBlock::Compaction(..) => "compaction",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",

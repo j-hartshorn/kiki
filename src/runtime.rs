@@ -14,8 +14,9 @@ use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session,
-    SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
+    CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
+    Session, SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore,
+    SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -102,6 +103,9 @@ pub(crate) enum Record {
     FailedRun {
         message: String,
         terminal: TerminalDetails,
+    },
+    Compaction {
+        outcome: CompactionOutcome,
     },
 }
 
@@ -495,9 +499,9 @@ fn root_settlement(record: &Record) -> Settlement {
         Record::FinalMessage { .. } => Settlement::Succeeded,
         Record::CancelledRun { .. } => Settlement::Cancelled,
         Record::FailedRun { .. } => Settlement::Failed,
-        Record::UserRequest { .. } | Record::CompletedExecution { .. } => {
-            unreachable!("only terminal root records settle runs")
-        }
+        Record::UserRequest { .. }
+        | Record::CompletedExecution { .. }
+        | Record::Compaction { .. } => unreachable!("only terminal root records settle runs"),
     }
 }
 
@@ -661,6 +665,7 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
             message,
             terminal: terminal_details(terminal),
         },
+        RestoredRecordKind::Compaction { outcome } => Record::Compaction { outcome },
     };
     StoredRecord {
         run_id: RunId(run_id),
@@ -2007,7 +2012,7 @@ mod tests {
         PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
         RestoredTimelineItem, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
         RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails, WorkerMessage,
-        restored_initial_state, runtime_event_payload_bytes,
+        restored_initial_state, restored_stored_record, runtime_event_payload_bytes,
     };
     use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
@@ -2025,9 +2030,9 @@ mod tests {
         ScriptedAction as ModelAction, ScriptedModel,
     };
     use crate::session::{
-        PersistedCode, PersistedTerminal, RestoredRecord, RestoredRecordKind, RestoredTask,
-        Session, SessionEntryId, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission,
-        TaskTerminal,
+        CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, RestoredRecord,
+        RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
+        SessionWriteGate, SessionWriteKind, TaskAdmission, TaskTerminal,
     };
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -5361,6 +5366,23 @@ mod tests {
     }
 
     #[test]
+    fn restored_compaction_is_a_record_without_terminal_settlement() {
+        let outcome = CompactionOutcome::Cancelled {
+            reason: CompactionReason::Manual,
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let restored = restored_stored_record(RestoredRecord {
+            revision: 7,
+            run_id: 3,
+            kind: RestoredRecordKind::Compaction {
+                outcome: outcome.clone(),
+            },
+        });
+        assert_eq!(restored.run_id, RunId(3));
+        assert_eq!(restored.record, Record::Compaction { outcome });
+    }
+
+    #[test]
     fn mutation_evidence_labels_are_path_free() {
         assert_eq!(
             tool_call_label(ToolCall {
@@ -5416,6 +5438,7 @@ mod tests {
             Record::FailedRun { message, .. } => {
                 format!("record:{}:failed:{message}", record.run_id.0)
             }
+            Record::Compaction { .. } => format!("record:{}:compaction", record.run_id.0),
         }
     }
 

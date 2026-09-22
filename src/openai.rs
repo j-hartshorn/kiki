@@ -6654,6 +6654,7 @@ mod tests {
                         }
                         Record::CancelledRun { .. } => run.cancelled_runs += 1,
                         Record::FailedRun { .. } => run.failed_runs += 1,
+                        Record::Compaction { .. } => {}
                     }
                 }
                 RuntimeEvent::RunSettled { run_id } => {
@@ -7101,6 +7102,7 @@ mod tests {
                 }
                 Record::CancelledRun { .. } => cancelled_runs += 1,
                 Record::FailedRun { .. } => failed_runs += 1,
+                Record::Compaction { .. } => {}
             }
         }
         (

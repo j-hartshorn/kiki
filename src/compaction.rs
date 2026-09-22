@@ -60,6 +60,7 @@ pub(crate) enum SelectedAncestryKind {
 pub(crate) struct CompactionPreparation {
     context_tokens: u64,
     first_retained: SessionEntryId,
+    retained_entries: Vec<ModelContextEntry>,
     requests: Vec<SummaryRequest>,
     assembly: SummaryAssembly,
     files: FileSets,
@@ -76,6 +77,10 @@ impl CompactionPreparation {
 
     pub(crate) fn requests(&self) -> &[SummaryRequest] {
         &self.requests
+    }
+
+    pub(crate) fn retained_entries(&self) -> &[ModelContextEntry] {
+        &self.retained_entries
     }
 
     pub(crate) fn finish(&self, outputs: &[String]) -> Result<CompactedSummary, CompactionError> {
@@ -221,9 +226,17 @@ pub(crate) fn prepare(
         index
     });
 
+    let retained_entries = facts[first_retained_index..]
+        .iter()
+        .filter(|fact| ordinary_context(fact))
+        .filter_map(context_entry)
+        .cloned()
+        .collect();
+
     Ok(Some(CompactionPreparation {
         context_tokens,
         first_retained: facts[first_retained_index].entry_id,
+        retained_entries,
         requests,
         assembly: SummaryAssembly {
             history,

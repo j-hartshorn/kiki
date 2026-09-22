@@ -19,8 +19,11 @@ use tokio::task;
 
 use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
+use crate::compaction::{
+    CompactedSummary, CompactionError, CompactionPolicy, SelectedAncestryFact, SelectedAncestryKind,
+};
 use crate::config::{ModelSelection, SessionPreferences};
-use crate::model::{AttemptAccounting, ModelHistory};
+use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
@@ -29,6 +32,7 @@ const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_SIGNATURE: &[u8] = b"SQLite format 3\0";
 const FORMAT_VERSION: u32 = 2;
 const INTERRUPTION_MESSAGE: &str = "Interrupted by previous process exit";
+const COMPACTION_DIAGNOSTIC_LIMIT: usize = 4_096;
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
@@ -123,6 +127,98 @@ impl SessionPaths {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SessionEntryId(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionReason {
+    Manual,
+    AutomaticThreshold,
+    ContextOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompactionOutcome {
+    Applied {
+        summary: String,
+        first_retained: SessionEntryId,
+        context_tokens: u64,
+        reason: CompactionReason,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Failed {
+        diagnostic: String,
+        reason: CompactionReason,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Cancelled {
+        reason: CompactionReason,
+        attempts: Vec<AttemptAccounting>,
+    },
+}
+
+impl CompactionOutcome {
+    pub(crate) fn reason(&self) -> CompactionReason {
+        match self {
+            Self::Applied { reason, .. }
+            | Self::Failed { reason, .. }
+            | Self::Cancelled { reason, .. } => *reason,
+        }
+    }
+
+    pub(crate) fn attempts(&self) -> &[AttemptAccounting] {
+        match self {
+            Self::Applied { attempts, .. }
+            | Self::Failed { attempts, .. }
+            | Self::Cancelled { attempts, .. } => attempts,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompactionSettlement {
+    Applied {
+        summary: String,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Failed {
+        diagnostic: String,
+        attempts: Vec<AttemptAccounting>,
+    },
+    Cancelled {
+        attempts: Vec<AttemptAccounting>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedCompaction {
+    pub(crate) entry_id: SessionEntryId,
+    pub(crate) run_id: u64,
+    pub(crate) outcome: CompactionOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCompaction {
+    expected_leaf: SessionEntryId,
+    parent_run_id: u64,
+    checkpoint_id: i64,
+    reason: CompactionReason,
+    context_tokens: u64,
+    first_retained: SessionEntryId,
+    retained_tail: Vec<ModelContextEntry>,
+    planner: crate::compaction::CompactionPreparation,
+}
+
+impl PreparedCompaction {
+    pub(crate) fn requests(&self) -> &[SummaryRequest] {
+        self.planner.requests()
+    }
+
+    pub(crate) fn finish(&self, outputs: &[String]) -> Result<CompactedSummary, CompactionError> {
+        self.planner.finish(outputs)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PersistedCode {
     pub(crate) source: String,
@@ -210,6 +306,9 @@ pub(crate) enum RestoredRecordKind {
         message: String,
         terminal: ReadableTerminal,
     },
+    Compaction {
+        outcome: CompactionOutcome,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,9 +326,6 @@ pub(crate) struct RestoredTask {
     pub(crate) admitted_revision: u64,
     pub(crate) terminal_revision: u64,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct SessionEntryId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestAdmission {
@@ -253,6 +349,9 @@ pub(crate) enum SessionCatalogueKind {
     },
     Cancelled,
     Failed,
+    Compaction {
+        outcome: CompactionOutcome,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +426,7 @@ pub(crate) enum SessionWriteKind {
     Request,
     Step,
     Settlement,
+    Compaction,
     Closure,
     TaskAdmission,
     TaskStep,
@@ -843,6 +943,92 @@ impl SessionWriter {
             .as_ref()
             .map(|context| context.history.clone())
             .ok_or(SessionError::ModelContextUnavailable)
+    }
+
+    pub(crate) async fn prepare_compaction(
+        &self,
+        policy: CompactionPolicy,
+        selection: ModelSelection,
+        focus: String,
+        reason: CompactionReason,
+    ) -> Result<Option<PreparedCompaction>, SessionError> {
+        let snapshot = self.read(load_compaction_snapshot).await?;
+        let Some(planner) = crate::compaction::prepare(&snapshot.facts, policy, selection, &focus)
+            .map_err(|error| SessionError::Codec(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedCompaction {
+            expected_leaf: snapshot.expected_leaf,
+            parent_run_id: snapshot.parent_run_id,
+            checkpoint_id: snapshot.checkpoint_id,
+            reason,
+            context_tokens: planner.context_tokens(),
+            first_retained: planner.first_retained(),
+            retained_tail: planner.retained_entries().to_vec(),
+            planner,
+        }))
+    }
+
+    pub(crate) async fn settle_compaction(
+        &self,
+        preparation: PreparedCompaction,
+        settlement: CompactionSettlement,
+    ) -> Result<CommittedCompaction, SessionError> {
+        self.write_context(SessionWriteKind::Compaction, move |connection, context| {
+            if context.effective_entry != preparation.expected_leaf {
+                return Err(SessionError::InvalidTransition);
+            }
+            let outcome = match settlement {
+                CompactionSettlement::Applied { summary, attempts } => CompactionOutcome::Applied {
+                    summary,
+                    first_retained: preparation.first_retained,
+                    context_tokens: preparation.context_tokens,
+                    reason: preparation.reason,
+                    attempts,
+                },
+                CompactionSettlement::Failed {
+                    diagnostic,
+                    attempts,
+                } => CompactionOutcome::Failed {
+                    diagnostic: bounded_compaction_diagnostic(diagnostic),
+                    reason: preparation.reason,
+                    attempts,
+                },
+                CompactionSettlement::Cancelled { attempts } => CompactionOutcome::Cancelled {
+                    reason: preparation.reason,
+                    attempts,
+                },
+            };
+            let history = match &outcome {
+                CompactionOutcome::Applied { summary, .. } => {
+                    let mut history = ModelHistory::new();
+                    history.append_compaction_summary(summary.clone());
+                    for entry in &preparation.retained_tail {
+                        append_model_context_entry(&mut history, entry.clone())?;
+                    }
+                    history
+                }
+                CompactionOutcome::Failed { .. } | CompactionOutcome::Cancelled { .. } => {
+                    context.history.clone()
+                }
+            };
+            let entry_id = commit_compaction(
+                connection,
+                preparation.expected_leaf,
+                preparation.parent_run_id,
+                preparation.checkpoint_id,
+                &outcome,
+            )?;
+            context.effective_entry = entry_id;
+            context.history = history;
+            Ok(CommittedCompaction {
+                entry_id,
+                run_id: preparation.parent_run_id,
+                outcome,
+            })
+        })
+        .await
     }
 
     pub(crate) async fn activate(
@@ -1521,6 +1707,88 @@ fn terminal_history(
     Ok(history)
 }
 
+fn append_model_context_entry(
+    history: &mut ModelHistory,
+    entry: ModelContextEntry,
+) -> Result<(), SessionError> {
+    match entry {
+        ModelContextEntry::UserRequest { text } => history.append_user_request(text),
+        ModelContextEntry::CompactionSummary { summary } => {
+            history.append_compaction_summary(summary)
+        }
+        ModelContextEntry::CompletedCode(code) => history
+            .append_completed_code(
+                code.source().to_owned(),
+                code.call_id().clone(),
+                code.commentary().map(str::to_owned),
+                code.reasoning_summary().to_owned(),
+                code.replay().clone(),
+                code.result().clone(),
+            )
+            .map_err(|error| SessionError::Codec(error.to_string()))?,
+        ModelContextEntry::FinalMessage {
+            text,
+            reasoning_summary,
+            replay,
+        } => history.append_final_message(text, reasoning_summary, replay),
+    }
+    Ok(())
+}
+
+fn bounded_compaction_diagnostic(mut diagnostic: String) -> String {
+    if diagnostic.len() <= COMPACTION_DIAGNOSTIC_LIMIT {
+        return diagnostic;
+    }
+    let mut end = COMPACTION_DIAGNOSTIC_LIMIT;
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic.truncate(end);
+    diagnostic
+}
+
+fn commit_compaction(
+    connection: &mut Connection,
+    expected_leaf: SessionEntryId,
+    expected_run_id: u64,
+    expected_checkpoint_id: i64,
+    outcome: &CompactionOutcome,
+) -> Result<SessionEntryId, SessionError> {
+    let expected_leaf = i64::try_from(expected_leaf.0).map_err(|_| SessionError::IdOverflow)?;
+    let expected_run_id = i64::try_from(expected_run_id).map_err(|_| SessionError::IdOverflow)?;
+    let stored = codec::encode_compaction(outcome)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let now = now_ms()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (active_entry, parent_run_id, checkpoint_id, revision): (i64, i64, i64, i64) = transaction
+        .query_row(
+            "SELECT session.active_entry_id, entries.run_id, entries.checkpoint_id, session.revision FROM session JOIN entries ON entries.id = session.active_entry_id WHERE session.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    if active_entry != expected_leaf
+        || parent_run_id != expected_run_id
+        || checkpoint_id != expected_checkpoint_id
+    {
+        return Err(SessionError::InvalidTransition);
+    }
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'compaction', ?3, ?4, NULL, ?5, ?6)",
+        params![active_entry, parent_run_id, checkpoint_id, stored.payload_json, now, next_revision],
+    )?;
+    let inserted_entry_id = transaction.last_insert_rowid();
+    let entry_id = session_entry_id(inserted_entry_id)?;
+    if transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1 AND active_entry_id = ?4",
+        params![inserted_entry_id, now, next_revision, active_entry],
+    )? != 1 {
+        return Err(SessionError::InvalidTransition);
+    }
+    transaction.commit()?;
+    Ok(entry_id)
+}
+
 fn admit_subagent_task(
     connection: &mut Connection,
     admission: &TaskAdmission,
@@ -2004,7 +2272,44 @@ struct CatalogueEntryRow {
     parent_id: Option<i64>,
     kind: String,
     payload_json: String,
+    provider_replay: Option<Vec<u8>>,
     revision: i64,
+}
+
+#[derive(Clone, Copy)]
+struct EntryPayload<'a> {
+    id: i64,
+    parent_id: Option<i64>,
+    kind: &'a str,
+    payload_json: &'a str,
+    provider_replay: Option<&'a [u8]>,
+    revision: i64,
+}
+
+impl RestoreEntryRow {
+    fn payload(&self) -> EntryPayload<'_> {
+        EntryPayload {
+            id: self.id,
+            parent_id: self.parent_id,
+            kind: &self.kind,
+            payload_json: &self.payload_json,
+            provider_replay: self.provider_replay.as_deref(),
+            revision: self.revision,
+        }
+    }
+}
+
+impl CatalogueEntryRow {
+    fn payload(&self) -> EntryPayload<'_> {
+        EntryPayload {
+            id: self.id,
+            parent_id: self.parent_id,
+            kind: &self.kind,
+            payload_json: &self.payload_json,
+            provider_replay: self.provider_replay.as_deref(),
+            revision: self.revision,
+        }
+    }
 }
 
 struct RestoreRunRow {
@@ -2056,6 +2361,218 @@ fn session_metadata(
     let preferences = codec::decode_session_preferences(&preferences_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     Ok(SessionMetadata::new(name, preferences))
+}
+
+struct CompactionSnapshot {
+    expected_leaf: SessionEntryId,
+    parent_run_id: u64,
+    checkpoint_id: i64,
+    facts: Vec<SelectedAncestryFact>,
+}
+
+fn load_compaction_snapshot(
+    connection: &mut Connection,
+) -> Result<CompactionSnapshot, SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let active_entry_id: i64 = transaction.query_row(
+        "SELECT active_entry_id FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let entries = {
+        let mut statement = transaction.prepare(
+            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreEntryRow {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    checkpoint_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    provider_replay: row.get(6)?,
+                    revision: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let entries_by_id = entries
+        .iter()
+        .map(|entry| (entry.id, entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let ancestry = selected_ancestry(&entries_by_id, active_entry_id);
+    if !ancestry.intact {
+        return Err(SessionError::InvalidTransition);
+    }
+    let parent = ancestry
+        .entries
+        .last()
+        .ok_or(SessionError::InvalidTransition)?;
+    let expected_leaf = session_entry_id(parent.id)?;
+    let parent_run_id = parent
+        .run_id
+        .and_then(|run_id| u64::try_from(run_id).ok())
+        .unwrap_or_default();
+    let checkpoint_id = parent.checkpoint_id;
+    let facts = ancestry
+        .entries
+        .iter()
+        .filter(|entry| entry.kind != "session_start")
+        .map(|entry| compaction_fact(entry, &entries))
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction.commit()?;
+    Ok(CompactionSnapshot {
+        expected_leaf,
+        parent_run_id,
+        checkpoint_id,
+        facts,
+    })
+}
+
+fn compaction_fact(
+    entry: &RestoreEntryRow,
+    entries: &[RestoreEntryRow],
+) -> Result<SelectedAncestryFact, SessionError> {
+    let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let entry_id = session_entry_id(entry.id)?;
+    let kind = match entry.kind.as_str() {
+        "user_request" => {
+            if entry.provider_replay.is_some() {
+                return Err(SessionError::InvalidTransition);
+            }
+            SelectedAncestryKind::Context {
+                entry: ModelContextEntry::UserRequest {
+                    text: codec::decoded_request(&decoded)
+                        .ok_or(SessionError::InvalidTransition)?
+                        .to_owned(),
+                },
+                normal_attempts: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
+            }
+        }
+        "execution" => {
+            let code = codec::decoded_execution_history(&decoded, entry.provider_replay.as_deref())
+                .map_err(|error| SessionError::Codec(error.to_string()))?;
+            let (_, execution) = codec::decoded_readable_execution(&decoded)
+                .map_err(|error| SessionError::Codec(error.to_string()))?
+                .ok_or(SessionError::InvalidTransition)?;
+            if !matches!(code.result, crate::model::CodeResult::Execution { .. }) {
+                return Err(SessionError::InvalidTransition);
+            }
+            SelectedAncestryKind::Context {
+                entry: model_entry_from_code(code)?,
+                normal_attempts: codec::decoded_attempts(&decoded),
+                read_paths: execution.read_paths,
+                modified_paths: execution.modified_paths,
+            }
+        }
+        "final_reply" | "cancelled" | "failed" => {
+            let terminal =
+                codec::decoded_terminal_history(&decoded, entry.provider_replay.as_deref())
+                    .map_err(|error| SessionError::Codec(error.to_string()))?;
+            let readable = codec::decoded_readable_terminal(&decoded)
+                .map_err(|error| SessionError::Codec(error.to_string()))?
+                .ok_or(SessionError::InvalidTransition)?;
+            let (read_paths, modified_paths) = match &readable {
+                ReadableTerminal::Cancelled {
+                    evidence: Some(TerminalEvidence::Execution(evidence)),
+                    ..
+                }
+                | ReadableTerminal::Failed {
+                    evidence: Some(TerminalEvidence::Execution(evidence)),
+                    ..
+                } => (evidence.read_paths.clone(), evidence.modified_paths.clone()),
+                ReadableTerminal::Final { .. }
+                | ReadableTerminal::Cancelled { .. }
+                | ReadableTerminal::Failed { .. } => (Vec::new(), Vec::new()),
+            };
+            match terminal {
+                codec::DecodedTerminalHistory::Final {
+                    text,
+                    reasoning_summary,
+                    replay,
+                } if entry.kind == "final_reply" => SelectedAncestryKind::Context {
+                    entry: ModelContextEntry::FinalMessage {
+                        text,
+                        reasoning_summary,
+                        replay,
+                    },
+                    normal_attempts: codec::decoded_attempts(&decoded),
+                    read_paths,
+                    modified_paths,
+                },
+                codec::DecodedTerminalHistory::Cancelled { code } if entry.kind == "cancelled" => {
+                    match code {
+                        Some(code) => SelectedAncestryKind::Context {
+                            entry: model_entry_from_code(code)?,
+                            normal_attempts: codec::decoded_attempts(&decoded),
+                            read_paths,
+                            modified_paths,
+                        },
+                        None => SelectedAncestryKind::ContextNeutral {
+                            read_paths,
+                            modified_paths,
+                        },
+                    }
+                }
+                codec::DecodedTerminalHistory::Failed { code } if entry.kind == "failed" => {
+                    match code {
+                        Some(code) => SelectedAncestryKind::Context {
+                            entry: model_entry_from_code(code)?,
+                            normal_attempts: codec::decoded_attempts(&decoded),
+                            read_paths,
+                            modified_paths,
+                        },
+                        None => SelectedAncestryKind::ContextNeutral {
+                            read_paths,
+                            modified_paths,
+                        },
+                    }
+                }
+                _ => return Err(SessionError::InvalidTransition),
+            }
+        }
+        "compaction" => {
+            let payloads = entries
+                .iter()
+                .map(RestoreEntryRow::payload)
+                .collect::<Vec<_>>();
+            validate_compaction_entry(entry.payload(), &payloads)
+                .map_err(|_| SessionError::InvalidTransition)?;
+            match codec::decoded_compaction(&decoded).ok_or(SessionError::InvalidTransition)? {
+                CompactionOutcome::Applied {
+                    summary,
+                    first_retained,
+                    ..
+                } => SelectedAncestryKind::Applied {
+                    summary,
+                    first_retained,
+                },
+                CompactionOutcome::Failed { .. } | CompactionOutcome::Cancelled { .. } => {
+                    SelectedAncestryKind::ContextNeutral {
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
+                    }
+                }
+            }
+        }
+        _ => return Err(SessionError::InvalidTransition),
+    };
+    Ok(SelectedAncestryFact { entry_id, kind })
+}
+
+fn model_entry_from_code(code: PersistedCode) -> Result<ModelContextEntry, SessionError> {
+    let mut history = ModelHistory::new();
+    append_persisted_code(&mut history, &code)?;
+    history
+        .entries()
+        .first()
+        .cloned()
+        .ok_or(SessionError::InvalidTransition)
 }
 
 fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
@@ -2193,7 +2710,7 @@ fn load_session_catalogue(connection: &mut Connection) -> Result<SessionCatalogu
     )?;
     let entries = {
         let mut statement = transaction.prepare(
-            "SELECT id, parent_id, kind, payload_json, revision FROM entries ORDER BY revision",
+            "SELECT id, parent_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY revision",
         )?;
         statement
             .query_map([], |row| {
@@ -2202,15 +2719,20 @@ fn load_session_catalogue(connection: &mut Connection) -> Result<SessionCatalogu
                     parent_id: row.get(1)?,
                     kind: row.get(2)?,
                     payload_json: row.get(3)?,
-                    revision: row.get(4)?,
+                    provider_replay: row.get(4)?,
+                    revision: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
     let active_entry = session_entry_id(active_entry_id)?;
+    let payloads = entries
+        .iter()
+        .map(CatalogueEntryRow::payload)
+        .collect::<Vec<_>>();
     let entries = entries
         .iter()
-        .map(session_catalogue_entry)
+        .map(|entry| session_catalogue_entry(entry, &payloads))
         .collect::<Result<Vec<_>, _>>()?;
     if !entries.iter().any(|entry| entry.entry_id == active_entry) {
         return Err(SessionError::InvalidTransition);
@@ -2230,6 +2752,7 @@ fn session_entry_id(value: i64) -> Result<SessionEntryId, SessionError> {
 
 fn session_catalogue_entry(
     entry: &CatalogueEntryRow,
+    entries: &[EntryPayload<'_>],
 ) -> Result<SessionCatalogueEntry, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -2260,6 +2783,14 @@ fn session_catalogue_entry(
         },
         codec::DecodedEntryKind::Cancelled => SessionCatalogueKind::Cancelled,
         codec::DecodedEntryKind::Failed => SessionCatalogueKind::Failed,
+        codec::DecodedEntryKind::Compaction => {
+            validate_compaction_entry(entry.payload(), entries)
+                .map_err(|_| SessionError::InvalidTransition)?;
+            SessionCatalogueKind::Compaction {
+                outcome: codec::decoded_compaction(&decoded)
+                    .ok_or(SessionError::InvalidTransition)?,
+            }
+        }
     };
     Ok(SessionCatalogueEntry {
         entry_id: session_entry_id(entry.id)?,
@@ -2295,6 +2826,10 @@ fn restore_projection_at(
         .iter()
         .map(|entry| (entry.id, entry.clone()))
         .collect::<BTreeMap<_, _>>();
+    let payloads = entries
+        .values()
+        .map(RestoreEntryRow::payload)
+        .collect::<Vec<_>>();
     let runs = snapshot
         .runs
         .iter()
@@ -2328,7 +2863,7 @@ fn restore_projection_at(
             .filter(|entry| {
                 matches!(
                     entry.kind.as_str(),
-                    "execution" | "final_reply" | "cancelled" | "failed"
+                    "execution" | "final_reply" | "cancelled" | "failed" | "compaction"
                 )
             })
             .map(|entry| entry.id),
@@ -2357,6 +2892,8 @@ fn restore_projection_at(
     let requested_is_valid = entries.get(&requested_entry_id).is_some_and(|entry| {
         decoded_restore_entry(&decoded_entries, entry.id).is_ok()
             && (entry.kind != "user_request" || entry.provider_replay.is_none())
+            && (entry.kind != "compaction"
+                || validate_compaction_entry(entry.payload(), &payloads).is_ok())
     });
     let mut executable = snapshot.metadata.is_some()
         && ancestry.intact
@@ -2401,6 +2938,17 @@ fn restore_projection_at(
     {
         match entry.kind.as_str() {
             "execution" | "final_reply" | "cancelled" | "failed" => {
+                let Ok(decoded) = decoded_restore_entry(&decoded_entries, entry.id) else {
+                    executable = false;
+                    continue;
+                };
+                footer_adjustment.extend(codec::decoded_attempts(decoded));
+            }
+            "compaction" => {
+                if validate_compaction_entry(entry.payload(), &payloads).is_err() {
+                    executable = false;
+                    continue;
+                }
                 let Ok(decoded) = decoded_restore_entry(&decoded_entries, entry.id) else {
                     executable = false;
                     continue;
@@ -2822,6 +3370,75 @@ fn valid_run_membership(snapshot: &RestoreSnapshot) -> bool {
     })
 }
 
+fn validate_compaction_entry(
+    entry: EntryPayload<'_>,
+    entries: &[EntryPayload<'_>],
+) -> Result<(), ()> {
+    if entry.kind != "compaction" || entry.provider_replay.is_some() {
+        return Err(());
+    }
+    let decoded = codec::decode_entry(entry.kind, entry.payload_json).map_err(|_| ())?;
+    let Some(CompactionOutcome::Applied { first_retained, .. }) =
+        codec::decoded_compaction(&decoded)
+    else {
+        return Ok(());
+    };
+    let boundary_id = i64::try_from(first_retained.0).map_err(|_| ())?;
+    let mut ancestor_id = entry.parent_id;
+    let mut visited = BTreeSet::new();
+    while let Some(id) = ancestor_id {
+        if !visited.insert(id) {
+            return Err(());
+        }
+        let boundary = entries
+            .iter()
+            .copied()
+            .find(|candidate| candidate.id == id)
+            .ok_or(())?;
+        if boundary.id == boundary_id {
+            return (boundary.revision < entry.revision && context_bearing_payload(boundary))
+                .then_some(())
+                .ok_or(());
+        }
+        ancestor_id = boundary.parent_id;
+    }
+    Err(())
+}
+
+fn context_bearing_payload(entry: EntryPayload<'_>) -> bool {
+    let Ok(decoded) = codec::decode_entry(entry.kind, entry.payload_json) else {
+        return false;
+    };
+    match entry.kind {
+        "user_request" => {
+            entry.provider_replay.is_none() && codec::decoded_request(&decoded).is_some()
+        }
+        "execution" => matches!(
+            codec::decoded_execution_history(&decoded, entry.provider_replay),
+            Ok(code) if matches!(code.result, crate::model::CodeResult::Execution { .. })
+        ),
+        "final_reply" => matches!(
+            codec::decoded_terminal_history(&decoded, entry.provider_replay),
+            Ok(codec::DecodedTerminalHistory::Final { .. })
+        ),
+        "cancelled" => matches!(
+            codec::decoded_terminal_history(&decoded, entry.provider_replay),
+            Ok(codec::DecodedTerminalHistory::Cancelled { code: Some(code) })
+                if matches!(
+                    code.result,
+                    crate::model::CodeResult::Cancelled { .. }
+                        | crate::model::CodeResult::Failure { .. }
+                )
+        ),
+        "failed" => matches!(
+            codec::decoded_terminal_history(&decoded, entry.provider_replay),
+            Ok(codec::DecodedTerminalHistory::Failed { code: Some(code) })
+                if matches!(code.result, crate::model::CodeResult::Failure { .. })
+        ),
+        "session_start" | "compaction" | _ => false,
+    }
+}
+
 fn readable_record(
     entry: &RestoreEntryRow,
     entries: &[RestoreEntryRow],
@@ -2942,6 +3559,27 @@ fn readable_record(
                 terminal,
             }
         }
+        "compaction" => {
+            let payloads = entries
+                .iter()
+                .map(RestoreEntryRow::payload)
+                .collect::<Vec<_>>();
+            validate_compaction_entry(entry.payload(), &payloads)?;
+            let parent = entry
+                .parent_id
+                .and_then(|parent_id| entries.iter().find(|candidate| candidate.id == parent_id))
+                .ok_or(())?;
+            if parent.run_id != entry.run_id
+                || steps
+                    .iter()
+                    .any(|step| step.settled_entry_id == Some(entry.id))
+            {
+                return Err(());
+            }
+            RestoredRecordKind::Compaction {
+                outcome: codec::decoded_compaction(decoded).ok_or(())?,
+            }
+        }
         _ => return Err(()),
     };
     Ok(Some(RestoredRecord {
@@ -2979,8 +3617,41 @@ fn restored_history(
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
 ) -> Option<ModelHistory> {
-    let mut history = ModelHistory::new();
-    for entry in selected {
+    let latest_applied = selected
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| {
+            (entry.kind == "compaction")
+                .then(|| decoded_restore_entry(decoded_entries, entry.id).ok())
+                .flatten()
+                .and_then(codec::decoded_compaction)
+                .and_then(|outcome| match outcome {
+                    CompactionOutcome::Applied {
+                        summary,
+                        first_retained,
+                        ..
+                    } => Some((index, summary, first_retained)),
+                    CompactionOutcome::Failed { .. } | CompactionOutcome::Cancelled { .. } => None,
+                })
+        });
+    let (start, mut history) = match latest_applied {
+        Some((applied_index, summary, first_retained)) => {
+            let first_retained = i64::try_from(first_retained.0).ok()?;
+            let boundary = selected[..applied_index]
+                .iter()
+                .position(|entry| entry.id == first_retained)?;
+            let boundary_entry = &selected[boundary];
+            if !context_bearing_payload(boundary_entry.payload()) {
+                return None;
+            }
+            let mut history = ModelHistory::new();
+            history.append_compaction_summary(summary);
+            (boundary, history)
+        }
+        None => (0, ModelHistory::new()),
+    };
+    for entry in &selected[start..] {
         let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
         match entry.kind.as_str() {
             "session_start" => {
@@ -3047,6 +3718,11 @@ fn restored_history(
                         }
                     }
                     _ => return None,
+                }
+            }
+            "compaction" => {
+                if entry.provider_replay.is_some() || codec::decoded_compaction(decoded).is_none() {
+                    return None;
                 }
             }
             _ => return None,
@@ -3123,8 +3799,8 @@ mod tests {
 
     use super::{
         PersistedCode, PersistedTerminal, Session, SessionEntryId, SessionError, SessionId,
-        SessionWriteGate, SessionWriteKind, TaskAdmission, TaskSnapshot, TaskStepCommit,
-        TaskTerminal,
+        SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskSnapshot,
+        TaskStepCommit, TaskTerminal,
     };
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity, ToolCall, ToolCallSummary,
@@ -3182,6 +3858,25 @@ mod tests {
             )
             .await
             .expect("activate session context");
+    }
+
+    async fn append_cancelled_request(writer: &SessionWriter, request: &str) {
+        let admission = writer
+            .commit_request(request.to_owned())
+            .await
+            .expect("commit request");
+        writer
+            .close_run(
+                admission.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close cancelled request");
     }
 
     #[cfg(unix)]
@@ -3597,6 +4292,54 @@ mod tests {
                 ..
             }] if request == "first"
         ));
+    }
+
+    #[test]
+    fn restore_validates_each_applied_compaction_boundary() {
+        let request = super::codec::encode_request("retained request").expect("encode request");
+        let invalid = super::codec::encode_compaction(&super::CompactionOutcome::Applied {
+            summary: "older summary".to_owned(),
+            first_retained: SessionEntryId(1),
+            context_tokens: 1,
+            reason: super::CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode invalid compaction");
+        let valid = super::codec::encode_compaction(&super::CompactionOutcome::Applied {
+            summary: "latest summary".to_owned(),
+            first_retained: SessionEntryId(2),
+            context_tokens: 1,
+            reason: super::CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode valid compaction");
+        let mut older = restore_entry(3, Some(2), Some(1), invalid.payload_json, 3);
+        older.kind = "compaction".to_owned();
+        let mut latest = restore_entry(4, Some(3), Some(1), valid.payload_json, 4);
+        latest.kind = "compaction".to_owned();
+        let restore = super::restore_projection(super::RestoreSnapshot {
+            active_entry_id: 4,
+            session_revision: 4,
+            metadata: Some(super::SessionMetadata::new(
+                None,
+                SessionPreferences::initial(selection()),
+            )),
+            entries: vec![
+                restore_entry(1, None, None, "{}".to_owned(), 1),
+                restore_entry(2, Some(1), Some(1), request, 2),
+                older,
+                latest,
+            ],
+            runs: vec![super::RestoreRunRow {
+                id: 1,
+                terminal_entry_id: None,
+            }],
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            checkpoint: valid_checkpoint_tuple(),
+        });
+
+        assert!(restore.executable.is_none());
     }
 
     #[test]
@@ -9313,6 +10056,918 @@ mod tests {
             lock_inode
         );
         recovered.close().expect("close recovered session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn applied_compaction_restores_summary_tail_checkpoint_and_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+
+        let discarded = writer
+            .commit_request("discarded request".to_owned())
+            .await
+            .expect("commit discarded request");
+        let discarded_step = writer
+            .start_model_step(discarded.run_id)
+            .await
+            .expect("start discarded step");
+        writer
+            .close_run(
+                discarded.run_id,
+                Some(discarded_step),
+                move || PersistedTerminal::Final {
+                    step_id: discarded_step,
+                    text: "discarded reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "fixture",
+                        vec![crate::model::OpaqueReplayItem::new(b"discarded".to_vec())],
+                    ),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close discarded run");
+        let retained = writer
+            .commit_request("retained request".to_owned())
+            .await
+            .expect("commit retained request");
+        let retained_step = writer
+            .start_model_step(retained.run_id)
+            .await
+            .expect("start retained step");
+        writer
+            .close_run(
+                retained.run_id,
+                Some(retained_step),
+                move || PersistedTerminal::Final {
+                    step_id: retained_step,
+                    text: "retained reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "fixture",
+                        vec![crate::model::OpaqueReplayItem::new(b"retained".to_vec())],
+                    ),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close retained run");
+
+        let (
+            parent_id,
+            parent_run_id,
+            checkpoint_id,
+            revision,
+            runtime_identity,
+            checkpoint_bytes,
+            authorisations,
+            counts,
+        ) = {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let (parent_id, parent_run_id, checkpoint_id, revision) = connection
+                .query_row(
+                    "SELECT entries.id, entries.run_id, entries.checkpoint_id, session.revision FROM session JOIN entries ON entries.id = session.active_entry_id",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                )
+                .expect("read compaction parent");
+            let (runtime_identity, checkpoint_bytes, authorisations): (String, Vec<u8>, String) = connection
+                .query_row(
+                    "SELECT runtime_identity, arena_state, authorisations_json FROM checkpoints WHERE id = ?1",
+                    [checkpoint_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read parent checkpoint");
+            let counts = connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                )
+                .expect("read pre-compaction counts");
+            (
+                parent_id,
+                parent_run_id,
+                checkpoint_id,
+                revision,
+                runtime_identity,
+                checkpoint_bytes,
+                authorisations,
+                counts,
+            )
+        };
+
+        let preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 6),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        assert_eq!(preparation.first_retained, retained.request_entry);
+        let committed = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "exact stored summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        assert_eq!(committed.run_id, parent_run_id as u64);
+        let super::CompactionOutcome::Applied {
+            summary,
+            first_retained,
+            context_tokens,
+            reason,
+            attempts,
+        } = &committed.outcome
+        else {
+            panic!("applied compaction outcome")
+        };
+        assert_eq!(summary, "exact stored summary");
+        assert_eq!(*first_retained, retained.request_entry);
+        assert!(*context_tokens > 0);
+        assert_eq!(*reason, super::CompactionReason::Manual);
+        assert!(attempts.is_empty());
+
+        let (
+            stored_parent,
+            stored_run,
+            stored_checkpoint,
+            stored_revision,
+            active_entry,
+            updated_counts,
+            stored_checkpoint_bytes,
+            stored_authorisations,
+        ) = {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let (stored_parent, stored_run, stored_checkpoint, stored_revision, active_entry) = connection
+                .query_row(
+                    "SELECT entries.parent_id, entries.run_id, entries.checkpoint_id, entries.revision, session.active_entry_id FROM entries JOIN session WHERE entries.id = ?1",
+                    [committed.entry_id.0 as i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+                )
+                .expect("read committed compaction");
+            let updated_counts = connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries), (SELECT COUNT(*) FROM checkpoints), (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                )
+                .expect("read post-compaction counts");
+            let (stored_checkpoint_bytes, stored_authorisations): (Vec<u8>, String) = connection
+                .query_row(
+                    "SELECT arena_state, authorisations_json FROM checkpoints WHERE id = ?1",
+                    [stored_checkpoint],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read reused checkpoint");
+            (
+                stored_parent,
+                stored_run,
+                stored_checkpoint,
+                stored_revision,
+                active_entry,
+                updated_counts,
+                stored_checkpoint_bytes,
+                stored_authorisations,
+            )
+        };
+        assert_eq!(stored_parent, parent_id);
+        assert_eq!(stored_run, parent_run_id);
+        assert_eq!(stored_checkpoint, checkpoint_id);
+        assert_eq!(stored_revision, revision + 1);
+        assert_eq!(active_entry, committed.entry_id.0 as i64);
+        assert_eq!(updated_counts, (counts.0 + 1, counts.1, counts.2, counts.3));
+        assert_eq!(stored_checkpoint_bytes, checkpoint_bytes);
+        assert_eq!(stored_authorisations, authorisations);
+
+        let expected_history = [
+            crate::model::ModelContextEntry::CompactionSummary {
+                summary: "exact stored summary".to_owned(),
+            },
+            crate::model::ModelContextEntry::UserRequest {
+                text: "retained request".to_owned(),
+            },
+            crate::model::ModelContextEntry::FinalMessage {
+                text: "retained reply".to_owned(),
+                reasoning_summary: String::new(),
+                replay: crate::model::ProviderReplay::new(
+                    "fixture",
+                    vec![crate::model::OpaqueReplayItem::new(b"retained".to_vec())],
+                ),
+            },
+        ];
+        assert_eq!(
+            writer
+                .model_history()
+                .expect("live compacted history")
+                .entries(),
+            expected_history
+        );
+
+        let restore = writer
+            .restore_at(committed.entry_id)
+            .await
+            .expect("restore applied compaction");
+        let executable = restore
+            .executable
+            .expect("applied compaction must restore executable summary and tail");
+        assert_eq!(restore.effective_entry, committed.entry_id);
+        assert_eq!(executable.history.entries(), expected_history);
+        assert_eq!(executable.checkpoint.session_parts().1, checkpoint_bytes);
+        assert_eq!(
+            executable.checkpoint.session_parts().2,
+            &super::codec::decode_checkpoint(
+                runtime_identity.clone(),
+                checkpoint_bytes.clone(),
+                &authorisations,
+            )
+            .expect("decode original authorisations")
+            .session_parts()
+            .2
+            .to_owned()
+        );
+        let catalogue = writer.catalogue().await.expect("catalogue compaction");
+        assert_eq!(catalogue.active_entry, committed.entry_id);
+        assert!(catalogue.entries.iter().any(|entry| {
+            entry.entry_id == committed.entry_id
+                && entry.kind
+                    == super::SessionCatalogueKind::Compaction {
+                        outcome: committed.outcome.clone(),
+                    }
+        }));
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session before restart");
+        let reopened = Session::open(home.path(), &id).expect("reopen compacted session");
+        let restarted = reopened.restore().expect("restore restarted session");
+        let executable = restarted
+            .executable
+            .expect("restart restores executable compaction history");
+        assert_eq!(restarted.effective_entry, committed.entry_id);
+        assert_eq!(executable.history.entries(), expected_history);
+        assert_eq!(executable.checkpoint.session_parts().1, checkpoint_bytes);
+        assert_eq!(
+            executable.checkpoint.session_parts().2,
+            &super::codec::decode_checkpoint(runtime_identity, checkpoint_bytes, &authorisations)
+                .expect("decode original authorisations")
+                .session_parts()
+                .2
+                .to_owned()
+        );
+        let reopened_writer = reopened.writer();
+        reopened_writer
+            .activate(
+                restarted.effective_entry,
+                restarted.observed_active_entry,
+                executable.history,
+            )
+            .await
+            .expect("select reopened compaction");
+        let child = reopened_writer
+            .commit_request("branch request".to_owned())
+            .await
+            .expect("branch from applied compaction");
+        let child_parent: i64 = reopened
+            .connection_for_test()
+            .expect("lock reopened session connection")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = ?1",
+                [child.request_entry.0 as i64],
+                |row| row.get(0),
+            )
+            .expect("read branch parent");
+        assert_eq!(child_parent, committed.entry_id.0 as i64);
+        drop(reopened_writer);
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sibling_compactions_keep_independent_projections_and_accounting() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let attempts_a = vec![crate::model::AttemptAccounting::UsageUnavailable];
+        let preparation_a = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare first compaction")
+            .expect("prepare compactable history");
+        let compaction_a = writer
+            .settle_compaction(
+                preparation_a,
+                super::CompactionSettlement::Applied {
+                    summary: "summary A".to_owned(),
+                    attempts: attempts_a.clone(),
+                },
+            )
+            .await
+            .expect("settle first compaction");
+        let parent: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = ?1",
+                [i64::try_from(compaction_a.entry_id.0).expect("entry ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read compaction parent");
+        let parent_restore = writer
+            .restore_at(SessionEntryId(
+                u64::try_from(parent).expect("parent ID is positive"),
+            ))
+            .await
+            .expect("restore compaction parent");
+        writer
+            .activate(
+                parent_restore.effective_entry,
+                parent_restore.observed_active_entry,
+                parent_restore
+                    .executable
+                    .expect("compaction parent is executable")
+                    .history,
+            )
+            .await
+            .expect("select compaction parent");
+        let attempts_b = vec![crate::model::AttemptAccounting::KnownUsage(
+            crate::model::ModelUsage {
+                model: "fixture".to_owned(),
+                service_tier: None,
+                input_tokens: Some(3),
+                cached_input_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+                output_tokens: Some(2),
+                reasoning_output_tokens: Some(0),
+                total_tokens: Some(5),
+            },
+        )];
+        let preparation_b = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare second compaction")
+            .expect("prepare compactable history");
+        let compaction_b = writer
+            .settle_compaction(
+                preparation_b,
+                super::CompactionSettlement::Applied {
+                    summary: "summary B".to_owned(),
+                    attempts: attempts_b.clone(),
+                },
+            )
+            .await
+            .expect("settle second compaction");
+
+        let restored_b = session.restore().expect("restore second compaction");
+        assert_eq!(restored_b.footer_adjustment, attempts_a);
+        assert!(matches!(
+            restored_b.records.last(),
+            Some(super::RestoredRecord {
+                kind: super::RestoredRecordKind::Compaction {
+                    outcome: super::CompactionOutcome::Applied { attempts, .. },
+                },
+                ..
+            }) if attempts == &attempts_b
+        ));
+        assert_eq!(
+            writer
+                .model_history()
+                .expect("read second compaction history")
+                .entries()[0]
+                .compaction_summary(),
+            Some("summary B")
+        );
+
+        for (compaction, summary) in [
+            (compaction_a.entry_id, "summary A"),
+            (compaction_b.entry_id, "summary B"),
+        ] {
+            let restore = writer
+                .restore_at(compaction)
+                .await
+                .expect("restore compaction branch");
+            let history = restore
+                .executable
+                .expect("compaction branch is executable")
+                .history;
+            assert_eq!(history.entries()[0].compaction_summary(), Some(summary));
+            writer
+                .activate(
+                    restore.effective_entry,
+                    restore.observed_active_entry,
+                    history,
+                )
+                .await
+                .expect("select compaction branch");
+            let child = writer
+                .commit_request(format!("branch from {summary}"))
+                .await
+                .expect("branch from compaction");
+            let child_parent: i64 = session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = ?1",
+                    [i64::try_from(child.request_entry.0).expect("entry ID fits SQLite")],
+                    |row| row.get(0),
+                )
+                .expect("read branch parent");
+            assert_eq!(
+                child_parent,
+                i64::try_from(compaction.0).expect("entry ID fits SQLite")
+            );
+            writer
+                .close_run(
+                    child.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close branch request");
+        }
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn non_applied_compactions_advance_the_leaf_without_changing_context() {
+        for settlement in [
+            super::CompactionSettlement::Failed {
+                diagnostic: "é".repeat(2_049),
+                attempts: Vec::new(),
+            },
+            super::CompactionSettlement::Cancelled {
+                attempts: Vec::new(),
+            },
+        ] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let session = create_session(&home, &workspace).await;
+            let writer = session.writer();
+            append_cancelled_request(&writer, "discarded request").await;
+            append_cancelled_request(&writer, "retained request").await;
+            let parent_history = writer.model_history().expect("read parent context");
+            let preparation = writer
+                .prepare_compaction(
+                    crate::compaction::CompactionPolicy::new(100, 4),
+                    selection(),
+                    String::new(),
+                    super::CompactionReason::ContextOverflow,
+                )
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history");
+            let committed = writer
+                .settle_compaction(preparation, settlement)
+                .await
+                .expect("settle non-applied compaction");
+            assert_eq!(
+                writer.model_history().expect("read unchanged context"),
+                parent_history
+            );
+            let restored = writer
+                .restore_at(committed.entry_id)
+                .await
+                .expect("restore non-applied compaction");
+            let executable = restored
+                .executable
+                .expect("non-applied compaction remains executable");
+            assert_eq!(executable.history, parent_history);
+            writer
+                .activate(
+                    restored.effective_entry,
+                    restored.observed_active_entry,
+                    executable.history,
+                )
+                .await
+                .expect("select compaction outcome");
+            let child = writer
+                .commit_request("branch request".to_owned())
+                .await
+                .expect("branch from compaction outcome");
+            let child_parent: i64 = session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE id = ?1",
+                    [child.request_entry.0 as i64],
+                    |row| row.get(0),
+                )
+                .expect("read branch parent");
+            assert_eq!(child_parent, committed.entry_id.0 as i64);
+            match committed.outcome {
+                super::CompactionOutcome::Failed { diagnostic, .. } => {
+                    assert_eq!(diagnostic.len(), 4_096);
+                    assert!(diagnostic.chars().all(|character| character == 'é'));
+                }
+                super::CompactionOutcome::Cancelled { .. } => {}
+                super::CompactionOutcome::Applied { .. } => unreachable!("non-applied outcome"),
+            }
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compaction_projection_failure_does_not_commit_or_publish() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let mut preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        let mut invalid_history = crate::model::ModelHistory::new();
+        invalid_history
+            .append_completed_code(
+                "pass".to_owned(),
+                crate::model::ModelCallId::new("duplicate"),
+                None,
+                String::new(),
+                crate::model::ProviderReplay::new("fixture", Vec::new()),
+                crate::model::CodeResult::Execution {
+                    feedback: String::new(),
+                },
+            )
+            .expect("append first duplicate");
+        let duplicate = invalid_history.entries()[0].clone();
+        preparation.retained_tail = vec![duplicate.clone(), duplicate];
+        let before_selection = selection_snapshot(&session);
+        let before_history = writer.model_history().expect("read live history");
+
+        assert!(matches!(
+            writer
+                .settle_compaction(
+                    preparation,
+                    super::CompactionSettlement::Applied {
+                        summary: "summary".to_owned(),
+                        attempts: Vec::new(),
+                    },
+                )
+                .await,
+            Err(SessionError::Codec(_))
+        ));
+        assert_eq!(selection_snapshot(&session), before_selection);
+        assert_eq!(
+            writer.model_history().expect("read unchanged history"),
+            before_history
+        );
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn off_branch_compaction_replay_disables_restore_and_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        let compaction = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "summary".to_owned(),
+                    attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                },
+            )
+            .await
+            .expect("settle compaction");
+        let parent: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = ?1",
+                [i64::try_from(compaction.entry_id.0).expect("entry ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read compaction parent");
+        let parent_restore = writer
+            .restore_at(SessionEntryId(
+                u64::try_from(parent).expect("parent ID is positive"),
+            ))
+            .await
+            .expect("restore compaction parent");
+        let parent_history = parent_restore
+            .executable
+            .expect("compaction parent is executable")
+            .history;
+        writer
+            .activate(
+                parent_restore.effective_entry,
+                parent_restore.observed_active_entry,
+                parent_history,
+            )
+            .await
+            .expect("select compaction parent");
+        append_cancelled_request(&writer, "sibling request").await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET provider_replay = X'00' WHERE id = ?1",
+                [i64::try_from(compaction.entry_id.0).expect("entry ID fits SQLite")],
+            )
+            .expect("corrupt off-branch compaction replay");
+
+        let restore = session.restore().expect("restore corrupt session");
+        assert!(restore.executable.is_none());
+        assert!(restore.footer_adjustment.is_empty());
+        assert!(
+            writer
+                .restore_at(compaction.entry_id)
+                .await
+                .expect("restore corrupt compaction")
+                .executable
+                .is_none()
+        );
+        assert!(writer.catalogue().await.is_err());
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn off_branch_invalid_compaction_boundary_disables_restore_and_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        let compaction = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "summary".to_owned(),
+                    attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                },
+            )
+            .await
+            .expect("settle compaction");
+        let parent: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT parent_id FROM entries WHERE id = ?1",
+                [i64::try_from(compaction.entry_id.0).expect("entry ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("read compaction parent");
+        let parent_restore = writer
+            .restore_at(SessionEntryId(
+                u64::try_from(parent).expect("parent ID is positive"),
+            ))
+            .await
+            .expect("restore compaction parent");
+        writer
+            .activate(
+                parent_restore.effective_entry,
+                parent_restore.observed_active_entry,
+                parent_restore
+                    .executable
+                    .expect("compaction parent is executable")
+                    .history,
+            )
+            .await
+            .expect("select compaction parent");
+        append_cancelled_request(&writer, "sibling request").await;
+        let mut payload: serde_json::Value = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT payload_json FROM entries WHERE id = ?1",
+                [i64::try_from(compaction.entry_id.0).expect("entry ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .map(|payload: String| serde_json::from_str(&payload).expect("decode payload"))
+            .expect("read compaction payload");
+        payload["Compaction"]["compaction"]["first_retained"] = serde_json::json!(1);
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute(
+                "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                [
+                    payload.to_string(),
+                    i64::try_from(compaction.entry_id.0)
+                        .expect("entry ID fits SQLite")
+                        .to_string(),
+                ],
+            )
+            .expect("corrupt off-branch boundary");
+
+        let restore = session.restore().expect("restore corrupt session");
+        assert!(restore.executable.is_none());
+        assert!(restore.footer_adjustment.is_empty());
+        assert!(writer.catalogue().await.is_err());
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn corrupt_compaction_payload_or_reason_disables_restore_and_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        let compaction = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        let entry_id = i64::try_from(compaction.entry_id.0).expect("entry ID fits SQLite");
+        let payload: String = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row(
+                "SELECT payload_json FROM entries WHERE id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .expect("read compaction payload");
+        let mut unknown_reason: serde_json::Value =
+            serde_json::from_str(&payload).expect("decode payload");
+        unknown_reason["Compaction"]["compaction"]["reason"] = serde_json::json!("unknown");
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+            .expect("remove entry immutability trigger");
+
+        for corrupt_payload in [unknown_reason.to_string(), "not JSON".to_owned()] {
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .execute(
+                    "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                    params![corrupt_payload, entry_id],
+                )
+                .expect("corrupt compaction payload");
+            assert!(
+                writer
+                    .restore_at(compaction.entry_id)
+                    .await
+                    .expect("read corrupt compaction")
+                    .executable
+                    .is_none()
+            );
+            assert!(writer.catalogue().await.is_err());
+        }
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stale_compaction_settlement_does_not_append_or_publish() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let preparation = writer
+            .prepare_compaction(
+                crate::compaction::CompactionPolicy::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        let history = writer.model_history().expect("read parent context");
+        let entries_before: i64 = session
+            .connection_for_test()
+            .expect("lock session connection")
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .expect("count entries");
+        append_cancelled_request(&writer, "new request").await;
+        let current_history = writer.model_history().expect("read current context");
+
+        assert!(matches!(
+            writer
+                .settle_compaction(
+                    preparation,
+                    super::CompactionSettlement::Cancelled {
+                        attempts: Vec::new(),
+                    },
+                )
+                .await,
+            Err(super::SessionError::InvalidTransition)
+        ));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count entries"),
+            entries_before + 2
+        );
+        assert_ne!(current_history, history);
+        assert_eq!(
+            writer.model_history().expect("read unchanged context"),
+            current_history
+        );
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]
