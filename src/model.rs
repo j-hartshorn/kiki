@@ -36,6 +36,20 @@ pub struct ModelStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRequest {
+    pub instructions: String,
+    pub input: String,
+    pub selection: ModelSelection,
+    pub output_limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryResult {
+    pub text: String,
+    pub attempts: Vec<AttemptAccounting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelUsage {
     pub model: String,
     pub service_tier: Option<String>,
@@ -183,6 +197,9 @@ pub enum ModelContextEntry {
     UserRequest {
         text: String,
     },
+    CompactionSummary {
+        summary: String,
+    },
     CompletedCode(CompletedCode),
     FinalMessage {
         text: String,
@@ -198,6 +215,23 @@ impl ModelContextEntry {
             _ => None,
         }
     }
+
+    pub fn compaction_summary(&self) -> Option<&str> {
+        match self {
+            Self::CompactionSummary { summary } => Some(summary),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn canonical_text(&self) -> Option<String> {
+        self.compaction_summary().map(canonical_compaction_summary)
+    }
+}
+
+pub(crate) fn canonical_compaction_summary(summary: &str) -> String {
+    format!(
+        "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\n{summary}\n</summary>"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +259,12 @@ impl ModelHistory {
     pub fn append_user_request(&mut self, text: impl Into<String>) {
         self.entries
             .push(ModelContextEntry::UserRequest { text: text.into() });
+    }
+
+    pub fn append_compaction_summary(&mut self, summary: impl Into<String>) {
+        self.entries.push(ModelContextEntry::CompactionSummary {
+            summary: summary.into(),
+        });
     }
 
     pub fn append_completed_code(
@@ -352,6 +392,8 @@ fn bounded_utf8(mut value: String, limit: usize) -> String {
 pub enum ModelError {
     #[error("model step was cancelled")]
     Cancelled,
+    #[error("model does not support summarisation")]
+    UnsupportedSummarisation,
     #[error("scripted model exhausted before returning a final message")]
     Exhausted,
     #[error("model provider failed: {0}")]
@@ -435,6 +477,15 @@ pub trait Model: Send + 'static {
         Ok(())
     }
 
+    #[allow(clippy::manual_async_fn)]
+    fn summarise<'a>(
+        &'a mut self,
+        _request: SummaryRequest,
+        _cancellation: &'a CancellationToken,
+    ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
+        async { Err(ModelError::UnsupportedSummarisation.into()) }
+    }
+
     fn step<'a>(
         &'a mut self,
         history: &'a ModelHistory,
@@ -447,9 +498,13 @@ pub struct ScriptedModel {
     actions: Vec<ScriptedAction>,
     cursor: usize,
     observed_user_requests: usize,
+    summary_responses: Vec<String>,
+    summary_cursor: usize,
     delay: Duration,
     #[cfg(test)]
     contexts: Vec<Vec<ModelContextEntry>>,
+    #[cfg(test)]
+    summary_requests: Vec<SummaryRequest>,
 }
 
 impl ScriptedModel {
@@ -458,9 +513,13 @@ impl ScriptedModel {
             actions,
             cursor: 0,
             observed_user_requests: 0,
+            summary_responses: Vec::new(),
+            summary_cursor: 0,
             delay: Duration::ZERO,
             #[cfg(test)]
             contexts: Vec::new(),
+            #[cfg(test)]
+            summary_requests: Vec::new(),
         }
     }
 
@@ -471,8 +530,19 @@ impl ScriptedModel {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_summary_responses(mut self, responses: Vec<String>) -> Self {
+        self.summary_responses = responses;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn contexts(&self) -> &[Vec<ModelContextEntry>] {
         &self.contexts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn summary_requests(&self) -> &[SummaryRequest] {
+        &self.summary_requests
     }
 
     #[cfg(test)]
@@ -482,6 +552,34 @@ impl ScriptedModel {
 }
 
 impl Model for ScriptedModel {
+    #[allow(clippy::manual_async_fn)]
+    fn summarise<'a>(
+        &'a mut self,
+        _request: SummaryRequest,
+        cancellation: &'a CancellationToken,
+    ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
+        async move {
+            if cancellation.is_cancelled() {
+                return Err(ModelError::Cancelled.into());
+            }
+            #[cfg(test)]
+            self.summary_requests.push(_request);
+            let text = self
+                .summary_responses
+                .get(self.summary_cursor)
+                .cloned()
+                .ok_or(ModelError::Exhausted)?;
+            if cancellation.is_cancelled() {
+                return Err(ModelError::Cancelled.into());
+            }
+            self.summary_cursor += 1;
+            Ok(SummaryResult {
+                text,
+                attempts: Vec::new(),
+            })
+        }
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn step<'a>(
         &'a mut self,
@@ -570,7 +668,7 @@ mod tests {
     use super::{
         CodeResult, CompletedCode, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
         ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay,
-        ScriptedAction, ScriptedModel,
+        ScriptedAction, ScriptedModel, SummaryRequest,
     };
 
     fn history_with_request(request: &str) -> ModelHistory {
@@ -584,6 +682,118 @@ mod tests {
             "test-provider",
             vec![OpaqueReplayItem::new(value.as_bytes().to_vec())],
         )
+    }
+
+    fn summary_request(input: &str) -> SummaryRequest {
+        SummaryRequest {
+            instructions: "summarise".to_owned(),
+            input: input.to_owned(),
+            selection: crate::config::ModelSelection::new(
+                crate::config::DEFAULT_MODEL,
+                crate::config::DEFAULT_MODEL.default_thinking,
+            )
+            .unwrap(),
+            output_limit: 123,
+        }
+    }
+
+    struct StepOnlyModel;
+
+    impl Model for StepOnlyModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(super::ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<super::ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn models_without_summary_support_fail_without_attempts() {
+        let mut model = StepOnlyModel;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            model
+                .summarise(summary_request("conversation"), &cancellation)
+                .await,
+            Err(ModelFailure::from(ModelError::UnsupportedSummarisation))
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_model_records_summary_requests_independently_from_normal_context() {
+        let mut model = ScriptedModel::new(vec![ScriptedAction::Message {
+            text: "normal result".to_owned(),
+        }])
+        .with_summary_responses(vec![
+            "first summary".to_owned(),
+            "second summary".to_owned(),
+        ]);
+        let history = history_with_request("inspect");
+        let cancellation = CancellationToken::new();
+        let first = summary_request("first input");
+        let second = summary_request("second input");
+        let mut progress = |_| {};
+
+        let first_result = model.summarise(first.clone(), &cancellation).await.unwrap();
+        assert_eq!(first_result.text, "first summary");
+        assert!(first_result.attempts.is_empty());
+        assert_eq!(
+            model
+                .step(&history, &cancellation, &mut progress)
+                .await
+                .unwrap()
+                .action,
+            ModelAction::Message {
+                text: "normal result".to_owned(),
+            }
+        );
+        assert_eq!(
+            model
+                .summarise(second.clone(), &cancellation)
+                .await
+                .unwrap()
+                .text,
+            "second summary"
+        );
+        assert_eq!(model.summary_requests(), &[first, second]);
+        assert_eq!(model.contexts(), &[history.entries().to_vec()]);
+        assert_eq!(model.position(), 1);
+    }
+
+    #[test]
+    fn compaction_summary_keeps_raw_text_and_its_canonical_wrapper() {
+        let mut history = history_with_request("inspect");
+        history.append_compaction_summary("saved summary");
+
+        let summary = history.entries().last().unwrap();
+        assert_eq!(summary.compaction_summary(), Some("saved summary"));
+        assert_eq!(
+            summary.canonical_text().as_deref(),
+            Some(
+                "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nsaved summary\n</summary>"
+            )
+        );
+        assert_eq!(history.user_request_count(), 1);
+        let call_id = ModelCallId::new("call");
+        history
+            .append_completed_code(
+                "code".to_owned(),
+                call_id.clone(),
+                None,
+                String::new(),
+                replay("opaque"),
+                CodeResult::Execution {
+                    feedback: "result".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(history.contains_call_id(&call_id));
     }
 
     #[tokio::test]
