@@ -67,6 +67,6 @@ Accept only bare `--continue`. Select the first row that would be displayed by `
 
 **Files** — Modify: `src/main.rs`, `tests/sessions_cli.rs`, `justfile`, `README.md`.
 
-**Verification** — `MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --test sessions_cli`, `just --dry-run continue`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and `MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets` pass. The dry run prints the Monty prerequisite and `cargo run -- --continue`; check README examples against the tested CLI.
+**Verification** — Run every command in Overall validation; the dry run prints the Monty prerequisite and `cargo run -- --continue`. Check README examples against the tested CLI.
 
 After plan approval, create `work/continue-latest-session` and `worktrees/continue-latest-session` from `main`. Implement and commit in that worktree with signed-off commits. Do not merge into `main` until the result is accepted.

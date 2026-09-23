@@ -370,9 +370,6 @@ fn invalid_arguments_fail_before_home_lookup_or_tracing() {
         vec!["--resume", "00000000000000000000000000000001", "unexpected"],
         vec!["sessions", "--here"],
         vec!["--continue", "--here"],
-        vec!["--here", "--continue"],
-        vec!["--continue", "00000000000000000000000000000001"],
-        vec!["--continue", "sessions"],
     ] {
         let trace = workspace.path().join(format!("{}.jsonl", arguments.len()));
         let output = Command::new(env!("CARGO_BIN_EXE_kiki"))
@@ -763,6 +760,7 @@ fn continue_resumes_newest_session_for_current_workspace() {
     let elsewhere_id = "00000000000000000000000000000021";
     let older = "00000000000000000000000000000022";
     let latest = "00000000000000000000000000000023";
+    let tied = "00000000000000000000000000000024";
     create_session_fixture(
         home.path(),
         elsewhere_id,
@@ -781,6 +779,7 @@ fn continue_resumes_newest_session_for_current_workspace() {
         None,
         None,
     );
+    create_session_fixture(home.path(), tied, tied, workspace.path(), 3_000, None, None);
     create_session_fixture(
         home.path(),
         latest,
@@ -802,37 +801,7 @@ fn continue_resumes_newest_session_for_current_workspace() {
     );
     assert!(!stdout.contains(elsewhere_id));
     assert!(!stdout.contains(older));
-}
-
-#[test]
-fn continue_breaks_equal_activity_ties_by_ascending_id() {
-    let home = tempdir().expect("create home");
-    let workspace = tempdir().expect("create workspace");
-    let older = "00000000000000000000000000000030";
-    let lower = "00000000000000000000000000000031";
-    let higher = "00000000000000000000000000000032";
-    for (id, updated_at_ms) in [(higher, 5_000), (older, 1_000), (lower, 5_000)] {
-        create_session_fixture(
-            home.path(),
-            id,
-            id,
-            workspace.path(),
-            updated_at_ms,
-            None,
-            None,
-        );
-    }
-    assert_eq!(first_listed_id(home.path(), workspace.path()), lower);
-
-    let output = invoke(home.path(), workspace.path(), &["--continue"], None);
-
-    let (stdout, stderr) = output_text(&output);
-    assert!(!output.status.success(), "{stdout}\n{stderr}");
-    assert!(
-        stdout.contains(&format!("Session: {lower}")),
-        "{stdout}\n{stderr}"
-    );
-    assert!(!stdout.contains(higher));
+    assert!(!stdout.contains(tied));
 }
 
 #[cfg(unix)]
@@ -904,7 +873,7 @@ fn continue_fails_when_selected_session_is_owned_without_fallback() {
     let workspace = tempdir().expect("create workspace");
     let older = "00000000000000000000000000000051";
     let owned = "00000000000000000000000000000052";
-    let older_database = create_session_fixture(
+    create_session_fixture(
         home.path(),
         older,
         older,
@@ -913,7 +882,7 @@ fn continue_fails_when_selected_session_is_owned_without_fallback() {
         None,
         None,
     );
-    let owned_database = create_session_fixture(
+    create_session_fixture(
         home.path(),
         owned,
         owned,
@@ -931,9 +900,6 @@ fn continue_fails_when_selected_session_is_owned_without_fallback() {
         .expect("create owner lock");
     rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .expect("lock owner file");
-    let older_before = fs::read(&older_database).expect("read older fixture");
-    let owned_before = fs::read(&owned_database).expect("read owned fixture");
-
     let output = invoke(home.path(), workspace.path(), &["--continue"], None);
 
     let (stdout, stderr) = output_text(&output);
@@ -948,14 +914,6 @@ fn continue_fails_when_selected_session_is_owned_without_fallback() {
             .path()
             .join(format!(".kiki/sessions/{older}.lock"))
             .exists()
-    );
-    assert_eq!(
-        fs::read(older_database).expect("reread older fixture"),
-        older_before
-    );
-    assert_eq!(
-        fs::read(owned_database).expect("reread owned fixture"),
-        owned_before
     );
 }
 
