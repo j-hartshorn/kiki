@@ -3392,6 +3392,16 @@ fn validate_compaction_entry(
                 .then_some(())
                 .ok_or(());
         }
+        if boundary.kind == "compaction" {
+            let decoded =
+                codec::decode_entry(boundary.kind, boundary.payload_json).map_err(|_| ())?;
+            if matches!(
+                codec::decoded_compaction(&decoded),
+                Some(CompactionOutcome::Applied { .. })
+            ) {
+                return Err(());
+            }
+        }
         ancestor_id = boundary.parent_id;
     }
     Err(())
@@ -10772,6 +10782,116 @@ mod tests {
         let restore = session.restore().expect("restore corrupt session");
         assert!(restore.executable.is_none());
         assert!(restore.footer_adjustment.is_empty());
+        assert!(writer.catalogue().await.is_err());
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn backwards_repeated_compaction_boundary_disables_restore_and_catalogue() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        for request in ["oldest request", "older request", "first tail"] {
+            append_cancelled_request(&writer, request).await;
+        }
+        let first_preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare first compaction")
+            .expect("prepare first compactable history");
+        let first = writer
+            .settle_compaction(
+                first_preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "first summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle first compaction");
+        let first_retained = match first.outcome {
+            super::CompactionOutcome::Applied { first_retained, .. } => first_retained,
+            _ => unreachable!("first compaction was applied"),
+        };
+        for request in ["newly discarded", "second tail"] {
+            append_cancelled_request(&writer, request).await;
+        }
+        let second_preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare second compaction")
+            .expect("prepare second compactable history");
+        let second = writer
+            .settle_compaction(
+                second_preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "second summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle second compaction");
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let backwards_boundary: i64 = connection
+                .query_row(
+                    "SELECT MAX(id) FROM entries WHERE kind = 'user_request' AND id < ?1",
+                    [i64::try_from(first_retained.0).expect("entry ID fits SQLite")],
+                    |row| row.get(0),
+                )
+                .expect("read earlier context boundary");
+            let second_id = i64::try_from(second.entry_id.0).expect("entry ID fits SQLite");
+            let mut payload: serde_json::Value = connection
+                .query_row(
+                    "SELECT payload_json FROM entries WHERE id = ?1",
+                    [second_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|payload| serde_json::from_str(&payload).expect("decode payload"))
+                .expect("read second compaction payload");
+            payload["Compaction"]["compaction"]["first_retained"] =
+                serde_json::json!(backwards_boundary);
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                    params![payload.to_string(), second_id],
+                )
+                .expect("corrupt repeated compaction boundary");
+        }
+
+        assert!(
+            session
+                .restore()
+                .expect("restore corrupt session")
+                .executable
+                .is_none()
+        );
+        assert!(
+            writer
+                .restore_at(second.entry_id)
+                .await
+                .expect("restore corrupt compaction")
+                .executable
+                .is_none()
+        );
         assert!(writer.catalogue().await.is_err());
         drop(writer);
         session.close().expect("close session");
