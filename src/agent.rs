@@ -1857,15 +1857,15 @@ mod tests {
                 .await
                 .expect("close seeded run");
         }
-        let connection = session.connection_for_test().expect("open session");
-        let revision_before: i64 = connection
+        let revision_before: i64 = session
+            .connection_for_test()
+            .expect("open session")
             .query_row(
                 "SELECT revision FROM session WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )
             .expect("read revision");
-        drop(connection);
         let cancellation = CancellationToken::new();
         let mut started = 0;
 

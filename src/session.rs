@@ -3435,7 +3435,8 @@ fn context_bearing_payload(entry: EntryPayload<'_>) -> bool {
             Ok(codec::DecodedTerminalHistory::Failed { code: Some(code) })
                 if matches!(code.result, crate::model::CodeResult::Failure { .. })
         ),
-        "session_start" | "compaction" | _ => false,
+        "session_start" | "compaction" => false,
+        _ => false,
     }
 }
 

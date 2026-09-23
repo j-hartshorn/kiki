@@ -67,6 +67,7 @@ pub(super) struct StoredEntry {
     pub(super) provider_replay: Option<Vec<u8>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum StoredPayload {
@@ -121,6 +122,7 @@ enum StoredCompactionReason {
 
 pub(super) struct DecodedEntry(DecodedEntryPayload);
 
+#[allow(clippy::large_enum_variant)]
 enum DecodedEntryPayload {
     SessionStart,
     UserRequest {
@@ -1687,8 +1689,8 @@ mod tests {
 
         for outcome in outcomes {
             let stored = encode_compaction(&outcome).expect("encode compaction");
-            let decoded = decode_entry(&stored.kind, &stored.payload_json)
-                .expect("decode compaction outcome");
+            let decoded =
+                decode_entry(stored.kind, &stored.payload_json).expect("decode compaction outcome");
             assert_eq!(decoded_compaction(&decoded), Some(outcome));
             assert!(decode_entry("execution", &stored.payload_json).is_err());
         }
@@ -1700,7 +1702,7 @@ mod tests {
                 attempts: Vec::new(),
             };
             let stored = encode_compaction(&outcome).expect("encode boundary diagnostic");
-            let decoded = decode_entry(&stored.kind, &stored.payload_json)
+            let decoded = decode_entry(stored.kind, &stored.payload_json)
                 .expect("decode boundary diagnostic");
             assert_eq!(decoded_compaction(&decoded), Some(outcome));
         }

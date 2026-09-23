@@ -572,7 +572,7 @@ fn byte_len_bytes(bytes: &[u8]) -> u64 {
 }
 
 fn estimate_tokens(bytes: u64) -> u64 {
-    bytes / 4 + u64::from(bytes % 4 != 0)
+    bytes / 4 + u64::from(!bytes.is_multiple_of(4))
 }
 
 fn serialise_range(facts: &[SelectedAncestryFact], start: usize, end: usize) -> String {

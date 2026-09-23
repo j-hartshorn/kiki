@@ -3627,13 +3627,15 @@ mod tests {
         );
         assert!(compaction_started.expect("compaction started") < card.expect("compaction card"));
         assert!(card.expect("compaction card") < compaction_settled.expect("compaction settled"));
-        let summary_requests = summary_requests.lock().expect("read summary requests");
-        assert!(!summary_requests.is_empty());
-        assert!(
-            summary_requests
-                .iter()
-                .all(|request| request.input.contains("preserve decisions"))
-        );
+        {
+            let summary_requests = summary_requests.lock().expect("read summary requests");
+            assert!(!summary_requests.is_empty());
+            assert!(
+                summary_requests
+                    .iter()
+                    .all(|request| request.input.contains("preserve decisions"))
+            );
+        }
 
         shutdown_controller(commands, controller).await;
         drop(writer);
@@ -3952,14 +3954,15 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, RuntimeEvent::CorrectionCompleted { .. }))
             );
-            let summary_requests = summary_requests.lock().expect("read summary requests");
-            assert!(!summary_requests.is_empty());
-            assert!(
-                summary_requests
-                    .iter()
-                    .all(|request| request.input.contains("retain race winner"))
-            );
-            drop(summary_requests);
+            {
+                let summary_requests = summary_requests.lock().expect("read summary requests");
+                assert!(!summary_requests.is_empty());
+                assert!(
+                    summary_requests
+                        .iter()
+                        .all(|request| request.input.contains("retain race winner"))
+                );
+            }
 
             let compaction_parent: i64 = session
                 .connection_for_test()
@@ -4051,22 +4054,23 @@ mod tests {
 
             let correction = events
                 .iter()
-                .position(|event| match (expected_correction, event) {
-                    (
-                        "replaced",
-                        RuntimeEvent::CorrectionCompleted {
-                            outcome: CorrectionOutcome::Replaced { .. },
-                            ..
-                        },
+                .position(|event| {
+                    matches!(
+                        (expected_correction, event),
+                        (
+                            "replaced",
+                            RuntimeEvent::CorrectionCompleted {
+                                outcome: CorrectionOutcome::Replaced { .. },
+                                ..
+                            },
+                        ) | (
+                            "failed",
+                            RuntimeEvent::CorrectionCompleted {
+                                outcome: CorrectionOutcome::Failed,
+                                ..
+                            },
+                        )
                     )
-                    | (
-                        "failed",
-                        RuntimeEvent::CorrectionCompleted {
-                            outcome: CorrectionOutcome::Failed,
-                            ..
-                        },
-                    ) => true,
-                    _ => false,
                 })
                 .expect("expected correction outcome");
             let settled_run = events
@@ -4093,30 +4097,31 @@ mod tests {
                     .all(|request| request.input.contains("keep correction leaf"))
             );
 
-            let connection = session.connection_for_test().expect("open session");
-            let compaction_parent: i64 = connection
-                .query_row(
-                    "SELECT parent_id FROM entries WHERE kind = 'compaction'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("read compaction parent");
-            let cancelled_entry: i64 = connection
-                .query_row(
-                    "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("read cancelled terminal");
-            assert_eq!(
-                compaction_parent,
-                if corrupt_correction_target {
-                    cancelled_entry
-                } else {
-                    selected_before_run
-                }
-            );
-            drop(connection);
+            {
+                let connection = session.connection_for_test().expect("open session");
+                let compaction_parent: i64 = connection
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE kind = 'compaction'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read compaction parent");
+                let cancelled_entry: i64 = connection
+                    .query_row(
+                        "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read cancelled terminal");
+                assert_eq!(
+                    compaction_parent,
+                    if corrupt_correction_target {
+                        cancelled_entry
+                    } else {
+                        selected_before_run
+                    }
+                );
+            }
 
             shutdown_controller(commands, controller).await;
             drop(writer);
@@ -4220,32 +4225,34 @@ mod tests {
             })
             .expect("compaction started");
         assert!(correction < settled && settled < started);
-        let summary_requests = summary_requests.lock().expect("read summary requests");
-        assert!(!summary_requests.is_empty());
-        assert!(
-            summary_requests
-                .iter()
-                .all(|request| request.input.contains("keep cancelled leaf"))
-        );
-        drop(summary_requests);
+        {
+            let summary_requests = summary_requests.lock().expect("read summary requests");
+            assert!(!summary_requests.is_empty());
+            assert!(
+                summary_requests
+                    .iter()
+                    .all(|request| request.input.contains("keep cancelled leaf"))
+            );
+        }
 
-        let connection = session.connection_for_test().expect("open session");
-        let compaction_parent: i64 = connection
-            .query_row(
-                "SELECT parent_id FROM entries WHERE kind = 'compaction'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read compaction parent");
-        let cancelled_leaf: i64 = connection
-            .query_row(
-                "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read cancelled terminal");
-        assert_eq!(compaction_parent, cancelled_leaf);
-        drop(connection);
+        {
+            let connection = session.connection_for_test().expect("open session");
+            let compaction_parent: i64 = connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE kind = 'compaction'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read compaction parent");
+            let cancelled_leaf: i64 = connection
+                .query_row(
+                    "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read cancelled terminal");
+            assert_eq!(compaction_parent, cancelled_leaf);
+        }
 
         shutdown_controller(commands, controller).await;
         drop(writer);
