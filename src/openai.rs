@@ -22,6 +22,7 @@ use crate::{
         AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
         OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+        canonical_compaction_summary,
     },
     subagents::ChildModelFactory,
 };
@@ -175,10 +176,10 @@ impl OpenAiModel {
                 ModelContextEntry::UserRequest { text } => {
                     input.push(json!({"role": "user", "content": text}));
                 }
-                ModelContextEntry::CompactionSummary { .. } => {
+                ModelContextEntry::CompactionSummary { summary } => {
                     input.push(json!({
                         "role": "user",
-                        "content": entry.canonical_text().expect("compaction summary text")
+                        "content": canonical_compaction_summary(summary)
                     }));
                 }
                 ModelContextEntry::CompletedCode(completed) => {

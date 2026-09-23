@@ -248,10 +248,6 @@ impl ModelContextEntry {
             _ => None,
         }
     }
-
-    pub(crate) fn canonical_text(&self) -> Option<String> {
-        self.compaction_summary().map(canonical_compaction_summary)
-    }
 }
 
 pub(crate) fn canonical_compaction_summary(summary: &str) -> String {
@@ -697,7 +693,7 @@ mod tests {
     use super::{
         CodeResult, CompletedCode, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
         ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay,
-        ScriptedAction, ScriptedModel, SummaryRequest,
+        ScriptedAction, ScriptedModel, SummaryRequest, canonical_compaction_summary,
     };
 
     fn history_with_request(request: &str) -> ModelHistory {
@@ -812,10 +808,8 @@ mod tests {
         let summary = history.entries().last().unwrap();
         assert_eq!(summary.compaction_summary(), Some("saved summary"));
         assert_eq!(
-            summary.canonical_text().as_deref(),
-            Some(
-                "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nsaved summary\n</summary>"
-            )
+            canonical_compaction_summary(summary.compaction_summary().unwrap()),
+            "The conversation history before this point was compacted into the following summary.\n\nThe Python Arena and its existing variables, functions, classes, and data persisted unchanged across compaction. Treat Arena details marked unverified as historical evidence and inspect them directly before relying on them.\n\n<summary>\nsaved summary\n</summary>"
         );
         assert_eq!(history.user_request_count(), 1);
         let call_id = ModelCallId::new("call");
