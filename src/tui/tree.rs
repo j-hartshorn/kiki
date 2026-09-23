@@ -11,11 +11,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::session::{
-    CompactionOutcome, CompactionReason, SessionCatalogue, SessionCatalogueKind, SessionEntryId,
-};
+use crate::session::{CompactionOutcome, SessionCatalogue, SessionCatalogueKind, SessionEntryId};
 use crate::transcript::{
-    format_token_count, normalise_terminal_text, observation_text, tool_call_label, truncate_front,
+    compaction_reason_label, format_token_count, normalise_terminal_text, observation_text,
+    tool_call_label, truncate_front,
 };
 
 use super::picker::{
@@ -1190,14 +1189,6 @@ fn compaction_row(outcome: &CompactionOutcome) -> String {
                 compaction_reason_label(*reason)
             )
         }
-    }
-}
-
-fn compaction_reason_label(reason: CompactionReason) -> &'static str {
-    match reason {
-        CompactionReason::Manual => "manual",
-        CompactionReason::AutomaticThreshold => "automatic threshold",
-        CompactionReason::ContextOverflow => "context overflow",
     }
 }
 

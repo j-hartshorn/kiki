@@ -3668,7 +3668,7 @@ fn compaction_card(outcome: &CompactionOutcome) -> CompactionCard {
     }
 }
 
-fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+pub(crate) fn compaction_reason_label(reason: CompactionReason) -> &'static str {
     match reason {
         CompactionReason::Manual => "manual",
         CompactionReason::AutomaticThreshold => "automatic threshold",
