@@ -508,6 +508,7 @@ pub trait Model: Send + 'static {
         &'a mut self,
         _request: SummaryRequest,
         _cancellation: &'a CancellationToken,
+        _attempt_started: &'a mut (dyn FnMut() + Send),
     ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
         async { Err(ModelError::UnsupportedSummarisation.into()) }
     }
@@ -583,13 +584,12 @@ impl Model for ScriptedModel {
         &'a mut self,
         _request: SummaryRequest,
         cancellation: &'a CancellationToken,
+        attempt_started: &'a mut (dyn FnMut() + Send),
     ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
         async move {
             if cancellation.is_cancelled() {
                 return Err(ModelError::Cancelled.into());
             }
-            #[cfg(test)]
-            self.summary_requests.push(_request);
             let text = self
                 .summary_responses
                 .get(self.summary_cursor)
@@ -598,6 +598,9 @@ impl Model for ScriptedModel {
             if cancellation.is_cancelled() {
                 return Err(ModelError::Cancelled.into());
             }
+            attempt_started();
+            #[cfg(test)]
+            self.summary_requests.push(_request);
             self.summary_cursor += 1;
             Ok(SummaryResult {
                 text,
@@ -743,12 +746,16 @@ mod tests {
         let mut model = StepOnlyModel;
         let cancellation = CancellationToken::new();
 
+        let mut attempts = 0;
         assert_eq!(
             model
-                .summarise(summary_request("conversation"), &cancellation)
+                .summarise(summary_request("conversation"), &cancellation, &mut || {
+                    attempts += 1
+                },)
                 .await,
             Err(ModelFailure::from(ModelError::UnsupportedSummarisation))
         );
+        assert_eq!(attempts, 0);
     }
 
     #[tokio::test]
@@ -765,8 +772,12 @@ mod tests {
         let first = summary_request("first input");
         let second = summary_request("second input");
         let mut progress = |_| {};
+        let mut attempts = 0;
 
-        let first_result = model.summarise(first.clone(), &cancellation).await.unwrap();
+        let first_result = model
+            .summarise(first.clone(), &cancellation, &mut || attempts += 1)
+            .await
+            .unwrap();
         assert_eq!(first_result.text, "first summary");
         assert!(first_result.attempts.is_empty());
         assert_eq!(
@@ -781,13 +792,14 @@ mod tests {
         );
         assert_eq!(
             model
-                .summarise(second.clone(), &cancellation)
+                .summarise(second.clone(), &cancellation, &mut || attempts += 1)
                 .await
                 .unwrap()
                 .text,
             "second summary"
         );
         assert_eq!(model.summary_requests(), &[first, second]);
+        assert_eq!(attempts, 2);
         assert_eq!(model.contexts(), &[history.entries().to_vec()]);
         assert_eq!(model.position(), 1);
     }

@@ -69,6 +69,14 @@ enum RunState {
     Active(RunId),
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum CompactionState {
+    #[default]
+    Idle,
+    Pending,
+    Active,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DisplayedRecord {
     record: StoredRecord,
@@ -2267,6 +2275,7 @@ struct PendingSubagentBlock {
 pub(crate) struct Transcript {
     startup: Option<StartupSnapshot>,
     run_state: RunState,
+    compaction_state: CompactionState,
     disabled_reason: Option<RuntimeDisabledReason>,
     latest_run_id: Option<RunId>,
     settled_run_ids: Vec<RunId>,
@@ -2294,6 +2303,7 @@ impl Default for Transcript {
         Self {
             startup: None,
             run_state: RunState::Idle,
+            compaction_state: CompactionState::Idle,
             disabled_reason: None,
             latest_run_id: None,
             settled_run_ids: Vec::new(),
@@ -2385,7 +2395,10 @@ impl Transcript {
     }
 
     pub(crate) fn begin_submission(&mut self) -> bool {
-        if self.disabled_reason.is_some() || self.run_state != RunState::Idle {
+        if self.disabled_reason.is_some()
+            || self.run_state != RunState::Idle
+            || self.compaction_state != CompactionState::Idle
+        {
             return false;
         }
         self.run_state = RunState::Submitting;
@@ -2393,7 +2406,15 @@ impl Transcript {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.run_state == RunState::Idle
+        self.run_state == RunState::Idle && self.compaction_state == CompactionState::Idle
+    }
+
+    pub(crate) fn has_foreground_compaction(&self) -> bool {
+        self.compaction_state != CompactionState::Idle
+    }
+
+    pub(crate) fn has_active_run(&self) -> bool {
+        self.run_state != RunState::Idle
     }
 
     pub(crate) fn is_generating(&self) -> bool {
@@ -2614,15 +2635,41 @@ impl Transcript {
             }
             RuntimeEvent::SubagentOperationSettled { .. } => false,
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
+            RuntimeEvent::CompactionAcknowledged { acknowledgement } => match acknowledgement {
+                crate::runtime::CompactionAcknowledgement::Accepted
+                    if self.disabled_reason.is_none()
+                        && self.compaction_state == CompactionState::Idle =>
+                {
+                    self.compaction_state = CompactionState::Pending;
+                    true
+                }
+                crate::runtime::CompactionAcknowledgement::Disabled { reason } => {
+                    self.disable(reason, true)
+                }
+                crate::runtime::CompactionAcknowledgement::Busy
+                | crate::runtime::CompactionAcknowledgement::Accepted => false,
+            },
+            RuntimeEvent::CompactionLifecycle { lifecycle } => match lifecycle {
+                crate::runtime::CompactionLifecycle::Started
+                    if self.compaction_state == CompactionState::Pending =>
+                {
+                    self.compaction_state = CompactionState::Active;
+                    self.set_status("compacting context".to_owned())
+                }
+                crate::runtime::CompactionLifecycle::NoOp
+                | crate::runtime::CompactionLifecycle::Settled(_) => self.settle_compaction(),
+                crate::runtime::CompactionLifecycle::Started => false,
+            },
             RuntimeEvent::SettingsAccepted { .. }
             | RuntimeEvent::NameAccepted { .. }
             | RuntimeEvent::NavigationCompleted { .. }
             | RuntimeEvent::CorrectionCompleted { .. }
             | RuntimeEvent::TreeCatalogue { .. } => false,
-            RuntimeEvent::SubmissionRejectedBusy { active_run_id }
-                if self.disabled_reason.is_none()
-                    && (self.run_state == RunState::Submitting
-                        || self.run_state == RunState::Active(active_run_id)) =>
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: Some(active_run_id),
+            } if self.disabled_reason.is_none()
+                && (self.run_state == RunState::Submitting
+                    || self.run_state == RunState::Active(active_run_id)) =>
             {
                 self.latest_run_id = Some(
                     self.latest_run_id
@@ -2630,6 +2677,12 @@ impl Transcript {
                 );
                 self.run_state = RunState::Active(active_run_id);
                 self.set_status("busy".to_owned())
+            }
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            } if self.disabled_reason.is_none() && self.run_state == RunState::Submitting => {
+                self.run_state = RunState::Idle;
+                self.compaction_state != CompactionState::Idle || self.set_status("idle".to_owned())
             }
             RuntimeEvent::RuntimeDisabled { reason } => self.disable(reason, false),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
@@ -2989,9 +3042,12 @@ impl Transcript {
         if submitting_cleared {
             self.run_state = RunState::Idle;
         }
+        let compaction_cleared = self.compaction_state != CompactionState::Idle;
+        self.compaction_state = CompactionState::Idle;
         let cards_released = self.release_pending_subagent_blocks();
         reason_changed
             | submitting_cleared
+            | compaction_cleared
             | cards_released
             | self.set_status(disabled_status(&reason).to_owned())
     }
@@ -3205,7 +3261,21 @@ impl Transcript {
         let cards_flushed = self.flush_pending_subagent_blocks(run_id, None);
         state_changed
             | cards_flushed
-            | (self.disabled_reason.is_none() && self.set_status("idle".to_owned()))
+            | (self.disabled_reason.is_none()
+                && self.compaction_state == CompactionState::Idle
+                && self.set_status("idle".to_owned()))
+    }
+
+    fn settle_compaction(&mut self) -> bool {
+        if self.compaction_state == CompactionState::Idle {
+            return false;
+        }
+        self.compaction_state = CompactionState::Idle;
+        let mut changed = true;
+        changed |= self.disabled_reason.is_none()
+            && self.run_state == RunState::Idle
+            && self.set_status("idle".to_owned());
+        changed
     }
 
     fn mark_terminal_run(&mut self, run_id: RunId) {
@@ -4278,8 +4348,9 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
-        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent,
-        RuntimeInitialState, StoredRecord, TerminalDetails,
+        CompactionAcknowledgement, CompactionLifecycle, CompactionSettlement, ModelStepId, Record,
+        RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState,
+        StoredRecord, TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
     use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
@@ -4303,6 +4374,82 @@ mod tests {
             false,
         ));
         assert!(transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn compaction_busy_releases_submitting_without_clearing_foreground_state() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.begin_submission());
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "compacting context");
+        assert!(!transcript.begin_submission());
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Cancelled),
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
+    }
+
+    #[test]
+    fn compaction_lifecycle_owns_foreground_state_without_a_run() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "idle");
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "compacting context");
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
+        assert_eq!(transcript.status(), "idle");
+
+        assert!(!transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
     }
 
     #[test]
@@ -4408,7 +4555,7 @@ mod tests {
         assert!(replacement.begin_submission());
         assert!(replacement.apply(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(2),
+                active_run_id: Some(RunId(2)),
             },
             false,
         ));
@@ -11113,7 +11260,7 @@ truncated"
         assert_eq!(transcript.status(), "read · 12 bytes");
         transcript.apply(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(3),
+                active_run_id: Some(RunId(3)),
             },
             false,
         );

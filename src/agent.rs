@@ -8,13 +8,15 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
     InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
+use crate::compaction::CompactionPolicy;
 use crate::config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
 };
 use crate::session::{
-    PersistedCode, PersistedTerminal, SessionEntryId, SessionError, SessionWriter,
+    CommittedCompaction, CompactionReason, CompactionSettlement, PersistedCode, PersistedTerminal,
+    SessionEntryId, SessionError, SessionWriter,
 };
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
@@ -181,6 +183,14 @@ pub(crate) struct PersistedRunOutcome {
     pub(crate) terminal: PersistedTerminal,
     pub(crate) authentication_failure: bool,
     pub(crate) recovery_failure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManualCompactionResult {
+    NoOp,
+    CancelledBeforeStart,
+    FailedBeforeStart,
+    Settled(CommittedCompaction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,6 +613,82 @@ impl<M: Model> Agent<M> {
         self.arena
             .collect_result_values_with_cancellation(cancellation)
             .await
+    }
+
+    pub(crate) async fn compact_manual(
+        &mut self,
+        policy: CompactionPolicy,
+        selection: ModelSelection,
+        focus: String,
+        cancellation: &CancellationToken,
+        writer: &SessionWriter,
+        started: &mut (impl FnMut() + Send),
+    ) -> Result<ManualCompactionResult, SessionError> {
+        let Some(preparation) = writer
+            .prepare_compaction(policy, selection, focus, CompactionReason::Manual)
+            .await?
+        else {
+            return Ok(ManualCompactionResult::NoOp);
+        };
+
+        let mut attempts = Vec::new();
+        let mut outputs = Vec::new();
+        let mut failure = None;
+        let mut provider_started = false;
+        for request in preparation.requests().iter().cloned() {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let mut attempt_started = || {
+                provider_started = true;
+                started();
+            };
+            match self
+                .model
+                .summarise(request, cancellation, &mut attempt_started)
+                .await
+            {
+                Ok(result) => {
+                    attempts.extend(result.attempts);
+                    outputs.push(result.text);
+                }
+                Err(error) => {
+                    attempts.extend(error.attempts().iter().cloned());
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        if !provider_started {
+            return Ok(if cancellation.is_cancelled() {
+                ManualCompactionResult::CancelledBeforeStart
+            } else {
+                ManualCompactionResult::FailedBeforeStart
+            });
+        }
+
+        let settlement = if cancellation.is_cancelled() {
+            CompactionSettlement::Cancelled { attempts }
+        } else if let Some(diagnostic) = failure {
+            CompactionSettlement::Failed {
+                diagnostic,
+                attempts,
+            }
+        } else {
+            match preparation.finish(&outputs) {
+                Ok(summary) => CompactionSettlement::Applied {
+                    summary: summary.summary().to_owned(),
+                    attempts,
+                },
+                Err(error) => CompactionSettlement::Failed {
+                    diagnostic: error.to_string(),
+                    attempts,
+                },
+            }
+        };
+        let committed = writer.settle_compaction(preparation, settlement).await?;
+        Ok(ManualCompactionResult::Settled(committed))
     }
 
     #[cfg(test)]
@@ -1333,7 +1419,10 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -1343,19 +1432,24 @@ mod tests {
 
     use super::{
         Agent, AgentError, AgentProgress, ExecutionFailure, GenerationEvidenceBuilder,
-        TerminalEvidence,
+        ManualCompactionResult, TerminalEvidence,
     };
     use crate::arena::{
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
+    use crate::compaction::CompactionPolicy;
     use crate::config::{DEFAULT_MODEL, ModelSelection, models::SOL};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ProviderFailure, ProviderReplay, ScriptedAction as ModelAction, ScriptedModel,
+        SummaryRequest, SummaryResult,
     };
-    use crate::session::{Session, SessionEntryId, SessionWriteGate, SessionWriteKind};
+    use crate::session::{
+        CompactionOutcome, PersistedTerminal, Session, SessionEntryId, SessionWriteGate,
+        SessionWriteKind, SessionWriter,
+    };
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -1478,6 +1572,338 @@ mod tests {
                 })
             }
         }
+    }
+
+    async fn seed_compactable_history(writer: &SessionWriter) {
+        for label in ["discarded", "retained"] {
+            let admission = writer
+                .commit_request(format!("{label} request"))
+                .await
+                .expect("commit compaction fixture request");
+            let step_id = writer
+                .start_model_step(admission.run_id)
+                .await
+                .expect("start compaction fixture step");
+            let replay = ProviderReplay::new(
+                "fixture",
+                vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
+            );
+            writer
+                .close_run(
+                    admission.run_id,
+                    Some(step_id),
+                    move || PersistedTerminal::Final {
+                        step_id,
+                        text: format!("{label} reply"),
+                        reasoning_summary: String::new(),
+                        replay,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close compaction fixture run");
+        }
+    }
+
+    struct CancelBeforeSummaryAttemptModel;
+
+    impl Model for CancelBeforeSummaryAttemptModel {
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            _request: crate::model::SummaryRequest,
+            cancellation: &'a CancellationToken,
+            _attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<crate::model::SummaryResult, ModelFailure>>
+        + Send
+        + 'a {
+            async move {
+                cancellation.cancel();
+                Err(ModelError::Cancelled.into())
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    struct CancelBetweenSummaryRequestsModel {
+        calls: Arc<AtomicUsize>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl Model for CancelBetweenSummaryRequestsModel {
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            _request: SummaryRequest,
+            cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call != 0 {
+                    return Err(ModelError::Cancelled.into());
+                }
+                attempt_started();
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                cancellation.cancel();
+                Ok(SummaryResult {
+                    text: "first summary".to_owned(),
+                    attempts: vec![AttemptAccounting::UsageUnavailable],
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_cancellation_between_prepared_requests_settles_one_attempt() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent_with_model(
+            &workspace,
+            CancelBetweenSummaryRequestsModel {
+                calls: calls.clone(),
+                attempts: attempts.clone(),
+            },
+        )
+        .await;
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = CompactionPolicy::new(16_384, 20_000);
+        assert_eq!(
+            writer
+                .prepare_compaction(
+                    policy,
+                    selection,
+                    String::new(),
+                    crate::session::CompactionReason::Manual,
+                )
+                .await
+                .expect("prepare compaction")
+                .expect("compaction should remove a prefix")
+                .requests()
+                .len(),
+            2
+        );
+        let cancellation = CancellationToken::new();
+        let mut started = 0;
+
+        let result = agent
+            .compact_manual(
+                policy,
+                selection,
+                String::new(),
+                &cancellation,
+                &writer,
+                &mut || started += 1,
+            )
+            .await
+            .expect("persist cancellation outcome");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(started, 1);
+        assert!(matches!(
+            result,
+            ManualCompactionResult::Settled(committed)
+                if matches!(
+                    committed.outcome,
+                    CompactionOutcome::Cancelled { ref attempts, .. }
+                        if attempts == &[AttemptAccounting::UsageUnavailable]
+                )
+        ));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_uses_the_prepared_summary_calls_and_commits_once() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "next normal response".to_owned(),
+            }])
+            .with_summary_responses(vec![
+                "first summary".to_owned(),
+                "second summary".to_owned(),
+            ]),
+        )
+        .await;
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = CompactionPolicy::new(16_384, 20_000);
+        let expected_requests = writer
+            .prepare_compaction(
+                policy,
+                selection,
+                "preserve decisions".to_owned(),
+                crate::session::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("compaction should remove a prefix")
+            .requests()
+            .to_vec();
+        let cancellation = CancellationToken::new();
+        let mut started = 0;
+
+        let result = agent
+            .compact_manual(
+                policy,
+                selection,
+                "preserve decisions".to_owned(),
+                &cancellation,
+                &writer,
+                &mut || started += 1,
+            )
+            .await
+            .expect("settle compaction");
+
+        assert_eq!(agent.model.summary_requests(), expected_requests);
+        assert_eq!(started, expected_requests.len());
+        assert!(matches!(
+            result,
+            ManualCompactionResult::Settled(committed)
+                if matches!(committed.outcome, CompactionOutcome::Applied { .. })
+        ));
+        let next_cancellation = CancellationToken::new();
+        let mut events = Vec::new();
+        agent
+            .run_persisted(
+                "next request".to_owned(),
+                &next_cancellation,
+                &writer,
+                &mut |event| events.push(event),
+            )
+            .await
+            .expect("run after compaction");
+        assert!(
+            agent
+                .model
+                .contexts()
+                .last()
+                .expect("capture next model context")
+                .iter()
+                .any(|entry| matches!(entry, ModelContextEntry::CompactionSummary { .. }))
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_cancelled_before_an_attempt_writes_nothing() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let mut agent = agent_with_model(&workspace, CancelBeforeSummaryAttemptModel).await;
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        for request in [
+            "first ".to_owned() + &"x".repeat(100_000),
+            "second ".to_owned() + &"y".repeat(100_000),
+        ] {
+            let admission = writer
+                .commit_request(request)
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close seeded run");
+        }
+        let connection = session.connection_for_test().expect("open session");
+        let revision_before: i64 = connection
+            .query_row(
+                "SELECT revision FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read revision");
+        drop(connection);
+        let cancellation = CancellationToken::new();
+        let mut started = 0;
+
+        let result = agent
+            .compact_manual(
+                CompactionPolicy::new(16_384, 20_000),
+                selection,
+                String::new(),
+                &cancellation,
+                &writer,
+                &mut || started += 1,
+            )
+            .await
+            .expect("cancelled compaction is not a storage failure");
+
+        assert_eq!(result, ManualCompactionResult::CancelledBeforeStart);
+        assert_eq!(started, 0);
+        let connection = session.connection_for_test().expect("open session");
+        let revision_after: i64 = connection
+            .query_row(
+                "SELECT revision FROM session WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read revision");
+        let compactions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'compaction'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count compactions");
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(compactions, 0);
+
+        drop(connection);
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]

@@ -180,6 +180,7 @@ struct App {
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
+    compaction_cancellation_requested: bool,
     settled_escape_at: Option<Instant>,
     submission_at: Option<Instant>,
     correction_pending: bool,
@@ -227,6 +228,7 @@ impl Default for App {
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
+            compaction_cancellation_requested: false,
             settled_escape_at: None,
             submission_at: None,
             correction_pending: false,
@@ -300,6 +302,8 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::CompactionAcknowledged { .. }
+        | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. }
         | RuntimeEvent::SubagentSpawned { .. }
@@ -525,6 +529,15 @@ impl App {
             }
             if self.is_configuration_only() {
                 return Update::default();
+            }
+            if !self.transcript.is_disabled()
+                && !self.transcript.is_idle()
+                && self.transcript.has_foreground_compaction()
+                && !self.compaction_cancellation_requested
+            {
+                self.foreground_cancellation_requested = true;
+                self.compaction_cancellation_requested = true;
+                return Update::with_commands([RuntimeCommand::Cancel { correction: false }]);
             }
             if !self.transcript.is_disabled()
                 && !self.transcript.is_idle()
@@ -1396,6 +1409,7 @@ impl App {
         }
         if let RuntimeEvent::RunSettled { run_id } = &event {
             self.foreground_cancellation_requested = false;
+            self.compaction_cancellation_requested = false;
             self.submission_at = None;
             if self.correction_pending
                 && self
@@ -1408,13 +1422,47 @@ impl App {
         }
         if matches!(
             &event,
-            RuntimeEvent::SubmissionRejectedBusy { .. }
-                | RuntimeEvent::SubmissionRejectedDisabled { .. }
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: Some(_),
+            } | RuntimeEvent::SubmissionRejectedDisabled { .. }
                 | RuntimeEvent::RuntimeDisabled { .. }
+                | RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: crate::runtime::CompactionAcknowledgement::Disabled { .. }
+                }
         ) {
+            self.compaction_cancellation_requested = false;
             self.submission_at = None;
             self.correction_pending = false;
             self.correction_run_id = None;
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            }
+        ) {
+            self.submission_at = None;
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: crate::runtime::CompactionAcknowledgement::Accepted,
+            }
+        ) {
+            self.compaction_cancellation_requested = false;
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: crate::runtime::CompactionLifecycle::NoOp
+                    | crate::runtime::CompactionLifecycle::Settled(_),
+            }
+        ) {
+            self.compaction_cancellation_requested = false;
+            if !self.transcript.has_active_run() {
+                self.foreground_cancellation_requested = false;
+                self.submission_at = None;
+            }
         }
         if let RuntimeEvent::CorrectionCompleted { run_id, outcome } = &event
             && self.correction_pending
@@ -2576,9 +2624,10 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        CorrectionOutcome, ModelStepId, NavigationOutcome, ProgressEnvelope, Record,
-        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
-        RuntimeInitialState, StoredRecord, TerminalDetails, TreeRequestOutcome,
+        CompactionAcknowledgement, CompactionLifecycle, CompactionSettlement, CorrectionOutcome,
+        ModelStepId, NavigationOutcome, ProgressEnvelope, Record, RestoredTimelineItem, RunId,
+        RuntimeCommand, RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState, StoredRecord,
+        TerminalDetails, TreeRequestOutcome,
     };
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
@@ -6769,6 +6818,137 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_retained_compaction_does_not_create_a_correction() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "request", submitted_at);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, submitted_at);
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            submitted_at,
+        );
+
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert!(app.foreground_cancellation_requested);
+        assert!(!app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::CancelledBeforeStart),
+            },
+            submitted_at + Duration::from_millis(1),
+        );
+        assert!(app.foreground_cancellation_requested);
+        assert_eq!(app.submission_at, Some(submitted_at));
+        assert!(!app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::RunSettled { run_id: RunId(1) },
+            submitted_at + Duration::from_millis(2),
+        );
+        assert!(!app.foreground_cancellation_requested);
+        assert_eq!(app.submission_at, None);
+        assert!(!app.correction_pending);
+    }
+
+    #[test]
+    fn cancelling_retained_compaction_preserves_an_existing_correction() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "request", submitted_at);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, submitted_at);
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+        assert!(app.correction_pending);
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            submitted_at + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(2))
+                .commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(3))
+                .commands,
+            [RuntimeCommand::CancelBackground]
+        );
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::CancelledBeforeStart),
+            },
+            submitted_at + Duration::from_millis(2),
+        );
+        assert!(app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails::empty(),
+                    },
+                },
+                progress_gap: false,
+            },
+            submitted_at + Duration::from_millis(3),
+        );
+        assert!(app.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::SkippedBackground,
+            },
+            submitted_at + Duration::from_millis(4),
+        ));
+        assert!(app.correction_pending);
+        app.handle_event_at(
+            RuntimeEvent::RunSettled { run_id: RunId(1) },
+            submitted_at + Duration::from_millis(5),
+        );
+        assert!(!app.correction_pending);
+    }
+
+    #[test]
+    fn active_compaction_accepts_cancel_but_not_submit() {
+        let mut app = App::default();
+        assert!(app.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        }));
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Started,
+        }));
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::CancelBackground]
+        );
+
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Cancelled),
+        }));
+        assert!(!app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+    }
+
+    #[test]
     fn ctrl_c_clears_a_prompt_then_shuts_down_when_it_is_empty() {
         for active in [false, true] {
             let mut app = app_with_prompt("draft");
@@ -8494,7 +8674,7 @@ mod tests {
         );
         app.handle_event_at(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(1),
+                active_run_id: Some(RunId(1)),
             },
             now,
         );

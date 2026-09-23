@@ -787,6 +787,7 @@ impl OpenAiModel {
         &self,
         request: SummaryRequest,
         cancellation: &CancellationToken,
+        attempt_started: &mut (dyn FnMut() + Send),
     ) -> Result<SummaryResult, ModelFailure> {
         if cancellation.is_cancelled() {
             return Err(ModelError::Cancelled.into());
@@ -799,6 +800,7 @@ impl OpenAiModel {
             if cancellation.is_cancelled() {
                 return Err(ModelFailure::new(ModelError::Cancelled, attempts));
             }
+            attempt_started();
 
             match self
                 .one_summary_attempt(request.clone(), selection, cancellation)
@@ -1090,8 +1092,9 @@ impl Model for OpenAiModel {
         &'a mut self,
         request: SummaryRequest,
         cancellation: &'a CancellationToken,
+        attempt_started: &'a mut (dyn FnMut() + Send),
     ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
-        self.summary_with_restarts(request, cancellation)
+        self.summary_with_restarts(request, cancellation, attempt_started)
     }
 
     fn step<'a>(
@@ -4852,7 +4855,10 @@ mod tests {
         ) -> Result<crate::model::SummaryResult, crate::model::ModelFailure> {
             let mut model =
                 OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
-            model.summarise(request, cancellation).await
+            let mut attempt_started = || {};
+            model
+                .summarise(request, cancellation, &mut attempt_started)
+                .await
         }
 
         #[tokio::test]
@@ -5083,6 +5089,31 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn summary_attempt_start_callback_matches_real_attempts() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::Sse(""),
+                FixtureReply::OwnedSse(stream([completed_event(
+                    vec![message("recovered summary")],
+                    Some(usage()),
+                )])),
+            ])
+            .await;
+            let cancellation = CancellationToken::new();
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let mut started = 0;
+
+            let result = model
+                .summarise(request(), &cancellation, &mut || started += 1)
+                .await
+                .expect("retry should complete");
+
+            assert_eq!(started, 2);
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(result.attempts.len(), 2);
+        }
+
+        #[tokio::test]
         async fn summary_accepts_reasoning_metadata_and_usage_absence() {
             let fixture = Fixture::start(FixtureReply::OwnedSse(stream([completed_event(
                 vec![reasoning(), message("summary")],
@@ -5102,13 +5133,18 @@ mod tests {
             let fixture = Fixture::start(FixtureReply::Sse("")).await;
             let cancellation = CancellationToken::new();
             cancellation.cancel();
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let mut started = 0;
 
-            let failure = summarise(&fixture, request(), &cancellation)
+            let failure = model
+                .summarise(request(), &cancellation, &mut || started += 1)
                 .await
                 .unwrap_err();
 
             assert_eq!(failure.error(), &ModelError::Cancelled);
             assert!(failure.attempts().is_empty());
+            assert_eq!(started, 0);
             assert_eq!(fixture.request_count(), 0);
         }
 
@@ -5121,7 +5157,10 @@ mod tests {
             let task = tokio::spawn(async move {
                 let mut model =
                     OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
-                model.summarise(request(), &cancellation).await
+                let mut attempt_started = || {};
+                model
+                    .summarise(request(), &cancellation, &mut attempt_started)
+                    .await
             });
 
             fixture.wait_for_requests(1).await;
@@ -6679,7 +6718,9 @@ mod tests {
                 | RuntimeEvent::NavigationCompleted { .. }
                 | RuntimeEvent::CorrectionCompleted { .. }
                 | RuntimeEvent::TreeCatalogue { .. }
-                | RuntimeEvent::SubmissionRejectedBusy { .. } => {}
+                | RuntimeEvent::SubmissionRejectedBusy { .. }
+                | RuntimeEvent::CompactionAcknowledged { .. }
+                | RuntimeEvent::CompactionLifecycle { .. } => {}
             }
         }
 
