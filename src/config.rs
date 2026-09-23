@@ -1035,7 +1035,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
             );
             assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
@@ -1071,7 +1071,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
         );
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(

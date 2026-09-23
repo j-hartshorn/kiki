@@ -1,6 +1,6 @@
 # Kiki
 
-Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `openai/gpt-6-astra` (a frontier model for computer/browser use, software engineering, scientific analysis, and document artifacts), `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), or `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
+Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `openai/gpt-6-astra` (a frontier model for computer/browser use, software engineering, scientific analysis, and document artifacts), `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), or `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
 
 ## Setup
 
@@ -10,7 +10,7 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-6-astra`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker but does not change the Sol default. All four OpenAI models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, while the GPT-5.6 models default to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
+Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-6-astra`, `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured but does not change the Sol default. All six OpenAI models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, while Sol and Luna default to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
 
 Export the variables:
 
@@ -87,9 +87,12 @@ User defaults live at `~/.kiki/config.toml`:
 
 ```toml
 model = "openai/gpt-5.6-terra"
+favourites = ["openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6-luna"]
 
 [thinking]
 "openai/gpt-6-astra" = "low"
+"openai/gpt-6-sol" = "high"
+"openai/gpt-6-luna" = "medium"
 "openai/gpt-5.6-sol" = "low"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
@@ -106,6 +109,8 @@ model = "openai/gpt-5.6-terra"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
 ```
+
+`favourites` is an optional, non-empty, ordered list of unique supported model IDs. User and project lists use the same precedence as other file settings; a project list replaces the user list. Favourites lead the model picker in their written order, followed by all other models. When set, only favourites may be used by subagents, and the first is the default for every new subagent. The foreground model remains independent of favourites. Without the setting, the picker uses catalogue order and subagents retain the invoking model by default and may use any supported model.
 
 `Ctrl-S` in either model or thinking picker writes the user default separately from the active session setting. If project settings or environment variables mask it, Kiki reports that override.
 
@@ -130,7 +135,7 @@ Use `start_subagent(...)` to receive a `SubagentTask` immediately, or `run_subag
 
 A child receives an independent copy of the invoking Python execution's **pre-execution** Arena checkpoint. Values committed before that execution are available; assignments made earlier in the same execution are not. Every child starts with a fresh `result_values` dictionary. A successful `wait()` returns a dictionary with `id`, `message`, and `values` keys. Export only supported neutral scalars, lists, and string-keyed dictionaries within the existing Arena and transport limits. Missing, non-dictionary, cyclic, or unsupported `result_values` make that child fail; they do not disable the foreground agent. `wait()` raises `RuntimeError` for a failed or cancelled child and `TimeoutError` for a timed-out child.
 
-Children have fresh model context and a model/thinking selection fixed at admission. Without an override, that selection is the invoking model step's selection. An explicit model uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
+Children have fresh model context and a model/thinking selection fixed at admission. Without an override, they use the first configured favourite; if no favourites are configured, they use the invoking model step's selection. An explicit model must be a favourite when favourites are configured and uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
 
 Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by the host. A read-only child cannot widen a descendant. All agents still share the same filesystem. Completed file effects are visible to every agent and cancellation never rolls them back.
 
@@ -164,7 +169,7 @@ A trace is diagnostic only, not authoritative or resumable history: it cannot re
 
 Session storage is local and unencrypted. It includes prompts, outputs, provider replay, Arena contents, and potentially sensitive project data. On Unix, Kiki restricts session directories to `0700` and session files to `0600`; this is not a portable permission guarantee. Configured API credentials are not saved as session configuration or shown in Kiki's display, but credentials included in a prompt, output, or Arena value are ordinary session content. Local persistence does not protect against disk loss.
 
-Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
+Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, snapshot `2026-09-23` for `gpt-6-sol` and `gpt-6-luna`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
 
 ## Controls and availability
 

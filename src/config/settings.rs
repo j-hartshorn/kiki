@@ -21,8 +21,8 @@ use super::{
 const MAX_DOCUMENT_PROBLEMS: usize = 3;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
 const PROJECT_SETTINGS_LABEL: &str = "project settings file `.kiki/config.toml`";
-const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
-const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
+const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
+const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
 
 pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
@@ -114,6 +114,7 @@ pub(crate) struct SettingsContext {
     user_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
     model_origin: SettingsOrigin,
+    favourites: Option<Vec<&'static ModelConfiguration>>,
     thinking: BTreeMap<&'static str, PersistedThinking>,
     environment_thinking_model: Option<&'static str>,
 }
@@ -134,6 +135,7 @@ impl fmt::Debug for SettingsContext {
                     .map(|_| "[project settings path]"),
             )
             .field("model_origin", &self.model_origin)
+            .field("favourites", &self.favourites)
             .field("thinking", &self.thinking)
             .field(
                 "environment_thinking_model",
@@ -156,6 +158,10 @@ impl SettingsContext {
     #[cfg(test)]
     pub(crate) fn model_origin(&self) -> SettingsOrigin {
         self.model_origin
+    }
+
+    pub(crate) fn favourites(&self) -> Option<&[&'static ModelConfiguration]> {
+        self.favourites.as_deref()
     }
 
     pub(crate) fn thinking_for(&self, model: &'static ModelConfiguration) -> Option<&'static str> {
@@ -384,6 +390,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     let mut model = DEFAULT_MODEL;
     let mut model_origin = SettingsOrigin::BuiltIn;
     let mut thinking = BTreeMap::new();
+    let mut favourites = None;
     let mut subagents = SubagentSettings::default();
     apply_layer(
         user.as_ref(),
@@ -391,6 +398,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut model,
         &mut model_origin,
         &mut thinking,
+        &mut favourites,
         &mut subagents,
     );
     apply_layer(
@@ -399,6 +407,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut model,
         &mut model_origin,
         &mut thinking,
+        &mut favourites,
         &mut subagents,
     );
     if let Some(session_preferences) = input.session_preferences {
@@ -493,6 +502,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             user_path,
             project_path,
             model_origin,
+            favourites,
             thinking,
             environment_thinking_model,
         },
@@ -511,6 +521,7 @@ fn apply_layer(
     model: &mut &'static ModelConfiguration,
     model_origin: &mut SettingsOrigin,
     thinking: &mut BTreeMap<&'static str, PersistedThinking>,
+    favourites: &mut Option<Vec<&'static ModelConfiguration>>,
     subagents: &mut SubagentSettings,
 ) {
     let Some(settings) = settings else {
@@ -519,6 +530,9 @@ fn apply_layer(
     if let Some(selected) = settings.model {
         *model = selected;
         *model_origin = origin;
+    }
+    if let Some(selected) = &settings.favourites {
+        *favourites = Some(selected.clone());
     }
     thinking.extend(settings.thinking.iter().map(|(model, thinking)| {
         (
@@ -607,10 +621,11 @@ fn validate_document(
                     MODEL_REMEDIATION,
                 ),
             },
+            "favourites" => validate_favourites(item, &mut settings.favourites, &mut problems),
             "thinking" => validate_thinking_table(item, &mut settings.thinking, &mut problems),
             "subagents" => validate_subagents_table(item, &mut settings.subagents, &mut problems),
             _ => problems.push(
-                "contains an unknown field; only `model`, `[thinking]`, and `[subagents]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `[thinking]`, and `[subagents]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -620,6 +635,46 @@ fn validate_document(
         (Some(settings), Vec::new())
     } else {
         (None, problems.finish())
+    }
+}
+
+fn validate_favourites(
+    item: &Item,
+    favourites: &mut Option<Vec<&'static ModelConfiguration>>,
+    problems: &mut DocumentProblems,
+) {
+    let Some(array) = item.as_array() else {
+        problems.push(
+            "field `favourites` must be a non-empty array of supported qualified model ids",
+            "Set favourites to a non-empty array of unique supported model ids, then restart Kiki.",
+        );
+        return;
+    };
+    let mut models = Vec::new();
+    for value in array.iter() {
+        let Some(model) = value.as_str().and_then(model_by_id) else {
+            problems.push(
+                "field `favourites` contains an invalid model id",
+                "Use only supported qualified model ids in favourites, then restart Kiki.",
+            );
+            return;
+        };
+        if models.contains(&model) {
+            problems.push(
+                "field `favourites` contains a duplicate model id",
+                "List each favourite model only once, then restart Kiki.",
+            );
+            return;
+        }
+        models.push(model);
+    }
+    if models.is_empty() {
+        problems.push(
+            "field `favourites` must not be empty",
+            "List at least one favourite model, then restart Kiki.",
+        );
+    } else {
+        *favourites = Some(models);
     }
 }
 
@@ -639,7 +694,7 @@ fn validate_thinking_table(
     for (key, item) in table.iter() {
         let Some(model) = model_by_id(key) else {
             problems.push(
-                "field `thinking` contains an unknown model key; use openai/gpt-6-astra, openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
+                "field `thinking` contains an unknown model key; use openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
                 "Use only supported qualified model ids as [thinking] keys, then restart Kiki.",
             );
             continue;
@@ -797,6 +852,7 @@ fn known_thinking_level(level: &str) -> bool {
 #[derive(Default)]
 struct FileSettings {
     model: Option<&'static ModelConfiguration>,
+    favourites: Option<Vec<&'static ModelConfiguration>>,
     thinking: BTreeMap<&'static str, &'static str>,
     subagents: FileSubagentSettings,
 }
@@ -1015,6 +1071,68 @@ mod tests {
                 .contains("low, medium, high, xhigh, max")
         );
         assert!(!problem.diagnostic().contains("none,"));
+    }
+
+    #[test]
+    fn ordered_favourites_override_as_one_setting_without_changing_foreground_model() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_settings(
+            home.path(),
+            "favourites = [\"openai/gpt-6-luna\", \"openai/gpt-6-astra\"]\n",
+        );
+        let user = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            user.context()
+                .favourites()
+                .unwrap()
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            ["openai/gpt-6-luna", "openai/gpt-6-astra"]
+        );
+        assert_eq!(user.model().id, SOL.id);
+        write_settings(
+            project.path(),
+            "favourites = [\"openai/gpt-6-astra\", \"openai/gpt-6-sol\"]\n",
+        );
+        let project = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            project
+                .context()
+                .favourites()
+                .unwrap()
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            ["openai/gpt-6-astra", "openai/gpt-6-sol"]
+        );
+        assert!(project.problems().is_empty());
+    }
+
+    #[test]
+    fn invalid_favourites_reject_whole_layer_without_leaking_values() {
+        for favourites in [
+            "[]",
+            "[\"openai/gpt-6-sol\", \"openai/gpt-6-sol\"]",
+            "[\"openai/unknown\"]",
+            "[7]",
+            "\"openai/gpt-6-sol\"",
+        ] {
+            let home = tempdir().unwrap();
+            write_settings(
+                home.path(),
+                &format!("model = \"openai/gpt-5.6-terra\"\nfavourites = {favourites}\n"),
+            );
+            let resolution = resolve(input(Some(home.path()), None));
+            assert_eq!(resolution.model().id, SOL.id);
+            assert!(resolution.context().favourites().is_none());
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid
+            );
+            assert!(resolution.problems()[0].diagnostic().contains("favourites"));
+        }
     }
 
     #[test]

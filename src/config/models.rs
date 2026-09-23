@@ -93,6 +93,72 @@ pub static ASTRA: ModelConfiguration = ModelConfiguration {
     },
 };
 
+pub static GPT6_SOL: ModelConfiguration = ModelConfiguration {
+    id: "openai/gpt-6-sol",
+    thinking_levels: OPENAI_THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "default",
+    context_window_tokens: 1_050_000,
+    context_window_display: "1.05m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "openai/gpt-6-sol",
+            service_tier: "default",
+            version: "2026-09-23",
+            source: "https://developers.openai.com/api/docs/pricing",
+        },
+        long_context_threshold: 272_000,
+        long_context_threshold_display: "272k",
+        short_context: Rates {
+            uncached_input_nanos: 2_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 2_500,
+            output_nanos: 10_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 4_000,
+            cached_input_nanos: 400,
+            cache_write_nanos: 5_000,
+            output_nanos: 15_000,
+        },
+    },
+};
+
+pub static GPT6_LUNA: ModelConfiguration = ModelConfiguration {
+    id: "openai/gpt-6-luna",
+    thinking_levels: OPENAI_THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "default",
+    context_window_tokens: 1_050_000,
+    context_window_display: "1.05m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "openai/gpt-6-luna",
+            service_tier: "default",
+            version: "2026-09-23",
+            source: "https://developers.openai.com/api/docs/pricing",
+        },
+        long_context_threshold: 272_000,
+        long_context_threshold_display: "272k",
+        short_context: Rates {
+            uncached_input_nanos: 100,
+            cached_input_nanos: 10,
+            cache_write_nanos: 125,
+            output_nanos: 500,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 200,
+            cached_input_nanos: 20,
+            cache_write_nanos: 250,
+            output_nanos: 750,
+        },
+    },
+};
+
 pub static SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-5.6-sol",
     thinking_levels: OPENAI_THINKING_LEVELS,
@@ -192,7 +258,8 @@ pub static LUNA: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 4] = [&ASTRA, &SOL, &TERRA, &LUNA];
+pub static CATALOGUE: [&ModelConfiguration; 6] =
+    [&ASTRA, &GPT6_SOL, &GPT6_LUNA, &SOL, &TERRA, &LUNA];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
 impl ModelConfiguration {
@@ -216,6 +283,8 @@ mod tests {
             CATALOGUE.map(|m| m.id),
             [
                 "openai/gpt-6-astra",
+                "openai/gpt-6-sol",
+                "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
                 "openai/gpt-5.6-terra",
                 "openai/gpt-5.6-luna"
@@ -223,9 +292,54 @@ mod tests {
         );
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
-            4
+            6
         );
         assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_match_published_standard_rates() {
+        for (model, short, long) in [
+            (
+                &GPT6_SOL,
+                Rates {
+                    uncached_input_nanos: 2_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 2_500,
+                    output_nanos: 10_000,
+                },
+                Rates {
+                    uncached_input_nanos: 4_000,
+                    cached_input_nanos: 400,
+                    cache_write_nanos: 5_000,
+                    output_nanos: 15_000,
+                },
+            ),
+            (
+                &GPT6_LUNA,
+                Rates {
+                    uncached_input_nanos: 100,
+                    cached_input_nanos: 10,
+                    cache_write_nanos: 125,
+                    output_nanos: 500,
+                },
+                Rates {
+                    uncached_input_nanos: 200,
+                    cached_input_nanos: 20,
+                    cache_write_nanos: 250,
+                    output_nanos: 750,
+                },
+            ),
+        ] {
+            assert_eq!(model.default_thinking, "medium");
+            assert_eq!(model.pricing.short_context, short);
+            assert_eq!(model.pricing.long_context, long);
+            assert_eq!(
+                model.pricing.identity.source,
+                "https://developers.openai.com/api/docs/pricing"
+            );
+            assert!(std::ptr::eq(model_by_id(model.id).unwrap(), model));
+        }
     }
 
     #[test]
