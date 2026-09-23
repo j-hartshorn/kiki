@@ -36,7 +36,7 @@ use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
-use crate::session::Session;
+use crate::session::{Session, SessionListRow};
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -53,13 +53,14 @@ fn production_model(
 enum Invocation {
     Fresh,
     List,
+    Continue,
     Resume { id: String, here: bool },
 }
 
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "Usage: kiki [sessions | --resume <32-lowerhex-id> [--here]]",
+        "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here]]",
     )
 }
 
@@ -78,6 +79,7 @@ fn invocation() -> Result<Invocation, io::Error> {
     match arguments.as_slice() {
         [] => Ok(Invocation::Fresh),
         [command] if command == "sessions" => Ok(Invocation::List),
+        [command] if command == "--continue" => Ok(Invocation::Continue),
         [command, id] if command == "--resume" && valid_session_id(id) => Ok(Invocation::Resume {
             id: id.clone(),
             here: false,
@@ -138,7 +140,7 @@ fn session_description(name: Option<&str>, request: Option<&str>) -> String {
     }
 }
 
-fn list_sessions(home: &Path) -> Result<(), Box<dyn Error>> {
+fn displayed_sessions(home: &Path) -> Result<Vec<(SessionListRow, String)>, Box<dyn Error>> {
     let current_root = current_workspace_root()?;
     let (mut rows, warnings) = Session::list(home)?.into_parts();
     for warning in warnings {
@@ -158,14 +160,20 @@ fn list_sessions(home: &Path) -> Result<(), Box<dyn Error>> {
             .cmp(&left.updated_at_ms())
             .then_with(|| left.id().cmp(right.id()))
     });
-    for row in rows {
-        let timestamp = match session_timestamp(row.updated_at_ms()) {
-            Ok(timestamp) => timestamp,
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| match session_timestamp(row.updated_at_ms()) {
+            Ok(timestamp) => Some((row, timestamp)),
             Err(_) => {
                 eprintln!("Warning: could not read session {}.", row.id());
-                continue;
+                None
             }
-        };
+        })
+        .collect())
+}
+
+fn list_sessions(home: &Path) -> Result<(), Box<dyn Error>> {
+    for (row, timestamp) in displayed_sessions(home)? {
         println!(
             "{} {} {}",
             row.id(),
@@ -174,6 +182,13 @@ fn list_sessions(home: &Path) -> Result<(), Box<dyn Error>> {
         );
     }
     Ok(())
+}
+
+fn continue_latest_session(home: PathBuf) -> Result<(), Box<dyn Error>> {
+    let Some((latest, _)) = displayed_sessions(&home)?.into_iter().next() else {
+        return Err(io::Error::other("no saved session for the current workspace").into());
+    };
+    run_resume(home, latest.id().to_owned(), false)
 }
 
 fn run_configuration(
@@ -406,6 +421,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match invocation {
         Invocation::Fresh => run_fresh(home),
         Invocation::List => list_sessions(&home),
+        Invocation::Continue => continue_latest_session(home),
         Invocation::Resume { id, here } => run_resume(home, id, here),
     }
 }

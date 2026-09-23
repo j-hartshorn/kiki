@@ -369,6 +369,7 @@ fn invalid_arguments_fail_before_home_lookup_or_tracing() {
         vec!["--here", "--resume", "00000000000000000000000000000001"],
         vec!["--resume", "00000000000000000000000000000001", "unexpected"],
         vec!["sessions", "--here"],
+        vec!["--continue", "--here"],
     ] {
         let trace = workspace.path().join(format!("{}.jsonl", arguments.len()));
         let output = Command::new(env!("CARGO_BIN_EXE_kiki"))
@@ -733,4 +734,240 @@ fn here_skips_directory_guard_but_does_not_relocate_after_configuration_failure(
     assert!(stdout.contains(&format!("Session: {id}")));
     assert!(!stderr.contains("session relocated"));
     assert_eq!(fs::read(database).expect("reread fixture database"), before);
+}
+
+fn first_listed_id(home: &Path, workspace: &Path) -> String {
+    let output = invoke(home, workspace, &["sessions"], None);
+    let (stdout, stderr) = output_text(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    stdout
+        .lines()
+        .next()
+        .expect("listed session")
+        .chars()
+        .take(32)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn continue_resumes_newest_session_for_current_workspace() {
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+    let elsewhere = tempdir().expect("create other workspace");
+    let workspace_link = home.path().join("workspace-link");
+    symlink(workspace.path(), &workspace_link).expect("create workspace symlink");
+    let elsewhere_id = "00000000000000000000000000000021";
+    let older = "00000000000000000000000000000022";
+    let latest = "00000000000000000000000000000023";
+    let tied = "00000000000000000000000000000024";
+    create_session_fixture(
+        home.path(),
+        elsewhere_id,
+        elsewhere_id,
+        elsewhere.path(),
+        4_000,
+        None,
+        None,
+    );
+    create_session_fixture(
+        home.path(),
+        older,
+        older,
+        workspace.path(),
+        2_000,
+        None,
+        None,
+    );
+    create_session_fixture(home.path(), tied, tied, workspace.path(), 3_000, None, None);
+    create_session_fixture(
+        home.path(),
+        latest,
+        latest,
+        &workspace_link,
+        3_000,
+        None,
+        None,
+    );
+    assert_eq!(first_listed_id(home.path(), workspace.path()), latest);
+
+    let output = invoke(home.path(), workspace.path(), &["--continue"], None);
+
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("Session: {latest}")),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains(elsewhere_id));
+    assert!(!stdout.contains(older));
+    assert!(!stdout.contains(tied));
+}
+
+#[cfg(unix)]
+#[test]
+fn continue_skips_unreadable_and_invalid_timestamp_sessions_with_warnings() {
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+    let healthy = "00000000000000000000000000000041";
+    let invalid_timestamp = "00000000000000000000000000000042";
+    let unreadable = "00000000000000000000000000000043";
+    create_session_fixture(
+        home.path(),
+        healthy,
+        healthy,
+        workspace.path(),
+        1_000,
+        None,
+        None,
+    );
+    create_session_fixture(
+        home.path(),
+        invalid_timestamp,
+        invalid_timestamp,
+        workspace.path(),
+        i64::MAX,
+        None,
+        None,
+    );
+    let unreadable_path = create_session_fixture(
+        home.path(),
+        unreadable,
+        unreadable,
+        workspace.path(),
+        6_000,
+        None,
+        None,
+    );
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000))
+        .expect("make session unreadable");
+    let listed = first_listed_id(home.path(), workspace.path());
+
+    let output = invoke(home.path(), workspace.path(), &["--continue"], None);
+
+    fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o600))
+        .expect("restore session permissions");
+    assert_eq!(listed, healthy);
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("Session: {healthy}")),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("Warning: could not read session {unreadable}.")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Warning: could not read session {invalid_timestamp}."
+        )),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn continue_fails_when_selected_session_is_owned_without_fallback() {
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+    let older = "00000000000000000000000000000051";
+    let owned = "00000000000000000000000000000052";
+    create_session_fixture(
+        home.path(),
+        older,
+        older,
+        workspace.path(),
+        1_000,
+        None,
+        None,
+    );
+    create_session_fixture(
+        home.path(),
+        owned,
+        owned,
+        workspace.path(),
+        2_000,
+        None,
+        None,
+    );
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.path().join(format!(".kiki/sessions/{owned}.lock")))
+        .expect("create owner lock");
+    rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("lock owner file");
+    let output = invoke(home.path(), workspace.path(), &["--continue"], None);
+
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("session is already owned by another process"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("Session:"), "{stdout}");
+    assert!(
+        !home
+            .path()
+            .join(format!(".kiki/sessions/{older}.lock"))
+            .exists()
+    );
+}
+
+#[test]
+fn continue_without_matching_session_fails_without_session_or_runtime() {
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+    let elsewhere = tempdir().expect("create other workspace");
+    let trace = home.path().join("trace.jsonl");
+
+    let empty_output = invoke(home.path(), workspace.path(), &["--continue"], Some(&trace));
+
+    let (stdout, stderr) = output_text(&empty_output);
+    assert!(!empty_output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("no saved session for the current workspace"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("terminal operation failed"), "{stderr}");
+    assert!(!stdout.contains("Session:"), "{stdout}");
+    assert!(!trace.exists());
+    assert!(!home.path().join(".kiki").exists());
+
+    let elsewhere_id = "00000000000000000000000000000061";
+    create_session_fixture(
+        home.path(),
+        elsewhere_id,
+        elsewhere_id,
+        elsewhere.path(),
+        1_000,
+        None,
+        None,
+    );
+    let sessions = home.path().join(".kiki/sessions");
+    let entries = |directory: &Path| {
+        let mut names = fs::read_dir(directory)
+            .expect("read sessions directory")
+            .map(|entry| entry.expect("read session entry").file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let entries_before = entries(&sessions);
+
+    let output = invoke(home.path(), workspace.path(), &["--continue"], Some(&trace));
+
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("no saved session for the current workspace"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("terminal operation failed"), "{stderr}");
+    assert!(!stdout.contains("Session:"), "{stdout}");
+    assert!(!trace.exists());
+    assert_eq!(entries(&sessions), entries_before);
 }
