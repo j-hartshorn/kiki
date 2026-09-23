@@ -639,8 +639,10 @@ impl<M: Model> Agent<M> {
                 break;
             }
             let mut attempt_started = || {
-                provider_started = true;
-                started();
+                if !provider_started {
+                    provider_started = true;
+                    started();
+                }
             };
             match self
                 .model
@@ -1790,7 +1792,7 @@ mod tests {
             .expect("settle compaction");
 
         assert_eq!(agent.model.summary_requests(), expected_requests);
-        assert_eq!(started, expected_requests.len());
+        assert_eq!(started, 1);
         assert!(matches!(
             result,
             ManualCompactionResult::Settled(committed)

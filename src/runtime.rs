@@ -1519,7 +1519,6 @@ impl<M: Model> RuntimeController<M> {
         let worker_task = tokio::spawn(async move {
             let mut agent = agent;
             let completion_sender = sender.clone();
-            let mut started = false;
             let result = agent
                 .compact_manual(
                     policy,
@@ -1528,10 +1527,7 @@ impl<M: Model> RuntimeController<M> {
                     &cancellation_for_worker,
                     &writer,
                     &mut || {
-                        if !started {
-                            started = true;
-                            let _ = completion_sender.send(WorkerMessage::CompactionStarted);
-                        }
+                        let _ = completion_sender.send(WorkerMessage::CompactionStarted);
                     },
                 )
                 .await;
