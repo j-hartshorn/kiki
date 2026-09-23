@@ -1506,6 +1506,14 @@ impl App {
             &event,
             RuntimeEvent::CompactionLifecycle {
                 lifecycle: crate::runtime::CompactionLifecycle::NoOp
+            }
+        ) {
+            self.set_notice("Nothing to compact.".to_owned());
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: crate::runtime::CompactionLifecycle::NoOp
                     | crate::runtime::CompactionLifecycle::Settled(_),
             }
         ) {
@@ -6919,6 +6927,23 @@ mod tests {
             lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
         });
         assert_eq!(app.prompt.text(), "later draft");
+    }
+
+    #[test]
+    fn compact_noop_reports_a_notice_without_a_card() {
+        let mut app = app_with_prompt("/compact");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::NoOp,
+        }));
+        assert_eq!(app.notice(), Some("Nothing to compact."));
+        let screen = rendered(&mut app, 120, 24);
+        assert!(screen.contains("Nothing to compact."), "{screen}");
+        assert!(!screen.contains("Compaction ·"), "{screen}");
     }
 
     #[test]
