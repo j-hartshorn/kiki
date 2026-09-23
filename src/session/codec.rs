@@ -7,8 +7,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use thiserror::Error;
 
 use super::{
-    CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, ReadableCode,
-    ReadableTerminal, SessionEntryId,
+    COMPACTION_DIAGNOSTIC_LIMIT, CompactionOutcome, CompactionReason, PersistedCode,
+    PersistedTerminal, ReadableCode, ReadableTerminal, SessionEntryId,
 };
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{
@@ -601,7 +601,9 @@ fn validate_stored_compaction(outcome: &StoredCompactionOutcome) -> Result<(), C
         StoredCompactionOutcome::Applied { first_retained, .. } if *first_retained == 0 => {
             Err(CodecError::InvalidPayload)
         }
-        StoredCompactionOutcome::Failed { diagnostic, .. } if diagnostic.len() > 4_096 => {
+        StoredCompactionOutcome::Failed { diagnostic, .. }
+            if diagnostic.len() > COMPACTION_DIAGNOSTIC_LIMIT =>
+        {
             Err(CodecError::OversizedCompactionDiagnostic)
         }
         StoredCompactionOutcome::Applied { .. }
@@ -893,7 +895,7 @@ pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEnt
             context_tokens,
             reason,
             attempts,
-        } if first_retained.0 != 0 => StoredCompactionOutcome::Applied {
+        } => StoredCompactionOutcome::Applied {
             summary: summary.clone(),
             first_retained: first_retained.0,
             context_tokens: *context_tokens,
@@ -904,7 +906,7 @@ pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEnt
             diagnostic,
             reason,
             attempts,
-        } if diagnostic.len() <= 4_096 => StoredCompactionOutcome::Failed {
+        } => StoredCompactionOutcome::Failed {
             diagnostic: diagnostic.clone(),
             reason: encode_compaction_reason(*reason),
             attempts: attempts.iter().map(encode_attempt).collect(),
@@ -913,9 +915,8 @@ pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEnt
             reason: encode_compaction_reason(*reason),
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
-        CompactionOutcome::Applied { .. } => return Err(CodecError::InvalidPayload),
-        CompactionOutcome::Failed { .. } => return Err(CodecError::OversizedCompactionDiagnostic),
     };
+    validate_stored_compaction(&compaction)?;
     Ok(StoredEntry {
         kind: "compaction",
         payload_json: serde_json::to_string(&StoredPayload::Compaction(StoredCompaction {
