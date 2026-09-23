@@ -19,9 +19,7 @@ use tokio::task;
 
 use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
-use crate::compaction::{
-    CompactedSummary, CompactionError, SelectedAncestryFact, SelectedAncestryKind,
-};
+use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
@@ -211,7 +209,7 @@ impl PreparedCompaction {
         self.planner.requests()
     }
 
-    pub(crate) fn finish(&self, outputs: &[String]) -> Result<CompactedSummary, CompactionError> {
+    pub(crate) fn finish(&self, outputs: &[String]) -> Result<String, CompactionError> {
         self.planner.finish(outputs)
     }
 }

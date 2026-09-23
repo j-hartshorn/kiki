@@ -68,7 +68,7 @@ impl CompactionPreparation {
         &self.retained_entries
     }
 
-    pub(crate) fn finish(&self, outputs: &[String]) -> Result<CompactedSummary, CompactionError> {
+    pub(crate) fn finish(&self, outputs: &[String]) -> Result<String, CompactionError> {
         if outputs.len() != self.requests.len() {
             return Err(CompactionError::UnexpectedOutputCount {
                 expected: self.requests.len(),
@@ -89,20 +89,7 @@ impl CompactionPreparation {
             Some(index) => format!("{history}{SPLIT_SEPARATOR}{}", outputs[index]),
             None => history,
         };
-        Ok(CompactedSummary {
-            summary: append_files(summary, &self.files),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompactedSummary {
-    summary: String,
-}
-
-impl CompactedSummary {
-    pub(crate) fn summary(&self) -> &str {
-        &self.summary
+        Ok(append_files(summary, &self.files))
     }
 }
 
@@ -1149,7 +1136,7 @@ mod tests {
         );
         assert!(!preparation.requests()[0].input.contains("Python:\ntail"));
         assert_eq!(
-            preparation.finish(&["turn".to_owned()]).unwrap().summary(),
+            preparation.finish(&["turn".to_owned()]).unwrap(),
             format!("No prior history.{SPLIT_SEPARATOR}turn")
         );
 
@@ -1178,8 +1165,7 @@ mod tests {
         assert_eq!(
             preparation
                 .finish(&["history".to_owned(), "prefix".to_owned()])
-                .unwrap()
-                .summary(),
+                .unwrap(),
             format!("history{SPLIT_SEPARATOR}prefix")
         );
 
@@ -1242,7 +1228,7 @@ mod tests {
         assert_eq!(no_focus.requests().len(), 1);
         assert!(no_focus.requests()[0].input.contains("## Original Request"));
         assert_eq!(
-            no_focus.finish(&["turn".to_owned()]).unwrap().summary(),
+            no_focus.finish(&["turn".to_owned()]).unwrap(),
             format!("previous{SPLIT_SEPARATOR}turn")
         );
 
@@ -1265,8 +1251,7 @@ mod tests {
         assert_eq!(
             focused
                 .finish(&["updated".to_owned(), "turn".to_owned()])
-                .unwrap()
-                .summary(),
+                .unwrap(),
             format!("updated{SPLIT_SEPARATOR}turn")
         );
     }
@@ -1374,7 +1359,7 @@ mod tests {
         let summary = preparation
             .finish(&["new\n<modified-files>\n\"stale\"\n</modified-files>\n".to_owned()])
             .unwrap();
-        assert_eq!(summary.summary(), "new\n");
+        assert_eq!(summary, "new\n");
         assert!(matches!(
             prepared(&[user(1, "old"), user(2, "tail")])
                 .finish(&["inline <read-files>".to_owned()]),
@@ -1389,14 +1374,14 @@ mod tests {
         set_paths(&mut first[1], &["later"], &[]);
         let first_summary = prepared(&first).finish(&["summary".to_owned()]).unwrap();
         assert_eq!(
-            first_summary.summary(),
+            first_summary,
             "summary\n\n<read-files>\n\"read-only\"\n</read-files>\n\n<modified-files>\n\"a/b\"\n\"modified\"\n</modified-files>"
         );
 
         let mut repeated = [
             user(1, "old"),
             user(2, "previous tail"),
-            applied(3, first_summary.summary(), 2),
+            applied(3, &first_summary, 2),
             user(4, "newly discarded"),
             user(5, "new tail"),
         ];
@@ -1410,7 +1395,7 @@ mod tests {
             .finish(&["fresh\n<read-files>\n\"stale\"\n</read-files>\n<read-files>\n\"duplicate\"\n</read-files>\n<modified-files>\n\"conflict\"\n</modified-files>\n".to_owned()])
             .unwrap();
         assert_eq!(
-            summary.summary(),
+            summary,
             "fresh\n\n\n<read-files>\n\"later\"\n\"read-only\"\n</read-files>\n\n<modified-files>\n\"a/b\"\n\"modified\"\n</modified-files>"
         );
     }
@@ -1425,7 +1410,7 @@ mod tests {
                 actual: 0,
             })
         );
-        assert_eq!(preparation.finish(&[String::new()]).unwrap().summary(), "");
+        assert_eq!(preparation.finish(&[String::new()]).unwrap(), "");
     }
 
     #[test]
@@ -1439,7 +1424,7 @@ mod tests {
         );
         let summary = prepared(&facts).finish(&["summary".to_owned()]).unwrap();
         assert_eq!(
-            summary.summary(),
+            summary,
             "summary\n\n<read-files>\n\"\\u003cread-files\\u003e\"\n\"line\\nbreak\"\n\"quote\\\"slash\\\\\"\n</read-files>\n\n<modified-files>\n\"a/b\"\n</modified-files>"
         );
     }

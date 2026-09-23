@@ -676,10 +676,7 @@ impl<M: Model> Agent<M> {
             }
         } else {
             match preparation.finish(&outputs) {
-                Ok(summary) => CompactionSettlement::Applied {
-                    summary: summary.summary().to_owned(),
-                    attempts,
-                },
+                Ok(summary) => CompactionSettlement::Applied { summary, attempts },
                 Err(error) => CompactionSettlement::Failed {
                     diagnostic: error.to_string(),
                     attempts,
