@@ -32,16 +32,19 @@ Alternatively, put the variables in the ignored root `.env` file and launch with
 
 ## Sessions
 
-Kiki keeps each session in local SQLite storage under `~/.kiki/sessions`. Its four CLI forms are:
+Kiki keeps each session in local SQLite storage under `~/.kiki/sessions`. Its five CLI forms are:
 
 ```sh
 kiki
 kiki sessions
+kiki --continue
 kiki --resume <32-lowercase-hex-id>
 kiki --resume <32-lowercase-hex-id> --here
 ```
 
 `kiki sessions` is a read-only, current-directory-scoped listing sorted by saved activity, newest first, then by ascending ID. Each line contains the full ID, a UTC timestamp, and the session name, falling back to its first request or `(empty session)`. It shows only sessions whose saved workspace resolves to the current workspace, so equivalent symlink spellings match. It needs neither credentials nor Monty and does not modify sessions. Normal resume has the same resolved-directory guard and resumes the saved active leaf. Only one Kiki process can write a session; another resume fails while it is owned.
+
+`kiki --continue` resumes the first session `kiki sessions` would show: the most recently active session saved for the current workspace, with ties broken by ascending ID. It skips unreadable entries with the same warnings. When no session matches, it fails without creating a session. If the selected session cannot be opened, for example because another process owns it, Kiki reports that error rather than falling back to an older session. It does not accept `--here`; relocation needs an explicit ID. With the variables in `.env`, `just continue` runs `cargo run -- --continue` after the same Monty check as `just run`.
 
 Use `--here` only to deliberately relocate a session: it binds tools to the current directory. Only after successful executable restoration does Kiki save that directory and print:
 

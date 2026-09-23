@@ -18,6 +18,9 @@ format:
 run *args: monty
     cargo run -- {{args}}
 
+continue: monty
+    cargo run -- --continue
+
 test: monty
     cargo test --all-targets
 
