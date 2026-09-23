@@ -82,13 +82,9 @@ enum StoredPayload {
         terminal: StoredTerminal,
         code: Option<StoredCode>,
     },
-    Compaction(StoredCompaction),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredCompaction {
-    compaction: StoredCompactionOutcome,
+    Compaction {
+        compaction: StoredCompactionOutcome,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -517,7 +513,7 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
                 code,
             }))
         }
-        ("compaction", StoredPayload::Compaction(StoredCompaction { compaction })) => {
+        ("compaction", StoredPayload::Compaction { compaction }) => {
             validate_stored_compaction(&compaction)?;
             Ok(DecodedEntry(DecodedEntryPayload::Compaction(compaction)))
         }
@@ -919,9 +915,7 @@ pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEnt
     validate_stored_compaction(&compaction)?;
     Ok(StoredEntry {
         kind: "compaction",
-        payload_json: serde_json::to_string(&StoredPayload::Compaction(StoredCompaction {
-            compaction,
-        }))?,
+        payload_json: serde_json::to_string(&StoredPayload::Compaction { compaction })?,
         provider_replay: None,
     })
 }
