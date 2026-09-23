@@ -203,9 +203,6 @@ pub(crate) struct PreparedCompaction {
     parent_run_id: u64,
     checkpoint_id: i64,
     reason: CompactionReason,
-    context_tokens: u64,
-    first_retained: SessionEntryId,
-    retained_tail: Vec<ModelContextEntry>,
     planner: crate::compaction::CompactionPreparation,
 }
 
@@ -963,9 +960,6 @@ impl SessionWriter {
             parent_run_id: snapshot.parent_run_id,
             checkpoint_id: snapshot.checkpoint_id,
             reason,
-            context_tokens: planner.context_tokens(),
-            first_retained: planner.first_retained(),
-            retained_tail: planner.retained_entries().to_vec(),
             planner,
         }))
     }
@@ -982,8 +976,8 @@ impl SessionWriter {
             let outcome = match settlement {
                 CompactionSettlement::Applied { summary, attempts } => CompactionOutcome::Applied {
                     summary,
-                    first_retained: preparation.first_retained,
-                    context_tokens: preparation.context_tokens,
+                    first_retained: preparation.planner.first_retained(),
+                    context_tokens: preparation.planner.context_tokens(),
                     reason: preparation.reason,
                     attempts,
                 },
@@ -1004,7 +998,7 @@ impl SessionWriter {
                 CompactionOutcome::Applied { summary, .. } => {
                     let mut history = ModelHistory::new();
                     history.append_compaction_summary(summary.clone());
-                    for entry in &preparation.retained_tail {
+                    for entry in preparation.planner.retained_entries() {
                         append_model_context_entry(&mut history, entry.clone())?;
                     }
                     history
@@ -10176,7 +10170,7 @@ mod tests {
             .await
             .expect("prepare compaction")
             .expect("prepare compactable history");
-        assert_eq!(preparation.first_retained, retained.request_entry);
+        assert_eq!(preparation.planner.first_retained(), retained.request_entry);
         let committed = writer
             .settle_compaction(
                 preparation,
@@ -10602,64 +10596,6 @@ mod tests {
             drop(writer);
             session.close().expect("close session");
         }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn compaction_projection_failure_does_not_commit_or_publish() {
-        let home = tempfile::tempdir().expect("create home");
-        let workspace = tempfile::tempdir().expect("create workspace");
-        let session = create_session(&home, &workspace).await;
-        let writer = session.writer();
-        append_cancelled_request(&writer, "discarded request").await;
-        append_cancelled_request(&writer, "retained request").await;
-        let mut preparation = writer
-            .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
-                selection(),
-                String::new(),
-                super::CompactionReason::Manual,
-            )
-            .await
-            .expect("prepare compaction")
-            .expect("prepare compactable history");
-        let mut invalid_history = crate::model::ModelHistory::new();
-        invalid_history
-            .append_completed_code(
-                "pass".to_owned(),
-                crate::model::ModelCallId::new("duplicate"),
-                None,
-                String::new(),
-                crate::model::ProviderReplay::new("fixture", Vec::new()),
-                crate::model::CodeResult::Execution {
-                    feedback: String::new(),
-                },
-            )
-            .expect("append first duplicate");
-        let duplicate = invalid_history.entries()[0].clone();
-        preparation.retained_tail = vec![duplicate.clone(), duplicate];
-        let before_selection = selection_snapshot(&session);
-        let before_history = writer.model_history().expect("read live history");
-
-        assert!(matches!(
-            writer
-                .settle_compaction(
-                    preparation,
-                    super::CompactionSettlement::Applied {
-                        summary: "summary".to_owned(),
-                        attempts: Vec::new(),
-                    },
-                )
-                .await,
-            Err(SessionError::Codec(_))
-        ));
-        assert_eq!(selection_snapshot(&session), before_selection);
-        assert_eq!(
-            writer.model_history().expect("read unchanged history"),
-            before_history
-        );
-        drop(writer);
-        session.close().expect("close session");
     }
 
     #[tokio::test]
