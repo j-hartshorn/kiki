@@ -3378,33 +3378,48 @@ fn validate_compaction_entry(
     let boundary_id = i64::try_from(first_retained.0).map_err(|_| ())?;
     let mut ancestor_id = entry.parent_id;
     let mut visited = BTreeSet::new();
+    let mut boundary = None;
+    let mut previous_boundary_id = None;
     while let Some(id) = ancestor_id {
         if !visited.insert(id) {
             return Err(());
         }
-        let boundary = entries
+        let ancestor = entries
             .iter()
             .copied()
             .find(|candidate| candidate.id == id)
             .ok_or(())?;
-        if boundary.id == boundary_id {
-            return (boundary.revision < entry.revision && context_bearing_payload(boundary))
-                .then_some(())
-                .ok_or(());
+        if ancestor.id == boundary_id {
+            boundary = Some(ancestor);
         }
-        if boundary.kind == "compaction" {
+        if previous_boundary_id.is_none() && ancestor.kind == "compaction" {
             let decoded =
-                codec::decode_entry(boundary.kind, boundary.payload_json).map_err(|_| ())?;
-            if matches!(
-                codec::decoded_compaction(&decoded),
-                Some(CompactionOutcome::Applied { .. })
-            ) {
-                return Err(());
+                codec::decode_entry(ancestor.kind, ancestor.payload_json).map_err(|_| ())?;
+            if let Some(CompactionOutcome::Applied { first_retained, .. }) =
+                codec::decoded_compaction(&decoded)
+            {
+                previous_boundary_id = Some(i64::try_from(first_retained.0).map_err(|_| ())?);
             }
         }
-        ancestor_id = boundary.parent_id;
+        ancestor_id = ancestor.parent_id;
     }
-    Err(())
+    let boundary = boundary.ok_or(())?;
+    if boundary.revision >= entry.revision || !context_bearing_payload(boundary) {
+        return Err(());
+    }
+    let Some(previous_boundary_id) = previous_boundary_id else {
+        return Ok(());
+    };
+    let previous_boundary = entries
+        .iter()
+        .copied()
+        .find(|candidate| candidate.id == previous_boundary_id)
+        .ok_or(())?;
+    (visited.contains(&previous_boundary_id)
+        && previous_boundary.revision < boundary.revision
+        && context_bearing_payload(previous_boundary))
+    .then_some(())
+    .ok_or(())
 }
 
 fn context_bearing_payload(entry: EntryPayload<'_>) -> bool {
@@ -10785,6 +10800,103 @@ mod tests {
         assert!(writer.catalogue().await.is_err());
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn repeated_compaction_boundary_within_previous_tail_survives_restart() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        for request in ["request1", "request2", "request3", "request4"] {
+            append_cancelled_request(&writer, request).await;
+        }
+        let first_preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare first compaction")
+            .expect("prepare first compactable history");
+        let first_retained = first_preparation.planner.first_retained();
+        let first = writer
+            .settle_compaction(
+                first_preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "first summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle first compaction");
+        append_cancelled_request(&writer, "request5").await;
+        let second_preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare second compaction")
+            .expect("prepare second compactable history");
+        let second_retained = second_preparation.planner.first_retained();
+        assert!(first_retained < second_retained);
+        assert!(second_retained < first.entry_id);
+        let second = writer
+            .settle_compaction(
+                second_preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "second summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle second compaction");
+
+        assert_eq!(
+            writer.catalogue().await.expect("catalogue").active_entry,
+            second.entry_id
+        );
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session before restart");
+
+        let reopened = Session::open(home.path(), &id).expect("reopen compacted session");
+        let restore = reopened.restore().expect("restore repeated compaction");
+        let history = restore
+            .executable
+            .expect("repeated compaction remains executable")
+            .history;
+        assert_eq!(
+            history.entries(),
+            [
+                crate::model::ModelContextEntry::CompactionSummary {
+                    summary: "second summary".to_owned(),
+                },
+                crate::model::ModelContextEntry::UserRequest {
+                    text: "request4".to_owned(),
+                },
+                crate::model::ModelContextEntry::UserRequest {
+                    text: "request5".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(restore.effective_entry, second.entry_id);
+        assert_eq!(
+            reopened
+                .writer()
+                .catalogue()
+                .await
+                .expect("reopened catalogue")
+                .active_entry,
+            second.entry_id
+        );
+        reopened.close().expect("close reopened session");
     }
 
     #[tokio::test]
