@@ -775,6 +775,15 @@ impl AcceptedThinking {
             .expect("accepted thinking values must be supported by their models")
     }
 
+    fn allows_model(&self, model: &'static ModelConfiguration) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .persisted
+            .favourites()
+            .is_none_or(|models| models.contains(&model))
+    }
+
     #[cfg(test)]
     pub(crate) fn persisted_settings(&self) -> SettingsContext {
         self.0
@@ -789,13 +798,14 @@ impl AcceptedThinking {
         invoking: ModelSelection,
         target: Option<&'static ModelConfiguration>,
     ) -> ModelSelection {
-        let Some(target) = target else {
-            return invoking;
-        };
         let state = self
             .0
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = target.or_else(|| state.persisted.favourites().map(|models| models[0]));
+        let Some(target) = target else {
+            return invoking;
+        };
         let thinking = state
             .values
             .get(target.id)
@@ -893,6 +903,14 @@ impl TrustedExecutionContext {
         let accepted_thinking = self.accepted_thinking.as_ref().ok_or_else(|| {
             ToolError::runtime("subagent invocation context is unavailable for this execution")
         })?;
+        if let Some(target) = target
+            && !accepted_thinking.allows_model(target)
+        {
+            return Err(ToolError::value(format!(
+                "subagent model `{}` is not a favourite",
+                target.id
+            )));
+        }
         Ok(accepted_thinking.resolve(invoking, target))
     }
 
@@ -3893,6 +3911,88 @@ mod tests {
     use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolHost, ToolValue};
+
+    #[tokio::test]
+    async fn favourites_set_subagent_default_and_reject_unlisted_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".kiki")).unwrap();
+        std::fs::write(home.path().join(".kiki/config.toml"), "favourites = [\"openai/gpt-6-luna\", \"openai/gpt-6-sol\"]\n[thinking]\n\"openai/gpt-6-sol\" = \"high\"\n").unwrap();
+        let settings = crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        );
+        let invoking = ModelSelection::new(&crate::config::models::TERRA, "low").unwrap();
+        let accepted = super::AcceptedThinking::new(invoking, settings.settings().clone(), None);
+        assert_eq!(
+            accepted.resolve(invoking, None).model().id,
+            "openai/gpt-6-luna"
+        );
+        assert_eq!(
+            accepted
+                .resolve(invoking, Some(&crate::config::models::GPT6_SOL))
+                .thinking(),
+            "high"
+        );
+        assert!(!accepted.allows_model(&crate::config::models::TERRA));
+        assert!(!accepted.allows_model(&crate::config::models::SOL));
+        assert!(accepted.allows_model(&crate::config::models::GPT6_SOL));
+
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let coordinator: super::SessionSubagents = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "base".to_owned(),
+                ScriptedChildFactory::new([]),
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        let context = super::AgentInvocationContext::new(caller, coordinator)
+            .with_accepted_thinking(accepted)
+            .execution(
+                arena.child_source(),
+                Some(invoking),
+                arena.checkpoint(),
+                CancellationToken::new(),
+            );
+        assert_eq!(
+            context.resolve_selection(None).unwrap().model().id,
+            "openai/gpt-6-luna"
+        );
+        assert_eq!(
+            context
+                .resolve_selection(Some("openai/gpt-6-sol"))
+                .unwrap()
+                .thinking(),
+            "high"
+        );
+        assert!(
+            context
+                .resolve_selection(Some(crate::config::models::TERRA.id))
+                .is_err()
+        );
+        assert!(context.resolve_selection(Some("openai/unknown")).is_err());
+    }
+
+    #[test]
+    fn absent_favourites_keep_existing_subagent_selection() {
+        let settings = crate::config::ready_snapshot_for_test();
+        let invoking = ModelSelection::new(&crate::config::models::TERRA, "low").unwrap();
+        let accepted = super::AcceptedThinking::new(invoking, settings.settings().clone(), None);
+        assert_eq!(accepted.resolve(invoking, None), invoking);
+        assert_eq!(
+            accepted
+                .resolve(invoking, Some(&crate::config::models::SOL))
+                .model()
+                .id,
+            crate::config::models::SOL.id
+        );
+    }
 
     fn worker_path() -> PathBuf {
         env::var_os("MONTY_BIN")
