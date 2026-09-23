@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,12 +131,26 @@ impl PythonError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Execution {
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) outcome: ExecutionOutcome,
     pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) modified_paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for Execution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Execution")
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("outcome", &self.outcome)
+            .field("tool_calls", &self.tool_calls)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +277,8 @@ impl ToolCallToken {
 #[derive(Debug, Default)]
 struct ToolTraceState {
     calls: Vec<ToolCall>,
+    read_paths: BTreeSet<PathBuf>,
+    modified_paths: BTreeSet<PathBuf>,
 }
 
 impl ToolTraceState {
@@ -298,22 +315,44 @@ impl ToolTraceState {
             .clone()
     }
 
+    fn record_observed_file_operation(&mut self, result: &ToolResult) {
+        result.record_observed_file_operation(&mut self.read_paths, &mut self.modified_paths);
+    }
+
     #[cfg(test)]
     fn calls(&self) -> &[ToolCall] {
         &self.calls
     }
 
-    fn into_calls(self) -> Vec<ToolCall> {
-        self.calls
+    fn into_parts(self) -> (Vec<ToolCall>, Vec<PathBuf>, Vec<PathBuf>) {
+        (
+            self.calls,
+            self.read_paths.into_iter().collect(),
+            self.modified_paths.into_iter().collect(),
+        )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InterruptedExecution {
     pub(crate) began: bool,
     pub(crate) stdout: Observation,
     pub(crate) stderr: Observation,
     pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) modified_paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for InterruptedExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InterruptedExecution")
+            .field("began", &self.began)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("tool_calls", &self.tool_calls)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -430,11 +469,14 @@ impl InterruptedExecutionState {
             began,
         } = self;
         streams.flush_stdout(now, progress);
+        let (tool_calls, read_paths, modified_paths) = tools.into_parts();
         InterruptedExecution {
             began,
             stdout: streams.stdout.finish(),
             stderr: streams.stderr.finish(),
-            tool_calls: tools.into_calls(),
+            tool_calls,
+            read_paths,
+            modified_paths,
         }
     }
 }
@@ -1010,11 +1052,14 @@ impl Arena {
                     state,
                     authorisations,
                 };
+                let (tool_calls, read_paths, modified_paths) = interruption.tools.into_parts();
                 Ok(Execution {
                     stdout: interruption.streams.stdout.finish(),
                     stderr: interruption.streams.stderr.finish(),
                     outcome,
-                    tool_calls: interruption.tools.into_calls(),
+                    tool_calls,
+                    read_paths,
+                    modified_paths,
                 })
             }
             Err(failure) => {
@@ -1890,11 +1935,12 @@ async fn drive(
                             .remove(&call_id)
                             .expect("a host result must retain an admitted call mode");
                         let summary = tool_summary(tool, &result);
+                        let call = tools.settle(token, summary);
+                        tools.record_observed_file_operation(&result);
                         assert!(
                             results.insert(call_id, result).is_none(),
                             "a host tool call must settle once"
                         );
-                        let call = tools.settle(token, summary);
                         run_previews.remove(&call_id);
                         #[cfg(test)]
                         match budget
@@ -7741,8 +7787,14 @@ mod tests {
                 .count(),
             1
         );
+        assert!(execution.read_paths.is_empty());
+        assert_eq!(
+            execution.modified_paths,
+            [PathBuf::from("created-on-cancel")]
+        );
         assert!(!format!("{execution:?}").contains("created-on-cancel"));
-        assert!(!format!("{execution:?}").contains("still-pending"));
+        assert!(!format!("{:?}", execution.tool_calls).contains("created-on-cancel"));
+        assert!(!format!("{:?}", execution.tool_calls).contains("still-pending"));
         assert!(!has_authorisation(&arena, "created-on-cancel"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("created-on-cancel")).unwrap(),
@@ -7901,6 +7953,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_retains_normalised_file_operations_without_exposing_paths_in_tool_calls() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("nested/read-only"), "read").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "await write('./nested//mutated', 'before')\nawait read('nested/./read-only')\nawait read('./nested//mutated')\nawait edit('nested/mutated', 'before', 'after')\nawait write('nested/./second', 'second')",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.read_paths,
+            vec![
+                PathBuf::from("nested/mutated"),
+                PathBuf::from("nested/read-only"),
+            ]
+        );
+        assert_eq!(
+            execution.modified_paths,
+            vec![
+                PathBuf::from("nested/mutated"),
+                PathBuf::from("nested/second"),
+            ]
+        );
+        assert!(!format!("{execution:?}").contains("nested/mutated"));
+        assert!(!format!("{:?}", execution.tool_calls).contains("nested/mutated"));
+    }
+
+    #[tokio::test]
+    async fn file_operations_survive_python_errors_and_settled_cancellation() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("settled"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        let execution = execute_without_cancellation(
+            &mut arena,
+            "value = 'committed'\nawait read('./settled')\nawait write('written', 'contents')\nraise RuntimeError('expected')",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::PythonError(_)
+        ));
+        assert_eq!(execution.read_paths, [PathBuf::from("settled")]);
+        assert_eq!(execution.modified_paths, [PathBuf::from("written")]);
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .expect("committed Python state")
+            .head,
+            "'committed'"
+        );
+
+        let (mut arena, gate) = arena_with_read_gate(&workspace).await;
+        execute_without_cancellation(&mut arena, "value = 'before'")
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut execution =
+            Box::pin(arena.execute("value = 'discarded'\nawait read('settled')", &cancellation));
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before its read started: {result:?}"),
+        }
+        gate.resume_read();
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before its read settled: {result:?}"),
+        }
+        cancellation.cancel();
+        let ArenaError::Cancelled { execution } = execution.await.unwrap_err() else {
+            panic!("expected interrupted cancellation");
+        };
+        assert_eq!(execution.read_paths, [PathBuf::from("settled")]);
+        assert!(execution.modified_paths.is_empty());
+        assert_eq!(
+            complete(
+                &execute_without_cancellation(&mut arena, "value")
+                    .await
+                    .unwrap()
+            )
+            .expect("restored Python state")
+            .head,
+            "'before'"
+        );
+    }
+
+    #[tokio::test]
     async fn read_call_trace_keeps_ordered_successes_and_failures() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("lines"), "one\ntwo\n").unwrap();
@@ -7926,6 +8073,8 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(execution.read_paths, [PathBuf::from("lines")]);
+        assert!(execution.modified_paths.is_empty());
     }
 
     #[tokio::test]
@@ -7952,6 +8101,8 @@ mod tests {
                 summary: ToolCallSummary::Pending,
             }]
         );
+        assert!(execution.read_paths.is_empty());
+        assert!(execution.modified_paths.is_empty());
     }
 
     #[tokio::test]
@@ -8065,6 +8216,8 @@ mod tests {
                 summary: ToolCallSummary::Count(5),
             }]
         );
+        assert_eq!(execution.read_paths, [PathBuf::from("settled")]);
+        assert!(execution.modified_paths.is_empty());
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod arena;
 mod clipboard;
+mod compaction;
 pub mod config;
 mod highlight;
 pub mod model;

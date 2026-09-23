@@ -9,6 +9,10 @@ use crate::tools::prompt_reference;
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
 const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
+const COMPACTION_SYSTEM_PROMPT: &str = include_str!("../prompts/compaction-system.md");
+const COMPACTION_INITIAL_PROMPT: &str = include_str!("../prompts/compaction-initial.md");
+const COMPACTION_UPDATE_PROMPT: &str = include_str!("../prompts/compaction-update.md");
+const COMPACTION_SPLIT_RUN_PROMPT: &str = include_str!("../prompts/compaction-split-run.md");
 const BUNDLED_PROMPT_NAME: &str = "system";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
 
@@ -44,6 +48,28 @@ pub(crate) fn root_prompt(base: &str) -> String {
 
 pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
     assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
+}
+
+pub(crate) fn compaction_system_prompt() -> &'static str {
+    strip_file_final_lf(COMPACTION_SYSTEM_PROMPT)
+}
+
+pub(crate) fn compaction_initial_prompt() -> &'static str {
+    strip_file_final_lf(COMPACTION_INITIAL_PROMPT)
+}
+
+pub(crate) fn compaction_update_prompt() -> &'static str {
+    strip_file_final_lf(COMPACTION_UPDATE_PROMPT)
+}
+
+pub(crate) fn compaction_split_run_prompt() -> &'static str {
+    strip_file_final_lf(COMPACTION_SPLIT_RUN_PROMPT)
+}
+
+fn strip_file_final_lf(prompt: &str) -> &str {
+    prompt
+        .strip_suffix('\n')
+        .expect("bundled compaction prompts end in a line feed")
 }
 
 fn assemble(base: &str, tool_reference: String) -> String {
@@ -149,6 +175,56 @@ mod tests {
             "a, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))",
         ] {
             assert!(reference.contains(guidance), "missing `{guidance}`");
+        }
+    }
+
+    #[test]
+    fn compaction_resources_contain_the_required_arena_section() {
+        const ARENA_SECTION: &str = "## Arena State\n- `<name>` (`<latest known type>`) — <purpose and useful contents>\n- Include useful persistent variables, functions, classes, and datasets.\n- Mark uncertain availability or type as unverified.\n- Do not claim this is a complete live-variable inventory.\n- State \"(none identified)\" if no useful Arena state is evidenced.";
+
+        let resources = [
+            (
+                super::COMPACTION_SYSTEM_PROMPT,
+                super::compaction_system_prompt(),
+            ),
+            (
+                super::COMPACTION_INITIAL_PROMPT,
+                super::compaction_initial_prompt(),
+            ),
+            (
+                super::COMPACTION_UPDATE_PROMPT,
+                super::compaction_update_prompt(),
+            ),
+            (
+                super::COMPACTION_SPLIT_RUN_PROMPT,
+                super::compaction_split_run_prompt(),
+            ),
+        ];
+
+        for (resource, prompt) in resources {
+            assert!(resource.ends_with('\n'));
+            assert_eq!(prompt, resource.strip_suffix('\n').unwrap());
+            assert!(!prompt.ends_with('\n'));
+            assert!(prompt.len() > 200);
+            assert!(!include_str!("prompt.rs").contains(prompt));
+        }
+        assert!(super::compaction_system_prompt().contains("context summarization assistant"));
+        assert!(super::compaction_initial_prompt().contains("## Critical Context"));
+        assert!(
+            super::compaction_update_prompt().contains("Update the existing structured summary")
+        );
+        assert!(super::compaction_split_run_prompt().contains("## Original Request"));
+        assert_eq!(
+            super::strip_file_final_lf("\n  prompt  \n\n"),
+            "\n  prompt  \n"
+        );
+        assert!(!super::compaction_system_prompt().contains(ARENA_SECTION));
+        for prompt in [
+            super::compaction_initial_prompt(),
+            super::compaction_update_prompt(),
+            super::compaction_split_run_prompt(),
+        ] {
+            assert_eq!(prompt.matches(ARENA_SECTION).count(), 1);
         }
     }
 

@@ -51,8 +51,8 @@ const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
 const TREE_BUSY_NOTICE: &str = "Session tree is unavailable while work is active.";
 const TREE_READ_ONLY_NOTICE: &str = "Session tree is unavailable while the session is read-only.";
 const SESSION_RESTORE_FAILED_NOTICE: &str = "Session could not be restored.";
-const GENERATION_THROBBER_ROWS: u16 = 2;
-const GENERATION_THROBBER_LEFT_PADDING: u16 = 1;
+const THROBBER_ROWS: u16 = 2;
+const THROBBER_LEFT_PADDING: u16 = 1;
 
 rattles::rattle!(
     GenerationThrobber,
@@ -61,6 +61,23 @@ rattles::rattle!(
     50,
     [
         "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠"
+    ]
+);
+
+rattles::rattle!(
+    CompactionThrobber,
+    compaction_throbber,
+    9,
+    50,
+    [
+        "·       ·",
+        "●·     ·●",
+        "·●·   ·●·",
+        " ·●· ·●· ",
+        "  ·●·●·  ",
+        "   ·●·   ",
+        "    ·    ",
+        "         "
     ]
 );
 
@@ -180,6 +197,8 @@ struct App {
     transcript: Transcript,
     subagent_monitor: subagents::SubagentMonitor,
     foreground_cancellation_requested: bool,
+    compaction_cancellation_requested: bool,
+    compact_acknowledgement_pending: bool,
     settled_escape_at: Option<Instant>,
     submission_at: Option<Instant>,
     correction_pending: bool,
@@ -195,7 +214,8 @@ struct App {
     pending_copy_text: Option<String>,
     notice: Option<Notice>,
     flash: Option<Flash>,
-    throbber: TickedRattler<GenerationThrobber>,
+    generation_throbber: TickedRattler<GenerationThrobber>,
+    compaction_throbber: TickedRattler<CompactionThrobber>,
     throbber_next_tick: Option<Instant>,
     settings: Option<SettingsContext>,
     workspace_root: Option<String>,
@@ -227,6 +247,8 @@ impl Default for App {
             transcript: Transcript::default(),
             subagent_monitor: subagents::SubagentMonitor::default(),
             foreground_cancellation_requested: false,
+            compaction_cancellation_requested: false,
+            compact_acknowledgement_pending: false,
             settled_escape_at: None,
             submission_at: None,
             correction_pending: false,
@@ -242,7 +264,8 @@ impl Default for App {
             pending_copy_text: None,
             notice: None,
             flash: None,
-            throbber: generation_throbber().into_ticked(),
+            generation_throbber: generation_throbber().into_ticked(),
+            compaction_throbber: compaction_throbber().into_ticked(),
             throbber_next_tick: None,
             settings: None,
             workspace_root: None,
@@ -300,6 +323,8 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::CompactionAcknowledged { .. }
+        | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. }
         | RuntimeEvent::SubagentSpawned { .. }
@@ -437,6 +462,7 @@ impl App {
             false
         };
         let prompt_changed = if self.is_submission_disabled()
+            || self.compact_acknowledgement_pending
             || self.picker.is_some()
             || self.tree_navigator.is_some()
         {
@@ -461,6 +487,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.handle_picker_key(key);
+        }
+        if self.compact_acknowledgement_pending && matches!(key.code, KeyCode::Char('c' | 'C')) {
+            return Update::default();
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -526,6 +555,20 @@ impl App {
             if self.is_configuration_only() {
                 return Update::default();
             }
+            if self.compact_acknowledgement_pending && !self.compaction_cancellation_requested {
+                self.foreground_cancellation_requested = true;
+                self.compaction_cancellation_requested = true;
+                return Update::with_commands([RuntimeCommand::Cancel { correction: false }]);
+            }
+            if !self.transcript.is_disabled()
+                && !self.transcript.is_idle()
+                && self.transcript.has_foreground_compaction()
+                && !self.compaction_cancellation_requested
+            {
+                self.foreground_cancellation_requested = true;
+                self.compaction_cancellation_requested = true;
+                return Update::with_commands([RuntimeCommand::Cancel { correction: false }]);
+            }
             if !self.transcript.is_disabled()
                 && !self.transcript.is_idle()
                 && !self.foreground_cancellation_requested
@@ -555,6 +598,14 @@ impl App {
         }
         if is_shift_tab(key) {
             return self.cycle_thinking_preview(now);
+        }
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && let Some(focus) = slash::parse(self.prompt.text()).and_then(|command| {
+                (command.action == slash::Action::Compact).then(|| command.argument.to_owned())
+            })
+        {
+            return self.dispatch_compact(&focus);
         }
         if (self.manual_navigation_pending || self.correction_pending)
             && key.code == KeyCode::Enter
@@ -592,7 +643,9 @@ impl App {
                 quit: false,
             };
         }
-        if let Some(edit) = self.prompt_edit(key) {
+        if !self.compact_acknowledgement_pending
+            && let Some(edit) = self.prompt_edit(key)
+        {
             let prompt_changed = self.prompt.apply(edit, self.prompt_width);
             return Update {
                 commands: Vec::new(),
@@ -655,8 +708,31 @@ impl App {
             .sync(self.prompt.text(), self.prompt.caret_at_end())
     }
 
+    fn dispatch_compact(&mut self, focus: &str) -> Update {
+        if self.compact_acknowledgement_pending {
+            return Update::default();
+        }
+        if self.manual_navigation_pending {
+            self.set_notice("Session restoration is still in progress.".to_owned());
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
+        }
+        self.compact_acknowledgement_pending = true;
+        let mut update = Update::with_commands([RuntimeCommand::Compact {
+            focus: focus.to_owned(),
+        }]);
+        update.visible_changed = true;
+        update
+    }
+
     fn handle_slash_command(&mut self, command: slash::Parsed<'_>) -> Update {
         match command.action {
+            slash::Action::Compact => {
+                unreachable!("compact dispatch is handled before editor consumption")
+            }
             slash::Action::Model => {
                 let argument = command.argument;
                 if let Some(model) = CATALOGUE
@@ -1120,12 +1196,21 @@ impl App {
         if now < next_tick {
             return false;
         }
-        self.throbber.tick();
-        let scheduled = next_tick + self.throbber.interval();
+        let interval = if self.transcript.is_generating() {
+            self.generation_throbber.tick();
+            self.generation_throbber.interval()
+        } else if self.transcript.is_compacting() {
+            self.compaction_throbber.tick();
+            self.compaction_throbber.interval()
+        } else {
+            self.throbber_next_tick = None;
+            return false;
+        };
+        let scheduled = next_tick + interval;
         self.throbber_next_tick = Some(if scheduled > now {
             scheduled
         } else {
-            now + self.throbber.interval()
+            now + interval
         });
         true
     }
@@ -1402,6 +1487,21 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
+        let compact_draft_changed = if self.compact_acknowledgement_pending
+            && let RuntimeEvent::CompactionAcknowledged { acknowledgement } = &event
+        {
+            self.compact_acknowledgement_pending = false;
+            if matches!(
+                acknowledgement,
+                crate::runtime::CompactionAcknowledgement::Accepted
+            ) {
+                self.prompt.take();
+                self.refresh_completion();
+            }
+            true
+        } else {
+            false
+        };
         if let RuntimeEvent::RecordAppended { record, .. } = &event
             && self.correction_pending
             && matches!(&record.record, crate::runtime::Record::CancelledRun { .. })
@@ -1410,6 +1510,7 @@ impl App {
         }
         if let RuntimeEvent::RunSettled { run_id } = &event {
             self.foreground_cancellation_requested = false;
+            self.compaction_cancellation_requested = false;
             self.submission_at = None;
             if self.correction_pending
                 && self
@@ -1422,13 +1523,47 @@ impl App {
         }
         if matches!(
             &event,
-            RuntimeEvent::SubmissionRejectedBusy { .. }
-                | RuntimeEvent::SubmissionRejectedDisabled { .. }
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: Some(_),
+            } | RuntimeEvent::SubmissionRejectedDisabled { .. }
                 | RuntimeEvent::RuntimeDisabled { .. }
+                | RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: crate::runtime::CompactionAcknowledgement::Disabled { .. }
+                }
         ) {
+            self.compaction_cancellation_requested = false;
             self.submission_at = None;
             self.correction_pending = false;
             self.correction_run_id = None;
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            }
+        ) {
+            self.submission_at = None;
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: crate::runtime::CompactionLifecycle::NoOp
+            }
+        ) {
+            self.set_notice("Nothing to compact.".to_owned());
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: crate::runtime::CompactionLifecycle::NoOp
+                    | crate::runtime::CompactionLifecycle::Settled(_),
+            }
+        ) {
+            self.compaction_cancellation_requested = false;
+            if !self.transcript.has_active_run() {
+                self.foreground_cancellation_requested = false;
+                self.submission_at = None;
+            }
         }
         if let RuntimeEvent::CorrectionCompleted { run_id, outcome } = &event
             && self.correction_pending
@@ -1450,19 +1585,24 @@ impl App {
             _ => false,
         };
         let was_generating = self.transcript.is_generating();
+        let was_compacting = self.transcript.is_compacting();
         let monitor_changed = self.subagent_monitor.apply(&event, now);
         let transcript_changed = self.transcript.apply(event, gap_before);
         let is_generating = self.transcript.is_generating();
+        let is_compacting = self.transcript.is_compacting();
         if !was_generating && is_generating {
-            self.throbber.reset();
-            self.throbber_next_tick = Some(now + self.throbber.interval());
-        } else if was_generating && !is_generating {
+            self.generation_throbber.reset();
+            self.throbber_next_tick = Some(now + self.generation_throbber.interval());
+        } else if !was_compacting && is_compacting {
+            self.compaction_throbber.reset();
+            self.throbber_next_tick = Some(now + self.compaction_throbber.interval());
+        } else if (was_generating || was_compacting) && !is_generating && !is_compacting {
             self.throbber_next_tick = None;
         }
         if transcript_changed {
             self.invalidate_layout_selection();
         }
-        metadata_changed || monitor_changed || transcript_changed
+        compact_draft_changed || metadata_changed || monitor_changed || transcript_changed
     }
 
     fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
@@ -2261,12 +2401,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         .height
         .saturating_sub(1)
         .saturating_sub(prompt_box_height);
-    let throbber_height = if !app.transcript.is_generating() || history_height < 2 {
+    let throbber_active = app.transcript.is_generating() || app.transcript.is_compacting();
+    let throbber_height = if !throbber_active || history_height < 2 {
         0
-    } else if history_height == GENERATION_THROBBER_ROWS {
+    } else if history_height == THROBBER_ROWS {
         1
     } else {
-        GENERATION_THROBBER_ROWS
+        THROBBER_ROWS
     };
     let monitor = app.subagent_monitor.layout(
         area.width,
@@ -2295,15 +2436,20 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
     if throbber_height > 0 {
+        let throbber_frame = if app.transcript.is_generating() {
+            app.generation_throbber.current_frame()
+        } else {
+            app.compaction_throbber.current_frame()
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                app.throbber.current_frame(),
+                throbber_frame,
                 Style::new().add_modifier(Modifier::BOLD),
             )),
             Rect::new(
-                area.x.saturating_add(GENERATION_THROBBER_LEFT_PADDING),
+                area.x.saturating_add(THROBBER_LEFT_PADDING),
                 prompt_top.saturating_sub(1),
-                area.width.saturating_sub(GENERATION_THROBBER_LEFT_PADDING),
+                area.width.saturating_sub(THROBBER_LEFT_PADDING),
                 1,
             ),
         );
@@ -2319,7 +2465,10 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         &prompt,
         content,
-        !app.is_submission_disabled() && app.picker.is_none() && app.tree_navigator.is_none(),
+        !app.is_submission_disabled()
+            && !app.compact_acknowledgement_pending
+            && app.picker.is_none()
+            && app.tree_navigator.is_none(),
         slash::recognised_token_range(app.prompt.text()),
     );
     frame.render_widget(
@@ -2577,7 +2726,8 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::{
-        App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, generation_throbber,
+        App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, compaction_throbber,
+        generation_throbber,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -2590,9 +2740,10 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
     use crate::runtime::{
-        CorrectionOutcome, ModelStepId, NavigationOutcome, ProgressEnvelope, Record,
-        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeDisabledReason, RuntimeEvent,
-        RuntimeInitialState, StoredRecord, TerminalDetails, TreeRequestOutcome,
+        CompactionAcknowledgement, CompactionLifecycle, CompactionSettlement, CorrectionOutcome,
+        ModelStepId, NavigationOutcome, ProgressEnvelope, Record, RestoredTimelineItem, RunId,
+        RuntimeCommand, RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState, StoredRecord,
+        TerminalDetails, TreeRequestOutcome,
     };
     use crate::session::{
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
@@ -2660,6 +2811,8 @@ mod tests {
                 stderr: observation(""),
                 outcome: ExecutionOutcome::Complete { result: None },
                 tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
             }),
         }
     }
@@ -3033,6 +3186,8 @@ mod tests {
                                     result: Some(observation("42")),
                                 },
                                 tool_calls: Vec::new(),
+                                read_paths: Vec::new(),
+                                modified_paths: Vec::new(),
                             },
                             attempts: Vec::new(),
                         },
@@ -3753,29 +3908,42 @@ mod tests {
     #[test]
     fn slash_completion_lists_catalogue_in_order_and_clamps_keyboard_selection() {
         let mut app = app_with_prompt("/");
-        let initial = rendered_buffer(&mut app, 40, 8);
+        let initial = rendered_buffer(&mut app, 40, 10);
         let overlay = app.slash_overlay.expect("slash overlay");
+        let (compact_column, compact_row) = cell_start(&initial, "/compact");
         let (model_column, model_row) = cell_start(&initial, "/model");
         let (name_column, name_row) = cell_start(&initial, "/name");
         let (thinking_column, thinking_row) = cell_start(&initial, "/thinking");
         let (tree_column, tree_row) = cell_start(&initial, "/tree");
 
-        assert_eq!(model_column, overlay.x);
-        assert!(model_row < name_row && name_row < thinking_row && thinking_row < tree_row);
+        assert_eq!(compact_column, overlay.x);
         assert!(
-            initial[(model_column, model_row)]
+            compact_row < model_row
+                && model_row < name_row
+                && name_row < thinking_row
+                && thinking_row < tree_row
+        );
+        assert!(
+            initial[(compact_column, compact_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        let name = rendered_buffer(&mut app, 40, 8);
+        let model = rendered_buffer(&mut app, 40, 10);
+        assert!(
+            model[(model_column, model_row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
+        let name = rendered_buffer(&mut app, 40, 10);
         assert!(
             name[(name_column, name_row)]
                 .modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
         assert!(app.handle_key(key(KeyCode::Down)).visible_changed);
-        let thinking = rendered_buffer(&mut app, 40, 8);
+        let thinking = rendered_buffer(&mut app, 40, 10);
         assert!(
             thinking[(thinking_column, thinking_row)]
                 .modifier
@@ -3787,7 +3955,7 @@ mod tests {
             !app.handle_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL))
                 .visible_changed
         );
-        let tree = rendered_buffer(&mut app, 40, 8);
+        let tree = rendered_buffer(&mut app, 40, 10);
         assert!(
             tree[(tree_column, tree_row)]
                 .modifier
@@ -3937,6 +4105,7 @@ mod tests {
         assert_eq!(tiny.slash_overlay.expect("tiny overlay").height, 1);
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
+        assert!(tiny.handle_key(key(KeyCode::Down)).visible_changed);
         let buffer = rendered_buffer(&mut tiny, 5, 5);
         let (column, row) = cell_start(&buffer, "/thin");
         assert!(
@@ -3952,7 +4121,7 @@ mod tests {
     #[test]
     fn slash_overlay_stays_above_prompt_over_visible_subagent_monitor() {
         let now = Instant::now();
-        for (height, last_suggestion) in [(12, "/tree"), (6, "/name")] {
+        for (height, last_suggestion) in [(12, "/model"), (6, "/model")] {
             let mut plain = app_with_history(App::default());
             plain
                 .subagent_monitor
@@ -3960,7 +4129,7 @@ mod tests {
             plain
                 .subagent_monitor
                 .insert_for_test("child2", TaskState::Completed, now);
-            let mut completed = app_with_history(app_with_prompt("/"));
+            let mut completed = app_with_history(app_with_prompt("/m"));
             completed
                 .subagent_monitor
                 .insert_for_test("child1", TaskState::Completed, now);
@@ -6808,6 +6977,359 @@ mod tests {
     }
 
     #[test]
+    fn compact_dispatch_waits_for_acknowledgement_to_consume_its_draft() {
+        let draft = "/compact  keep the current focus  ";
+        let mut app = app_with_prompt(draft);
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "keep the current focus".to_owned(),
+            }]
+        );
+        assert_eq!(app.prompt.text(), draft);
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(!app.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert!(!app.handle_paste(" changed").visible_changed);
+        assert!(
+            !app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .visible_changed
+        );
+        assert_eq!(app.prompt.text(), draft);
+
+        assert!(app.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        }));
+        assert!(app.prompt.is_empty());
+
+        type_prompt(&mut app, "later draft");
+        app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Started,
+        });
+        app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
+        });
+        assert_eq!(app.prompt.text(), "later draft");
+    }
+
+    #[test]
+    fn compact_noop_reports_a_notice_without_a_card() {
+        let mut app = app_with_prompt("/compact");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::NoOp,
+        }));
+        assert_eq!(app.notice(), Some("Nothing to compact."));
+        let screen = rendered(&mut app, 120, 24);
+        assert!(screen.contains("Nothing to compact."), "{screen}");
+        assert!(!screen.contains("Compaction ·"), "{screen}");
+    }
+
+    #[test]
+    fn compact_busy_and_disabled_acknowledgements_retain_the_draft() {
+        let busy_draft = "/compact  retain 🦀  ";
+        let mut busy = app_with_prompt(busy_draft);
+        assert_eq!(
+            busy.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "retain 🦀".to_owned(),
+            }]
+        );
+        assert!(busy.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Busy,
+        }));
+        assert_eq!(busy.prompt.text(), busy_draft);
+        assert!(busy.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert_eq!(busy.prompt.text(), format!("{busy_draft}x"));
+
+        let mut active = app_with_prompt("/compact first");
+        active.handle_key(key(KeyCode::Enter));
+        active.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+        let duplicate = "/compact second";
+        set_prompt(&mut active, duplicate);
+        assert_eq!(
+            active.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "second".to_owned(),
+            }]
+        );
+        assert!(active.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Busy,
+        }));
+        assert_eq!(active.prompt.text(), duplicate);
+
+        let disabled_draft = "/compact  preserve this  ";
+        let mut disabled = app_with_prompt(disabled_draft);
+        assert_eq!(
+            disabled.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "preserve this".to_owned(),
+            }]
+        );
+        assert!(disabled.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Disabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+        }));
+        assert_eq!(disabled.prompt.text(), disabled_draft);
+        assert!(!disabled.handle_key(key(KeyCode::Char('x'))).visible_changed);
+        assert_eq!(disabled.prompt.text(), disabled_draft);
+    }
+
+    #[test]
+    fn compact_dispatches_during_runs_and_corrections_but_not_navigation() {
+        let mut running = App::default();
+        running.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
+        set_prompt(&mut running, "/compact  retain the tail  ");
+        assert_eq!(
+            running.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "retain the tail".to_owned(),
+            }]
+        );
+        assert_eq!(running.prompt.text(), "/compact  retain the tail  ");
+
+        let mut correction = App {
+            correction_pending: true,
+            ..App::default()
+        };
+        set_prompt(&mut correction, "/compact use the restored leaf");
+        assert_eq!(
+            correction.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: "use the restored leaf".to_owned(),
+            }]
+        );
+
+        let draft = "/compact keep this draft";
+        let mut navigating = App {
+            manual_navigation_pending: true,
+            ..App::default()
+        };
+        set_prompt(&mut navigating, draft);
+        assert!(
+            navigating
+                .handle_key(key(KeyCode::Enter))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(navigating.prompt.text(), draft);
+        assert_eq!(
+            navigating.notice(),
+            Some("Session restoration is still in progress.")
+        );
+    }
+
+    #[test]
+    fn compact_rejection_without_dispatch_preserves_the_draft() {
+        let draft = "/compact  focus  ";
+        let mut configuration = App::configuration(crate::config::ready_snapshot_for_test());
+        set_prompt(&mut configuration, draft);
+        assert!(
+            configuration
+                .handle_key(key(KeyCode::Enter))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(configuration.prompt.text(), draft);
+
+        let mut read_only = App::default();
+        read_only.handle_event(RuntimeEvent::RuntimeDisabled {
+            reason: RuntimeDisabledReason::SessionRestoreFailed,
+        });
+        set_prompt(&mut read_only, draft);
+        assert!(
+            read_only
+                .handle_key(key(KeyCode::Enter))
+                .commands
+                .is_empty()
+        );
+        assert_eq!(read_only.prompt.text(), draft);
+    }
+
+    #[test]
+    fn escape_cancels_pending_and_active_compaction_dispatched_from_the_prompt() {
+        let mut unacknowledged = app_with_prompt("/compact");
+        assert_eq!(
+            unacknowledged.handle_key(key(KeyCode::Enter)).commands,
+            [RuntimeCommand::Compact {
+                focus: String::new(),
+            }]
+        );
+        assert_eq!(
+            unacknowledged.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        unacknowledged.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+        assert_eq!(
+            unacknowledged.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::CancelBackground]
+        );
+
+        let mut pending = app_with_prompt("/compact");
+        pending.handle_key(key(KeyCode::Enter));
+        pending.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+        assert_eq!(
+            pending.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+
+        let mut active = app_with_prompt("/compact retain state");
+        active.handle_key(key(KeyCode::Enter));
+        active.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        });
+        active.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Started,
+        });
+        assert_eq!(
+            active.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+    }
+
+    #[test]
+    fn cancelling_retained_compaction_does_not_create_a_correction() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "request", submitted_at);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, submitted_at);
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            submitted_at,
+        );
+
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert!(app.foreground_cancellation_requested);
+        assert!(!app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::CancelledBeforeStart),
+            },
+            submitted_at + Duration::from_millis(1),
+        );
+        assert!(app.foreground_cancellation_requested);
+        assert_eq!(app.submission_at, Some(submitted_at));
+        assert!(!app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::RunSettled { run_id: RunId(1) },
+            submitted_at + Duration::from_millis(2),
+        );
+        assert!(!app.foreground_cancellation_requested);
+        assert_eq!(app.submission_at, None);
+        assert!(!app.correction_pending);
+    }
+
+    #[test]
+    fn cancelling_retained_compaction_preserves_an_existing_correction() {
+        let submitted_at = Instant::now();
+        let mut app = App::default();
+        enter_at(&mut app, "request", submitted_at);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, submitted_at);
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(1))
+                .commands,
+            [RuntimeCommand::Cancel { correction: true }]
+        );
+        assert!(app.correction_pending);
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            submitted_at + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(2))
+                .commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert_eq!(
+            app.handle_key_at(key(KeyCode::Esc), submitted_at + Duration::from_millis(3))
+                .commands,
+            [RuntimeCommand::CancelBackground]
+        );
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::CancelledBeforeStart),
+            },
+            submitted_at + Duration::from_millis(2),
+        );
+        assert!(app.correction_pending);
+
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails::empty(),
+                    },
+                },
+                progress_gap: false,
+            },
+            submitted_at + Duration::from_millis(3),
+        );
+        assert!(app.handle_event_at(
+            RuntimeEvent::CorrectionCompleted {
+                run_id: RunId(1),
+                outcome: CorrectionOutcome::SkippedBackground,
+            },
+            submitted_at + Duration::from_millis(4),
+        ));
+        assert!(app.correction_pending);
+        app.handle_event_at(
+            RuntimeEvent::RunSettled { run_id: RunId(1) },
+            submitted_at + Duration::from_millis(5),
+        );
+        assert!(!app.correction_pending);
+    }
+
+    #[test]
+    fn active_compaction_accepts_cancel_but_not_submit() {
+        let mut app = App::default();
+        assert!(app.handle_event(RuntimeEvent::CompactionAcknowledged {
+            acknowledgement: CompactionAcknowledgement::Accepted,
+        }));
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Started,
+        }));
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::Cancel { correction: false }]
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)).commands,
+            [RuntimeCommand::CancelBackground]
+        );
+
+        assert!(app.handle_event(RuntimeEvent::CompactionLifecycle {
+            lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Cancelled),
+        }));
+        assert!(!app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+    }
+
+    #[test]
     fn ctrl_c_clears_a_prompt_then_shuts_down_when_it_is_empty() {
         for active in [false, true] {
             let mut app = app_with_prompt("draft");
@@ -6883,6 +7405,8 @@ mod tests {
                             summary: ToolCallSummary::Count(count),
                         })
                         .collect(),
+                    read_paths: Vec::new(),
+                    modified_paths: Vec::new(),
                 },
                 attempts: Vec::new(),
             },
@@ -8218,6 +8742,8 @@ mod tests {
                             result: Some(observation("42")),
                         },
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts,
                 },
@@ -8246,6 +8772,8 @@ mod tests {
                             omitted_bytes: 0,
                         }),
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: vec![],
                 },
@@ -8268,6 +8796,8 @@ mod tests {
                                 tool: ToolName::Read,
                                 summary: ToolCallSummary::Failed,
                             }],
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             failure: Some(ExecutionFailure::Arena {
                                 message: "interrupted".to_owned(),
                             }),
@@ -8525,7 +9055,7 @@ mod tests {
         );
         app.handle_event_at(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(1),
+                active_run_id: Some(RunId(1)),
             },
             now,
         );
@@ -9202,6 +9732,75 @@ mod tests {
                 "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠",
             ]
         );
+    }
+
+    #[test]
+    fn compaction_throbber_converges_and_disappears() {
+        let throbber = compaction_throbber();
+
+        assert_eq!((throbber.size().width, throbber.size().height), (9, 1));
+        assert_eq!(
+            (0..8)
+                .map(|index| throbber.frame(index))
+                .collect::<Vec<_>>(),
+            [
+                "·       ·",
+                "●·     ·●",
+                "·●·   ·●·",
+                " ·●· ·●· ",
+                "  ·●·●·  ",
+                "   ·●·   ",
+                "    ·    ",
+                "         ",
+            ]
+        );
+    }
+
+    #[test]
+    fn active_compaction_animates_the_convergence_throbber_above_the_prompt() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            now,
+        );
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            now,
+        );
+
+        let initial = rendered_at(&mut app, 20, 12, now);
+        let rows = initial.lines().collect::<Vec<_>>();
+        assert!(rows[8].starts_with(" ·       ·"), "{initial}");
+        assert_eq!(rows[9], "─".repeat(20));
+        assert_eq!(app.history_height, 6);
+
+        assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
+        assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
+        let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(
+            advanced
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ●·     ·●")),
+            "{advanced}"
+        );
+
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
+            },
+            now + Duration::from_millis(50),
+        );
+        let settled = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(!settled.contains('●'));
+        assert!(!settled.contains('·'));
+        assert_eq!(app.history_height, 8);
+        assert!(!app.tick(now + Duration::from_millis(100)).visible_changed);
     }
 
     #[test]
@@ -9976,6 +10575,8 @@ mod tests {
                                 summary: ToolCallSummary::Count(count),
                             })
                             .collect(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -10069,6 +10670,8 @@ mod tests {
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -10102,6 +10705,8 @@ mod tests {
                         stderr: observation(""),
                         outcome: ExecutionOutcome::Complete { result: None },
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },

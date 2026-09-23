@@ -6,16 +6,18 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AgentProgress, PersistedAgentEvent, PersistedRunOutcome, TerminalEvidence,
+    Agent, AgentProgress, ManualCompactionResult, PersistedAgentEvent, PersistedRunOutcome,
+    TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
+use crate::config::{CompactionSettings, ModelSelection, settings::SettingsContext};
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
-use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind, Session,
-    SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore, SessionWriter,
+    CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
+    Session, SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore,
+    SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -38,6 +40,10 @@ pub(crate) enum RuntimeCommand {
     Submit {
         request: String,
     },
+    #[allow(dead_code)]
+    Compact {
+        focus: String,
+    },
     ApplySettings {
         selection: ModelSelection,
         revision: u64,
@@ -57,6 +63,28 @@ pub(crate) enum RuntimeCommand {
     },
     CancelBackground,
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompactionAcknowledgement {
+    Accepted,
+    Busy,
+    Disabled { reason: RuntimeDisabledReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionLifecycle {
+    Started,
+    NoOp,
+    Settled(CompactionSettlement),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionSettlement {
+    Applied,
+    Failed,
+    Cancelled,
+    CancelledBeforeStart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +130,9 @@ pub(crate) enum Record {
     FailedRun {
         message: String,
         terminal: TerminalDetails,
+    },
+    Compaction {
+        outcome: CompactionOutcome,
     },
 }
 
@@ -261,7 +292,13 @@ pub(crate) enum RuntimeEvent {
         outcome: TreeRequestOutcome,
     },
     SubmissionRejectedBusy {
-        active_run_id: RunId,
+        active_run_id: Option<RunId>,
+    },
+    CompactionAcknowledged {
+        acknowledgement: CompactionAcknowledgement,
+    },
+    CompactionLifecycle {
+        lifecycle: CompactionLifecycle,
     },
     RuntimeDisabled {
         reason: RuntimeDisabledReason,
@@ -343,6 +380,8 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_events: Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
     subagent_record_revisions: BTreeMap<TaskId, u64>,
     subagent_status_revisions: BTreeMap<TaskId, u64>,
+    compaction_policy: CompactionSettings,
+    pending_compaction: Option<PendingCompaction>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
     #[cfg(test)]
@@ -351,7 +390,19 @@ pub(crate) struct RuntimeController<M: Model> {
     test_home: Option<tempfile::TempDir>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForegroundOperation {
+    Run,
+    Compaction,
+}
+
+struct PendingCompaction {
+    focus: String,
+    cancellation: CancellationToken,
+}
+
 struct ActiveRun<M: Model> {
+    operation: ForegroundOperation,
     run_id: Option<RunId>,
     request_entry: Option<SessionEntryId>,
     correction_requested: bool,
@@ -400,6 +451,11 @@ enum WorkerMessage<M: Model> {
         agent: Agent<M>,
         result: Result<PersistedRunOutcome, SessionError>,
         progress_gap: bool,
+    },
+    CompactionStarted,
+    CompactionFinished {
+        agent: Agent<M>,
+        result: Result<ManualCompactionResult, SessionError>,
     },
 }
 
@@ -455,6 +511,7 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
         RuntimeCommand::Submit { .. }
+        | RuntimeCommand::Compact { .. }
         | RuntimeCommand::ApplySettings { .. }
         | RuntimeCommand::SetSessionName { .. }
         | RuntimeCommand::Navigate { .. }
@@ -495,9 +552,9 @@ fn root_settlement(record: &Record) -> Settlement {
         Record::FinalMessage { .. } => Settlement::Succeeded,
         Record::CancelledRun { .. } => Settlement::Cancelled,
         Record::FailedRun { .. } => Settlement::Failed,
-        Record::UserRequest { .. } | Record::CompletedExecution { .. } => {
-            unreachable!("only terminal root records settle runs")
-        }
+        Record::UserRequest { .. }
+        | Record::CompletedExecution { .. }
+        | Record::Compaction { .. } => unreachable!("only terminal root records settle runs"),
     }
 }
 
@@ -544,6 +601,8 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::CorrectionCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::CompactionAcknowledged { .. }
+        | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
         | RuntimeEvent::SubmissionRejectedDisabled { .. } => 0,
     }
@@ -661,6 +720,7 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
             message,
             terminal: terminal_details(terminal),
         },
+        RestoredRecordKind::Compaction { outcome } => Record::Compaction { outcome },
     };
     StoredRecord {
         run_id: RunId(run_id),
@@ -676,6 +736,7 @@ impl<M: Model> RuntimeController<M> {
         subagents: SessionSubagents,
         session: SessionWriter,
     ) -> Self {
+        let compaction = persisted_settings.compaction();
         let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
         Self {
@@ -689,6 +750,8 @@ impl<M: Model> RuntimeController<M> {
             subagents,
             subagent_record_revisions: BTreeMap::new(),
             subagent_status_revisions: BTreeMap::new(),
+            compaction_policy: compaction,
+            pending_compaction: None,
             active: None,
             trace: Trace::disabled(),
             #[cfg(test)]
@@ -733,6 +796,7 @@ impl<M: Model> RuntimeController<M> {
             subagents.replace_selected_origins(selected_origins).await,
             "restoration has no tracked subagent operations"
         );
+        let compaction = persisted_settings.compaction();
         let accepted_thinking = AcceptedThinking::new(
             *settings.borrow(),
             persisted_settings,
@@ -806,6 +870,8 @@ impl<M: Model> RuntimeController<M> {
                 subagent_events,
                 subagent_record_revisions: BTreeMap::new(),
                 subagent_status_revisions: BTreeMap::new(),
+                compaction_policy: compaction,
+                pending_compaction: None,
                 active: None,
                 trace: Trace::disabled(),
                 #[cfg(test)]
@@ -1022,12 +1088,26 @@ impl<M: Model> RuntimeController<M> {
                             reason: reason.clone(),
                         },
                     );
+                } else if self.pending_compaction.is_some() {
+                    self.emit(
+                        events,
+                        RuntimeEvent::SubmissionRejectedBusy {
+                            active_run_id: None,
+                        },
+                    );
                 } else if let Some(active) = &mut self.active {
-                    if let Some(run_id) = active.run_id {
+                    if active.operation == ForegroundOperation::Compaction {
                         self.emit(
                             events,
                             RuntimeEvent::SubmissionRejectedBusy {
-                                active_run_id: run_id,
+                                active_run_id: None,
+                            },
+                        );
+                    } else if let Some(run_id) = active.run_id {
+                        self.emit(
+                            events,
+                            RuntimeEvent::SubmissionRejectedBusy {
+                                active_run_id: Some(run_id),
                             },
                         );
                     } else {
@@ -1035,6 +1115,41 @@ impl<M: Model> RuntimeController<M> {
                     }
                 } else {
                     self.start_run(request, events, progress).await;
+                }
+            }
+            RuntimeCommand::Compact { focus } => {
+                if self.subagents.storage_failure_token().is_cancelled() {
+                    self.disable_session_storage(events).await;
+                }
+                let acknowledgement = if let Some(reason) = &self.disabled_reason {
+                    CompactionAcknowledgement::Disabled {
+                        reason: reason.clone(),
+                    }
+                } else if self.pending_compaction.is_some()
+                    || self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.operation == ForegroundOperation::Compaction)
+                {
+                    CompactionAcknowledgement::Busy
+                } else {
+                    let cancellation = self.subagents.storage_failure_token().child_token();
+                    self.pending_compaction = Some(PendingCompaction {
+                        focus,
+                        cancellation,
+                    });
+                    if self.active.is_some() {
+                        self.request_active_cancellation(false);
+                    }
+                    CompactionAcknowledgement::Accepted
+                };
+                let accepted = acknowledgement == CompactionAcknowledgement::Accepted;
+                self.emit(
+                    events,
+                    RuntimeEvent::CompactionAcknowledged { acknowledgement },
+                );
+                if accepted {
+                    self.start_pending_compaction().await;
                 }
             }
             RuntimeCommand::ApplySettings {
@@ -1070,7 +1185,10 @@ impl<M: Model> RuntimeController<M> {
             RuntimeCommand::Navigate { entry } => {
                 let outcome = if self.disabled_reason.is_some() {
                     NavigationOutcome::RejectedReadOnly
-                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                } else if self.pending_compaction.is_some()
+                    || self.active.is_some()
+                    || self.subagents.operation_count() != 0
+                {
                     NavigationOutcome::RejectedBusy
                 } else {
                     self.drain_coordinator_events(events, progress).await;
@@ -1085,7 +1203,10 @@ impl<M: Model> RuntimeController<M> {
                 let storage_failure = self.subagents.storage_failure_token().is_cancelled();
                 let outcome = if storage_failure || self.disabled_reason.is_some() {
                     TreeRequestOutcome::RejectedReadOnly
-                } else if self.active.is_some() || self.subagents.operation_count() != 0 {
+                } else if self.pending_compaction.is_some()
+                    || self.active.is_some()
+                    || self.subagents.operation_count() != 0
+                {
                     TreeRequestOutcome::RejectedBusy
                 } else {
                     self.drain_coordinator_events(events, progress).await;
@@ -1096,7 +1217,9 @@ impl<M: Model> RuntimeController<M> {
                 };
                 self.emit(events, RuntimeEvent::TreeCatalogue { revision, outcome });
             }
-            RuntimeCommand::Cancel { correction } => self.request_active_cancellation(correction),
+            RuntimeCommand::Cancel { correction } => {
+                self.cancel_foreground(correction, events);
+            }
             RuntimeCommand::CancelBackground => self.request_background_cancellation().await,
             RuntimeCommand::Shutdown => {
                 *shutdown_requested = true;
@@ -1242,6 +1365,9 @@ impl<M: Model> RuntimeController<M> {
     }
 
     fn disable_arena_checkpoint_recovery(&mut self, events: &mpsc::UnboundedSender<RuntimeEvent>) {
+        if let Some(pending) = self.pending_compaction.take() {
+            pending.cancellation.cancel();
+        }
         self.disabled_reason = Some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed);
         self.emit(
             events,
@@ -1366,6 +1492,63 @@ impl<M: Model> RuntimeController<M> {
             };
             self.handle_coordinator_event(event, events, progress).await;
         }
+    }
+
+    async fn start_pending_compaction(&mut self) {
+        if self.active.is_some() {
+            return;
+        }
+        let Some(PendingCompaction {
+            focus,
+            cancellation,
+        }) = self.pending_compaction.take()
+        else {
+            return;
+        };
+        let caller = self.subagents.root_caller().await;
+        let agent = self
+            .agent
+            .take()
+            .expect("an idle runtime controller owns its agent");
+        let writer = self.session.clone();
+        let cancellation_for_worker = cancellation.clone();
+        let policy = self.compaction_policy;
+        let selection = *self.settings.borrow();
+        let (sender, worker) = mpsc::unbounded_channel();
+        let (_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let worker_task = tokio::spawn(async move {
+            let mut agent = agent;
+            let completion_sender = sender.clone();
+            let result = agent
+                .compact_manual(
+                    policy,
+                    selection,
+                    focus,
+                    &cancellation_for_worker,
+                    &writer,
+                    &mut || {
+                        let _ = completion_sender.send(WorkerMessage::CompactionStarted);
+                    },
+                )
+                .await;
+            drop(writer);
+            let _ = sender.send(WorkerMessage::CompactionFinished { agent, result });
+        });
+        drop(worker_task);
+        self.active = Some(ActiveRun {
+            operation: ForegroundOperation::Compaction,
+            run_id: None,
+            request_entry: None,
+            correction_requested: false,
+            persisted_model_steps: BTreeSet::new(),
+            pending_busy_submissions: 0,
+            caller,
+            cancellation,
+            worker,
+            progress: worker_progress,
+            progress_open: true,
+            cancellation_requested: false,
+        });
     }
 
     async fn start_run(
@@ -1577,6 +1760,7 @@ impl<M: Model> RuntimeController<M> {
         });
         drop(worker_task);
         self.active = Some(ActiveRun {
+            operation: ForegroundOperation::Run,
             run_id: None,
             request_entry: None,
             correction_requested: false,
@@ -1591,6 +1775,35 @@ impl<M: Model> RuntimeController<M> {
         });
     }
 
+    fn cancel_foreground(
+        &mut self,
+        correction: bool,
+        events: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        if self.pending_compaction.is_some()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.operation == ForegroundOperation::Run)
+        {
+            let pending = self
+                .pending_compaction
+                .take()
+                .expect("pending compaction was checked");
+            pending.cancellation.cancel();
+            self.emit(
+                events,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: CompactionLifecycle::Settled(
+                        CompactionSettlement::CancelledBeforeStart,
+                    ),
+                },
+            );
+            return;
+        }
+        self.request_active_cancellation(correction);
+    }
+
     fn request_active_cancellation(&mut self, correction: bool) {
         if let Some(active) = &mut self.active {
             self.trace
@@ -1598,7 +1811,7 @@ impl<M: Model> RuntimeController<M> {
             let first_cancellation = !active.cancellation_requested;
             active.cancellation_requested = true;
             active.cancellation.cancel();
-            if first_cancellation {
+            if first_cancellation && active.operation == ForegroundOperation::Run {
                 active.correction_requested = correction;
             }
         }
@@ -1615,6 +1828,9 @@ impl<M: Model> RuntimeController<M> {
     }
 
     async fn request_shutdown(&mut self) {
+        if let Some(pending) = self.pending_compaction.take() {
+            pending.cancellation.cancel();
+        }
         self.request_active_cancellation(false);
         self.request_background_cancellation().await;
     }
@@ -1658,7 +1874,7 @@ impl<M: Model> RuntimeController<M> {
                     self.emit(
                         events,
                         RuntimeEvent::SubmissionRejectedBusy {
-                            active_run_id: run_id,
+                            active_run_id: Some(run_id),
                         },
                     );
                 }
@@ -1734,6 +1950,76 @@ impl<M: Model> RuntimeController<M> {
                 );
                 self.session.clear_execution(step_id);
             }
+            WorkerMessage::CompactionStarted => {
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.operation == ForegroundOperation::Compaction)
+                {
+                    self.emit(
+                        events,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: CompactionLifecycle::Started,
+                        },
+                    );
+                }
+            }
+            WorkerMessage::CompactionFinished { agent, result } => {
+                self.drain_worker_progress(progress);
+                self.agent = Some(agent);
+                match result {
+                    Ok(ManualCompactionResult::NoOp) => self.emit(
+                        events,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: CompactionLifecycle::NoOp,
+                        },
+                    ),
+                    Ok(ManualCompactionResult::CancelledBeforeStart) => self.emit(
+                        events,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: CompactionLifecycle::Settled(
+                                CompactionSettlement::CancelledBeforeStart,
+                            ),
+                        },
+                    ),
+                    Ok(ManualCompactionResult::FailedBeforeStart) => self.emit(
+                        events,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Failed),
+                        },
+                    ),
+                    Ok(ManualCompactionResult::Settled(committed)) => {
+                        let settlement = match &committed.outcome {
+                            CompactionOutcome::Applied { .. } => CompactionSettlement::Applied,
+                            CompactionOutcome::Failed { .. } => CompactionSettlement::Failed,
+                            CompactionOutcome::Cancelled { .. } => CompactionSettlement::Cancelled,
+                        };
+                        self.append_committed_record(
+                            events,
+                            RunId(committed.run_id),
+                            Record::Compaction {
+                                outcome: committed.outcome,
+                            },
+                            false,
+                        );
+                        self.emit(
+                            events,
+                            RuntimeEvent::CompactionLifecycle {
+                                lifecycle: CompactionLifecycle::Settled(settlement),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        self.subagents.latch_storage_failure().await;
+                        self.active = None;
+                        self.disable_session_storage(events).await;
+                        self.session.clear_active_execution();
+                        return;
+                    }
+                }
+                self.active = None;
+                self.session.clear_active_execution();
+            }
             WorkerMessage::PersistedFinished {
                 agent,
                 result,
@@ -1781,6 +2067,9 @@ impl<M: Model> RuntimeController<M> {
                         );
                         if let Some(reason) = disabled_reason {
                             self.disabled_reason = Some(reason.clone());
+                            if let Some(pending) = self.pending_compaction.take() {
+                                pending.cancellation.cancel();
+                            }
                             self.emit(events, RuntimeEvent::RuntimeDisabled { reason });
                         }
                         self.subagents
@@ -1825,6 +2114,9 @@ impl<M: Model> RuntimeController<M> {
                         });
                         self.emit(events, RuntimeEvent::RunSettled { run_id });
                         self.active = None;
+                        if self.disabled_reason.is_none() {
+                            self.start_pending_compaction().await;
+                        }
                     }
                     Err(_error) => {
                         self.agent = Some(agent);
@@ -1843,6 +2135,9 @@ impl<M: Model> RuntimeController<M> {
             return;
         }
         self.disabled_reason = Some(RuntimeDisabledReason::SessionStorageWriteFailed);
+        if let Some(pending) = self.pending_compaction.take() {
+            pending.cancellation.cancel();
+        }
         self.request_active_cancellation(false);
         self.request_background_cancellation().await;
         self.emit(
@@ -2003,11 +2298,11 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        AcceptedThinking, ActiveRun, CoordinatorEvent, CorrectionOutcome, ModelStepId,
-        PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
+        AcceptedThinking, ActiveRun, CoordinatorEvent, CorrectionOutcome, ForegroundOperation,
+        ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
         RestoredTimelineItem, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
         RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails, WorkerMessage,
-        restored_initial_state, runtime_event_payload_bytes,
+        restored_initial_state, restored_stored_record, runtime_event_payload_bytes,
     };
     use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
@@ -2022,12 +2317,12 @@ mod tests {
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
-        ScriptedAction as ModelAction, ScriptedModel,
+        ScriptedAction as ModelAction, ScriptedModel, SummaryRequest, SummaryResult,
     };
     use crate::session::{
-        PersistedCode, PersistedTerminal, RestoredRecord, RestoredRecordKind, RestoredTask,
-        Session, SessionEntryId, SessionRestore, SessionWriteGate, SessionWriteKind, TaskAdmission,
-        TaskTerminal,
+        CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, RestoredRecord,
+        RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
+        SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -2105,6 +2400,37 @@ mod tests {
 
     async fn default_controller(workspace: &tempfile::TempDir) -> RuntimeController<ScriptedModel> {
         controller_with_model(workspace, ScriptedModel::default()).await
+    }
+
+    async fn seed_compactable_history(writer: &SessionWriter) {
+        for label in ["discarded", "retained"] {
+            let admission = writer
+                .commit_request(format!("{label} request"))
+                .await
+                .expect("commit compaction fixture request");
+            let step_id = writer
+                .start_model_step(admission.run_id)
+                .await
+                .expect("start compaction fixture step");
+            writer
+                .close_run(
+                    admission.run_id,
+                    Some(step_id),
+                    move || PersistedTerminal::Final {
+                        step_id,
+                        text: format!("{label} reply"),
+                        reasoning_summary: String::new(),
+                        replay: ProviderReplay::new(
+                            "fixture",
+                            vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
+                        ),
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close compaction fixture run");
+        }
     }
 
     async fn controller_with_subagents<M: Model>(
@@ -2642,6 +2968,97 @@ mod tests {
         }
     }
 
+    struct RetainedCompactionModel {
+        run_started: Arc<Notify>,
+        summary_requests: Arc<Mutex<Vec<SummaryRequest>>>,
+    }
+
+    impl Model for RetainedCompactionModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.run_started.notify_one();
+                cancellation.cancelled().await;
+                Err(ModelError::Cancelled.into())
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                if cancellation.is_cancelled() {
+                    return Err(ModelError::Cancelled.into());
+                }
+                attempt_started();
+                self.summary_requests
+                    .lock()
+                    .expect("record summary request")
+                    .push(request);
+                Ok(SummaryResult {
+                    text: "summary".to_owned(),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    struct GatedSummaryModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Model for GatedSummaryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            _request: SummaryRequest,
+            cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                if cancellation.is_cancelled() {
+                    return Err(ModelError::Cancelled.into());
+                }
+                attempt_started();
+                self.started.notify_one();
+                tokio::select! {
+                    _ = cancellation.cancelled() => Err(ModelFailure::new(
+                        ModelError::Cancelled,
+                        vec![AttemptAccounting::UsageUnavailable],
+                    )),
+                    _ = self.release.notified() => Ok(SummaryResult {
+                        text: "summary".to_owned(),
+                        attempts: vec![AttemptAccounting::UsageUnavailable],
+                    }),
+                }
+            }
+        }
+    }
+
     struct SettlementGatedModel {
         calls: Arc<AtomicUsize>,
         provider_called: Arc<Notify>,
@@ -2737,6 +3154,1429 @@ mod tests {
                     attempts: Vec::new(),
                 })
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_persists_before_reporting_completion() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Compaction);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        for request in [
+            "first ".to_owned() + &"x".repeat(100_000),
+            "second ".to_owned() + &"y".repeat(100_000),
+        ] {
+            let admission = writer
+                .commit_request(request)
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close seeded run");
+        }
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ScriptedModel::new(Vec::new()).with_summary_responses(vec!["summary".to_owned()]),
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, mut progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: String::new(),
+            })
+            .await
+            .expect("request compaction");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: super::CompactionAcknowledgement::Accepted,
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: super::CompactionLifecycle::Started,
+            }
+        );
+        gate.wait_until_started().await;
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "busy request".to_owned(),
+            })
+            .await
+            .expect("submit while compacting");
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "duplicate".to_owned(),
+            })
+            .await
+            .expect("duplicate compaction");
+        commands
+            .send(RuntimeCommand::RequestTree { revision: 7 })
+            .await
+            .expect("request tree while compacting");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: super::CompactionAcknowledgement::Busy,
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::TreeCatalogue {
+                revision: 7,
+                outcome: super::TreeRequestOutcome::RejectedBusy,
+            }
+        );
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel after compaction linearisation");
+        assert!(events.try_recv().is_err());
+        assert!(progress.try_recv().is_err());
+        gate.release();
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::Compaction { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let count: i64 = session
+            .connection_for_test()
+            .expect("open session")
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'compaction'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count compactions");
+        assert_eq!(count, 1);
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: super::CompactionLifecycle::Settled(
+                    super::CompactionSettlement::Applied,
+                ),
+            }
+        );
+
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn empty_history_compaction_reports_noop_without_a_card() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let controller = default_controller(&workspace).await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: String::new(),
+            })
+            .await
+            .expect("request compaction");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: super::CompactionAcknowledgement::Accepted,
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: super::CompactionLifecycle::NoOp,
+            }
+        );
+        assert!(events.try_recv().is_err());
+
+        shutdown_controller(commands, controller).await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_manual_compaction_settles_failed_without_an_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, ScriptedModel::new(Vec::new())),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: String::new(),
+            })
+            .await
+            .expect("request unsupported compaction");
+        let events = events_until_compaction_terminal(&mut events).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                },
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Settled(
+                        super::CompactionSettlement::Failed,
+                    ),
+                },
+            ]
+        ));
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = 'compaction'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count compactions"),
+            0
+        );
+
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn compaction_lifecycle_remains_fifo_when_progress_is_saturated() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ScriptedModel::new(Vec::new()).with_summary_responses(vec![
+                    "history summary".to_owned(),
+                    "split summary".to_owned(),
+                ]),
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (command_sender, command_receiver) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut progress) = mpsc::channel(1);
+        progress_sender
+            .try_send(ProgressEnvelope {
+                item: RuntimeEvent::ModelProgress {
+                    run_id: RunId(99),
+                    step_id: ModelStepId(99),
+                    progress: ModelProgress::AttemptStarted { attempt: 1 },
+                },
+                gap_before: false,
+            })
+            .expect("saturate progress channel");
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        command_sender
+            .send(RuntimeCommand::Compact {
+                focus: String::new(),
+            })
+            .await
+            .expect("request compaction");
+        let events = events_until_compaction_terminal(&mut events).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                },
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::Compaction { .. },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Settled(
+                        super::CompactionSettlement::Applied,
+                    ),
+                },
+            ]
+        ));
+        assert!(progress.try_recv().is_ok(), "progress remained saturated");
+
+        shutdown_controller(command_sender, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn retained_manual_compaction_starts_after_run_settlement() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        for request in [
+            "first ".to_owned() + &"x".repeat(100_000),
+            "second ".to_owned() + &"y".repeat(100_000),
+        ] {
+            let admission = writer
+                .commit_request(request)
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close seeded run");
+        }
+        let run_started = Arc::new(Notify::new());
+        let summary_requests = Arc::new(Mutex::new(Vec::new()));
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                RetainedCompactionModel {
+                    run_started: run_started.clone(),
+                    summary_requests: summary_requests.clone(),
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "current ".to_owned() + &"z".repeat(100_000),
+            })
+            .await
+            .expect("start run");
+        run_started.notified().await;
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "preserve decisions".to_owned(),
+            })
+            .await
+            .expect("retain compaction");
+
+        let mut run_settled = None;
+        let mut compaction_started = None;
+        let mut card = None;
+        let mut compaction_settled = None;
+        for index in 0..16 {
+            match next_event(&mut events).await {
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                } => {}
+                RuntimeEvent::RunSettled { .. } => run_settled = Some(index),
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                } => compaction_started = Some(index),
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            record: Record::Compaction { .. },
+                            ..
+                        },
+                    ..
+                } => card = Some(index),
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle:
+                        super::CompactionLifecycle::Settled(super::CompactionSettlement::Applied),
+                } => {
+                    compaction_settled = Some(index);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            run_settled.expect("run settled") < compaction_started.expect("compaction started")
+        );
+        assert!(compaction_started.expect("compaction started") < card.expect("compaction card"));
+        assert!(card.expect("compaction card") < compaction_settled.expect("compaction settled"));
+        {
+            let summary_requests = summary_requests.lock().expect("read summary requests");
+            assert!(!summary_requests.is_empty());
+            assert!(
+                summary_requests
+                    .iter()
+                    .all(|request| request.input.contains("preserve decisions"))
+            );
+        }
+
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancelling_retained_compaction_before_start_leaves_no_card_or_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        for request in [
+            "first ".to_owned() + &"x".repeat(100_000),
+            "second ".to_owned() + &"y".repeat(100_000),
+        ] {
+            let admission = writer
+                .commit_request(request)
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close seeded run");
+        }
+        let run_started = Arc::new(Notify::new());
+        let summary_requests = Arc::new(Mutex::new(Vec::new()));
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                RetainedCompactionModel {
+                    run_started: run_started.clone(),
+                    summary_requests: summary_requests.clone(),
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "current ".to_owned() + &"z".repeat(100_000),
+            })
+            .await
+            .expect("start run");
+        run_started.notified().await;
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "preserve decisions".to_owned(),
+            })
+            .await
+            .expect("retain compaction");
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel retained compaction");
+
+        let mut acknowledged = 0;
+        let mut cancelled_before_start = 0;
+        let mut run_settled = false;
+        while !run_settled {
+            match next_event(&mut events).await {
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                } => acknowledged += 1,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle:
+                        super::CompactionLifecycle::Settled(
+                            super::CompactionSettlement::CancelledBeforeStart,
+                        ),
+                } => cancelled_before_start += 1,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                }
+                | RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            record: Record::Compaction { .. },
+                            ..
+                        },
+                    ..
+                } => panic!("cancelled retained compaction must not start or append"),
+                RuntimeEvent::RunSettled { .. } => run_settled = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(acknowledged, 1);
+        assert_eq!(cancelled_before_start, 1);
+        assert!(
+            summary_requests
+                .lock()
+                .expect("read summary requests")
+                .is_empty()
+        );
+        let compactions: i64 = session
+            .connection_for_test()
+            .expect("open session")
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'compaction'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count compactions");
+        assert_eq!(compactions, 0);
+
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn retained_compaction_uses_terminal_leaf_when_final_or_failed_wins_cancellation() {
+        for terminal_kind in ["final", "failed"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path())
+                    .await
+                    .expect("open tool host"),
+            )
+            .await
+            .expect("create arena");
+            let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select model");
+            let session =
+                Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                    .expect("create session");
+            let writer = session.writer();
+            seed_compactable_history(&writer).await;
+            let admission = writer
+                .commit_request("race winner".to_owned())
+                .await
+                .expect("commit race request");
+            let terminal = if terminal_kind == "final" {
+                let step_id = writer
+                    .start_model_step(admission.run_id)
+                    .await
+                    .expect("start final step");
+                writer
+                    .close_run(
+                        admission.run_id,
+                        Some(step_id),
+                        move || PersistedTerminal::Final {
+                            step_id,
+                            text: "final wins".to_owned(),
+                            reasoning_summary: String::new(),
+                            replay: ProviderReplay::new("fixture", Vec::new()),
+                            attempts: Vec::new(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close final race winner")
+            } else {
+                writer
+                    .close_run(
+                        admission.run_id,
+                        None,
+                        || PersistedTerminal::Failed {
+                            message: "failed wins".to_owned(),
+                            evidence: None,
+                            attempts: Vec::new(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close failed race winner")
+            };
+            let terminal_leaf = active_entry_id(&session);
+            let summary_requests = Arc::new(Mutex::new(Vec::new()));
+            let (settings, _) = watch::channel(selection);
+            let snapshot = crate::config::ready_snapshot_for_test();
+            let mut controller = RuntimeController::with_session(
+                Agent::new(
+                    arena,
+                    RetainedCompactionModel {
+                        run_started: Arc::new(Notify::new()),
+                        summary_requests: summary_requests.clone(),
+                    },
+                ),
+                settings,
+                snapshot.settings().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+                session.writer(),
+            );
+            let agent = controller.agent.take().expect("take racing run agent");
+            let (worker_sender, worker) = mpsc::unbounded_channel();
+            let (_worker_progress_sender, worker_progress) =
+                mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+            controller.active = Some(ActiveRun {
+                operation: ForegroundOperation::Run,
+                run_id: Some(RunId(admission.run_id)),
+                request_entry: Some(admission.request_entry),
+                correction_requested: false,
+                persisted_model_steps: BTreeSet::new(),
+                pending_busy_submissions: 0,
+                caller: controller.subagents.root_caller().await,
+                cancellation: CancellationToken::new(),
+                worker,
+                progress: worker_progress,
+                progress_open: false,
+                cancellation_requested: false,
+            });
+            controller.request_active_cancellation(true);
+            let (commands, mut events, _progress, controller) = start_controller(controller);
+
+            commands
+                .send(RuntimeCommand::Compact {
+                    focus: "retain race winner".to_owned(),
+                })
+                .await
+                .expect("retain compaction");
+            assert_eq!(
+                next_event(&mut events).await,
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                }
+            );
+            worker_sender
+                .send(WorkerMessage::PersistedFinished {
+                    agent,
+                    result: Ok(crate::agent::PersistedRunOutcome {
+                        run_id: admission.run_id,
+                        terminal,
+                        authentication_failure: false,
+                        recovery_failure: false,
+                    }),
+                    progress_gap: false,
+                })
+                .expect("report race-winning terminal");
+            let events = events_until_compaction_terminal(&mut events).await;
+
+            let terminal = events
+                .iter()
+                .position(|event| match (terminal_kind, event) {
+                    (
+                        "final",
+                        RuntimeEvent::RecordAppended {
+                            record:
+                                StoredRecord {
+                                    run_id,
+                                    record: Record::FinalMessage { text, .. },
+                                },
+                            ..
+                        },
+                    ) => *run_id == RunId(admission.run_id) && text == "final wins",
+                    (
+                        "failed",
+                        RuntimeEvent::RecordAppended {
+                            record:
+                                StoredRecord {
+                                    run_id,
+                                    record: Record::FailedRun { message, .. },
+                                },
+                            ..
+                        },
+                    ) => *run_id == RunId(admission.run_id) && message == "failed wins",
+                    _ => false,
+                })
+                .expect("race-winning terminal record");
+            let settled = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        RuntimeEvent::RunSettled { run_id } if *run_id == RunId(admission.run_id)
+                    )
+                })
+                .expect("run settled");
+            let started = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: super::CompactionLifecycle::Started,
+                        }
+                    )
+                })
+                .expect("compaction started");
+            assert!(terminal < settled && settled < started);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, RuntimeEvent::CorrectionCompleted { .. }))
+            );
+            {
+                let summary_requests = summary_requests.lock().expect("read summary requests");
+                assert!(!summary_requests.is_empty());
+                assert!(
+                    summary_requests
+                        .iter()
+                        .all(|request| request.input.contains("retain race winner"))
+                );
+            }
+
+            let compaction_parent: i64 = session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE kind = 'compaction'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read compaction parent");
+            assert_eq!(compaction_parent, terminal_leaf);
+
+            shutdown_controller(commands, controller).await;
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_compaction_uses_the_leaf_left_by_correction() {
+        for (corrupt_correction_target, expected_correction) in
+            [(false, "replaced"), (true, "failed")]
+        {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path())
+                    .await
+                    .expect("open tool host"),
+            )
+            .await
+            .expect("create arena");
+            let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select model");
+            let session =
+                Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                    .expect("create session");
+            let writer = session.writer();
+            seed_compactable_history(&writer).await;
+            let selected_before_run = active_entry_id(&session);
+            if corrupt_correction_target {
+                replace_entry_checkpoint_identity(
+                    &session,
+                    SessionEntryId(selected_before_run as u64),
+                    "invalid correction checkpoint",
+                );
+            }
+            let run_started = Arc::new(Notify::new());
+            let summary_requests = Arc::new(Mutex::new(Vec::new()));
+            let (settings, _) = watch::channel(selection);
+            let snapshot = crate::config::ready_snapshot_for_test();
+            let controller = RuntimeController::with_session(
+                Agent::new(
+                    arena,
+                    RetainedCompactionModel {
+                        run_started: run_started.clone(),
+                        summary_requests: summary_requests.clone(),
+                    },
+                ),
+                settings,
+                snapshot.settings().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+                session.writer(),
+            );
+            let (commands, mut events, _progress, controller) = start_controller(controller);
+
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "cancel and compact".to_owned(),
+                })
+                .await
+                .expect("start run");
+            run_started.notified().await;
+            commands
+                .send(RuntimeCommand::Cancel { correction: true })
+                .await
+                .expect("latch correction");
+            commands
+                .send(RuntimeCommand::Compact {
+                    focus: "keep correction leaf".to_owned(),
+                })
+                .await
+                .expect("retain compaction");
+            let events = events_until_compaction_terminal(&mut events).await;
+
+            let correction = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        (expected_correction, event),
+                        (
+                            "replaced",
+                            RuntimeEvent::CorrectionCompleted {
+                                outcome: CorrectionOutcome::Replaced { .. },
+                                ..
+                            },
+                        ) | (
+                            "failed",
+                            RuntimeEvent::CorrectionCompleted {
+                                outcome: CorrectionOutcome::Failed,
+                                ..
+                            },
+                        )
+                    )
+                })
+                .expect("expected correction outcome");
+            let settled_run = events
+                .iter()
+                .position(|event| matches!(event, RuntimeEvent::RunSettled { .. }))
+                .expect("run settled");
+            let started = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        RuntimeEvent::CompactionLifecycle {
+                            lifecycle: super::CompactionLifecycle::Started,
+                        }
+                    )
+                })
+                .expect("compaction started");
+            assert!(correction < settled_run && settled_run < started);
+            assert!(
+                summary_requests
+                    .lock()
+                    .expect("read summary requests")
+                    .iter()
+                    .all(|request| request.input.contains("keep correction leaf"))
+            );
+
+            {
+                let connection = session.connection_for_test().expect("open session");
+                let compaction_parent: i64 = connection
+                    .query_row(
+                        "SELECT parent_id FROM entries WHERE kind = 'compaction'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read compaction parent");
+                let cancelled_entry: i64 = connection
+                    .query_row(
+                        "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read cancelled terminal");
+                assert_eq!(
+                    compaction_parent,
+                    if corrupt_correction_target {
+                        cancelled_entry
+                    } else {
+                        selected_before_run
+                    }
+                );
+            }
+
+            shutdown_controller(commands, controller).await;
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_compaction_uses_cancelled_leaf_when_correction_skips_background() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let factory = GatedChildFactory {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            attempts: Vec::new(),
+        };
+        let coordinator = complete_child_coordinator(factory.clone());
+        let caller = coordinator.root_caller().await;
+        let _child = coordinator
+            .start(&caller, child_parameters(), child_payload(&workspace).await)
+            .await
+            .expect("admit background child");
+        factory.started.notified().await;
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let run_started = Arc::new(Notify::new());
+        let summary_requests = Arc::new(Mutex::new(Vec::new()));
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                RetainedCompactionModel {
+                    run_started: run_started.clone(),
+                    summary_requests: summary_requests.clone(),
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            coordinator,
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "cancel and compact".to_owned(),
+            })
+            .await
+            .expect("start run");
+        run_started.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: true })
+            .await
+            .expect("latch correction");
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "keep cancelled leaf".to_owned(),
+            })
+            .await
+            .expect("retain compaction");
+        let events = events_until_compaction_terminal(&mut events).await;
+
+        let correction = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CorrectionCompleted {
+                        outcome: CorrectionOutcome::SkippedBackground,
+                        ..
+                    }
+                )
+            })
+            .expect("correction skipped for background work");
+        let settled = events
+            .iter()
+            .position(|event| matches!(event, RuntimeEvent::RunSettled { .. }))
+            .expect("run settled");
+        let started = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::CompactionLifecycle {
+                        lifecycle: super::CompactionLifecycle::Started,
+                    }
+                )
+            })
+            .expect("compaction started");
+        assert!(correction < settled && settled < started);
+        {
+            let summary_requests = summary_requests.lock().expect("read summary requests");
+            assert!(!summary_requests.is_empty());
+            assert!(
+                summary_requests
+                    .iter()
+                    .all(|request| request.input.contains("keep cancelled leaf"))
+            );
+        }
+
+        {
+            let connection = session.connection_for_test().expect("open session");
+            let compaction_parent: i64 = connection
+                .query_row(
+                    "SELECT parent_id FROM entries WHERE kind = 'compaction'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read compaction parent");
+            let cancelled_leaf: i64 = connection
+                .query_row(
+                    "SELECT id FROM entries WHERE kind = 'cancelled' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read cancelled terminal");
+            assert_eq!(compaction_parent, cancelled_leaf);
+        }
+
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn shutdown_clears_retained_compaction_before_it_starts() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let run_started = Arc::new(Notify::new());
+        let summary_requests = Arc::new(Mutex::new(Vec::new()));
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                RetainedCompactionModel {
+                    run_started: run_started.clone(),
+                    summary_requests: summary_requests.clone(),
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "running request".to_owned(),
+            })
+            .await
+            .expect("start run");
+        run_started.notified().await;
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "retain nothing after shutdown".to_owned(),
+            })
+            .await
+            .expect("retain compaction");
+        loop {
+            if matches!(
+                next_event(&mut events).await,
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                }
+            ) {
+                break;
+            }
+        }
+        commands
+            .send(RuntimeCommand::Shutdown)
+            .await
+            .expect("shutdown before compaction start");
+        let records = timeout(TEST_TIMEOUT, controller)
+            .await
+            .expect("shutdown completes")
+            .expect("controller task should not panic");
+
+        assert!(
+            summary_requests
+                .lock()
+                .expect("read summary requests")
+                .is_empty()
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.record, Record::Compaction { .. }))
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_compaction_waits_for_cancelled_settlement() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Compaction);
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            selection,
+            arena.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let summary_started = Arc::new(Notify::new());
+        let (settings, _) = watch::channel(selection);
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                GatedSummaryModel {
+                    started: summary_started.clone(),
+                    release: Arc::new(Notify::new()),
+                },
+            ),
+            settings,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, mut controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: String::new(),
+            })
+            .await
+            .expect("start compaction");
+        summary_started.notified().await;
+        commands
+            .send(RuntimeCommand::Shutdown)
+            .await
+            .expect("shutdown compaction");
+        gate.wait_until_started().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut controller)
+                .await
+                .is_err(),
+            "shutdown returned before durable cancellation"
+        );
+        gate.release();
+        let records = timeout(TEST_TIMEOUT, controller)
+            .await
+            .expect("shutdown completes after settlement")
+            .expect("controller task should not panic");
+        let events = events_until_compaction_terminal(&mut events).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Accepted,
+                },
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                },
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        record: Record::Compaction {
+                            outcome: CompactionOutcome::Cancelled { .. },
+                        },
+                        ..
+                    },
+                    ..
+                },
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Settled(
+                        super::CompactionSettlement::Cancelled,
+                    ),
+                },
+            ]
+        ));
+        assert!(matches!(
+            records.as_slice(),
+            [StoredRecord {
+                record: Record::Compaction {
+                    outcome: CompactionOutcome::Cancelled { .. },
+                },
+                ..
+            }]
+        ));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_settlement_disables_without_a_successful_card() {
+        for failure in ["storage", "expected leaf"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let arena = Arena::new(
+                worker_path(),
+                ToolHost::new(workspace.path())
+                    .await
+                    .expect("open tool host"),
+            )
+            .await
+            .expect("create arena");
+            let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                .expect("select model");
+            let session =
+                Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                    .expect("create session");
+            let writer = session.writer();
+            seed_compactable_history(&writer).await;
+            let summary_started = Arc::new(Notify::new());
+            let summary_release = Arc::new(Notify::new());
+            if failure == "storage" {
+                session
+                    .connection_for_test()
+                    .expect("open session")
+                    .execute_batch(
+                        "CREATE TRIGGER reject_compaction BEFORE INSERT ON entries WHEN NEW.kind = 'compaction' BEGIN SELECT RAISE(ABORT, 'reject compaction'); END;",
+                    )
+                    .expect("reject compaction writes");
+            }
+            let (settings, _) = watch::channel(selection);
+            let snapshot = crate::config::ready_snapshot_for_test();
+            let controller = RuntimeController::with_session(
+                Agent::new(
+                    arena,
+                    GatedSummaryModel {
+                        started: summary_started.clone(),
+                        release: summary_release.clone(),
+                    },
+                ),
+                settings,
+                snapshot.settings().clone(),
+                SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                ),
+                session.writer(),
+            );
+            let (commands, mut events, _progress, controller) = start_controller(controller);
+
+            commands
+                .send(RuntimeCommand::Compact {
+                    focus: String::new(),
+                })
+                .await
+                .expect("start compaction");
+            summary_started.notified().await;
+            if failure == "expected leaf" {
+                let admission = writer
+                    .commit_request("concurrent leaf".to_owned())
+                    .await
+                    .expect("advance selected leaf");
+                let step_id = writer
+                    .start_model_step(admission.run_id)
+                    .await
+                    .expect("start concurrent step");
+                writer
+                    .close_run(
+                        admission.run_id,
+                        Some(step_id),
+                        move || PersistedTerminal::Final {
+                            step_id,
+                            text: "concurrent reply".to_owned(),
+                            reasoning_summary: String::new(),
+                            replay: ProviderReplay::new("fixture", Vec::new()),
+                            attempts: Vec::new(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close concurrent run");
+            }
+            summary_release.notify_one();
+            summary_release.notify_one();
+            let disabled_events = events_until_disabled(&mut events).await;
+
+            assert!(matches!(
+                disabled_events.as_slice(),
+                [
+                    RuntimeEvent::CompactionAcknowledged {
+                        acknowledgement: super::CompactionAcknowledgement::Accepted,
+                    },
+                    RuntimeEvent::CompactionLifecycle {
+                        lifecycle: super::CompactionLifecycle::Started,
+                    },
+                    RuntimeEvent::RuntimeDisabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                    },
+                ]
+            ));
+            assert_eq!(
+                session
+                    .connection_for_test()
+                    .expect("open session")
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE kind = 'compaction'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count compactions"),
+                0
+            );
+            commands
+                .send(RuntimeCommand::Compact {
+                    focus: String::new(),
+                })
+                .await
+                .expect("retry after disable");
+            assert!(matches!(
+                next_event(&mut events).await,
+                RuntimeEvent::CompactionAcknowledged {
+                    acknowledgement: super::CompactionAcknowledgement::Disabled {
+                        reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+                    },
+                }
+            ));
+
+            shutdown_controller(commands, controller).await;
+            drop(writer);
+            session.close().expect("close session");
         }
     }
 
@@ -4349,7 +6189,7 @@ mod tests {
             assert_eq!(
                 next_event(&mut events).await,
                 RuntimeEvent::SubmissionRejectedBusy {
-                    active_run_id: RunId(1),
+                    active_run_id: Some(RunId(1)),
                 }
             );
         }
@@ -4370,6 +6210,7 @@ mod tests {
         drop(worker_sender);
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
+            operation: ForegroundOperation::Run,
             run_id: None,
             request_entry: None,
             correction_requested: false,
@@ -4446,6 +6287,26 @@ mod tests {
             let settled = matches!(event, RuntimeEvent::RunSettled { .. });
             collected.push(event);
             if settled {
+                return collected;
+            }
+        }
+    }
+
+    async fn events_until_compaction_terminal(
+        events: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> Vec<RuntimeEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::NoOp
+                        | super::CompactionLifecycle::Settled(_),
+                }
+            );
+            collected.push(event);
+            if terminal {
                 return collected;
             }
         }
@@ -4586,8 +6447,17 @@ mod tests {
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
             RuntimeEvent::CorrectionCompleted { .. } => "correction-completed".to_owned(),
             RuntimeEvent::TreeCatalogue { revision, .. } => format!("tree-catalogue:{revision}"),
-            RuntimeEvent::SubmissionRejectedBusy { active_run_id } => {
-                format!("busy:{}", active_run_id.0)
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: Some(active_run_id),
+            } => format!("busy:{}", active_run_id.0),
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            } => "busy:compaction".to_owned(),
+            RuntimeEvent::CompactionAcknowledged { acknowledgement } => {
+                format!("compaction-ack:{acknowledgement:?}")
+            }
+            RuntimeEvent::CompactionLifecycle { lifecycle } => {
+                format!("compaction:{lifecycle:?}")
             }
             RuntimeEvent::RuntimeDisabled { reason } => format!("disabled:{reason:?}"),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => {
@@ -5361,6 +7231,23 @@ mod tests {
     }
 
     #[test]
+    fn restored_compaction_is_a_record_without_terminal_settlement() {
+        let outcome = CompactionOutcome::Cancelled {
+            reason: CompactionReason::Manual,
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let restored = restored_stored_record(RestoredRecord {
+            revision: 7,
+            run_id: 3,
+            kind: RestoredRecordKind::Compaction {
+                outcome: outcome.clone(),
+            },
+        });
+        assert_eq!(restored.run_id, RunId(3));
+        assert_eq!(restored.record, Record::Compaction { outcome });
+    }
+
+    #[test]
     fn mutation_evidence_labels_are_path_free() {
         assert_eq!(
             tool_call_label(ToolCall {
@@ -5416,6 +7303,7 @@ mod tests {
             Record::FailedRun { message, .. } => {
                 format!("record:{}:failed:{message}", record.run_id.0)
             }
+            Record::Compaction { .. } => format!("record:{}:compaction", record.run_id.0),
         }
     }
 
@@ -7929,6 +9817,7 @@ mod tests {
         let (_worker_sender, worker) = mpsc::unbounded_channel();
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
+            operation: ForegroundOperation::Run,
             run_id: Some(RunId(1)),
             request_entry: None,
             correction_requested: false,
@@ -8330,7 +10219,7 @@ mod tests {
         assert_eq!(
             next_event(&mut events).await,
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(1)
+                active_run_id: Some(RunId(1))
             }
         );
         commands
@@ -9040,6 +10929,7 @@ mod tests {
             let (_worker_sender, worker) = mpsc::unbounded_channel();
             let (_progress_sender, progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             controller.active = Some(ActiveRun {
+                operation: ForegroundOperation::Run,
                 run_id: Some(RunId(1)),
                 request_entry: Some(SessionEntryId(1)),
                 correction_requested: false,
