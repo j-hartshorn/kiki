@@ -51,8 +51,8 @@ const SETTLED_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
 const TREE_BUSY_NOTICE: &str = "Session tree is unavailable while work is active.";
 const TREE_READ_ONLY_NOTICE: &str = "Session tree is unavailable while the session is read-only.";
 const SESSION_RESTORE_FAILED_NOTICE: &str = "Session could not be restored.";
-const GENERATION_THROBBER_ROWS: u16 = 2;
-const GENERATION_THROBBER_LEFT_PADDING: u16 = 1;
+const THROBBER_ROWS: u16 = 2;
+const THROBBER_LEFT_PADDING: u16 = 1;
 
 rattles::rattle!(
     GenerationThrobber,
@@ -61,6 +61,23 @@ rattles::rattle!(
     50,
     [
         "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠"
+    ]
+);
+
+rattles::rattle!(
+    CompactionThrobber,
+    compaction_throbber,
+    9,
+    50,
+    [
+        "·       ·",
+        "●       ●",
+        " ●     ● ",
+        "  ●   ●  ",
+        "   ● ●   ",
+        "    ●    ",
+        "    ·    ",
+        "         "
     ]
 );
 
@@ -197,7 +214,8 @@ struct App {
     pending_copy_text: Option<String>,
     notice: Option<Notice>,
     flash: Option<Flash>,
-    throbber: TickedRattler<GenerationThrobber>,
+    generation_throbber: TickedRattler<GenerationThrobber>,
+    compaction_throbber: TickedRattler<CompactionThrobber>,
     throbber_next_tick: Option<Instant>,
     settings: Option<SettingsContext>,
     workspace_root: Option<String>,
@@ -246,7 +264,8 @@ impl Default for App {
             pending_copy_text: None,
             notice: None,
             flash: None,
-            throbber: generation_throbber().into_ticked(),
+            generation_throbber: generation_throbber().into_ticked(),
+            compaction_throbber: compaction_throbber().into_ticked(),
             throbber_next_tick: None,
             settings: None,
             workspace_root: None,
@@ -1163,12 +1182,21 @@ impl App {
         if now < next_tick {
             return false;
         }
-        self.throbber.tick();
-        let scheduled = next_tick + self.throbber.interval();
+        let interval = if self.transcript.is_generating() {
+            self.generation_throbber.tick();
+            self.generation_throbber.interval()
+        } else if self.transcript.is_compacting() {
+            self.compaction_throbber.tick();
+            self.compaction_throbber.interval()
+        } else {
+            self.throbber_next_tick = None;
+            return false;
+        };
+        let scheduled = next_tick + interval;
         self.throbber_next_tick = Some(if scheduled > now {
             scheduled
         } else {
-            now + self.throbber.interval()
+            now + interval
         });
         true
     }
@@ -1543,13 +1571,18 @@ impl App {
             _ => false,
         };
         let was_generating = self.transcript.is_generating();
+        let was_compacting = self.transcript.is_compacting();
         let monitor_changed = self.subagent_monitor.apply(&event, now);
         let transcript_changed = self.transcript.apply(event, gap_before);
         let is_generating = self.transcript.is_generating();
+        let is_compacting = self.transcript.is_compacting();
         if !was_generating && is_generating {
-            self.throbber.reset();
-            self.throbber_next_tick = Some(now + self.throbber.interval());
-        } else if was_generating && !is_generating {
+            self.generation_throbber.reset();
+            self.throbber_next_tick = Some(now + self.generation_throbber.interval());
+        } else if !was_compacting && is_compacting {
+            self.compaction_throbber.reset();
+            self.throbber_next_tick = Some(now + self.compaction_throbber.interval());
+        } else if (was_generating || was_compacting) && !is_generating && !is_compacting {
             self.throbber_next_tick = None;
         }
         if transcript_changed {
@@ -2354,12 +2387,13 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         .height
         .saturating_sub(1)
         .saturating_sub(prompt_box_height);
-    let throbber_height = if !app.transcript.is_generating() || history_height < 2 {
+    let throbber_active = app.transcript.is_generating() || app.transcript.is_compacting();
+    let throbber_height = if !throbber_active || history_height < 2 {
         0
-    } else if history_height == GENERATION_THROBBER_ROWS {
+    } else if history_height == THROBBER_ROWS {
         1
     } else {
-        GENERATION_THROBBER_ROWS
+        THROBBER_ROWS
     };
     let monitor = app.subagent_monitor.layout(
         area.width,
@@ -2388,15 +2422,20 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
     if throbber_height > 0 {
+        let throbber_frame = if app.transcript.is_generating() {
+            app.generation_throbber.current_frame()
+        } else {
+            app.compaction_throbber.current_frame()
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                app.throbber.current_frame(),
+                throbber_frame,
                 Style::new().add_modifier(Modifier::BOLD),
             )),
             Rect::new(
-                area.x.saturating_add(GENERATION_THROBBER_LEFT_PADDING),
+                area.x.saturating_add(THROBBER_LEFT_PADDING),
                 prompt_top.saturating_sub(1),
-                area.width.saturating_sub(GENERATION_THROBBER_LEFT_PADDING),
+                area.width.saturating_sub(THROBBER_LEFT_PADDING),
                 1,
             ),
         );
@@ -2673,7 +2712,8 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::{
-        App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, generation_throbber,
+        App, DocumentPosition, HistoryPosition, Selection, TitlePublisher, compaction_throbber,
+        generation_throbber,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -9649,6 +9689,75 @@ mod tests {
                 "⠁  ⢀", "⠈  ⡀", " ⠁⢀ ", " ⠈⡀ ", " ⢀⠁ ", " ⡀⠈ ", "⢀  ⠁", "⡀  ⠈", "⠄  ⠐", "⠂  ⠠",
             ]
         );
+    }
+
+    #[test]
+    fn compaction_throbber_converges_and_disappears() {
+        let throbber = compaction_throbber();
+
+        assert_eq!((throbber.size().width, throbber.size().height), (9, 1));
+        assert_eq!(
+            (0..8)
+                .map(|index| throbber.frame(index))
+                .collect::<Vec<_>>(),
+            [
+                "·       ·",
+                "●       ●",
+                " ●     ● ",
+                "  ●   ●  ",
+                "   ● ●   ",
+                "    ●    ",
+                "    ·    ",
+                "         ",
+            ]
+        );
+    }
+
+    #[test]
+    fn active_compaction_animates_the_convergence_throbber_above_the_prompt() {
+        let now = Instant::now();
+        let mut app = App::default();
+        app.handle_event_at(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            now,
+        );
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            now,
+        );
+
+        let initial = rendered_at(&mut app, 20, 12, now);
+        let rows = initial.lines().collect::<Vec<_>>();
+        assert!(rows[8].starts_with(" ·       ·"), "{initial}");
+        assert_eq!(rows[9], "─".repeat(20));
+        assert_eq!(app.history_height, 6);
+
+        assert!(!app.tick(now + Duration::from_millis(49)).visible_changed);
+        assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
+        let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(
+            advanced
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ●       ●")),
+            "{advanced}"
+        );
+
+        app.handle_event_at(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
+            },
+            now + Duration::from_millis(50),
+        );
+        let settled = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(!settled.contains('●'));
+        assert!(!settled.contains('·'));
+        assert_eq!(app.history_height, 8);
+        assert!(!app.tick(now + Duration::from_millis(100)).visible_changed);
     }
 
     #[test]

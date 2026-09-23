@@ -2425,6 +2425,10 @@ impl Transcript {
                 .is_some_and(|live| live.phase == LivePhase::Generating)
     }
 
+    pub(crate) fn is_compacting(&self) -> bool {
+        self.disabled_reason.is_none() && self.compaction_state == CompactionState::Active
+    }
+
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled_reason.is_some()
     }
