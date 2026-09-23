@@ -833,11 +833,25 @@ impl App {
     }
 
     fn open_model_picker(&mut self, filter: &str) {
-        let items = CATALOGUE.iter().copied().map(|model| PickerItem {
-            group: "OpenAI",
-            label: model.id,
-            value: PickerValue::Model(model),
-        });
+        let favourites = self
+            .settings
+            .as_ref()
+            .and_then(SettingsContext::favourites)
+            .unwrap_or(&[]);
+        let items = favourites
+            .iter()
+            .copied()
+            .chain(
+                CATALOGUE
+                    .iter()
+                    .copied()
+                    .filter(|model| !favourites.contains(model)),
+            )
+            .map(|model| PickerItem {
+                group: "OpenAI",
+                label: model.id,
+                value: PickerValue::Model(model),
+            });
         let mut picker = Picker::new(
             "Models",
             "No matching models",
@@ -4956,6 +4970,35 @@ mod tests {
         assert_eq!(app.prompt.text(), "keep this draft");
         assert!(app.picker.is_some());
         assert!(rendered(&mut app, 80, 15).contains("Models"));
+    }
+
+    #[test]
+    fn favourites_lead_model_picker_in_configured_order_without_hiding_other_models() {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        fs::create_dir(home.path().join(".kiki")).unwrap();
+        fs::write(
+            home.path().join(".kiki/config.toml"),
+            "favourites = [\"openai/gpt-6-luna\", \"openai/gpt-6-sol\", \"openai/gpt-6-astra\"]\n",
+        )
+        .unwrap();
+        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        ));
+        app.open_model_picker("");
+        let screen = rendered(&mut app, 80, 24);
+        let picker = &screen[screen.find("Filter:").unwrap()..];
+        let positions = [
+            "openai/gpt-6-luna",
+            "openai/gpt-6-sol",
+            "openai/gpt-6-astra",
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.6-luna",
+        ]
+        .map(|id| picker.find(id).expect("model visible in picker"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
