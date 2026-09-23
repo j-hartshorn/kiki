@@ -3004,10 +3004,9 @@ impl Transcript {
         let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
             append_record_attempts(&displayed.record.record, &mut foreground_attempts);
-            append_normal_record_attempts(
-                &displayed.record.record,
-                &mut normal_foreground_attempts,
-            );
+            if !matches!(displayed.record.record, Record::Compaction { .. }) {
+                append_record_attempts(&displayed.record.record, &mut normal_foreground_attempts);
+            }
         }
         if let Some(live) = &self.live_step {
             foreground_attempts.extend(&live.settled_attempts);
@@ -3554,22 +3553,6 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
         | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
         Record::Compaction { outcome } => attempts.extend(outcome.attempts()),
         Record::UserRequest { .. } => {}
-    }
-}
-
-fn append_normal_record_attempts<'a>(
-    record: &'a Record,
-    attempts: &mut Vec<&'a AttemptAccounting>,
-) {
-    match record {
-        Record::Compaction { .. } | Record::UserRequest { .. } => {}
-        Record::CompletedExecution {
-            attempts: record_attempts,
-            ..
-        } => attempts.extend(record_attempts),
-        Record::FinalMessage { terminal, .. }
-        | Record::CancelledRun { terminal }
-        | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
     }
 }
 
