@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use thiserror::Error;
 
-use super::{PersistedCode, PersistedTerminal, ReadableCode, ReadableTerminal};
+use super::{
+    COMPACTION_DIAGNOSTIC_LIMIT, CompactionOutcome, CompactionReason, PersistedCode,
+    PersistedTerminal, ReadableCode, ReadableTerminal, SessionEntryId,
+};
 use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
 use crate::arena::{
     Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
@@ -25,6 +28,8 @@ pub(super) enum CodecError {
     Json(#[from] serde_json::Error),
     #[error("stored session path is not hexadecimal")]
     InvalidPath,
+    #[error("stored execution path is not normalised workspace-relative")]
+    InvalidExecutionPath,
     #[error("stored content fingerprint is not a 32-byte hexadecimal value")]
     InvalidFingerprint,
     #[error("stored session model selection is invalid")]
@@ -37,6 +42,8 @@ pub(super) enum CodecError {
     TerminalTaskDetails,
     #[error("stored session replay is missing")]
     MissingReplay,
+    #[error("stored compaction diagnostic exceeds 4096 bytes")]
+    OversizedCompactionDiagnostic,
     #[cfg(not(unix))]
     #[error("session paths are supported only on Unix")]
     UnsupportedPath,
@@ -60,7 +67,9 @@ pub(super) struct StoredEntry {
     pub(super) provider_replay: Option<Vec<u8>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum StoredPayload {
     UserRequest {
         request: String,
@@ -73,10 +82,43 @@ enum StoredPayload {
         terminal: StoredTerminal,
         code: Option<StoredCode>,
     },
+    Compaction {
+        compaction: StoredCompactionOutcome,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredCompactionOutcome {
+    Applied {
+        summary: String,
+        first_retained: u64,
+        context_tokens: u64,
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Failed {
+        diagnostic: String,
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+    Cancelled {
+        reason: StoredCompactionReason,
+        attempts: Vec<StoredAttemptAccounting>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredCompactionReason {
+    Manual,
+    AutomaticThreshold,
+    ContextOverflow,
 }
 
 pub(super) struct DecodedEntry(DecodedEntryPayload);
 
+#[allow(clippy::large_enum_variant)]
 enum DecodedEntryPayload {
     SessionStart,
     UserRequest {
@@ -90,6 +132,7 @@ enum DecodedEntryPayload {
         terminal: StoredTerminal,
         code: Option<StoredCode>,
     },
+    Compaction(StoredCompactionOutcome),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,6 +143,7 @@ pub(super) enum DecodedEntryKind {
     FinalReply,
     Cancelled,
     Failed,
+    Compaction,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,6 +204,8 @@ struct StoredExecution {
     stderr: StoredObservation,
     outcome: StoredExecutionOutcome,
     tool_calls: Vec<StoredToolCall>,
+    read_paths: Vec<String>,
+    modified_paths: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -259,6 +305,8 @@ struct StoredExecutionEvidence {
     stdout: StoredObservation,
     stderr: StoredObservation,
     tool_calls: Vec<StoredToolCall>,
+    read_paths: Vec<String>,
+    modified_paths: Vec<String>,
     cancellation_warning: Option<String>,
     failure: Option<StoredExecutionFailure>,
 }
@@ -465,6 +513,10 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
                 code,
             }))
         }
+        ("compaction", StoredPayload::Compaction { compaction }) => {
+            validate_stored_compaction(&compaction)?;
+            Ok(DecodedEntry(DecodedEntryPayload::Compaction(compaction)))
+        }
         _ => Err(CodecError::InvalidPayload),
     }
 }
@@ -479,6 +531,7 @@ pub(super) fn decoded_entry_kind(entry: &DecodedEntry) -> DecodedEntryKind {
             StoredTerminal::Cancelled { .. } => DecodedEntryKind::Cancelled,
             StoredTerminal::Failed { .. } => DecodedEntryKind::Failed,
         },
+        DecodedEntryPayload::Compaction(_) => DecodedEntryKind::Compaction,
     }
 }
 
@@ -525,6 +578,88 @@ pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
                 attempts.iter().map(decode_attempt).collect()
             }
         },
+        DecodedEntryPayload::Compaction(outcome) => stored_compaction_attempts(outcome)
+            .iter()
+            .map(decode_attempt)
+            .collect(),
+    }
+}
+
+pub(super) fn decoded_compaction(entry: &DecodedEntry) -> Option<CompactionOutcome> {
+    let DecodedEntryPayload::Compaction(outcome) = &entry.0 else {
+        return None;
+    };
+    Some(decode_compaction_outcome(outcome))
+}
+
+fn validate_stored_compaction(outcome: &StoredCompactionOutcome) -> Result<(), CodecError> {
+    match outcome {
+        StoredCompactionOutcome::Applied { first_retained, .. } if *first_retained == 0 => {
+            Err(CodecError::InvalidPayload)
+        }
+        StoredCompactionOutcome::Failed { diagnostic, .. }
+            if diagnostic.len() > COMPACTION_DIAGNOSTIC_LIMIT =>
+        {
+            Err(CodecError::OversizedCompactionDiagnostic)
+        }
+        StoredCompactionOutcome::Applied { .. }
+        | StoredCompactionOutcome::Failed { .. }
+        | StoredCompactionOutcome::Cancelled { .. } => Ok(()),
+    }
+}
+
+fn stored_compaction_attempts(outcome: &StoredCompactionOutcome) -> &[StoredAttemptAccounting] {
+    match outcome {
+        StoredCompactionOutcome::Applied { attempts, .. }
+        | StoredCompactionOutcome::Failed { attempts, .. }
+        | StoredCompactionOutcome::Cancelled { attempts, .. } => attempts,
+    }
+}
+
+fn decode_compaction_outcome(outcome: &StoredCompactionOutcome) -> CompactionOutcome {
+    match outcome {
+        StoredCompactionOutcome::Applied {
+            summary,
+            first_retained,
+            context_tokens,
+            reason,
+            attempts,
+        } => CompactionOutcome::Applied {
+            summary: summary.clone(),
+            first_retained: SessionEntryId(*first_retained),
+            context_tokens: *context_tokens,
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+        StoredCompactionOutcome::Failed {
+            diagnostic,
+            reason,
+            attempts,
+        } => CompactionOutcome::Failed {
+            diagnostic: diagnostic.clone(),
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+        StoredCompactionOutcome::Cancelled { reason, attempts } => CompactionOutcome::Cancelled {
+            reason: decode_compaction_reason(reason),
+            attempts: attempts.iter().map(decode_attempt).collect(),
+        },
+    }
+}
+
+fn decode_compaction_reason(reason: &StoredCompactionReason) -> CompactionReason {
+    match reason {
+        StoredCompactionReason::Manual => CompactionReason::Manual,
+        StoredCompactionReason::AutomaticThreshold => CompactionReason::AutomaticThreshold,
+        StoredCompactionReason::ContextOverflow => CompactionReason::ContextOverflow,
+    }
+}
+
+fn encode_compaction_reason(reason: CompactionReason) -> StoredCompactionReason {
+    match reason {
+        CompactionReason::Manual => StoredCompactionReason::Manual,
+        CompactionReason::AutomaticThreshold => StoredCompactionReason::AutomaticThreshold,
+        CompactionReason::ContextOverflow => StoredCompactionReason::ContextOverflow,
     }
 }
 
@@ -637,14 +772,16 @@ pub(super) fn encode_task_details(record: &TaskRecord) -> Result<String, CodecEr
         executions: record
             .executions()
             .iter()
-            .map(|execution| StoredTaskExecution {
-                model_step: execution.model_step(),
-                source: execution.source().to_owned(),
-                reasoning_summary: execution.reasoning_summary().to_owned(),
-                execution: encode_execution_value(execution.execution()),
-                attempts: execution.attempts().iter().map(encode_attempt).collect(),
+            .map(|execution| {
+                Ok(StoredTaskExecution {
+                    model_step: execution.model_step(),
+                    source: execution.source().to_owned(),
+                    reasoning_summary: execution.reasoning_summary().to_owned(),
+                    execution: encode_execution_value(execution.execution())?,
+                    attempts: execution.attempts().iter().map(encode_attempt).collect(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, CodecError>>()?,
         outcome: record.outcome().map(|outcome| match outcome {
             TaskOutcome::Completed(result) => StoredTaskOutcome::Completed {
                 message: result.message().to_owned(),
@@ -746,6 +883,43 @@ fn decode_task_details(value: &str) -> Result<StoredTaskDetails, CodecError> {
     serde_json::from_str(value).map_err(CodecError::from)
 }
 
+pub(super) fn encode_compaction(outcome: &CompactionOutcome) -> Result<StoredEntry, CodecError> {
+    let compaction = match outcome {
+        CompactionOutcome::Applied {
+            summary,
+            first_retained,
+            context_tokens,
+            reason,
+            attempts,
+        } => StoredCompactionOutcome::Applied {
+            summary: summary.clone(),
+            first_retained: first_retained.0,
+            context_tokens: *context_tokens,
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        CompactionOutcome::Failed {
+            diagnostic,
+            reason,
+            attempts,
+        } => StoredCompactionOutcome::Failed {
+            diagnostic: diagnostic.clone(),
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+        CompactionOutcome::Cancelled { reason, attempts } => StoredCompactionOutcome::Cancelled {
+            reason: encode_compaction_reason(*reason),
+            attempts: attempts.iter().map(encode_attempt).collect(),
+        },
+    };
+    validate_stored_compaction(&compaction)?;
+    Ok(StoredEntry {
+        kind: "compaction",
+        payload_json: serde_json::to_string(&StoredPayload::Compaction { compaction })?,
+        provider_replay: None,
+    })
+}
+
 pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, CodecError> {
     let execution = code
         .execution
@@ -755,7 +929,7 @@ pub(super) fn encode_execution(code: &PersistedCode) -> Result<StoredEntry, Code
         kind: "execution",
         payload_json: serde_json::to_string(&StoredPayload::Execution {
             code: encode_code(code),
-            execution: encode_execution_value(execution),
+            execution: encode_execution_value(execution)?,
         })?,
         provider_replay: Some(encode_replay(&code.replay)?),
     })
@@ -779,7 +953,7 @@ pub(super) fn encode_terminal(
     Ok(StoredEntry {
         kind,
         payload_json: serde_json::to_string(&StoredPayload::Terminal {
-            terminal: encode_terminal_value(terminal),
+            terminal: encode_terminal_value(terminal)?,
             code: code.map(|code| {
                 let mut code = encode_code(code);
                 code.attempts.clear();
@@ -923,8 +1097,8 @@ fn decode_code_result(result: &StoredCodeResult) -> CodeResult {
     }
 }
 
-fn encode_execution_value(execution: &Execution) -> StoredExecution {
-    StoredExecution {
+fn encode_execution_value(execution: &Execution) -> Result<StoredExecution, CodecError> {
+    Ok(StoredExecution {
         stdout: encode_observation(&execution.stdout),
         stderr: encode_observation(&execution.stderr),
         outcome: match &execution.outcome {
@@ -937,7 +1111,9 @@ fn encode_execution_value(execution: &Execution) -> StoredExecution {
             },
         },
         tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
-    }
+        read_paths: encode_effect_paths(&execution.read_paths)?,
+        modified_paths: encode_effect_paths(&execution.modified_paths)?,
+    })
 }
 
 fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, CodecError> {
@@ -961,7 +1137,54 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
             .iter()
             .map(decode_tool_call)
             .collect::<Result<Vec<_>, _>>()?,
+        read_paths: decode_effect_paths(&execution.read_paths)?,
+        modified_paths: decode_effect_paths(&execution.modified_paths)?,
     })
+}
+
+fn encode_effect_paths(paths: &[PathBuf]) -> Result<Vec<String>, CodecError> {
+    paths
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|path| {
+            if !normalised_workspace_relative(path) {
+                return Err(CodecError::InvalidExecutionPath);
+            }
+            encode_path(path)
+        })
+        .collect()
+}
+
+fn decode_effect_paths(paths: &[String]) -> Result<Vec<PathBuf>, CodecError> {
+    let paths = paths
+        .iter()
+        .map(|path| {
+            let path = decode_path(path)?;
+            normalised_workspace_relative(&path)
+                .then_some(path)
+                .ok_or(CodecError::InvalidExecutionPath)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+        .then_some(paths)
+        .ok_or(CodecError::InvalidExecutionPath)
+}
+
+fn normalised_workspace_relative(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    let mut normalised = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return false;
+        };
+        normalised.push(component);
+    }
+    normalised.as_os_str() == path.as_os_str()
 }
 
 fn encode_observation(observation: &Observation) -> StoredObservation {
@@ -1093,8 +1316,8 @@ fn decode_tool_call_summary(summary: &StoredToolCallSummary) -> ToolCallSummary 
     }
 }
 
-fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
-    match terminal {
+fn encode_terminal_value(terminal: &PersistedTerminal) -> Result<StoredTerminal, CodecError> {
+    Ok(match terminal {
         PersistedTerminal::Final {
             text,
             reasoning_summary,
@@ -1106,7 +1329,7 @@ fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
         PersistedTerminal::Cancelled { evidence, attempts } => StoredTerminal::Cancelled {
-            evidence: evidence.as_ref().map(encode_evidence),
+            evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
         PersistedTerminal::Failed {
@@ -1115,24 +1338,24 @@ fn encode_terminal_value(terminal: &PersistedTerminal) -> StoredTerminal {
             attempts,
         } => StoredTerminal::Failed {
             message: message.clone(),
-            evidence: evidence.as_ref().map(encode_evidence),
+            evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
         },
-    }
+    })
 }
 
-fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
+fn encode_evidence(evidence: &TerminalEvidence) -> Result<StoredTerminalEvidence, CodecError> {
     match evidence {
-        TerminalEvidence::Generation(evidence) => {
-            StoredTerminalEvidence::Generation(StoredGenerationEvidence {
+        TerminalEvidence::Generation(evidence) => Ok(StoredTerminalEvidence::Generation(
+            StoredGenerationEvidence {
                 reasoning_summary: evidence.reasoning_summary.clone(),
                 reasoning: evidence.reasoning.clone(),
                 assistant_text: evidence.assistant_text.clone(),
                 decoded_python: evidence.decoded_python.clone(),
-            })
-        }
-        TerminalEvidence::Execution(evidence) => {
-            StoredTerminalEvidence::Execution(Box::new(StoredExecutionEvidence {
+            },
+        )),
+        TerminalEvidence::Execution(evidence) => Ok(StoredTerminalEvidence::Execution(Box::new(
+            StoredExecutionEvidence {
                 source: evidence.source.clone(),
                 commentary: evidence.commentary.clone(),
                 reasoning_summary: evidence.reasoning_summary.clone(),
@@ -1140,6 +1363,8 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
                 stdout: encode_observation(&evidence.stdout),
                 stderr: encode_observation(&evidence.stderr),
                 tool_calls: evidence.tool_calls.iter().map(encode_tool_call).collect(),
+                read_paths: encode_effect_paths(&evidence.read_paths)?,
+                modified_paths: encode_effect_paths(&evidence.modified_paths)?,
                 cancellation_warning: evidence.cancellation_warning.clone(),
                 failure: evidence.failure.as_ref().map(|failure| match failure {
                     ExecutionFailure::Arena { message } => StoredExecutionFailure::Arena {
@@ -1152,8 +1377,8 @@ fn encode_evidence(evidence: &TerminalEvidence) -> StoredTerminalEvidence {
                         }
                     }
                 }),
-            }))
-        }
+            },
+        ))),
     }
 }
 
@@ -1180,6 +1405,8 @@ fn decode_evidence(evidence: &StoredTerminalEvidence) -> Result<TerminalEvidence
                     .iter()
                     .map(decode_tool_call)
                     .collect::<Result<Vec<_>, _>>()?,
+                read_paths: decode_effect_paths(&evidence.read_paths)?,
+                modified_paths: decode_effect_paths(&evidence.modified_paths)?,
                 cancellation_warning: evidence.cancellation_warning.clone(),
                 failure: evidence.failure.as_ref().map(|failure| match failure {
                     StoredExecutionFailure::Arena { message } => ExecutionFailure::Arena {
@@ -1403,18 +1630,118 @@ mod tests {
     use super::{
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
         decode_path, decode_session_preferences, decode_task_details, decode_task_record_details,
-        decode_tool_value, decoded_execution_history, decoded_readable_execution,
-        decoded_readable_terminal, decoded_terminal_history, encode_checkpoint, encode_execution,
-        encode_execution_value, encode_path, encode_request, encode_session_preferences,
-        encode_task_details, encode_terminal, encode_tool_value, fail_unfinished_task_details,
+        decode_tool_value, decoded_compaction, decoded_execution_history,
+        decoded_readable_execution, decoded_readable_terminal, decoded_terminal_history,
+        encode_checkpoint, encode_compaction, encode_execution, encode_execution_value,
+        encode_path, encode_request, encode_session_preferences, encode_task_details,
+        encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
         ModelSelection, SessionPreferences,
         models::{SOL, TERRA},
     };
+    use crate::model::{AttemptAccounting, ModelUsage};
+    use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
     use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
+
+    #[test]
+    fn compaction_codec_round_trips_attempts_and_rejects_invalid_payloads() {
+        let usage = ModelUsage {
+            model: "openai/gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(1),
+            cached_input_tokens: Some(2),
+            cache_write_input_tokens: Some(3),
+            output_tokens: Some(4),
+            reasoning_output_tokens: Some(5),
+            total_tokens: Some(6),
+        };
+        let attempts = vec![
+            AttemptAccounting::KnownUsage(usage.clone()),
+            AttemptAccounting::KnownUsageWithUntrackedRetries(usage),
+            AttemptAccounting::UsageUnavailable,
+        ];
+        let outcomes = [
+            CompactionOutcome::Applied {
+                summary: "summary".to_owned(),
+                first_retained: SessionEntryId(42),
+                context_tokens: 1_500,
+                reason: CompactionReason::Manual,
+                attempts: attempts.clone(),
+            },
+            CompactionOutcome::Failed {
+                diagnostic: "diagnostic".to_owned(),
+                reason: CompactionReason::AutomaticThreshold,
+                attempts: attempts.clone(),
+            },
+            CompactionOutcome::Cancelled {
+                reason: CompactionReason::ContextOverflow,
+                attempts,
+            },
+        ];
+
+        for outcome in outcomes {
+            let stored = encode_compaction(&outcome).expect("encode compaction");
+            let decoded =
+                decode_entry(stored.kind, &stored.payload_json).expect("decode compaction outcome");
+            assert_eq!(decoded_compaction(&decoded), Some(outcome));
+            assert!(decode_entry("execution", &stored.payload_json).is_err());
+        }
+
+        for diagnostic in ["x".repeat(4_096), "é".repeat(2_048)] {
+            let outcome = CompactionOutcome::Failed {
+                diagnostic: diagnostic.clone(),
+                reason: CompactionReason::Manual,
+                attempts: Vec::new(),
+            };
+            let stored = encode_compaction(&outcome).expect("encode boundary diagnostic");
+            let decoded = decode_entry(stored.kind, &stored.payload_json)
+                .expect("decode boundary diagnostic");
+            assert_eq!(decoded_compaction(&decoded), Some(outcome));
+        }
+
+        let applied = encode_compaction(&CompactionOutcome::Applied {
+            summary: "summary".to_owned(),
+            first_retained: SessionEntryId(42),
+            context_tokens: 1,
+            reason: CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode applied compaction");
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&applied.payload_json).expect("decode applied JSON");
+        invalid["Compaction"]["compaction"]["first_retained"] = serde_json::json!(0);
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        invalid["Compaction"]["compaction"]["first_retained"] = serde_json::json!(42);
+        invalid["Compaction"]["compaction"]["reason"] = serde_json::json!("unknown");
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        invalid["Compaction"]["compaction"]["reason"] = serde_json::json!("manual");
+        invalid["Compaction"]["compaction"]["diagnostic"] = serde_json::json!("forbidden");
+        assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+
+        let failed = encode_compaction(&CompactionOutcome::Failed {
+            diagnostic: "diagnostic".to_owned(),
+            reason: CompactionReason::Manual,
+            attempts: Vec::new(),
+        })
+        .expect("encode failed compaction");
+        for diagnostic in ["x".repeat(4_097), "é".repeat(2_049)] {
+            let mut invalid: serde_json::Value =
+                serde_json::from_str(&failed.payload_json).expect("decode failed JSON");
+            invalid["Compaction"]["compaction"]["diagnostic"] = serde_json::json!(diagnostic);
+            assert!(decode_entry("compaction", &invalid.to_string()).is_err());
+        }
+        assert!(
+            encode_compaction(&CompactionOutcome::Failed {
+                diagnostic: "x".repeat(4_097),
+                reason: CompactionReason::Manual,
+                attempts: Vec::new(),
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn session_preferences_codec_round_trips_and_rejects_invalid_metadata() {
@@ -1488,12 +1815,60 @@ mod tests {
                 omitted_bytes: 9,
             }),
             tool_calls: Vec::new(),
+            read_paths: Vec::new(),
+            modified_paths: Vec::new(),
         };
 
         assert_eq!(
-            decode_execution_value(&encode_execution_value(&execution)).expect("decode execution"),
+            decode_execution_value(&encode_execution_value(&execution).expect("encode execution"))
+                .expect("decode execution"),
             execution
         );
+    }
+
+    #[test]
+    fn execution_file_path_codec_sorts_deduplicates_and_rejects_malformed_paths() {
+        let mut execution = task_execution();
+        execution.read_paths = vec![
+            PathBuf::from("nested/z"),
+            PathBuf::from("a-b"),
+            PathBuf::from("a/b"),
+            PathBuf::from("nested/a"),
+            PathBuf::from("nested/z"),
+        ];
+        execution.modified_paths = vec![PathBuf::from("nested/b")];
+        let stored = encode_execution_value(&execution).expect("encode execution");
+        let decoded = decode_execution_value(&stored).expect("decode execution");
+        assert_eq!(
+            decoded.read_paths,
+            [
+                PathBuf::from("a/b"),
+                PathBuf::from("a-b"),
+                PathBuf::from("nested/a"),
+                PathBuf::from("nested/z"),
+            ]
+        );
+        assert_eq!(decoded.modified_paths, [PathBuf::from("nested/b")]);
+
+        for paths in [
+            serde_json::json!(["2e2f6e65737465642f61"]),
+            serde_json::json!(["6e65737465642f61", "6e65737465642f61"]),
+            serde_json::json!(["612d62", "612f62"]),
+            serde_json::json!(["not-hex"]),
+        ] {
+            let mut value = serde_json::to_value(&stored).expect("serialise execution");
+            value["read_paths"] = paths;
+            let stored: super::StoredExecution =
+                serde_json::from_value(value).expect("decode stored execution");
+            assert!(decode_execution_value(&stored).is_err());
+        }
+
+        let mut value = serde_json::to_value(&stored).expect("serialise execution");
+        value
+            .as_object_mut()
+            .expect("stored execution object")
+            .remove("modified_paths");
+        assert!(serde_json::from_value::<super::StoredExecution>(value).is_err());
     }
 
     #[test]
@@ -1538,6 +1913,8 @@ mod tests {
                     stdout: execution.stdout.clone(),
                     stderr: execution.stderr.clone(),
                     tool_calls: execution.tool_calls.clone(),
+                    read_paths: execution.read_paths.clone(),
+                    modified_paths: execution.modified_paths.clone(),
                     cancellation_warning: None,
                     failure: None,
                 },
@@ -1626,6 +2003,8 @@ mod tests {
                 tool: crate::arena::ToolName::Run,
                 summary: crate::arena::ToolCallSummary::Exit(7),
             }],
+            read_paths: vec![PathBuf::from("nested/read")],
+            modified_paths: vec![PathBuf::from("nested/modified")],
         };
         let attempts = vec![
             crate::model::AttemptAccounting::KnownUsageWithUntrackedRetries(
@@ -1723,6 +2102,8 @@ mod tests {
                     stdout: execution.stdout.clone(),
                     stderr: execution.stderr.clone(),
                     tool_calls: execution.tool_calls.clone(),
+                    read_paths: execution.read_paths.clone(),
+                    modified_paths: execution.modified_paths.clone(),
                     cancellation_warning: Some("cancelled".to_owned()),
                     failure: Some(crate::agent::ExecutionFailure::RecoveryFailed {
                         original: "original".to_owned(),
@@ -1851,6 +2232,8 @@ mod tests {
             },
             outcome: ExecutionOutcome::Complete { result: None },
             tool_calls: Vec::new(),
+            read_paths: vec![PathBuf::from("nested/read")],
+            modified_paths: vec![PathBuf::from("nested/modified")],
         }
     }
 
@@ -1948,6 +2331,26 @@ mod tests {
         assert_eq!(details.executions[0].source, "value = 1");
         assert_eq!(details.executions[0].reasoning_summary, "reasoning");
         assert_eq!(details.executions[0].execution.stdout.head, "stdout");
+        assert_eq!(
+            details.executions[0].execution.read_paths,
+            ["6e65737465642f72656164"]
+        );
+        assert_eq!(
+            details.executions[0].execution.modified_paths,
+            ["6e65737465642f6d6f646966696564"]
+        );
+        let restored = decode_task_record_details(
+            &encode_task_details(&record).expect("encode child task execution"),
+        )
+        .expect("decode child task execution");
+        assert_eq!(
+            restored.details.executions[0].execution().read_paths,
+            [PathBuf::from("nested/read")]
+        );
+        assert_eq!(
+            restored.details.executions[0].execution().modified_paths,
+            [PathBuf::from("nested/modified")]
+        );
         assert!(matches!(
             details.executions[0].execution.outcome,
             super::StoredExecutionOutcome::Complete { result: None }

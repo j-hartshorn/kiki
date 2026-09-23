@@ -31,6 +31,7 @@ use crate::runtime::{
 use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
+use crate::session::{CompactionOutcome, CompactionReason};
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 
 #[derive(Clone, Copy)]
@@ -68,6 +69,14 @@ enum RunState {
     Active(RunId),
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum CompactionState {
+    #[default]
+    Idle,
+    Pending,
+    Active,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DisplayedRecord {
     record: StoredRecord,
@@ -95,6 +104,29 @@ struct SubagentFinishedCard {
     outcome: String,
     measures: String,
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactionCard {
+    heading: String,
+    collapsed: String,
+    expanded: CompactionContent,
+    accounting: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompactionContent {
+    Markdown(String),
+    Plain(String),
+}
+
+impl CompactionContent {
+    fn normalise(self) -> Self {
+        match self {
+            Self::Markdown(text) => Self::Markdown(normalise_terminal_text(&text)),
+            Self::Plain(text) => Self::Plain(normalise_terminal_text(&text)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +222,7 @@ enum TranscriptBlock {
     },
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
+    Compaction(CompactionCard),
     Reasoning {
         markdown: String,
     },
@@ -246,6 +279,7 @@ enum NormalisedBlock {
     },
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
+    Compaction(CompactionCard),
     Reasoning {
         markdown: String,
     },
@@ -307,6 +341,14 @@ impl TranscriptBlock {
                         .map(|message| bounded_terminal_text(&message, 4 * 1024)),
                 })
             }
+            Self::Compaction(card) => NormalisedBlock::Compaction(CompactionCard {
+                heading: normalise_terminal_text(&card.heading),
+                collapsed: normalise_terminal_text(&card.collapsed),
+                expanded: card.expanded.normalise(),
+                accounting: card
+                    .accounting
+                    .map(|accounting| normalise_terminal_text(&accounting)),
+            }),
             Self::Reasoning { markdown } => NormalisedBlock::Reasoning {
                 markdown: normalise_terminal_text(&markdown),
             },
@@ -1394,6 +1436,7 @@ impl NormalisedBlock {
             Self::User { request } => request.clone(),
             Self::SubagentSpawned(card) => subagent_spawned_plain_text(card),
             Self::SubagentFinished(card) => subagent_finished_plain_text(card),
+            Self::Compaction(card) => format!("{}\n{}", card.heading, card.collapsed),
             Self::Arena(arena) => arena.plain_text(),
             Self::Status { text } => text.clone(),
             Self::SessionRestored => "Session restored.".to_owned(),
@@ -2002,6 +2045,7 @@ impl SettledBlock {
             NormalisedBlock::Arena(..)
                 | NormalisedBlock::SubagentSpawned(..)
                 | NormalisedBlock::SubagentFinished(..)
+                | NormalisedBlock::Compaction(..)
         )
     }
 }
@@ -2231,6 +2275,7 @@ struct PendingSubagentBlock {
 pub(crate) struct Transcript {
     startup: Option<StartupSnapshot>,
     run_state: RunState,
+    compaction_state: CompactionState,
     disabled_reason: Option<RuntimeDisabledReason>,
     latest_run_id: Option<RunId>,
     settled_run_ids: Vec<RunId>,
@@ -2258,6 +2303,7 @@ impl Default for Transcript {
         Self {
             startup: None,
             run_state: RunState::Idle,
+            compaction_state: CompactionState::Idle,
             disabled_reason: None,
             latest_run_id: None,
             settled_run_ids: Vec::new(),
@@ -2349,7 +2395,10 @@ impl Transcript {
     }
 
     pub(crate) fn begin_submission(&mut self) -> bool {
-        if self.disabled_reason.is_some() || self.run_state != RunState::Idle {
+        if self.disabled_reason.is_some()
+            || self.run_state != RunState::Idle
+            || self.compaction_state != CompactionState::Idle
+        {
             return false;
         }
         self.run_state = RunState::Submitting;
@@ -2357,7 +2406,15 @@ impl Transcript {
     }
 
     pub(crate) fn is_idle(&self) -> bool {
-        self.run_state == RunState::Idle
+        self.run_state == RunState::Idle && self.compaction_state == CompactionState::Idle
+    }
+
+    pub(crate) fn has_foreground_compaction(&self) -> bool {
+        self.compaction_state != CompactionState::Idle
+    }
+
+    pub(crate) fn has_active_run(&self) -> bool {
+        self.run_state != RunState::Idle
     }
 
     pub(crate) fn is_generating(&self) -> bool {
@@ -2366,6 +2423,10 @@ impl Transcript {
                 .live_step
                 .as_ref()
                 .is_some_and(|live| live.phase == LivePhase::Generating)
+    }
+
+    pub(crate) fn is_compacting(&self) -> bool {
+        self.disabled_reason.is_none() && self.compaction_state == CompactionState::Active
     }
 
     pub(crate) fn is_disabled(&self) -> bool {
@@ -2578,15 +2639,41 @@ impl Transcript {
             }
             RuntimeEvent::SubagentOperationSettled { .. } => false,
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
+            RuntimeEvent::CompactionAcknowledged { acknowledgement } => match acknowledgement {
+                crate::runtime::CompactionAcknowledgement::Accepted
+                    if self.disabled_reason.is_none()
+                        && self.compaction_state == CompactionState::Idle =>
+                {
+                    self.compaction_state = CompactionState::Pending;
+                    true
+                }
+                crate::runtime::CompactionAcknowledgement::Disabled { reason } => {
+                    self.disable(reason, true)
+                }
+                crate::runtime::CompactionAcknowledgement::Busy
+                | crate::runtime::CompactionAcknowledgement::Accepted => false,
+            },
+            RuntimeEvent::CompactionLifecycle { lifecycle } => match lifecycle {
+                crate::runtime::CompactionLifecycle::Started
+                    if self.compaction_state == CompactionState::Pending =>
+                {
+                    self.compaction_state = CompactionState::Active;
+                    self.set_status("compacting context".to_owned())
+                }
+                crate::runtime::CompactionLifecycle::NoOp
+                | crate::runtime::CompactionLifecycle::Settled(_) => self.settle_compaction(),
+                crate::runtime::CompactionLifecycle::Started => false,
+            },
             RuntimeEvent::SettingsAccepted { .. }
             | RuntimeEvent::NameAccepted { .. }
             | RuntimeEvent::NavigationCompleted { .. }
             | RuntimeEvent::CorrectionCompleted { .. }
             | RuntimeEvent::TreeCatalogue { .. } => false,
-            RuntimeEvent::SubmissionRejectedBusy { active_run_id }
-                if self.disabled_reason.is_none()
-                    && (self.run_state == RunState::Submitting
-                        || self.run_state == RunState::Active(active_run_id)) =>
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: Some(active_run_id),
+            } if self.disabled_reason.is_none()
+                && (self.run_state == RunState::Submitting
+                    || self.run_state == RunState::Active(active_run_id)) =>
             {
                 self.latest_run_id = Some(
                     self.latest_run_id
@@ -2594,6 +2681,12 @@ impl Transcript {
                 );
                 self.run_state = RunState::Active(active_run_id);
                 self.set_status("busy".to_owned())
+            }
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            } if self.disabled_reason.is_none() && self.run_state == RunState::Submitting => {
+                self.run_state = RunState::Idle;
+                self.compaction_state != CompactionState::Idle || self.set_status("idle".to_owned())
             }
             RuntimeEvent::RuntimeDisabled { reason } => self.disable(reason, false),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
@@ -2912,13 +3005,18 @@ impl Transcript {
 
     fn footer(&self, context: Option<FooterContext>) -> Option<Footer> {
         let mut foreground_attempts = Vec::new();
+        let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
             append_record_attempts(&displayed.record.record, &mut foreground_attempts);
+            if !matches!(displayed.record.record, Record::Compaction { .. }) {
+                append_record_attempts(&displayed.record.record, &mut normal_foreground_attempts);
+            }
         }
         if let Some(live) = &self.live_step {
             foreground_attempts.extend(&live.settled_attempts);
+            normal_foreground_attempts.extend(&live.settled_attempts);
         }
-        let latest_foreground_attempt = foreground_attempts.last().copied();
+        let latest_foreground_attempt = normal_foreground_attempts.last().copied();
         let mut attempts = foreground_attempts;
         attempts.extend(
             self.subagent_records
@@ -2947,9 +3045,12 @@ impl Transcript {
         if submitting_cleared {
             self.run_state = RunState::Idle;
         }
+        let compaction_cleared = self.compaction_state != CompactionState::Idle;
+        self.compaction_state = CompactionState::Idle;
         let cards_released = self.release_pending_subagent_blocks();
         reason_changed
             | submitting_cleared
+            | compaction_cleared
             | cards_released
             | self.set_status(disabled_status(&reason).to_owned())
     }
@@ -3080,7 +3181,8 @@ impl Transcript {
             Record::UserRequest { .. }
             | Record::FinalMessage { .. }
             | Record::CancelledRun { .. }
-            | Record::FailedRun { .. } => None,
+            | Record::FailedRun { .. }
+            | Record::Compaction { .. } => None,
         };
         let settles_run = matches!(
             &record.record,
@@ -3124,7 +3226,7 @@ impl Transcript {
                 }
                 self.mark_terminal_run(record.run_id);
             }
-            Record::UserRequest { .. } => {}
+            Record::UserRequest { .. } | Record::Compaction { .. } => {}
         }
         let displayed = DisplayedRecord {
             record,
@@ -3162,7 +3264,21 @@ impl Transcript {
         let cards_flushed = self.flush_pending_subagent_blocks(run_id, None);
         state_changed
             | cards_flushed
-            | (self.disabled_reason.is_none() && self.set_status("idle".to_owned()))
+            | (self.disabled_reason.is_none()
+                && self.compaction_state == CompactionState::Idle
+                && self.set_status("idle".to_owned()))
+    }
+
+    fn settle_compaction(&mut self) -> bool {
+        if self.compaction_state == CompactionState::Idle {
+            return false;
+        }
+        self.compaction_state = CompactionState::Idle;
+        let mut changed = true;
+        changed |= self.disabled_reason.is_none()
+            && self.run_state == RunState::Idle
+            && self.set_status("idle".to_owned());
+        changed
     }
 
     fn mark_terminal_run(&mut self, run_id: RunId) {
@@ -3255,6 +3371,29 @@ fn build_render_block(
                 SUBAGENT_CARD_HORIZONTAL_PADDING,
                 1,
             )
+        }
+        NormalisedBlock::Compaction(card) => {
+            let style = card_style(COMPLETE_ARENA);
+            let mut text = if expand_arenas {
+                match &card.expanded {
+                    CompactionContent::Markdown(source) => markdown(
+                        source,
+                        #[cfg(test)]
+                        construction_counts,
+                    ),
+                    CompactionContent::Plain(source) => literal_text(source, style),
+                }
+            } else {
+                Text::raw(card.collapsed.clone())
+            };
+            text.lines.insert(0, Line::raw(card.heading.clone()));
+            if expand_arenas && let Some(accounting) = &card.accounting {
+                text.lines.push(accounting_line(
+                    accounting.clone(),
+                    muted_card_style(COMPLETE_ARENA),
+                ));
+            }
+            RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
         }
         NormalisedBlock::Reasoning { markdown: source } => {
             let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
@@ -3416,6 +3555,7 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
         Record::FinalMessage { terminal, .. }
         | Record::CancelledRun { terminal }
         | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
+        Record::Compaction { outcome } => attempts.extend(outcome.attempts()),
         Record::UserRequest { .. } => {}
     }
 }
@@ -3477,6 +3617,49 @@ fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
             terminal,
             displayed.progress_gap,
         ),
+        Record::Compaction { outcome } => {
+            vec![TranscriptBlock::Compaction(compaction_card(outcome))]
+        }
+    }
+}
+
+fn compaction_card(outcome: &CompactionOutcome) -> CompactionCard {
+    let heading = format!("compaction · {}", compaction_reason_label(outcome.reason()));
+    let accounting = step_accounting(outcome.attempts());
+    match outcome {
+        CompactionOutcome::Applied {
+            summary,
+            context_tokens,
+            ..
+        } => CompactionCard {
+            heading,
+            collapsed: format!(
+                "Compacted {} tokens · Ctrl-O to expand",
+                format_token_count(u128::from(*context_tokens))
+            ),
+            expanded: CompactionContent::Markdown(summary.clone()),
+            accounting,
+        },
+        CompactionOutcome::Failed { diagnostic, .. } => CompactionCard {
+            heading,
+            collapsed: "Failed · Ctrl-O to expand".to_owned(),
+            expanded: CompactionContent::Plain(diagnostic.clone()),
+            accounting,
+        },
+        CompactionOutcome::Cancelled { .. } => CompactionCard {
+            heading,
+            collapsed: "Cancelled · Ctrl-O to expand".to_owned(),
+            expanded: CompactionContent::Plain("Cancelled".to_owned()),
+            accounting,
+        },
+    }
+}
+
+pub(crate) fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+    match reason {
+        CompactionReason::Manual => "manual",
+        CompactionReason::AutomaticThreshold => "automatic threshold",
+        CompactionReason::ContextOverflow => "context overflow",
     }
 }
 
@@ -3900,7 +4083,7 @@ fn footer_accounting_fields(accounting: &SessionAccounting) -> Vec<String> {
     .collect()
 }
 
-fn format_token_count(value: u128) -> String {
+pub(crate) fn format_token_count(value: u128) -> String {
     const K: u128 = 1_000;
     const M: u128 = 1_000_000;
     if value < K {
@@ -4124,6 +4307,7 @@ pub(crate) fn normalise_terminal_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use ratatui::buffer::Buffer;
@@ -4138,7 +4322,7 @@ mod tests {
         NormalisedBlock, RenderBlock, SubagentCardPhase, SubagentFinishedCard, SubagentSpawnedCard,
         TEXT, Transcript, TranscriptBlock, TranscriptLayout, USER, assistant_text,
         format_footer_usd, format_token_count, markdown, muted_page_style, normalise_terminal_text,
-        own_styled_text, page_style, subagent_preview, tool_call_label,
+        own_styled_text, page_style, step_accounting, subagent_preview, tool_call_label,
     };
     use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
     use crate::arena::{
@@ -4151,10 +4335,12 @@ mod tests {
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
-        ModelStepId, Record, RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent,
-        RuntimeInitialState, StoredRecord, TerminalDetails,
+        CompactionAcknowledgement, CompactionLifecycle, CompactionSettlement, ModelStepId, Record,
+        RestoredTimelineItem, RunId, RuntimeDisabledReason, RuntimeEvent, RuntimeInitialState,
+        StoredRecord, TerminalDetails,
     };
     use crate::selection::{DocumentPosition, Selection};
+    use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
     use crate::subagents::TaskRecord;
 
     #[test]
@@ -4175,6 +4361,148 @@ mod tests {
             false,
         ));
         assert!(transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn compaction_busy_releases_submitting_without_clearing_foreground_state() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.begin_submission());
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+
+        assert!(transcript.apply(
+            RuntimeEvent::SubmissionRejectedBusy {
+                active_run_id: None,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "compacting context");
+        assert!(!transcript.begin_submission());
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Cancelled),
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
+    }
+
+    #[test]
+    fn compaction_lifecycle_owns_foreground_state_without_a_run() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionAcknowledged {
+                acknowledgement: CompactionAcknowledgement::Accepted,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "idle");
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "compacting context");
+
+        assert!(transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Applied),
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
+        assert_eq!(transcript.status(), "idle");
+
+        assert!(!transcript.apply(
+            RuntimeEvent::CompactionLifecycle {
+                lifecycle: CompactionLifecycle::Started,
+            },
+            false,
+        ));
+        assert!(transcript.is_idle());
+    }
+
+    #[test]
+    fn compaction_cards_expand_durable_content_before_accounting() {
+        let attempts = vec![usage(3, 2)];
+        let accounting = step_accounting(&attempts).expect("known usage accounting");
+        let cases = [
+            (
+                CompactionOutcome::Applied {
+                    summary: "## Applied detail\n\n[guide](https://example.com)".to_owned(),
+                    first_retained: SessionEntryId(4),
+                    context_tokens: 1_250,
+                    reason: CompactionReason::Manual,
+                    attempts: attempts.clone(),
+                },
+                "Compacted 1.25k tokens · Ctrl-O to expand",
+                "guide (https://example.com)",
+                true,
+            ),
+            (
+                CompactionOutcome::Failed {
+                    diagnostic: "first line\n[plain](https://example.com)".to_owned(),
+                    reason: CompactionReason::AutomaticThreshold,
+                    attempts: attempts.clone(),
+                },
+                "Failed · Ctrl-O to expand",
+                "[plain](https://example.com)",
+                true,
+            ),
+            (
+                CompactionOutcome::Cancelled {
+                    reason: CompactionReason::ContextOverflow,
+                    attempts: attempts.clone(),
+                },
+                "Cancelled · Ctrl-O to expand",
+                "Cancelled",
+                false,
+            ),
+        ];
+
+        for (outcome, collapsed_line, expanded_content, hides_expanded_content) in cases {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id: RunId(3),
+                        record: Record::Compaction { outcome },
+                    },
+                    progress_gap: false,
+                },
+                false,
+            );
+
+            let collapsed = rendered_layout_text(&mut transcript);
+            assert!(collapsed.contains("compaction ·"), "{collapsed}");
+            assert!(collapsed.contains(collapsed_line), "{collapsed}");
+            if hides_expanded_content {
+                assert!(!collapsed.contains(expanded_content), "{collapsed}");
+            }
+            assert!(!collapsed.contains(&accounting), "{collapsed}");
+
+            assert!(transcript.toggle_arena_expansion());
+            let expanded = rendered_layout_text(&mut transcript);
+            assert!(expanded.contains(expanded_content), "{expanded}");
+            assert!(expanded.contains(&accounting), "{expanded}");
+        }
     }
 
     #[test]
@@ -4214,7 +4542,7 @@ mod tests {
         assert!(replacement.begin_submission());
         assert!(replacement.apply(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(2),
+                active_run_id: Some(RunId(2)),
             },
             false,
         ));
@@ -5446,6 +5774,8 @@ mod tests {
                             result: Some(observation("42")),
                         },
                         tool_calls: Vec::new(),
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts,
                 },
@@ -5476,6 +5806,8 @@ mod tests {
                             result: Some(observation("result")),
                         },
                         tool_calls,
+                        read_paths: Vec::new(),
+                        modified_paths: Vec::new(),
                     },
                     attempts: Vec::new(),
                 },
@@ -6436,6 +6768,8 @@ store: false disables retained Response objects but does not prevent user reques
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "failure body".to_owned(),
                                     }),
@@ -6523,6 +6857,8 @@ warning body"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![usage(1, 1)],
                     },
@@ -7279,6 +7615,40 @@ truncated"
     }
 
     #[test]
+    fn footer_counts_compaction_attempts_without_replacing_normal_context_measurement() {
+        let normal = detailed_usage(Some(100), Some(10), Some(75), Some(0), Some(0), Some(110));
+        let summary = detailed_usage(Some(20), Some(5), Some(5), Some(0), Some(0), Some(25));
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            completed_execution(1, 1, "normal()", "", vec![normal]),
+            false,
+        );
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::Compaction {
+                        outcome: CompactionOutcome::Applied {
+                            summary: "summary".to_owned(),
+                            first_retained: SessionEntryId(2),
+                            context_tokens: 1,
+                            reason: CompactionReason::Manual,
+                            attempts: vec![summary],
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let footer = footer_text(&transcript.layout(128)).expect("footer");
+        assert!(footer.contains("↑120 ↓15 R80 W0"), "{footer}");
+        assert!(footer.contains("CH75.0%"), "{footer}");
+        assert!(!footer.contains("CH25.0%"), "{footer}");
+    }
+
+    #[test]
     fn footer_uses_the_latest_settled_attempt_during_streaming() {
         let first = detailed_usage(
             Some(100_000),
@@ -7903,6 +8273,44 @@ truncated"
     }
 
     #[test]
+    fn execution_paths_remain_private_in_collapsed_and_expanded_cards() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        commentary: None,
+                        source: "pass".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::Complete { result: None },
+                            tool_calls: Vec::new(),
+                            read_paths: vec![PathBuf::from("private/effect-sentinel")],
+                            modified_paths: vec![PathBuf::from("private/mutation-sentinel")],
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        for expanded in [false, true] {
+            if expanded {
+                assert!(transcript.toggle_arena_expansion());
+            }
+            let rendered = rendered_layout_text(&mut transcript);
+            assert!(!rendered.contains("private/effect-sentinel"));
+            assert!(!rendered.contains("private/mutation-sentinel"));
+        }
+    }
+
+    #[test]
     fn projection_formats_execution_and_interrupted_evidence() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -7922,6 +8330,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -7948,6 +8358,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "interrupted".to_owned(),
                                     }),
@@ -8085,6 +8497,7 @@ truncated"
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
+                TranscriptBlock::Compaction(..) => "compaction",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
@@ -8202,6 +8615,7 @@ truncated"
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
+                TranscriptBlock::Compaction(..) => "compaction",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
@@ -8336,6 +8750,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -8366,6 +8782,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             failure: None,
                             cancellation_warning: None,
                         }))),
@@ -8583,6 +9001,8 @@ truncated"
                                 result: Some(observation("**literal result**")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::UsageUnavailable],
                     },
@@ -8660,6 +9080,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![AttemptAccounting::KnownUsage(ModelUsage {
                             model: hostile.to_owned(),
@@ -8730,6 +9152,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::RecoveryFailed {
                                         original: hostile.to_owned(),
                                         recovery: hostile.to_owned(),
@@ -9158,6 +9582,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9189,6 +9615,8 @@ truncated"
                                 result: Some(observation("done")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9264,6 +9692,8 @@ truncated"
                                 result: Some(observation("result-tail")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9382,6 +9812,8 @@ truncated"
                                 result: Some(observation("done")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -9448,6 +9880,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10216,6 +10650,8 @@ truncated"
                                 result: Some(observation("UVW")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10288,6 +10724,8 @@ truncated"
                                 omitted_bytes: 0,
                             }),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10310,6 +10748,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             cancellation_warning: Some("cancelled".to_owned()),
                             failure: None,
                         }))),
@@ -10331,6 +10771,8 @@ truncated"
                             stdout: observation(""),
                             stderr: observation(""),
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                             cancellation_warning: None,
                             failure: Some(ExecutionFailure::Arena {
                                 message: "failed".to_owned(),
@@ -10419,6 +10861,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: vec![usage(1, 1)],
                     },
@@ -10470,6 +10914,8 @@ truncated"
                                 result: Some(observation("fourth")),
                             },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10510,6 +10956,8 @@ truncated"
                                         tool: ToolName::Read,
                                         summary: ToolCallSummary::Failed,
                                     }],
+                                    read_paths: Vec::new(),
+                                    modified_paths: Vec::new(),
                                     failure: Some(ExecutionFailure::Arena {
                                         message: "failure".to_owned(),
                                     }),
@@ -10586,6 +11034,8 @@ truncated"
                             stderr: observation(""),
                             outcome: ExecutionOutcome::Complete { result: None },
                             tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
                         },
                         attempts: Vec::new(),
                     },
@@ -10797,7 +11247,7 @@ truncated"
         assert_eq!(transcript.status(), "read · 12 bytes");
         transcript.apply(
             RuntimeEvent::SubmissionRejectedBusy {
-                active_run_id: RunId(3),
+                active_run_id: Some(RunId(3)),
             },
             false,
         );

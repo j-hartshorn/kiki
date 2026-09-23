@@ -2,6 +2,7 @@ use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
+    Compact,
     Model,
     Name,
     Tree,
@@ -15,7 +16,12 @@ struct Command {
     action: Action,
 }
 
-const CATALOGUE: [Command; 4] = [
+const CATALOGUE: [Command; 5] = [
+    Command {
+        token: "/compact",
+        purpose: "Compact context",
+        action: Action::Compact,
+    },
     Command {
         token: "/model",
         purpose: "Choose model",
@@ -150,6 +156,22 @@ mod tests {
     use super::{Action, Completion, parse, recognised_token_range};
 
     #[test]
+    fn compact_preserves_optional_focus_text() {
+        for (draft, focus) in [
+            ("/compact", ""),
+            ("/compact \t ", ""),
+            (
+                "/compact  preserve the Python state \t",
+                "preserve the Python state",
+            ),
+        ] {
+            let command = parse(draft).expect("recognised compact command");
+            assert_eq!(command.action, Action::Compact);
+            assert_eq!(command.argument, focus);
+        }
+    }
+
+    #[test]
     fn completion_rows_keep_catalogue_order_and_purposes() {
         let mut completion = Completion::default();
         completion.sync("/", true);
@@ -161,6 +183,7 @@ mod tests {
                 .map(|row| (row.token, row.purpose))
                 .collect::<Vec<_>>(),
             [
+                ("/compact", "Compact context"),
                 ("/model", "Choose model"),
                 ("/name", "Name session"),
                 ("/thinking", "Choose thinking level"),
@@ -172,6 +195,13 @@ mod tests {
     #[test]
     fn exact_parsing_keeps_existing_arguments_and_token_ranges() {
         for (draft, action, argument, token_range) in [
+            ("/compact", Action::Compact, "", 0..8),
+            (
+                "/compact  focus Python state\t",
+                Action::Compact,
+                "focus Python state",
+                0..8,
+            ),
             ("/model", Action::Model, "", 0..6),
             ("/model  terra\t", Action::Model, "terra", 0..6),
             ("/name  A session  ", Action::Name, "A session", 0..5),
@@ -190,6 +220,7 @@ mod tests {
             " /model",
             "/Model",
             "/models",
+            "/compact-more",
             "/namex",
             "/thinking-more",
             "/tree-more",
@@ -205,7 +236,12 @@ mod tests {
     fn completion_requires_a_strict_prefix_at_the_end_of_a_single_line() {
         let mut completion = Completion::default();
         for (draft, caret_at_end, expected) in [
-            ("/", true, vec!["/model", "/name", "/thinking", "/tree"]),
+            (
+                "/",
+                true,
+                vec!["/compact", "/model", "/name", "/thinking", "/tree"],
+            ),
+            ("/co", true, vec!["/compact"]),
             ("/mo", true, vec!["/model"]),
             ("/model", true, vec![]),
             ("/model ", true, vec![]),
@@ -233,9 +269,9 @@ mod tests {
     fn completion_selects_the_first_match_preserves_it_or_resets_and_clamps() {
         let mut completion = Completion::default();
         completion.sync("/", true);
-        assert_eq!(completion.selected_token(), Some("/model"));
+        assert_eq!(completion.selected_token(), Some("/compact"));
         assert!(completion.move_selection(1));
-        assert_eq!(completion.selected_token(), Some("/name"));
+        assert_eq!(completion.selected_token(), Some("/model"));
 
         completion.sync("/n", true);
         assert_eq!(completion.selected_token(), Some("/name"));

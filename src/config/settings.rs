@@ -19,6 +19,8 @@ use super::{
 };
 
 const MAX_DOCUMENT_PROBLEMS: usize = 3;
+const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
+const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
 const PROJECT_SETTINGS_LABEL: &str = "project settings file `.kiki/config.toml`";
 const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
@@ -109,6 +111,38 @@ impl fmt::Display for SettingsOrigin {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionSettings {
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_COMPACTION_RESERVE_TOKENS,
+            DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+        )
+    }
+}
+
+impl CompactionSettings {
+    pub(crate) fn new(reserve_tokens: u64, keep_recent_tokens: u64) -> Self {
+        Self {
+            reserve_tokens,
+            keep_recent_tokens,
+        }
+    }
+
+    pub(crate) fn reserve_tokens(self) -> u64 {
+        self.reserve_tokens
+    }
+
+    pub(crate) fn keep_recent_tokens(self) -> u64 {
+        self.keep_recent_tokens
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SettingsContext {
     user_path: Option<PathBuf>,
@@ -117,6 +151,7 @@ pub(crate) struct SettingsContext {
     favourites: Option<Vec<&'static ModelConfiguration>>,
     thinking: BTreeMap<&'static str, PersistedThinking>,
     environment_thinking_model: Option<&'static str>,
+    compaction: CompactionSettings,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -141,6 +176,7 @@ impl fmt::Debug for SettingsContext {
                 "environment_thinking_model",
                 &self.environment_thinking_model,
             )
+            .field("compaction", &self.compaction)
             .finish()
     }
 }
@@ -166,6 +202,10 @@ impl SettingsContext {
 
     pub(crate) fn thinking_for(&self, model: &'static ModelConfiguration) -> Option<&'static str> {
         self.thinking.get(model.id).map(|selection| selection.value)
+    }
+
+    pub(crate) fn compaction(&self) -> CompactionSettings {
+        self.compaction
     }
 
     pub(crate) fn save_model(
@@ -392,6 +432,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
     let mut thinking = BTreeMap::new();
     let mut favourites = None;
     let mut subagents = SubagentSettings::default();
+    let mut compaction = CompactionSettings::default();
     apply_layer(
         user.as_ref(),
         SettingsOrigin::User,
@@ -401,6 +442,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut favourites,
         &mut subagents,
     );
+    apply_compaction_layer(user.as_ref(), &mut compaction);
     apply_layer(
         project.as_ref(),
         SettingsOrigin::Project,
@@ -410,6 +452,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut favourites,
         &mut subagents,
     );
+    apply_compaction_layer(project.as_ref(), &mut compaction);
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -505,6 +548,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             favourites,
             thinking,
             environment_thinking_model,
+            compaction,
         },
         problems,
     }
@@ -557,6 +601,18 @@ fn apply_layer(
     }
     if let Some(timeout) = settings.subagents.timeout {
         subagents.timeout = timeout;
+    }
+}
+
+fn apply_compaction_layer(settings: Option<&FileSettings>, compaction: &mut CompactionSettings) {
+    let Some(settings) = settings else {
+        return;
+    };
+    if let Some(reserve_tokens) = settings.compaction.reserve_tokens {
+        compaction.reserve_tokens = reserve_tokens;
+    }
+    if let Some(keep_recent_tokens) = settings.compaction.keep_recent_tokens {
+        compaction.keep_recent_tokens = keep_recent_tokens;
     }
 }
 
@@ -624,8 +680,9 @@ fn validate_document(
             "favourites" => validate_favourites(item, &mut settings.favourites, &mut problems),
             "thinking" => validate_thinking_table(item, &mut settings.thinking, &mut problems),
             "subagents" => validate_subagents_table(item, &mut settings.subagents, &mut problems),
+            "compaction" => validate_compaction_table(item, &mut settings.compaction, &mut problems),
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `[thinking]`, and `[subagents]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `[thinking]`, `[subagents]`, and `[compaction]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -772,6 +829,56 @@ fn validate_subagents_table(
     }
 }
 
+fn validate_compaction_table(
+    item: &Item,
+    compaction: &mut FileCompactionSettings,
+    problems: &mut DocumentProblems,
+) {
+    let Some(table) = item.as_table() else {
+        problems.push(
+            "field `compaction` must be a TOML table",
+            "Use [compaction] with supported settings, then restart Kiki.",
+        );
+        return;
+    };
+
+    for (key, item) in table.iter() {
+        match key {
+            "reserve_tokens" => {
+                compaction.reserve_tokens = positive_compaction_tokens(item, key, problems);
+            }
+            "keep_recent_tokens" => {
+                compaction.keep_recent_tokens = positive_compaction_tokens(item, key, problems);
+            }
+            _ => problems.push(
+                "table `compaction` contains an unknown key; only `reserve_tokens` and `keep_recent_tokens` are allowed",
+                "Remove the unknown key from table `compaction`, then restart Kiki.",
+            ),
+        }
+    }
+}
+
+fn positive_compaction_tokens(
+    item: &Item,
+    field: &str,
+    problems: &mut DocumentProblems,
+) -> Option<u64> {
+    match item
+        .as_integer()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+    {
+        Some(value) => Some(value),
+        None => {
+            problems.push(
+                format!("field `compaction.{field}` must be a positive integer"),
+                "Set it to a positive integer, then restart Kiki.",
+            );
+            None
+        }
+    }
+}
+
 fn positive_subagent_counter(
     item: &Item,
     field: &str,
@@ -855,6 +962,7 @@ struct FileSettings {
     favourites: Option<Vec<&'static ModelConfiguration>>,
     thinking: BTreeMap<&'static str, &'static str>,
     subagents: FileSubagentSettings,
+    compaction: FileCompactionSettings,
 }
 
 #[derive(Default)]
@@ -864,6 +972,12 @@ struct FileSubagentSettings {
     max_starts_per_run: Option<usize>,
     max_depth: Option<usize>,
     timeout: Option<Duration>,
+}
+
+#[derive(Default)]
+struct FileCompactionSettings {
+    reserve_tokens: Option<u64>,
+    keep_recent_tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1071,6 +1185,139 @@ mod tests {
                 .contains("low, medium, high, xhigh, max")
         );
         assert!(!problem.diagnostic().contains("none,"));
+    }
+
+    #[test]
+    fn compaction_defaults_and_project_fields_override_user_fields() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        let default_policy = defaults.context().compaction();
+        assert_eq!(default_policy.reserve_tokens(), 16_384);
+        assert_eq!(default_policy.keep_recent_tokens(), 20_000);
+        assert!(defaults.problems().is_empty());
+
+        write_settings(
+            home.path(),
+            "[compaction]\nreserve_tokens = 1024\nkeep_recent_tokens = 2048\n",
+        );
+        write_settings(project.path(), "[compaction]\nreserve_tokens = 4096\n");
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let policy = resolution.context().compaction();
+
+        assert_eq!(policy.reserve_tokens(), 4096);
+        assert_eq!(policy.keep_recent_tokens(), 2048);
+        assert!(resolution.problems().is_empty());
+    }
+
+    #[test]
+    fn compaction_settings_require_a_table_of_positive_integers() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for field in ["reserve_tokens", "keep_recent_tokens"] {
+            for value in ["\"8\"", "false", "1.5", "[8]", "0", "-1"] {
+                write_settings(home.path(), &format!("[compaction]\n{field} = {value}\n"));
+                let resolution = resolve(input(Some(home.path()), Some(project.path())));
+                let policy = resolution.context().compaction();
+
+                assert_eq!(policy.reserve_tokens(), 16_384, "{field} = {value}");
+                assert_eq!(policy.keep_recent_tokens(), 20_000, "{field} = {value}");
+                assert_eq!(
+                    resolution.problems()[0].kind(),
+                    crate::config::StartupProblemKind::UserSettingsInvalid,
+                    "{field} = {value}"
+                );
+                assert!(
+                    resolution.problems()[0]
+                        .diagnostic()
+                        .contains(&format!("compaction.{field}")),
+                    "{field} = {value}"
+                );
+            }
+        }
+
+        for content in [
+            "compaction = true\n",
+            "compaction = {}\n",
+            "[[compaction]]\n",
+        ] {
+            write_settings(home.path(), content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(
+                resolution.context().compaction(),
+                super::CompactionSettings::default()
+            );
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{content}"
+            );
+            assert!(
+                resolution.problems()[0]
+                    .diagnostic()
+                    .contains("field `compaction`")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_compaction_layers_are_discarded_and_overflow_is_malformed() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(project.path(), "[compaction]\nkeep_recent_tokens = 2048\n");
+        for unknown in ["enabled", "other"] {
+            write_settings(
+                home.path(),
+                &format!(
+                    "model = \"openai/gpt-5.6-terra\"\n\n[compaction]\nreserve_tokens = 1024\n{unknown} = true\n"
+                ),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+            let policy = resolution.context().compaction();
+
+            assert_eq!(resolution.model().id, SOL.id, "{unknown}");
+            assert_eq!(policy.reserve_tokens(), 16_384, "{unknown}");
+            assert_eq!(policy.keep_recent_tokens(), 2048, "{unknown}");
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{unknown}"
+            );
+            assert!(
+                resolution.problems()[0]
+                    .diagnostic()
+                    .contains("unknown key")
+            );
+        }
+
+        for content in [
+            "[compaction]\nreserve_tokens = 9223372036854775808\n",
+            "[compaction\nreserve_tokens = 1024\n",
+        ] {
+            write_settings(home.path(), content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(resolution.context().compaction().reserve_tokens(), 16_384);
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsMalformed,
+                "{content}"
+            );
+        }
+
+        write_settings(
+            home.path(),
+            "[compaction]\nreserve_tokens = 9223372036854775807\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            resolution.context().compaction().reserve_tokens(),
+            9_223_372_036_854_775_807
+        );
+        assert!(resolution.problems().is_empty());
     }
 
     #[test]
