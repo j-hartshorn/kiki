@@ -8,8 +8,7 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
     InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
-use crate::compaction::CompactionPolicy;
-use crate::config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
+use crate::config::{CompactionSettings, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
@@ -617,7 +616,7 @@ impl<M: Model> Agent<M> {
 
     pub(crate) async fn compact_manual(
         &mut self,
-        policy: CompactionPolicy,
+        policy: CompactionSettings,
         selection: ModelSelection,
         focus: String,
         cancellation: &CancellationToken,
@@ -1438,8 +1437,7 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
-    use crate::compaction::CompactionPolicy;
-    use crate::config::{DEFAULT_MODEL, ModelSelection, models::SOL};
+    use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection, models::SOL};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -1697,7 +1695,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         seed_compactable_history(&writer).await;
-        let policy = CompactionPolicy::new(16_384, 20_000);
+        let policy = CompactionSettings::new(16_384, 20_000);
         assert_eq!(
             writer
                 .prepare_compaction(
@@ -1766,7 +1764,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         seed_compactable_history(&writer).await;
-        let policy = CompactionPolicy::new(16_384, 20_000);
+        let policy = CompactionSettings::new(16_384, 20_000);
         let expected_requests = writer
             .prepare_compaction(
                 policy,
@@ -1871,7 +1869,7 @@ mod tests {
 
         let result = agent
             .compact_manual(
-                CompactionPolicy::new(16_384, 20_000),
+                CompactionSettings::new(16_384, 20_000),
                 selection,
                 String::new(),
                 &cancellation,

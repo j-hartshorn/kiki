@@ -20,9 +20,9 @@ use tokio::task;
 use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{
-    CompactedSummary, CompactionError, CompactionPolicy, SelectedAncestryFact, SelectedAncestryKind,
+    CompactedSummary, CompactionError, SelectedAncestryFact, SelectedAncestryKind,
 };
-use crate::config::{ModelSelection, SessionPreferences};
+use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
@@ -944,7 +944,7 @@ impl SessionWriter {
 
     pub(crate) async fn prepare_compaction(
         &self,
-        policy: CompactionPolicy,
+        policy: CompactionSettings,
         selection: ModelSelection,
         focus: String,
         reason: CompactionReason,
@@ -10162,7 +10162,7 @@ mod tests {
 
         let preparation = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 6),
+                crate::config::CompactionSettings::new(100, 6),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10366,7 +10366,7 @@ mod tests {
         let attempts_a = vec![crate::model::AttemptAccounting::UsageUnavailable];
         let preparation_a = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10424,7 +10424,7 @@ mod tests {
         )];
         let preparation_b = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10539,7 +10539,7 @@ mod tests {
             let parent_history = writer.model_history().expect("read parent context");
             let preparation = writer
                 .prepare_compaction(
-                    crate::compaction::CompactionPolicy::new(100, 4),
+                    crate::config::CompactionSettings::new(100, 4),
                     selection(),
                     String::new(),
                     super::CompactionReason::ContextOverflow,
@@ -10609,7 +10609,7 @@ mod tests {
         append_cancelled_request(&writer, "retained request").await;
         let preparation = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10696,7 +10696,7 @@ mod tests {
         append_cancelled_request(&writer, "retained request").await;
         let preparation = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10790,7 +10790,7 @@ mod tests {
         append_cancelled_request(&writer, "retained request").await;
         let preparation = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,
@@ -10861,7 +10861,7 @@ mod tests {
         append_cancelled_request(&writer, "retained request").await;
         let preparation = writer
             .prepare_compaction(
-                crate::compaction::CompactionPolicy::new(100, 4),
+                crate::config::CompactionSettings::new(100, 4),
                 selection(),
                 String::new(),
                 super::CompactionReason::Manual,

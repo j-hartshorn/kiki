@@ -14,7 +14,7 @@ pub use models::{
     DEFAULT_MODEL, ModelConfiguration, ModelPricing, ModelSelection, PricingIdentity, Rates,
     model_by_id,
 };
-pub(crate) use settings::SessionPreferences;
+pub(crate) use settings::{CompactionSettings, SessionPreferences};
 
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
 const KIKI_MODEL_ENV: &str = "KIKI_MODEL";

@@ -119,14 +119,21 @@ pub(crate) struct CompactionSettings {
 
 impl Default for CompactionSettings {
     fn default() -> Self {
-        Self {
-            reserve_tokens: DEFAULT_COMPACTION_RESERVE_TOKENS,
-            keep_recent_tokens: DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
-        }
+        Self::new(
+            DEFAULT_COMPACTION_RESERVE_TOKENS,
+            DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+        )
     }
 }
 
 impl CompactionSettings {
+    pub(crate) fn new(reserve_tokens: u64, keep_recent_tokens: u64) -> Self {
+        Self {
+            reserve_tokens,
+            keep_recent_tokens,
+        }
+    }
+
     pub(crate) fn reserve_tokens(self) -> u64 {
         self.reserve_tokens
     }

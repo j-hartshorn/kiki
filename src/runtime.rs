@@ -10,10 +10,9 @@ use crate::agent::{
     TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
-use crate::compaction::CompactionPolicy;
+use crate::config::{CompactionSettings, ModelSelection, settings::SettingsContext};
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
-use crate::config::{ModelSelection, settings::SettingsContext};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
     CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
@@ -381,7 +380,7 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_events: Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
     subagent_record_revisions: BTreeMap<TaskId, u64>,
     subagent_status_revisions: BTreeMap<TaskId, u64>,
-    compaction_policy: CompactionPolicy,
+    compaction_policy: CompactionSettings,
     pending_compaction: Option<PendingCompaction>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
@@ -751,10 +750,7 @@ impl<M: Model> RuntimeController<M> {
             subagents,
             subagent_record_revisions: BTreeMap::new(),
             subagent_status_revisions: BTreeMap::new(),
-            compaction_policy: CompactionPolicy::new(
-                compaction.reserve_tokens(),
-                compaction.keep_recent_tokens(),
-            ),
+            compaction_policy: compaction,
             pending_compaction: None,
             active: None,
             trace: Trace::disabled(),
@@ -874,10 +870,7 @@ impl<M: Model> RuntimeController<M> {
                 subagent_events,
                 subagent_record_revisions: BTreeMap::new(),
                 subagent_status_revisions: BTreeMap::new(),
-                compaction_policy: CompactionPolicy::new(
-                    compaction.reserve_tokens(),
-                    compaction.keep_recent_tokens(),
-                ),
+                compaction_policy: compaction,
                 pending_compaction: None,
                 active: None,
                 trace: Trace::disabled(),

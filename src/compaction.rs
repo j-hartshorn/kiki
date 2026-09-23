@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::config::ModelSelection;
+use crate::config::{CompactionSettings, ModelSelection};
 use crate::model::{
     AttemptAccounting, ModelContextEntry, SummaryRequest, canonical_compaction_summary,
 };
@@ -16,21 +16,6 @@ const HISTORY_OUTPUT_RATIO: u64 = 80;
 const SPLIT_OUTPUT_RATIO: u64 = 50;
 const FEEDBACK_SCALAR_LIMIT: usize = 2_000;
 const SPLIT_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompactionPolicy {
-    reserve_tokens: u64,
-    keep_recent_tokens: u64,
-}
-
-impl CompactionPolicy {
-    pub(crate) fn new(reserve_tokens: u64, keep_recent_tokens: u64) -> Self {
-        Self {
-            reserve_tokens,
-            keep_recent_tokens,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectedAncestryFact {
@@ -148,7 +133,7 @@ pub(crate) enum CompactionError {
 
 pub(crate) fn prepare(
     facts: &[SelectedAncestryFact],
-    policy: CompactionPolicy,
+    policy: CompactionSettings,
     selection: ModelSelection,
     focus: &str,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
@@ -156,7 +141,8 @@ pub(crate) fn prepare(
     let projected = projected_context_indices(facts, latest)?;
     let context_tokens = measure_context(facts, &projected, latest);
     let start = latest.map_or(0, |applied| applied.boundary_index);
-    let Some(first_retained_index) = first_retained_index(facts, start, policy.keep_recent_tokens)
+    let Some(first_retained_index) =
+        first_retained_index(facts, start, policy.keep_recent_tokens())
     else {
         return Ok(None);
     };
@@ -182,7 +168,7 @@ pub(crate) fn prepare(
                     history_input("", Some(&previous), compaction_update_prompt(), focus),
                     selection,
                     output_budget(
-                        policy.reserve_tokens,
+                        policy.reserve_tokens(),
                         HISTORY_OUTPUT_RATIO,
                         selection.model().max_output_tokens,
                     ),
@@ -205,7 +191,7 @@ pub(crate) fn prepare(
             ),
             selection,
             output_budget(
-                policy.reserve_tokens,
+                policy.reserve_tokens(),
                 HISTORY_OUTPUT_RATIO,
                 selection.model().max_output_tokens,
             ),
@@ -218,7 +204,7 @@ pub(crate) fn prepare(
             split_input(&blocks, focus),
             selection,
             output_budget(
-                policy.reserve_tokens,
+                policy.reserve_tokens(),
                 SPLIT_OUTPUT_RATIO,
                 selection.model().max_output_tokens,
             ),
@@ -755,9 +741,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CompactionError, CompactionPolicy, SPLIT_SEPARATOR, SelectedAncestryFact,
-        SelectedAncestryKind, estimate_tokens, output_budget, prepare, serialise_entry,
-        strip_reserved_blocks, truncate_feedback,
+        CompactionError, SPLIT_SEPARATOR, SelectedAncestryFact, SelectedAncestryKind,
+        estimate_tokens, output_budget, prepare, serialise_entry, strip_reserved_blocks,
+        truncate_feedback,
     };
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::model::{
@@ -770,8 +756,8 @@ mod tests {
         ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap()
     }
 
-    fn policy(keep_recent_tokens: u64) -> CompactionPolicy {
-        CompactionPolicy::new(100, keep_recent_tokens)
+    fn policy(keep_recent_tokens: u64) -> crate::config::CompactionSettings {
+        crate::config::CompactionSettings::new(100, keep_recent_tokens)
     }
 
     fn context(
