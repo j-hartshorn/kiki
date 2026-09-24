@@ -365,6 +365,10 @@ impl OpenAiModel {
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
+                if matches!(&error, OpenAIError::Reqwest(error) if error.is_request() && !error.is_connect())
+                {
+                    return Err(self.stream_failure(error));
+                }
                 return Err(AttemptFailure::Terminal {
                     error: ModelError::Provider(Box::new(self.provider_failure(error))),
                     accounting: Box::new(AttemptAccounting::UsageUnavailable),
@@ -868,6 +872,10 @@ impl OpenAiModel {
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
+                if matches!(&error, OpenAIError::Reqwest(error) if error.is_request() && !error.is_connect())
+                {
+                    return Err(self.stream_failure(error));
+                }
                 return Err(AttemptFailure::Terminal {
                     error: ModelError::Provider(Box::new(self.provider_failure(error))),
                     accounting: Box::new(AttemptAccounting::UsageUnavailable),
@@ -2621,6 +2629,7 @@ mod tests {
             body: String,
         },
         AbruptSse(&'static str),
+        CloseBeforeHeaders,
         GatedSse {
             body: &'static str,
             allow: Arc<Notify>,
@@ -2838,6 +2847,7 @@ mod tests {
                 write_chunked_headers(stream).await;
                 write_chunk(stream, body).await;
             }
+            FixtureReply::CloseBeforeHeaders => {}
             FixtureReply::GatedSse { body, allow } => {
                 allow.notified().await;
                 let response = format!(
@@ -3365,6 +3375,75 @@ mod tests {
             assert_eq!(starts(&progress), vec![1]);
             assert_eq!(settles(&progress), vec![1]);
             assert_eq!(failure.provider_failure().unwrap().status(), Some(429));
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        }
+
+        #[tokio::test]
+        async fn opening_transport_disconnect_restarts_the_model_step() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::CloseBeforeHeaders,
+                FixtureReply::Sse(COMPLETED_STREAM),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture).await;
+            let step = result.expect("opening transport disconnect should restart");
+
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(starts(&progress), vec![1, 2]);
+            assert_eq!(settles(&progress), vec![1, 2]);
+            assert!(matches!(
+                step.attempts.as_slice(),
+                [
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::KnownUsageWithUntrackedRetries(_)
+                ]
+            ));
+        }
+
+        #[tokio::test]
+        async fn opening_transport_disconnects_stop_after_three_attempts() {
+            let fixture = Fixture::start(FixtureReply::CloseBeforeHeaders).await;
+
+            let (result, progress) = step(&fixture).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(starts(&progress), vec![1, 2, 3]);
+            assert_eq!(settles(&progress), vec![1, 2, 3]);
+            assert_eq!(
+                failure.to_string(),
+                "model provider failed: provider failure: provider transport failed"
+            );
+            assert_eq!(
+                failure.attempts(),
+                &[
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn exhausted_sdk_connection_retries_do_not_restart_the_model_step() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener);
+            let mut model = OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = Vec::new();
+            let failure = model
+                .step(&history(), &cancellation, &mut |event| progress.push(event))
+                .await
+                .unwrap_err();
+
+            assert_eq!(starts(&progress), vec![1]);
+            assert_eq!(settles(&progress), vec![1]);
+            assert_eq!(
+                failure.to_string(),
+                "model provider failed: provider failure: provider transport failed"
+            );
             assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
         }
 
@@ -5082,6 +5161,29 @@ mod tests {
             let result = summarise(&fixture, request(), &cancellation).await.unwrap();
 
             assert_eq!(result.text, "recovered summary");
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(
+                result.attempts,
+                [AttemptAccounting::UsageUnavailable, expected_accounting()]
+            );
+        }
+
+        #[tokio::test]
+        async fn summary_restarts_after_opening_transport_disconnect() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::CloseBeforeHeaders,
+                FixtureReply::OwnedSse(stream([completed_event(
+                    vec![message("recovered summary")],
+                    Some(usage()),
+                )])),
+            ])
+            .await;
+            let cancellation = CancellationToken::new();
+
+            let result = summarise(&fixture, request(), &cancellation)
+                .await
+                .expect("opening summary request should restart");
+
             assert_eq!(fixture.request_count(), 2);
             assert_eq!(
                 result.attempts,
