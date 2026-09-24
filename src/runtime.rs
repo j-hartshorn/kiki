@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
-use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
@@ -374,7 +374,7 @@ pub(crate) struct RuntimeController<M: Model> {
     disabled_reason: Option<RuntimeDisabledReason>,
     records: Vec<StoredRecord>,
     session: SessionWriter,
-    settings: watch::Sender<ModelSelection>,
+    selection: ModelSelection,
     accepted_thinking: AcceptedThinking,
     subagents: SessionSubagents,
     subagent_events: Option<mpsc::UnboundedReceiver<CoordinatorEvent>>,
@@ -731,20 +731,20 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
 impl<M: Model> RuntimeController<M> {
     pub(crate) fn with_session(
         agent: Agent<M>,
-        settings: watch::Sender<ModelSelection>,
+        selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
         session: SessionWriter,
     ) -> Self {
         let compaction = persisted_settings.compaction();
-        let accepted_thinking = AcceptedThinking::new(*settings.borrow(), persisted_settings, None);
+        let accepted_thinking = AcceptedThinking::new(selection, persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
         Self {
             agent: Some(agent),
             disabled_reason: None,
             records: Vec::new(),
             session,
-            settings,
+            selection,
             accepted_thinking,
             subagent_events: subagents.take_event_receiver(),
             subagents,
@@ -765,7 +765,7 @@ impl<M: Model> RuntimeController<M> {
         session: &Session,
         mut arena: crate::arena::Arena,
         model: M,
-        settings: watch::Sender<ModelSelection>,
+        selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
         relocated_cwd: Option<PathBuf>,
@@ -798,7 +798,7 @@ impl<M: Model> RuntimeController<M> {
         );
         let compaction = persisted_settings.compaction();
         let accepted_thinking = AcceptedThinking::new(
-            *settings.borrow(),
+            selection,
             persisted_settings,
             restore
                 .metadata
@@ -806,7 +806,6 @@ impl<M: Model> RuntimeController<M> {
                 .map(|metadata| metadata.preferences().clone()),
         );
         let agent = if let Some(state) = restore.executable {
-            let selection = *settings.borrow();
             if model.validate_history(&state.history, selection).is_ok()
                 && arena.restore(state.checkpoint.clone()).await.is_ok()
             {
@@ -864,7 +863,7 @@ impl<M: Model> RuntimeController<M> {
                 disabled_reason: initial.disabled_reason.clone(),
                 records,
                 session: session.writer(),
-                settings,
+                selection,
                 accepted_thinking,
                 subagents,
                 subagent_events,
@@ -886,12 +885,11 @@ impl<M: Model> RuntimeController<M> {
     #[cfg(test)]
     fn new_for_test(
         agent: Agent<M>,
-        settings: watch::Sender<ModelSelection>,
+        selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
     ) -> Self {
         let home = tempfile::tempdir().expect("create session home");
-        let selection = *settings.borrow();
         let session = crate::session::Session::create(
             home.path(),
             std::path::Path::new("/"),
@@ -901,7 +899,7 @@ impl<M: Model> RuntimeController<M> {
         .expect("create persisted runtime session");
         let mut controller = Self::with_session(
             agent,
-            settings,
+            selection,
             persisted_settings,
             subagents,
             session.writer(),
@@ -928,22 +926,21 @@ impl<M: Model> RuntimeController<M> {
     #[cfg(test)]
     pub(crate) fn new(
         agent: Agent<M>,
-        settings: watch::Sender<ModelSelection>,
+        selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
     ) -> Self {
-        Self::new_for_test(agent, settings, persisted_settings, subagents)
+        Self::new_for_test(agent, selection, persisted_settings, subagents)
     }
 
     #[cfg(test)]
     fn for_test(agent: Agent<M>) -> Self {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
             .expect("default model selection must be valid");
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         Self::new_for_test(
             agent,
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -953,13 +950,10 @@ impl<M: Model> RuntimeController<M> {
     }
 
     #[cfg(test)]
-    fn with_settings(mut self, settings: watch::Sender<ModelSelection>) -> Self {
-        self.accepted_thinking = AcceptedThinking::new(
-            *settings.borrow(),
-            self.accepted_thinking.persisted_settings(),
-            None,
-        );
-        self.settings = settings;
+    fn with_selection(mut self, selection: ModelSelection) -> Self {
+        self.accepted_thinking =
+            AcceptedThinking::new(selection, self.accepted_thinking.persisted_settings(), None);
+        self.selection = selection;
         self
     }
 
@@ -1166,7 +1160,7 @@ impl<M: Model> RuntimeController<M> {
                     return;
                 }
                 self.accepted_thinking.accept(selection);
-                self.settings.send_replace(selection);
+                self.selection = selection;
                 self.emit(events, RuntimeEvent::SettingsAccepted { revision });
             }
             RuntimeCommand::SetSessionName { name, revision } => {
@@ -1258,7 +1252,7 @@ impl<M: Model> RuntimeController<M> {
             return (NavigationOutcome::Failed, None);
         };
         if agent
-            .validate_restored_history(&executable.history, *self.settings.borrow())
+            .validate_restored_history(&executable.history, self.selection)
             .is_err()
         {
             return (NavigationOutcome::Failed, None);
@@ -1513,7 +1507,7 @@ impl<M: Model> RuntimeController<M> {
         let writer = self.session.clone();
         let cancellation_for_worker = cancellation.clone();
         let policy = self.compaction_policy;
-        let selection = *self.settings.borrow();
+        let selection = self.selection;
         let (sender, worker) = mpsc::unbounded_channel();
         let (_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
@@ -1569,7 +1563,7 @@ impl<M: Model> RuntimeController<M> {
         let cancellation = self.subagents.storage_failure_token().child_token();
         let cancellation_for_worker = cancellation.clone();
         let writer = self.session.clone();
-        let selection = *self.settings.borrow();
+        let selection = self.selection;
         let (sender, worker) = mpsc::unbounded_channel();
         let (progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
@@ -2299,7 +2293,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(unix)]
     use tokio::net::UnixListener;
-    use tokio::sync::{Notify, mpsc, oneshot, watch};
+    use tokio::sync::{Notify, mpsc, oneshot};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -2457,10 +2451,9 @@ mod tests {
             crate::config::DEFAULT_MODEL.default_thinking,
         )
         .unwrap();
-        let (settings, _) = watch::channel(selection);
         RuntimeController::new_for_test(
             Agent::new(arena, model),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             subagents,
         )
@@ -3218,14 +3211,13 @@ mod tests {
                 .await
                 .expect("close seeded run");
         }
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
                 ScriptedModel::new(Vec::new()).with_summary_responses(vec!["summary".to_owned()]),
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -3378,11 +3370,10 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         seed_compactable_history(&writer).await;
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(arena, ScriptedModel::new(Vec::new())),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -3449,7 +3440,6 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         seed_compactable_history(&writer).await;
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -3459,7 +3449,7 @@ mod tests {
                     "split summary".to_owned(),
                 ]),
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -3561,7 +3551,6 @@ mod tests {
         }
         let run_started = Arc::new(Notify::new());
         let summary_requests = Arc::new(Mutex::new(Vec::new()));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -3571,7 +3560,7 @@ mod tests {
                     summary_requests: summary_requests.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -3687,7 +3676,6 @@ mod tests {
         }
         let run_started = Arc::new(Notify::new());
         let summary_requests = Arc::new(Mutex::new(Vec::new()));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -3697,7 +3685,7 @@ mod tests {
                     summary_requests: summary_requests.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -3840,7 +3828,6 @@ mod tests {
             };
             let terminal_leaf = active_entry_id(&session);
             let summary_requests = Arc::new(Mutex::new(Vec::new()));
-            let (settings, _) = watch::channel(selection);
             let snapshot = crate::config::ready_snapshot_for_test();
             let mut controller = RuntimeController::with_session(
                 Agent::new(
@@ -3850,7 +3837,7 @@ mod tests {
                         summary_requests: summary_requests.clone(),
                     },
                 ),
-                settings,
+                selection,
                 snapshot.settings().clone(),
                 SubagentCoordinator::new(
                     SubagentPolicy::from(snapshot.subagents()),
@@ -4018,7 +4005,6 @@ mod tests {
             }
             let run_started = Arc::new(Notify::new());
             let summary_requests = Arc::new(Mutex::new(Vec::new()));
-            let (settings, _) = watch::channel(selection);
             let snapshot = crate::config::ready_snapshot_for_test();
             let controller = RuntimeController::with_session(
                 Agent::new(
@@ -4028,7 +4014,7 @@ mod tests {
                         summary_requests: summary_requests.clone(),
                     },
                 ),
-                settings,
+                selection,
                 snapshot.settings().clone(),
                 SubagentCoordinator::new(
                     SubagentPolicy::from(snapshot.subagents()),
@@ -4166,7 +4152,6 @@ mod tests {
         seed_compactable_history(&writer).await;
         let run_started = Arc::new(Notify::new());
         let summary_requests = Arc::new(Mutex::new(Vec::new()));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4176,7 +4161,7 @@ mod tests {
                     summary_requests: summary_requests.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             coordinator,
             session.writer(),
@@ -4284,7 +4269,6 @@ mod tests {
         seed_compactable_history(&writer).await;
         let run_started = Arc::new(Notify::new());
         let summary_requests = Arc::new(Mutex::new(Vec::new()));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4294,7 +4278,7 @@ mod tests {
                     summary_requests: summary_requests.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -4378,7 +4362,6 @@ mod tests {
         let writer = session.writer();
         seed_compactable_history(&writer).await;
         let summary_started = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4388,7 +4371,7 @@ mod tests {
                     release: Arc::new(Notify::new()),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -4493,7 +4476,6 @@ mod tests {
                     )
                     .expect("reject compaction writes");
             }
-            let (settings, _) = watch::channel(selection);
             let snapshot = crate::config::ready_snapshot_for_test();
             let controller = RuntimeController::with_session(
                 Agent::new(
@@ -4503,7 +4485,7 @@ mod tests {
                         release: summary_release.clone(),
                     },
                 ),
-                settings,
+                selection,
                 snapshot.settings().clone(),
                 SubagentCoordinator::new(
                     SubagentPolicy::from(snapshot.subagents()),
@@ -4687,7 +4669,6 @@ mod tests {
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_called = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4697,7 +4678,7 @@ mod tests {
                     provider_called: provider_called.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -4801,7 +4782,6 @@ mod tests {
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_called = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4811,7 +4791,7 @@ mod tests {
                     provider_called: provider_called.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -4865,7 +4845,6 @@ mod tests {
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_called = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4876,7 +4855,7 @@ mod tests {
                     source: "value = 1".to_owned(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -4946,7 +4925,6 @@ mod tests {
         )
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -4955,7 +4933,7 @@ mod tests {
                     calls: calls.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5066,11 +5044,10 @@ mod tests {
             gate.clone(),
         )
         .unwrap();
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(arena, ClosureCommitProviderFailureModel { steps: 0 }),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5246,11 +5223,10 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session =
             Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(arena, OversizedProviderFailureModel),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5317,7 +5293,6 @@ mod tests {
         )
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5326,7 +5301,7 @@ mod tests {
                     calls: calls.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5438,7 +5413,6 @@ mod tests {
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_called = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5448,7 +5422,7 @@ mod tests {
                     provider_called: provider_called.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5590,7 +5564,6 @@ mod tests {
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let provider_called = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5600,7 +5573,7 @@ mod tests {
                     provider_called,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5693,7 +5666,6 @@ mod tests {
             )
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5704,7 +5676,7 @@ mod tests {
                     source: "await run(\"printf 'settled'\")".to_owned(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5799,7 +5771,6 @@ mod tests {
             )
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5808,7 +5779,7 @@ mod tests {
                     calls: calls.clone(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -5900,7 +5871,6 @@ mod tests {
                 "CREATE TRIGGER reject_task_admission BEFORE INSERT ON subagent_tasks BEGIN SELECT RAISE(ABORT, 'reject task'); END;",
             )
             .unwrap();
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -5912,7 +5882,7 @@ mod tests {
                     message_waiting: None,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -6016,7 +5986,6 @@ mod tests {
             release: Arc::new(Notify::new()),
             attempts: Vec::new(),
         };
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -6033,7 +6002,7 @@ mod tests {
                     message_waiting: None,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             complete_child_coordinator(factory.clone()),
             session.writer(),
@@ -6138,7 +6107,6 @@ mod tests {
         )
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -6148,7 +6116,7 @@ mod tests {
                     provider_called: Arc::new(Notify::new()),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -6537,7 +6505,6 @@ mod tests {
         let mut child_events = coordinator
             .take_event_receiver()
             .expect("reserve undrained child event receiver");
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
@@ -6554,7 +6521,7 @@ mod tests {
                     message_waiting: None,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             coordinator.clone(),
             session.writer(),
@@ -7418,7 +7385,6 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let allow_first_step = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -7432,7 +7398,7 @@ mod tests {
             },
         )
         .await
-        .with_settings(settings);
+        .with_selection(selection_a);
         let (commands, mut events, _progress, task) = start_controller(controller);
 
         commands
@@ -7542,7 +7508,6 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let first_started = Arc::new(Notify::new());
         let allow_first_step = Arc::new(Notify::new());
         let coordinator = SubagentCoordinator::new(
@@ -7559,7 +7524,7 @@ mod tests {
             coordinator.clone(),
         )
         .await
-        .with_settings(settings);
+        .with_selection(selection_a);
         let (commands, mut events, _progress, task) = start_controller(controller);
 
         commands
@@ -7658,8 +7623,6 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read initial metadata");
-        let (settings, _) = watch::channel(selection_a);
-        let settings_observer = settings.subscribe();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let snapshot = crate::config::ready_snapshot_for_test();
@@ -7671,7 +7634,7 @@ mod tests {
                     contexts,
                 },
             ),
-            settings,
+            selection_a,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -7690,7 +7653,6 @@ mod tests {
             .await
             .expect("send settings");
         gate.wait_until_started().await;
-        assert_eq!(*settings_observer.borrow(), selection_a);
         assert_eq!(
             accepted_thinking
                 .resolve(selection_a, Some(&TERRA))
@@ -7725,7 +7687,6 @@ mod tests {
             RuntimeEvent::SettingsAccepted { revision: 3 }
         );
         let settled = events_until_settled(&mut events).await;
-        assert_eq!(*settings_observer.borrow(), selection_b);
         assert_eq!(
             accepted_thinking
                 .resolve(selection_a, Some(&TERRA))
@@ -7792,11 +7753,10 @@ mod tests {
             gate.clone(),
         )
         .expect("create session");
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(arena, ScriptedModel::default()),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -7854,7 +7814,6 @@ mod tests {
         .expect("create arena");
         let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
             .expect("create session");
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let coordinator = complete_child_coordinator(factory.clone());
         let controller = RuntimeController::with_session(
@@ -7872,7 +7831,7 @@ mod tests {
                     message_waiting: None,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             coordinator.clone(),
             session.writer(),
@@ -8016,7 +7975,6 @@ mod tests {
             closure_gate.clone(),
         )
         .expect("create session");
-        let (settings, _) = watch::channel(selection_a);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -8026,7 +7984,7 @@ mod tests {
                     provider_called: provider_called.clone(),
                 },
             ),
-            settings.clone(),
+            selection_a,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -8084,7 +8042,6 @@ mod tests {
                 reason: RuntimeDisabledReason::SessionStorageWriteFailed,
             }
         );
-        assert_eq!(*settings.borrow(), selection_a);
         assert_eq!(
             accepted_thinking
                 .resolve(selection_a, Some(&TERRA))
@@ -8162,7 +8119,6 @@ mod tests {
             .commit_name("Saved session".to_owned())
             .await
             .expect("save session name");
-        let (settings, _) = watch::channel(effective);
         let snapshot = crate::config::ready_snapshot_for_test();
         let restore_session = Arc::clone(&session);
         let selections = Arc::new(Mutex::new(Vec::new()));
@@ -8175,7 +8131,7 @@ mod tests {
                 &restore_session,
                 arena,
                 model,
-                settings,
+                effective,
                 snapshot.settings().clone(),
                 SubagentCoordinator::new(
                     SubagentPolicy::from(snapshot.subagents()),
@@ -8253,7 +8209,6 @@ mod tests {
             )
             .expect("reject startup preference writes");
         let effective = ModelSelection::new(&TERRA, "high").expect("select Terra");
-        let (settings, _) = watch::channel(effective);
         let snapshot = crate::config::ready_snapshot_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
 
@@ -8263,7 +8218,7 @@ mod tests {
             CountingMessageModel {
                 calls: Arc::clone(&calls),
             },
-            settings,
+            effective,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -8368,7 +8323,6 @@ mod tests {
         .await
         .expect("create relocated arena");
         let effective = ModelSelection::new(&TERRA, "high").expect("select Terra");
-        let (settings, _) = watch::channel(effective);
         let snapshot = crate::config::ready_snapshot_for_test();
         let calls = Arc::new(AtomicUsize::new(0));
 
@@ -8378,7 +8332,7 @@ mod tests {
             CountingMessageModel {
                 calls: Arc::clone(&calls),
             },
-            settings,
+            effective,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -8565,7 +8519,6 @@ mod tests {
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
         let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
@@ -8576,7 +8529,7 @@ mod tests {
             },
         )
         .await
-        .with_settings(settings);
+        .with_selection(selection_a);
         let (commands, mut events, _progress, task) = start_controller(controller);
 
         for (selection, revision) in [(selection_b, 7), (selection_c, 8)] {
@@ -8640,7 +8593,6 @@ mod tests {
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
         let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let allow_first_step = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -8654,7 +8606,7 @@ mod tests {
             },
         )
         .await
-        .with_settings(settings);
+        .with_selection(selection_a);
         let (commands, mut events, _progress, task) = start_controller(controller);
 
         commands
@@ -8708,7 +8660,6 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
@@ -8720,7 +8671,7 @@ mod tests {
             },
         )
         .await
-        .with_settings(settings);
+        .with_selection(selection_a);
         let (commands, mut events, _progress, task) = start_controller(controller);
 
         commands
@@ -10628,7 +10579,6 @@ mod tests {
         let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
             .expect("create session");
         let ready = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -10638,7 +10588,7 @@ mod tests {
                     partial: false,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -10693,7 +10643,6 @@ mod tests {
         .expect("create session");
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let ready = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
@@ -10702,7 +10651,7 @@ mod tests {
                     partial: true,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -10834,7 +10783,6 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
             .expect("create session");
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -10843,7 +10791,7 @@ mod tests {
                     source: "print('before correction')\nawait read('blocked')".to_owned(),
                 }]),
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -10912,7 +10860,6 @@ mod tests {
             gate.clone(),
         )
         .expect("create session");
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -10922,7 +10869,7 @@ mod tests {
                     partial: false,
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -11020,11 +10967,10 @@ mod tests {
             .expect("create arena");
             let selection =
                 ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
-            let (settings, _) = watch::channel(selection);
             let mut controller = RuntimeController::new_for_test(
                 Agent::new(arena, ScriptedModel::new(Vec::new()))
                     .with_restore_test_gate(gate.clone()),
-                settings,
+                selection,
                 crate::config::ready_snapshot_for_test().settings().clone(),
                 SubagentCoordinator::new(
                     SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -11630,7 +11576,6 @@ mod tests {
         )
         .expect("create session");
         let ready = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
@@ -11639,7 +11584,7 @@ mod tests {
                     partial: false,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             coordinator.clone(),
             session.writer(),
@@ -11701,7 +11646,6 @@ mod tests {
         let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
             .expect("create session");
         let ready = Arc::new(Notify::new());
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
@@ -11710,7 +11654,7 @@ mod tests {
                     step: 0,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             coordinator.clone(),
             session.writer(),
@@ -12589,7 +12533,6 @@ mod tests {
         )
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let snapshot = crate::config::ready_snapshot_for_test();
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -12599,7 +12542,7 @@ mod tests {
                     source: "print('before')\nawait read('blocked')".to_owned(),
                 },
             ),
-            settings,
+            selection,
             snapshot.settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(snapshot.subagents()),
@@ -13158,10 +13101,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, _) = watch::channel(selection_a);
         let mut controller = controller(&workspace, Vec::new())
             .await
-            .with_settings(settings.clone());
+            .with_selection(selection_a);
         let (event_sender, mut events) = mpsc::unbounded_channel();
         let (progress_sender, _progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let mut progress = ProgressPublisher::new(progress_sender);
@@ -13183,7 +13125,7 @@ mod tests {
             controller.resolve_child_selection(selection_a, Some(&TERRA)),
             selection_b
         );
-        assert_eq!(*settings.borrow(), selection_b);
+        assert_eq!(controller.selection, selection_b);
         assert_eq!(
             events.recv().await,
             Some(RuntimeEvent::SettingsAccepted { revision: 1 })
@@ -13543,7 +13485,6 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let initial_selection = ModelSelection::new(&SOL, "high").unwrap();
         let changed_selection = ModelSelection::new(&TERRA, "low").unwrap();
-        let (settings, _) = watch::channel(initial_selection);
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let root_selections = Arc::new(Mutex::new(Vec::new()));
         let children = WorkflowChildFactory::new();
@@ -13559,7 +13500,7 @@ mod tests {
             coordinator.clone(),
         )
         .await
-        .with_settings(settings);
+        .with_selection(initial_selection);
         let (commands, mut events, mut progress, task) = start_controller(controller);
 
         commands
@@ -14232,7 +14173,6 @@ mod tests {
         .expect("create relocated arena");
         let calls = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
             restored_arena,
@@ -14246,7 +14186,7 @@ mod tests {
                 expected_runner_starts: Vec::new(),
                 step: 0,
             },
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -14774,7 +14714,6 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
         let start_gate = StartSubagentTestGate::new();
-        let (settings, _) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
             arena,
@@ -14800,7 +14739,7 @@ mod tests {
                 expected_runner_starts: vec![0, 1],
                 step: 0,
             },
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -14936,7 +14875,6 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session =
             Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
-        let (settings, _) = watch::channel(selection);
         let starts = Arc::new(AtomicUsize::new(0));
         let controller = RuntimeController::with_session(
             Agent::new(
@@ -14965,7 +14903,7 @@ mod tests {
                     step: 0,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -15104,7 +15042,6 @@ mod tests {
         )
         .await
         .expect("create navigation arena");
-        let (settings, _) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
             arena,
@@ -15112,7 +15049,7 @@ mod tests {
                 contexts: navigation_contexts.clone(),
                 step: 0,
             },
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -15634,7 +15571,6 @@ mod tests {
             .expect("restore old branch live state");
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let starts = Arc::new(AtomicUsize::new(0));
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 live_arena,
@@ -15643,7 +15579,7 @@ mod tests {
                     step: 0,
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -15843,11 +15779,10 @@ mod tests {
             .expect("request entry fits u64"),
         );
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
-        let (settings, _) = watch::channel(selection);
         let starts = Arc::new(AtomicUsize::new(0));
         let controller = RuntimeController::with_session(
             Agent::new(live_arena, ScriptedModel::new(Vec::new())),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -15974,10 +15909,9 @@ mod tests {
         gate: ArenaRestoreTestGate,
     ) -> RuntimeController<M> {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
-        let (settings, _) = watch::channel(selection);
         RuntimeController::with_session(
             Agent::new(arena, model).with_restore_test_gate(gate),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -16444,10 +16378,9 @@ mod tests {
             gate,
         )
         .expect("create session");
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(arena, model),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             subagents,
             session.writer(),
@@ -16714,11 +16647,10 @@ mod tests {
             )
             .expect("reject navigation selection");
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(live_arena, ScriptedModel::new(Vec::new()))
                 .with_restore_test_gate(gate.clone()),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -16818,7 +16750,6 @@ mod tests {
             .writer()
             .model_history()
             .expect("read selected branch context");
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(
                 live_arena,
@@ -16826,7 +16757,7 @@ mod tests {
                     calls: Arc::new(AtomicUsize::new(0)),
                 },
             ),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
@@ -16956,10 +16887,9 @@ mod tests {
             .expect("close request");
         set_active_entry_for_fixture(&session, root.0 as i64);
         drop(writer);
-        let (settings, _) = watch::channel(selection);
         let controller = RuntimeController::with_session(
             Agent::new(arena, ScriptedModel::new(Vec::new())),
-            settings,
+            selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
             SubagentCoordinator::new(
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),

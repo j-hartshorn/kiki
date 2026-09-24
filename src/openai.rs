@@ -2140,7 +2140,7 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep, sleep_until, timeout};
     use tokio_util::sync::CancellationToken;
@@ -6785,7 +6785,6 @@ mod tests {
                 configuration.snapshot().subagents(),
             )
         };
-        let (settings, _) = watch::channel(selection);
         let model = super::OpenAiModel::new(prompt, api_key.clone());
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
@@ -6802,7 +6801,7 @@ mod tests {
         );
         let runtime = crate::runtime::RuntimeController::new(
             crate::agent::Agent::new(arena, model),
-            settings,
+            selection,
             persisted_settings,
             subagents,
         );

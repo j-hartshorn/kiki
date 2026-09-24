@@ -26,7 +26,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::runtime::Builder;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::Agent;
@@ -237,7 +237,6 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let (settings, _) = watch::channel(selection);
     let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
     let api_key = ready.api_key().expose().to_owned();
@@ -268,7 +267,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     .with_trace(trace.clone());
     let controller = RuntimeController::with_session(
         Agent::new(arena, model),
-        settings,
+        selection,
         startup.settings().clone(),
         subagents,
         session.writer(),
@@ -336,7 +335,6 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let (settings, _) = watch::channel(selection);
     let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
     let api_key = ready.api_key().expose().to_owned();
@@ -374,7 +372,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         &session,
         arena,
         model,
-        settings,
+        selection,
         startup.settings().clone(),
         subagents,
         relocated_cwd,
