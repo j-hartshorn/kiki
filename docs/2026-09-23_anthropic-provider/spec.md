@@ -11,6 +11,7 @@ A credentialed probe on 23 September 2026 confirmed the Anthropic facts this spe
 ## Goals
 
 - Model selection (model plus thinking) is captured once per run. Changes made mid-run are accepted and saved, and apply from the next run.
+- The transcript shows where the effective selection changed between runs. The model never sees these cards.
 - `anthropic/claude-opus-5-5` and `anthropic/claude-fable-5-1` are selectable everywhere catalogue models are: settings, environment, pickers, favourites, subagents and session persistence.
 - Each provider's API key is optional. Kiki only requires the key for the effective selected model. Selecting a model without its key keeps the current model and shows an error; it never panics.
 - A session can switch between OpenAI and Anthropic between runs. Foreign steps are rendered from Kiki's semantic history. Reasoning goes inline as assistant text by default, or is dropped with `cross_provider_reasoning = "drop"`.
@@ -26,6 +27,8 @@ A credentialed probe on 23 September 2026 confirmed the Anthropic facts this spe
 - Environment variables, slash commands or picker controls for the two new settings. A settings menu comes later.
 - A dyn-compatible provider trait, or dynamic model discovery.
 - Mid-run model or thinking changes of any kind.
+- Making the selection branch state. `/tree` navigation doesn't change the current selection.
+- Showing model changes in `/tree`, or a card for a session's initial selection.
 
 ## Key discoveries
 
@@ -56,6 +59,19 @@ A credentialed probe on 23 September 2026 confirmed the Anthropic facts this spe
 ### Phase 1: selection per run
 
 The runtime captures the current `ModelSelection` when a run starts and gives it to the agent. `Model::step` and `Model::validate_history` take the selection explicitly, and models no longer hold a watch receiver. Restore and navigation validate history against the session's current selection (`src/runtime.rs:809,1261`; `src/agent.rs:585`). `ApplySettings` during a run still commits and acknowledges straight away; the new value is used from the next run. Compaction keeps using the selection in its `SummaryRequest`, and child agents keep their fixed selection.
+
+### Phase 1b: model change cards
+
+Each run saves the selection it used, which `start_run` already captures. It is passed to `SessionWriter::commit_request`, stored as `selection` on the `user_request` payload, and carried on `Record::UserRequest` and the restored user-request record as `Option<ModelSelection>`, where `None` means unknown. The model context builder never reads it. Every new run writes it. Only decoding an old payload that lacks the field (`#[serde(default)]`) produces `None`. The session format stays at version 2. `PersistedCode.selection` is removed: nothing reads it (it is only encoded and decoded, `src/session/codec.rs:1012,1024`), and since Phase 1 it always equals the run's selection. Old payloads that contain it still decode, because `StoredCode` accepts unknown fields.
+
+The transcript in `src/transcript.rs` derives **model change cards** with no stored card state. History cards come from the branch's user-request records as they are appended or restored. The pending card is evaluated at layout time from the branch's last run selection and the current selection, which `src/tui.rs` passes in alongside the footer context. Each card compares a previous selection with a next one, and is shown only when both are known and differ:
+
+- A **history card** sits above a run's request card. Previous is the prior run's selection on the branch, and next is this run's.
+- A **pending card** is the last transcript block, after any live run output. Previous is the last run's selection on the branch, and next is the current selection the footer shows (`settings_selection`, which includes a Shift-Tab preview).
+
+The consequences need no extra rules. The pending card disappears when the selection is switched back. It re-compares after `/tree` navigation. It is replaced by the new run's history card once that run's `Record::UserRequest` arrives. There is none before a branch has a run, and none after old runs with an unknown selection.
+
+Every card reads `Model selected: openai/gpt-6-sol · high`. The middle dot and missing "thinking" word are deliberate: the card is a compact marker, not the footer identity. It uses the footer's dark grey text, has no background, and uses the standard card padding. It scrolls with history like other cards. It is not a session entry, doesn't appear in `/tree`, and never reaches the model.
 
 ### Phase 2: Anthropic provider
 
@@ -153,6 +169,7 @@ Anthropic has no long-context band, so each Anthropic model's long-context thres
 - *No long-context band via threshold equal to the context window with identical rates*: behaves the same as an optional band, with no code change. Rejected making the band optional in pricing and the footer.
 - *Provider derived from the ID prefix*: rejected a stored `provider` field, which would duplicate the prefix.
 - *One shared foreign-entry helper*: the reasoning, commentary and drop rules are written and tested once; each adapter only encodes them.
+- *Model change cards derived from each run's saved selection*: rejected a new session entry kind for model changes. Pi does this, and it has to reconcile tree entries with a session-wide live model: `/tree` navigation doesn't restore the model, but resume does (`docs/research/2026-09-23_pi-model-change-entries.md`). Also rejected deriving the cards from step data, because final-message steps lack the thinking level and runs with no attempts have no model at all. Whether the selection should become branch state is left for later.
 - *Settings in TOML only*: a settings menu comes later.
 - *Picker: `Favourites` group, then the full catalogue under provider groups*: keeps the user's cross-provider favourite order and gives clean headings. Rejected provider-only groups (loses the favourite order) and a flat list (loses the provider context).
 
@@ -164,11 +181,12 @@ Anthropic has no long-context band, so each Anthropic model's long-context thres
 - Anthropic may change its adaptive-thinking or display defaults. Kiki always sends both explicitly.
 - `reqwest` must match the major version `async-openai` uses, to avoid two HTTP stacks.
 - The probes were small. Behaviour near 1M context, and latency at `xhigh` and `max`, are untested.
+- The `user_request` payload gains a selection field. `StoredPayload` uses `deny_unknown_fields` (`src/session/codec.rs:72`), so an older Kiki binary can't open sessions written by the new one. New Kiki reads old sessions through `#[serde(default)]`.
 - Stored sessions gain an optional usage field. Old sessions must still decode, ideally without bumping the session format version.
 
 ## Dependencies
 
-- Research: `docs/research/2026-09-23_pi-anthropic-provider.md`, `docs/research/2026-09-23_maki-anthropic-provider.md`.
+- Research: `docs/research/2026-09-23_pi-anthropic-provider.md`, `docs/research/2026-09-23_maki-anthropic-provider.md`, `docs/research/2026-09-23_pi-model-change-entries.md`.
 - Anthropic documentation: Messages API (`https://docs.anthropic.com/en/api/messages`), pricing (`https://docs.anthropic.com/en/docs/about-claude/pricing`), models overview (`https://docs.anthropic.com/en/docs/about-claude/models/overview`).
 - The credentialed probe of 23 September 2026 is summarised in Key discoveries. Credentials, response IDs and raw artefacts are deliberately not kept.
 - Crates: `reqwest` (rustls, streaming) and `eventsource-stream`.
@@ -177,4 +195,5 @@ Anthropic has no long-context band, so each Anthropic model's long-context thres
 ## Phase outline
 
 1. **Selection per run.** Today's OpenAI models get one immutable model-and-thinking selection per run. Changes made mid-run apply from the next run, and the per-step selection plumbing is removed.
+1b. **Model change cards.** Each run saves its selection on its request entry. The transcript shows a card between runs where the selection changed, and a pending card at the end of history while a change hasn't yet been used. The unused per-step selection is removed.
 2. **Anthropic provider.** Opus 5.5 and Fable 5.1 work end to end. This covers the catalogue entries with provider derived from the ID prefix, optional per-provider keys with fallback on selection, the router, the Anthropic adapter with caching and its TTL setting, exact pricing, cross-provider switching with the `cross_provider_reasoning` setting, and documentation.
