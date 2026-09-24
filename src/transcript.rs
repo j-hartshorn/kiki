@@ -3562,7 +3562,7 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
 
 fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
     match &displayed.record.record {
-        Record::UserRequest { request } => {
+        Record::UserRequest { request, .. } => {
             let mut blocks = vec![TranscriptBlock::User {
                 request: request.clone(),
             }];
@@ -4516,6 +4516,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "restored request".to_owned(),
+                    selection: None,
                 },
             })],
             footer_adjustment: Vec::new(),
@@ -4564,6 +4565,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "new request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -4595,6 +4597,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "restored request".to_owned(),
+                        selection: None,
                     },
                 }),
                 RestoredTimelineItem::SubagentSpawned(task.clone()),
@@ -5306,6 +5309,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "root before".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -5939,6 +5943,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "cached request: Café 日本 🦀 e\u{301}".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6075,6 +6080,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "new request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6237,6 +6243,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "x".repeat(usize::from(u16::MAX) + 1),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6378,7 +6385,10 @@ mod tests {
             RuntimeEvent::RecordAppended {
                 record: StoredRecord {
                     run_id: RunId(1),
-                    record: Record::UserRequest { request: source },
+                    record: Record::UserRequest {
+                        request: source,
+                        selection: None,
+                    },
                 },
                 progress_gap: false,
             },
@@ -6496,6 +6506,7 @@ line 66"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "padded request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6528,6 +6539,7 @@ line 66"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "padded request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6653,6 +6665,7 @@ result
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "first card".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6729,6 +6742,7 @@ store: false disables retained Response objects but does not prevent user reques
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: source.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -8503,6 +8517,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "inspect".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9097,6 +9112,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: hostile.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9231,7 +9247,7 @@ truncated"
                 .chars()
                 .any(|character| { character != '\n' && character.is_control() })
         );
-        let Record::UserRequest { request } = &transcript.records[0].record.record else {
+        let Record::UserRequest { request, .. } = &transcript.records[0].record.record else {
             unreachable!("user record")
         };
         assert_eq!(request, hostile);
@@ -9490,6 +9506,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "inspect".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -11157,6 +11174,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -11204,6 +11222,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "user".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -11307,6 +11326,7 @@ truncated"
                     run_id: RunId(97),
                     record: Record::UserRequest {
                         request: "inspect this".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -11433,6 +11453,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: true,
@@ -11459,6 +11480,7 @@ truncated"
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "user request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,

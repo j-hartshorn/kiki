@@ -6835,6 +6835,7 @@ mod tests {
         };
         let crate::runtime::Record::UserRequest {
             request: actual_request,
+            ..
         } = &record.record
         else {
             return None;

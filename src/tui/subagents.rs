@@ -980,6 +980,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::UserRequest {
                     request: request.to_owned(),
+                    selection: None,
                 },
             })
         };
@@ -1025,6 +1026,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::UserRequest {
                     request: "saved request".to_owned(),
+                    selection: None,
                 },
             })
         };
@@ -1055,6 +1057,7 @@ mod tests {
             run_id: RunId(1),
             record: Record::UserRequest {
                 request: "saved request".to_owned(),
+                selection: None,
             },
         });
 
@@ -1528,6 +1531,7 @@ mod tests {
                 run_id: crate::runtime::RunId(run_id),
                 record: Record::UserRequest {
                     request: "accepted".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -1776,6 +1780,7 @@ mod tests {
                     run_id: crate::runtime::RunId(1),
                     record: Record::UserRequest {
                         request: "accepted".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -1807,6 +1812,7 @@ mod tests {
                     run_id: crate::runtime::RunId(1),
                     record: Record::UserRequest {
                         request: "accepted".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -1827,6 +1833,7 @@ mod tests {
                     run_id: crate::runtime::RunId(2),
                     record: Record::UserRequest {
                         request: "another accepted request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -1849,6 +1856,7 @@ mod tests {
                     run_id: crate::runtime::RunId(3),
                     record: Record::UserRequest {
                         request: "final accepted request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,

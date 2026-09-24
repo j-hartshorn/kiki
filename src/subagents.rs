@@ -4439,7 +4439,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -4848,19 +4848,20 @@ mod tests {
         )
         .await
         .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
         let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
         let session = Session::create_with_write_gate(
             home.path(),
             workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
+            selection,
             arena.checkpoint(),
             admission_gate.clone(),
         )
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -5525,19 +5526,20 @@ mod tests {
         )
         .await
         .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
         let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
         let session = Session::create_with_write_gate(
             home.path(),
             workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
+            selection,
             arena.checkpoint(),
             terminal_gate.clone(),
         )
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -6395,17 +6397,13 @@ mod tests {
         )
         .await
         .expect("create arena");
-        let session = Session::create(
-            home.path(),
-            workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
-            arena.checkpoint(),
-        )
-        .expect("create session");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;

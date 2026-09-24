@@ -2902,6 +2902,7 @@ mod tests {
                 run_id: RunId(4),
                 record: Record::UserRequest {
                     request: request.to_owned(),
+                    selection: None,
                 },
             })],
             footer_adjustment: Vec::new(),
@@ -3167,6 +3168,7 @@ mod tests {
                         run_id: RunId(run_id),
                         record: Record::UserRequest {
                             request: format!("benchmark request {run_id:03}"),
+                            selection: None,
                         },
                     },
                     progress_gap: false,
@@ -3363,6 +3365,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -3484,6 +3487,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -6312,6 +6316,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6345,6 +6350,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7382,6 +7388,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::UserRequest {
                     request: format!("saved request {run_id}"),
+                    selection: None,
                 },
             })
             .collect::<Vec<_>>();
@@ -7446,6 +7453,7 @@ mod tests {
             run_id: RunId(1),
             record: Record::UserRequest {
                 request: "saved request".to_owned(),
+                selection: None,
             },
         };
         let final_message = StoredRecord {
@@ -7497,6 +7505,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "inspect".to_owned(),
+                        selection: None,
                     },
                 }),
                 RestoredTimelineItem::Record(StoredRecord {
@@ -7537,6 +7546,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "inspect".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7573,6 +7583,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7620,6 +7631,7 @@ mod tests {
                 run_id: RunId(9),
                 record: Record::UserRequest {
                     request: "request 9".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7642,6 +7654,7 @@ mod tests {
                 run_id: RunId(9),
                 record: Record::UserRequest {
                     request: "request 9".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7745,6 +7758,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::UserRequest {
                     request: "followed tail".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7786,6 +7800,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: request.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7812,6 +7827,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: "first second third fourth".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7890,6 +7906,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "only line".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7908,6 +7925,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7940,6 +7958,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: request.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -8117,6 +8136,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "content".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8165,6 +8185,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8411,6 +8432,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "selectable text".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8648,6 +8670,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "small".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -9107,6 +9130,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "accepted".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9460,6 +9484,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "corrected request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9516,6 +9541,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "correct this".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9624,6 +9650,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "correct this".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9688,6 +9715,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "second prompt".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9737,6 +9765,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "history".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10092,6 +10121,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("history line {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -10251,6 +10281,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "request".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10334,6 +10365,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "first prompt".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10373,6 +10405,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::UserRequest {
                     request: "second prompt".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10401,6 +10434,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,

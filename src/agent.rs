@@ -709,7 +709,7 @@ impl<M: Model> Agent<M> {
         writer: &SessionWriter,
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
-        let admission = writer.commit_request(request.clone()).await?;
+        let admission = writer.commit_request(request.clone(), selection).await?;
         let run_id = admission.run_id;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
@@ -1557,7 +1557,7 @@ mod tests {
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
-                .commit_request(format!("{label} request"))
+                .commit_request(format!("{label} request"), default_selection())
                 .await
                 .expect("commit compaction fixture request");
             let step_id = writer
@@ -1824,7 +1824,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request)
+                .commit_request(request, selection)
                 .await
                 .expect("commit request");
             writer

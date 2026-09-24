@@ -73,6 +73,8 @@ pub(super) struct StoredEntry {
 enum StoredPayload {
     UserRequest {
         request: String,
+        #[serde(default)]
+        selection: Option<StoredSelection>,
     },
     Execution {
         code: StoredCode,
@@ -123,6 +125,7 @@ enum DecodedEntryPayload {
     SessionStart,
     UserRequest {
         request: String,
+        selection: Option<StoredSelection>,
     },
     Execution {
         code: StoredCode,
@@ -457,15 +460,19 @@ pub(super) fn decode_checkpoint(
     ))
 }
 
-pub(super) fn encode_request(request: &str) -> Result<String, CodecError> {
+pub(super) fn encode_request(
+    request: &str,
+    selection: ModelSelection,
+) -> Result<String, CodecError> {
     serde_json::to_string(&StoredPayload::UserRequest {
         request: request.to_owned(),
+        selection: Some(encode_selection(selection)),
     })
     .map_err(CodecError::from)
 }
 
 pub(super) fn decode_request(payload_json: &str) -> Result<String, CodecError> {
-    let StoredPayload::UserRequest { request } = serde_json::from_str(payload_json)? else {
+    let StoredPayload::UserRequest { request, .. } = serde_json::from_str(payload_json)? else {
         return Err(CodecError::InvalidPayload);
     };
     Ok(request)
@@ -479,8 +486,11 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
     }
     let payload: StoredPayload = serde_json::from_str(payload_json)?;
     match (kind, payload) {
-        ("user_request", StoredPayload::UserRequest { request }) => {
-            Ok(DecodedEntry(DecodedEntryPayload::UserRequest { request }))
+        ("user_request", StoredPayload::UserRequest { request, selection }) => {
+            Ok(DecodedEntry(DecodedEntryPayload::UserRequest {
+                request,
+                selection,
+            }))
         }
         ("execution", StoredPayload::Execution { code, execution }) => {
             Ok(DecodedEntry(DecodedEntryPayload::Execution {
@@ -535,10 +545,22 @@ pub(super) fn decoded_entry_kind(entry: &DecodedEntry) -> DecodedEntryKind {
 }
 
 pub(super) fn decoded_request(entry: &DecodedEntry) -> Option<&str> {
-    let DecodedEntryPayload::UserRequest { request } = &entry.0 else {
+    let DecodedEntryPayload::UserRequest { request, .. } = &entry.0 else {
         return None;
     };
     Some(request)
+}
+
+// Display-only: an undecodable selection must not make the session unreadable.
+pub(super) fn decoded_request_selection(entry: &DecodedEntry) -> Option<ModelSelection> {
+    let DecodedEntryPayload::UserRequest {
+        selection: Some(selection),
+        ..
+    } = &entry.0
+    else {
+        return None;
+    };
+    decode_selection(selection).ok()
 }
 
 pub(super) fn decoded_final_text(entry: &DecodedEntry) -> Option<&str> {
@@ -1631,12 +1653,13 @@ mod tests {
 
     use super::{
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
-        decode_path, decode_session_preferences, decode_task_details, decode_task_record_details,
-        decode_tool_value, decoded_compaction, decoded_execution_history,
-        decoded_readable_execution, decoded_readable_terminal, decoded_terminal_history,
-        encode_checkpoint, encode_compaction, encode_execution, encode_execution_value,
-        encode_path, encode_request, encode_session_preferences, encode_task_details,
-        encode_terminal, encode_tool_value, fail_unfinished_task_details,
+        decode_path, decode_request, decode_session_preferences, decode_task_details,
+        decode_task_record_details, decode_tool_value, decoded_compaction,
+        decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
+        decoded_request, decoded_request_selection, decoded_terminal_history, encode_checkpoint,
+        encode_compaction, encode_execution, encode_execution_value, encode_path, encode_request,
+        encode_session_preferences, encode_task_details, encode_terminal, encode_tool_value,
+        fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
@@ -2047,7 +2070,11 @@ mod tests {
                 .to_string(),
             "stored session execution is missing"
         );
-        let invalid_payload = encode_request("unexpected payload").unwrap();
+        let invalid_payload = encode_request(
+            "unexpected payload",
+            ModelSelection::new(&SOL, "low").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             decode_entry("execution", &invalid_payload)
                 .err()
@@ -2227,6 +2254,63 @@ mod tests {
             decoded_terminal_history(&decoded, stored.provider_replay.as_deref()).unwrap(),
             DecodedTerminalHistory::Cancelled { code: Some(code) } if code == expected
         ));
+    }
+
+    #[test]
+    fn user_request_payloads_decode_their_stored_selection() {
+        let payload = serde_json::json!({
+            "UserRequest": {
+                "request": "hi",
+                "selection": {
+                    "model_id": crate::config::DEFAULT_MODEL.id,
+                    "thinking": crate::config::DEFAULT_MODEL.default_thinking,
+                },
+            },
+        });
+
+        let decoded = decode_entry("user_request", &payload.to_string())
+            .expect("decode request with selection");
+
+        assert_eq!(decoded_request(&decoded), Some("hi"));
+        assert_eq!(
+            decoded_request_selection(&decoded),
+            Some(
+                ModelSelection::new(
+                    crate::config::DEFAULT_MODEL,
+                    crate::config::DEFAULT_MODEL.default_thinking
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn user_request_payloads_without_a_known_selection_decode_with_none() {
+        let legacy = serde_json::json!({ "UserRequest": { "request": "hi" } });
+        let removed_model = serde_json::json!({
+            "UserRequest": {
+                "request": "hi",
+                "selection": { "model_id": "openai/removed-model", "thinking": "high" },
+            },
+        });
+
+        for payload in [legacy, removed_model] {
+            let decoded =
+                decode_entry("user_request", &payload.to_string()).expect("decode request");
+            assert_eq!(decoded_request(&decoded), Some("hi"));
+            assert_eq!(decoded_request_selection(&decoded), None);
+        }
+    }
+
+    #[test]
+    fn encoded_requests_round_trip_their_selection() {
+        let selection = ModelSelection::new(&TERRA, "high").unwrap();
+
+        let payload = encode_request("hi", selection).expect("encode request");
+        let decoded = decode_entry("user_request", &payload).expect("decode request");
+
+        assert_eq!(decoded_request_selection(&decoded), Some(selection));
+        assert_eq!(decode_request(&payload).expect("decode request text"), "hi");
     }
 
     #[test]

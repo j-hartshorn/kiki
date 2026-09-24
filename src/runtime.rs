@@ -109,6 +109,7 @@ impl TerminalDetails {
 pub(crate) enum Record {
     UserRequest {
         request: String,
+        selection: Option<ModelSelection>,
     },
     CompletedExecution {
         step_id: ModelStepId,
@@ -422,6 +423,7 @@ enum WorkerMessage<M: Model> {
         run_id: u64,
         request_entry: SessionEntryId,
         request: String,
+        selection: ModelSelection,
     },
     PersistedModelStepStarted {
         run_id: u64,
@@ -686,7 +688,9 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
         } => TerminalDetails::new(evidence, attempts),
     };
     let record = match record.kind {
-        RestoredRecordKind::UserRequest { request } => Record::UserRequest { request },
+        RestoredRecordKind::UserRequest { request, selection } => {
+            Record::UserRequest { request, selection }
+        }
         RestoredRecordKind::CompletedExecution {
             step_id,
             source,
@@ -1582,6 +1586,7 @@ impl<M: Model> RuntimeController<M> {
                             run_id,
                             request_entry,
                             request,
+                            selection,
                         });
                     }
                     PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
@@ -1846,6 +1851,7 @@ impl<M: Model> RuntimeController<M> {
                 run_id,
                 request_entry,
                 request,
+                selection,
             } => {
                 let run_id = RunId(run_id);
                 let pending_busy_submissions = std::mem::take(
@@ -1867,7 +1873,10 @@ impl<M: Model> RuntimeController<M> {
                 self.append_committed_record(
                     events,
                     run_id,
-                    Record::UserRequest { request },
+                    Record::UserRequest {
+                        request,
+                        selection: Some(selection),
+                    },
                     false,
                 );
                 for _ in 0..pending_busy_submissions {
@@ -2405,7 +2414,10 @@ mod tests {
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
-                .commit_request(format!("{label} request"))
+                .commit_request(
+                    format!("{label} request"),
+                    ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                )
                 .await
                 .expect("commit compaction fixture request");
             let step_id = writer
@@ -3193,7 +3205,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request)
+                .commit_request(request, selection)
                 .await
                 .expect("commit request");
             writer
@@ -3531,7 +3543,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request)
+                .commit_request(request, selection)
                 .await
                 .expect("commit request");
             writer
@@ -3656,7 +3668,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request)
+                .commit_request(request, selection)
                 .await
                 .expect("commit request");
             writer
@@ -3786,7 +3798,7 @@ mod tests {
             let writer = session.writer();
             seed_compactable_history(&writer).await;
             let admission = writer
-                .commit_request("race winner".to_owned())
+                .commit_request("race winner".to_owned(), selection)
                 .await
                 .expect("commit race request");
             let terminal = if terminal_kind == "final" {
@@ -4502,7 +4514,7 @@ mod tests {
             summary_started.notified().await;
             if failure == "expected leaf" {
                 let admission = writer
-                    .commit_request("concurrent leaf".to_owned())
+                    .commit_request("concurrent leaf".to_owned(), selection)
                     .await
                     .expect("advance selected leaf");
                 let step_id = writer
@@ -4594,7 +4606,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         let prior = writer
-            .commit_request("saved request".to_owned())
+            .commit_request("saved request".to_owned(), selection)
             .await
             .expect("commit saved request");
         writer
@@ -4726,7 +4738,7 @@ mod tests {
             [
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
-                        record: Record::UserRequest { request },
+                        record: Record::UserRequest { request, .. },
                         ..
                     },
                     ..
@@ -6733,7 +6745,7 @@ mod tests {
             [
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
-                        record: Record::UserRequest { request },
+                        record: Record::UserRequest { request, .. },
                         ..
                     },
                     ..
@@ -6772,7 +6784,7 @@ mod tests {
             RuntimeEvent::RecordAppended {
                 record: StoredRecord {
                     run_id: RunId(2),
-                    record: Record::UserRequest { request },
+                    record: Record::UserRequest { request, .. },
                 },
                 ..
             } if request == "second"
@@ -7113,7 +7125,7 @@ mod tests {
             [
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
-                        record: Record::UserRequest { request },
+                        record: Record::UserRequest { request, .. },
                         ..
                     },
                     ..
@@ -7260,7 +7272,9 @@ mod tests {
 
     fn record_label(record: &StoredRecord) -> String {
         match &record.record {
-            Record::UserRequest { request } => format!("record:{}:user:{request}", record.run_id.0),
+            Record::UserRequest { request, .. } => {
+                format!("record:{}:user:{request}", record.run_id.0)
+            }
             Record::CompletedExecution { step_id, .. } => {
                 format!("record:{}:execution:{}", record.run_id.0, step_id.0)
             }
@@ -7443,6 +7457,61 @@ mod tests {
             [selection_a, selection_a, selection_b]
         );
         assert_eq!(records.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_run_request_record_keeps_the_selection_captured_at_submit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let allow_first_step = Arc::new(Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let controller = controller_with_model(
+            &workspace,
+            GatedSelectionModel {
+                first_snapshotted: Arc::new(Notify::new()),
+                allow_first_step: allow_first_step.clone(),
+                observed: observed.clone(),
+                step: 0,
+            },
+        )
+        .await
+        .with_selection(selection_a);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    record: Record::UserRequest { selection, .. },
+                    ..
+                },
+                ..
+            } if selection == Some(selection_a)
+        ));
+
+        allow_first_step.notify_one();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+        assert_eq!(*observed.lock().unwrap(), [selection_a, selection_a]);
     }
 
     struct MidRunChildModel {
@@ -8174,7 +8243,7 @@ mod tests {
             .expect("create session");
         session
             .writer()
-            .commit_request("readable saved request".to_owned())
+            .commit_request("readable saved request".to_owned(), selection)
             .await
             .expect("commit readable request");
         let saved_metadata = session.metadata().expect("read saved metadata");
@@ -8225,6 +8294,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "readable saved request".to_owned(),
+                    selection: Some(selection),
                 },
             }]
         );
@@ -8281,7 +8351,7 @@ mod tests {
         drop(saved_arena);
         session
             .writer()
-            .commit_request("readable saved request".to_owned())
+            .commit_request("readable saved request".to_owned(), saved_selection)
             .await
             .expect("commit readable request");
         let metadata_before: (String, String, i64, i64) = session
@@ -8336,7 +8406,7 @@ mod tests {
         assert!(matches!(
             controller.records.as_slice(),
             [StoredRecord {
-                record: Record::UserRequest { request },
+                record: Record::UserRequest { request, .. },
                 ..
             }] if request == "readable saved request"
         ));
@@ -8562,7 +8632,7 @@ mod tests {
             records.as_slice(),
             [
                 StoredRecord {
-                    record: Record::UserRequest { request },
+                    record: Record::UserRequest { request, .. },
                     ..
                 },
                 StoredRecord {
@@ -10892,7 +10962,7 @@ mod tests {
             [
                 RuntimeEvent::RecordAppended {
                     record: StoredRecord {
-                        record: Record::UserRequest { request },
+                        record: Record::UserRequest { request, .. },
                         ..
                     },
                     ..
@@ -13852,6 +13922,7 @@ mod tests {
                     run_id: 1,
                     kind: RestoredRecordKind::UserRequest {
                         request: "saved request".to_owned(),
+                        selection: None,
                     },
                 },
                 RestoredRecord {
@@ -13927,6 +13998,7 @@ mod tests {
                     run_id: 1,
                     kind: RestoredRecordKind::UserRequest {
                         request: "origin request".to_owned(),
+                        selection: None,
                     },
                 },
                 RestoredRecord {
@@ -13948,6 +14020,7 @@ mod tests {
                     run_id: 2,
                     kind: RestoredRecordKind::UserRequest {
                         request: "later request".to_owned(),
+                        selection: None,
                     },
                 },
             ],
@@ -13969,7 +14042,7 @@ mod tests {
             initial.timeline.as_slice(),
             [
                 RestoredTimelineItem::Record(StoredRecord {
-                    record: Record::UserRequest { request: origin },
+                    record: Record::UserRequest { request: origin, .. },
                     ..
                 }),
                 RestoredTimelineItem::Record(StoredRecord {
@@ -13978,7 +14051,7 @@ mod tests {
                 }),
                 RestoredTimelineItem::SubagentSpawned(_),
                 RestoredTimelineItem::Record(StoredRecord {
-                    record: Record::UserRequest { request: later },
+                    record: Record::UserRequest { request: later, .. },
                     ..
                 }),
                 RestoredTimelineItem::SubagentFinished(_),
@@ -14017,6 +14090,7 @@ mod tests {
                     run_id: 1,
                     kind: RestoredRecordKind::UserRequest {
                         request: "origin request".to_owned(),
+                        selection: None,
                     },
                 },
                 RestoredRecord {
@@ -14029,6 +14103,7 @@ mod tests {
                     run_id: 2,
                     kind: RestoredRecordKind::UserRequest {
                         request: "later request".to_owned(),
+                        selection: None,
                     },
                 },
                 RestoredRecord {
@@ -14101,7 +14176,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("readable saved request".to_owned())
+            .commit_request("readable saved request".to_owned(), selection)
             .await
             .expect("commit readable request")
             .run_id;
@@ -14187,7 +14262,7 @@ mod tests {
             [
                 RestoredTimelineItem::Record(StoredRecord {
                     run_id: RunId(1),
-                    record: Record::UserRequest { request },
+                    record: Record::UserRequest { request, .. },
                 }),
                 RestoredTimelineItem::Record(StoredRecord {
                     run_id: RunId(1),
@@ -14408,7 +14483,10 @@ mod tests {
         set_active_entry_for_fixture(session, root_entry);
 
         let sibling_run = writer
-            .commit_request("sibling request".to_owned())
+            .commit_request(
+                "sibling request".to_owned(),
+                ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            )
             .await
             .expect("commit sibling request")
             .run_id;
@@ -14825,7 +14903,7 @@ mod tests {
             event,
             RuntimeEvent::RecordAppended {
                 record: StoredRecord {
-                    record: Record::UserRequest { request },
+                    record: Record::UserRequest { request, .. },
                     ..
                 },
                 ..
@@ -15241,7 +15319,10 @@ mod tests {
     ) -> (SessionEntryId, ModelHistory, Checkpoint) {
         let writer = session.writer();
         let run_id = writer
-            .commit_request(request.to_owned())
+            .commit_request(
+                request.to_owned(),
+                ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+            )
             .await
             .expect("commit branch request")
             .run_id;
@@ -16777,7 +16858,7 @@ mod tests {
             event,
             RuntimeEvent::RecordAppended {
                 record: StoredRecord {
-                    record: Record::UserRequest { request },
+                    record: Record::UserRequest { request, .. },
                     ..
                 },
                 ..
@@ -16836,7 +16917,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let writer = session.writer();
         let run = writer
-            .commit_request("prefilled request".to_owned())
+            .commit_request("prefilled request".to_owned(), selection)
             .await
             .expect("commit request")
             .run_id;
