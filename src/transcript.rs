@@ -8083,11 +8083,21 @@ truncated"
             false,
         );
 
-        let rendered = rendered_layout_text(&mut transcript);
-        assert!(
-            rendered.contains("failed: model provider failed"),
-            "{rendered}"
+        assert_eq!(
+            transcript.blocks(),
+            [
+                TranscriptBlock::Status {
+                    text:
+                        "failed: model provider failed: provider failure: provider transport failed"
+                            .to_owned(),
+                },
+                TranscriptBlock::Accounting {
+                    text: "3 attempts".to_owned(),
+                },
+            ]
         );
+        assert_eq!(footer_text(&transcript.layout(120)), None);
+        let rendered = rendered_layout_text(&mut transcript);
         assert!(rendered.contains("3 attempts"), "{rendered}");
     }
 
