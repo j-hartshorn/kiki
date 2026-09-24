@@ -2615,12 +2615,12 @@ mod tests {
         }
     }
 
-    struct SelectedScriptedModel {
+    struct MessageWaitingModel {
         model: ScriptedModel,
-        message_waiting: Option<Arc<Notify>>,
+        message_waiting: Arc<Notify>,
     }
 
-    impl Model for SelectedScriptedModel {
+    impl Model for MessageWaitingModel {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
@@ -2635,10 +2635,8 @@ mod tests {
                     .model
                     .step(selection, history, cancellation, progress)
                     .await?;
-                if matches!(&step.action, CompletedModelAction::Message { .. })
-                    && let Some(message_waiting) = &self.message_waiting
-                {
-                    message_waiting.notify_one();
+                if matches!(&step.action, CompletedModelAction::Message { .. }) {
+                    self.message_waiting.notify_one();
                     cancellation.cancelled().await;
                     return Err(ModelError::Cancelled.into());
                 }
@@ -5875,12 +5873,9 @@ mod tests {
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
-                SelectedScriptedModel {
-                    model: ScriptedModel::new(vec![ModelAction::Code {
-                        source: "await start_subagent('background work')".to_owned(),
-                    }]),
-                    message_waiting: None,
-                },
+                ScriptedModel::new(vec![ModelAction::Code {
+                    source: "await start_subagent('background work')".to_owned(),
+                }]),
             ),
             selection,
             snapshot.settings().clone(),
@@ -5990,17 +5985,14 @@ mod tests {
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
-                SelectedScriptedModel {
-                    model: ScriptedModel::new(vec![
-                        ModelAction::Code {
-                            source: "await start_subagent('background work')".to_owned(),
-                        },
-                        ModelAction::Message {
-                            text: "root complete".to_owned(),
-                        },
-                    ]),
-                    message_waiting: None,
-                },
+                ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await start_subagent('background work')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "root complete".to_owned(),
+                    },
+                ]),
             ),
             selection,
             snapshot.settings().clone(),
@@ -6508,18 +6500,15 @@ mod tests {
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
-                SelectedScriptedModel {
-                    model: ScriptedModel::new(vec![
-                        ModelAction::Code {
-                            source: "task = await start_subagent('child work')\nawait task.wait()"
-                                .to_owned(),
-                        },
-                        ModelAction::Message {
-                            text: "must not run".to_owned(),
-                        },
-                    ]),
-                    message_waiting: None,
-                },
+                ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "task = await start_subagent('child work')\nawait task.wait()"
+                            .to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "must not run".to_owned(),
+                    },
+                ]),
             ),
             selection,
             crate::config::ready_snapshot_for_test().settings().clone(),
@@ -6605,7 +6594,7 @@ mod tests {
         let message_waiting = Arc::new(Notify::new());
         let controller = controller_with_subagents(
             &workspace,
-            SelectedScriptedModel {
+            MessageWaitingModel {
                 model: ScriptedModel::new(vec![
                     ModelAction::Code {
                         source: source.to_owned(),
@@ -6614,7 +6603,7 @@ mod tests {
                         text: "foreground complete".to_owned(),
                     },
                 ]),
-                message_waiting: Some(message_waiting.clone()),
+                message_waiting: message_waiting.clone(),
             },
             coordinator,
         )
@@ -7819,17 +7808,14 @@ mod tests {
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
-                SelectedScriptedModel {
-                    model: ScriptedModel::new(vec![
-                        ModelAction::Code {
-                            source: "task = await start_subagent('background work')".to_owned(),
-                        },
-                        ModelAction::Message {
-                            text: "foreground complete".to_owned(),
-                        },
-                    ]),
-                    message_waiting: None,
-                },
+                ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "task = await start_subagent('background work')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "foreground complete".to_owned(),
+                    },
+                ]),
             ),
             selection,
             snapshot.settings().clone(),
@@ -16271,17 +16257,14 @@ mod tests {
         );
         let controller = controller_with_subagents(
             &workspace,
-            SelectedScriptedModel {
-                model: ScriptedModel::new(vec![
-                    ModelAction::Code {
-                        source: "await start_subagent('background')".to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "foreground settled".to_owned(),
-                    },
-                ]),
-                message_waiting: None,
-            },
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await start_subagent('background')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "foreground settled".to_owned(),
+                },
+            ]),
             subagents,
         )
         .await;
@@ -16511,17 +16494,14 @@ mod tests {
         let (_home, session, controller) = controller_with_write_gate(
             &workspace,
             admission_gate.clone(),
-            SelectedScriptedModel {
-                model: ScriptedModel::new(vec![
-                    ModelAction::Code {
-                        source: "await start_subagent('hold admission')".to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "foreground settled".to_owned(),
-                    },
-                ]),
-                message_waiting: None,
-            },
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await start_subagent('hold admission')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "foreground settled".to_owned(),
+                },
+            ]),
             complete_child_coordinator(GatedChildFactory {
                 started: Arc::new(Notify::new()),
                 release: Arc::new(Notify::new()),
@@ -16548,17 +16528,14 @@ mod tests {
         let (_home, session, controller) = controller_with_write_gate(
             &workspace,
             SessionWriteGate::new(SessionWriteKind::Preferences),
-            SelectedScriptedModel {
-                model: ScriptedModel::new(vec![
-                    ModelAction::Code {
-                        source: "await start_subagent('hold child execution')".to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "foreground settled".to_owned(),
-                    },
-                ]),
-                message_waiting: None,
-            },
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await start_subagent('hold child execution')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "foreground settled".to_owned(),
+                },
+            ]),
             complete_child_coordinator(GatedChildFactory {
                 started: child_started.clone(),
                 release: child_release.clone(),
@@ -16586,17 +16563,14 @@ mod tests {
         let (_home, session, controller) = controller_with_write_gate(
             &workspace,
             terminal_gate.clone(),
-            SelectedScriptedModel {
-                model: ScriptedModel::new(vec![
-                    ModelAction::Code {
-                        source: "await start_subagent('hold child terminal')".to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "foreground settled".to_owned(),
-                    },
-                ]),
-                message_waiting: None,
-            },
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await start_subagent('hold child terminal')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "foreground settled".to_owned(),
+                },
+            ]),
             complete_child_coordinator(GatedChildFactory {
                 started: child_started.clone(),
                 release: child_release.clone(),
