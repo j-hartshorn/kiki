@@ -217,6 +217,9 @@ enum TranscriptBlock {
     Startup {
         lines: Vec<String>,
     },
+    ModelChange {
+        selection: ModelSelection,
+    },
     User {
         request: String,
     },
@@ -274,6 +277,9 @@ enum NormalisedBlock {
     Startup {
         lines: Vec<String>,
     },
+    ModelChange {
+        text: String,
+    },
     User {
         request: String,
     },
@@ -321,6 +327,13 @@ impl TranscriptBlock {
                     .into_iter()
                     .map(|line| normalise_terminal_text(&line))
                     .collect(),
+            },
+            Self::ModelChange { selection } => NormalisedBlock::ModelChange {
+                text: format!(
+                    "Model selected: {} · {}",
+                    selection.model().id,
+                    selection.thinking()
+                ),
             },
             Self::User { request } => NormalisedBlock::User {
                 request: normalise_terminal_text(&request),
@@ -1433,6 +1446,7 @@ impl NormalisedBlock {
     fn plain_text(&self) -> String {
         match self {
             Self::Startup { lines } | Self::Metadata { lines } => lines.join("\n"),
+            Self::ModelChange { text } => text.clone(),
             Self::User { request } => request.clone(),
             Self::SubagentSpawned(card) => subagent_spawned_plain_text(card),
             Self::SubagentFinished(card) => subagent_finished_plain_text(card),
@@ -2984,8 +2998,12 @@ impl Transcript {
             .map(startup_block)
             .into_iter()
             .collect::<Vec<_>>();
+        let mut previous_selection = None;
         for displayed in &self.records {
-            blocks.extend(record_blocks(displayed));
+            blocks.extend(record_blocks(displayed, previous_selection));
+            if let Record::UserRequest { selection, .. } = &displayed.record.record {
+                previous_selection = *selection;
+            }
         }
         if let Some(live) = &self.live_step {
             blocks.extend(live_blocks(live));
@@ -3233,7 +3251,10 @@ impl Transcript {
             run_previews,
             progress_gap,
         };
-        let blocks = record_blocks(&displayed);
+        let previous_selection = matches!(displayed.record.record, Record::UserRequest { .. })
+            .then(|| self.last_request_selection())
+            .flatten();
+        let blocks = record_blocks(&displayed, previous_selection);
         self.records.push(displayed);
         self.append_settled_blocks(blocks);
         if let Some(step_id) = settled_step {
@@ -3242,6 +3263,17 @@ impl Transcript {
             self.flush_pending_subagent_blocks(run_id, None);
         }
         true
+    }
+
+    fn last_request_selection(&self) -> Option<ModelSelection> {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|displayed| match &displayed.record.record {
+                Record::UserRequest { selection, .. } => Some(*selection),
+                _ => None,
+            })
+            .flatten()
     }
 
     fn settle_run(&mut self, run_id: RunId) -> bool {
@@ -3342,6 +3374,13 @@ fn build_render_block(
                 0,
             )
         }
+        NormalisedBlock::ModelChange { text } => RenderBlock::card(
+            own_styled_text(Text::raw(text.as_str()), muted_page_style()),
+            muted_page_style(),
+            width,
+            1,
+            1,
+        ),
         NormalisedBlock::User { request } => {
             let style = card_style(USER);
             RenderBlock::card(
@@ -3560,12 +3599,21 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
     }
 }
 
-fn record_blocks(displayed: &DisplayedRecord) -> Vec<TranscriptBlock> {
+fn record_blocks(
+    displayed: &DisplayedRecord,
+    previous_selection: Option<ModelSelection>,
+) -> Vec<TranscriptBlock> {
     match &displayed.record.record {
-        Record::UserRequest { request, .. } => {
-            let mut blocks = vec![TranscriptBlock::User {
+        Record::UserRequest { request, selection } => {
+            let mut blocks = Vec::new();
+            if let (Some(previous), Some(selection)) = (previous_selection, *selection)
+                && previous != selection
+            {
+                blocks.push(TranscriptBlock::ModelChange { selection });
+            }
+            blocks.push(TranscriptBlock::User {
                 request: request.clone(),
-            }];
+            });
             append_gap_metadata(&mut blocks, displayed.progress_gap);
             blocks
         }
@@ -4613,6 +4661,222 @@ mod tests {
         assert!(
             text.find("subagent:0").expect("finished task")
                 < text.find("Session restored.").expect("restoration card")
+        );
+    }
+
+    fn run_records(selections: &[Option<ModelSelection>]) -> Vec<StoredRecord> {
+        selections
+            .iter()
+            .zip(1..)
+            .flat_map(|(selection, run_id)| {
+                [
+                    StoredRecord {
+                        run_id: RunId(run_id),
+                        record: Record::UserRequest {
+                            request: format!("request {run_id}"),
+                            selection: *selection,
+                        },
+                    },
+                    StoredRecord {
+                        run_id: RunId(run_id),
+                        record: Record::FinalMessage {
+                            step_id: ModelStepId(1),
+                            text: "answer".to_owned(),
+                            reasoning_summary: String::new(),
+                            terminal: TerminalDetails::empty(),
+                        },
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    fn append_records(transcript: &mut Transcript, records: Vec<StoredRecord>) {
+        for record in records {
+            transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record,
+                    progress_gap: false,
+                },
+                false,
+            );
+        }
+    }
+
+    fn is_model_change(block: &TranscriptBlock) -> bool {
+        matches!(block, TranscriptBlock::ModelChange { .. })
+    }
+
+    #[test]
+    fn model_change_card_sits_above_a_request_whose_selection_differs() {
+        let sol_low = ModelSelection::new(&SOL, "low").unwrap();
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let mut transcript = Transcript::default();
+        append_records(
+            &mut transcript,
+            run_records(&[Some(sol_low), Some(terra_high)]),
+        );
+
+        let blocks = transcript.blocks();
+        let second_request = blocks
+            .iter()
+            .rposition(|block| matches!(block, TranscriptBlock::User { .. }))
+            .expect("second request");
+        assert_eq!(
+            blocks[second_request - 1],
+            TranscriptBlock::ModelChange {
+                selection: terra_high
+            }
+        );
+        assert_eq!(
+            blocks.iter().filter(|block| is_model_change(block)).count(),
+            1
+        );
+
+        let buffer = rendered_buffer(&mut transcript, 60);
+        let card_row = row_containing(&buffer, "Model selected:");
+        assert_eq!(
+            row_text(&buffer, card_row).trim(),
+            "Model selected: openai/gpt-5.6-terra · high"
+        );
+        assert!(row_containing(&buffer, "answer") < card_row);
+        assert!(card_row < row_containing(&buffer, "request 2"));
+        for column in 0..buffer.area.width {
+            let cell = &buffer[(column, card_row as u16)];
+            assert_eq!(cell.fg, Color::Rgb(128, 128, 128));
+            assert_eq!(cell.bg, Color::Reset);
+        }
+    }
+
+    #[test]
+    fn model_change_card_needs_two_known_different_run_selections() {
+        let sol_low = Some(ModelSelection::new(&SOL, "low").unwrap());
+        let terra_high = Some(ModelSelection::new(&TERRA, "high").unwrap());
+        for selections in [
+            vec![terra_high],
+            vec![sol_low, sol_low],
+            vec![None, terra_high],
+            vec![sol_low, None],
+            vec![sol_low, None, terra_high],
+        ] {
+            let mut transcript = Transcript::default();
+            append_records(&mut transcript, run_records(&selections));
+
+            assert!(
+                !transcript.blocks().iter().any(is_model_change),
+                "{selections:?}"
+            );
+            assert!(
+                !rendered_layout_text(&mut transcript).contains("Model selected"),
+                "{selections:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_change_card_looks_past_compaction_to_the_previous_run() {
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let mut records = run_records(&[
+            Some(ModelSelection::new(&SOL, "low").unwrap()),
+            Some(terra_high),
+        ]);
+        records.insert(
+            2,
+            StoredRecord {
+                run_id: RunId(1),
+                record: Record::Compaction {
+                    outcome: CompactionOutcome::Applied {
+                        summary: "summary".to_owned(),
+                        first_retained: SessionEntryId(2),
+                        context_tokens: 1,
+                        reason: CompactionReason::Manual,
+                        attempts: Vec::new(),
+                    },
+                },
+            },
+        );
+        let mut transcript = Transcript::default();
+        append_records(&mut transcript, records);
+
+        let blocks = transcript.blocks();
+        let second_request = blocks
+            .iter()
+            .rposition(|block| matches!(block, TranscriptBlock::User { .. }))
+            .expect("second request");
+        assert!(matches!(
+            blocks[second_request - 2],
+            TranscriptBlock::Compaction(..)
+        ));
+        assert_eq!(
+            blocks[second_request - 1],
+            TranscriptBlock::ModelChange {
+                selection: terra_high
+            }
+        );
+        let text = rendered_layout_text(&mut transcript);
+        assert!(
+            text.find("compaction ·").expect("compaction card")
+                < text.find("Model selected").expect("model change card")
+        );
+    }
+
+    #[test]
+    fn restored_model_change_cards_match_live_appends() {
+        let sol_low = ModelSelection::new(&SOL, "low").unwrap();
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let records = run_records(&[
+            Some(sol_low),
+            Some(terra_high),
+            None,
+            Some(terra_high),
+            Some(sol_low),
+        ]);
+        let mut live = Transcript::default();
+        append_records(&mut live, records.clone());
+        let state = RuntimeInitialState {
+            metadata: None,
+            timeline: records
+                .into_iter()
+                .map(RestoredTimelineItem::Record)
+                .collect(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+
+        let mut restored = Transcript::default().restored_replacement(&state);
+
+        assert_eq!(
+            live.blocks()
+                .into_iter()
+                .filter(is_model_change)
+                .collect::<Vec<_>>(),
+            [
+                TranscriptBlock::ModelChange {
+                    selection: terra_high
+                },
+                TranscriptBlock::ModelChange { selection: sol_low },
+            ]
+        );
+        assert_eq!(restored.blocks(), live.blocks());
+        let restored_text = rendered_layout_text(&mut restored);
+        assert_eq!(restored_text.matches("Model selected").count(), 2);
+        assert_eq!(restored_text, rendered_layout_text(&mut live));
+    }
+
+    #[test]
+    fn copying_a_model_change_card_yields_its_text() {
+        let mut transcript = Transcript::default();
+        append_records(
+            &mut transcript,
+            run_records(&[
+                Some(ModelSelection::new(&SOL, "low").unwrap()),
+                Some(ModelSelection::new(&TERRA, "high").unwrap()),
+            ]),
+        );
+
+        assert_eq!(
+            copied_text(&mut transcript, 80),
+            "request 1\n\nanswer\n\nModel selected: openai/gpt-5.6-terra · high\n\nrequest 2\n\nanswer"
         );
     }
 
@@ -8549,6 +8813,7 @@ truncated"
             .iter()
             .map(|block| match block {
                 TranscriptBlock::Startup { .. } => "startup",
+                TranscriptBlock::ModelChange { .. } => "model change",
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
@@ -8667,6 +8932,7 @@ truncated"
             .iter()
             .map(|block| match block {
                 TranscriptBlock::Startup { .. } => "startup",
+                TranscriptBlock::ModelChange { .. } => "model change",
                 TranscriptBlock::User { .. } => "user",
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",

@@ -212,6 +212,7 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `Ctrl-P` opens the model picker without consuming the current prompt, including while a run is active.
 - Model and thinking changes from `/model`, `/thinking`, `Shift-Tab`, or the picker are saved as soon as they apply. A change made during a run applies from the next run; the active run keeps the selection it started with.
+- When a run's model or thinking differs from the previous run on the branch, a muted `Model selected: <model> · <thinking>` card sits above its request. There is no card for the first run, or when either run was saved without its selection.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/compact [instructions]` manually compacts the selected context, optionally focusing its summary. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.
