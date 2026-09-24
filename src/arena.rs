@@ -2741,9 +2741,7 @@ mod tests {
         parse_soft_memory_limit, result_values_from_monty, tool_summary, update_budget_pause,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::model::{
-        Model, ModelFailure, ModelHistory, ModelProgress, ModelStep, ScriptedAction, ScriptedModel,
-    };
+    use crate::model::{ScriptedAction, ScriptedModel};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
         ChildParameters, ChildPayload, ChildResult, ChildRun, ChildRunner, Clock,
@@ -3036,62 +3034,30 @@ mod tests {
         }
     }
 
-    struct SelectedScriptedModel {
-        model: ScriptedModel,
-        selection: crate::config::ModelSelection,
-    }
-
-    impl Model for SelectedScriptedModel {
-        #[allow(clippy::manual_async_fn)]
-        fn step<'a>(
-            &'a mut self,
-            history: &'a ModelHistory,
-            cancellation: &'a CancellationToken,
-            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
-        {
-            async move {
-                let mut step = self.model.step(history, cancellation, progress).await?;
-                step.selection = Some(self.selection);
-                Ok(step)
-            }
-        }
-    }
-
     #[derive(Clone)]
     struct ScriptedInvocationFactory {
         scripts: Arc<Mutex<VecDeque<Vec<ScriptedAction>>>>,
-        selection: crate::config::ModelSelection,
     }
 
     impl ScriptedInvocationFactory {
         fn new(scripts: impl IntoIterator<Item = Vec<ScriptedAction>>) -> Self {
             Self {
                 scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
-                selection: crate::config::ModelSelection::new(
-                    crate::config::DEFAULT_MODEL,
-                    crate::config::DEFAULT_MODEL.default_thinking,
-                )
-                .unwrap(),
             }
         }
     }
 
     impl ChildModelFactory for ScriptedInvocationFactory {
-        type Model = SelectedScriptedModel;
+        type Model = ScriptedModel;
 
-        fn create(&self, _prompt: String, selection: crate::config::ModelSelection) -> Self::Model {
-            assert_eq!(selection, self.selection);
-            SelectedScriptedModel {
-                model: ScriptedModel::new(
-                    self.scripts
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("test configures one child script"),
-                ),
-                selection,
-            }
+        fn create(&self, _prompt: String) -> Self::Model {
+            ScriptedModel::new(
+                self.scripts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("test configures one child script"),
+            )
         }
     }
 

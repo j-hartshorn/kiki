@@ -806,10 +806,10 @@ impl<M: Model> RuntimeController<M> {
                 .map(|metadata| metadata.preferences().clone()),
         );
         let agent = if let Some(state) = restore.executable {
-            if model.validate_history(&state.history).is_ok()
+            let selection = *settings.borrow();
+            if model.validate_history(&state.history, selection).is_ok()
                 && arena.restore(state.checkpoint.clone()).await.is_ok()
             {
-                let selection = *settings.borrow();
                 let preferences = accepted_thinking.proposal(selection);
                 match session
                     .writer()
@@ -1258,7 +1258,7 @@ impl<M: Model> RuntimeController<M> {
             return (NavigationOutcome::Failed, None);
         };
         if agent
-            .validate_restored_history(&executable.history)
+            .validate_restored_history(&executable.history, *self.settings.borrow())
             .is_err()
         {
             return (NavigationOutcome::Failed, None);
@@ -1569,6 +1569,7 @@ impl<M: Model> RuntimeController<M> {
         let cancellation = self.subagents.storage_failure_token().child_token();
         let cancellation_for_worker = cancellation.clone();
         let writer = self.session.clone();
+        let selection = *self.settings.borrow();
         let (sender, worker) = mpsc::unbounded_channel();
         let (progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
@@ -1739,7 +1740,13 @@ impl<M: Model> RuntimeController<M> {
                     }
                 };
                 agent
-                    .run_persisted(request, &cancellation_for_worker, &writer, &mut event)
+                    .run_persisted(
+                        selection,
+                        request,
+                        &cancellation_for_worker,
+                        &writer,
+                        &mut event,
+                    )
                     .await
             };
             if let Ok(outcome) = &result {
@@ -2519,7 +2526,7 @@ mod tests {
     impl ChildModelFactory for GatedChildFactory {
         type Model = GatedChildModel;
 
-        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
             GatedChildModel {
                 started: self.started.clone(),
                 release: self.release.clone(),
@@ -2546,7 +2553,7 @@ mod tests {
     impl ChildModelFactory for TaskStepFailureChildFactory {
         type Model = TaskStepFailureChildModel;
 
-        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
             TaskStepFailureChildModel {
                 calls: self.calls.clone(),
             }
@@ -2557,6 +2564,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2576,7 +2584,6 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2589,6 +2596,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2606,7 +2614,6 @@ mod tests {
                         action: CompletedModelAction::Message {
                             text: "child complete".to_owned(),
                         },
-                        selection: None,
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new("test", Vec::new()),
                         attempts: self.attempts.clone(),
@@ -2618,7 +2625,6 @@ mod tests {
 
     struct SelectedScriptedModel {
         model: ScriptedModel,
-        selection: ModelSelection,
         message_waiting: Option<Arc<Notify>>,
     }
 
@@ -2626,13 +2632,17 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
-                let mut step = self.model.step(history, cancellation, progress).await?;
+                let step = self
+                    .model
+                    .step(selection, history, cancellation, progress)
+                    .await?;
                 if matches!(&step.action, CompletedModelAction::Message { .. })
                     && let Some(message_waiting) = &self.message_waiting
                 {
@@ -2640,7 +2650,6 @@ mod tests {
                     cancellation.cancelled().await;
                     return Err(ModelError::Cancelled.into());
                 }
-                step.selection = Some(self.selection);
                 Ok(step)
             }
         }
@@ -2654,6 +2663,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2665,7 +2675,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "foreground complete".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts,
@@ -2685,7 +2694,7 @@ mod tests {
     impl ChildModelFactory for CleanupGatedChildFactory {
         type Model = CleanupGatedChildModel;
 
-        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
             CleanupGatedChildModel {
                 started: self.started.clone(),
                 cleanup_started: self.cleanup_started.clone(),
@@ -2706,6 +2715,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2754,9 +2764,9 @@ mod tests {
     }
 
     enum WorkflowChildModel {
+        Unselected(WorkflowChildFactory),
         Scripted {
             model: ScriptedModel,
-            selection: ModelSelection,
             attempt: AttemptAccounting,
         },
         Failed {
@@ -2772,20 +2782,22 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
+                if let Self::Unselected(factory) = self {
+                    *self = factory.model_for(selection);
+                }
                 match self {
-                    Self::Scripted {
-                        model,
-                        selection,
-                        attempt,
-                    } => {
-                        let mut step = model.step(history, cancellation, progress).await?;
-                        step.selection = Some(*selection);
+                    Self::Unselected(_) => unreachable!("workflow child resolved its model"),
+                    Self::Scripted { model, attempt } => {
+                        let mut step = model
+                            .step(selection, history, cancellation, progress)
+                            .await?;
                         step.attempts = vec![attempt.clone()];
                         Ok(step)
                     }
@@ -2813,7 +2825,13 @@ mod tests {
     impl ChildModelFactory for WorkflowChildFactory {
         type Model = WorkflowChildModel;
 
-        fn create(&self, _prompt: String, selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
+            WorkflowChildModel::Unselected(self.clone())
+        }
+    }
+
+    impl WorkflowChildFactory {
+        fn model_for(&self, selection: ModelSelection) -> WorkflowChildModel {
             self.selections.lock().unwrap().push(selection);
             let attempt = known_usage(selection.model(), 10, 1, 0);
             match selection.model().id {
@@ -2826,7 +2844,6 @@ mod tests {
                             text: "recoverable child completed".to_owned(),
                         },
                     ]),
-                    selection,
                     attempt,
                 },
                 id if id == LUNA.id => WorkflowChildModel::Failed { attempt },
@@ -2842,7 +2859,6 @@ mod tests {
                                 text: "cancellable parent completed".to_owned(),
                             },
                         ]),
-                        selection,
                         attempt,
                     }
                 }
@@ -2856,7 +2872,6 @@ mod tests {
     }
 
     struct WorkflowRootModel {
-        selection: watch::Receiver<ModelSelection>,
         contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
         selections: Arc<Mutex<Vec<ModelSelection>>>,
         request: usize,
@@ -2867,6 +2882,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2886,7 +2902,6 @@ mod tests {
                     self.request = request;
                     self.step = 0;
                 }
-                let selection = *self.selection.borrow_and_update();
                 self.selections.lock().unwrap().push(selection);
                 let action = match (request, self.step) {
                     (1, 0) => CompletedModelAction::Code {
@@ -2915,7 +2930,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: Some(selection),
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![known_usage(selection.model(), 100, 10, 20)],
@@ -2954,6 +2968,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2977,6 +2992,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -3023,6 +3039,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -3069,6 +3086,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -3089,7 +3107,6 @@ mod tests {
                             text: "done".to_owned(),
                         }
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -3106,6 +3123,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -3117,7 +3135,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: "final summary".to_owned(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -3134,6 +3151,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -3148,7 +3166,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "next response".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -4624,6 +4641,7 @@ mod tests {
 
         agent
             .run_persisted(
+                selection,
                 "next request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -5892,7 +5910,6 @@ mod tests {
                     model: ScriptedModel::new(vec![ModelAction::Code {
                         source: "await start_subagent('background work')".to_owned(),
                     }]),
-                    selection,
                     message_waiting: None,
                 },
             ),
@@ -6014,7 +6031,6 @@ mod tests {
                             text: "root complete".to_owned(),
                         },
                     ]),
-                    selection,
                     message_waiting: None,
                 },
             ),
@@ -6536,7 +6552,6 @@ mod tests {
                             text: "must not run".to_owned(),
                         },
                     ]),
-                    selection,
                     message_waiting: None,
                 },
             ),
@@ -6633,8 +6648,6 @@ mod tests {
                         text: "foreground complete".to_owned(),
                     },
                 ]),
-                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                    .unwrap(),
                 message_waiting: Some(message_waiting.clone()),
             },
             coordinator,
@@ -7358,7 +7371,6 @@ mod tests {
     }
 
     struct GatedSelectionModel {
-        selection: watch::Receiver<ModelSelection>,
         first_snapshotted: Arc<Notify>,
         allow_first_step: Arc<Notify>,
         observed: Arc<Mutex<Vec<ModelSelection>>>,
@@ -7369,13 +7381,13 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
-                let selection = *self.selection.borrow_and_update();
                 self.observed.lock().unwrap().push(selection);
                 let action = match self.step {
                     0 => {
@@ -7387,15 +7399,13 @@ mod tests {
                             commentary: None,
                         }
                     }
-                    1 => CompletedModelAction::Message {
+                    _ => CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
-                    _ => return Err(ModelError::Exhausted.into()),
                 };
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -7405,18 +7415,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_committed_during_a_started_step_apply_to_the_later_step() {
+    async fn settings_accepted_during_a_run_apply_to_the_next_run() {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
+        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let allow_first_step = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
             &workspace,
             GatedSelectionModel {
-                selection: selection_receiver,
                 first_snapshotted: first_snapshotted.clone(),
                 allow_first_step: allow_first_step.clone(),
                 observed: observed.clone(),
@@ -7458,20 +7467,134 @@ mod tests {
         );
 
         allow_first_step.notify_one();
-        let events = events_until_settled(&mut events).await;
-        let records = shutdown_controller(commands, task).await;
-
-        assert_eq!(*observed.lock().unwrap(), [selection_a, selection_b]);
+        let settled = events_until_settled(&mut events).await;
+        assert_eq!(*observed.lock().unwrap(), [selection_a, selection_a]);
         assert!(
-            !events
+            !settled
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::SettingsAccepted { .. }))
         );
-        assert_eq!(records.len(), 3);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "follow up".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [selection_a, selection_a, selection_b]
+        );
+        assert_eq!(records.len(), 5);
+    }
+
+    struct MidRunChildModel {
+        first_started: Arc<Notify>,
+        allow_first_step: Arc<Notify>,
+        step: u8,
+    }
+
+    impl Model for MidRunChildModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let action = match self.step {
+                    0 => {
+                        self.first_started.notify_one();
+                        self.allow_first_step.notified().await;
+                        CompletedModelAction::Code {
+                            source: "value = 1".to_owned(),
+                            call_id: ModelCallId::new("before-child"),
+                            commentary: None,
+                        }
+                    }
+                    1 => CompletedModelAction::Code {
+                        source: "await start_subagent('child work')".to_owned(),
+                        call_id: ModelCallId::new("start-child"),
+                        commentary: None,
+                    },
+                    _ => CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                };
+                self.step += 1;
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_default_child_admitted_after_a_mid_run_settings_change_uses_the_run_selection() {
+        let workspace = tempfile::tempdir().unwrap();
+        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
+        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
+        let (settings, _) = watch::channel(selection_a);
+        let first_started = Arc::new(Notify::new());
+        let allow_first_step = Arc::new(Notify::new());
+        let coordinator = SubagentCoordinator::new(
+            SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
+            Arc::new(CountingChildRunner(Arc::new(AtomicUsize::new(0)))),
+        );
+        let controller = controller_with_subagents(
+            &workspace,
+            MidRunChildModel {
+                first_started: first_started.clone(),
+                allow_first_step: allow_first_step.clone(),
+                step: 0,
+            },
+            coordinator.clone(),
+        )
+        .await
+        .with_settings(settings);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        first_started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: selection_b,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::RecordAppended { .. }
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        allow_first_step.notify_one();
+        events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+
+        let records = coordinator.records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].parameters().selection(), selection_a);
     }
 
     struct SelectionMessageModel {
-        selection: watch::Receiver<ModelSelection>,
         observed: Arc<Mutex<Vec<ModelSelection>>>,
         contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
     }
@@ -7480,16 +7603,14 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(*self.selection.borrow_and_update());
+                self.observed.lock().unwrap().push(selection);
                 self.contexts
                     .lock()
                     .unwrap()
@@ -7498,7 +7619,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -7539,7 +7659,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read initial metadata");
-        let (settings, selection_receiver) = watch::channel(selection_a);
+        let (settings, _) = watch::channel(selection_a);
         let settings_observer = settings.subscribe();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let contexts = Arc::new(Mutex::new(Vec::new()));
@@ -7548,7 +7668,6 @@ mod tests {
             Agent::new(
                 arena,
                 SelectionMessageModel {
-                    selection: selection_receiver,
                     observed: observed.clone(),
                     contexts,
                 },
@@ -7751,7 +7870,6 @@ mod tests {
                             text: "foreground complete".to_owned(),
                         },
                     ]),
-                    selection,
                     message_waiting: None,
                 },
             ),
@@ -8048,12 +8166,16 @@ mod tests {
         let (settings, _) = watch::channel(effective);
         let snapshot = crate::config::ready_snapshot_for_test();
         let restore_session = Arc::clone(&session);
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let model = ValidatedSelectionsModel {
+            selections: selections.clone(),
+        };
         let (returned, mut returned_receiver) = oneshot::channel();
         let restore = tokio::spawn(async move {
             let restored = RuntimeController::restore(
                 &restore_session,
                 arena,
-                ScriptedModel::default(),
+                model,
                 settings,
                 snapshot.settings().clone(),
                 SubagentCoordinator::new(
@@ -8077,6 +8199,7 @@ mod tests {
             .expect("restore runtime");
 
         assert_eq!(initial.disabled_reason, None);
+        assert_eq!(*selections.lock().unwrap(), vec![effective]);
         let metadata = session.metadata().expect("read committed metadata");
         assert_eq!(initial.metadata.as_ref(), Some(&metadata));
         assert_eq!(metadata.name(), Some("Saved session"));
@@ -8322,7 +8445,6 @@ mod tests {
     }
 
     struct RestoredStateModel {
-        selection: watch::Receiver<ModelSelection>,
         observed: Arc<Mutex<Vec<ModelSelection>>>,
         contexts: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
         calls: Arc<AtomicUsize>,
@@ -8337,6 +8459,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8344,10 +8467,7 @@ mod tests {
         {
             async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(*self.selection.borrow_and_update());
+                self.observed.lock().unwrap().push(selection);
                 self.contexts
                     .lock()
                     .unwrap()
@@ -8390,7 +8510,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: Some(*self.selection.borrow_and_update()),
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new(
                         "fixture",
@@ -8404,44 +8523,7 @@ mod tests {
         }
     }
 
-    struct SnapshotAfterGateModel {
-        selection: watch::Receiver<ModelSelection>,
-        before_snapshot: Arc<Notify>,
-        allow_snapshot: Arc<Notify>,
-        observed: Arc<Mutex<Vec<ModelSelection>>>,
-    }
-
-    impl Model for SnapshotAfterGateModel {
-        #[allow(clippy::manual_async_fn)]
-        fn step<'a>(
-            &'a mut self,
-            _history: &'a ModelHistory,
-            _cancellation: &'a CancellationToken,
-            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
-        {
-            async move {
-                self.before_snapshot.notify_one();
-                self.allow_snapshot.notified().await;
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(*self.selection.borrow_and_update());
-                Ok(ModelStep {
-                    action: CompletedModelAction::Message {
-                        text: "done".to_owned(),
-                    },
-                    selection: None,
-                    reasoning_summary: String::new(),
-                    replay: ProviderReplay::new("test", Vec::new()),
-                    attempts: Vec::new(),
-                })
-            }
-        }
-    }
-
     struct CancelThenMessageSelectionModel {
-        selection: watch::Receiver<ModelSelection>,
         first_snapshotted: Arc<Notify>,
         observed: Arc<Mutex<Vec<ModelSelection>>>,
         step: u8,
@@ -8451,16 +8533,14 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
             async move {
-                self.observed
-                    .lock()
-                    .unwrap()
-                    .push(*self.selection.borrow_and_update());
+                self.observed.lock().unwrap().push(selection);
                 if self.step == 0 {
                     self.step = 1;
                     self.first_snapshotted.notify_one();
@@ -8472,7 +8552,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later done".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -8487,13 +8566,12 @@ mod tests {
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
         let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
+        let (settings, _) = watch::channel(selection_a);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
             &workspace,
             SelectionMessageModel {
-                selection: selection_receiver,
                 observed: observed.clone(),
                 contexts: contexts.clone(),
             },
@@ -8563,14 +8641,13 @@ mod tests {
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
         let selection_c = ModelSelection::new(&LUNA, "max").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
+        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let allow_first_step = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
             &workspace,
             GatedSelectionModel {
-                selection: selection_receiver,
                 first_snapshotted: first_snapshotted.clone(),
                 allow_first_step: allow_first_step.clone(),
                 observed: observed.clone(),
@@ -8612,64 +8689,19 @@ mod tests {
         );
         allow_first_step.notify_one();
         events_until_settled(&mut events).await;
-        shutdown_controller(commands, task).await;
-
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.as_slice(), [selection_a, selection_c]);
-        assert!(std::ptr::eq(observed[1].model(), &LUNA));
-        assert_eq!(observed[1].thinking(), "max");
-    }
-
-    #[tokio::test]
-    async fn an_accepted_command_before_the_step_snapshot_applies_to_that_step() {
-        let workspace = tempfile::tempdir().unwrap();
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
-        let before_snapshot = Arc::new(Notify::new());
-        let allow_snapshot = Arc::new(Notify::new());
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let controller = controller_with_model(
-            &workspace,
-            SnapshotAfterGateModel {
-                selection: selection_receiver,
-                before_snapshot: before_snapshot.clone(),
-                allow_snapshot: allow_snapshot.clone(),
-                observed: observed.clone(),
-            },
-        )
-        .await
-        .with_settings(settings);
-        let (commands, mut events, _progress, task) = start_controller(controller);
-
         commands
             .send(RuntimeCommand::Submit {
-                request: "inspect".to_owned(),
+                request: "follow up".to_owned(),
             })
             .await
             .unwrap();
-        before_snapshot.notified().await;
-        commands
-            .send(RuntimeCommand::ApplySettings {
-                selection: selection_b,
-                revision: 1,
-            })
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            next_event(&mut events).await,
-            RuntimeEvent::RecordAppended { .. }
-        ));
-        assert_eq!(
-            next_event(&mut events).await,
-            RuntimeEvent::SettingsAccepted { revision: 1 }
-        );
-        allow_snapshot.notify_one();
         events_until_settled(&mut events).await;
         shutdown_controller(commands, task).await;
 
-        assert_eq!(*observed.lock().unwrap(), [selection_b]);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.as_slice(), [selection_a, selection_a, selection_c]);
+        assert!(std::ptr::eq(observed[2].model(), &LUNA));
+        assert_eq!(observed[2].thinking(), "max");
     }
 
     #[tokio::test]
@@ -8677,13 +8709,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let selection_a = ModelSelection::new(&SOL, "low").unwrap();
         let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
+        let (settings, _) = watch::channel(selection_a);
         let first_snapshotted = Arc::new(Notify::new());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let controller = controller_with_model(
             &workspace,
             CancelThenMessageSelectionModel {
-                selection: selection_receiver,
                 first_snapshotted: first_snapshotted.clone(),
                 observed: observed.clone(),
                 step: 0,
@@ -8787,6 +8818,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8806,7 +8838,6 @@ mod tests {
                 self.next_action += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -8836,6 +8867,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8868,6 +8900,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8891,10 +8924,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: Some(
-                        ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                            .expect("default selection is valid"),
-                    ),
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -8920,6 +8949,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8946,6 +8976,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8967,6 +8998,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8982,7 +9014,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -8997,6 +9028,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9023,6 +9055,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9055,7 +9088,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -9073,6 +9105,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9090,7 +9123,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "later completed".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -9108,6 +9140,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9127,7 +9160,6 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -9144,6 +9176,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9169,7 +9202,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -9186,6 +9218,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9212,7 +9245,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -9231,6 +9263,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9246,7 +9279,6 @@ mod tests {
                         call_id: ModelCallId::new("summary-code"),
                         commentary: None,
                     },
-                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -9265,6 +9297,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -9315,7 +9348,6 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -13512,7 +13544,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let initial_selection = ModelSelection::new(&SOL, "high").unwrap();
         let changed_selection = ModelSelection::new(&TERRA, "low").unwrap();
-        let (settings, selection) = watch::channel(initial_selection);
+        let (settings, _) = watch::channel(initial_selection);
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let root_selections = Arc::new(Mutex::new(Vec::new()));
         let children = WorkflowChildFactory::new();
@@ -13520,7 +13552,6 @@ mod tests {
         let controller = controller_with_subagents(
             &workspace,
             WorkflowRootModel {
-                selection,
                 contexts: contexts.clone(),
                 selections: root_selections.clone(),
                 request: 0,
@@ -14202,12 +14233,11 @@ mod tests {
         .expect("create relocated arena");
         let calls = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
-        let (settings, selection_receiver) = watch::channel(selection);
+        let (settings, _) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
             restored_arena,
             RestoredStateModel {
-                selection: selection_receiver,
                 observed: Arc::new(Mutex::new(Vec::new())),
                 contexts: Arc::new(Mutex::new(Vec::new())),
                 calls: calls.clone(),
@@ -14745,12 +14775,11 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
         let start_gate = StartSubagentTestGate::new();
-        let (settings, selection_receiver) = watch::channel(selection);
+        let (settings, _) = watch::channel(selection);
         let (controller, initial) = RuntimeController::restore(
             &session,
             arena,
             RestoredStateModel {
-                selection: selection_receiver,
                 observed: Arc::new(Mutex::new(Vec::new())),
                 contexts: contexts.clone(),
                 calls: calls.clone(),
@@ -14908,13 +14937,12 @@ mod tests {
         let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let session =
             Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
-        let (settings, selection_receiver) = watch::channel(selection);
+        let (settings, _) = watch::channel(selection);
         let starts = Arc::new(AtomicUsize::new(0));
         let controller = RuntimeController::with_session(
             Agent::new(
                 arena,
                 RestoredStateModel {
-                    selection: selection_receiver,
                     observed: Arc::new(Mutex::new(Vec::new())),
                     contexts: Arc::new(Mutex::new(Vec::new())),
                     calls: Arc::new(AtomicUsize::new(0)),
@@ -15390,7 +15418,11 @@ mod tests {
     struct RejectTargetHistoryModel;
 
     impl Model for RejectTargetHistoryModel {
-        fn validate_history(&self, history: &ModelHistory) -> Result<(), ModelError> {
+        fn validate_history(
+            &self,
+            history: &ModelHistory,
+            _selection: ModelSelection,
+        ) -> Result<(), ModelError> {
             if history.entries().iter().any(|entry| {
                 matches!(entry, ModelContextEntry::UserRequest { text } if text == "target branch")
             }) {
@@ -15402,6 +15434,34 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async { Err(ModelError::Exhausted.into()) }
+        }
+    }
+
+    struct ValidatedSelectionsModel {
+        selections: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl Model for ValidatedSelectionsModel {
+        fn validate_history(
+            &self,
+            _history: &ModelHistory,
+            selection: ModelSelection,
+        ) -> Result<(), ModelError> {
+            self.selections.lock().unwrap().push(selection);
+            Ok(())
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -15420,6 +15480,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -15452,7 +15513,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -15465,6 +15525,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -15489,7 +15550,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -15965,6 +16025,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn navigation_validates_target_history_with_the_current_selection() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (_home, session, live_arena, _root, _old_entry, target_entry) =
+            navigation_fixture(&workspace).await;
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let controller = navigation_controller(
+            &session,
+            live_arena,
+            ValidatedSelectionsModel {
+                selections: selections.clone(),
+            },
+            ArenaRestoreTestGate::new(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        let selection = ModelSelection::new(&TERRA, "high").expect("select Terra");
+
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection,
+                revision: 1,
+            })
+            .await
+            .expect("apply settings");
+        assert_eq!(
+            next_event(&mut events).await,
+            RuntimeEvent::SettingsAccepted { revision: 1 }
+        );
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: target_entry,
+            })
+            .await
+            .expect("request navigation");
+        assert!(matches!(
+            next_navigation_outcome(&mut events).await,
+            super::NavigationOutcome::Replaced { .. }
+        ));
+        assert_eq!(*selections.lock().unwrap(), vec![selection]);
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
     async fn navigation_does_not_compensate_an_incompatible_checkpoint() {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (_home, session, live_arena, _root, old_entry, target_entry) =
@@ -16233,7 +16336,6 @@ mod tests {
             SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
             Arc::new(CancellationOnlyChildRunner),
         );
-        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let controller = controller_with_subagents(
             &workspace,
             SelectedScriptedModel {
@@ -16245,7 +16347,6 @@ mod tests {
                         text: "foreground settled".to_owned(),
                     },
                 ]),
-                selection,
                 message_waiting: None,
             },
             subagents,
@@ -16487,8 +16588,6 @@ mod tests {
                         text: "foreground settled".to_owned(),
                     },
                 ]),
-                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                    .unwrap(),
                 message_waiting: None,
             },
             complete_child_coordinator(GatedChildFactory {
@@ -16526,8 +16625,6 @@ mod tests {
                         text: "foreground settled".to_owned(),
                     },
                 ]),
-                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                    .unwrap(),
                 message_waiting: None,
             },
             complete_child_coordinator(GatedChildFactory {
@@ -16566,8 +16663,6 @@ mod tests {
                         text: "foreground settled".to_owned(),
                     },
                 ]),
-                selection: ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                    .unwrap(),
                 message_waiting: None,
             },
             complete_child_coordinator(GatedChildFactory {

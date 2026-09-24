@@ -162,7 +162,7 @@ Use `start_subagent(...)` to receive a `SubagentTask` immediately, or `run_subag
 
 A child receives an independent copy of the invoking Python execution's **pre-execution** Arena checkpoint. Values committed before that execution are available; assignments made earlier in the same execution are not. Every child starts with a fresh `result_values` dictionary. A successful `wait()` returns a dictionary with `id`, `message`, and `values` keys. Export only supported neutral scalars, lists, and string-keyed dictionaries within the existing Arena and transport limits. Missing, non-dictionary, cyclic, or unsupported `result_values` make that child fail; they do not disable the foreground agent. `wait()` raises `RuntimeError` for a failed or cancelled child and `TimeoutError` for a timed-out child.
 
-Children have fresh model context and a model/thinking selection fixed at admission. Without an override, they use the first configured favourite; if no favourites are configured, they use the invoking model step's selection. An explicit model must be a favourite when favourites are configured and uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
+Children have fresh model context and a model/thinking selection fixed at admission. Without an override, they use the first configured favourite; if no favourites are configured, they use the invoking run's selection. An explicit model must be a favourite when favourites are configured and uses its accepted per-model thinking setting. Later foreground `/model` or `/thinking` changes do not alter admitted children.
 
 Use `read_only=True` to narrow a child: `write`, `edit`, and `run` are denied by the host. A read-only child cannot widen a descendant. All agents still share the same filesystem. Completed file effects are visible to every agent and cancellation never rolls them back.
 
@@ -211,6 +211,7 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - `Ctrl-T` toggles all retained thinking. Thinking is shown by default; hidden blocks show a placeholder.
 - `Shift-Tab` cycles the current model's thinking level and applies the final level after two quiet seconds.
 - `Ctrl-P` opens the model picker without consuming the current prompt, including while a run is active.
+- Model and thinking changes from `/model`, `/thinking`, `Shift-Tab`, or the picker are saved as soon as they apply. A change made during a run applies from the next run; the active run keeps the selection it started with.
 - `/model` and `/thinking` open their selectors; exact arguments select immediately. `/name <name>` gives this session a name, shown in the footer and terminal title. `/compact [instructions]` manually compacts the selected context, optionally focusing its summary. `/tree` opens the session-tree picker; `Ctrl-R` and settled double-`Esc` open it without clearing a draft.
 - `Ctrl-O` toggles retained arena cards and subagent history prompts and terminal results between automatic collapse and expanded display; it does not expand the sticky subagent list.
 - `Up` / `Down` edit the configured prompt. In read-only configuration-only and runtime-disabled views, they retain history scrolling.

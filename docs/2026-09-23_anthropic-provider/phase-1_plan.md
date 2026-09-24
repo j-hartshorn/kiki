@@ -5,7 +5,7 @@
 
 ## Acceptance criteria
 - Every model step in a run uses the model and thinking selection that was current when the run was submitted. This includes steps after tool executions and restarted stream attempts.
-- `/model`, `/thinking` or Shift-Tab during a run are committed and acknowledged straight away (`SettingsAccepted`), and the next run's first model step uses them.
+- `/model`, `/thinking` or Shift-Tab during a run are committed and acknowledged (`SettingsAccepted`) as soon as they apply (Shift-Tab keeps its two-second preview), and the next run's first model step uses them.
 - A change accepted during a run that is then cancelled still drives the next run.
 - Restore and `/tree` navigation validate history against the session's current selection.
 - Subagents keep the selection fixed when they are admitted. A child with no override and no favourites gets the selection of the run that invoked it, not a change made later in that run.
