@@ -2230,9 +2230,15 @@ mod tests {
 
     #[test]
     fn constructs_and_serializes_each_configured_openai_model() {
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        assert_eq!(model.prompt, "system prompt");
+        assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
+        assert_eq!(
+            model.client.config().url("/responses"),
+            format!("{OPENAI_API_BASE}/responses")
+        );
         for configuration in CATALOGUE {
             for &thinking in configuration.thinking_levels {
-                let model = super::OpenAiModel::new("system prompt", "test-api-key");
                 let request = model
                     .request(
                         ModelSelection::new(configuration, thinking).unwrap(),
@@ -2240,12 +2246,6 @@ mod tests {
                     )
                     .unwrap();
 
-                assert_eq!(model.prompt, "system prompt");
-                assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
-                assert_eq!(
-                    model.client.config().url("/responses"),
-                    format!("{OPENAI_API_BASE}/responses")
-                );
                 assert_eq!(
                     request["model"],
                     json!(configuration.id.strip_prefix("openai/").unwrap())
