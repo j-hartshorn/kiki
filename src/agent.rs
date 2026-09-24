@@ -99,7 +99,6 @@ pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
     ExecutionStarted {
-        selection: Option<ModelSelection>,
         commentary: Option<String>,
     },
     ToolUpdated {
@@ -452,7 +451,7 @@ impl AgentError {
 struct PendingCode {
     source: String,
     commentary: Option<String>,
-    selection: Option<ModelSelection>,
+    selection: ModelSelection,
     call_id: ModelCallId,
     reasoning_summary: String,
     replay: ProviderReplay,
@@ -864,7 +863,7 @@ impl<M: Model> Agent<M> {
                     let pending = PendingCode {
                         source,
                         commentary,
-                        selection: Some(selection),
+                        selection,
                         call_id,
                         reasoning_summary,
                         replay,
@@ -931,8 +930,9 @@ impl<M: Model> Agent<M> {
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
-                                self.invocation_context.as_ref(),
-                                pending.selection,
+                                self.invocation_context
+                                    .as_ref()
+                                    .map(|context| (context, pending.selection)),
                             )
                             .await
                     };
@@ -1140,7 +1140,7 @@ impl<M: Model> Agent<M> {
                     let pending = PendingCode {
                         source,
                         commentary,
-                        selection: Some(selection),
+                        selection,
                         call_id,
                         reasoning_summary,
                         replay,
@@ -1158,7 +1158,6 @@ impl<M: Model> Agent<M> {
                         });
                     }
                     progress(AgentProgress::ExecutionStarted {
-                        selection: pending.selection,
                         commentary: pending.commentary.clone(),
                     });
                     let execution = {
@@ -1181,8 +1180,9 @@ impl<M: Model> Agent<M> {
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
-                                self.invocation_context.as_ref(),
-                                pending.selection,
+                                self.invocation_context
+                                    .as_ref()
+                                    .map(|context| (context, pending.selection)),
                             )
                             .await
                     };
@@ -1261,7 +1261,7 @@ fn persisted_code(
         call_id: pending.call_id.clone(),
         commentary: pending.commentary.clone(),
         reasoning_summary: pending.reasoning_summary.clone(),
-        selection: pending.selection,
+        selection: Some(pending.selection),
         replay: pending.replay.clone(),
         result,
         execution,
@@ -1438,7 +1438,7 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
-    use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection, models::SOL};
+    use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -2232,49 +2232,6 @@ mod tests {
                 })
             }
         }
-    }
-
-    #[tokio::test]
-    async fn agent_exposes_the_run_selection_when_code_execution_starts() {
-        let workspace = tempfile::tempdir().unwrap();
-        let selection = ModelSelection::new(&SOL, "low").unwrap();
-        let mut agent = agent(
-            &workspace,
-            vec![
-                ModelAction::Code {
-                    source: "value = 1".to_owned(),
-                },
-                ModelAction::Message {
-                    text: "done".to_owned(),
-                },
-            ],
-        )
-        .await;
-        let cancellation = CancellationToken::new();
-        let mut progress = Vec::new();
-
-        {
-            let mut capture = |event| progress.push(event);
-            assert_eq!(
-                agent
-                    .run_with_progress(selection, "inspect", &cancellation, &mut capture)
-                    .await
-                    .unwrap()
-                    .text(),
-                "done"
-            );
-        }
-
-        assert_eq!(
-            progress
-                .iter()
-                .filter_map(|event| match event {
-                    AgentProgress::ExecutionStarted { selection, .. } => Some(*selection),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            [Some(selection)]
-        );
     }
 
     struct MessageWithAccountingModel;
@@ -3322,7 +3279,6 @@ mod tests {
             [
                 AgentProgress::ModelStepStarted,
                 AgentProgress::ExecutionStarted {
-                    selection: Some(_),
                     commentary: Some(commentary),
                 },
                 AgentProgress::ExecutionCompleted {

@@ -83,11 +83,10 @@
 ### Task 2: In-memory execution selection is always present
 **Changes**
 - The in-memory execution selection becomes a plain `ModelSelection` rather than `Option`. This covers:
-  - `AgentProgress::ExecutionStarted` (`src/agent.rs:102`)
   - `PendingCode` (`src/agent.rs:455`)
   - the subagent invocation and trusted contexts (`src/subagents.rs:852,871`)
 - In the arena (`src/arena.rs:987-997`), the selection travels with the invocation context. An execution with an invocation always has a selection, and a standalone execution has neither. No selection is fabricated.
-- `PersistedAgentEvent::ExecutionStarted` carries the pending step's selection, so the runtime can build `AgentProgress::ExecutionStarted` from it (`src/runtime.rs:1660`, `src/agent.rs:142,893`).
+- `AgentProgress::ExecutionStarted` loses its `selection` field. Nothing in production read it: the runtime filled it with `None` (`src/runtime.rs:1660`) and the subagent runner ignored it. The test `agent_exposes_the_run_selection_when_code_execution_starts`, which only checked that field, is deleted. The runtime test for a default child's selection covers the run selection reaching children.
 - The "subagent model selection is unavailable" error branch (`src/subagents.rs:893-895`) is removed.
 - Persisted `Option` selections (`src/session.rs:223`) are unchanged.
 

@@ -849,7 +849,7 @@ impl AgentInvocationContext {
     pub(crate) fn execution(
         &self,
         source: ArenaChildSource,
-        selection: Option<ModelSelection>,
+        selection: ModelSelection,
         checkpoint: Checkpoint,
         cancellation: CancellationToken,
     ) -> TrustedExecutionContext {
@@ -868,7 +868,7 @@ impl AgentInvocationContext {
 #[derive(Clone)]
 pub(crate) struct TrustedExecutionContext {
     caller: Caller,
-    selection: Option<ModelSelection>,
+    selection: ModelSelection,
     checkpoint: Checkpoint,
     source: ArenaChildSource,
     coordinator: SessionSubagents,
@@ -890,9 +890,6 @@ impl TrustedExecutionContext {
     }
 
     fn resolve_selection(&self, model: Option<&str>) -> Result<ModelSelection, ToolError> {
-        let invoking = self.selection.ok_or_else(|| {
-            ToolError::runtime("subagent model selection is unavailable for this execution")
-        })?;
         let target = match model {
             Some(model) => Some(
                 model_by_id(model)
@@ -911,7 +908,7 @@ impl TrustedExecutionContext {
                 target.id
             )));
         }
-        Ok(accepted_thinking.resolve(invoking, target))
+        Ok(accepted_thinking.resolve(self.selection, target))
     }
 
     pub(crate) fn coordinator(&self) -> &SessionSubagents {
@@ -3956,7 +3953,7 @@ mod tests {
             .with_accepted_thinking(accepted)
             .execution(
                 arena.child_source(),
-                Some(invoking),
+                invoking,
                 arena.checkpoint(),
                 CancellationToken::new(),
             );

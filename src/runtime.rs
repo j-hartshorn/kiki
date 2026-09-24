@@ -1659,7 +1659,6 @@ impl<M: Model> RuntimeController<M> {
                     } => {
                         writer.mark_execution_started(step_id);
                         let progress = AgentProgress::ExecutionStarted {
-                            selection: None,
                             commentary: commentary.clone(),
                         };
                         let bytes = agent_progress_payload_bytes(&progress);

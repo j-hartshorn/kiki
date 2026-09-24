@@ -984,7 +984,7 @@ impl Arena {
         cancellation: &CancellationToken,
         progress: &mut (impl FnMut(ArenaProgress) + Send),
     ) -> Result<Execution, ArenaError> {
-        self.execute_with_progress_and_context(code, cancellation, progress, None, None)
+        self.execute_with_progress_and_context(code, cancellation, progress, None)
             .await
     }
 
@@ -993,8 +993,7 @@ impl Arena {
         code: &str,
         cancellation: &CancellationToken,
         progress: &mut (impl FnMut(ArenaProgress) + Send),
-        invocation: Option<&AgentInvocationContext>,
-        selection: Option<ModelSelection>,
+        invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
         let mut budget = ChargeableBudget::new(self.clock.clone(), self.execution_timeout);
         match budget
@@ -1011,7 +1010,7 @@ impl Arena {
                 return Err(self.recover(error).await);
             }
         }
-        let context = invocation.map(|invocation| {
+        let context = invocation.map(|(invocation, selection)| {
             invocation.execution(
                 self.child_source(),
                 selection,
@@ -3216,8 +3215,7 @@ mod tests {
                 code,
                 &CancellationToken::new(),
                 &mut |_| {},
-                Some(context),
-                Some(selection),
+                Some((context, selection)),
             )
             .await
             .unwrap()
@@ -3984,8 +3982,7 @@ mod tests {
                 "task = await start_subagent('child work')\ncontinued = 'yes'\ntask.status.state",
                 &cancellation,
                 &mut |_| {},
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4005,8 +4002,7 @@ mod tests {
                 "(continued, (await task.refresh()).state)",
                 &cancellation,
                 &mut |_| {},
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4031,8 +4027,7 @@ mod tests {
                 "result = await task.wait()\n(continued, result['message'], result['values']['answer'], task.status.state)",
                 &cancellation,
                 &mut |_| {},
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4434,8 +4429,7 @@ mod tests {
                 "task = await start_subagent('wait')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4444,8 +4438,7 @@ mod tests {
             "(await task.wait())['message']",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
 
         let wait_phase = clock.wait_until_budget_paused();
@@ -4490,8 +4483,7 @@ mod tests {
                 "first = await start_subagent('first')\nsecond = await start_subagent('second')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4501,8 +4493,7 @@ mod tests {
             "import asyncio\nfirst_result, second_result = await asyncio.gather(first.wait(), second.wait())\n(first_result['message'], second_result['message'])",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
 
         let wait_phase = clock.wait_until_budget_paused();
@@ -4558,8 +4549,7 @@ mod tests {
             "result = await run_subagent('wait')\ntask = await get_subagent(result['id'])\nagain = await task.wait()\n(result['message'], again['message'])",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         let finish = tokio::select! {
             finish = started.recv() => finish.expect("child starts"),
@@ -4613,8 +4603,7 @@ mod tests {
             "task = await start_subagent('wait')",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         tokio::select! {
             _ = gate.wait_until_read_settled() => {}
@@ -4627,8 +4616,7 @@ mod tests {
             "import asyncio\nawait asyncio.gather(task.wait(), read('before'))\nawait read('after')",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
 
         tokio::select! {
@@ -4685,8 +4673,7 @@ mod tests {
             "task = await start_subagent('wait')",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         tokio::select! {
             _ = gate.wait_until_read_settled() => {}
@@ -4699,8 +4686,7 @@ mod tests {
             "import asyncio\nawait asyncio.gather(task.wait(), read('blocked'))",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
 
         tokio::select! {
@@ -4803,8 +4789,7 @@ mod tests {
                 "task = await start_subagent('wait')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4814,8 +4799,7 @@ mod tests {
             "await task.wait()",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         let wait_phase = clock.wait_until_budget_paused();
         tokio::pin!(wait_phase);
@@ -4969,8 +4953,7 @@ mod tests {
                 "task = await start_subagent('cancel')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -4979,8 +4962,7 @@ mod tests {
             "(await task.cancel()).state",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         let wait_phase = clock.wait_until_budget_paused();
         tokio::pin!(wait_phase);
@@ -5023,8 +5005,7 @@ mod tests {
                 "task = await start_subagent('wait')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -5033,8 +5014,7 @@ mod tests {
             "caught = None\ntry:\n    await task.wait()\nexcept TimeoutError:\n    caught = 'timed out'\ncaught",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         let wait_phase = clock.wait_until_budget_paused();
         tokio::pin!(wait_phase);
@@ -5076,8 +5056,7 @@ mod tests {
                 "task = await start_subagent('wait')",
                 &cancellation,
                 &mut progress,
-                Some(&context),
-                Some(selection),
+                Some((&context, selection)),
             )
             .await
             .unwrap();
@@ -5086,8 +5065,7 @@ mod tests {
             "caught = None\ntry:\n    await task.wait()\nexcept TimeoutError:\n    caught = 'timed out'\ncaught",
             &cancellation,
             &mut progress,
-            Some(&context),
-            Some(selection),
+            Some((&context, selection)),
         ));
         let wait_phase = clock.wait_until_budget_paused();
         tokio::pin!(wait_phase);
