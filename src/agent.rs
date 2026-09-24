@@ -1261,7 +1261,6 @@ fn persisted_code(
         call_id: pending.call_id.clone(),
         commentary: pending.commentary.clone(),
         reasoning_summary: pending.reasoning_summary.clone(),
-        selection: Some(pending.selection),
         replay: pending.replay.clone(),
         result,
         execution,

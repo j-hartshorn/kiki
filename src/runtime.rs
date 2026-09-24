@@ -14129,7 +14129,6 @@ mod tests {
                     call_id: ModelCallId::new("incompatible-checkpoint"),
                     commentary: None,
                     reasoning_summary: String::new(),
-                    selection: Some(selection),
                     replay: fixture_replay("incompatible checkpoint replay"),
                     result: CodeResult::execution(String::new()),
                     execution: Some(execution),
@@ -14351,7 +14350,6 @@ mod tests {
         workspace: &Path,
     ) -> BranchedResumeFixture {
         let writer = session.writer();
-        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let selected_origin_step = u64::try_from(
             session
                 .connection_for_test()
@@ -14451,7 +14449,6 @@ mod tests {
                     call_id: ModelCallId::new("sibling-execution"),
                     commentary: Some("sibling commentary".to_owned()),
                     reasoning_summary: "sibling reasoning".to_owned(),
-                    selection: Some(selection),
                     replay: fixture_replay("sibling execution replay"),
                     result: CodeResult::execution("sibling execution feedback".to_owned()),
                     execution: Some(execution.clone()),
@@ -14483,7 +14480,6 @@ mod tests {
                     call_id: ModelCallId::new("sibling-terminal"),
                     commentary: None,
                     reasoning_summary: "sibling terminal reasoning".to_owned(),
-                    selection: Some(selection),
                     replay: fixture_replay("sibling terminal replay"),
                     result: CodeResult::failure("sibling terminal feedback".to_owned()),
                     execution: None,
@@ -15243,7 +15239,6 @@ mod tests {
         source: &str,
         final_text: &str,
     ) -> (SessionEntryId, ModelHistory, Checkpoint) {
-        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
         let writer = session.writer();
         let run_id = writer
             .commit_request(request.to_owned())
@@ -15268,7 +15263,6 @@ mod tests {
                     call_id: ModelCallId::new(format!("{request}-code")),
                     commentary: None,
                     reasoning_summary: String::new(),
-                    selection: Some(selection),
                     replay: fixture_replay(&format!("{request} execution")),
                     result: CodeResult::execution(String::new()),
                     execution: Some(execution),

@@ -220,7 +220,6 @@ pub(crate) struct PersistedCode {
     pub(crate) call_id: crate::model::ModelCallId,
     pub(crate) commentary: Option<String>,
     pub(crate) reasoning_summary: String,
-    pub(crate) selection: Option<ModelSelection>,
     pub(crate) replay: crate::model::ProviderReplay,
     pub(crate) result: crate::model::CodeResult,
     pub(crate) execution: Option<crate::arena::Execution>,
@@ -3993,7 +3992,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("projection"),
             commentary: None,
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result,
             execution: execution.then(projection_execution),
@@ -4189,7 +4187,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new(format!("fixture-{run_id}")),
             commentary: commentary.map(str::to_owned),
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
@@ -7459,7 +7456,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("committed-step"),
             commentary: None,
             reasoning_summary: "commit execution checkpoint".to_owned(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
@@ -8775,7 +8771,6 @@ mod tests {
                                 call_id: crate::model::ModelCallId::new("unfinished-task"),
                                 commentary: None,
                                 reasoning_summary: String::new(),
-                                selection: None,
                                 replay: crate::model::ProviderReplay::new("test", Vec::new()),
                                 result: crate::model::CodeResult::execution(String::new()),
                                 execution: Some(Execution {
@@ -9136,7 +9131,6 @@ mod tests {
                         call_id: crate::model::ModelCallId::new("stale-settlement"),
                         commentary: None,
                         reasoning_summary: String::new(),
-                        selection: None,
                         replay: crate::model::ProviderReplay::new("test", Vec::new()),
                         result: crate::model::CodeResult::execution(String::new()),
                         execution: Some(Execution {
@@ -9271,7 +9265,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("call-1"),
             commentary: Some("setting a value".to_owned()),
             reasoning_summary: "set the value".to_owned(),
-            selection: Some(selection()),
             replay: crate::model::ProviderReplay::new(
                 "test",
                 vec![crate::model::OpaqueReplayItem::new(vec![0, 255])],
@@ -9441,7 +9434,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("call-rollback"),
             commentary: None,
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
