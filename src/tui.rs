@@ -981,7 +981,7 @@ impl App {
     }
 
     fn apply_selection(&mut self, selection: ModelSelection) -> Update {
-        self.settings_selection = selection;
+        self.set_settings_selection(selection);
         self.preview = None;
         let mut update = Update::with_commands([self.send_settings(selection)]);
         update.visible_changed = true;
@@ -999,7 +999,7 @@ impl App {
         let next = model.thinking_levels[(index + 1) % model.thinking_levels.len()];
         let selection = ModelSelection::new(model, next)
             .expect("catalogue thinking must be supported by its model");
-        self.settings_selection = selection;
+        self.set_settings_selection(selection);
         self.preview = Some(ThinkingPreview {
             selection,
             deadline: now + Duration::from_secs(2),
@@ -1009,6 +1009,16 @@ impl App {
             commands: Vec::new(),
             visible_changed: true,
             quit: false,
+        }
+    }
+
+    fn set_settings_selection(&mut self, selection: ModelSelection) {
+        let pending = self
+            .transcript
+            .pending_model_change(self.settings_selection);
+        self.settings_selection = selection;
+        if self.transcript.pending_model_change(selection) != pending {
+            self.invalidate_layout_selection();
         }
     }
 
@@ -3492,6 +3502,10 @@ mod tests {
             },
             progress_gap: false,
         });
+        select_history_text(app, text, width, height)
+    }
+
+    fn select_history_text(app: &mut App, text: &str, width: u16, height: u16) -> Instant {
         let buffer = rendered_buffer(app, width, height);
         let (column, row) = cell_start(&buffer, text);
         let end = column + u16::try_from(text.len() - 1).unwrap();
@@ -3510,6 +3524,62 @@ mod tests {
         );
         rendered_buffer(app, width, height);
         now
+    }
+
+    fn completed_run_records(run_id: u64, selection: ModelSelection) -> [StoredRecord; 2] {
+        [
+            StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: format!("request {run_id}"),
+                    selection: Some(selection),
+                },
+            },
+            StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "answer".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+        ]
+    }
+
+    fn branch_state(selections: &[ModelSelection]) -> RuntimeInitialState {
+        RuntimeInitialState {
+            metadata: None,
+            timeline: selections
+                .iter()
+                .zip(1..)
+                .flat_map(|(selection, run_id)| completed_run_records(run_id, *selection))
+                .map(RestoredTimelineItem::Record)
+                .collect(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        }
+    }
+
+    fn history_rows(app: &mut App) -> Vec<String> {
+        history_viewport_rows(app)
+            .into_iter()
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    fn history_viewport_rows(app: &mut App) -> Vec<String> {
+        let buffer = rendered_buffer(app, 80, 40);
+        let area = app.history_viewport.expect("history viewport").area;
+        (area.top()..area.bottom())
+            .map(|row| {
+                (area.left()..area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect()
     }
 
     struct RecordingTitles {
@@ -5114,6 +5184,50 @@ mod tests {
     }
 
     #[test]
+    fn tree_navigation_rebuilds_model_change_cards_for_the_selected_branch() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let current = app.settings_selection;
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+
+        select_tree_request(&mut app);
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: branch_state(&[current, terra_high]),
+                request_prefill: None,
+            },
+        }));
+        assert_eq!(app.settings_selection, current);
+        let rows = history_rows(&mut app);
+        let terra_card = rows
+            .iter()
+            .position(|row| row == "Model selected: openai/gpt-5.6-terra · high")
+            .expect("history card");
+        assert!(rows[terra_card + 1].contains("request 2"), "{rows:?}");
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-sol · medium")
+        );
+
+        select_tree_request(&mut app);
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: branch_state(&[terra_high, current]),
+                request_prefill: None,
+            },
+        }));
+        assert_eq!(app.settings_selection, current);
+        let rows = history_rows(&mut app);
+        let cards = rows
+            .iter()
+            .filter(|row| row.contains("Model selected"))
+            .collect::<Vec<_>>();
+        assert_eq!(cards, ["Model selected: openai/gpt-5.6-sol · medium"]);
+        assert_eq!(rows.last().map(String::as_str), Some("Session restored."));
+        let screen = rendered(&mut app, 80, 40);
+        assert!(screen.contains("gpt-5.6-sol • thinking medium"), "{screen}");
+    }
+
+    #[test]
     fn model_argument_opens_a_filtered_picker_without_submitting() {
         let mut app = App::default();
         type_prompt(&mut app, "/model terra");
@@ -5367,6 +5481,75 @@ mod tests {
             assert!(update.commands.is_empty());
             assert_eq!(app.settings_selection.thinking(), expected);
         }
+    }
+
+    #[test]
+    fn shift_tab_after_a_run_shows_the_pending_model_change_card() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        for record in completed_run_records(1, selection) {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record,
+                progress_gap: false,
+            });
+        }
+        assert_eq!(
+            history_rows(&mut app).last().map(String::as_str),
+            Some("answer")
+        );
+        select_history_text(&mut app, "request 1", 80, 40);
+        assert!(app.selection.is_some());
+
+        assert!(
+            app.handle_key_at(key(KeyCode::BackTab), now)
+                .visible_changed
+        );
+        assert!(app.selection.is_none());
+        assert_eq!(
+            history_rows(&mut app).last().map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-sol · high")
+        );
+
+        select_history_text(&mut app, "request 1", 80, 40);
+        app.select_thinking("high");
+        assert!(app.selection.is_some());
+        assert_eq!(
+            history_rows(&mut app).last().map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-sol · high")
+        );
+    }
+
+    #[test]
+    fn pending_model_change_card_keeps_long_history_following_the_bottom() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        for run_id in 1..=20 {
+            for record in completed_run_records(run_id, selection) {
+                app.handle_event(RuntimeEvent::RecordAppended {
+                    record,
+                    progress_gap: false,
+                });
+            }
+        }
+        let baseline = history_viewport_rows(&mut app);
+        let last_row = baseline
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .expect("history content");
+        assert!(app.newest_history_top() > 0);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(baseline[last_row], "answer");
+
+        app.handle_key_at(key(KeyCode::BackTab), Instant::now());
+        let rows = history_viewport_rows(&mut app);
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(app.history_document_top(), app.newest_history_top());
+        assert_eq!(rows.iter().rposition(|row| !row.is_empty()), Some(last_row));
+        assert_eq!(rows[last_row], "Model selected: openai/gpt-5.6-sol · high");
+
+        app.apply_selection(selection);
+        assert_eq!(history_viewport_rows(&mut app), baseline);
     }
 
     #[test]

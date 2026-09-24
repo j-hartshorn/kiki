@@ -2893,6 +2893,10 @@ impl Transcript {
     ) -> TranscriptLayout {
         let show_reasoning = self.show_reasoning;
         let expand_arenas = self.expand_arenas;
+        let model_change_source = footer_context
+            .as_ref()
+            .and_then(|context| self.pending_model_change(context.selection))
+            .map(|selection| TranscriptBlock::ModelChange { selection }.normalise());
         let footer = self.footer(footer_context);
         let live_sources = self
             .live_step
@@ -2958,7 +2962,11 @@ impl Transcript {
             };
             blocks.push(block);
         }
-        for source in live_sources.iter().chain(&pending_sources) {
+        for source in live_sources
+            .iter()
+            .chain(&pending_sources)
+            .chain(&model_change_source)
+        {
             blocks.push(LayoutBlock::Fresh(build_render_block(
                 source,
                 show_reasoning,
@@ -3263,6 +3271,12 @@ impl Transcript {
             self.flush_pending_subagent_blocks(run_id, None);
         }
         true
+    }
+
+    pub(crate) fn pending_model_change(&self, current: ModelSelection) -> Option<ModelSelection> {
+        self.last_request_selection()
+            .is_some_and(|last| last != current)
+            .then_some(current)
     }
 
     fn last_request_selection(&self) -> Option<ModelSelection> {
@@ -4878,6 +4892,150 @@ mod tests {
             copied_text(&mut transcript, 80),
             "request 1\n\nanswer\n\nModel selected: openai/gpt-5.6-terra · high\n\nrequest 2\n\nanswer"
         );
+    }
+
+    fn rendered_rows_with_selection(
+        transcript: &mut Transcript,
+        selection: ModelSelection,
+    ) -> Vec<String> {
+        let layout = transcript.layout_with_footer(
+            80,
+            FooterContext {
+                workspace_root: None,
+                home: None,
+                name: None,
+                selection,
+            },
+        );
+        let height = u16::try_from(layout.total_height()).expect("test transcript height");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, height));
+        layout.render(buffer.area, 0, &mut buffer);
+        (0..usize::from(height))
+            .map(|row| row_text(&buffer, row).trim().to_owned())
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn pending_model_change_card_ends_the_layout_when_the_selection_differs() {
+        let sol_low = ModelSelection::new(&SOL, "low").unwrap();
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let mut transcript = Transcript::default();
+        append_records(&mut transcript, run_records(&[Some(sol_low)]));
+
+        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-terra · high")
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Model selected"))
+                .count(),
+            1
+        );
+
+        let rows = rendered_rows_with_selection(&mut transcript, sol_low);
+        assert!(!rows.iter().any(|row| row.contains("Model selected")));
+        assert!(!rendered_layout_text(&mut transcript).contains("Model selected"));
+    }
+
+    #[test]
+    fn pending_model_change_card_needs_a_known_last_run_selection() {
+        let sol_low = Some(ModelSelection::new(&SOL, "low").unwrap());
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        for selections in [vec![], vec![None], vec![sol_low, None]] {
+            let mut transcript = Transcript::default();
+            append_records(&mut transcript, run_records(&selections));
+
+            let rows = rendered_rows_with_selection(&mut transcript, terra_high);
+            assert!(
+                !rows.iter().any(|row| row.contains("Model selected")),
+                "{selections:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_model_change_card_follows_live_output() {
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let mut transcript = Transcript::default();
+        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+        append_records(
+            &mut transcript,
+            vec![StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: "request 1".to_owned(),
+                    selection: Some(ModelSelection::new(&SOL, "low").unwrap()),
+                },
+            }],
+        );
+        assert!(transcript.apply(
+            RuntimeEvent::ExecutionStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                commentary: None,
+            },
+            false,
+        ));
+        assert!(transcript.apply(
+            RuntimeEvent::ModelProgress {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+                progress: ModelProgress::DecodedPythonChunk {
+                    code: "live_python()".to_owned(),
+                },
+            },
+            false,
+        ));
+
+        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
+        let live_row = rows
+            .iter()
+            .position(|row| row.contains("live_python()"))
+            .expect("live python");
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-terra · high")
+        );
+        assert!(live_row < rows.len() - 1);
+    }
+
+    #[test]
+    fn next_run_replaces_the_pending_model_change_card_with_its_history_card() {
+        let sol_low = ModelSelection::new(&SOL, "low").unwrap();
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        let mut records = run_records(&[Some(sol_low), Some(terra_high)]);
+        let second_run = records.split_off(2);
+        let mut transcript = Transcript::default();
+        append_records(&mut transcript, records);
+        assert_eq!(
+            rendered_rows_with_selection(&mut transcript, terra_high)
+                .last()
+                .map(String::as_str),
+            Some("Model selected: openai/gpt-5.6-terra · high")
+        );
+
+        append_records(&mut transcript, second_run);
+
+        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
+        let card_rows = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("Model selected"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let second_request = rows
+            .iter()
+            .position(|row| row.contains("request 2"))
+            .expect("second request");
+        assert_eq!(card_rows, [second_request - 1]);
+        assert_eq!(
+            rows[second_request - 1],
+            "Model selected: openai/gpt-5.6-terra · high"
+        );
+        assert_eq!(rows.last().map(String::as_str), Some("answer"));
     }
 
     #[test]
