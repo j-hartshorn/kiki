@@ -3,6 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use async_openai::Client;
 use async_openai::config::{OPENAI_API_BASE, OpenAIConfig};
 use async_openai::error::OpenAIError;
@@ -10,6 +13,8 @@ use async_openai::middleware::{ReqwestService, retry::OpenAIRetryLayer};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
@@ -47,6 +52,8 @@ pub(crate) struct OpenAiModel {
     client: Client<OpenAIConfig>,
     settings: watch::Receiver<ModelSelection>,
     api_key: String,
+    #[cfg(test)]
+    summary_retry_wait_started: Option<Arc<Notify>>,
 }
 
 #[derive(Clone)]
@@ -117,6 +124,8 @@ impl OpenAiModel {
                 .with_http_service(service),
             settings,
             api_key,
+            #[cfg(test)]
+            summary_retry_wait_started: None,
         }
     }
 
@@ -365,6 +374,10 @@ impl OpenAiModel {
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
+                if matches!(&error, OpenAIError::Reqwest(error) if error.is_request() && !error.is_connect())
+                {
+                    return Err(self.stream_failure(error));
+                }
                 return Err(AttemptFailure::Terminal {
                     error: ModelError::Provider(Box::new(self.provider_failure(error))),
                     accounting: Box::new(AttemptAccounting::UsageUnavailable),
@@ -828,6 +841,10 @@ impl OpenAiModel {
                             attempts,
                         ));
                     }
+                    #[cfg(test)]
+                    if let Some(signal) = &self.summary_retry_wait_started {
+                        signal.notify_one();
+                    }
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => {
@@ -868,6 +885,10 @@ impl OpenAiModel {
         let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
+                if matches!(&error, OpenAIError::Reqwest(error) if error.is_request() && !error.is_connect())
+                {
+                    return Err(self.stream_failure(error));
+                }
                 return Err(AttemptFailure::Terminal {
                     error: ModelError::Provider(Box::new(self.provider_failure(error))),
                     accounting: Box::new(AttemptAccounting::UsageUnavailable),
@@ -2621,6 +2642,7 @@ mod tests {
             body: String,
         },
         AbruptSse(&'static str),
+        CloseBeforeHeaders,
         GatedSse {
             body: &'static str,
             allow: Arc<Notify>,
@@ -2838,6 +2860,7 @@ mod tests {
                 write_chunked_headers(stream).await;
                 write_chunk(stream, body).await;
             }
+            FixtureReply::CloseBeforeHeaders => stream.shutdown().await.unwrap(),
             FixtureReply::GatedSse { body, allow } => {
                 allow.notified().await;
                 let response = format!(
@@ -3365,6 +3388,75 @@ mod tests {
             assert_eq!(starts(&progress), vec![1]);
             assert_eq!(settles(&progress), vec![1]);
             assert_eq!(failure.provider_failure().unwrap().status(), Some(429));
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        }
+
+        #[tokio::test]
+        async fn opening_transport_disconnect_restarts_the_model_step() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::CloseBeforeHeaders,
+                FixtureReply::Sse(COMPLETED_STREAM),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture).await;
+            let step = result.expect("opening transport disconnect should restart");
+
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(starts(&progress), vec![1, 2]);
+            assert_eq!(settles(&progress), vec![1, 2]);
+            assert!(matches!(
+                step.attempts.as_slice(),
+                [
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::KnownUsageWithUntrackedRetries(_)
+                ]
+            ));
+        }
+
+        #[tokio::test]
+        async fn opening_transport_disconnects_stop_after_three_attempts() {
+            let fixture = Fixture::start(FixtureReply::CloseBeforeHeaders).await;
+
+            let (result, progress) = step(&fixture).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(starts(&progress), vec![1, 2, 3]);
+            assert_eq!(settles(&progress), vec![1, 2, 3]);
+            assert_eq!(
+                failure.to_string(),
+                "model provider failed: provider failure: provider transport failed"
+            );
+            assert_eq!(
+                failure.attempts(),
+                &[
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                    AttemptAccounting::UsageUnavailable,
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn exhausted_sdk_connection_retries_do_not_restart_the_model_step() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener);
+            let mut model = OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+            let cancellation = CancellationToken::new();
+            let mut progress = Vec::new();
+            let failure = model
+                .step(&history(), &cancellation, &mut |event| progress.push(event))
+                .await
+                .unwrap_err();
+
+            assert_eq!(starts(&progress), vec![1]);
+            assert_eq!(settles(&progress), vec![1]);
+            assert_eq!(
+                failure.to_string(),
+                "model provider failed: provider failure: provider transport failed"
+            );
             assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
         }
 
@@ -5087,6 +5179,99 @@ mod tests {
                 result.attempts,
                 [AttemptAccounting::UsageUnavailable, expected_accounting()]
             );
+        }
+
+        #[tokio::test]
+        async fn summary_restarts_after_opening_transport_disconnect() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::CloseBeforeHeaders,
+                FixtureReply::OwnedSse(stream([completed_event(
+                    vec![message("recovered summary")],
+                    Some(usage()),
+                )])),
+            ])
+            .await;
+            let cancellation = CancellationToken::new();
+
+            let result = summarise(&fixture, request(), &cancellation)
+                .await
+                .expect("opening summary request should restart");
+
+            assert_eq!(fixture.request_count(), 2);
+            assert_eq!(
+                result.attempts,
+                [AttemptAccounting::UsageUnavailable, expected_accounting()]
+            );
+        }
+
+        #[tokio::test]
+        async fn summary_opening_disconnects_stop_after_three_attempts() {
+            let fixture = Fixture::start(FixtureReply::CloseBeforeHeaders).await;
+            let cancellation = CancellationToken::new();
+            let mut model =
+                OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+            let mut started = 0;
+
+            let failure = model
+                .summarise(request(), &cancellation, &mut || started += 1)
+                .await
+                .unwrap_err();
+
+            assert_eq!(started, 3);
+            assert_eq!(fixture.request_count(), 3);
+            assert_eq!(
+                failure.to_string(),
+                "model provider failed: provider failure: provider transport failed"
+            );
+            assert_eq!(
+                failure.attempts(),
+                vec![AttemptAccounting::UsageUnavailable; 3]
+            );
+        }
+
+        #[tokio::test]
+        async fn summary_cancellation_after_opening_disconnect_prevents_retry() {
+            let fixture = Fixture::start_sequence(vec![
+                FixtureReply::CloseBeforeHeaders,
+                FixtureReply::OwnedSse(stream([completed_event(
+                    vec![message("late summary")],
+                    Some(usage()),
+                )])),
+            ])
+            .await;
+            let endpoint = fixture.endpoint.clone();
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let started = Arc::new(AtomicUsize::new(0));
+            let observed = started.clone();
+            let retry_wait_started = Arc::new(Notify::new());
+            let retry_wait_signal = retry_wait_started.clone();
+            let task = tokio::spawn(async move {
+                let mut model =
+                    OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
+                model.summary_retry_wait_started = Some(retry_wait_signal);
+                model
+                    .summarise(request(), &cancellation, &mut || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            });
+
+            timeout(Duration::from_secs(1), retry_wait_started.notified())
+                .await
+                .expect("summary retry should enter its backoff");
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.request_count(), 1);
+            cancel.cancel();
+
+            let failure = timeout(Duration::from_millis(60), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(failure.is_cancelled());
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+            assert_eq!(fixture.request_count(), 1);
         }
 
         #[tokio::test]

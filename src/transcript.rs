@@ -4209,7 +4209,7 @@ fn step_accounting(attempts: &[AttemptAccounting]) -> Option<String> {
     let fields = accounting_fields(&accounting);
     let cost = estimated_cost(attempts.iter());
     if fields.is_empty() && cost.is_none() {
-        return None;
+        return (attempts.len() > 1).then(|| format!("{} attempts", attempts.len()));
     }
     let mut line = fields.join(" ");
     if let Some(cost) = cost {
@@ -8059,6 +8059,46 @@ truncated"
             let populated_rule = transcript.layout(width).footer_rule(width);
             assert_eq!(populated_rule.width(), usize::from(width));
         }
+    }
+
+    #[test]
+    fn failed_run_displays_retries_when_usage_is_unavailable() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::FailedRun {
+                        message:
+                            "model provider failed: provider failure: provider transport failed"
+                                .to_owned(),
+                        terminal: TerminalDetails {
+                            evidence: None,
+                            attempts: vec![AttemptAccounting::UsageUnavailable; 3],
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        assert_eq!(
+            transcript.blocks(),
+            [
+                TranscriptBlock::Status {
+                    text:
+                        "failed: model provider failed: provider failure: provider transport failed"
+                            .to_owned(),
+                },
+                TranscriptBlock::Accounting {
+                    text: "3 attempts".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(footer_text(&transcript.layout(120)), None);
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(rendered.contains("3 attempts"), "{rendered}");
     }
 
     #[test]

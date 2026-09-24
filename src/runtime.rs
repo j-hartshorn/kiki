@@ -8914,6 +8914,30 @@ mod tests {
         )
     }
 
+    struct UnavailableAttemptsModel;
+
+    impl Model for UnavailableAttemptsModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async {
+                Err(ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        None,
+                        None,
+                        "provider transport failed".to_owned(),
+                    ))),
+                    vec![AttemptAccounting::UsageUnavailable; 3],
+                ))
+            }
+        }
+    }
+
     struct AuthenticationFailureModel {
         calls: Arc<AtomicUsize>,
     }
@@ -10031,6 +10055,57 @@ mod tests {
             }
         )));
         assert_eq!(records, committed_records(&events));
+    }
+
+    #[tokio::test]
+    async fn failed_unmeasured_attempts_survive_session_reopen() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller_with_model(&workspace, UnavailableAttemptsModel).await;
+        let home = controller.test_home.take().expect("persisted test home");
+        let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        let [
+            _,
+            StoredRecord {
+                record: Record::FailedRun { message, terminal },
+                ..
+            },
+        ] = records.as_slice()
+        else {
+            panic!("expected failed Run after the request");
+        };
+        assert_eq!(
+            message,
+            "model provider failed: provider failure: provider transport failed"
+        );
+        assert_eq!(
+            terminal.attempts,
+            vec![AttemptAccounting::UsageUnavailable; 3]
+        );
+        assert_eq!(records, committed_records(&events));
+
+        let session = Session::open(home.path(), &session_id).expect("reopen failed session");
+        let restored = session.restore().expect("restore failed Run");
+        assert!(restored.executable.is_some());
+        let initial = restored_initial_state(&restored);
+        assert_eq!(initial.disabled_reason, None);
+        assert_eq!(
+            initial.timeline,
+            records
+                .into_iter()
+                .map(RestoredTimelineItem::Record)
+                .collect::<Vec<_>>()
+        );
+        session.close().expect("close failed session");
     }
 
     #[tokio::test]

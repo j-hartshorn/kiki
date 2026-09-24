@@ -7489,6 +7489,46 @@ mod tests {
     }
 
     #[test]
+    fn restored_failed_run_shows_unmeasured_retries_in_the_tui() {
+        let initial = RuntimeInitialState {
+            metadata: None,
+            timeline: vec![
+                RestoredTimelineItem::Record(StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "inspect".to_owned(),
+                    },
+                }),
+                RestoredTimelineItem::Record(StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::FailedRun {
+                        message:
+                            "model provider failed: provider failure: provider transport failed"
+                                .to_owned(),
+                        terminal: terminal(None, vec![AttemptAccounting::UsageUnavailable; 3]),
+                    },
+                }),
+            ],
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+        let mut app = App::restored(crate::config::ready_snapshot_for_test(), &initial);
+
+        let screen = rendered(&mut app, 120, 24);
+        assert!(
+            screen.contains(
+                "failed: model provider failed: provider failure: provider transport failed"
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.lines().any(|row| row.trim() == "3 attempts"),
+            "{screen}"
+        );
+        assert!(!screen.contains(['$', '↑', '↓']), "{screen}");
+    }
+
+    #[test]
     fn transcript_committed_history_renders_chronologically_through_final_settlement() {
         let mut app = App::default();
         app.handle_event(RuntimeEvent::RunStarted { run_id: RunId(1) });
