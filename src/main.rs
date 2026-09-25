@@ -247,6 +247,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(&ready);
+    let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
@@ -277,6 +278,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         subagents,
         session.writer(),
     )
+    .with_providers(providers.clone())
     .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
@@ -285,6 +287,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run(
         startup,
+        providers,
         command_sender.clone(),
         event_receiver,
         progress_receiver,
@@ -341,6 +344,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(&ready);
+    let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
     let runtime = match Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -389,7 +393,9 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             "Warning: session relocated; retained paths, data, and external effects were not rewritten."
         );
     }
-    let controller = controller.with_trace(trace.clone());
+    let controller = controller
+        .with_providers(providers.clone())
+        .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =
@@ -398,6 +404,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let tui_result = tui::run_restored(
         startup,
         initial,
+        providers,
         command_sender.clone(),
         event_receiver,
         progress_receiver,

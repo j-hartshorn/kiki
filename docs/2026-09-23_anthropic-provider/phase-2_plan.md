@@ -103,7 +103,8 @@
 **Tests**
 - `src/tui.rs`: Red first: with both providers and favourites, groups and order match the spec and a favourite appears twice; with only OpenAI, no Anthropic group or favourite entry; `/model anthropic/claude-opus-5-5` without the key shows the notice and sends no `ApplySettings`.
 - `src/subagents.rs`: explicit keyless model and keyless first favourite each return the tool error; a keyed model resolves as before.
-**Files** — Modify: `src/main.rs`, `src/tui.rs`, `src/subagents.rs`
+- `src/runtime.rs`: a controller given an OpenAI-only provider set rejects a keyless subagent model started from Python.
+**Files** — Modify: `src/main.rs`, `src/provider.rs` (provider set in production), `src/runtime.rs` (relays the provider set to subagent selection), `src/tui.rs`, `src/subagents.rs`
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 7: Anthropic retries and stream restarts

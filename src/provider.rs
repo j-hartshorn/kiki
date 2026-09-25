@@ -31,7 +31,6 @@ impl ProviderModel {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn providers(&self) -> Vec<Provider> {
         [
             (Provider::OpenAi, self.openai.is_some()),

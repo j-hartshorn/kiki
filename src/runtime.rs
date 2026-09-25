@@ -931,6 +931,11 @@ impl<M: Model> RuntimeController<M> {
         self
     }
 
+    pub(crate) fn with_providers(mut self, providers: Vec<Provider>) -> Self {
+        self.accepted_thinking = self.accepted_thinking.with_providers(providers);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve_child_selection(
         &self,
@@ -2344,7 +2349,7 @@ mod tests {
     };
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
-        models::{LUNA, OPUS_5_5, SOL, TERRA},
+        models::{LUNA, OPUS_5_5, Provider, SOL, TERRA},
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -13402,6 +13407,43 @@ mod tests {
             AcceptedThinking::new(root, persisted_settings(&home, workspace.path()), None);
 
         assert_eq!(accepted.resolve(child, None), child);
+    }
+
+    #[tokio::test]
+    async fn relayed_provider_set_rejects_keyless_subagent_models() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (commands, mut events, _progress, controller) = start_controller(
+            controller(
+                &workspace,
+                vec![
+                    ModelAction::Code {
+                        source: "try:\n    await start_subagent('child', 'anthropic/claude-opus-5-5')\n    outcome = 'started'\nexcept ValueError as error:\n    outcome = str(error)\noutcome".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .with_providers(vec![Provider::OpenAi]),
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start a child".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+
+        let outcome = result_head(completed_execution(&records, RunId(1), ModelStepId(1)));
+        assert!(outcome.contains("ANTHROPIC_API_KEY"), "{outcome}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SubagentSpawned { .. }))
+        );
     }
 
     #[tokio::test]
