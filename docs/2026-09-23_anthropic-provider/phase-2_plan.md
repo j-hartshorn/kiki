@@ -138,9 +138,9 @@
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 11: Live Anthropic smoke test
-**Changes** — An ignored live test mirroring `live_sol` on `anthropic/claude-opus-5-5`, plus a `live-test-anthropic` justfile recipe.
+**Changes** — An ignored live test mirroring `live_sol` on `anthropic/claude-opus-5-5`, plus a `live-test-anthropic` justfile recipe that sets `KIKI_MODEL`. The test reuses the `live_sol` harness through a `pub(crate)` helper that fails setup unless the effective model is the required one.
 **Tests** (`src/anthropic.rs`, ignored) — The same run, cancellation and follow-up checks as `live_sol`.
-**Files** — Modify: `src/anthropic.rs`, `justfile`
+**Files** — Modify: `src/anthropic.rs`, `src/openai.rs` (shared live harness), `justfile`
 **Verification** — `just live-test-anthropic`: passes with `ANTHROPIC_API_KEY` set; the overall test command skips it.
 
 ### Task 12: Document the Anthropic provider

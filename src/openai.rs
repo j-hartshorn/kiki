@@ -1847,7 +1847,7 @@ struct WireIncompleteDetails {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -6061,8 +6061,12 @@ mod tests {
     const LIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-    const LIVE_SETUP_CONFIGURATION: &str =
+    const LIVE_SETUP_OPENAI: &str =
         "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+    const LIVE_SETUP_ANTHROPIC: &str =
+        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+    const LIVE_SETUP_MODEL: &str =
+        "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =
         "live test could not initialise the workspace read capability";
     const LIVE_SETUP_ARENA: &str = "live test could not initialise the Monty arena";
@@ -6072,7 +6076,7 @@ mod tests {
     const LIVE_OUTER_DEADLINE: &str = "live scenario exceeded its five-minute deadline";
     const LIVE_STEP_LIMIT: &str = "live first run exceeded eight model steps";
     const LIVE_FIRST_SETTLEMENT: &str = "live first run did not settle correctly";
-    const LIVE_SECOND_START: &str = "live cancellation run did not start an OpenAI attempt";
+    const LIVE_SECOND_START: &str = "live cancellation run did not start a provider attempt";
     const LIVE_SECOND_SETTLEMENT: &str = "live cancellation run did not settle correctly";
     const LIVE_THIRD_SETTLEMENT: &str = "live follow-up run did not settle correctly";
     const LIVE_CLEANUP_SHUTDOWN: &str = "live test could not request runtime shutdown";
@@ -6352,11 +6356,21 @@ mod tests {
         third_run_id: crate::runtime::RunId,
     }
 
-    async fn start_live_controller() -> Result<LiveController, &'static str> {
+    async fn start_live_controller(
+        required_model: Option<&'static crate::config::ModelConfiguration>,
+    ) -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
+        let effective_model = configuration.snapshot().model();
+        if required_model.is_some_and(|required| required.id != effective_model.id) {
+            return Err(LIVE_SETUP_MODEL);
+        }
+        let setup_failure = match effective_model.provider() {
+            Provider::OpenAi => LIVE_SETUP_OPENAI,
+            Provider::Anthropic => LIVE_SETUP_ANTHROPIC,
+        };
         let persisted_settings = configuration.snapshot().settings().clone();
         let (worker_path, workspace_root, model, prompt_base, selection, policy) = {
-            let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
+            let ready = configuration.ready().ok_or(setup_failure)?;
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
@@ -6758,8 +6772,10 @@ mod tests {
         }
     }
 
-    async fn run_live_sol_smoke_test() -> Result<(), &'static str> {
-        let mut controller = start_live_controller().await?;
+    pub(crate) async fn run_live_smoke_test(
+        required_model: Option<&'static crate::config::ModelConfiguration>,
+    ) -> Result<(), &'static str> {
+        let mut controller = start_live_controller(required_model).await?;
         let scenario = match timeout(LIVE_OUTER_TIMEOUT, run_live_scenario(&mut controller)).await {
             Ok(result) => result,
             Err(_) => Err(LIVE_OUTER_DEADLINE),
@@ -6775,7 +6791,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires explicit OPENAI_API_KEY and MONTY_BIN"]
     async fn live_sol() {
-        if let Err(message) = run_live_sol_smoke_test().await {
+        if let Err(message) = run_live_smoke_test(None).await {
             panic!("{message}");
         }
     }

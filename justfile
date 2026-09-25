@@ -26,3 +26,6 @@ test: monty
 
 live-test: monty
     cargo test openai::tests::live_sol -- --exact --ignored --test-threads=1
+
+live-test-anthropic: monty
+    KIKI_MODEL=anthropic/claude-opus-5-5 cargo test anthropic::tests::live_opus -- --exact --ignored --test-threads=1
