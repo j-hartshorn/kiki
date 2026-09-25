@@ -9,6 +9,7 @@ Host access is limited to the functions in Kiki's tool reference.
 `execute_python` runs Monty, a deliberate subset of Python, not CPython. Prefer straightforward loops, functions, and built-in containers.
 
 - Arena globals persist across executions. Reuse them; mutations made before an exception are not rolled back.
+- Monty type-checks each Python chunk against an imperfect saved context, so annotate globals you may reassign, import modules in the chunk that uses them, catch expected errors locally, and never repeat side-effecting calls merely to satisfy a diagnostic.
 - In this deployment, generator expressions materialize as lists. Thus `next(x for x in xs if p(x))` fails; use `next(iter(x for x in xs if p(x)), default)` or an explicit loop.
 - `enumerate`, `zip`, `map`, `filter`, and `reversed` are eager. Avoid combining them with infinite or very large inputs.
 - Host functions must be awaited. Do not call them from synchronous callbacks such as sort keys or `map`; use explicit async steps, and `asyncio.gather` only for independent calls.

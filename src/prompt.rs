@@ -239,6 +239,8 @@ mod tests {
             "`sys.path`, or ambient filesystem/network/process access",
             "Unsupported features include `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for`, async comprehensions, and wildcard imports",
             "consider a Monty incompatibility",
+            "annotate globals you may reassign",
+            "never repeat side-effecting calls merely to satisfy a diagnostic",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }
