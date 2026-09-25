@@ -110,7 +110,7 @@
 ### Task 7: Anthropic retries and stream restarts
 **Changes** — One path for step and summarise: 2 request retries on 408, 429, 5xx including 529, delayed by `retry-after-ms`, then `retry-after` (server delays capped at 60s), else backoff; up to 3 stream attempts on transport drops and mid-stream `overloaded_error`, resending the pre-attempt request and discarding partial output; each restart gets a fresh 16 MiB content budget, and `ContentTooLarge` is terminal rather than restartable; cancellation-aware waits; `AttemptStarted`/`AttemptSettled` as OpenAI emits them.
 **Tests** (`src/anthropic.rs`, loopback fixture) — Red first: 429 then success is one attempt and two requests; `retry-after-ms` beats `retry-after`; a 120s `retry-after` waits at most 60s (use paused tokio time if the fixture allows, otherwise assert the computed delay); 400 is not retried; a dropped stream and a mid-stream `overloaded_error` restart with the same request body; the settled step after a restart contains none of the failed attempt's text, reasoning, preview or replay; three failed attempts exhaust; a restart succeeds when the failed and successful attempts together exceed 16 MiB but each remains within its own budget; `ContentTooLarge` sends no retry; cancelling during a wait sends no further request.
-**Files** — Modify: `src/anthropic.rs`
+**Files** — Modify: `src/anthropic.rs`, `Cargo.toml` (`time` `parsing` feature for HTTP-date `retry-after`)
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 8: Anthropic summarisation

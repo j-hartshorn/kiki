@@ -1,10 +1,11 @@
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -24,6 +25,11 @@ const EXECUTE_PYTHON: &str = "execute_python";
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
 // Room for 16 MiB of content escaped as `\u00XX` (6 bytes per byte) in one frame.
 const SSE_FRAME_LIMIT: usize = 128 * 1024 * 1024;
+const HTTP_RETRIES: u32 = 2;
+const HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const SERVER_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(60);
+const MAX_STREAM_ATTEMPTS: u32 = 3;
+const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct AnthropicModel {
@@ -32,6 +38,8 @@ pub(crate) struct AnthropicModel {
     endpoint: String,
     client: reqwest::Client,
     frame_limit: usize,
+    #[cfg(test)]
+    wait_entered: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl AnthropicModel {
@@ -60,6 +68,8 @@ impl AnthropicModel {
                 .build()
                 .expect("Anthropic HTTP client"),
             frame_limit: SSE_FRAME_LIMIT,
+            #[cfg(test)]
+            wait_entered: Default::default(),
         }
     }
 
@@ -158,7 +168,7 @@ impl AnthropicModel {
         }))
     }
 
-    async fn step_once(
+    async fn step_with_restarts(
         &self,
         selection: ModelSelection,
         history: &ModelHistory,
@@ -169,38 +179,130 @@ impl AnthropicModel {
             return Err(ModelError::Cancelled.into());
         }
         let request = self.request(selection, history)?;
-        progress(ModelProgress::AttemptStarted { attempt: 1 });
+        let (mut step, attempts) = self
+            .with_restarts(&request, selection, cancellation, progress, |message| {
+                self.completed_step(history, message)
+            })
+            .await?;
+        step.attempts = attempts;
+        Ok(step)
+    }
 
-        let mut presentation = PresentationBatcher::default();
-        let streamed = self
-            .stream(
-                &request,
-                selection.model().wire_id(),
-                cancellation,
-                &mut presentation,
-                progress,
-            )
-            .await;
-        presentation.flush_all(progress);
-        let (result, accounting) = match streamed {
-            Ok(message) => {
-                let accounting =
-                    AttemptAccounting::KnownUsage(self.usage(&message.usage, selection));
-                (self.completed_step(history, message), accounting)
-            }
-            Err(error) => (Err(error), AttemptAccounting::UsageUnavailable),
-        };
-        progress(ModelProgress::AttemptSettled {
-            attempt: 1,
-            accounting: accounting.clone(),
-        });
+    async fn with_restarts<T>(
+        &self,
+        request: &Value,
+        selection: ModelSelection,
+        cancellation: &CancellationToken,
+        progress: &mut (dyn FnMut(ModelProgress) + Send),
+        finish: impl Fn(StreamedMessage) -> Result<T, ModelError>,
+    ) -> Result<(T, Vec<AttemptAccounting>), ModelFailure> {
+        let mut attempts = Vec::new();
+        for attempt in 1..=MAX_STREAM_ATTEMPTS {
+            progress(ModelProgress::AttemptStarted { attempt });
+            let mut presentation = PresentationBatcher::default();
+            let streamed = self
+                .stream(
+                    request,
+                    selection.model().wire_id(),
+                    cancellation,
+                    &mut presentation,
+                    progress,
+                )
+                .await;
+            presentation.flush_all(progress);
+            let (result, accounting) = match streamed {
+                Ok(message) => {
+                    let usage = self.usage(&message.usage, selection);
+                    let accounting = if message.retried_requests {
+                        AttemptAccounting::KnownUsageWithUntrackedRetries(usage)
+                    } else {
+                        AttemptAccounting::KnownUsage(usage)
+                    };
+                    (
+                        finish(message).map_err(AttemptFailure::Terminal),
+                        accounting,
+                    )
+                }
+                Err(failure) => (Err(failure), AttemptAccounting::UsageUnavailable),
+            };
+            progress(ModelProgress::AttemptSettled {
+                attempt,
+                accounting: accounting.clone(),
+            });
+            attempts.push(accounting);
 
-        match result {
-            Ok(mut step) => {
-                step.attempts = vec![accounting];
-                Ok(step)
+            match result {
+                Ok(value) => return Ok((value, attempts)),
+                Err(AttemptFailure::Restartable(_)) if attempt < MAX_STREAM_ATTEMPTS => {
+                    if let Err(error) = self
+                        .cancellable_wait(STREAM_RESTART_DELAY, cancellation)
+                        .await
+                    {
+                        return Err(ModelFailure::new(error, attempts));
+                    }
+                }
+                Err(AttemptFailure::Restartable(error) | AttemptFailure::Terminal(error)) => {
+                    return Err(ModelFailure::new(error, attempts));
+                }
             }
-            Err(error) => Err(ModelFailure::new(error, vec![accounting])),
+        }
+        unreachable!("stream attempts are bounded")
+    }
+
+    async fn cancellable_wait(
+        &self,
+        delay: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelError> {
+        #[cfg(test)]
+        self.wait_entered.notify_one();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ModelError::Cancelled),
+            _ = tokio::time::sleep(delay) => Ok(()),
+        }
+    }
+
+    async fn send(
+        &self,
+        request: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<(reqwest::Response, bool), AttemptFailure> {
+        let mut retry = 0;
+        loop {
+            let send = self
+                .client
+                .post(&self.endpoint)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(request)
+                .send();
+            let response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ModelError::Cancelled.into()),
+                response = send => response,
+            }
+            .map_err(|_| {
+                AttemptFailure::Restartable(self.provider_error(
+                    None,
+                    None,
+                    "provider transport failed",
+                ))
+            })?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok((response, retry > 0));
+            }
+            if retry == HTTP_RETRIES || !matches!(status.as_u16(), 408 | 429 | 500..=599) {
+                return Err(self
+                    .http_failure(status.as_u16(), response, cancellation)
+                    .await
+                    .into());
+            }
+            let delay = retry_delay(response.headers(), retry);
+            drop(response);
+            self.cancellable_wait(delay, cancellation).await?;
+            retry += 1;
         }
     }
 
@@ -211,53 +313,42 @@ impl AnthropicModel {
         cancellation: &CancellationToken,
         presentation: &mut PresentationBatcher,
         progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) -> Result<StreamedMessage, ModelError> {
-        let send = self
-            .client
-            .post(&self.endpoint)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(request)
-            .send();
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
-            response = send => response,
-        }
-        .map_err(|_| self.provider_error(None, None, "provider transport failed"))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(self
-                .http_failure(status.as_u16(), response, cancellation)
-                .await);
-        }
-
+    ) -> Result<StreamedMessage, AttemptFailure> {
+        let (response, retried_requests) = self.send(request, cancellation).await?;
         let mut frames = SseFrameLimit::new(self.frame_limit);
         let chunks = response.bytes_stream().map(move |chunk| match chunk {
-            Ok(chunk) => frames.complete_lines(&chunk),
-            Err(_) => Err(self.provider_error(None, None, "provider stream failed")),
+            Ok(chunk) => Ok(frames.complete_lines(&chunk)?),
+            Err(_) => Err(AttemptFailure::Restartable(self.provider_error(
+                None,
+                None,
+                "provider stream failed",
+            ))),
         });
         let mut events = std::pin::pin!(chunks.eventsource());
-        let mut message = StreamedMessage::default();
+        let mut message = StreamedMessage {
+            retried_requests,
+            ..StreamedMessage::default()
+        };
         loop {
             let event = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                _ = cancellation.cancelled() => return Err(ModelError::Cancelled.into()),
                 event = events.next() => event,
             };
             let event = match event {
                 None => {
-                    return Err(self.provider_error(
+                    return Err(AttemptFailure::Restartable(self.provider_error(
                         None,
                         None,
                         "provider stream ended without a terminal response",
-                    ));
+                    )));
                 }
-                Some(Err(EventStreamError::Transport(error))) => return Err(error),
+                Some(Err(EventStreamError::Transport(failure))) => return Err(failure),
                 Some(Err(_)) => {
                     return Err(ModelError::InvalidResponse(
                         "stream was not valid server-sent events",
-                    ));
+                    )
+                    .into());
                 }
                 Some(Ok(event)) => event,
             };
@@ -266,22 +357,30 @@ impl AnthropicModel {
             let now = Instant::now();
             match event {
                 WireEvent::Error { error } => {
-                    return Err(self.provider_error(None, Some(error.kind), error.message));
+                    let restartable = error.kind == "overloaded_error";
+                    let error = self.provider_error(None, Some(error.kind), error.message);
+                    return Err(if restartable {
+                        AttemptFailure::Restartable(error)
+                    } else {
+                        AttemptFailure::Terminal(error)
+                    });
                 }
                 WireEvent::Ping | WireEvent::Unexpected => {}
                 WireEvent::MessageStart { .. } if message.started => {
-                    return Err(ModelError::InvalidResponse("stream repeated message start"));
+                    return Err(ModelError::InvalidResponse("stream repeated message start").into());
                 }
                 WireEvent::MessageStart { message: start } => {
                     if start.role != "assistant" {
                         return Err(ModelError::InvalidResponse(
                             "message start was not an assistant message",
-                        ));
+                        )
+                        .into());
                     }
                     if start.model != model {
                         return Err(ModelError::InvalidResponse(
                             "message start did not echo the selected model",
-                        ));
+                        )
+                        .into());
                     }
                     message.started = true;
                     if let Some(usage) = start.usage {
@@ -291,12 +390,14 @@ impl AnthropicModel {
                 _ if !message.started => {
                     return Err(ModelError::InvalidResponse(
                         "stream content arrived before message start",
-                    ));
+                    )
+                    .into());
                 }
                 WireEvent::MessageStop if message.open.is_some() => {
                     return Err(ModelError::InvalidResponse(
                         "stream stopped inside a content block",
-                    ));
+                    )
+                    .into());
                 }
                 WireEvent::MessageStop => return Ok(message),
                 WireEvent::MessageDelta { delta, usage } => {
@@ -458,8 +559,38 @@ impl Model for AnthropicModel {
         cancellation: &'a CancellationToken,
         progress: &'a mut (dyn FnMut(ModelProgress) + Send),
     ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a {
-        self.step_once(selection, history, cancellation, progress)
+        self.step_with_restarts(selection, history, cancellation, progress)
     }
+}
+
+enum AttemptFailure {
+    Restartable(ModelError),
+    Terminal(ModelError),
+}
+
+impl From<ModelError> for AttemptFailure {
+    fn from(error: ModelError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+fn retry_delay(headers: &reqwest::header::HeaderMap, retry: u32) -> Duration {
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
+    let number = |value: &str| value.parse::<f64>().ok().filter(|number| *number >= 0.0);
+    let seconds_until = |value: &str| {
+        let date = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+        Some((date - OffsetDateTime::now_utc()).as_seconds_f64()).filter(|seconds| *seconds >= 0.0)
+    };
+    header("retry-after-ms")
+        .and_then(number)
+        .map(|milliseconds| milliseconds / 1000.0)
+        .or_else(|| {
+            let value = header("retry-after")?;
+            number(value).or_else(|| seconds_until(value))
+        })
+        // Cap before converting: huge values overflow `Duration`.
+        .map(|seconds| Duration::from_secs_f64(seconds.min(SERVER_RETRY_DELAY_LIMIT.as_secs_f64())))
+        .unwrap_or(HTTP_RETRY_BACKOFF * 2_u32.pow(retry))
 }
 
 fn redact(value: &str, api_key: &str) -> String {
@@ -732,6 +863,7 @@ impl UsageTotals {
 
 #[derive(Default)]
 struct StreamedMessage {
+    retried_requests: bool,
     started: bool,
     usage: UsageTotals,
     blocks: Vec<ContentBlock>,
@@ -995,10 +1127,12 @@ mod tests {
 
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
+    use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::{Value, json};
+    use time::{OffsetDateTime, format_description::well_known::Rfc2822};
     use tokio_util::sync::CancellationToken;
 
-    use super::{AnthropicModel, SSE_FRAME_LIMIT, SseFrameLimit};
+    use super::{AnthropicModel, SSE_FRAME_LIMIT, SseFrameLimit, retry_delay};
     use crate::{
         config::{
             ModelSelection,
@@ -1012,6 +1146,7 @@ mod tests {
             ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
             ProviderReplay, canonical_compaction_summary,
         },
+        pricing::{RunCostEstimate, estimate_run_cost},
         sse_fixture::{Fixture, FixtureReply},
     };
 
@@ -1053,7 +1188,15 @@ mod tests {
     }
 
     fn expected_accounting() -> AttemptAccounting {
-        AttemptAccounting::KnownUsage(ModelUsage {
+        AttemptAccounting::KnownUsage(expected_usage())
+    }
+
+    fn retried_accounting() -> AttemptAccounting {
+        AttemptAccounting::KnownUsageWithUntrackedRetries(expected_usage())
+    }
+
+    fn expected_usage() -> ModelUsage {
+        ModelUsage {
             model: "anthropic/claude-opus-5-5".to_owned(),
             service_tier: Some("standard".to_owned()),
             input_tokens: Some(12),
@@ -1063,7 +1206,7 @@ mod tests {
             output_tokens: Some(40),
             reasoning_output_tokens: Some(25),
             total_tokens: Some(52),
-        })
+        }
     }
 
     fn message_start(usage: Value) -> Value {
@@ -1904,7 +2047,7 @@ mod tests {
     async fn sse_error_before_message_start_is_a_provider_failure() {
         let fixture = Fixture::start(FixtureReply::OwnedSse(sse([json!({
             "type": "error",
-            "error": {"type": "overloaded_error", "message": "Overloaded"}
+            "error": {"type": "api_error", "message": "Internal server error"}
         })])))
         .await;
 
@@ -1914,9 +2057,10 @@ mod tests {
 
         assert_eq!(
             (provider.status(), provider.code(), provider.message()),
-            (None, Some("overloaded_error"), "Overloaded")
+            (None, Some("api_error"), "Internal server error")
         );
         assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        assert_eq!(fixture.request_count(), 1);
     }
 
     fn budget_stream(
@@ -2358,5 +2502,506 @@ mod tests {
             })
         );
         fixture.wait_for_disconnect().await;
+    }
+
+    fn starts(progress: &[ModelProgress]) -> Vec<u32> {
+        progress
+            .iter()
+            .filter_map(|event| match event {
+                ModelProgress::AttemptStarted { attempt } => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn settles(progress: &[ModelProgress]) -> Vec<u32> {
+        progress
+            .iter()
+            .filter_map(|event| match event {
+                ModelProgress::AttemptSettled { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn status_reply(code: u16, headers: &[(&str, &str)]) -> FixtureReply {
+        FixtureReply::OwnedStatus {
+            code,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            body: json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "try again"}
+            })
+            .to_string(),
+        }
+    }
+
+    fn assert_same_requests(fixture: &Fixture, count: usize) {
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), count);
+        let expected = expected_request(json!([{
+            "role": "user",
+            "content": [{"type": "text", "text": "inspect"}]
+        }]));
+        assert!(requests.iter().all(|request| request.body == expected));
+    }
+
+    fn interrupted_stream() -> String {
+        sse([message_start(start_usage())]
+            .into_iter()
+            .chain(thinking(0, &["stale thought"], "stale-sig"))
+            .chain(text(1, "stale text"))
+            .chain([
+                block_start(
+                    2,
+                    json!({"type": "tool_use", "id": "toolu_stale", "name": "execute_python", "input": {}}),
+                ),
+                delta(
+                    2,
+                    json!({"type": "input_json_delta", "partial_json": r#"{"code":"stale"#}),
+                ),
+            ]))
+    }
+
+    fn overloaded_stream() -> String {
+        format!(
+            "{}{}",
+            interrupted_stream(),
+            sse([json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"}
+            })])
+        )
+    }
+
+    #[tokio::test]
+    async fn retryable_statuses_are_retried_within_one_attempt_with_the_same_request() {
+        for code in [408, 429, 500, 529] {
+            let fixture = Fixture::start_sequence(vec![
+                status_reply(code, &[]),
+                FixtureReply::OwnedSse(tool_stream()),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture, &history("inspect")).await;
+            let step = result.unwrap();
+
+            assert_same_requests(&fixture, 2);
+            assert_eq!(starts(&progress), [1], "HTTP {code}");
+            assert_eq!(settles(&progress), [1], "HTTP {code}");
+            assert_eq!(step.attempts, vec![retried_accounting()], "HTTP {code}");
+            assert_eq!(
+                progress.last(),
+                Some(&ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: retried_accounting(),
+                })
+            );
+            assert!(matches!(
+                estimate_run_cost(&step.attempts),
+                RunCostEstimate::LowerBound(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_without_http_retries_keeps_known_usage_and_a_complete_cost() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(tool_stream())).await;
+
+        let (result, _) = step(&fixture, &history("inspect")).await;
+        let step = result.unwrap();
+
+        assert_eq!(step.attempts, vec![expected_accounting()]);
+        assert!(matches!(
+            estimate_run_cost(&step.attempts),
+            RunCostEstimate::Complete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_semantic_failure_after_an_http_retry_reports_usage_with_untracked_retries() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after-ms", "0")]),
+            FixtureReply::OwnedSse(stream(
+                start_usage(),
+                vec![text(0, "partial")],
+                "max_tokens",
+                final_usage(),
+            )),
+        ])
+        .await;
+
+        let (result, progress) = step(&fixture, &history("inspect")).await;
+        let failure = result.unwrap_err();
+
+        assert_eq!(
+            failure.provider_failure().unwrap().code(),
+            Some("max_tokens")
+        );
+        assert_eq!(failure.attempts(), &[retried_accounting()]);
+        assert_eq!(
+            progress.last(),
+            Some(&ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting: retried_accounting(),
+            })
+        );
+        assert!(matches!(
+            estimate_run_cost(failure.attempts()),
+            RunCostEstimate::LowerBound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_retries_in_a_failed_attempt_do_not_mark_the_restarted_attempt() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after-ms", "0")]),
+            FixtureReply::Sse(""),
+            FixtureReply::OwnedSse(tool_stream()),
+        ])
+        .await;
+
+        let (result, _) = step(&fixture, &history("inspect")).await;
+        let step = result.unwrap();
+
+        assert_same_requests(&fixture, 3);
+        assert_eq!(
+            step.attempts,
+            vec![AttemptAccounting::UsageUnavailable, expected_accounting()]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_ms_takes_precedence_over_retry_after() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after-ms", "0"), ("retry-after", "30")]),
+            FixtureReply::OwnedSse(tool_stream()),
+        ])
+        .await;
+
+        let (result, _) =
+            tokio::time::timeout(Duration::from_secs(5), step(&fixture, &history("inspect")))
+                .await
+                .expect("retry-after-ms should override retry-after");
+
+        result.unwrap();
+        assert_same_requests(&fixture, 2);
+    }
+
+    fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn retry_delay_prefers_retry_after_ms_caps_server_delays_and_otherwise_backs_off() {
+        let huge = "9".repeat(400);
+        for (pairs, retry, expected) in [
+            (
+                &[("retry-after-ms", "250"), ("retry-after", "30")][..],
+                0,
+                Duration::from_millis(250),
+            ),
+            (&[("retry-after", "2")], 0, Duration::from_secs(2)),
+            (&[("retry-after", "120")], 0, Duration::from_secs(60)),
+            (&[("retry-after-ms", "120000")], 0, Duration::from_secs(60)),
+            (&[("retry-after", "1e20")], 0, Duration::from_secs(60)),
+            (
+                &[("retry-after", huge.as_str())],
+                0,
+                Duration::from_secs(60),
+            ),
+            (&[("retry-after-ms", "1e30")], 0, Duration::from_secs(60)),
+            (
+                &[("retry-after-ms", huge.as_str()), ("retry-after", "3")],
+                0,
+                Duration::from_secs(60),
+            ),
+            (&[("retry-after", "NaN")], 0, Duration::from_millis(100)),
+            (
+                &[("retry-after-ms", "soon"), ("retry-after", "3")],
+                0,
+                Duration::from_secs(3),
+            ),
+            (&[("retry-after", "-1")], 0, Duration::from_millis(100)),
+            (
+                &[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                1,
+                Duration::from_millis(200),
+            ),
+            (&[], 0, Duration::from_millis(100)),
+            (&[], 1, Duration::from_millis(200)),
+        ] {
+            assert_eq!(
+                retry_delay(&header_map(pairs), retry),
+                expected,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_http_dates_delay_until_a_future_date_capped_and_ignore_past_dates() {
+        let date = |offset: OffsetDateTime| offset.format(&Rfc2822).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let beyond_cap = date(now + Duration::from_secs(120));
+        let imf_fixdate = date(now + Duration::from_secs(30)).replace("+0000", "GMT");
+        let past = date(now - Duration::from_secs(120));
+
+        assert_eq!(
+            retry_delay(&header_map(&[("retry-after", beyond_cap.as_str())]), 0),
+            Duration::from_secs(60)
+        );
+        let delay = retry_delay(&header_map(&[("retry-after", imf_fixdate.as_str())]), 0);
+        assert!(
+            (Duration::from_secs(28)..=Duration::from_secs(30)).contains(&delay),
+            "{imf_fixdate}: {delay:?}"
+        );
+        assert_eq!(
+            retry_delay(&header_map(&[("retry-after", past.as_str())]), 1),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_http_retries_fail_the_attempt_without_a_stream_restart() {
+        let fixture = Fixture::start(status_reply(529, &[("retry-after-ms", "0")])).await;
+
+        let (result, progress) = step(&fixture, &history("inspect")).await;
+        let failure = result.unwrap_err();
+        let provider = failure.provider_failure().unwrap();
+
+        assert_same_requests(&fixture, 3);
+        assert_eq!(starts(&progress), [1]);
+        assert_eq!(settles(&progress), [1]);
+        assert_eq!(
+            (provider.status(), provider.code(), provider.message()),
+            (Some(529), Some("overloaded_error"), "try again")
+        );
+        assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+    }
+
+    #[tokio::test]
+    async fn client_errors_are_not_retried() {
+        for code in [400, 401] {
+            let fixture = Fixture::start_sequence(vec![
+                status_reply(code, &[("retry-after-ms", "0")]),
+                FixtureReply::OwnedSse(tool_stream()),
+            ])
+            .await;
+
+            let (result, progress) = step(&fixture, &history("inspect")).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(failure.provider_failure().unwrap().status(), Some(code));
+            assert_eq!(fixture.request_count(), 1, "HTTP {code}");
+            assert_eq!(starts(&progress), [1]);
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_streams_restart_with_the_same_request_and_discard_partial_output() {
+        for first in [
+            FixtureReply::CloseBeforeHeaders,
+            FixtureReply::AbruptSse(IDLE_STREAM),
+            FixtureReply::OwnedSse(interrupted_stream()),
+            FixtureReply::OwnedSse(overloaded_stream()),
+        ] {
+            let fixture =
+                Fixture::start_sequence(vec![first, FixtureReply::OwnedSse(tool_stream())]).await;
+
+            let (result, progress) = step(&fixture, &history("inspect")).await;
+            let step = result.unwrap();
+
+            assert_same_requests(&fixture, 2);
+            assert_eq!(starts(&progress), [1, 2]);
+            assert_eq!(settles(&progress), [1, 2]);
+            let restart = progress
+                .iter()
+                .position(|event| event == &ModelProgress::AttemptStarted { attempt: 2 })
+                .unwrap();
+            assert_eq!(
+                progress[restart - 1],
+                ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: AttemptAccounting::UsageUnavailable,
+                }
+            );
+            assert_eq!(
+                streamed(&progress[restart..]),
+                (
+                    "Checking the file".to_owned(),
+                    "I'll run it.".to_owned(),
+                    "print(1)".to_owned()
+                )
+            );
+            assert_eq!(
+                step.action,
+                ModelAction::Code {
+                    source: "print(1)".to_owned(),
+                    call_id: ModelCallId::new("toolu_1"),
+                    commentary: Some("I'll run it.".to_owned()),
+                }
+            );
+            assert_eq!(step.reasoning_summary, "Checking the file");
+            assert_eq!(replay_values(&step.replay), tool_blocks());
+            assert_eq!(
+                step.attempts,
+                vec![AttemptAccounting::UsageUnavailable, expected_accounting()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_restarts_stop_after_three_interrupted_attempts() {
+        for (reply, code, message) in [
+            (
+                FixtureReply::AbruptSse(IDLE_STREAM),
+                None,
+                "provider stream failed",
+            ),
+            (
+                FixtureReply::OwnedSse(overloaded_stream()),
+                Some("overloaded_error"),
+                "Overloaded",
+            ),
+        ] {
+            let fixture = Fixture::start(reply).await;
+
+            let (result, progress) = step(&fixture, &history("inspect")).await;
+            let failure = result.unwrap_err();
+            let provider = failure.provider_failure().unwrap();
+
+            assert_same_requests(&fixture, 3);
+            assert_eq!(starts(&progress), [1, 2, 3]);
+            assert_eq!(settles(&progress), [1, 2, 3]);
+            assert_eq!(
+                (provider.status(), provider.code(), provider.message()),
+                (None, code, message)
+            );
+            assert_eq!(
+                failure.attempts(),
+                vec![AttemptAccounting::UsageUnavailable; 3]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restarted_attempt_has_a_fresh_content_budget() {
+        let at_limit = sse([
+            message_start(start_usage()),
+            block_start(0, json!({"type": "text", "text": ""})),
+            delta(
+                0,
+                json!({"type": "text_delta", "text": "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT)}),
+            ),
+        ]);
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::OwnedSse(at_limit),
+            FixtureReply::OwnedSse(message_stream()),
+        ])
+        .await;
+
+        let step = model(&fixture, KEY)
+            .step(
+                selection(),
+                &history("inspect"),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fixture.request_count(), 2);
+        assert_eq!(
+            step.action,
+            ModelAction::Message {
+                text: "Done.".to_owned()
+            }
+        );
+        assert_eq!(
+            step.attempts,
+            vec![AttemptAccounting::UsageUnavailable, expected_accounting()]
+        );
+    }
+
+    async fn cancel_once_waiting(
+        fixture: &Fixture,
+        wait: &str,
+    ) -> (ModelFailure, Vec<ModelProgress>) {
+        let mut model = model(fixture, KEY);
+        let wait_entered = model.wait_entered.clone();
+        let cancellation = CancellationToken::new();
+        let history = history("inspect");
+        let mut progress = Vec::new();
+
+        let (result, ()) = {
+            let mut sink = |event| progress.push(event);
+            tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    model.step(selection(), &history, &cancellation, &mut sink),
+                ),
+                async {
+                    tokio::time::timeout(Duration::from_secs(1), wait_entered.notified())
+                        .await
+                        .unwrap_or_else(|_| panic!("model should enter the {wait}"));
+                    cancellation.cancel();
+                }
+            )
+        };
+        let failure = result
+            .expect("cancellation should end the wait")
+            .unwrap_err();
+        (failure, progress)
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_an_http_retry_wait_sends_no_further_request() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after", "30")]),
+            FixtureReply::OwnedSse(tool_stream()),
+        ])
+        .await;
+
+        let (failure, progress) = cancel_once_waiting(&fixture, "HTTP retry wait").await;
+
+        assert!(failure.is_cancelled());
+        assert_eq!(fixture.request_count(), 1);
+        assert_eq!(
+            progress,
+            [
+                ModelProgress::AttemptStarted { attempt: 1 },
+                ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: AttemptAccounting::UsageUnavailable,
+                },
+            ]
+        );
+        assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_the_restart_delay_starts_no_further_attempt() {
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::Sse(""),
+            FixtureReply::OwnedSse(tool_stream()),
+        ])
+        .await;
+
+        let (failure, progress) = cancel_once_waiting(&fixture, "restart wait").await;
+
+        assert!(failure.is_cancelled());
+        assert_eq!(fixture.request_count(), 1);
+        assert_eq!(starts(&progress), [1]);
+        assert_eq!(settles(&progress), [1]);
+        assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
     }
 }
