@@ -16,7 +16,6 @@ use crate::arena::{
     Execution, ExecutionOutcome, Observation, RunPreview, ToolCall, ToolCallSummary, ToolCallToken,
     ToolName,
 };
-use crate::config::models::CATALOGUE;
 use crate::config::{
     ApiKeyPresence, DEFAULT_MODEL, ModelSelection, PromptProvenance, StartupSnapshot,
     SubmissionAvailability, model_by_id,
@@ -1722,15 +1721,19 @@ struct ModelFooter {
 
 impl ModelFooter {
     fn full(&self) -> String {
-        format!(
+        format!("{} • thinking {}", self.id, self.thinking)
+    }
+
+    fn compact(&self) -> FooterField {
+        FooterField::muted(format!(
             "{} • thinking {}",
-            display_model_id(&self.id),
+            unqualified_model_id(&self.id),
             self.thinking
-        )
+        ))
     }
 
     fn truncated(&self, width: usize) -> Option<FooterField> {
-        let model = display_model_id(&self.id);
+        let model = unqualified_model_id(&self.id);
         let thinking = format!("thinking {}", self.thinking);
         let separator = " • ";
         let full = self.full();
@@ -1869,6 +1872,14 @@ impl Footer {
         let identity = if footer_fits(width, full_identity.as_ref(), &statistics, model.as_ref()) {
             full_identity
         } else {
+            if !footer_fits(
+                width,
+                preferred_identity.as_ref(),
+                &statistics,
+                model.as_ref(),
+            ) {
+                model = self.model.as_ref().map(ModelFooter::compact);
+            }
             while !statistics.is_empty()
                 && !footer_fits(
                     width,
@@ -1947,16 +1958,8 @@ fn right_width(statistics: &[FooterField], model: Option<&FooterField>) -> usize
     }
 }
 
-fn display_model_id(id: &str) -> &str {
-    let mut providers = CATALOGUE
-        .iter()
-        .filter_map(|model| model.id.split_once('/').map(|(provider, _)| provider));
-    match providers.next() {
-        Some(provider) if providers.all(|candidate| candidate == provider) => {
-            id.split_once('/').map_or(id, |(_, model)| model)
-        }
-        _ => id,
-    }
+fn unqualified_model_id(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, model)| model)
 }
 
 pub(crate) fn truncate_front(text: &str, width: usize) -> String {
@@ -7696,7 +7699,7 @@ truncated"
         assert_eq!(
             footer_text(&layout).as_deref(),
             Some(
-                "~/worktrees/interactive/settings/kiki (Refactor auth) ↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k  gpt-5.6-sol • thinking high"
+                "~/worktrees/interactive/settings/kiki (Refactor auth) ↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k  openai/gpt-5.6-sol • thinking high"
             )
         );
 
@@ -7751,6 +7754,12 @@ truncated"
             .footer_rule(80);
         assert!(
             model.to_string().contains("~/…/kiki (Refactor auth)"),
+            "{model}"
+        );
+        assert!(
+            model
+                .to_string()
+                .contains("openai/gpt-5.6-sol • thinking high"),
             "{model}"
         );
     }

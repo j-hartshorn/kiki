@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use tempfile::NamedTempFile;
@@ -23,8 +24,28 @@ const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
 const PROJECT_SETTINGS_LABEL: &str = "project settings file `.kiki/config.toml`";
-const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
-const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
+static MODEL_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Set it to a supported qualified model id ({}) or remove it, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+static ENVIRONMENT_MODEL_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Set KIKI_MODEL to a supported qualified model id ({}) or leave it unset, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+static THINKING_KEY_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Use only supported qualified model ids ({}) as [thinking] keys, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+
+fn supported_model_ids() -> String {
+    super::models::CATALOGUE.map(|model| model.id).join(", ")
+}
 
 pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
@@ -479,7 +500,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                 problems.push(environment_problem(
                     StartupProblemKind::ModelInvalidUnicode,
                     "KIKI_MODEL is not valid Unicode.",
-                    ENVIRONMENT_MODEL_REMEDIATION,
+                    &ENVIRONMENT_MODEL_REMEDIATION,
                 ));
                 false
             }
@@ -493,7 +514,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                     problems.push(environment_problem(
                         StartupProblemKind::ModelUnknown,
                         "KIKI_MODEL is not a supported qualified model id.",
-                        ENVIRONMENT_MODEL_REMEDIATION,
+                        &ENVIRONMENT_MODEL_REMEDIATION,
                     ));
                     false
                 }
@@ -670,11 +691,11 @@ fn validate_document(
                 Some(model) => settings.model = Some(model),
                 None if item.as_str().is_some() => problems.push(
                     "field `model` must be a supported qualified model id",
-                    MODEL_REMEDIATION,
+                    &MODEL_REMEDIATION,
                 ),
                 None => problems.push(
                     "field `model` must be a string containing a supported qualified model id",
-                    MODEL_REMEDIATION,
+                    &MODEL_REMEDIATION,
                 ),
             },
             "favourites" => validate_favourites(item, &mut settings.favourites, &mut problems),
@@ -751,8 +772,8 @@ fn validate_thinking_table(
     for (key, item) in table.iter() {
         let Some(model) = model_by_id(key) else {
             problems.push(
-                "field `thinking` contains an unknown model key; use openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
-                "Use only supported qualified model ids as [thinking] keys, then restart Kiki.",
+                "field `thinking` contains an unknown model key",
+                &THINKING_KEY_REMEDIATION,
             );
             continue;
         };
@@ -1157,7 +1178,7 @@ mod tests {
     use crate::config::{
         ModelSelection,
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
-        models::{ASTRA, LUNA, SOL, TERRA},
+        models::{ASTRA, CATALOGUE, LUNA, SOL, TERRA},
     };
 
     use super::{Input, SessionPreferences, SubagentSettings, resolve};
@@ -1821,6 +1842,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             [crate::config::StartupProblemKind::ModelUnknown]
         );
+    }
+
+    #[test]
+    fn unknown_model_remediations_list_every_catalogue_model_id() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let untrusted = "openai/typo-SECRET";
+        write_settings(home.path(), &format!("model = \"{untrusted}\"\n"));
+        let file_model = resolve(input(Some(home.path()), Some(project.path())));
+        let mut environment = input(None, Some(project.path()));
+        environment.model = Some(OsString::from(untrusted));
+        let environment_model = resolve(environment);
+        write_settings(
+            home.path(),
+            &format!("[thinking]\n\"{untrusted}\" = \"high\"\n"),
+        );
+        let thinking_key = resolve(input(Some(home.path()), Some(project.path())));
+
+        for resolution in [file_model, environment_model, thinking_key] {
+            let problem = &resolution.problems()[0];
+            let remediation = problem.remediation();
+            for model in CATALOGUE {
+                assert!(
+                    remediation.contains(model.id),
+                    "{remediation} should list {}",
+                    model.id
+                );
+            }
+            assert!(
+                !problem.diagnostic().contains("SECRET"),
+                "{}",
+                problem.diagnostic()
+            );
+            assert!(!remediation.contains("SECRET"), "{remediation}");
+        }
     }
 
     #[test]

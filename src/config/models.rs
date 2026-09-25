@@ -37,6 +37,28 @@ pub struct ModelConfiguration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    OpenAi,
+    Anthropic,
+}
+
+impl Provider {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::Anthropic => "Anthropic",
+        }
+    }
+
+    pub fn api_key_variable(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OPENAI_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSelection {
     model: &'static ModelConfiguration,
     thinking: &'static str,
@@ -58,11 +80,11 @@ impl ModelSelection {
     }
 }
 
-pub static OPENAI_THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub static THINKING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 pub static ASTRA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-astra",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "low",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -95,7 +117,7 @@ pub static ASTRA: ModelConfiguration = ModelConfiguration {
 
 pub static GPT6_SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-sol",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -128,7 +150,7 @@ pub static GPT6_SOL: ModelConfiguration = ModelConfiguration {
 
 pub static GPT6_LUNA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-6-luna",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -161,7 +183,7 @@ pub static GPT6_LUNA: ModelConfiguration = ModelConfiguration {
 
 pub static SOL: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-5.6-sol",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -194,7 +216,7 @@ pub static SOL: ModelConfiguration = ModelConfiguration {
 
 pub static TERRA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-5.6-terra",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -227,7 +249,7 @@ pub static TERRA: ModelConfiguration = ModelConfiguration {
 
 pub static LUNA: ModelConfiguration = ModelConfiguration {
     id: "openai/gpt-5.6-luna",
-    thinking_levels: OPENAI_THINKING_LEVELS,
+    thinking_levels: THINKING_LEVELS,
     default_thinking: "medium",
     service_tier: "default",
     context_window_tokens: 1_050_000,
@@ -258,13 +280,96 @@ pub static LUNA: ModelConfiguration = ModelConfiguration {
     },
 };
 
-pub static CATALOGUE: [&ModelConfiguration; 6] =
-    [&ASTRA, &GPT6_SOL, &GPT6_LUNA, &SOL, &TERRA, &LUNA];
+pub static OPUS_5_5: ModelConfiguration = ModelConfiguration {
+    id: "anthropic/claude-opus-5-5",
+    thinking_levels: THINKING_LEVELS,
+    default_thinking: "medium",
+    service_tier: "standard",
+    context_window_tokens: 1_000_000,
+    context_window_display: "1m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "anthropic/claude-opus-5-5",
+            service_tier: "standard",
+            version: "2026-09-23",
+            source: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        },
+        long_context_threshold: 1_000_000,
+        long_context_threshold_display: "1m",
+        short_context: Rates {
+            uncached_input_nanos: 4_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 5_000,
+            output_nanos: 20_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 4_000,
+            cached_input_nanos: 200,
+            cache_write_nanos: 5_000,
+            output_nanos: 20_000,
+        },
+    },
+};
+
+pub static FABLE_5_1: ModelConfiguration = ModelConfiguration {
+    id: "anthropic/claude-fable-5-1",
+    thinking_levels: THINKING_LEVELS,
+    default_thinking: "high",
+    service_tier: "standard",
+    context_window_tokens: 1_000_000,
+    context_window_display: "1m",
+    max_output_tokens: 128_000,
+    max_output_display: "128k",
+    pricing: ModelPricing {
+        identity: PricingIdentity {
+            model: "anthropic/claude-fable-5-1",
+            service_tier: "standard",
+            version: "2026-09-23",
+            source: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        },
+        long_context_threshold: 1_000_000,
+        long_context_threshold_display: "1m",
+        short_context: Rates {
+            uncached_input_nanos: 10_000,
+            cached_input_nanos: 250,
+            cache_write_nanos: 12_500,
+            output_nanos: 50_000,
+        },
+        long_context: Rates {
+            uncached_input_nanos: 10_000,
+            cached_input_nanos: 250,
+            cache_write_nanos: 12_500,
+            output_nanos: 50_000,
+        },
+    },
+};
+
+pub static CATALOGUE: [&ModelConfiguration; 8] = [
+    &ASTRA, &GPT6_SOL, &GPT6_LUNA, &SOL, &TERRA, &LUNA, &OPUS_5_5, &FABLE_5_1,
+];
 pub static DEFAULT_MODEL: &ModelConfiguration = &SOL;
 
 impl ModelConfiguration {
     pub fn supports_thinking(&self, thinking: &str) -> bool {
         self.thinking_levels.contains(&thinking)
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.qualified_id().0
+    }
+
+    pub fn wire_id(&self) -> &'static str {
+        self.qualified_id().1
+    }
+
+    fn qualified_id(&self) -> (Provider, &'static str) {
+        match self.id.split_once('/') {
+            Some(("openai", wire_id)) => (Provider::OpenAi, wire_id),
+            Some(("anthropic", wire_id)) => (Provider::Anthropic, wire_id),
+            _ => panic!("model id `{}` has no known provider prefix", self.id),
+        }
     }
 }
 
@@ -280,21 +385,122 @@ mod tests {
     #[test]
     fn catalogue_identity_order_and_default_are_exact() {
         assert_eq!(
-            CATALOGUE.map(|m| m.id),
+            CATALOGUE.iter().map(|m| m.id).collect::<Vec<_>>(),
             [
                 "openai/gpt-6-astra",
                 "openai/gpt-6-sol",
                 "openai/gpt-6-luna",
                 "openai/gpt-5.6-sol",
                 "openai/gpt-5.6-terra",
-                "openai/gpt-5.6-luna"
+                "openai/gpt-5.6-luna",
+                "anthropic/claude-opus-5-5",
+                "anthropic/claude-fable-5-1"
             ]
         );
         assert_eq!(
             CATALOGUE.iter().map(|m| m.id).collect::<HashSet<_>>().len(),
-            6
+            8
         );
         assert!(std::ptr::eq(DEFAULT_MODEL, &SOL));
+    }
+
+    #[test]
+    fn provider_and_wire_id_derive_from_the_qualified_id_prefix() {
+        assert_eq!(
+            CATALOGUE
+                .iter()
+                .map(|m| (m.id, m.provider(), m.wire_id()))
+                .collect::<Vec<_>>(),
+            [
+                ("openai/gpt-6-astra", Provider::OpenAi, "gpt-6-astra"),
+                ("openai/gpt-6-sol", Provider::OpenAi, "gpt-6-sol"),
+                ("openai/gpt-6-luna", Provider::OpenAi, "gpt-6-luna"),
+                ("openai/gpt-5.6-sol", Provider::OpenAi, "gpt-5.6-sol"),
+                ("openai/gpt-5.6-terra", Provider::OpenAi, "gpt-5.6-terra"),
+                ("openai/gpt-5.6-luna", Provider::OpenAi, "gpt-5.6-luna"),
+                (
+                    "anthropic/claude-opus-5-5",
+                    Provider::Anthropic,
+                    "claude-opus-5-5"
+                ),
+                (
+                    "anthropic/claude-fable-5-1",
+                    Provider::Anthropic,
+                    "claude-fable-5-1"
+                ),
+            ]
+        );
+        assert_eq!(
+            (
+                Provider::OpenAi.display_name(),
+                Provider::OpenAi.api_key_variable()
+            ),
+            ("OpenAI", "OPENAI_API_KEY")
+        );
+        assert_eq!(
+            (
+                Provider::Anthropic.display_name(),
+                Provider::Anthropic.api_key_variable()
+            ),
+            ("Anthropic", "ANTHROPIC_API_KEY")
+        );
+    }
+
+    #[test]
+    fn anthropic_models_match_the_spec_catalogue_and_pricing() {
+        for (id, default_thinking, rates) in [
+            (
+                "anthropic/claude-opus-5-5",
+                "medium",
+                Rates {
+                    uncached_input_nanos: 4_000,
+                    cached_input_nanos: 200,
+                    cache_write_nanos: 5_000,
+                    output_nanos: 20_000,
+                },
+            ),
+            (
+                "anthropic/claude-fable-5-1",
+                "high",
+                Rates {
+                    uncached_input_nanos: 10_000,
+                    cached_input_nanos: 250,
+                    cache_write_nanos: 12_500,
+                    output_nanos: 50_000,
+                },
+            ),
+        ] {
+            let model = model_by_id(id).expect("Anthropic model is in the catalogue");
+            assert!(std::ptr::eq(model.thinking_levels, THINKING_LEVELS));
+            assert_eq!(model.default_thinking, default_thinking);
+            assert_eq!(model.service_tier, "standard");
+            assert_eq!(
+                (model.context_window_tokens, model.context_window_display),
+                (1_000_000, "1m")
+            );
+            assert_eq!(
+                (model.max_output_tokens, model.max_output_display),
+                (128_000, "128k")
+            );
+            assert_eq!(
+                model.pricing.identity,
+                PricingIdentity {
+                    model: id,
+                    service_tier: "standard",
+                    version: "2026-09-23",
+                    source: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+                }
+            );
+            assert_eq!(
+                (
+                    model.pricing.long_context_threshold,
+                    model.pricing.long_context_threshold_display
+                ),
+                (1_000_000, "1m")
+            );
+            assert_eq!(model.pricing.short_context, rates);
+            assert_eq!(model.pricing.long_context, rates);
+        }
     }
 
     #[test]
@@ -345,8 +551,7 @@ mod tests {
     #[test]
     fn universal_capacities_and_identity_invariants_hold() {
         for model in CATALOGUE {
-            assert_eq!(model.service_tier, "default");
-            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
+            assert!(std::ptr::eq(model.thinking_levels, THINKING_LEVELS));
             assert_eq!(
                 model.thinking_levels,
                 &["low", "medium", "high", "xhigh", "max"]
@@ -354,22 +559,38 @@ mod tests {
             assert!(!model.supports_thinking("none"));
             assert!(model.thinking_levels.contains(&model.default_thinking));
             assert_eq!(
-                (model.context_window_tokens, model.context_window_display),
-                (1_050_000, "1.05m")
-            );
-            assert_eq!(
                 (model.max_output_tokens, model.max_output_display),
                 (128_000, "128k")
             );
-            assert_eq!(
-                (
-                    model.pricing.long_context_threshold,
-                    model.pricing.long_context_threshold_display
-                ),
-                (272_000, "272k")
-            );
             assert_eq!(model.pricing.identity.model, model.id);
             assert_eq!(model.pricing.identity.service_tier, model.service_tier);
+            match model.provider() {
+                Provider::OpenAi => {
+                    assert_eq!(model.service_tier, "default");
+                    assert_eq!(
+                        (model.context_window_tokens, model.context_window_display),
+                        (1_050_000, "1.05m")
+                    );
+                    assert_eq!(
+                        (
+                            model.pricing.long_context_threshold,
+                            model.pricing.long_context_threshold_display
+                        ),
+                        (272_000, "272k")
+                    );
+                }
+                Provider::Anthropic => {
+                    assert_eq!(model.service_tier, "standard");
+                    assert_eq!(
+                        (
+                            model.pricing.long_context_threshold,
+                            model.pricing.long_context_threshold_display
+                        ),
+                        (model.context_window_tokens, model.context_window_display)
+                    );
+                    assert_eq!(model.pricing.long_context, model.pricing.short_context);
+                }
+            }
         }
     }
 
@@ -435,7 +656,7 @@ mod tests {
             ASTRA.thinking_levels,
             &["low", "medium", "high", "xhigh", "max"]
         );
-        assert!(std::ptr::eq(ASTRA.thinking_levels, OPENAI_THINKING_LEVELS));
+        assert!(std::ptr::eq(ASTRA.thinking_levels, THINKING_LEVELS));
         assert_eq!(ASTRA.default_thinking, "low");
         assert!(!ASTRA.supports_thinking("none"));
         assert_eq!(ASTRA.pricing.identity.version, "2026-09-04");
@@ -466,7 +687,7 @@ mod tests {
     #[test]
     fn gpt_56_defaults_and_pricing_are_unchanged() {
         for model in [&SOL, &TERRA, &LUNA] {
-            assert!(std::ptr::eq(model.thinking_levels, OPENAI_THINKING_LEVELS));
+            assert!(std::ptr::eq(model.thinking_levels, THINKING_LEVELS));
             assert_eq!(
                 model.thinking_levels,
                 &["low", "medium", "high", "xhigh", "max"]

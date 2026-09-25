@@ -19,7 +19,10 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
 use crate::{
-    config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT},
+    config::{
+        ModelConfiguration, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+        models::Provider,
+    },
     model::{
         AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
@@ -30,7 +33,6 @@ use crate::{
 };
 
 const OPENAI_PROVIDER: &str = "openai";
-const OPENAI_MODEL_QUALIFIER: &str = "openai/";
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -107,10 +109,7 @@ impl OpenAiModel {
         history: &ModelHistory,
     ) -> Result<Value, ModelError> {
         let model = selection.model();
-        let wire_model = model
-            .id
-            .strip_prefix(OPENAI_MODEL_QUALIFIER)
-            .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))?;
+        let wire_model = openai_wire_model(model)?;
         let mut input = Vec::new();
 
         for entry in history.entries() {
@@ -706,10 +705,7 @@ impl OpenAiModel {
 
     fn summary_request(&self, request: &SummaryRequest) -> Result<Value, ModelError> {
         let model = request.selection.model();
-        let wire_model = model
-            .id
-            .strip_prefix(OPENAI_MODEL_QUALIFIER)
-            .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))?;
+        let wire_model = openai_wire_model(model)?;
 
         Ok(json!({
             "model": wire_model,
@@ -1072,6 +1068,12 @@ enum AttemptFailure {
         error: ModelError,
         accounting: Box<AttemptAccounting>,
     },
+}
+
+fn openai_wire_model(model: &ModelConfiguration) -> Result<&'static str, ModelError> {
+    (model.provider() == Provider::OpenAi)
+        .then(|| model.wire_id())
+        .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))
 }
 
 fn redact(value: &str, api_key: &str) -> String {
@@ -2148,9 +2150,9 @@ mod tests {
     use crate::{
         config::{
             ModelSelection,
-            models::{ASTRA, CATALOGUE, SOL, TERRA},
+            models::{ASTRA, CATALOGUE, Provider, SOL, TERRA},
         },
-        model::{AttemptAccounting, Model, ModelHistory},
+        model::{AttemptAccounting, Model, ModelError, ModelHistory},
         sse_fixture::{Fixture, FixtureReply},
     };
 
@@ -2237,7 +2239,10 @@ mod tests {
             model.client.config().url("/responses"),
             format!("{OPENAI_API_BASE}/responses")
         );
-        for configuration in CATALOGUE {
+        for configuration in CATALOGUE
+            .into_iter()
+            .filter(|model| model.provider() == Provider::OpenAi)
+        {
             for &thinking in configuration.thinking_levels {
                 let request = model
                     .request(
@@ -2254,6 +2259,60 @@ mod tests {
                 assert_eq!(request["reasoning"]["effort"], json!(thinking));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_anthropic_selections_before_networking() {
+        let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
+        let mut model =
+            super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+        let cancellation = CancellationToken::new();
+
+        for id in ["anthropic/claude-opus-5-5", "anthropic/claude-fable-5-1"] {
+            let configuration =
+                crate::config::model_by_id(id).expect("Anthropic model is in the catalogue");
+            let selection =
+                ModelSelection::new(configuration, configuration.default_thinking).unwrap();
+            let mut progress_events = 0;
+            let mut attempts_started = 0;
+
+            let step = model
+                .step(selection, &history(), &cancellation, &mut |_| {
+                    progress_events += 1
+                })
+                .await
+                .unwrap_err();
+            let summary = model
+                .summarise(
+                    crate::model::SummaryRequest {
+                        instructions: "summary instructions".to_owned(),
+                        input: "summary input".to_owned(),
+                        selection,
+                        output_limit: 321,
+                    },
+                    &cancellation,
+                    &mut || attempts_started += 1,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(step.error(), ModelError::InvalidSelection(_)),
+                "{id}"
+            );
+            assert!(step.attempts().is_empty(), "{id}");
+            assert!(
+                matches!(summary.error(), ModelError::InvalidSelection(_)),
+                "{id}"
+            );
+            assert!(summary.attempts().is_empty(), "{id}");
+            assert_eq!((progress_events, attempts_started), (0, 0), "{id}");
+            assert!(matches!(
+                model.validate_history(&history(), selection),
+                Err(ModelError::InvalidSelection(_))
+            ));
+        }
+        assert_eq!(fixture.request_count(), 0);
     }
 
     #[test]
