@@ -8,7 +8,7 @@
 - Each new run's `user_request` entry stores the run's selection. `Record::UserRequest` and the restored user-request record carry it as `Option<ModelSelection>`. A payload written before this change decodes with `None`, and the session format stays at version 2.
 - `PersistedCode.selection` no longer exists. Stored execution and terminal payloads that still contain a `selection` field decode.
 - A history card `Model selected: <model id> · <thinking>` sits directly above a run's request card when that run's selection and the previous run's selection on the branch are both known and differ. Otherwise there is no card: not for the first run, not across an unknown selection, not for an unchanged selection.
-- The pending card has the same text and is the last transcript block. It shows when the branch's last run selection is known and differs from the footer's current selection, including during a Shift-Tab preview. It disappears when the selection is switched back. After the next run's request record arrives, it is replaced by that run's history card.
+- The pending card has the same text and is attached to the prompt area (Task 5), prefixed `[pending] ` until the change applies. It shows when the branch's last run selection is known and differs from the footer's current selection, including during a Shift-Tab preview. It disappears when the selection is switched back. After the next run's request record arrives, it is replaced by that run's history card.
 - Cards use the footer's muted grey text on the page background (no card background) with the standard card padding. They behave the same live, after restore and after `/tree` navigation.
 - Cards are never session entries, never appear in `/tree`, and never reach model context.
 
@@ -17,7 +17,7 @@
 - `env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1`: all pass.
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - `rg -n "selection" src/session/codec.rs | rg -i "code\.selection|StoredCode"` and `sed -n '/pub(crate) struct PersistedCode/,/^}/p' src/session.rs | rg selection`: no matches.
-- Manual: `just run`, complete one request, then `/model openai/gpt-5.6-terra`. A pending `Model selected: openai/gpt-5.6-terra · …` card appears at the bottom. Switch back with `/model openai/gpt-5.6-sol` and it disappears. Switch to terra again and submit: the card sits between the first run and the second request. Quit, `just continue`: the card is still there. Shift-Tab after that run shows a pending card for the previewed thinking level.
+- Manual: `just run`, complete one request, then `/model openai/gpt-5.6-terra`. A `Model selected: openai/gpt-5.6-terra · …` card appears just above the prompt (briefly `[pending] ` until the runtime accepts). Scroll history up: the card stays put. Switch back with `/model openai/gpt-5.6-sol` and it disappears. Switch to terra again and submit: the card sits between the first run and the second request. Quit, `just continue`: the card is still there. Shift-Tab after that run shows `[pending] Model selected: … · <level>` above the prompt for two seconds, then the prefix goes.
 
 ## Planning context
 - Request persistence:
@@ -138,3 +138,28 @@
 **Verification**
 - The overall test and clippy commands: all pass and clean.
 - Manual check from Overall validation.
+
+### Task 5: Attach the pending card to the prompt area
+Added after Tasks 1-4 landed, at the user's request: the pending card sat at the end of history and scrolled with it.
+
+**Changes**
+- `src/transcript.rs`: `layout_with_cache` no longer appends the pending card. Keep `pending_model_change` as the single rule. Expose a small way for the TUI to build the card with the same style and padding as the history card, with an optional `[pending] ` prefix.
+- `src/tui.rs` `render_at`: when `pending_model_change(settings_selection)` is `Some`, reserve the card's rows below the subagent monitor and above the throbber and prompt, shrinking the history viewport, and skip it when there isn't room. The prefix shows while `preview` is set or `pending_settings` holds the current selection.
+- Remove `set_settings_selection`: the card no longer changes history layout, and a history viewport size change already clears a text selection (`src/tui.rs:~2503`).
+- `README.md`: describe the card as sitting above the prompt, with the `[pending]` prefix.
+
+**Tests** (red first)
+- `src/transcript.rs`: `layout_with_footer` never contains the pending card; the Task 4 transcript tests move to the TUI or become this assertion.
+- `src/tui.rs`:
+  - After a run, `/model` to another selection: the card renders directly above the prompt rule (above the throbber while a run is active, below the subagent monitor when shown), prefixed `[pending] ` until `SettingsAccepted`, then without the prefix.
+  - Shift-Tab: `[pending] ` during the preview, gone after the preview is accepted.
+  - Scrolling history up leaves the card in place; the history viewport is shorter by the card's height while it shows.
+  - Switching back removes it; the next run's request record settles it into history as the history card above that request.
+  - `/tree` navigation re-compares against the selected branch (adapt the Task 4 test).
+
+**Files** — Modify: `src/transcript.rs`, `src/tui.rs`, `README.md`
+
+**Verification**
+- The overall test and clippy commands: all pass and clean.
+- Manual check from Overall validation.
+
