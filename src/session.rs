@@ -373,11 +373,20 @@ pub(crate) struct RestoredExecutableState {
 pub(crate) struct SessionMetadata {
     name: Option<String>,
     preferences: SessionPreferences,
+    type_check_disabled: bool,
 }
 
 impl SessionMetadata {
-    pub(crate) fn new(name: Option<String>, preferences: SessionPreferences) -> Self {
-        Self { name, preferences }
+    pub(crate) fn new(
+        name: Option<String>,
+        preferences: SessionPreferences,
+        type_check_disabled: bool,
+    ) -> Self {
+        Self {
+            name,
+            preferences,
+            type_check_disabled,
+        }
     }
 
     pub(crate) fn name(&self) -> Option<&str> {
@@ -390,6 +399,14 @@ impl SessionMetadata {
 
     pub(crate) fn update_preferences(&mut self, preferences: SessionPreferences) {
         self.preferences = preferences;
+    }
+
+    pub(crate) fn type_check_disabled(&self) -> bool {
+        self.type_check_disabled
+    }
+
+    pub(crate) fn disable_type_check(&mut self) {
+        self.type_check_disabled = true;
     }
 }
 
@@ -647,13 +664,32 @@ impl SessionListing {
 }
 
 impl Session {
+    #[cfg(test)]
     pub(crate) fn create(
         home: &Path,
         cwd: &Path,
         selection: ModelSelection,
         checkpoint: Checkpoint,
     ) -> Result<Self, SessionError> {
-        Self::create_with_id_source(home, cwd, selection, checkpoint, SessionId::generate, None)
+        Self::create_with_type_check_disabled(home, cwd, selection, checkpoint, false)
+    }
+
+    pub(crate) fn create_with_type_check_disabled(
+        home: &Path,
+        cwd: &Path,
+        selection: ModelSelection,
+        checkpoint: Checkpoint,
+        type_check_disabled: bool,
+    ) -> Result<Self, SessionError> {
+        Self::create_with_id_source(
+            home,
+            cwd,
+            selection,
+            checkpoint,
+            type_check_disabled,
+            SessionId::generate,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -669,6 +705,7 @@ impl Session {
             cwd,
             selection,
             checkpoint,
+            false,
             SessionId::generate,
             Some(gate),
         )
@@ -688,6 +725,7 @@ impl Session {
             cwd,
             selection,
             checkpoint,
+            false,
             || {
                 ids.next()
                     .ok_or(SessionError::Random)
@@ -702,10 +740,16 @@ impl Session {
         cwd: &Path,
         selection: ModelSelection,
         checkpoint: Checkpoint,
+        type_check_disabled: bool,
         mut next_id: impl FnMut() -> Result<SessionId, SessionError>,
         #[cfg(test)] write_gate: Option<SessionWriteGate>,
         #[cfg(not(test))] write_gate: Option<()>,
     ) -> Result<Self, SessionError> {
+        let preferences_json = codec::encode_session_preferences(
+            &SessionPreferences::initial(selection),
+            type_check_disabled,
+        )
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
         sessions_directory(home)?;
         loop {
             let id = next_id()?;
@@ -722,7 +766,7 @@ impl Session {
                         paths,
                         writer_lock,
                         cwd,
-                        selection,
+                        preferences_json,
                         checkpoint,
                         write_gate,
                     );
@@ -1116,16 +1160,17 @@ impl SessionWriter {
         &self,
         preferences: SessionPreferences,
     ) -> Result<(), SessionError> {
-        self.commit_startup_preferences(preferences, None).await
+        self.commit_startup_preferences(preferences, None, false)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn commit_startup_preferences(
         &self,
         preferences: SessionPreferences,
         relocated_cwd: Option<PathBuf>,
-    ) -> Result<(), SessionError> {
-        let preferences_json = codec::encode_session_preferences(&preferences)
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        disable_type_check: bool,
+    ) -> Result<bool, SessionError> {
         let relocated_cwd = relocated_cwd
             .as_deref()
             .map(codec::encode_path)
@@ -1137,7 +1182,12 @@ impl SessionWriter {
             SessionWriteKind::Preferences
         };
         self.write(kind, move |connection| {
-            commit_preferences(connection, &preferences_json, relocated_cwd.as_deref())
+            commit_preferences(
+                connection,
+                &preferences,
+                relocated_cwd.as_deref(),
+                disable_type_check,
+            )
         })
         .await
     }
@@ -1342,16 +1392,22 @@ impl SessionWriter {
 
 fn commit_preferences(
     connection: &mut Connection,
-    preferences_json: &str,
+    preferences: &SessionPreferences,
     cwd: Option<&str>,
-) -> Result<(), SessionError> {
+    disable_type_check: bool,
+) -> Result<bool, SessionError> {
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let revision: i64 = transaction.query_row(
-        "SELECT revision FROM session WHERE singleton = 1",
+    let (revision, previous_json): (i64, String) = transaction.query_row(
+        "SELECT revision, preferences_json FROM session WHERE singleton = 1",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let (_, previously_disabled) = codec::decode_session_preferences(&previous_json)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let disabled = previously_disabled || disable_type_check;
+    let preferences_json = codec::encode_session_preferences(preferences, disabled)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
     let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
     let updated = match cwd {
         Some(cwd) => transaction.execute(
@@ -1367,7 +1423,7 @@ fn commit_preferences(
         return Err(SessionError::InvalidTransition);
     }
     transaction.commit()?;
-    Ok(())
+    Ok(disabled)
 }
 
 fn commit_name(connection: &mut Connection, name: &str) -> Result<(), SessionError> {
@@ -2013,7 +2069,7 @@ fn initialise(
     paths: SessionPaths,
     writer_lock: File,
     cwd: &Path,
-    selection: ModelSelection,
+    preferences_json: String,
     checkpoint: Checkpoint,
     #[cfg(test)] write_gate: Option<SessionWriteGate>,
     #[cfg(not(test))] _write_gate: Option<()>,
@@ -2022,9 +2078,6 @@ fn initialise(
     let now = now_ms()?;
     let stored_checkpoint = codec::encode_checkpoint(&checkpoint)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
-    let preferences_json =
-        codec::encode_session_preferences(&SessionPreferences::initial(selection))
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(include_str!("session/schema.sql"))?;
     transaction.execute(
@@ -2353,9 +2406,10 @@ fn session_metadata(
     name: Option<String>,
     preferences_json: String,
 ) -> Result<SessionMetadata, SessionError> {
-    let preferences = codec::decode_session_preferences(&preferences_json)
-        .map_err(|error| SessionError::Codec(error.to_string()))?;
-    Ok(SessionMetadata::new(name, preferences))
+    let (preferences, type_check_disabled) =
+        codec::decode_session_preferences(&preferences_json)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+    Ok(SessionMetadata::new(name, preferences, type_check_disabled))
 }
 
 struct CompactionSnapshot {
@@ -4345,6 +4399,7 @@ mod tests {
             metadata: Some(super::SessionMetadata::new(
                 None,
                 SessionPreferences::initial(selection()),
+                false,
             )),
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
@@ -4575,6 +4630,7 @@ mod tests {
             metadata: Some(super::SessionMetadata::new(
                 None,
                 crate::config::SessionPreferences::initial(selection()),
+                false,
             )),
             entries: vec![
                 restore_entry(1, None, None, "{}".to_owned(), 1),
@@ -6666,6 +6722,7 @@ mod tests {
             serde_json::json!({
                 "selected_model": DEFAULT_MODEL.id,
                 "thinking": { DEFAULT_MODEL.id: DEFAULT_MODEL.default_thinking },
+                "type_check_disabled": false,
             })
         );
         assert!(!preferences.contains("sk-configured-credential"));
@@ -6738,6 +6795,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_session_can_start_with_type_check_disabled() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = Session::create_with_type_check_disabled(
+            home.path(),
+            workspace.path(),
+            selection(),
+            checkpoint(&workspace).await,
+            true,
+        )
+        .expect("create opted-out session");
+        assert!(session.metadata().unwrap().type_check_disabled());
+        session.close().expect("close opted-out session");
+    }
+
+    #[tokio::test]
+    async fn type_check_opt_out_is_durable_and_one_way_across_preference_writes() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        assert!(!session.metadata().unwrap().type_check_disabled());
+
+        assert!(
+            writer
+                .commit_startup_preferences(SessionPreferences::initial(selection()), None, true)
+                .await
+                .expect("disable type checking")
+        );
+        assert!(session.metadata().unwrap().type_check_disabled());
+        writer
+            .commit_preferences(SessionPreferences::initial(selection()))
+            .await
+            .expect("update model preferences");
+        assert!(
+            writer
+                .commit_startup_preferences(SessionPreferences::initial(selection()), None, false)
+                .await
+                .expect("resume without opt-out request")
+        );
+
+        drop(writer);
+        session.close().expect("close opted-out session");
+        let reopened = Session::open(home.path(), &id).expect("reopen opted-out session");
+        assert!(reopened.metadata().unwrap().type_check_disabled());
+        assert!(
+            reopened
+                .restore()
+                .unwrap()
+                .metadata
+                .unwrap()
+                .type_check_disabled()
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
     async fn startup_preferences_and_relocation_share_one_transaction() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -6760,7 +6875,11 @@ mod tests {
 
         session
             .writer()
-            .commit_startup_preferences(preferences.clone(), Some(relocated.path().to_path_buf()))
+            .commit_startup_preferences(
+                preferences.clone(),
+                Some(relocated.path().to_path_buf()),
+                false,
+            )
             .await
             .expect("commit relocation");
         let after: (String, String, i64) = session
@@ -6780,7 +6899,9 @@ mod tests {
         );
         assert_eq!(after.2, before.2 + 1);
         assert_eq!(
-            super::codec::decode_session_preferences(&after.0).unwrap(),
+            super::codec::decode_session_preferences(&after.0)
+                .unwrap()
+                .0,
             preferences
         );
         session.close().expect("close session");

@@ -369,6 +369,9 @@ impl App {
         if let Some(metadata) = &initial.metadata {
             app.session_name = metadata.name().map(str::to_owned);
             app.session_thinking = metadata.preferences().thinking().clone();
+            if metadata.type_check_disabled() {
+                app.set_notice("Type checking is off for this session.".to_owned());
+            }
         }
         app.transcript = Transcript::restored(startup, initial);
         app.subagent_monitor = subagents::SubagentMonitor::restored(&initial.timeline);
@@ -3880,7 +3883,8 @@ mod tests {
             BTreeMap::from([(SOL.id, "low"), (TERRA.id, "high")]),
         )
         .expect("valid preferences");
-        let metadata = SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone());
+        let metadata =
+            SessionMetadata::new(Some("Saved name".to_owned()), preferences.clone(), false);
         let initial = RuntimeInitialState {
             metadata: Some(metadata.clone()),
             timeline: Vec::new(),
@@ -3905,6 +3909,24 @@ mod tests {
         assert_eq!(sol.thinking(), "low");
         let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
         assert_eq!(terra.thinking(), "high");
+    }
+
+    #[test]
+    fn restored_type_check_opt_out_is_visible() {
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let selection = ModelSelection::new(&SOL, "low").unwrap();
+        let initial = RuntimeInitialState {
+            metadata: Some(SessionMetadata::new(
+                None,
+                SessionPreferences::initial(selection),
+                true,
+            )),
+            timeline: Vec::new(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        };
+        let app = App::restored(snapshot, &initial);
+        assert_eq!(app.notice(), Some("Type checking is off for this session."));
     }
 
     #[test]

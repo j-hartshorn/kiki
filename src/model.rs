@@ -523,6 +523,7 @@ pub trait Model: Send + 'static {
 
 pub struct ScriptedModel {
     actions: Vec<ScriptedAction>,
+    subsequent_first_action: Option<ScriptedAction>,
     cursor: usize,
     observed_user_requests: usize,
     summary_responses: Vec<String>,
@@ -538,6 +539,7 @@ impl ScriptedModel {
     pub fn new(actions: Vec<ScriptedAction>) -> Self {
         Self {
             actions,
+            subsequent_first_action: None,
             cursor: 0,
             observed_user_requests: 0,
             summary_responses: Vec::new(),
@@ -548,6 +550,11 @@ impl ScriptedModel {
             #[cfg(test)]
             summary_requests: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_subsequent_first_action(mut self, action: ScriptedAction) -> Self {
+        self.subsequent_first_action = Some(action);
+        self
     }
 
     #[cfg(test)]
@@ -630,9 +637,13 @@ impl Model for ScriptedModel {
             #[cfg(test)]
             self.contexts.push(history.entries().to_vec());
 
-            let scripted_action = self
-                .actions
-                .get(self.cursor)
+            let later_action = if user_requests > 1 && self.cursor == 0 {
+                self.subsequent_first_action.as_ref()
+            } else {
+                None
+            };
+            let scripted_action = later_action
+                .or_else(|| self.actions.get(self.cursor))
                 .cloned()
                 .ok_or(ModelError::Exhausted)?;
             if !self.delay.is_zero() {
@@ -673,9 +684,9 @@ impl Model for ScriptedModel {
 
 impl Default for ScriptedModel {
     fn default() -> Self {
-        Self::new(vec![
+        let actions = vec![
             ScriptedAction::Code {
-                source: "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")".to_owned(),
+                source: "try:\n    request_count += 1  # ty: ignore[unresolved-reference]\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")".to_owned(),
             },
             ScriptedAction::Code {
                 source: "print(contents[0:20], end=\"\")\nrequest_count".to_owned(),
@@ -683,7 +694,10 @@ impl Default for ScriptedModel {
             ScriptedAction::Message {
                 text: "I inspected Cargo.toml.".to_owned(),
             },
-        ])
+        ];
+        Self::new(actions).with_subsequent_first_action(ScriptedAction::Code {
+            source: "request_count += 1\ncontents = await read(\"Cargo.toml\")".to_owned(),
+        })
     }
 }
 

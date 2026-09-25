@@ -1041,6 +1041,20 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
             commentary,
             execution,
             ..
+        } if matches!(
+            execution.outcome,
+            crate::arena::ExecutionOutcome::TypeCheckError(_)
+        ) =>
+        {
+            row.push("Type check failed", colour_style(ERROR));
+            if let Some(commentary) = commentary {
+                append_preview(row, commentary, content_style);
+            }
+        }
+        SessionCatalogueKind::Execution {
+            commentary,
+            execution,
+            ..
         } => append_execution_row(
             row,
             commentary.as_deref(),
@@ -1161,6 +1175,20 @@ fn row_text(kind: &SessionCatalogueKind) -> String {
             commentary,
             execution,
             ..
+        } if matches!(
+            execution.outcome,
+            crate::arena::ExecutionOutcome::TypeCheckError(_)
+        ) =>
+        {
+            match commentary.as_deref().filter(|text| !text.is_empty()) {
+                Some(text) => preview("Type check failed", text),
+                None => "Type check failed".to_owned(),
+            }
+        }
+        SessionCatalogueKind::Execution {
+            commentary,
+            execution,
+            ..
         } => execution_row(commentary.as_deref(), &execution.tool_calls),
         SessionCatalogueKind::Final { text } => preview("Kiki", text),
         SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
@@ -1268,12 +1296,21 @@ fn copy_text(kind: &SessionCatalogueKind) -> String {
                     result: Some(result),
                 } => sections.push(copy_section("Result", &observation_text(result))),
                 crate::arena::ExecutionOutcome::Complete { result: None } => {}
-                crate::arena::ExecutionOutcome::PythonError(error) => {
+                crate::arena::ExecutionOutcome::PythonError(error)
+                | crate::arena::ExecutionOutcome::TypeCheckError(error) => {
                     let mut text = error.text.clone();
                     if error.omitted_bytes > 0 {
                         text.push_str(&format!("\n[{} bytes omitted]", error.omitted_bytes));
                     }
-                    sections.push(copy_section("Error", &text));
+                    let heading = if matches!(
+                        execution.outcome,
+                        crate::arena::ExecutionOutcome::TypeCheckError(_)
+                    ) {
+                        "Type check"
+                    } else {
+                        "Error"
+                    };
+                    sections.push(copy_section(heading, &text));
                 }
             }
             sections.join("\n\n")
@@ -1591,6 +1628,20 @@ mod tests {
                 ),
                 "Python:\nraise ValueError('bad')\n\nError:\nbad    value\\x1B\n[5 bytes omitted]",
             ),
+            (
+                detailed_execution(
+                    "wrong: int = 'text'",
+                    None,
+                    observation(""),
+                    observation(""),
+                    ExecutionOutcome::TypeCheckError(PythonError {
+                        text: "invalid-assignment".to_owned(),
+                        omitted_bytes: 0,
+                    }),
+                    Vec::new(),
+                ),
+                "Python:\nwrong: int = 'text'\n\nType check:\ninvalid-assignment",
+            ),
             (request("first\r\nsecond\t\u{1b}"), "first\nsecond    \\x1B"),
             (
                 SessionCatalogueKind::Final {
@@ -1753,6 +1804,36 @@ mod tests {
             row.spans
                 .iter()
                 .all(|span| span.style.fg == Some(super::COMPACTION))
+        );
+    }
+
+    #[test]
+    fn rejected_code_is_labelled_as_unexecuted_in_tree_rows() {
+        let kind = detailed_execution(
+            "wrong: int = 'text'",
+            None,
+            observation(""),
+            observation(""),
+            ExecutionOutcome::TypeCheckError(PythonError {
+                text: "invalid-assignment".to_owned(),
+                omitted_bytes: 0,
+            }),
+            Vec::new(),
+        );
+        assert_eq!(super::row_text(&kind), "Type check failed");
+        let mut row = super::StyledRow::new(PICKER_ROW_WIDTH);
+        super::append_kind_row(&mut row, &kind, super::colour_style(super::TEXT));
+        assert_eq!(
+            row.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Type check failed"
+        );
+        assert!(
+            row.spans
+                .iter()
+                .all(|span| span.style.fg == Some(super::ERROR))
         );
     }
 

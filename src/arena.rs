@@ -10,7 +10,10 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use monty_pool::{
     Checkout, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
 };
-use monty_types::{ExcType, MontyException, MontyObject, PrintStream, ResourceLimits};
+use monty_types::{
+    ExcType, MontyException, MontyObject, PrintStream, ResourceLimits, TypeCheckingConfig,
+    TypeCheckingFormat,
+};
 use thiserror::Error;
 use tokio::process::Command;
 #[cfg(test)]
@@ -33,7 +36,7 @@ use crate::{
     },
     tools::{
         ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
-        ToolValue, WholeFileAuthorisations, bootstrap_source,
+        ToolValue, WholeFileAuthorisations, bootstrap_source, type_check_stubs,
     },
 };
 
@@ -157,6 +160,7 @@ impl fmt::Debug for Execution {
 pub enum ExecutionOutcome {
     Complete { result: Option<Observation> },
     PythonError(PythonError),
+    TypeCheckError(PythonError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,6 +751,7 @@ pub(crate) struct ArenaChildSource {
     tool_host: ToolHost,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
+    model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -800,6 +805,7 @@ impl ArenaChildSource {
             },
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
+            model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -826,6 +832,7 @@ pub struct Arena {
     checkpoint: Checkpoint,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
+    model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -895,13 +902,21 @@ impl Arena {
         max_memory: Option<usize>,
         clock: Arc<dyn ArenaClock>,
     ) -> Result<Self, ArenaError> {
-        let runtime = validate_worker(&worker_path).await?;
+        let worker_identity = validate_worker(&worker_path).await?;
+        // Monty dumps retain type checking and its host stubs.
+        let runtime = RuntimeIdentity(format!("{}+type-check-v2", worker_identity.0));
         let pool = Self::open_pool(worker_path.clone()).await?;
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
                 max_memory,
                 ..ResourceLimits::default()
             }),
+            type_check: true,
+            type_check_stubs: Some(type_check_stubs()),
+            type_check_config: TypeCheckingConfig {
+                format: TypeCheckingFormat::Concise,
+                color: false,
+            },
             ..ReplConfig::default()
         };
         let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
@@ -921,6 +936,7 @@ impl Arena {
             checkpoint,
             runtime,
             repl_config,
+            model_type_check_disabled: false,
             execution_timeout,
             clock,
             #[cfg(test)]
@@ -947,6 +963,7 @@ impl Arena {
             tool_host: self.tool_host.clone(),
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
+            model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -954,6 +971,10 @@ impl Arena {
             #[cfg(test)]
             child_construction_test_gate: self.child_construction_test_gate.clone(),
         }
+    }
+
+    pub(crate) fn disable_model_type_check(&mut self) {
+        self.model_type_check_disabled = true;
     }
 
     #[cfg(test)]
@@ -995,6 +1016,35 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
+        self.execute_with_context(code, cancellation, progress, invocation, true)
+            .await
+    }
+
+    pub(crate) async fn execute_model_code_with_progress_and_context(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
+        invocation: Option<(&AgentInvocationContext, ModelSelection)>,
+    ) -> Result<Execution, ArenaError> {
+        self.execute_with_context(
+            code,
+            cancellation,
+            progress,
+            invocation,
+            self.model_type_check_disabled,
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
+        invocation: Option<(&AgentInvocationContext, ModelSelection)>,
+        skip_type_check: bool,
+    ) -> Result<Execution, ArenaError> {
         let mut budget = ChargeableBudget::new(self.clock.clone(), self.execution_timeout);
         match budget
             .wait(cancellation, self.restore_current_checkpoint_if_needed())
@@ -1033,6 +1083,7 @@ impl Arena {
             &mut checkout,
             &self.tool_host,
             code,
+            skip_type_check,
             context.as_ref(),
             max_memory,
             &mut authorisations,
@@ -1255,7 +1306,7 @@ impl Arena {
 async fn reset_result_values(checkout: &mut Checkout) -> Result<(), ArenaError> {
     let mut on_print = on_print_sync(|_, _| {});
     match checkout
-        .feed("result_values = {}", vec![], vec![], false, &mut on_print)
+        .feed("result_values = {}", vec![], vec![], true, &mut on_print)
         .await
         .map_err(pool_failure)?
     {
@@ -1271,7 +1322,7 @@ async fn collect_result_values_checkout(
 ) -> Result<MontyObject, ResultValuesError> {
     let mut on_print = on_print_sync(|_, _| {});
     match checkout
-        .feed(RESULT_VALUES_BINDING, vec![], vec![], false, &mut on_print)
+        .feed(RESULT_VALUES_BINDING, vec![], vec![], true, &mut on_print)
         .await
         .map_err(result_values_pool_failure)?
     {
@@ -1460,7 +1511,7 @@ async fn bootstrap(checkout: &mut Checkout) -> Result<(), ArenaError> {
     let source = bootstrap_source();
     let mut on_print = on_print_sync(|_, _| {});
     match checkout
-        .feed(&source, vec![], vec![], false, &mut on_print)
+        .feed(&source, vec![], vec![], true, &mut on_print)
         .await
         .map_err(pool_failure)?
     {
@@ -1476,6 +1527,7 @@ async fn execute_checkout(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    skip_type_check: bool,
     context: Option<&TrustedExecutionContext>,
     max_memory: Option<usize>,
     authorisations: &mut WholeFileAuthorisations,
@@ -1488,6 +1540,7 @@ async fn execute_checkout(
         checkout,
         tool_host,
         code,
+        skip_type_check,
         context,
         authorisations,
         progress,
@@ -1503,6 +1556,11 @@ async fn execute_checkout(
                 result: (!matches!(value, MontyObject::None))
                     .then(|| observation_from_text(value.py_repr())),
             },
+            false,
+            None,
+        ),
+        Err(DriverError::Typing(diagnostics)) => (
+            ExecutionOutcome::TypeCheckError(PythonError::from_text(diagnostics)),
             false,
             None,
         ),
@@ -1577,6 +1635,7 @@ fn parse_canonical_usize(value: &str) -> Option<usize> {
 
 enum DriverError {
     Runtime(MontyException),
+    Typing(String),
     Fatal(ArenaError),
     Cancelled,
     TimedOut,
@@ -1623,6 +1682,7 @@ async fn drive(
     checkout: &mut Checkout,
     tool_host: &ToolHost,
     code: &str,
+    skip_type_check: bool,
     context: Option<&TrustedExecutionContext>,
     authorisations: &mut WholeFileAuthorisations,
     progress: &mut (impl FnMut(ArenaProgress) + Send),
@@ -1651,6 +1711,9 @@ async fn drive(
                 Ok(Err(PoolError::Runtime(error))) => {
                     break $label Err(DriverError::Runtime(error));
                 }
+                Ok(Err(PoolError::Typing(diagnostics))) => {
+                    break $label Err(DriverError::Typing(diagnostics));
+                }
                 Ok(Err(error)) => break $label Err(DriverError::Fatal(pool_failure(error))),
                 Err(BudgetInterruption::Cancelled) => break $label Err(DriverError::Cancelled),
                 Err(BudgetInterruption::TimedOut) => break $label Err(DriverError::TimedOut),
@@ -1658,8 +1721,7 @@ async fn drive(
         }};
     }
     'drive: {
-        let mut event =
-            turn!('drive, on_print => checkout.feed(code, vec![], vec![], false, &mut on_print));
+        let mut event = turn!('drive, on_print => checkout.feed(code, vec![], vec![], skip_type_check, &mut on_print));
 
         let mut pending_calls = Vec::new();
         loop {
@@ -2907,6 +2969,155 @@ mod tests {
             panic!("expected Python error, got {:?}", execution.outcome);
         };
         error
+    }
+
+    #[tokio::test]
+    async fn checked_model_code_can_catch_tool_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for (index, (call, error)) in [
+            ("await read('missing')", "FileNotFoundError"),
+            ("await read('directory')", "IsADirectoryError"),
+            ("await glob('*', 'file')", "NotADirectoryError"),
+            ("await read('/outside')", "PermissionError"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let code = format!(
+                "caught_{index}: bool = False\ntry:\n    {call}\nexcept {error} as failure_{index}:\n    observed_{index}: OSError = failure_{index}\n    caught_{index} = True\ncaught_{index}"
+            );
+            let execution = execute_checked(&mut arena, &code).await.unwrap();
+            assert_eq!(
+                complete(&execution).map(|result| result.head.as_str()),
+                Some("True"),
+                "{error}: {:?}",
+                execution.outcome
+            );
+            assert_eq!(execution.tool_calls.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_type_check_does_not_run_code_or_change_python_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let initial = execute_checked(&mut arena, "saved: int = 1").await.unwrap();
+        assert!(matches!(initial.outcome, ExecutionOutcome::Complete { .. }));
+        let checkpoint = arena.checkpoint();
+
+        let rejected = execute_checked(
+            &mut arena,
+            "saved = 99\nwrong: int = 'text'\nawait write('created.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        let ExecutionOutcome::TypeCheckError(error) = rejected.outcome else {
+            panic!("expected type-check failure, got {:?}", rejected.outcome);
+        };
+        assert!(error.text.contains("invalid-assignment"), "{error:?}");
+        assert!(rejected.tool_calls.is_empty());
+        assert!(!workspace.path().join("created.txt").exists());
+        assert_eq!(arena.checkpoint(), checkpoint);
+
+        arena.restore(checkpoint).await.unwrap();
+        let rejected = execute_checked(
+            &mut arena,
+            "wrong: int = 'still wrong'\nawait write('created.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        let ExecutionOutcome::TypeCheckError(error) = rejected.outcome else {
+            panic!("expected a type-check error after restore");
+        };
+        assert!(error.text.contains("invalid-assignment"), "{error:?}");
+        assert!(rejected.tool_calls.is_empty());
+        assert!(!workspace.path().join("created.txt").exists());
+        let next = execute_checked(&mut arena, "saved + 1").await.unwrap();
+        assert_eq!(complete(&next).unwrap().head, "2");
+    }
+
+    #[tokio::test]
+    async fn disabled_model_type_check_survives_restore_and_child_creation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let rejected = execute_checked(
+            &mut arena,
+            "wrong: int = 'text'\nawait write('rejected.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            rejected.outcome,
+            ExecutionOutcome::TypeCheckError(_)
+        ));
+        assert!(!workspace.path().join("rejected.txt").exists());
+
+        arena.disable_model_type_check();
+        let executed = execute_checked(
+            &mut arena,
+            "wrong: int = 'text'\nawait write('accepted.txt', 'ok')",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            executed.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("accepted.txt")).unwrap(),
+            "ok"
+        );
+
+        let checkpoint = arena.checkpoint();
+        arena.restore(checkpoint.clone()).await.unwrap();
+        let restored = execute_checked(&mut arena, "restored: int = 'text'")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+
+        let mut child = arena.child(&checkpoint, false).await.unwrap();
+        let inherited = execute_checked(&mut child, "child: int = 'text'")
+            .await
+            .unwrap();
+        assert!(matches!(
+            inherited.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoints_cannot_disable_model_type_checks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        for identity in [
+            RUNTIME_IDENTITY.to_owned(),
+            format!("{RUNTIME_IDENTITY}+type-check"),
+        ] {
+            let mut checkpoint = arena.checkpoint();
+            checkpoint.identity = RuntimeIdentity(identity);
+            assert!(matches!(
+                arena.restore(checkpoint).await,
+                Err(ArenaError::IncompatibleCheckpoint { .. })
+            ));
+        }
+    }
+
+    async fn execute_checked(arena: &mut Arena, code: &str) -> Result<Execution, ArenaError> {
+        arena
+            .execute_model_code_with_progress_and_context(
+                code,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
+            .await
     }
 
     fn gathered_reads(count: usize) -> String {
@@ -5120,13 +5331,13 @@ mod tests {
     async fn same_execution_starts_inherit_the_pre_execution_checkpoint_only() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
-        execute_without_cancellation(&mut arena, "inherited = 'before'")
+        execute_checked(&mut arena, "inherited = 'before'")
             .await
             .unwrap();
         let context = complete_invocation_context([
             vec![
                 ScriptedAction::Code {
-                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution  # ty: ignore[unresolved-reference]\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
                 },
                 ScriptedAction::Message {
                     text: "first".to_owned(),
@@ -5134,7 +5345,7 @@ mod tests {
             ],
             vec![
                 ScriptedAction::Code {
-                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                    source: "result_values['inherited'] = inherited\ntry:\n    result_values['same_execution'] = same_execution  # ty: ignore[unresolved-reference]\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
                 },
                 ScriptedAction::Message {
                     text: "second".to_owned(),
@@ -5355,6 +5566,19 @@ mod tests {
             .head,
             "1"
         );
+
+        let rejected = execute_checked(
+            &mut first,
+            "wrong: int = 'text'\nawait write('created.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        let ExecutionOutcome::TypeCheckError(error) = rejected.outcome else {
+            panic!("expected a type-check error in child arena");
+        };
+        assert!(error.text.contains("invalid-assignment"), "{error:?}");
+        assert!(rejected.tool_calls.is_empty());
+        assert!(!workspace.path().join("created.txt").exists());
 
         let mut foreign = checkpoint;
         foreign.identity = RuntimeIdentity("monty-runtime 9.9.9".to_owned());
@@ -8543,6 +8767,7 @@ mod tests {
             checkout,
             &arena.tool_host,
             "x = ' ' * (1 << 60)",
+            true,
             None,
             &mut authorisations,
             &mut progress,

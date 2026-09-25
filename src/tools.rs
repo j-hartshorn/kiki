@@ -635,29 +635,19 @@ pub(crate) fn bootstrap_source() -> String {
     tool_source(false)
 }
 
+pub(crate) fn type_check_stubs() -> String {
+    format!(
+        "{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\nresult_values: dict[str, object] = {{}}",
+        type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>())
+    )
+}
+
 pub(crate) fn prompt_reference() -> String {
     prompt_reference_for(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), false)
 }
 
 fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
-    let records = record_definitions(definitions)
-        .into_iter()
-        .map(ToolRecord::bootstrap_definition)
-        .collect::<Vec<_>>();
-    let definitions = definitions
-        .iter()
-        .map(|definition| definition.prompt_skeleton())
-        .collect::<Vec<_>>();
-    let source = [
-        Some("from dataclasses import dataclass".to_owned()),
-        (!records.is_empty()).then(|| records.join("\n\n")),
-        (!definitions.is_empty()).then(|| definitions.join("\n\n")),
-        Some(invocation_source(true)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n\n");
+    let source = type_reference_source(definitions);
     let availability_guidance = if read_only {
         " This Arena is read-only; write, edit, and run are unavailable."
     } else {
@@ -666,6 +656,27 @@ fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> Str
     format!(
         "## Kiki tool reference\n\nDo not redefine these host functions. Every host call must be awaited. Use `asyncio.gather()` only for independent calls expected to succeed. Keep dependent calls sequential. Avoid unbounded fan-out. A gather failure can follow completed host calls and does not assign sibling results. Keep large files and intermediate data in Python variables.{availability_guidance} Keep model-visible output focused. The Arena has five minutes of chargeable time. Time pauses only while waiting exclusively for child completion or cleanup; ordinary and control calls stay charged.\n\n```python\na, b = await asyncio.gather(read(\"a.rs\"), read(\"b.rs\"))\n```\n\n{source}\n"
     )
+}
+
+fn type_reference_source(definitions: &[&ToolDefinition]) -> String {
+    let records = record_definitions(definitions)
+        .into_iter()
+        .map(ToolRecord::bootstrap_definition)
+        .collect::<Vec<_>>();
+    let definitions = definitions
+        .iter()
+        .map(|definition| definition.prompt_skeleton())
+        .collect::<Vec<_>>();
+    [
+        Some("from dataclasses import dataclass".to_owned()),
+        (!records.is_empty()).then(|| records.join("\n\n")),
+        (!definitions.is_empty()).then(|| definitions.join("\n\n")),
+        Some(invocation_source(true)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n")
 }
 
 fn tool_source(reference: bool) -> String {

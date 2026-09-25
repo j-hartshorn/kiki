@@ -158,6 +158,12 @@ pub(crate) enum RestoredTimelineItem {
     SubagentFinished(TaskRecord),
 }
 
+#[derive(Default)]
+pub(crate) struct ResumeOptions {
+    pub(crate) relocated_cwd: Option<PathBuf>,
+    pub(crate) disable_type_check: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeInitialState {
     pub(crate) metadata: Option<SessionMetadata>,
@@ -772,8 +778,12 @@ impl<M: Model> RuntimeController<M> {
         selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
-        relocated_cwd: Option<PathBuf>,
+        options: ResumeOptions,
     ) -> Result<(Self, RuntimeInitialState), SessionError> {
+        let ResumeOptions {
+            relocated_cwd,
+            disable_type_check,
+        } = options;
         let restore = session.restore()?;
         let mut initial = restored_initial_state(&restore);
         let records = restore
@@ -816,10 +826,14 @@ impl<M: Model> RuntimeController<M> {
                 let preferences = accepted_thinking.proposal(selection);
                 match session
                     .writer()
-                    .commit_startup_preferences(preferences.clone(), relocated_cwd)
+                    .commit_startup_preferences(
+                        preferences.clone(),
+                        relocated_cwd,
+                        disable_type_check,
+                    )
                     .await
                 {
-                    Ok(()) => match session
+                    Ok(type_check_disabled) => match session
                         .writer()
                         .activate(
                             restore.effective_entry,
@@ -830,11 +844,15 @@ impl<M: Model> RuntimeController<M> {
                     {
                         Ok(()) => {
                             accepted_thinking.accept(selection);
-                            initial
+                            let metadata = initial
                                 .metadata
                                 .as_mut()
-                                .expect("executable session restore must have metadata")
-                                .update_preferences(preferences);
+                                .expect("executable session restore must have metadata");
+                            metadata.update_preferences(preferences);
+                            if type_check_disabled {
+                                metadata.disable_type_check();
+                                arena.disable_model_type_check();
+                            }
                             Some(Agent::new(arena, model))
                         }
                         Err(_) => {
@@ -2309,9 +2327,10 @@ mod tests {
     use super::{
         AcceptedThinking, ActiveRun, CoordinatorEvent, CorrectionOutcome, ForegroundOperation,
         ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
-        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
-        RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails, WorkerMessage,
-        restored_initial_state, restored_stored_record, runtime_event_payload_bytes,
+        RestoredTimelineItem, ResumeOptions, RunId, RuntimeCommand, RuntimeController,
+        RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord,
+        TerminalDetails, WorkerMessage, restored_initial_state, restored_stored_record,
+        runtime_event_payload_bytes,
     };
     use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
@@ -2409,6 +2428,29 @@ mod tests {
 
     async fn default_controller(workspace: &tempfile::TempDir) -> RuntimeController<ScriptedModel> {
         controller_with_model(workspace, ScriptedModel::default()).await
+    }
+
+    async fn attempts_controller(
+        workspace: &tempfile::TempDir,
+    ) -> RuntimeController<ScriptedModel> {
+        let actions = vec![
+            ModelAction::Code {
+                source: "attempts: int = 1".to_owned(),
+            },
+            ModelAction::Code {
+                source: "if attempts == 1:\n    while True:\n        pass\nattempts".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ];
+        controller_with_model(
+            workspace,
+            ScriptedModel::new(actions).with_subsequent_first_action(ModelAction::Code {
+                source: "attempts += 1".to_owned(),
+            }),
+        )
+        .await
     }
 
     async fn seed_compactable_history(writer: &SessionWriter) {
@@ -2840,7 +2882,7 @@ mod tests {
                 id if id == TERRA.id => WorkflowChildModel::Scripted {
                     model: ScriptedModel::new(vec![
                         ModelAction::Code {
-                            source: "result_values['handoff'] = handoff\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                            source: "result_values['handoff'] = handoff\ntry:\n    result_values['same_execution'] = same_execution  # ty: ignore[unresolved-reference]\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
                         },
                         ModelAction::Message {
                             text: "recoverable child completed".to_owned(),
@@ -7780,6 +7822,7 @@ mod tests {
                     SOL.id: "low",
                     TERRA.id: "high",
                 },
+                "type_check_disabled": false,
             })
         );
         assert!(metadata_after.1 >= metadata_before.1);
@@ -8145,6 +8188,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opt_out_on_resume_survives_restart_and_tree_navigation() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(&SOL, "low").unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let id = session.id().to_owned();
+        let root = session.restore().unwrap().effective_entry;
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "first: int = 'text'\nawait write('first.txt', 'ok')".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ]);
+        let (mut controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            model,
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions {
+                disable_type_check: true,
+                ..ResumeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(initial.metadata.unwrap().type_check_disabled());
+        let writer = session.writer();
+        let mut agent = controller.agent.take().unwrap();
+        agent
+            .run_persisted(
+                selection,
+                "first request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("first.txt")).unwrap(),
+            "ok"
+        );
+        let active = session.restore().unwrap().observed_active_entry;
+        writer.select_active_entry(root, active).await.unwrap();
+        assert!(session.metadata().unwrap().type_check_disabled());
+        drop(agent);
+        drop(controller);
+        drop(writer);
+        session.close().unwrap();
+
+        let session = Session::open(home.path(), &id).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "second: int = 'text'\nawait write('second.txt', 'ok')".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ]);
+        let (mut controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            model,
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(initial.metadata.unwrap().type_check_disabled());
+        let writer = session.writer();
+        let mut agent = controller.agent.take().unwrap();
+        agent
+            .run_persisted(
+                selection,
+                "second request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("second.txt")).unwrap(),
+            "ok"
+        );
+        drop(agent);
+        drop(controller);
+        drop(writer);
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn restore_waits_for_and_reports_the_effective_startup_preferences() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -8192,7 +8353,7 @@ mod tests {
                     SubagentPolicy::from(snapshot.subagents()),
                     Arc::new(super::UnavailableChildRunner),
                 ),
-                None,
+                ResumeOptions::default(),
             )
             .await;
             let _ = returned.send(());
@@ -8279,7 +8440,10 @@ mod tests {
                 SubagentPolicy::from(snapshot.subagents()),
                 Arc::new(super::UnavailableChildRunner),
             ),
-            None,
+            ResumeOptions {
+                disable_type_check: true,
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -8394,7 +8558,10 @@ mod tests {
                 SubagentPolicy::from(snapshot.subagents()),
                 Arc::new(super::UnavailableChildRunner),
             ),
-            Some(relocated_workspace.path().to_path_buf()),
+            ResumeOptions {
+                relocated_cwd: Some(relocated_workspace.path().to_path_buf()),
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -10216,7 +10383,7 @@ mod tests {
                         source: "value = 1\nraise ValueError('expected')".to_owned(),
                     },
                     ModelAction::Code {
-                        source: "value + 1".to_owned(),
+                        source: "value + 1  # ty: ignore[unresolved-reference]".to_owned(),
                     },
                     ModelAction::Message {
                         text: "done".to_owned(),
@@ -10260,25 +10427,8 @@ mod tests {
     #[tokio::test]
     async fn busy_submission_does_not_allocate_run_or_model_step_ids() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, mut progress, controller) = start_controller(
-            controller(
-                &workspace,
-                vec![
-                    ModelAction::Code {
-                        source: "try:\n    attempts += 1\nexcept NameError:\n    attempts = 1"
-                            .to_owned(),
-                    },
-                    ModelAction::Code {
-                        source: "if attempts == 1:\n    while True:\n        pass\nattempts"
-                            .to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "done".to_owned(),
-                    },
-                ],
-            )
-            .await,
-        );
+        let (commands, mut events, mut progress, controller) =
+            start_controller(attempts_controller(&workspace).await);
 
         commands
             .send(RuntimeCommand::Submit {
@@ -10498,19 +10648,8 @@ mod tests {
     #[tokio::test]
     async fn a_later_request_succeeds_after_cancellation_recovery() {
         let workspace = tempfile::tempdir().unwrap();
-        let actions = vec![
-            ModelAction::Code {
-                source: "try:\n    attempts += 1\nexcept NameError:\n    attempts = 1".to_owned(),
-            },
-            ModelAction::Code {
-                source: "if attempts == 1:\n    while True:\n        pass\nattempts".to_owned(),
-            },
-            ModelAction::Message {
-                text: "done".to_owned(),
-            },
-        ];
         let (commands, mut events, mut progress, controller) =
-            start_controller(controller(&workspace, actions).await);
+            start_controller(attempts_controller(&workspace).await);
 
         commands
             .send(RuntimeCommand::Submit {
@@ -14252,7 +14391,10 @@ mod tests {
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
                 Arc::new(CountingChildRunner(starts.clone())),
             ),
-            Some(relocated.path().to_path_buf()),
+            ResumeOptions {
+                relocated_cwd: Some(relocated.path().to_path_buf()),
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -14508,7 +14650,12 @@ mod tests {
             .expect("restore root checkpoint");
         let source = "sibling_value = 99\nresult_values = {'sibling': sibling_value}";
         let execution = sibling_arena
-            .execute(source, &CancellationToken::new())
+            .execute_model_code_with_progress_and_context(
+                source,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
             .await
             .expect("execute sibling branch");
         assert!(matches!(
@@ -14783,7 +14930,7 @@ mod tests {
                 calls: calls.clone(),
                 actions: vec![
                     RestoredModelAction::Code {
-                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\nvisible = await get_subagent('0.0')\nvisible_result = await visible.wait()\nassert visible_result['message'] == 'late selected result'\nassert visible_result['values']['visible'] == 62\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\nvisible = await get_subagent('0.0')\nvisible_result = await visible.wait()\nassert visible_result['message'] == 'late selected result'\nassert visible_result['values']['visible'] == 62\ntry:\n    sibling_value  # ty: ignore[unresolved-reference]\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
                             .to_owned(),
                         commentary: None,
                         attempts: Vec::new(),
@@ -14806,7 +14953,7 @@ mod tests {
                 Arc::new(CountingChildRunner(starts.clone())),
             )
             .with_start_test_gate(start_gate.clone()),
-            None,
+            ResumeOptions::default(),
         )
         .await
         .expect("restore runtime");
@@ -15115,7 +15262,7 @@ mod tests {
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
                 Arc::new(CountingChildRunner(Arc::new(AtomicUsize::new(0)))),
             ),
-            None,
+            ResumeOptions::default(),
         )
         .await
         .expect("restore navigation runtime");
@@ -15331,7 +15478,12 @@ mod tests {
             .await
             .expect("start branch execution");
         let execution = arena
-            .execute(source, &CancellationToken::new())
+            .execute_model_code_with_progress_and_context(
+                source,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
             .await
             .expect("execute branch state");
         let checkpoint = arena.checkpoint();
@@ -15498,7 +15650,7 @@ mod tests {
                         text: "sibling continuation".to_owned(),
                     },
                     2 => CompletedModelAction::Code {
-                        source: "assert saved_value == 41\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('0.0')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
+                        source: "assert saved_value == 41\ntry:\n    sibling_value  # ty: ignore[unresolved-reference]\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('0.0')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
                         call_id: ModelCallId::new("probe-original"),
                         commentary: None,
                     },

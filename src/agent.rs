@@ -926,7 +926,7 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_with_progress_and_context(
+                            .execute_model_code_with_progress_and_context(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
@@ -1176,7 +1176,7 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_with_progress_and_context(
+                            .execute_model_code_with_progress_and_context(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
@@ -1341,6 +1341,15 @@ fn execution_feedback(execution: &Execution) -> String {
             frames.push(render_error(error));
             if error.omitted_bytes > 0 {
                 frames.push(error_truncation_warning());
+            }
+        }
+        ExecutionOutcome::TypeCheckError(error) => {
+            frames.push(format!(
+                "<kiki_type_check_error omitted_bytes=\"{}\" arena_state=\"unchanged\">\nType check failed before execution:\n{}</kiki_type_check_error>",
+                error.omitted_bytes, error.text
+            ));
+            if error.omitted_bytes > 0 {
+                frames.push("<kiki_warning code=\"type_check_error_truncated\" arena_state=\"unchanged\">\nType-check diagnostics were truncated. No Python code was executed.\n</kiki_warning>".to_owned());
             }
         }
     }
@@ -1528,7 +1537,12 @@ mod tests {
                 self.contexts.push(entries.clone());
                 let action = match entries.as_slice() {
                     [ModelContextEntry::UserRequest { .. }] => CompletedModelAction::Code {
-                        source: "try:\n    value += 1\nexcept NameError:\n    value = 1".to_owned(),
+                        source: if self.contexts.len() == 1 {
+                            "value: int = 1"
+                        } else {
+                            "value += 1"
+                        }
+                        .to_owned(),
                         call_id: ModelCallId::new("history-aware-code"),
                         commentary: None,
                     },
@@ -2088,6 +2102,126 @@ mod tests {
                 feedback: "<kiki_output stream=\"stdout\" truncated=\"false\" total_lines=\"1\" total_bytes=\"6\">\n<kiki_output_head lines=\"1\" bytes=\"6\" ends_mid_line=\"false\">\nhello\n</kiki_output_head>\n</kiki_output>".to_owned(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn agent_returns_type_errors_to_model_before_retrying_code() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "wrong: int = 'text'\nawait write('rejected.txt', 'bad')".to_owned(),
+                },
+                ModelAction::Code {
+                    source: "await write('accepted.txt', 'good')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            agent
+                .run(default_selection(), "inspect", &CancellationToken::new())
+                .await
+                .unwrap()
+                .text(),
+            "done"
+        );
+        let rejected = agent.model.contexts()[1]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .unwrap();
+        assert!(matches!(rejected.result(), CodeResult::Execution { .. }));
+        assert!(rejected.result().feedback().contains("invalid-assignment"));
+        assert!(rejected.result().feedback().contains("before execution"));
+        let accepted = agent.model.contexts()[2]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .unwrap();
+        assert_eq!(accepted.result().feedback(), "");
+        assert!(!workspace.path().join("rejected.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("accepted.txt")).unwrap(),
+            "good"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_type_error_is_visible_on_the_next_model_step() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = default_selection();
+        let mut agent = agent(
+            &workspace,
+            vec![
+                ModelAction::Code {
+                    source: "wrong: int = 'text'\nawait write('bad.txt', 'bad')".to_owned(),
+                },
+                ModelAction::Code {
+                    source: "await write('good.txt', 'good')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
+        )
+        .await;
+        let session =
+            Session::create(home.path(), workspace.path(), selection, agent.checkpoint()).unwrap();
+        let writer = session.writer();
+        let mut events = Vec::new();
+        let outcome = agent
+            .run_persisted(
+                selection,
+                "inspect".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        assert!(!workspace.path().join("bad.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("good.txt")).unwrap(),
+            "good"
+        );
+        let next_context = agent.model.contexts()[1]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("retry should receive rejected code");
+        assert!(
+            next_context
+                .result()
+                .feedback()
+                .contains("invalid-assignment")
+        );
+        let history = writer.model_history().unwrap();
+        let completed = history
+            .entries()
+            .iter()
+            .filter_map(ModelContextEntry::completed_code)
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 2);
+        assert!(
+            completed[0]
+                .result()
+                .feedback()
+                .contains("invalid-assignment")
+        );
+        assert_eq!(completed[1].result().feedback(), "");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::PersistedAgentEvent::ExecutionCommitted { execution, .. }
+                if matches!(execution.outcome, ExecutionOutcome::TypeCheckError(_))
+        )));
+        drop(writer);
+        session.close().unwrap();
     }
 
     #[tokio::test]
@@ -3178,7 +3312,7 @@ mod tests {
                     source: "value = 1\nraise ValueError('expected')".to_owned(),
                 },
                 ModelAction::Code {
-                    source: "value + 1".to_owned(),
+                    source: "value + 1  # ty: ignore[unresolved-reference]".to_owned(),
                 },
                 ModelAction::Message {
                     text: "done".to_owned(),
@@ -3410,7 +3544,7 @@ mod tests {
         assert_eq!(executions.len(), 2);
         assert_eq!(
             executions[0].0,
-            "try:\n    request_count += 1\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")"
+            "try:\n    request_count += 1  # ty: ignore[unresolved-reference]\nexcept NameError:\n    request_count = 1\ncontents = await read(\"Cargo.toml\")",
         );
         assert_eq!(
             executions[1].0,

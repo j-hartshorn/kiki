@@ -191,6 +191,8 @@ struct StoredSelection {
 struct StoredSessionPreferences {
     selected_model: String,
     thinking: BTreeMap<String, String>,
+    #[serde(default)]
+    type_check_disabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -214,6 +216,7 @@ struct StoredExecution {
 enum StoredExecutionOutcome {
     Complete { result: Option<StoredObservation> },
     PythonError { text: String, omitted_bytes: usize },
+    TypeCheckError { text: String, omitted_bytes: usize },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1075,6 +1078,7 @@ fn decode_selection(selection: &StoredSelection) -> Result<ModelSelection, Codec
 
 pub(super) fn encode_session_preferences(
     preferences: &SessionPreferences,
+    type_check_disabled: bool,
 ) -> Result<String, CodecError> {
     serde_json::to_string(&StoredSessionPreferences {
         selected_model: preferences.selection().model().id.to_owned(),
@@ -1083,13 +1087,17 @@ pub(super) fn encode_session_preferences(
             .iter()
             .map(|(model, thinking)| ((*model).to_owned(), (*thinking).to_owned()))
             .collect(),
+        type_check_disabled,
     })
     .map_err(CodecError::from)
 }
 
-pub(super) fn decode_session_preferences(value: &str) -> Result<SessionPreferences, CodecError> {
-    let preferences: StoredSessionPreferences = serde_json::from_str(value)?;
-    SessionPreferences::from_ids(preferences.selected_model.as_str(), preferences.thinking)
+pub(super) fn decode_session_preferences(
+    value: &str,
+) -> Result<(SessionPreferences, bool), CodecError> {
+    let stored: StoredSessionPreferences = serde_json::from_str(value)?;
+    SessionPreferences::from_ids(stored.selected_model.as_str(), stored.thinking)
+        .map(|preferences| (preferences, stored.type_check_disabled))
         .ok_or(CodecError::InvalidSelection)
 }
 
@@ -1133,6 +1141,10 @@ fn encode_execution_value(execution: &Execution) -> Result<StoredExecution, Code
                 text: error.text.clone(),
                 omitted_bytes: error.omitted_bytes,
             },
+            ExecutionOutcome::TypeCheckError(error) => StoredExecutionOutcome::TypeCheckError {
+                text: error.text.clone(),
+                omitted_bytes: error.omitted_bytes,
+            },
         },
         tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
         read_paths: encode_effect_paths(&execution.read_paths)?,
@@ -1152,6 +1164,13 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
                 text,
                 omitted_bytes,
             } => ExecutionOutcome::PythonError(PythonError {
+                text: text.clone(),
+                omitted_bytes: *omitted_bytes,
+            }),
+            StoredExecutionOutcome::TypeCheckError {
+                text,
+                omitted_bytes,
+            } => ExecutionOutcome::TypeCheckError(PythonError {
                 text: text.clone(),
                 omitted_bytes: *omitted_bytes,
             }),
@@ -1777,13 +1796,19 @@ mod tests {
         )
         .expect("valid preferences");
 
-        let encoded = encode_session_preferences(&preferences).expect("encode preferences");
-        assert_eq!(
-            decode_session_preferences(&encoded).expect("decode preferences"),
-            preferences
-        );
+        for disabled in [false, true] {
+            let encoded =
+                encode_session_preferences(&preferences, disabled).expect("encode preferences");
+            assert_eq!(
+                decode_session_preferences(&encoded).expect("decode preferences"),
+                (preferences.clone(), disabled)
+            );
+        }
+        let older = r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"}}"#;
+        assert!(!decode_session_preferences(older).unwrap().1);
 
         for invalid in [
+            r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"},"type_check_disabled":"off"}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"},"extra":true}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"unsupported"}}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{}}"#,
@@ -1818,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_codec_preserves_observations_and_python_errors() {
+    fn execution_codec_preserves_observations_and_errors() {
         let observation = |head: &str| Observation {
             head: head.to_owned(),
             tail: Some("tail".to_owned()),
@@ -1832,23 +1857,34 @@ mod tests {
             tail_starts_mid_line: true,
             partial_lines: true,
         };
-        let execution = Execution {
+        let mut execution = Execution {
             stdout: observation("stdout"),
             stderr: observation("stderr"),
-            outcome: ExecutionOutcome::PythonError(crate::arena::PythonError {
-                text: "ValueError".to_owned(),
-                omitted_bytes: 9,
-            }),
+            outcome: ExecutionOutcome::Complete { result: None },
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
         };
 
-        assert_eq!(
-            decode_execution_value(&encode_execution_value(&execution).expect("encode execution"))
+        for outcome in [
+            ExecutionOutcome::PythonError(crate::arena::PythonError {
+                text: "ValueError".to_owned(),
+                omitted_bytes: 9,
+            }),
+            ExecutionOutcome::TypeCheckError(crate::arena::PythonError {
+                text: "invalid-assignment".to_owned(),
+                omitted_bytes: 9,
+            }),
+        ] {
+            execution.outcome = outcome;
+            assert_eq!(
+                decode_execution_value(
+                    &encode_execution_value(&execution).expect("encode execution")
+                )
                 .expect("decode execution"),
-            execution
-        );
+                execution
+            );
+        }
     }
 
     #[test]

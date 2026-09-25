@@ -245,6 +245,8 @@ mod tests {
             "`next(x for x in xs)` fails",
             "No `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for` or wildcard imports",
             "Built-in methods generally work only as direct calls",
+            "annotate globals you may reassign",
+            "never repeat side-effecting calls merely to satisfy a diagnostic",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }

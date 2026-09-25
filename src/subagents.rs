@@ -7836,9 +7836,11 @@ mod tests {
         .await
         .expect("create parent arena");
         parent
-            .execute(
+            .execute_model_code_with_progress_and_context(
                 "inherited = 41\nresult_values = {'parent': 'kept'}",
                 &CancellationToken::new(),
+                &mut |_| {},
+                None,
             )
             .await
             .expect("initialise parent state");
@@ -7933,7 +7935,7 @@ mod tests {
         let payload = super::ChildPayload::new(parent.child_source(), parent.checkpoint());
         let factory = ScriptedChildFactory::new([vec![
             ScriptedAction::Code {
-                source: "result_values = 1".to_owned(),
+                source: "result_values = 1  # ty: ignore[invalid-assignment]".to_owned(),
             },
             ScriptedAction::Message {
                 text: "generated but not admitted".to_owned(),

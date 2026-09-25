@@ -3963,7 +3963,9 @@ fn terminal_evidence_blocks(
 fn arena_state(execution: &Execution) -> ArenaState {
     match execution.outcome {
         ExecutionOutcome::Complete { .. } => ArenaState::Complete,
-        ExecutionOutcome::PythonError(..) => ArenaState::Error,
+        ExecutionOutcome::PythonError(..) | ExecutionOutcome::TypeCheckError(..) => {
+            ArenaState::Error
+        }
     }
 }
 
@@ -3978,6 +3980,10 @@ fn execution_content(execution: &Execution) -> Vec<ArenaContent> {
         ExecutionOutcome::Complete { result: None } => {}
         ExecutionOutcome::PythonError(error) => content.push(ArenaContent {
             label: "error",
+            text: error.text.clone(),
+        }),
+        ExecutionOutcome::TypeCheckError(error) => content.push(ArenaContent {
+            label: "type check",
             text: error.text.clone(),
         }),
     }
@@ -9408,6 +9414,54 @@ truncated"
                 && heading == "running code"
                 && content.is_empty()
         ));
+    }
+
+    #[test]
+    fn rejected_code_renders_type_check_diagnostics() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        commentary: None,
+                        source: "wrong: int = 'text'".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::TypeCheckError(PythonError {
+                                text: "invalid-assignment".to_owned(),
+                                omitted_bytes: 0,
+                            }),
+                            tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let arena = transcript
+            .blocks()
+            .into_iter()
+            .find_map(|block| match block {
+                TranscriptBlock::Arena(arena) => Some(arena),
+                _ => None,
+            })
+            .expect("rejected execution card");
+        assert!(matches!(arena.state, super::ArenaState::Error));
+        assert_eq!(arena.content.len(), 1);
+        assert_eq!(arena.content[0].label, "type check");
+        assert_eq!(arena.content[0].text, "invalid-assignment");
+        let rendered = rendered_text(&transcript);
+        assert!(rendered.contains("type check"), "{rendered}");
+        assert!(rendered.contains("invalid-assignment"), "{rendered}");
     }
 
     #[test]
