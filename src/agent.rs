@@ -2111,10 +2111,10 @@ mod tests {
             &workspace,
             vec![
                 ModelAction::Code {
-                    source: "wrong: int = 'text'\nawait write('created.txt', 'bad')".to_owned(),
+                    source: "wrong: int = 'text'\nawait write('rejected.txt', 'bad')".to_owned(),
                 },
                 ModelAction::Code {
-                    source: "await write('created.txt', 'good')".to_owned(),
+                    source: "await write('accepted.txt', 'good')".to_owned(),
                 },
                 ModelAction::Message {
                     text: "done".to_owned(),
@@ -2143,8 +2143,9 @@ mod tests {
             .and_then(ModelContextEntry::completed_code)
             .unwrap();
         assert_eq!(accepted.result().feedback(), "");
+        assert!(!workspace.path().join("rejected.txt").exists());
         assert_eq!(
-            fs::read_to_string(workspace.path().join("created.txt")).unwrap(),
+            fs::read_to_string(workspace.path().join("accepted.txt")).unwrap(),
             "good"
         );
     }
@@ -2189,6 +2190,16 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.path().join("good.txt")).unwrap(),
             "good"
+        );
+        let next_context = agent.model.contexts()[1]
+            .last()
+            .and_then(ModelContextEntry::completed_code)
+            .expect("retry should receive rejected code");
+        assert!(
+            next_context
+                .result()
+                .feedback()
+                .contains("invalid-assignment")
         );
         let history = writer.model_history().unwrap();
         let completed = history

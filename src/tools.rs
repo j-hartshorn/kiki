@@ -637,7 +637,7 @@ pub(crate) fn bootstrap_source() -> String {
 
 pub(crate) fn type_check_stubs() -> String {
     format!(
-        "{}\n\nclass PermissionError(Exception): ...\n\nresult_values: dict[str, object] = {{}}",
+        "{}\n\nclass FileNotFoundError(OSError): ...\nclass IsADirectoryError(OSError): ...\nclass NotADirectoryError(OSError): ...\nclass PermissionError(OSError): ...\n\nresult_values: dict[str, object] = {{}}",
         type_reference_source(&ACTIVE_TOOLS.iter().collect::<Vec<_>>())
     )
 }

@@ -900,8 +900,8 @@ impl Arena {
         clock: Arc<dyn ArenaClock>,
     ) -> Result<Self, ArenaError> {
         let worker_identity = validate_worker(&worker_path).await?;
-        // Monty dumps retain whether type checking is enabled.
-        let runtime = RuntimeIdentity(format!("{}+type-check", worker_identity.0));
+        // Monty dumps retain type checking and its host stubs.
+        let runtime = RuntimeIdentity(format!("{}+type-check-v2", worker_identity.0));
         let pool = Self::open_pool(worker_path.clone()).await?;
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
@@ -2957,6 +2957,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_model_code_can_catch_tool_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("directory")).unwrap();
+        fs::write(workspace.path().join("file"), "contents").unwrap();
+        let mut arena = arena(&workspace).await;
+
+        for (index, (call, error)) in [
+            ("await read('missing')", "FileNotFoundError"),
+            ("await read('directory')", "IsADirectoryError"),
+            ("await glob('*', 'file')", "NotADirectoryError"),
+            ("await read('/outside')", "PermissionError"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let code = format!(
+                "caught_{index}: bool = False\ntry:\n    {call}\nexcept {error} as failure_{index}:\n    observed_{index}: OSError = failure_{index}\n    caught_{index} = True\ncaught_{index}"
+            );
+            let execution = execute_checked(&mut arena, &code).await.unwrap();
+            assert_eq!(
+                complete(&execution).map(|result| result.head.as_str()),
+                Some("True"),
+                "{error}: {:?}",
+                execution.outcome
+            );
+            assert_eq!(execution.tool_calls.len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn rejected_type_check_does_not_run_code_or_change_python_state() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
@@ -2979,6 +3009,18 @@ mod tests {
         assert_eq!(arena.checkpoint(), checkpoint);
 
         arena.restore(checkpoint).await.unwrap();
+        let rejected = execute_checked(
+            &mut arena,
+            "wrong: int = 'still wrong'\nawait write('created.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        let ExecutionOutcome::TypeCheckError(error) = rejected.outcome else {
+            panic!("expected a type-check error after restore");
+        };
+        assert!(error.text.contains("invalid-assignment"), "{error:?}");
+        assert!(rejected.tool_calls.is_empty());
+        assert!(!workspace.path().join("created.txt").exists());
         let next = execute_checked(&mut arena, "saved + 1").await.unwrap();
         assert_eq!(complete(&next).unwrap().head, "2");
     }
@@ -2987,13 +3029,17 @@ mod tests {
     async fn legacy_checkpoints_cannot_disable_model_type_checks() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
-        let mut checkpoint = arena.checkpoint();
-        checkpoint.identity = RuntimeIdentity(RUNTIME_IDENTITY.to_owned());
-
-        assert!(matches!(
-            arena.restore(checkpoint).await,
-            Err(ArenaError::IncompatibleCheckpoint { .. })
-        ));
+        for identity in [
+            RUNTIME_IDENTITY.to_owned(),
+            format!("{RUNTIME_IDENTITY}+type-check"),
+        ] {
+            let mut checkpoint = arena.checkpoint();
+            checkpoint.identity = RuntimeIdentity(identity);
+            assert!(matches!(
+                arena.restore(checkpoint).await,
+                Err(ArenaError::IncompatibleCheckpoint { .. })
+            ));
+        }
     }
 
     async fn execute_checked(arena: &mut Arena, code: &str) -> Result<Execution, ArenaError> {
@@ -5453,6 +5499,19 @@ mod tests {
             .head,
             "1"
         );
+
+        let rejected = execute_checked(
+            &mut first,
+            "wrong: int = 'text'\nawait write('created.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        let ExecutionOutcome::TypeCheckError(error) = rejected.outcome else {
+            panic!("expected a type-check error in child arena");
+        };
+        assert!(error.text.contains("invalid-assignment"), "{error:?}");
+        assert!(rejected.tool_calls.is_empty());
+        assert!(!workspace.path().join("created.txt").exists());
 
         let mut foreign = checkpoint;
         foreign.identity = RuntimeIdentity("monty-runtime 9.9.9".to_owned());

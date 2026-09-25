@@ -9417,6 +9417,54 @@ truncated"
     }
 
     #[test]
+    fn rejected_code_renders_type_check_diagnostics() {
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::CompletedExecution {
+                        step_id: ModelStepId(1),
+                        commentary: None,
+                        source: "wrong: int = 'text'".to_owned(),
+                        reasoning_summary: String::new(),
+                        execution: Execution {
+                            stdout: observation(""),
+                            stderr: observation(""),
+                            outcome: ExecutionOutcome::TypeCheckError(PythonError {
+                                text: "invalid-assignment".to_owned(),
+                                omitted_bytes: 0,
+                            }),
+                            tool_calls: Vec::new(),
+                            read_paths: Vec::new(),
+                            modified_paths: Vec::new(),
+                        },
+                        attempts: Vec::new(),
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+
+        let arena = transcript
+            .blocks()
+            .into_iter()
+            .find_map(|block| match block {
+                TranscriptBlock::Arena(arena) => Some(arena),
+                _ => None,
+            })
+            .expect("rejected execution card");
+        assert!(matches!(arena.state, super::ArenaState::Error));
+        assert_eq!(arena.content.len(), 1);
+        assert_eq!(arena.content[0].label, "type check");
+        assert_eq!(arena.content[0].text, "invalid-assignment");
+        let rendered = rendered_text(&transcript);
+        assert!(rendered.contains("type check"), "{rendered}");
+        assert!(rendered.contains("invalid-assignment"), "{rendered}");
+    }
+
+    #[test]
     fn rendering_keeps_execution_content_literal_and_plain() {
         let mut transcript = Transcript::default();
         transcript.apply(
