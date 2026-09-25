@@ -16,10 +16,10 @@ use crate::{
         settings::{CacheTtl, CrossProviderReasoning},
     },
     model::{
-        AttemptAccounting, CodeResult, ForeignPart, Model, ModelAction, ModelCallId,
-        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest,
-        SummaryResult, canonical_compaction_summary,
+        AttemptAccounting, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+        canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
@@ -141,11 +141,7 @@ impl AnthropicModel {
                         }
                     }
                     push_content(&mut messages, "assistant", block_values(&blocks));
-                    let output = match completed.result() {
-                        CodeResult::Execution { feedback }
-                        | CodeResult::Cancelled { feedback }
-                        | CodeResult::Failure { feedback } => feedback,
-                    };
+                    let output = completed.result().feedback();
                     push_content(
                         &mut messages,
                         "user",

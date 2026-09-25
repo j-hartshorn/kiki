@@ -24,10 +24,10 @@ use crate::{
         models::Provider, settings::CrossProviderReasoning,
     },
     model::{
-        AttemptAccounting, CodeResult, ForeignPart, Model, ModelAction, ModelCallId,
-        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
-        ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest,
-        SummaryResult, canonical_compaction_summary,
+        AttemptAccounting, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+        canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
@@ -153,11 +153,7 @@ impl OpenAiModel {
                         }
                     }
                     input.extend(replay);
-                    let output = match completed.result() {
-                        CodeResult::Execution { feedback }
-                        | CodeResult::Cancelled { feedback }
-                        | CodeResult::Failure { feedback } => feedback,
-                    };
+                    let output = completed.result().feedback();
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": completed.call_id().as_str(),
