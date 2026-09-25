@@ -4398,6 +4398,7 @@ mod tests {
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(0),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(1),

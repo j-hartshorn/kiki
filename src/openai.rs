@@ -640,6 +640,7 @@ impl OpenAiModel {
                 .input_tokens_details
                 .as_ref()
                 .and_then(|details| details.cache_write_tokens),
+            cache_write_1h_input_tokens: 0,
             output_tokens: usage.output_tokens,
             reasoning_output_tokens: usage
                 .output_tokens_details
@@ -3521,6 +3522,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),
@@ -4473,6 +4475,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),
@@ -5142,6 +5145,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),

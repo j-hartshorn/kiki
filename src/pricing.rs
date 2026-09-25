@@ -57,6 +57,8 @@ pub enum PricingError {
     ServiceTierMismatch,
     #[error("cached and cache-write input exceeds total input")]
     InconsistentInputBreakdown,
+    #[error("1h cache-write input exceeds total cache-write input")]
+    InconsistentCacheWriteBreakdown,
     #[error("reasoning output exceeds total output")]
     InconsistentReasoningBreakdown,
     #[error("total tokens does not equal input plus output")]
@@ -100,6 +102,10 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
     if categorised_input > input {
         return Err(PricingError::InconsistentInputBreakdown);
     }
+    let cache_write_1h = usage.cache_write_1h_input_tokens;
+    let cache_write_5m = cache_write
+        .checked_sub(cache_write_1h)
+        .ok_or(PricingError::InconsistentCacheWriteBreakdown)?;
     if reasoning > output {
         return Err(PricingError::InconsistentReasoningBreakdown);
     }
@@ -121,7 +127,8 @@ pub fn estimate_usage(usage: &ModelUsage) -> Result<CostEstimate, PricingError> 
     let amount = [
         (uncached, rates.uncached_input_nanos),
         (cached, rates.cached_input_nanos),
-        (cache_write, rates.cache_write_nanos),
+        (cache_write_5m, rates.cache_write_nanos),
+        (cache_write_1h, rates.cache_write_1h_nanos),
         (output, rates.output_nanos),
     ]
     .into_iter()
@@ -192,7 +199,7 @@ mod tests {
     use crate::{
         config::{
             DEFAULT_MODEL,
-            models::{ASTRA, LUNA, SOL, TERRA},
+            models::{ASTRA, CATALOGUE, FABLE_5_1, LUNA, OPUS_5_5, Provider, SOL, TERRA},
         },
         model::{AttemptAccounting, ModelUsage},
     };
@@ -222,6 +229,7 @@ mod tests {
             input_tokens: Some(input),
             cached_input_tokens: Some(cached),
             cache_write_input_tokens: Some(cache_write),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(output),
             reasoning_output_tokens: Some(reasoning),
             total_tokens: Some(input + output),
@@ -309,6 +317,56 @@ mod tests {
             estimate_usage(&usage_for(ASTRA.id, 272_001, 100_000, 100_000, 100_000, 0)).unwrap();
         assert_eq!(amount(threshold), 7_070_000_000);
         assert_eq!(amount(above), 11_640_020_000);
+    }
+
+    #[test]
+    fn prices_anthropic_1h_cache_writes_at_the_1h_rate_and_the_rest_at_the_5m_rate() {
+        for (model, expected_amount) in [(OPUS_5_5.id, 684_000_000), (FABLE_5_1.id, 1_705_000_000)]
+        {
+            let usage = ModelUsage {
+                service_tier: Some("standard".to_owned()),
+                cache_write_1h_input_tokens: 10_000,
+                ..usage_for(model, 150_000, 20_000, 30_000, 5_000, 1_000)
+            };
+
+            assert_eq!(amount(estimate_usage(&usage).unwrap()), expected_amount);
+        }
+    }
+
+    #[test]
+    fn rejects_1h_cache_writes_above_total_cache_writes() {
+        let usage = |cache_write_1h| ModelUsage {
+            service_tier: Some("standard".to_owned()),
+            cache_write_1h_input_tokens: cache_write_1h,
+            ..usage_for(OPUS_5_5.id, 150, 20, 30, 5, 0)
+        };
+
+        assert!(estimate_usage(&usage(30)).is_ok());
+        assert_eq!(
+            estimate_usage(&usage(31)),
+            Err(PricingError::InconsistentCacheWriteBreakdown)
+        );
+    }
+
+    #[test]
+    fn openai_estimates_are_unchanged_by_a_1h_cache_write_subset() {
+        for model in CATALOGUE
+            .iter()
+            .filter(|model| model.provider() == Provider::OpenAi)
+        {
+            for input in [272_000, 272_001] {
+                let all_5m = usage_for(model.id, input, 0, 100_000, 0, 0);
+                let all_1h = ModelUsage {
+                    cache_write_1h_input_tokens: 100_000,
+                    ..all_5m.clone()
+                };
+
+                assert_eq!(
+                    estimate_usage(&all_1h).unwrap(),
+                    estimate_usage(&all_5m).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
