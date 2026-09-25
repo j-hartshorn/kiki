@@ -2350,6 +2350,7 @@ mod tests {
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
         models::{LUNA, OPUS_5_5, Provider, SOL, TERRA},
+        settings::CacheTtl,
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -13237,7 +13238,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut controller = controller_with_model(
             &workspace,
-            AnthropicModel::with_endpoint("system prompt", KEY, &fixture.endpoint),
+            AnthropicModel::with_endpoint(
+                "system prompt",
+                KEY,
+                &fixture.endpoint,
+                CacheTtl::FiveMinutes,
+            ),
         )
         .await
         .with_selection(ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap());

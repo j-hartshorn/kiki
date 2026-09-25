@@ -124,7 +124,7 @@
 **Tests**
 - `src/config/settings.rs`: Red first: default, `1h`, invalid value and unknown `[anthropic]` key.
 - `src/anthropic.rs`: breakpoints on the system block and the newest message's last block, for a fresh request and after a tool result; `ttl` omitted for `5m`, present for `1h`; summary requests have none.
-**Files** — Modify: `src/config/settings.rs`, `src/config.rs`, `src/anthropic.rs`, `src/provider.rs` or `src/main.rs` (construction)
+**Files** — Modify: `src/config/settings.rs`, `src/anthropic.rs`, `src/provider.rs` and `src/main.rs` (construction from `startup.settings()`); constructor call sites in `src/runtime.rs` tests and the `src/openai.rs` live test
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 10: Replay history across providers

@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     anthropic::AnthropicModel,
-    config::{ModelSelection, models::Provider},
+    config::{ModelSelection, models::Provider, settings::CacheTtl},
     model::{
         Model, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, SummaryRequest,
         SummaryResult,
@@ -24,10 +24,12 @@ impl ProviderModel {
         prompt: &str,
         openai_api_key: Option<&str>,
         anthropic_api_key: Option<&str>,
+        anthropic_cache_ttl: CacheTtl,
     ) -> Self {
         Self {
             openai: openai_api_key.map(|api_key| OpenAiModel::new(prompt, api_key)),
-            anthropic: anthropic_api_key.map(|api_key| AnthropicModel::new(prompt, api_key)),
+            anthropic: anthropic_api_key
+                .map(|api_key| AnthropicModel::new(prompt, api_key, anthropic_cache_ttl)),
         }
     }
 
@@ -153,6 +155,7 @@ mod tests {
         config::{
             ModelSelection,
             models::{OPUS_5_5, Provider, SOL},
+            settings::CacheTtl,
         },
         model::{
             Model, ModelAction, ModelError, ModelFailure, ModelHistory, ModelStep, SummaryRequest,
@@ -265,7 +268,12 @@ mod tests {
             openai: openai
                 .map(|fixture| OpenAiModel::with_endpoint(prompt, OPENAI_KEY, &fixture.endpoint)),
             anthropic: anthropic.map(|fixture| {
-                AnthropicModel::with_endpoint(prompt, ANTHROPIC_KEY, &fixture.endpoint)
+                AnthropicModel::with_endpoint(
+                    prompt,
+                    ANTHROPIC_KEY,
+                    &fixture.endpoint,
+                    CacheTtl::FiveMinutes,
+                )
             }),
         }
     }
@@ -431,7 +439,13 @@ mod tests {
             (None, None, Vec::new()),
         ] {
             assert_eq!(
-                ProviderModel::new("root prompt", openai_key, anthropic_key).providers(),
+                ProviderModel::new(
+                    "root prompt",
+                    openai_key,
+                    anthropic_key,
+                    CacheTtl::FiveMinutes
+                )
+                .providers(),
                 providers
             );
         }
@@ -451,7 +465,15 @@ mod tests {
         assert!(!child_instructions.contains("async def write("));
         let openai_fixture = Fixture::start(openai_message("done")).await;
         let anthropic_fixture = Fixture::start(anthropic_message("done")).await;
-        let mut parent = router(&root, Some(&openai_fixture), Some(&anthropic_fixture));
+        let mut parent = ProviderModel {
+            anthropic: Some(AnthropicModel::with_endpoint(
+                &root,
+                ANTHROPIC_KEY,
+                &anthropic_fixture.endpoint,
+                CacheTtl::OneHour,
+            )),
+            ..router(&root, Some(&openai_fixture), None)
+        };
 
         let mut child = parent.create(child_instructions.clone());
         for selection in [openai(), anthropic()] {
@@ -474,8 +496,16 @@ mod tests {
                 .map(|request| request.body["system"].clone())
                 .collect::<Vec<_>>(),
             [
-                json!([{"type": "text", "text": child_instructions}]),
-                json!([{"type": "text", "text": root}])
+                json!([{
+                    "type": "text",
+                    "text": child_instructions,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]),
+                json!([{
+                    "type": "text",
+                    "text": root,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }])
             ]
         );
         for request in &openai_requests {

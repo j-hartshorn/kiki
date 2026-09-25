@@ -9,7 +9,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT, models::Provider},
+    config::{
+        ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT, models::Provider,
+        settings::CacheTtl,
+    },
     model::{
         AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
@@ -37,6 +40,7 @@ pub(crate) struct AnthropicModel {
     prompt: String,
     api_key: String,
     endpoint: String,
+    cache_ttl: CacheTtl,
     client: reqwest::Client,
     frame_limit: usize,
     #[cfg(test)]
@@ -44,8 +48,12 @@ pub(crate) struct AnthropicModel {
 }
 
 impl AnthropicModel {
-    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::with_endpoint(prompt, api_key, ANTHROPIC_API_BASE)
+    pub(crate) fn new(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        cache_ttl: CacheTtl,
+    ) -> Self {
+        Self::with_endpoint(prompt, api_key, ANTHROPIC_API_BASE, cache_ttl)
     }
 
     pub(crate) fn with_prompt(&self, prompt: String) -> Self {
@@ -59,11 +67,13 @@ impl AnthropicModel {
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         api_base: &str,
+        cache_ttl: CacheTtl,
     ) -> Self {
         Self {
             prompt: prompt.into(),
             api_key: api_key.into(),
             endpoint: format!("{api_base}/v1/messages"),
+            cache_ttl,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -145,11 +155,21 @@ impl AnthropicModel {
             }
         }
 
+        let cache_control = cache_control(self.cache_ttl);
+        if let Some(newest_block) = messages
+            .last_mut()
+            .and_then(|message| message["content"].as_array_mut()?.last_mut())
+        {
+            newest_block["cache_control"] = cache_control.clone();
+        }
+        let mut system = text_content(&self.prompt);
+        system["cache_control"] = cache_control;
+
         Ok(json!({
             "model": model.wire_id(),
             "max_tokens": model.max_output_tokens,
             "stream": true,
-            "system": [text_content(&self.prompt)],
+            "system": [system],
             "messages": messages,
             "tools": [{
                 "name": EXECUTE_PYTHON,
@@ -701,6 +721,13 @@ fn text_content(text: &str) -> Value {
     json!({"type": "text", "text": text})
 }
 
+fn cache_control(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
+        CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+    }
+}
+
 fn push_content(messages: &mut Vec<Value>, role: &str, content: impl IntoIterator<Item = Value>) {
     match messages.last_mut() {
         Some(last) if last["role"] == role => last["content"]
@@ -1225,6 +1252,7 @@ mod tests {
                 ACCEPTED_MODEL_CONTENT_LIMIT, PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT,
             },
             models::{OPUS_5_5, SOL},
+            settings::CacheTtl,
         },
         model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError,
@@ -1484,7 +1512,11 @@ mod tests {
             "model": "claude-opus-5-5",
             "max_tokens": 128000,
             "stream": true,
-            "system": [{"type": "text", "text": "system prompt"}],
+            "system": [{
+                "type": "text",
+                "text": "system prompt",
+                "cache_control": {"type": "ephemeral"}
+            }],
             "messages": messages,
             "tools": [{
                 "name": "execute_python",
@@ -1500,6 +1532,10 @@ mod tests {
             "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": "medium"}
         })
+    }
+
+    fn cache_breakpoints(body: &Value) -> usize {
+        body.to_string().matches("\"cache_control\"").count()
     }
 
     fn headers(head: &str) -> BTreeMap<String, String> {
@@ -1524,7 +1560,12 @@ mod tests {
     }
 
     fn model(fixture: &Fixture, key: &str) -> AnthropicModel {
-        AnthropicModel::with_endpoint("system prompt", key, &fixture.endpoint)
+        AnthropicModel::with_endpoint(
+            "system prompt",
+            key,
+            &fixture.endpoint,
+            CacheTtl::FiveMinutes,
+        )
     }
 
     async fn step_with(
@@ -1569,7 +1610,7 @@ mod tests {
     #[test]
     fn production_model_posts_to_the_anthropic_messages_endpoint() {
         assert_eq!(
-            AnthropicModel::new("system prompt", KEY).endpoint,
+            AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes).endpoint,
             "https://api.anthropic.com/v1/messages"
         );
     }
@@ -1606,10 +1647,46 @@ mod tests {
         assert_eq!(headers["content-type"], "application/json");
         let mut expected = expected_request(json!([{
             "role": "user",
-            "content": [{"type": "text", "text": "inspect this project"}]
+            "content": [{
+                "type": "text",
+                "text": "inspect this project",
+                "cache_control": {"type": "ephemeral"}
+            }]
         }]));
         expected["output_config"]["effort"] = json!("high");
         assert_eq!(captured.body, expected);
+        assert_eq!(cache_breakpoints(&captured.body), 2);
+    }
+
+    #[tokio::test]
+    async fn one_hour_cache_ttl_marks_both_breakpoints_with_the_ttl() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(message_stream())).await;
+        let mut model = AnthropicModel::with_endpoint(
+            "system prompt",
+            KEY,
+            &fixture.endpoint,
+            CacheTtl::OneHour,
+        );
+
+        model
+            .step(
+                selection(),
+                &history("inspect"),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        let one_hour = json!({"type": "ephemeral", "ttl": "1h"});
+        let mut expected = expected_request(json!([{
+            "role": "user",
+            "content": [{"type": "text", "text": "inspect", "cache_control": one_hour}]
+        }]));
+        expected["system"][0]["cache_control"] = one_hour;
+        let body = fixture.request().body;
+        assert_eq!(body, expected);
+        assert_eq!(cache_breakpoints(&body), 2);
     }
 
     #[tokio::test]
@@ -1719,32 +1796,51 @@ mod tests {
         history.append_final_message(text, second.reasoning_summary, second.replay);
         history.append_user_request("thanks");
 
-        let first_turn = json!([
-            {"role": "user", "content": [{"type": "text", "text": "inspect"}]},
-            {"role": "assistant", "content": tool_blocks()},
-            {
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "1\n"}]
-            }
-        ]);
+        let tool_result_body = fixture.requests.lock().unwrap()[1].body.clone();
         assert_eq!(
-            fixture.requests.lock().unwrap()[1].body,
-            expected_request(first_turn.clone())
+            tool_result_body,
+            expected_request(json!([
+                {"role": "user", "content": [{"type": "text", "text": "inspect"}]},
+                {"role": "assistant", "content": tool_blocks()},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "1\n",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]))
         );
-        let mut next_turn = first_turn.as_array().unwrap().clone();
-        next_turn.extend([
-            json!({"role": "assistant", "content": message_blocks()}),
-            json!({"role": "user", "content": [{"type": "text", "text": "thanks"}]}),
-        ]);
+        assert_eq!(cache_breakpoints(&tool_result_body), 2);
+        let next_body = model.request(selection(), &history).unwrap();
         assert_eq!(
-            model.request(selection(), &history).unwrap(),
-            expected_request(Value::Array(next_turn))
+            next_body,
+            expected_request(json!([
+                {"role": "user", "content": [{"type": "text", "text": "inspect"}]},
+                {"role": "assistant", "content": tool_blocks()},
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "1\n"}]
+                },
+                {"role": "assistant", "content": message_blocks()},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "thanks",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]))
         );
+        assert_eq!(cache_breakpoints(&next_body), 2);
     }
 
     #[test]
     fn adjacent_user_content_merges_into_one_user_message() {
-        let model = AnthropicModel::new("system prompt", KEY);
+        let model = AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes);
         let mut history = ModelHistory::new();
         history.append_compaction_summary("saved summary");
         history.append_user_request("continue");
@@ -1775,7 +1871,7 @@ mod tests {
                     "role": "user",
                     "content": [
                         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "1\n"},
-                        {"type": "text", "text": "next"}
+                        {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
                     ]
                 }
             ]))
@@ -2470,7 +2566,7 @@ mod tests {
         assert_eq!(frame("\u{1}").len(), framing + 6);
         assert!(6 * ACCEPTED_MODEL_CONTENT_LIMIT + framing <= SSE_FRAME_LIMIT);
         assert_eq!(
-            AnthropicModel::new("system prompt", KEY).frame_limit,
+            AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes).frame_limit,
             SSE_FRAME_LIMIT
         );
     }
@@ -2630,7 +2726,11 @@ mod tests {
         assert_eq!(requests.len(), count);
         let expected = expected_request(json!([{
             "role": "user",
-            "content": [{"type": "text", "text": "inspect"}]
+            "content": [{
+                "type": "text",
+                "text": "inspect",
+                "cache_control": {"type": "ephemeral"}
+            }]
         }]));
         assert!(requests.iter().all(|request| request.body == expected));
     }
@@ -3200,6 +3300,18 @@ mod tests {
         let mut expected = expected_summary_request();
         expected["output_config"]["effort"] = json!("high");
         assert_eq!(captured.body, expected);
+    }
+
+    #[test]
+    fn summary_requests_carry_no_cache_breakpoints_for_either_ttl() {
+        for cache_ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            let body = AnthropicModel::new("system prompt", KEY, cache_ttl)
+                .summary_request(&summary_request(selection()))
+                .unwrap();
+
+            assert_eq!(body, expected_summary_request(), "{cache_ttl:?}");
+            assert_eq!(cache_breakpoints(&body), 0, "{cache_ttl:?}");
+        }
     }
 
     #[tokio::test]

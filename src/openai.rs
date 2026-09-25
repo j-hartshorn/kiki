@@ -6186,7 +6186,7 @@ mod tests {
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
-                crate::production_model(&ready),
+                crate::production_model(&ready, persisted_settings.anthropic_cache_ttl()),
                 ready.prompt_base().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),

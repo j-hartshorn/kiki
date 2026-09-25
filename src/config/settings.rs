@@ -164,6 +164,13 @@ impl CompactionSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CacheTtl {
+    #[default]
+    FiveMinutes,
+    OneHour,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SettingsContext {
     user_path: Option<PathBuf>,
@@ -173,6 +180,7 @@ pub(crate) struct SettingsContext {
     thinking: BTreeMap<&'static str, PersistedThinking>,
     environment_thinking_model: Option<&'static str>,
     compaction: CompactionSettings,
+    anthropic_cache_ttl: CacheTtl,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -198,6 +206,7 @@ impl fmt::Debug for SettingsContext {
                 &self.environment_thinking_model,
             )
             .field("compaction", &self.compaction)
+            .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
             .finish()
     }
 }
@@ -227,6 +236,10 @@ impl SettingsContext {
 
     pub(crate) fn compaction(&self) -> CompactionSettings {
         self.compaction
+    }
+
+    pub(crate) fn anthropic_cache_ttl(&self) -> CacheTtl {
+        self.anthropic_cache_ttl
     }
 
     pub(crate) fn save_model(
@@ -474,6 +487,10 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut subagents,
     );
     apply_compaction_layer(project.as_ref(), &mut compaction);
+    let anthropic_cache_ttl = [&project, &user]
+        .into_iter()
+        .find_map(|layer| layer.as_ref()?.anthropic_cache_ttl)
+        .unwrap_or_default();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -570,6 +587,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             thinking,
             environment_thinking_model,
             compaction,
+            anthropic_cache_ttl,
         },
         problems,
     }
@@ -702,8 +720,11 @@ fn validate_document(
             "thinking" => validate_thinking_table(item, &mut settings.thinking, &mut problems),
             "subagents" => validate_subagents_table(item, &mut settings.subagents, &mut problems),
             "compaction" => validate_compaction_table(item, &mut settings.compaction, &mut problems),
+            "anthropic" => {
+                validate_anthropic_table(item, &mut settings.anthropic_cache_ttl, &mut problems);
+            }
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `[thinking]`, `[subagents]`, and `[compaction]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -879,6 +900,37 @@ fn validate_compaction_table(
     }
 }
 
+fn validate_anthropic_table(
+    item: &Item,
+    cache_ttl: &mut Option<CacheTtl>,
+    problems: &mut DocumentProblems,
+) {
+    let Some(table) = item.as_table() else {
+        problems.push(
+            "field `anthropic` must be a TOML table",
+            "Use [anthropic] with supported settings, then restart Kiki.",
+        );
+        return;
+    };
+
+    for (key, item) in table.iter() {
+        match key {
+            "cache_ttl" => match item.as_str() {
+                Some("5m") => *cache_ttl = Some(CacheTtl::FiveMinutes),
+                Some("1h") => *cache_ttl = Some(CacheTtl::OneHour),
+                _ => problems.push(
+                    "field `anthropic.cache_ttl` must be \"5m\" or \"1h\"",
+                    "Set it to \"5m\" or \"1h\", then restart Kiki.",
+                ),
+            },
+            _ => problems.push(
+                "table `anthropic` contains an unknown key; only `cache_ttl` is allowed",
+                "Remove the unknown key from table `anthropic`, then restart Kiki.",
+            ),
+        }
+    }
+}
+
 fn positive_compaction_tokens(
     item: &Item,
     field: &str,
@@ -984,6 +1036,7 @@ struct FileSettings {
     thinking: BTreeMap<&'static str, &'static str>,
     subagents: FileSubagentSettings,
     compaction: FileCompactionSettings,
+    anthropic_cache_ttl: Option<CacheTtl>,
 }
 
 #[derive(Default)]
@@ -1181,7 +1234,7 @@ mod tests {
         models::{ASTRA, CATALOGUE, LUNA, SOL, TERRA},
     };
 
-    use super::{Input, SessionPreferences, SubagentSettings, resolve};
+    use super::{CacheTtl, Input, SessionPreferences, SubagentSettings, resolve};
 
     #[test]
     fn astra_uses_low_by_default_and_openai_models_reject_none() {
@@ -1339,6 +1392,111 @@ mod tests {
             9_223_372_036_854_775_807
         );
         assert!(resolution.problems().is_empty());
+    }
+
+    #[test]
+    fn anthropic_cache_ttl_defaults_to_five_minutes_and_project_overrides_user() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            defaults.context().anthropic_cache_ttl(),
+            CacheTtl::FiveMinutes
+        );
+        assert!(defaults.problems().is_empty());
+
+        write_settings(home.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        for (project_content, expected) in [
+            ("", CacheTtl::OneHour),
+            ("[anthropic]\n", CacheTtl::OneHour),
+            ("[anthropic]\ncache_ttl = \"5m\"\n", CacheTtl::FiveMinutes),
+        ] {
+            write_settings(project.path(), project_content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(
+                resolution.context().anthropic_cache_ttl(),
+                expected,
+                "{project_content}"
+            );
+            assert!(resolution.problems().is_empty(), "{project_content}");
+        }
+
+        write_settings(home.path(), "");
+        write_settings(project.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        let project_only = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            project_only.context().anthropic_cache_ttl(),
+            CacheTtl::OneHour
+        );
+    }
+
+    #[test]
+    fn invalid_anthropic_settings_discard_their_whole_layer() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for (content, diagnostic) in [
+            (
+                "[anthropic]\ncache_ttl = \"secret-ttl\"\n",
+                "anthropic.cache_ttl",
+            ),
+            ("[anthropic]\ncache_ttl = \"1H\"\n", "anthropic.cache_ttl"),
+            ("[anthropic]\ncache_ttl = 60\n", "anthropic.cache_ttl"),
+            ("[anthropic]\ncache_ttl = [\"1h\"]\n", "anthropic.cache_ttl"),
+            ("anthropic = \"1h\"\n", "field `anthropic`"),
+            ("[[anthropic]]\ncache_ttl = \"1h\"\n", "field `anthropic`"),
+            ("[anthropic]\nunknown = true\n", "table `anthropic`"),
+            (
+                "[anthropic]\ncache_ttl = \"1h\"\nttl = \"1h\"\n",
+                "table `anthropic`",
+            ),
+        ] {
+            write_settings(
+                home.path(),
+                &format!("model = \"openai/gpt-5.6-terra\"\n{content}"),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(resolution.model().id, SOL.id, "{content}");
+            assert_eq!(
+                resolution.context().anthropic_cache_ttl(),
+                CacheTtl::FiveMinutes,
+                "{content}"
+            );
+            let [problem] = resolution.problems() else {
+                panic!("expected one problem for {content}");
+            };
+            assert_eq!(
+                problem.kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{content}"
+            );
+            assert!(problem.diagnostic().contains(diagnostic), "{content}");
+            assert!(!problem.diagnostic().contains("secret-ttl"));
+        }
+
+        write_settings(home.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\n[anthropic]\ncache_ttl = \"5m\"\nunknown = true\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_eq!(resolution.model().id, SOL.id);
+        assert_eq!(
+            resolution.context().anthropic_cache_ttl(),
+            CacheTtl::OneHour
+        );
+        assert_eq!(
+            resolution
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [crate::config::StartupProblemKind::ProjectSettingsInvalid]
+        );
     }
 
     #[test]
