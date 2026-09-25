@@ -1,4 +1,6 @@
 pub mod agent;
+#[cfg(test)]
+mod anthropic;
 pub mod arena;
 mod clipboard;
 mod compaction;
@@ -6,6 +8,7 @@ pub mod config;
 mod highlight;
 pub mod model;
 mod openai;
+mod presentation;
 pub mod pricing;
 pub mod prompt;
 mod prompt_editor;

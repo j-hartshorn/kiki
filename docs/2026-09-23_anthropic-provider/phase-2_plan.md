@@ -71,13 +71,14 @@
 ### Task 4: Anthropic model steps
 **Changes**
 - `src/anthropic.rs` implements `step` and `validate_history` per the spec's adapter bullets and Usage paragraph, as a single attempt with no caching. Tool results come from semantic fields, 401 is an authentication provider failure, and foreign replay is `InvalidHistory` until Task 10.
-- HTTP and SSE error fields are redacted for the configured key before constructing bounded `ProviderFailure` diagnostics. Public errors never retain request bodies, headers, request IDs or raw transport debug output. The same sanitisation serves summaries in Task 8.
-- Enforce `ACCEPTED_MODEL_CONTENT_LIMIT` per attempt as content arrives: count accumulated UTF-8 bytes of assistant text, reasoning, tool arguments and opaque replay content, including signatures and redacted-thinking data. Count each field once across block reconstruction and exclude HTTP/SSE framing. Exceeding 16 MiB drops the stream and fails with `ContentTooLarge`, never a truncated action.
+- HTTP and SSE error fields are redacted for the configured key before constructing bounded `ProviderFailure` diagnostics. Public errors never retain request bodies, headers, request IDs or raw transport debug output. The same sanitisation serves summaries in Task 8. Disable HTTP redirects to prevent forwarding the key or conversation.
+- Enforce `ACCEPTED_MODEL_CONTENT_LIMIT` per attempt as content arrives: count accumulated UTF-8 bytes of assistant text, reasoning, tool arguments and opaque replay content, including signatures and redacted-thinking data. Count each field once across block reconstruction and exclude HTTP/SSE framing. Exceeding 16 MiB drops the stream and fails with `ContentTooLarge`, never a truncated action. Before `eventsource-stream` buffers events, bound raw SSE frames to 128 MiB; normalise CR, CRLF and LF line endings to LF so CR-only terminal events dispatch at EOF.
+- Move the existing OpenAI Python preview decoder and progress batcher to shared `src/presentation.rs`; emit bounded progress chunks without copying the entire remaining payload.
 **Tests** (`src/anthropic.rs`, loopback fixture)
 - Red first: the exact request body and headers for a fresh request; a tool-call stream yields `Code` with commentary, reasoning summary and preview chunks; a text stream yields `Message`; replay round-trips into the next request with the tool result; a compaction summary followed by a user request becomes one user message; usage from `message_start` is replaced by the cumulative `message_delta` values (fields a later event omits keep their earlier value) and the final 5m/1h split prices via `estimate_usage`; `max_tokens`, `refusal`, empty text and 401 each fail as specified.
 - Hostile HTTP and SSE errors echo the configured key in error fields and carry request metadata: neither display nor debug representations of the public failure contain the key or metadata, and diagnostics retain the existing byte limits.
 - Text, reasoning, tool arguments and opaque replay fields each contribute to the content budget; accumulated content over the limit returns `ContentTooLarge` with no action, while content at the limit is accepted.
-**Files** — Create: `src/anthropic.rs`; Modify: `src/main.rs` (module), `Cargo.toml`, `Cargo.lock`
+**Files** — Create: `src/anthropic.rs`, `src/presentation.rs`; Modify: `src/main.rs` (modules), `src/openai.rs` (shared presentation extraction), `Cargo.toml`, `Cargo.lock`
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 5: Route by provider with optional keys

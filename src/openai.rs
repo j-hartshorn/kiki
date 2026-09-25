@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ use crate::{
         OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
         canonical_compaction_summary,
     },
+    presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
     subagents::ChildModelFactory,
 };
 
@@ -1641,122 +1642,6 @@ impl ApplicationContentGuard {
     }
 }
 
-const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
-const PROGRESS_RATE_LIMIT: Duration = Duration::from_millis(50);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PresentationKind {
-    ReasoningSummary,
-    AssistantText,
-    DecodedPython,
-}
-
-impl PresentationKind {
-    fn progress(self, text: String) -> ModelProgress {
-        match self {
-            Self::ReasoningSummary => ModelProgress::ReasoningSummaryChunk { text },
-            Self::AssistantText => ModelProgress::AssistantTextChunk { text },
-            Self::DecodedPython => ModelProgress::DecodedPythonChunk { code: text },
-        }
-    }
-}
-
-struct PendingPresentation {
-    kind: PresentationKind,
-    text: String,
-}
-
-#[derive(Default)]
-struct PresentationBatcher {
-    pending: VecDeque<PendingPresentation>,
-    pending_bytes: usize,
-    last_emission: Option<Instant>,
-}
-
-impl PresentationBatcher {
-    fn push(
-        &mut self,
-        kind: PresentationKind,
-        text: String,
-        now: Instant,
-        progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        self.pending_bytes += text.len();
-        if let Some(pending) = self
-            .pending
-            .back_mut()
-            .filter(|pending| pending.kind == kind)
-        {
-            pending.text.push_str(&text);
-        } else {
-            self.pending.push_back(PendingPresentation { kind, text });
-        }
-
-        if self.rate_window_open(now) {
-            self.flush_all_at(now, progress);
-        } else {
-            self.flush_full_chunks(now, progress);
-        }
-    }
-
-    fn flush_due(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        if !self.pending.is_empty() && self.rate_window_open(now) {
-            self.flush_all_at(now, progress);
-        }
-    }
-
-    fn flush_all(&mut self, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        self.flush_all_at(Instant::now(), progress);
-    }
-
-    fn flush_all_at(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        while !self.pending.is_empty() {
-            self.emit_front(now, progress);
-        }
-    }
-
-    fn flush_full_chunks(
-        &mut self,
-        now: Instant,
-        progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) {
-        while self.pending_bytes >= PROGRESS_PAYLOAD_LIMIT {
-            self.emit_front(now, progress);
-        }
-    }
-
-    fn emit_front(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        let mut pending = self.pending.pop_front().expect("pending presentation");
-        let split = utf8_prefix_end(&pending.text, PROGRESS_PAYLOAD_LIMIT);
-        let remainder = pending.text.split_off(split);
-        self.pending_bytes -= pending.text.len();
-        if !remainder.is_empty() {
-            self.pending.push_front(PendingPresentation {
-                kind: pending.kind,
-                text: remainder,
-            });
-        }
-        self.last_emission = Some(now);
-        progress(pending.kind.progress(pending.text));
-    }
-
-    fn rate_window_open(&self, now: Instant) -> bool {
-        self.last_emission
-            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_RATE_LIMIT)
-    }
-}
-
-fn utf8_prefix_end(text: &str, limit: usize) -> usize {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
 fn execute_python_item_id(item: &Value) -> Option<&str> {
     if item.get("type").and_then(Value::as_str) != Some("function_call")
         || item.get("name").and_then(Value::as_str) != Some("execute_python")
@@ -1766,200 +1651,6 @@ fn execute_python_item_id(item: &Value) -> Option<&str> {
     item.get("id")
         .and_then(Value::as_str)
         .filter(|item_id| !item_id.is_empty())
-}
-
-#[derive(Default)]
-struct PythonPreviewDecoder {
-    state: PythonJsonState,
-}
-
-#[derive(Default)]
-enum PythonJsonState {
-    #[default]
-    LeadingWhitespace,
-    BeforeKey,
-    Key(usize),
-    AfterKey,
-    BeforeCode,
-    Code,
-    Escape,
-    Unicode {
-        value: u16,
-        digits: u8,
-    },
-    HighSurrogateBackslash {
-        high: u16,
-    },
-    HighSurrogateU {
-        high: u16,
-    },
-    LowSurrogate {
-        high: u16,
-        value: u16,
-        digits: u8,
-    },
-    AfterCode,
-    TrailingWhitespace,
-    Invalid,
-}
-
-impl PythonPreviewDecoder {
-    fn push(&mut self, fragment: &str) -> String {
-        let mut decoded = String::new();
-        for character in fragment.chars() {
-            let state = std::mem::replace(&mut self.state, PythonJsonState::Invalid);
-            self.state = match state {
-                PythonJsonState::LeadingWhitespace if json_whitespace(character) => {
-                    PythonJsonState::LeadingWhitespace
-                }
-                PythonJsonState::LeadingWhitespace if character == '{' => {
-                    PythonJsonState::BeforeKey
-                }
-                PythonJsonState::BeforeKey if json_whitespace(character) => {
-                    PythonJsonState::BeforeKey
-                }
-                PythonJsonState::BeforeKey if character == '"' => PythonJsonState::Key(0),
-                PythonJsonState::Key(index) => {
-                    let expected = ['c', 'o', 'd', 'e', '"'];
-                    if expected.get(index) == Some(&character) {
-                        if index + 1 == expected.len() {
-                            PythonJsonState::AfterKey
-                        } else {
-                            PythonJsonState::Key(index + 1)
-                        }
-                    } else {
-                        PythonJsonState::Invalid
-                    }
-                }
-                PythonJsonState::AfterKey if json_whitespace(character) => {
-                    PythonJsonState::AfterKey
-                }
-                PythonJsonState::AfterKey if character == ':' => PythonJsonState::BeforeCode,
-                PythonJsonState::BeforeCode if json_whitespace(character) => {
-                    PythonJsonState::BeforeCode
-                }
-                PythonJsonState::BeforeCode if character == '"' => PythonJsonState::Code,
-                PythonJsonState::Code if character == '"' => PythonJsonState::AfterCode,
-                PythonJsonState::Code if character == '\\' => PythonJsonState::Escape,
-                PythonJsonState::Code if character <= '\u{1f}' => PythonJsonState::Invalid,
-                PythonJsonState::Code => {
-                    decoded.push(character);
-                    PythonJsonState::Code
-                }
-                PythonJsonState::Escape => match character {
-                    '"' | '\\' | '/' => {
-                        decoded.push(character);
-                        PythonJsonState::Code
-                    }
-                    'b' => {
-                        decoded.push('\u{0008}');
-                        PythonJsonState::Code
-                    }
-                    'f' => {
-                        decoded.push('\u{000c}');
-                        PythonJsonState::Code
-                    }
-                    'n' => {
-                        decoded.push('\n');
-                        PythonJsonState::Code
-                    }
-                    'r' => {
-                        decoded.push('\r');
-                        PythonJsonState::Code
-                    }
-                    't' => {
-                        decoded.push('\t');
-                        PythonJsonState::Code
-                    }
-                    'u' => PythonJsonState::Unicode {
-                        value: 0,
-                        digits: 0,
-                    },
-                    _ => PythonJsonState::Invalid,
-                },
-                PythonJsonState::Unicode { value, digits } => match hexadecimal(character) {
-                    Some(digit) if digits < 3 => PythonJsonState::Unicode {
-                        value: value * 16 + digit,
-                        digits: digits + 1,
-                    },
-                    Some(digit) => {
-                        let value = value * 16 + digit;
-                        if (0xd800..=0xdbff).contains(&value) {
-                            PythonJsonState::HighSurrogateBackslash { high: value }
-                        } else if (0xdc00..=0xdfff).contains(&value) {
-                            PythonJsonState::Invalid
-                        } else if let Some(character) = char::from_u32(u32::from(value)) {
-                            decoded.push(character);
-                            PythonJsonState::Code
-                        } else {
-                            PythonJsonState::Invalid
-                        }
-                    }
-                    None => PythonJsonState::Invalid,
-                },
-                PythonJsonState::HighSurrogateBackslash { high } if character == '\\' => {
-                    PythonJsonState::HighSurrogateU { high }
-                }
-                PythonJsonState::HighSurrogateU { high } if character == 'u' => {
-                    PythonJsonState::LowSurrogate {
-                        high,
-                        value: 0,
-                        digits: 0,
-                    }
-                }
-                PythonJsonState::LowSurrogate {
-                    high,
-                    value,
-                    digits,
-                } => match hexadecimal(character) {
-                    Some(digit) if digits < 3 => PythonJsonState::LowSurrogate {
-                        high,
-                        value: value * 16 + digit,
-                        digits: digits + 1,
-                    },
-                    Some(digit) => {
-                        let low = value * 16 + digit;
-                        if (0xdc00..=0xdfff).contains(&low) {
-                            let scalar = 0x10000
-                                + ((u32::from(high) - 0xd800) << 10)
-                                + (u32::from(low) - 0xdc00);
-                            if let Some(character) = char::from_u32(scalar) {
-                                decoded.push(character);
-                                PythonJsonState::Code
-                            } else {
-                                PythonJsonState::Invalid
-                            }
-                        } else {
-                            PythonJsonState::Invalid
-                        }
-                    }
-                    None => PythonJsonState::Invalid,
-                },
-                PythonJsonState::AfterCode if json_whitespace(character) => {
-                    PythonJsonState::AfterCode
-                }
-                PythonJsonState::AfterCode if character == '}' => {
-                    PythonJsonState::TrailingWhitespace
-                }
-                PythonJsonState::TrailingWhitespace if json_whitespace(character) => {
-                    PythonJsonState::TrailingWhitespace
-                }
-                PythonJsonState::Invalid => PythonJsonState::Invalid,
-                _ => PythonJsonState::Invalid,
-            };
-        }
-        decoded
-    }
-}
-
-fn json_whitespace(character: char) -> bool {
-    matches!(character, ' ' | '\n' | '\r' | '\t')
-}
-
-fn hexadecimal(character: char) -> Option<u16> {
-    character
-        .to_digit(16)
-        .and_then(|value| u16::try_from(value).ok())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3481,15 +3172,11 @@ mod tests {
 
     mod streaming {
         use std::sync::{Arc, Mutex};
-        use std::time::Instant;
 
         use tokio::time::timeout;
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{
-            OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT, PresentationBatcher,
-            PresentationKind,
-        };
+        use super::super::OpenAiModel;
         use super::*;
         use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
@@ -3754,86 +3441,6 @@ mod tests {
                     expected_progress
                 );
             }
-        }
-
-        #[test]
-        fn presentation_batcher_emits_pending_content_at_the_next_due_producer_event() {
-            let start = Instant::now();
-            let mut batcher = PresentationBatcher::default();
-            let mut progress = Vec::new();
-            {
-                let mut sink = |event| progress.push(event);
-                batcher.push(
-                    PresentationKind::AssistantText,
-                    "first".to_owned(),
-                    start,
-                    &mut sink,
-                );
-                batcher.push(
-                    PresentationKind::AssistantText,
-                    "later".to_owned(),
-                    start + PROGRESS_RATE_LIMIT / 2,
-                    &mut sink,
-                );
-                batcher.flush_due(
-                    start + PROGRESS_RATE_LIMIT - Duration::from_nanos(1),
-                    &mut sink,
-                );
-            }
-            assert_eq!(
-                progress,
-                vec![ModelProgress::AssistantTextChunk {
-                    text: "first".to_owned(),
-                }]
-            );
-
-            {
-                let mut sink = |event| progress.push(event);
-                batcher.flush_due(start + PROGRESS_RATE_LIMIT, &mut sink);
-            }
-            assert_eq!(
-                progress,
-                vec![
-                    ModelProgress::AssistantTextChunk {
-                        text: "first".to_owned(),
-                    },
-                    ModelProgress::AssistantTextChunk {
-                        text: "later".to_owned(),
-                    },
-                ]
-            );
-        }
-
-        #[test]
-        fn presentation_batcher_emits_four_kib_before_an_explicit_flush() {
-            let start = Instant::now();
-            let full_chunk = "x".repeat(PROGRESS_PAYLOAD_LIMIT);
-            let mut batcher = PresentationBatcher::default();
-            let mut progress = Vec::new();
-            let mut sink = |event| progress.push(event);
-
-            batcher.push(
-                PresentationKind::AssistantText,
-                "first".to_owned(),
-                start,
-                &mut sink,
-            );
-            batcher.push(
-                PresentationKind::AssistantText,
-                full_chunk.clone(),
-                start + PROGRESS_RATE_LIMIT / 2,
-                &mut sink,
-            );
-
-            assert_eq!(
-                progress,
-                vec![
-                    ModelProgress::AssistantTextChunk {
-                        text: "first".to_owned(),
-                    },
-                    ModelProgress::AssistantTextChunk { text: full_chunk },
-                ]
-            );
         }
 
         #[tokio::test]
