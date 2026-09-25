@@ -30,7 +30,6 @@ use crate::{
         canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
-    subagents::ChildModelFactory,
 };
 
 const OPENAI_PROVIDER: &str = "openai";
@@ -47,6 +46,7 @@ fn openai_config(api_key: impl Into<String>, api_base: impl Into<String>) -> Ope
         .with_project_id("")
 }
 
+#[derive(Clone)]
 pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
@@ -55,30 +55,16 @@ pub(crate) struct OpenAiModel {
     summary_retry_wait_started: Option<Arc<Notify>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct OpenAiChildModelFactory {
-    api_key: String,
-}
-
-impl OpenAiChildModelFactory {
-    pub(crate) fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-        }
-    }
-}
-
-impl ChildModelFactory for OpenAiChildModelFactory {
-    type Model = OpenAiModel;
-
-    fn create(&self, prompt: String) -> Self::Model {
-        OpenAiModel::new(prompt, self.api_key.clone())
-    }
-}
-
 impl OpenAiModel {
     pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
+    }
+
+    pub(crate) fn with_prompt(&self, prompt: String) -> Self {
+        Self {
+            prompt,
+            ..self.clone()
+        }
     }
 
     fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
@@ -96,7 +82,7 @@ impl OpenAiModel {
     }
 
     #[cfg(test)]
-    fn with_endpoint(
+    pub(crate) fn with_endpoint(
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         endpoint: &str,
@@ -6195,20 +6181,18 @@ mod tests {
     async fn start_live_controller() -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
         let persisted_settings = configuration.snapshot().settings().clone();
-        let (worker_path, workspace_root, prompt, prompt_base, api_key, selection, policy) = {
+        let (worker_path, workspace_root, model, prompt_base, selection, policy) = {
             let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
-                ready.system_prompt().to_owned(),
+                crate::production_model(&ready),
                 ready.prompt_base().to_owned(),
-                ready.api_key().expose().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),
                 configuration.snapshot().subagents(),
             )
         };
-        let model = super::OpenAiModel::new(prompt, api_key.clone());
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
@@ -6219,7 +6203,7 @@ mod tests {
             crate::subagents::SubagentPolicy::from(policy),
             Arc::new(crate::subagents::CompleteChildRunner::new(
                 prompt_base,
-                super::OpenAiChildModelFactory::new(api_key.clone()),
+                model.clone(),
             )),
         );
         let runtime = crate::runtime::RuntimeController::new(

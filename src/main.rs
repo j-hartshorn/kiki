@@ -1,5 +1,4 @@
 pub mod agent;
-#[cfg(test)]
 mod anthropic;
 pub mod arena;
 mod clipboard;
@@ -12,6 +11,7 @@ mod presentation;
 pub mod pricing;
 pub mod prompt;
 mod prompt_editor;
+mod provider;
 pub mod runtime;
 mod selection;
 mod session;
@@ -36,8 +36,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::Agent;
 use crate::arena::Arena;
-use crate::config::ModelSelection;
-use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
+use crate::config::{ApiKey, ModelSelection, models::Provider};
+use crate::provider::ProviderModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
 };
@@ -48,8 +48,12 @@ use crate::subagents::{
 use crate::telemetry::TraceOwner;
 use crate::tools::ToolHost;
 
-fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
-    OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
+fn production_model(ready: &config::ReadyStartup<'_>) -> ProviderModel {
+    ProviderModel::new(
+        ready.system_prompt(),
+        ready.api_key(Provider::OpenAi).map(ApiKey::expose),
+        ready.api_key(Provider::Anthropic).map(ApiKey::expose),
+    )
 }
 
 enum Invocation {
@@ -244,7 +248,6 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         .expect("ready startup selection must be valid");
     let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
-    let api_key = ready.api_key().expose().to_owned();
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let tool_host = match runtime.block_on(ToolHost::new(&workspace_root)) {
@@ -264,10 +267,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let session = Session::create(&home, &workspace_root, selection, arena.checkpoint())?;
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
-        Arc::new(CompleteChildRunner::new(
-            prompt_base,
-            OpenAiChildModelFactory::new(api_key),
-        )),
+        Arc::new(CompleteChildRunner::new(prompt_base, model.clone())),
     )
     .with_trace(trace.clone());
     let controller = RuntimeController::with_session(
@@ -342,7 +342,6 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         .expect("ready startup selection must be valid");
     let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
-    let api_key = ready.api_key().expose().to_owned();
     let runtime = match Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -366,10 +365,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
-        Arc::new(CompleteChildRunner::new(
-            prompt_base,
-            OpenAiChildModelFactory::new(api_key),
-        )),
+        Arc::new(CompleteChildRunner::new(prompt_base, model.clone())),
     )
     .with_trace(trace.clone());
     let relocated_cwd = here.then_some(workspace_root);
@@ -438,10 +434,10 @@ mod tests {
     use super::production_model;
 
     use crate::config::ReadyStartup;
-    use crate::openai::OpenAiModel;
+    use crate::provider::ProviderModel;
 
     #[test]
-    fn production_model_composition_is_openai() {
-        let _: for<'a> fn(&ReadyStartup<'a>) -> OpenAiModel = production_model;
+    fn production_model_composition_is_the_provider_router() {
+        let _: for<'a> fn(&ReadyStartup<'a>) -> ProviderModel = production_model;
     }
 }

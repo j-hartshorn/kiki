@@ -25,6 +25,7 @@ const ERROR_BODY_LIMIT: usize = 64 * 1024;
 // Room for 16 MiB of content escaped as `\u00XX` (6 bytes per byte) in one frame.
 const SSE_FRAME_LIMIT: usize = 128 * 1024 * 1024;
 
+#[derive(Clone)]
 pub(crate) struct AnthropicModel {
     prompt: String,
     api_key: String,
@@ -38,7 +39,14 @@ impl AnthropicModel {
         Self::with_endpoint(prompt, api_key, ANTHROPIC_API_BASE)
     }
 
-    fn with_endpoint(
+    pub(crate) fn with_prompt(&self, prompt: String) -> Self {
+        Self {
+            prompt,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn with_endpoint(
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         api_base: &str,

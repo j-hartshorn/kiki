@@ -6764,10 +6764,11 @@ mod tests {
     fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
-        let history = rendered(&mut app, 120, 15);
+        let history = rendered(&mut app, 120, 16);
         assert!(history.contains("Startup configuration"));
         assert!(history.contains("Submission: available"));
         assert!(history.contains("OpenAI API key: present"));
+        assert!(history.contains("Anthropic API key: missing"));
         assert!(!history.contains("test-api-key"));
 
         assert!(app.handle_key(key(KeyCode::Char('x'))).visible_changed);

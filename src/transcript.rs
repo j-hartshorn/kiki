@@ -18,7 +18,7 @@ use crate::arena::{
 };
 use crate::config::{
     ApiKeyPresence, DEFAULT_MODEL, ModelSelection, PromptProvenance, StartupSnapshot,
-    SubmissionAvailability, model_by_id,
+    SubmissionAvailability, model_by_id, models::Provider,
 };
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
@@ -59,6 +59,8 @@ fn markdown<'a>(
 }
 
 const STORE_FALSE_PRIVACY_BOUNDARY: &str = "store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.";
+const ANTHROPIC_PRIVACY_BOUNDARY: &str =
+    "User requests or workspace content printed by Python may be sent to Anthropic.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 enum RunState {
@@ -146,6 +148,9 @@ impl LivePhase {
 fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
     match reason {
         RuntimeDisabledReason::OpenAiAuthentication => "OpenAI authentication failed; restart Kiki",
+        RuntimeDisabledReason::AnthropicAuthentication => {
+            "Anthropic authentication failed; restart Kiki"
+        }
         RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
             "Arena recovery failed; restart Kiki"
         }
@@ -3583,9 +3588,12 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         PromptProvenance::Bundled { name } => format!("bundled {name}"),
         PromptProvenance::Override { path } => format!("override {}", path.as_str()),
     };
-    let api_key_presence = match snapshot.api_key_presence() {
-        ApiKeyPresence::Missing => "missing",
-        ApiKeyPresence::Present => "present",
+    let api_key_line = |provider: Provider| {
+        let presence = match snapshot.api_key_presence(provider) {
+            ApiKeyPresence::Missing => "missing",
+            ApiKeyPresence::Present => "present",
+        };
+        format!("{} API key: {presence}", provider.display_name())
     };
     let submission = match snapshot.submission_availability() {
         SubmissionAvailability::Available => "available",
@@ -3603,7 +3611,8 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         ),
         format!("Thinking: {}", snapshot.thinking()),
         format!("Prompt: {prompt_source}"),
-        format!("OpenAI API key: {api_key_presence}"),
+        api_key_line(Provider::OpenAi),
+        api_key_line(Provider::Anthropic),
         format!("Submission: {submission}"),
     ];
     if snapshot.problems().is_empty() {
@@ -3614,7 +3623,16 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             lines.push(format!("Remediation: {}", problem.remediation()));
         }
     }
-    lines.push(STORE_FALSE_PRIVACY_BOUNDARY.to_owned());
+    for (provider, notice) in [
+        (Provider::OpenAi, STORE_FALSE_PRIVACY_BOUNDARY),
+        (Provider::Anthropic, ANTHROPIC_PRIVACY_BOUNDARY),
+    ] {
+        if snapshot.model().provider() == provider
+            || snapshot.api_key_presence(provider) == ApiKeyPresence::Present
+        {
+            lines.push(notice.to_owned());
+        }
+    }
     TranscriptBlock::Startup { lines }
 }
 
@@ -7102,6 +7120,7 @@ Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
 Thinking: medium
 Prompt: bundled system
 OpenAI API key: present
+Anthropic API key: missing
 Submission: available
 Problems: none
 store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."
@@ -8706,6 +8725,24 @@ truncated"
             "OpenAI authentication failed; restart Kiki"
         );
         assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
+    }
+
+    #[test]
+    fn anthropic_authentication_failure_shows_the_anthropic_status() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::AnthropicAuthentication,
+            },
+            false,
+        ));
+
+        assert!(transcript.is_disabled());
+        assert_eq!(
+            transcript.status(),
+            "Anthropic authentication failed; restart Kiki"
+        );
     }
 
     #[test]
