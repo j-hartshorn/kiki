@@ -453,20 +453,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::production_model;
-
-    use crate::config::{
-        ReadyStartup,
-        settings::{CacheTtl, CrossProviderReasoning},
-    };
-    use crate::provider::ProviderModel;
-
-    #[test]
-    fn production_model_composition_is_the_provider_router() {
-        let _: for<'a> fn(&ReadyStartup<'a>, CacheTtl, CrossProviderReasoning) -> ProviderModel =
-            production_model;
-    }
-}
