@@ -1,4 +1,5 @@
 pub mod agent;
+mod anthropic;
 pub mod arena;
 mod clipboard;
 mod compaction;
@@ -6,12 +7,16 @@ pub mod config;
 mod highlight;
 pub mod model;
 mod openai;
+mod presentation;
 pub mod pricing;
 pub mod prompt;
 mod prompt_editor;
+mod provider;
 pub mod runtime;
 mod selection;
 mod session;
+#[cfg(test)]
+mod sse_fixture;
 mod subagents;
 mod telemetry;
 pub mod tools;
@@ -32,8 +37,12 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::Agent;
 use crate::arena::Arena;
-use crate::config::ModelSelection;
-use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
+use crate::config::{
+    ApiKey, ModelSelection,
+    models::Provider,
+    settings::{CacheTtl, CrossProviderReasoning},
+};
+use crate::provider::ProviderModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ResumeOptions, RuntimeCommand, RuntimeController,
     RuntimeEvent,
@@ -45,8 +54,18 @@ use crate::subagents::{
 use crate::telemetry::TraceOwner;
 use crate::tools::ToolHost;
 
-fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
-    OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
+fn production_model(
+    ready: &config::ReadyStartup<'_>,
+    anthropic_cache_ttl: CacheTtl,
+    cross_provider_reasoning: CrossProviderReasoning,
+) -> ProviderModel {
+    ProviderModel::new(
+        ready.system_prompt(),
+        ready.api_key(Provider::OpenAi).map(ApiKey::expose),
+        ready.api_key(Provider::Anthropic).map(ApiKey::expose),
+        anthropic_cache_ttl,
+        cross_provider_reasoning,
+    )
 }
 
 enum Invocation {
@@ -253,9 +272,13 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let model = production_model(&ready);
+    let model = production_model(
+        &ready,
+        startup.settings().anthropic_cache_ttl(),
+        startup.settings().cross_provider_reasoning(),
+    );
+    let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
-    let api_key = ready.api_key().expose().to_owned();
 
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let tool_host = match runtime.block_on(ToolHost::new(&workspace_root)) {
@@ -284,10 +307,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     }
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
-        Arc::new(CompleteChildRunner::new(
-            prompt_base,
-            OpenAiChildModelFactory::new(api_key),
-        )),
+        Arc::new(CompleteChildRunner::new(prompt_base, model.clone())),
     )
     .with_trace(trace.clone());
     let controller = RuntimeController::with_session(
@@ -297,6 +317,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         subagents,
         session.writer(),
     )
+    .with_providers(providers.clone())
     .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
@@ -305,6 +326,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run(
         startup,
+        providers,
         command_sender.clone(),
         event_receiver,
         progress_receiver,
@@ -362,9 +384,13 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let model = production_model(&ready);
+    let model = production_model(
+        &ready,
+        startup.settings().anthropic_cache_ttl(),
+        startup.settings().cross_provider_reasoning(),
+    );
+    let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
-    let api_key = ready.api_key().expose().to_owned();
     let runtime = match Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -388,10 +414,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
-        Arc::new(CompleteChildRunner::new(
-            prompt_base,
-            OpenAiChildModelFactory::new(api_key),
-        )),
+        Arc::new(CompleteChildRunner::new(prompt_base, model.clone())),
     )
     .with_trace(trace.clone());
     let relocated_cwd = here.then_some(workspace_root);
@@ -418,7 +441,9 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             "Warning: session relocated; retained paths, data, and external effects were not rewritten."
         );
     }
-    let controller = controller.with_trace(trace.clone());
+    let controller = controller
+        .with_providers(providers.clone())
+        .with_trace(trace.clone());
     let (command_sender, command_receiver) = mpsc::channel(8);
     let (event_sender, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
     let (progress_sender, progress_receiver) =
@@ -427,6 +452,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let tui_result = tui::run_restored(
         startup,
         initial,
+        providers,
         command_sender.clone(),
         event_receiver,
         progress_receiver,
@@ -462,10 +488,7 @@ fn main() {
 mod tests {
     use std::ffi::OsStr;
 
-    use super::{production_model, requested_type_check_disabled};
-
-    use crate::config::ReadyStartup;
-    use crate::openai::OpenAiModel;
+    use super::requested_type_check_disabled;
 
     #[test]
     fn type_check_opt_out_accepts_only_on_and_off() {
@@ -474,10 +497,5 @@ mod tests {
         assert!(requested_type_check_disabled(Some(OsStr::new("off"))).unwrap());
         assert!(requested_type_check_disabled(Some(OsStr::new("false"))).is_err());
         assert!(requested_type_check_disabled(Some(OsStr::new(""))).is_err());
-    }
-
-    #[test]
-    fn production_model_composition_is_openai() {
-        let _: for<'a> fn(&ReadyStartup<'a>) -> OpenAiModel = production_model;
     }
 }

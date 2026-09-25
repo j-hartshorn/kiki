@@ -80,13 +80,13 @@ Every card reads `Model selected: openai/gpt-6-sol · high`. The pending card is
 - `anthropic/claude-opus-5-5`, defaulting to `medium`
 - `anthropic/claude-fable-5-1`, defaulting to `high`
 
-The model picker lists configured favourites under a `Favourites` heading, in their written order. It then lists every catalogue model, favourites included, under `OpenAI` and `Anthropic` headings in catalogue order. A favourite therefore appears twice, and picking either entry selects the same model. With no favourites set, only the provider groups appear. Remediation lists are generated from the catalogue.
+The model picker lists configured favourites under a `Favourites` heading, in their written order. It then lists every catalogue model, favourites included, under `OpenAI` and `Anthropic` headings in catalogue order. A favourite therefore appears twice, and picking either entry selects the same model. With no favourites set, only the provider groups appear. Models whose provider has no key are left out everywhere in the picker, including under `Favourites`, and a provider group with no usable models doesn't appear. Remediation lists are generated from the catalogue.
 
 **Credentials.** `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are each optional. Startup requires only the key for the effective selected model's provider. If that key is missing, Kiki reports a startup problem as it does today, including on resume when the session's saved model needs the missing key. The remediation names the missing variable and mentions `KIKI_MODEL` as a way to override the saved selection. The startup card shows whether each provider's key is present.
 
-Which providers have keys is known to foreground selection and to subagent selection, and it comes from the router, which is the single source of truth. The following are rejected with remediation that names the missing variable, and the current selection stays in place:
+Which providers have keys comes from the router, which is the single source of truth. `main.rs` hands that provider set to the TUI and to subagent selection, so both check it before a selection is used. The following are rejected with remediation that names the missing variable, and the current selection stays in place:
 
-- a picker or `/model` selection whose provider has no key
+- a `/model <id>` selection whose provider has no key, reported in the notice line
 - a subagent model, whether an explicit override or the favourite default, whose provider has no key; the rejection is returned to the calling Python as a tool error
 
 **Router.** A `ProviderModel` holds an optional OpenAI adapter and an optional Anthropic adapter. It dispatches `step`, `summarise` and `validate_history` on the selection's provider. A provider's adapter exists only when its key is present. Both new settings are resolved once at startup and passed straight to the adapter constructors. The child model factory hands child agents a clone of the parent's router.
@@ -108,7 +108,7 @@ Which providers have keys is known to foreground selection and to subagent selec
 - Responses map to actions:
   - a `tool_use` block becomes `Code`, with any text blocks as its commentary
   - `end_turn` with text becomes `Message`
-  - `max_tokens`, `refusal` or an empty message become typed errors
+  - `max_tokens`, `refusal` or an empty message fail the step, as OpenAI's refusal and incomplete responses do (`src/openai.rs:569-612`)
 - Replay stores the assistant content blocks verbatim, tagged `anthropic`.
 - Adjacent user-role content, such as a compaction summary followed by a user request, or a tool result followed by the next user request, is merged into one user message, so roles alternate.
 - Summarisation uses the same transport and has no tools and no cache breakpoints. `SummaryRequest.instructions` becomes the system block, `input` becomes a single user message, `max_tokens` is `output_limit`, and thinking is adaptive and summarised, with effort from the summary's selection. Text deltas form the summary. `max_tokens`, `refusal` or empty text is an error, matching the compaction spec's failure rules (`docs/2026-09-20_compaction/spec.md`).
@@ -172,6 +172,7 @@ Anthropic has no long-context band, so each Anthropic model's long-context thres
 - *Model change cards derived from each run's saved selection*: rejected a new session entry kind for model changes. Pi does this, and it has to reconcile tree entries with a session-wide live model: `/tree` navigation doesn't restore the model, but resume does (`docs/research/2026-09-23_pi-model-change-entries.md`). Also rejected deriving the cards from step data, because final-message steps lack the thinking level and runs with no attempts have no model at all. Whether the selection should become branch state is left for later.
 - *Settings in TOML only*: a settings menu comes later.
 - *Picker: `Favourites` group, then the full catalogue under provider groups*: keeps the user's cross-provider favourite order and gives clean headings. Rejected provider-only groups (loses the favourite order) and a flat list (loses the provider context).
+- *Keyless models hidden from the picker; typed `/model <id>` gets a notice*: the check lives in the TUI and subagent selection, using the router's provider set. Rejected showing keyless models marked unavailable (needs a disabled-item state) and a runtime `SettingsRejected` event with a revert path.
 
 ## Risks / unknowns
 

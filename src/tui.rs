@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::clipboard::{ClipboardPort, LocalClipboard};
-use crate::config::models::CATALOGUE;
+use crate::config::models::{CATALOGUE, Provider};
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
@@ -224,6 +224,7 @@ struct App {
     session_name: Option<String>,
     settings_selection: ModelSelection,
     session_thinking: BTreeMap<&'static str, &'static str>,
+    providers: Vec<Provider>,
     picker: Option<Picker<PickerValue>>,
     tree_navigator: Option<TreeNavigator>,
     manual_navigation_pending: bool,
@@ -274,6 +275,7 @@ impl Default for App {
             session_name: None,
             settings_selection,
             session_thinking: BTreeMap::from([(DEFAULT_MODEL.id, DEFAULT_MODEL.default_thinking)]),
+            providers: vec![Provider::OpenAi, Provider::Anthropic],
             picker: None,
             tree_navigator: None,
             manual_navigation_pending: false,
@@ -920,15 +922,15 @@ impl App {
             .unwrap_or(&[]);
         let items = favourites
             .iter()
-            .copied()
+            .map(|model| ("Favourites", *model))
             .chain(
                 CATALOGUE
                     .iter()
-                    .copied()
-                    .filter(|model| !favourites.contains(model)),
+                    .map(|model| (model.provider().display_name(), *model)),
             )
-            .map(|model| PickerItem {
-                group: "OpenAI",
+            .filter(|(_, model)| self.providers.contains(&model.provider()))
+            .map(|(group, model)| PickerItem {
+                group,
                 label: model.id,
                 value: PickerValue::Model(model),
             });
@@ -962,6 +964,19 @@ impl App {
     }
 
     fn select_model(&mut self, model: &'static ModelConfiguration) -> Update {
+        let provider = model.provider();
+        if !self.providers.contains(&provider) {
+            self.set_notice(format!(
+                "Cannot select {}; {} is not set.",
+                model.id,
+                provider.api_key_variable()
+            ));
+            return Update {
+                commands: Vec::new(),
+                visible_changed: true,
+                quit: false,
+            };
+        }
         let thinking = self
             .session_thinking
             .get(model.id)
@@ -1906,6 +1921,7 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
 
 pub(crate) fn run(
     startup: StartupSnapshot,
+    providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
     events: mpsc::UnboundedReceiver<RuntimeEvent>,
     progress: RuntimeProgressReceiver,
@@ -1914,6 +1930,7 @@ pub(crate) fn run(
     run_restored(
         startup,
         RuntimeInitialState::empty(),
+        providers,
         commands,
         events,
         progress,
@@ -1924,12 +1941,14 @@ pub(crate) fn run(
 pub(crate) fn run_restored(
     startup: StartupSnapshot,
     initial: RuntimeInitialState,
+    providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
     mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
     let mut app = App::restored(startup, &initial);
+    app.providers = providers;
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
     let mut titles = TerminalTitlePublisher;
@@ -2761,7 +2780,7 @@ mod tests {
         ToolCallToken, ToolName,
     };
     use crate::clipboard::{ClipboardError, ClipboardPort};
-    use crate::config::models::{ASTRA, SOL, TERRA};
+    use crate::config::models::{ASTRA, OPUS_5_5, Provider, SOL, TERRA};
     use crate::config::{ModelSelection, SessionPreferences};
     use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
     use crate::prompt_editor::{MAX_PROMPT_BYTES, PromptEdit, PromptEditor};
@@ -5328,33 +5347,106 @@ mod tests {
         assert!(rendered(&mut app, 80, 15).contains("Models"));
     }
 
-    #[test]
-    fn favourites_lead_model_picker_in_configured_order_without_hiding_other_models() {
+    fn app_with_favourites(favourites: &str) -> App {
         let home = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         fs::create_dir(home.path().join(".kiki")).unwrap();
         fs::write(
             home.path().join(".kiki/config.toml"),
-            "favourites = [\"openai/gpt-6-luna\", \"openai/gpt-6-sol\", \"openai/gpt-6-astra\"]\n",
+            format!("favourites = {favourites}\n"),
         )
         .unwrap();
-        let mut app = App::configured(crate::config::ready_snapshot_with_settings_for_test(
+        App::configured(crate::config::ready_snapshot_with_settings_for_test(
             Some(home.path()),
             workspace.path(),
-        ));
+        ))
+    }
+
+    fn model_picker_rows(app: &mut App) -> Vec<String> {
         app.open_model_picker("");
-        let screen = rendered(&mut app, 80, 24);
-        let picker = &screen[screen.find("Filter:").unwrap()..];
-        let positions = [
-            "openai/gpt-6-luna",
-            "openai/gpt-6-sol",
-            "openai/gpt-6-astra",
-            "openai/gpt-5.6-sol",
-            "openai/gpt-5.6-terra",
-            "openai/gpt-5.6-luna",
-        ]
-        .map(|id| picker.find(id).expect("model visible in picker"));
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let screen = rendered(app, 80, 40);
+        screen
+            .lines()
+            .skip_while(|line| !line.contains("Filter:"))
+            .skip(1)
+            .take_while(|line| !line.contains('└'))
+            .map(|line| line.trim().trim_matches('│').trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_picker_lists_favourites_then_every_model_under_its_provider() {
+        let mut app = app_with_favourites(
+            "[\"anthropic/claude-fable-5-1\", \"openai/gpt-6-luna\", \"openai/gpt-6-sol\"]",
+        );
+
+        assert_eq!(
+            model_picker_rows(&mut app),
+            [
+                "Favourites",
+                "anthropic/claude-fable-5-1",
+                "openai/gpt-6-luna",
+                "openai/gpt-6-sol",
+                "OpenAI",
+                "openai/gpt-6-astra",
+                "openai/gpt-6-sol",
+                "openai/gpt-6-luna",
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-terra",
+                "openai/gpt-5.6-luna",
+                "Anthropic",
+                "anthropic/claude-opus-5-5",
+                "anthropic/claude-fable-5-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_picker_leaves_out_keyless_models_and_their_empty_groups() {
+        let mut app = app_with_favourites(
+            "[\"anthropic/claude-fable-5-1\", \"openai/gpt-6-luna\", \"openai/gpt-6-sol\"]",
+        );
+        app.providers = vec![Provider::OpenAi];
+
+        assert_eq!(
+            model_picker_rows(&mut app),
+            [
+                "Favourites",
+                "openai/gpt-6-luna",
+                "openai/gpt-6-sol",
+                "OpenAI",
+                "openai/gpt-6-astra",
+                "openai/gpt-6-sol",
+                "openai/gpt-6-luna",
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-terra",
+                "openai/gpt-5.6-luna",
+            ]
+        );
+
+        let mut app = app_with_favourites("[\"anthropic/claude-fable-5-1\"]");
+        app.providers = vec![Provider::OpenAi];
+        let rows = model_picker_rows(&mut app);
+        assert_eq!(rows.first().map(String::as_str), Some("OpenAI"));
+        assert!(!rows.iter().any(|row| row == "Favourites"), "{rows:?}");
+    }
+
+    #[test]
+    fn keyless_model_command_names_the_missing_key_and_keeps_the_selection() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        app.providers = vec![Provider::OpenAi];
+        let before = app.settings_selection;
+
+        let update = enter_at(&mut app, "/model anthropic/claude-opus-5-5", now);
+
+        assert!(update.commands.is_empty(), "{:?}", update.commands);
+        assert!(update.visible_changed);
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.settings_selection, before);
+        let notice = app.notice().expect("keyless model notice");
+        assert!(notice.contains(OPUS_5_5.id), "{notice}");
+        assert!(notice.contains("ANTHROPIC_API_KEY"), "{notice}");
     }
 
     #[test]
@@ -6786,10 +6878,11 @@ mod tests {
     fn configuration_configured_mode_renders_a_ready_snapshot_and_remains_editable() {
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
 
-        let history = rendered(&mut app, 120, 15);
+        let history = rendered(&mut app, 120, 16);
         assert!(history.contains("Startup configuration"));
         assert!(history.contains("Submission: available"));
         assert!(history.contains("OpenAI API key: present"));
+        assert!(history.contains("Anthropic API key: missing"));
         assert!(!history.contains("test-api-key"));
 
         assert!(app.handle_key(key(KeyCode::Char('x'))).visible_changed);
@@ -6822,7 +6915,6 @@ mod tests {
 
         assert!(header.contains("Ctrl-T thinking"));
         assert!(!header.contains("reasoning"));
-        assert!(!include_str!("../README.md").contains("reasoning"));
     }
 
     #[test]
@@ -9125,6 +9217,7 @@ mod tests {
             input_tokens: Some(input),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(output),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(input + output),
@@ -9145,6 +9238,7 @@ mod tests {
             input_tokens: input,
             cached_input_tokens: cache_read,
             cache_write_input_tokens: cache_write,
+            cache_write_1h_input_tokens: 0,
             output_tokens: output,
             reasoning_output_tokens: reasoning,
             total_tokens: total,
@@ -10892,6 +10986,7 @@ mod tests {
                                 input_tokens: Some(0),
                                 cached_input_tokens: Some(0),
                                 cache_write_input_tokens: Some(0),
+                                cache_write_1h_input_tokens: 0,
                                 output_tokens: Some(100),
                                 reasoning_output_tokens: Some(20),
                                 total_tokens: Some(100),

@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::prompt::{self, PromptError, PromptSource, ResolvedPrompt};
+use models::Provider;
 
 pub(crate) mod constants;
 pub mod models;
@@ -19,7 +20,6 @@ pub(crate) use settings::{CompactionSettings, SessionPreferences};
 const MONTY_BIN_ENV: &str = "MONTY_BIN";
 const KIKI_MODEL_ENV: &str = "KIKI_MODEL";
 const KIKI_THINKING_ENV: &str = "KIKI_THINKING";
-const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 1_024;
 const MAX_STARTUP_REMEDIATION_BYTES: usize = 512;
 const MAX_STARTUP_PATH_BYTES: usize = 1_024;
@@ -115,16 +115,16 @@ impl StartupProblem {
         kind: StartupProblemKind,
         diagnostic: impl Into<String>,
         remediation: impl Into<String>,
-        api_key: Option<&str>,
+        secrets: &[&str],
     ) -> Self {
         Self {
             kind,
             diagnostic: BoundedText::new(
-                redact(diagnostic.into(), api_key),
+                redact(diagnostic.into(), secrets),
                 MAX_STARTUP_DIAGNOSTIC_BYTES,
             ),
             remediation: BoundedText::new(
-                redact(remediation.into(), api_key),
+                redact(remediation.into(), secrets),
                 MAX_STARTUP_REMEDIATION_BYTES,
             ),
         }
@@ -163,9 +163,9 @@ impl RedactedPath {
         &self.0.0
     }
 
-    fn new(path: &Path, api_key: Option<&str>) -> Self {
+    fn new(path: &Path, secrets: &[&str]) -> Self {
         Self(BoundedText::new(
-            redact(path.to_string_lossy().into_owned(), api_key),
+            redact(path.to_string_lossy().into_owned(), secrets),
             MAX_STARTUP_PATH_BYTES,
         ))
     }
@@ -178,11 +178,11 @@ pub enum PromptProvenance {
 }
 
 impl PromptProvenance {
-    fn from_source(source: &PromptSource, api_key: Option<&str>) -> Self {
+    fn from_source(source: &PromptSource, secrets: &[&str]) -> Self {
         match source {
             PromptSource::Bundled { name } => Self::Bundled { name },
             PromptSource::Override { path } => Self::Override {
-                path: RedactedPath::new(path, api_key),
+                path: RedactedPath::new(path, secrets),
             },
         }
     }
@@ -197,7 +197,8 @@ pub struct StartupSnapshot {
     subagents: settings::SubagentSettings,
     settings: settings::SettingsContext,
     prompt_source: PromptProvenance,
-    api_key_presence: ApiKeyPresence,
+    openai_api_key_presence: ApiKeyPresence,
+    anthropic_api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
 }
 
@@ -230,8 +231,11 @@ impl StartupSnapshot {
         &self.prompt_source
     }
 
-    pub fn api_key_presence(&self) -> ApiKeyPresence {
-        self.api_key_presence
+    pub fn api_key_presence(&self, provider: Provider) -> ApiKeyPresence {
+        match provider {
+            Provider::OpenAi => self.openai_api_key_presence,
+            Provider::Anthropic => self.anthropic_api_key_presence,
+        }
     }
 
     pub fn problems(&self) -> &[StartupProblem] {
@@ -274,7 +278,7 @@ impl StartupConfiguration {
             workspace_root: self.construction.workspace_root.as_deref()?,
             system_prompt: self.construction.system_prompt.as_deref()?,
             prompt_base: self.construction.prompt_base.as_deref()?,
-            api_key: self.construction.api_key.as_ref()?,
+            api_keys: &self.construction.api_keys,
             model: self.construction.model,
             thinking: self.snapshot.thinking,
         })
@@ -302,9 +306,9 @@ impl StartupConfiguration {
         diagnostic: String,
         remediation: &'static str,
     ) -> Self {
-        let api_key = self.construction.api_key.as_ref().map(ApiKey::expose);
+        let secrets = self.construction.api_keys.secrets();
         self.snapshot
-            .insert_problem(StartupProblem::new(kind, diagnostic, remediation, api_key));
+            .insert_problem(StartupProblem::new(kind, diagnostic, remediation, &secrets));
         self
     }
 }
@@ -314,7 +318,7 @@ struct StartupConstruction {
     workspace_root: Option<PathBuf>,
     system_prompt: Option<String>,
     prompt_base: Option<String>,
-    api_key: Option<ApiKey>,
+    api_keys: ApiKeys,
     model: &'static ModelConfiguration,
 }
 
@@ -323,7 +327,7 @@ pub(crate) struct ReadyStartup<'a> {
     workspace_root: &'a Path,
     system_prompt: &'a str,
     prompt_base: &'a str,
-    api_key: &'a ApiKey,
+    api_keys: &'a ApiKeys,
     model: &'static ModelConfiguration,
     thinking: &'static str,
 }
@@ -345,8 +349,8 @@ impl<'a> ReadyStartup<'a> {
         self.prompt_base
     }
 
-    pub(crate) fn api_key(&self) -> &'a ApiKey {
-        self.api_key
+    pub(crate) fn api_key(&self, provider: Provider) -> Option<&'a ApiKey> {
+        self.api_keys.get(provider)
     }
 
     pub(crate) fn model(&self) -> &'static ModelConfiguration {
@@ -366,6 +370,35 @@ impl ApiKey {
     }
 }
 
+struct ApiKeys {
+    openai: Option<ApiKey>,
+    anthropic: Option<ApiKey>,
+}
+
+impl ApiKeys {
+    fn get(&self, provider: Provider) -> Option<&ApiKey> {
+        match provider {
+            Provider::OpenAi => self.openai.as_ref(),
+            Provider::Anthropic => self.anthropic.as_ref(),
+        }
+    }
+
+    fn presence(&self, provider: Provider) -> ApiKeyPresence {
+        match self.get(provider) {
+            Some(_) => ApiKeyPresence::Present,
+            None => ApiKeyPresence::Missing,
+        }
+    }
+
+    fn secrets(&self) -> Vec<&str> {
+        [&self.openai, &self.anthropic]
+            .into_iter()
+            .flatten()
+            .map(ApiKey::expose)
+            .collect()
+    }
+}
+
 struct StartupInput {
     worker_path: Option<OsString>,
     model: Option<OsString>,
@@ -373,7 +406,8 @@ struct StartupInput {
     home: Option<OsString>,
     workspace_root: io::Result<PathBuf>,
     prompt: PromptResolution,
-    api_key: Option<OsString>,
+    openai_api_key: Option<OsString>,
+    anthropic_api_key: Option<OsString>,
 }
 
 enum PromptResolution {
@@ -431,7 +465,8 @@ pub(crate) fn load_with_session_preferences(
         home: env::var_os("HOME"),
         workspace_root: env::current_dir(),
         prompt: PromptResolution::from(prompt::resolve()),
-        api_key: env::var_os(OPENAI_API_KEY_ENV),
+        openai_api_key: env::var_os(Provider::OpenAi.api_key_variable()),
+        anthropic_api_key: env::var_os(Provider::Anthropic.api_key_variable()),
     };
     resolve_startup_with_session_preferences(input, session_preferences)
 }
@@ -452,10 +487,12 @@ fn resolve_startup_with_session_preferences(
         home,
         workspace_root,
         prompt,
-        api_key: api_key_input,
+        openai_api_key,
+        anthropic_api_key,
     } = input;
-    let (api_key, api_key_presence, api_key_problem) = resolve_api_key(api_key_input);
-    let exposed_api_key = api_key.as_ref().map(ApiKey::expose);
+    let resuming = session_preferences.is_some();
+    let openai_api_key = resolve_api_key(openai_api_key);
+    let anthropic_api_key = resolve_api_key(anthropic_api_key);
     let settings = settings::resolve(settings::Input {
         home,
         workspace_root: workspace_root.as_ref().ok().cloned(),
@@ -464,26 +501,38 @@ fn resolve_startup_with_session_preferences(
         thinking,
     });
     let model = settings.model();
+    let selected_api_key = match model.provider() {
+        Provider::OpenAi => &openai_api_key,
+        Provider::Anthropic => &anthropic_api_key,
+    };
+    let api_key_problem = selected_api_key
+        .as_ref()
+        .err()
+        .map(|&kind| api_key_problem(kind, model.provider(), resuming));
+    let api_keys = ApiKeys {
+        openai: openai_api_key.ok(),
+        anthropic: anthropic_api_key.ok(),
+    };
+    let secrets = api_keys.secrets();
     let thinking = settings.thinking();
     let subagents = settings.subagents();
     let settings_context = settings.context().clone();
     let settings_problems = settings
         .problems()
         .iter()
-        .map(|problem| startup_settings_problem(problem, exposed_api_key));
-    let (worker_path, worker_problem) = resolve_worker_path(worker_path, exposed_api_key);
-    let (workspace_root, workspace_problem) =
-        resolve_workspace_root(workspace_root, exposed_api_key);
+        .map(|problem| startup_settings_problem(problem, &secrets));
+    let (worker_path, worker_problem) = resolve_worker_path(worker_path, &secrets);
+    let (workspace_root, workspace_problem) = resolve_workspace_root(workspace_root, &secrets);
     let (prompt_source, system_prompt, prompt_base, prompt_problem) =
-        resolve_prompt(prompt, exposed_api_key);
+        resolve_prompt(prompt, &secrets);
 
     let worker_path_display = worker_path
         .as_deref()
-        .map(|path| RedactedPath::new(path, exposed_api_key));
+        .map(|path| RedactedPath::new(path, &secrets));
     let workspace_root_display = workspace_root
         .as_deref()
-        .map(|path| RedactedPath::new(path, exposed_api_key));
-    let prompt_source_display = PromptProvenance::from_source(&prompt_source, exposed_api_key);
+        .map(|path| RedactedPath::new(path, &secrets));
+    let prompt_source_display = PromptProvenance::from_source(&prompt_source, &secrets);
 
     let mut problems = Vec::new();
     problems.extend(worker_problem);
@@ -502,7 +551,8 @@ fn resolve_startup_with_session_preferences(
             subagents,
             settings: settings_context,
             prompt_source: prompt_source_display,
-            api_key_presence,
+            openai_api_key_presence: api_keys.presence(Provider::OpenAi),
+            anthropic_api_key_presence: api_keys.presence(Provider::Anthropic),
             problems,
         },
         construction: StartupConstruction {
@@ -510,67 +560,58 @@ fn resolve_startup_with_session_preferences(
             workspace_root,
             system_prompt,
             prompt_base,
-            api_key,
+            api_keys,
             model,
         },
     }
 }
 
-fn startup_settings_problem(problem: &settings::Problem, api_key: Option<&str>) -> StartupProblem {
+fn startup_settings_problem(problem: &settings::Problem, secrets: &[&str]) -> StartupProblem {
     StartupProblem::new(
         problem.kind(),
         problem.diagnostic(),
         problem.remediation(),
-        api_key,
+        secrets,
     )
 }
 
-fn resolve_api_key(
-    api_key: Option<OsString>,
-) -> (Option<ApiKey>, ApiKeyPresence, Option<StartupProblem>) {
-    let Some(api_key) = api_key else {
-        return (
-            None,
-            ApiKeyPresence::Missing,
-            Some(StartupProblem::new(
-                StartupProblemKind::ApiKeyMissing,
-                "OPENAI_API_KEY is missing or empty.",
-                "Set OPENAI_API_KEY to a non-empty OpenAI API key, then restart Kiki.",
-                None,
-            )),
-        );
-    };
-    let Ok(api_key) = api_key.into_string() else {
-        return (
-            None,
-            ApiKeyPresence::Missing,
-            Some(StartupProblem::new(
-                StartupProblemKind::ApiKeyInvalidUnicode,
-                "OPENAI_API_KEY is not valid Unicode.",
-                "Set OPENAI_API_KEY to a non-empty Unicode OpenAI API key, then restart Kiki.",
-                None,
-            )),
-        );
-    };
+fn resolve_api_key(api_key: Option<OsString>) -> Result<ApiKey, StartupProblemKind> {
+    let api_key = api_key
+        .ok_or(StartupProblemKind::ApiKeyMissing)?
+        .into_string()
+        .map_err(|_| StartupProblemKind::ApiKeyInvalidUnicode)?;
     if api_key.trim().is_empty() {
-        return (
-            None,
-            ApiKeyPresence::Missing,
-            Some(StartupProblem::new(
-                StartupProblemKind::ApiKeyMissing,
-                "OPENAI_API_KEY is missing or empty.",
-                "Set OPENAI_API_KEY to a non-empty OpenAI API key, then restart Kiki.",
-                None,
-            )),
-        );
+        return Err(StartupProblemKind::ApiKeyMissing);
     }
+    Ok(ApiKey(api_key))
+}
 
-    (Some(ApiKey(api_key)), ApiKeyPresence::Present, None)
+fn api_key_problem(kind: StartupProblemKind, provider: Provider, resuming: bool) -> StartupProblem {
+    let variable = provider.api_key_variable();
+    let (diagnostic, key) = if kind == StartupProblemKind::ApiKeyInvalidUnicode {
+        ("is not valid Unicode", "a non-empty Unicode")
+    } else {
+        ("is missing or empty", "a non-empty")
+    };
+    let saved_model = if resuming {
+        ", or set KIKI_MODEL to override the saved model"
+    } else {
+        ""
+    };
+    StartupProblem::new(
+        kind,
+        format!("{variable} {diagnostic}."),
+        format!(
+            "Set {variable} to {key} {} API key{saved_model}, then restart Kiki.",
+            provider.display_name()
+        ),
+        &[],
+    )
 }
 
 fn resolve_worker_path(
     worker_path: Option<OsString>,
-    api_key: Option<&str>,
+    secrets: &[&str],
 ) -> (Option<PathBuf>, Option<StartupProblem>) {
     let Some(worker_path) = worker_path else {
         return (
@@ -579,7 +620,7 @@ fn resolve_worker_path(
                 StartupProblemKind::WorkerPathMissing,
                 "MONTY_BIN is not set.",
                 "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
-                api_key,
+                secrets,
             )),
         );
     };
@@ -592,7 +633,7 @@ fn resolve_worker_path(
                 worker_path.display()
             ),
             "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
-            api_key,
+            secrets,
         )
     });
     (Some(worker_path), problem)
@@ -600,7 +641,7 @@ fn resolve_worker_path(
 
 fn resolve_workspace_root(
     workspace_root: io::Result<PathBuf>,
-    api_key: Option<&str>,
+    secrets: &[&str],
 ) -> (Option<PathBuf>, Option<StartupProblem>) {
     match workspace_root {
         Ok(workspace_root) => {
@@ -612,7 +653,7 @@ fn resolve_workspace_root(
                         workspace_root.display()
                     ),
                     "Start Kiki from an absolute workspace directory, then restart Kiki.",
-                    api_key,
+                    secrets,
                 )
             });
             (Some(workspace_root), problem)
@@ -623,7 +664,7 @@ fn resolve_workspace_root(
                 StartupProblemKind::WorkspaceRootUnavailable,
                 format!("Could not determine the current workspace root: {error}"),
                 "Start Kiki from a readable workspace directory, then restart Kiki.",
-                api_key,
+                secrets,
             )),
         ),
     }
@@ -631,7 +672,7 @@ fn resolve_workspace_root(
 
 fn resolve_prompt(
     prompt: PromptResolution,
-    api_key: Option<&str>,
+    secrets: &[&str],
 ) -> (
     PromptSource,
     Option<String>,
@@ -661,7 +702,7 @@ fn resolve_prompt(
                 kind,
                 diagnostic,
                 "Fix or unset KIKI_SYSTEM_PROMPT, then restart Kiki.",
-                api_key,
+                secrets,
             );
             (source, None, None, Some(problem))
         }
@@ -696,16 +737,38 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
             base: "system instructions".to_owned(),
             source: PromptSource::Bundled { name: "system" },
         },
-        api_key: Some(OsString::from("test-api-key")),
+        openai_api_key: Some(OsString::from("test-api-key")),
+        anthropic_api_key: None,
     })
     .snapshot
 }
 
-fn redact(mut text: String, api_key: Option<&str>) -> String {
-    if let Some(api_key) = api_key.filter(|api_key| !api_key.is_empty()) {
-        text = text.replace(api_key, REDACTED);
+fn redact(text: String, secrets: &[&str]) -> String {
+    let mut matches = Vec::new();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        let mut search_from = 0;
+        while let Some(at) = text[search_from..].find(secret) {
+            let start = search_from + at;
+            matches.push(start..start + secret.len());
+            search_from = start + text[start..].chars().next().unwrap().len_utf8();
+        }
     }
-    text
+    matches.sort_unstable_by_key(|range| range.start);
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut consumed = 0;
+    for range in matches {
+        if range.end <= consumed {
+            continue;
+        }
+        if range.start >= consumed {
+            redacted.push_str(&text[consumed..range.start]);
+            redacted.push_str(REDACTED);
+        }
+        consumed = range.end;
+    }
+    redacted.push_str(&text[consumed..]);
+    redacted
 }
 
 fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
@@ -720,7 +783,7 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
 mod tests {
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
-        models::{ASTRA, LUNA, SOL, TERRA},
+        models::{ASTRA, LUNA, OPUS_5_5, Provider, SOL, TERRA},
     };
     use crate::prompt::{PromptError, PromptSource, ResolvedPrompt};
     use std::collections::BTreeMap;
@@ -756,8 +819,16 @@ mod tests {
             home: None,
             workspace_root: Ok(PathBuf::from(WORKSPACE_ROOT)),
             prompt: bundled_prompt(),
-            api_key: Some(api_key.into()),
+            openai_api_key: Some(api_key.into()),
+            anthropic_api_key: None,
         }
+    }
+
+    fn anthropic_only_input(api_key: &str) -> StartupInput {
+        let mut input = ready_input("unused");
+        input.openai_api_key = None;
+        input.anthropic_api_key = Some(OsString::from(api_key));
+        input
     }
 
     fn ready_input_with_settings(
@@ -797,7 +868,10 @@ mod tests {
             snapshot.prompt_source(),
             &PromptProvenance::Bundled { name: "system" }
         );
-        assert_eq!(snapshot.api_key_presence(), ApiKeyPresence::Present);
+        assert_eq!(
+            snapshot.api_key_presence(Provider::OpenAi),
+            ApiKeyPresence::Present
+        );
         assert!(snapshot.problems().is_empty());
         assert_eq!(
             snapshot.submission_availability(),
@@ -806,8 +880,8 @@ mod tests {
         assert_eq!(
             configuration
                 .construction
-                .api_key
-                .as_ref()
+                .api_keys
+                .get(Provider::OpenAi)
                 .map(super::ApiKey::expose),
             Some("sk-private-value")
         );
@@ -815,6 +889,221 @@ mod tests {
             configuration.construction.system_prompt.as_deref(),
             Some("system instructions")
         );
+    }
+
+    #[test]
+    fn only_an_anthropic_key_with_an_anthropic_model_is_ready() {
+        let mut input = anthropic_only_input("sk-ant-private");
+        input.model = Some(OsString::from(OPUS_5_5.id));
+
+        let configuration = resolve_startup(input);
+        let snapshot = configuration.snapshot();
+        let rendered = crate::tui::format_startup_configuration(snapshot);
+
+        assert!(snapshot.problems().is_empty(), "{:?}", snapshot.problems());
+        assert!(std::ptr::eq(snapshot.model(), &OPUS_5_5));
+        assert_eq!(
+            snapshot.api_key_presence(Provider::OpenAi),
+            ApiKeyPresence::Missing
+        );
+        assert_eq!(
+            snapshot.api_key_presence(Provider::Anthropic),
+            ApiKeyPresence::Present
+        );
+        assert!(rendered.contains("OpenAI API key: missing"), "{rendered}");
+        assert!(
+            rendered.contains("Anthropic API key: present"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("sent to Anthropic"), "{rendered}");
+        assert!(!rendered.contains("store: false"), "{rendered}");
+        assert!(!rendered.contains("sent to OpenAI"), "{rendered}");
+        let ready = configuration
+            .ready()
+            .expect("Anthropic-only startup is ready");
+        assert!(std::ptr::eq(ready.model(), &OPUS_5_5));
+        assert!(ready.api_key(Provider::OpenAi).is_none());
+        assert_eq!(
+            ready
+                .api_key(Provider::Anthropic)
+                .map(super::ApiKey::expose),
+            Some("sk-ant-private")
+        );
+    }
+
+    #[test]
+    fn only_an_openai_key_with_the_default_model_is_ready() {
+        let configuration = resolve_startup(ready_input("sk-openai-private"));
+        let snapshot = configuration.snapshot();
+
+        assert!(snapshot.problems().is_empty());
+        assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
+        assert_eq!(
+            snapshot.api_key_presence(Provider::OpenAi),
+            ApiKeyPresence::Present
+        );
+        assert_eq!(
+            snapshot.api_key_presence(Provider::Anthropic),
+            ApiKeyPresence::Missing
+        );
+        let ready = configuration.ready().expect("OpenAI-only startup is ready");
+        assert_eq!(
+            ready.api_key(Provider::OpenAi).map(super::ApiKey::expose),
+            Some("sk-openai-private")
+        );
+        assert!(ready.api_key(Provider::Anthropic).is_none());
+    }
+
+    #[test]
+    fn a_missing_selected_provider_key_is_a_problem_naming_its_variable() {
+        let mut anthropic_selected = ready_input("sk-openai-private");
+        anthropic_selected.model = Some(OsString::from(OPUS_5_5.id));
+        let openai_selected = anthropic_only_input("sk-ant-private");
+
+        for (input, variable, provider) in [
+            (anthropic_selected, "ANTHROPIC_API_KEY", "Anthropic"),
+            (openai_selected, "OPENAI_API_KEY", "OpenAI"),
+        ] {
+            let configuration = resolve_startup(input);
+            let problems = configuration.snapshot().problems();
+
+            assert_eq!(
+                problems
+                    .iter()
+                    .map(|problem| problem.kind())
+                    .collect::<Vec<_>>(),
+                [StartupProblemKind::ApiKeyMissing]
+            );
+            assert_eq!(
+                problems[0].diagnostic(),
+                format!("{variable} is missing or empty.")
+            );
+            assert_eq!(
+                problems[0].remediation(),
+                format!("Set {variable} to a non-empty {provider} API key, then restart Kiki.")
+            );
+            assert!(configuration.ready().is_none());
+        }
+    }
+
+    #[test]
+    fn resuming_a_saved_anthropic_model_without_its_key_mentions_kiki_model() {
+        let saved = SessionPreferences::initial(
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
+        );
+
+        let configuration =
+            resolve_startup_with_session_preferences(ready_input("sk-openai-private"), Some(saved));
+        let problems = configuration.snapshot().problems();
+
+        assert!(std::ptr::eq(configuration.snapshot().model(), &OPUS_5_5));
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::ApiKeyMissing]
+        );
+        assert_eq!(
+            problems[0].diagnostic(),
+            "ANTHROPIC_API_KEY is missing or empty."
+        );
+        assert_eq!(
+            problems[0].remediation(),
+            "Set ANTHROPIC_API_KEY to a non-empty Anthropic API key, or set KIKI_MODEL to override the saved model, then restart Kiki."
+        );
+        assert!(configuration.ready().is_none());
+    }
+
+    #[test]
+    fn every_present_key_is_redacted_from_diagnostics_paths_and_provenance() {
+        let openai_key = "sk-openai-BOTH-SECRET";
+        let anthropic_key = "sk-ant-BOTH-SECRET";
+        let mut input = ready_input(openai_key);
+        input.anthropic_api_key = Some(OsString::from(anthropic_key));
+        input.worker_path = Some(OsString::from(format!("/opt/{anthropic_key}/monty")));
+        input.prompt = PromptResolution::Resolved {
+            text: "system instructions".to_owned(),
+            base: "system instructions".to_owned(),
+            source: PromptSource::Override {
+                path: PathBuf::from(format!("/prompts/{openai_key}/{anthropic_key}.md")),
+            },
+        };
+        input.workspace_root = Err(io::Error::other(format!(
+            "resolver repeated {openai_key} and {anthropic_key}"
+        )));
+
+        let configuration = resolve_startup(input)
+            .with_worker_construction_failure(format!("worker repeated {anthropic_key}"));
+        let snapshot = configuration.snapshot();
+        let mut inspectable = format!(
+            "{snapshot:?}\n{}",
+            crate::tui::format_startup_configuration(snapshot)
+        );
+        for problem in snapshot.problems() {
+            inspectable.push_str(&format!("\n{problem:?}\n{problem}"));
+        }
+
+        assert_eq!(
+            snapshot.worker_path().unwrap().as_str(),
+            "/opt/[redacted]/monty"
+        );
+        let PromptProvenance::Override { path } = snapshot.prompt_source() else {
+            panic!("override provenance should be retained")
+        };
+        assert_eq!(path.as_str(), "/prompts/[redacted]/[redacted].md");
+        assert_eq!(
+            snapshot
+                .problems()
+                .iter()
+                .map(|problem| problem.diagnostic())
+                .collect::<Vec<_>>(),
+            [
+                "Monty worker construction failed: worker repeated [redacted]",
+                "Could not determine the current workspace root: resolver repeated [redacted] and [redacted]",
+            ]
+        );
+        assert!(!inspectable.contains(openai_key), "{inspectable}");
+        assert!(!inspectable.contains(anthropic_key), "{inspectable}");
+        assert!(!inspectable.contains("BOTH-SECRET"), "{inspectable}");
+    }
+
+    #[test]
+    fn overlapping_keys_are_fully_redacted_from_original_text() {
+        let openai_key = "sk-shared";
+        let anthropic_key = "sk-shared-private";
+        let mut input = ready_input(openai_key);
+        input.anthropic_api_key = Some(OsString::from(anthropic_key));
+        input.worker_path = Some(OsString::from(format!("/opt/{anthropic_key}/monty")));
+        input.workspace_root = Err(io::Error::other(format!(
+            "{openai_key}, {anthropic_key}, and sk-shared-private-extra"
+        )));
+
+        let snapshot = resolve_startup(input).snapshot;
+        assert_eq!(
+            snapshot.worker_path().unwrap().as_str(),
+            "/opt/[redacted]/monty"
+        );
+        assert_eq!(
+            snapshot.problems()[0].diagnostic(),
+            "Could not determine the current workspace root: [redacted], [redacted], and [redacted]-extra"
+        );
+        assert_eq!(
+            super::redact("abcdefg".into(), &["abcde", "cdefg"]),
+            "[redacted]"
+        );
+        assert_eq!(super::redact("abcabcabc".into(), &["abcabc"]), "[redacted]");
+    }
+
+    #[test]
+    fn both_keyed_providers_are_named_in_the_startup_privacy_notice() {
+        let mut input = ready_input("openai-key");
+        input.anthropic_api_key = Some(OsString::from("anthropic-key"));
+        let configuration = resolve_startup(input);
+        let rendered = crate::tui::format_startup_configuration(configuration.snapshot());
+
+        assert!(rendered.contains("sent to OpenAI"), "{rendered}");
+        assert!(rendered.contains("sent to Anthropic"), "{rendered}");
     }
 
     #[test]
@@ -1035,7 +1324,7 @@ mod tests {
             );
             assert_eq!(
                 snapshot.problems()[0].remediation(),
-                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
+                "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
             );
             assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
             assert_eq!(
@@ -1071,7 +1360,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.problems()[0].remediation(),
-            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki."
+            "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna, anthropic/claude-opus-5-5, anthropic/claude-fable-5-1) or leave it unset, then restart Kiki."
         );
         assert!(std::ptr::eq(snapshot.model(), DEFAULT_MODEL));
         assert_eq!(
@@ -1116,7 +1405,8 @@ mod tests {
                     path: prompt_path.clone(),
                 },
             },
-            api_key: Some(OsString::from(api_key)),
+            openai_api_key: Some(OsString::from(api_key)),
+            anthropic_api_key: None,
         };
 
         let configuration = resolve_startup(input);
@@ -1149,7 +1439,10 @@ mod tests {
         assert_eq!(ready.worker_path(), worker_path);
         assert_eq!(ready.workspace_root(), workspace_root);
         assert_eq!(ready.system_prompt(), "system instructions");
-        assert_eq!(ready.api_key().expose(), api_key);
+        assert_eq!(
+            ready.api_key(Provider::OpenAi).map(super::ApiKey::expose),
+            Some(api_key)
+        );
     }
 
     #[test]
@@ -1279,12 +1572,12 @@ mod tests {
     fn absent_empty_and_whitespace_only_api_keys_are_missing() {
         for api_key in [None, Some(""), Some(" \t\n"), Some("\u{2003}")] {
             let mut input = ready_input("placeholder");
-            input.api_key = api_key.map(OsString::from);
+            input.openai_api_key = api_key.map(OsString::from);
 
             let configuration = resolve_startup(input);
 
             assert_eq!(
-                configuration.snapshot().api_key_presence(),
+                configuration.snapshot().api_key_presence(Provider::OpenAi),
                 ApiKeyPresence::Missing
             );
             assert_eq!(
@@ -1296,7 +1589,13 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [StartupProblemKind::ApiKeyMissing]
             );
-            assert!(configuration.construction.api_key.is_none());
+            assert!(
+                configuration
+                    .construction
+                    .api_keys
+                    .get(Provider::OpenAi)
+                    .is_none()
+            );
         }
     }
 
@@ -1305,25 +1604,34 @@ mod tests {
     fn non_unicode_api_key_is_invalid_without_retaining_its_bytes() {
         use std::os::unix::ffi::OsStringExt;
 
-        let mut input = ready_input("placeholder");
-        input.api_key = Some(OsString::from_vec(vec![b's', b'k', b'-', 0xff]));
+        let invalid = || Some(OsString::from_vec(vec![b's', b'k', b'-', 0xff]));
+        let mut openai = ready_input("placeholder");
+        openai.openai_api_key = invalid();
+        let mut anthropic = ready_input("placeholder");
+        anthropic.model = Some(OsString::from(OPUS_5_5.id));
+        anthropic.anthropic_api_key = invalid();
 
-        let configuration = resolve_startup(input);
+        for (input, provider) in [(openai, Provider::OpenAi), (anthropic, Provider::Anthropic)] {
+            let configuration = resolve_startup(input);
+            let problems = configuration.snapshot().problems();
 
-        assert_eq!(
-            configuration.snapshot().api_key_presence(),
-            ApiKeyPresence::Missing
-        );
-        assert_eq!(
-            configuration
-                .snapshot()
-                .problems()
-                .iter()
-                .map(|problem| problem.kind())
-                .collect::<Vec<_>>(),
-            [StartupProblemKind::ApiKeyInvalidUnicode]
-        );
-        assert!(configuration.construction.api_key.is_none());
+            assert_eq!(
+                configuration.snapshot().api_key_presence(provider),
+                ApiKeyPresence::Missing
+            );
+            assert_eq!(
+                problems
+                    .iter()
+                    .map(|problem| problem.kind())
+                    .collect::<Vec<_>>(),
+                [StartupProblemKind::ApiKeyInvalidUnicode]
+            );
+            assert_eq!(
+                problems[0].diagnostic(),
+                format!("{} is not valid Unicode.", provider.api_key_variable())
+            );
+            assert!(configuration.construction.api_keys.get(provider).is_none());
+        }
     }
 
     #[test]
@@ -1342,7 +1650,8 @@ mod tests {
                     detail: "invalid UTF-8".to_owned(),
                 },
             },
-            api_key: None,
+            openai_api_key: None,
+            anthropic_api_key: None,
         };
 
         let configuration = resolve_startup(input)
@@ -1429,8 +1738,8 @@ mod tests {
         assert_eq!(
             configuration
                 .construction
-                .api_key
-                .as_ref()
+                .api_keys
+                .get(Provider::OpenAi)
                 .map(super::ApiKey::expose),
             Some(api_key)
         );
@@ -1460,7 +1769,8 @@ mod tests {
                     path: PathBuf::from(format!("/prompts/{api_key}/agent\t\x1b.md")),
                 },
             },
-            api_key: Some(OsString::from(api_key)),
+            openai_api_key: Some(OsString::from(api_key)),
+            anthropic_api_key: None,
         })
         .with_worker_construction_failure(format!("worker failure \x1b {api_key}"))
         .with_workspace_construction_failure(format!("workspace failure \r {api_key}"));
@@ -1472,6 +1782,7 @@ mod tests {
         assert!(rendered.contains("Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)"));
         assert!(rendered.contains("Prompt: override /prompts/[redacted]/agent    \\x1B.md"));
         assert!(rendered.contains("OpenAI API key: present"));
+        assert!(rendered.contains("Anthropic API key: missing"));
         assert!(rendered.contains("Submission: unavailable"));
         assert!(rendered.contains(
             "Problem: Monty worker construction failed: worker failure \\x1B [redacted]"

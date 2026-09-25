@@ -8,17 +8,19 @@ async-openai = { version = "=0.41.3", default-features = false, features = ["byo
 arboard = { version = "=3.6.1", default-features = false }
 blake3 = "1"
 cap-std = "4"
+eventsource-stream = "=0.2.3"
 futures = "0.3"
 getrandom = "0.3"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 rattles = "=0.3.1"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 monty-pool = "=0.0.22"
 monty-types = "=0.0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-time = { version = "=0.3.55", default-features = false, features = ["formatting"] }
+time = { version = "=0.3.55", default-features = false, features = ["formatting", "parsing"] }
 thiserror = "2"
 tempfile = "=3.27.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

@@ -22,7 +22,7 @@ use crate::arena::{ArenaChildSource, Checkpoint, Execution};
 use crate::config::{
     ModelSelection, SessionPreferences,
     constants::{MAX_PROMPT_BYTES, SUBAGENT_TIMER_HEADROOM},
-    models::{ModelConfiguration, model_by_id},
+    models::{ModelConfiguration, Provider, model_by_id},
     settings::{SettingsContext, SubagentSettings},
 };
 use crate::model::{AttemptAccounting, Model, ModelProgress};
@@ -739,6 +739,7 @@ pub(crate) struct AcceptedThinking(Arc<RwLock<AcceptedThinkingState>>);
 struct AcceptedThinkingState {
     persisted: SettingsContext,
     values: BTreeMap<&'static str, &'static str>,
+    providers: Vec<Provider>,
 }
 
 impl AcceptedThinking {
@@ -753,7 +754,16 @@ impl AcceptedThinking {
         Self(Arc::new(RwLock::new(AcceptedThinkingState {
             persisted,
             values,
+            providers: vec![Provider::OpenAi, Provider::Anthropic],
         })))
+    }
+
+    pub(crate) fn with_providers(self, providers: Vec<Provider>) -> Self {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .providers = providers;
+        self
     }
 
     pub(crate) fn accept(&self, selection: ModelSelection) {
@@ -782,6 +792,14 @@ impl AcceptedThinking {
             .persisted
             .favourites()
             .is_none_or(|models| models.contains(&model))
+    }
+
+    fn has_provider(&self, provider: Provider) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .providers
+            .contains(&provider)
     }
 
     #[cfg(test)]
@@ -908,7 +926,16 @@ impl TrustedExecutionContext {
                 target.id
             )));
         }
-        Ok(accepted_thinking.resolve(self.selection, target))
+        let selection = accepted_thinking.resolve(self.selection, target);
+        let provider = selection.model().provider();
+        if !accepted_thinking.has_provider(provider) {
+            return Err(ToolError::value(format!(
+                "subagent model `{}` needs {}, which is not set",
+                selection.model().id,
+                provider.api_key_variable()
+            )));
+        }
+        Ok(selection)
     }
 
     pub(crate) fn coordinator(&self) -> &SessionSubagents {
@@ -3900,6 +3927,7 @@ mod tests {
     use crate::config::{
         DEFAULT_MODEL, ModelSelection,
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
+        models::Provider,
     };
     use crate::model::{
         AttemptAccounting, Model, ModelAction, ModelCallId, ModelContextEntry, ModelFailure,
@@ -3907,7 +3935,7 @@ mod tests {
     };
     use crate::session::{Session, SessionWriteGate, SessionWriteKind};
     use crate::telemetry::TraceOwner;
-    use crate::tools::{ReadTestGate, ToolHost, ToolValue};
+    use crate::tools::{ReadTestGate, ToolErrorKind, ToolHost, ToolValue};
 
     #[tokio::test]
     async fn favourites_set_subagent_default_and_reject_unlisted_overrides() {
@@ -3974,6 +4002,87 @@ mod tests {
                 .is_err()
         );
         assert!(context.resolve_selection(Some("openai/unknown")).is_err());
+    }
+
+    #[tokio::test]
+    async fn keyless_subagent_models_are_rejected_naming_the_missing_key_variable() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".kiki")).unwrap();
+        std::fs::write(
+            home.path().join(".kiki/config.toml"),
+            "favourites = [\"anthropic/claude-opus-5-5\", \"openai/gpt-6-sol\"]\n",
+        )
+        .unwrap();
+        let with_favourites = crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        );
+        let without_favourites = crate::config::ready_snapshot_for_test();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let invoking = ModelSelection::new(&crate::config::models::TERRA, "low").unwrap();
+        let explicit = openai_only_context(&arena, invoking, &without_favourites).await;
+        let favourite_default = openai_only_context(&arena, invoking, &with_favourites).await;
+
+        for error in [
+            explicit
+                .resolve_selection(Some(crate::config::models::OPUS_5_5.id))
+                .unwrap_err(),
+            favourite_default.resolve_selection(None).unwrap_err(),
+        ] {
+            assert_eq!(error.kind, ToolErrorKind::Value);
+            assert!(error.to_string().contains("ANTHROPIC_API_KEY"), "{error}");
+        }
+        assert_eq!(
+            explicit
+                .resolve_selection(Some(crate::config::models::SOL.id))
+                .unwrap(),
+            ModelSelection::new(
+                &crate::config::models::SOL,
+                crate::config::models::SOL.default_thinking
+            )
+            .unwrap()
+        );
+        assert_eq!(explicit.resolve_selection(None).unwrap(), invoking);
+        assert_eq!(
+            favourite_default
+                .resolve_selection(Some(crate::config::models::GPT6_SOL.id))
+                .unwrap()
+                .model()
+                .id,
+            crate::config::models::GPT6_SOL.id
+        );
+    }
+
+    async fn openai_only_context(
+        arena: &Arena,
+        invoking: ModelSelection,
+        settings: &crate::config::StartupSnapshot,
+    ) -> super::TrustedExecutionContext {
+        let coordinator: super::SessionSubagents = SubagentCoordinator::new(
+            policy(),
+            Arc::new(super::CompleteChildRunner::new(
+                "base".to_owned(),
+                ScriptedChildFactory::new([]),
+            )),
+        );
+        let caller = coordinator.root_caller().await;
+        super::AgentInvocationContext::new(caller, coordinator)
+            .with_accepted_thinking(
+                super::AcceptedThinking::new(invoking, settings.settings().clone(), None)
+                    .with_providers(vec![Provider::OpenAi]),
+            )
+            .execution(
+                arena.child_source(),
+                invoking,
+                arena.checkpoint(),
+                CancellationToken::new(),
+            )
     }
 
     #[test]
@@ -4398,6 +4507,7 @@ mod tests {
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(0),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(1),

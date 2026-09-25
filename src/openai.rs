@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -19,18 +19,20 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
 use crate::{
-    config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT},
+    config::{
+        ModelConfiguration, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+        models::Provider, settings::CrossProviderReasoning,
+    },
     model::{
-        AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
+        AttemptAccounting, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
         OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
         canonical_compaction_summary,
     },
-    subagents::ChildModelFactory,
+    presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
 
 const OPENAI_PROVIDER: &str = "openai";
-const OPENAI_MODEL_QUALIFIER: &str = "openai/";
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
 
@@ -44,41 +46,43 @@ fn openai_config(api_key: impl Into<String>, api_base: impl Into<String>) -> Ope
         .with_project_id("")
 }
 
+#[derive(Clone)]
 pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
     api_key: String,
+    cross_provider_reasoning: CrossProviderReasoning,
     #[cfg(test)]
     summary_retry_wait_started: Option<Arc<Notify>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct OpenAiChildModelFactory {
-    api_key: String,
-}
+impl OpenAiModel {
+    pub(crate) fn new(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        cross_provider_reasoning: CrossProviderReasoning,
+    ) -> Self {
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            OPENAI_API_BASE,
+            cross_provider_reasoning,
+        )
+    }
 
-impl OpenAiChildModelFactory {
-    pub(crate) fn new(api_key: impl Into<String>) -> Self {
+    pub(crate) fn with_prompt(&self, prompt: String) -> Self {
         Self {
-            api_key: api_key.into(),
+            prompt,
+            ..self.clone()
         }
     }
-}
 
-impl ChildModelFactory for OpenAiChildModelFactory {
-    type Model = OpenAiModel;
-
-    fn create(&self, prompt: String) -> Self::Model {
-        OpenAiModel::new(prompt, self.api_key.clone())
-    }
-}
-
-impl OpenAiModel {
-    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
-    }
-
-    fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
+    fn build(
+        prompt: String,
+        api_key: String,
+        endpoint: &str,
+        cross_provider_reasoning: CrossProviderReasoning,
+    ) -> Self {
         let service = ServiceBuilder::new()
             .layer(OpenAIRetryLayer::new(2))
             .service(ReqwestService::default());
@@ -87,18 +91,24 @@ impl OpenAiModel {
             client: Client::with_config(openai_config(api_key.clone(), endpoint))
                 .with_http_service(service),
             api_key,
+            cross_provider_reasoning,
             #[cfg(test)]
             summary_retry_wait_started: None,
         }
     }
 
     #[cfg(test)]
-    fn with_endpoint(
+    pub(crate) fn with_endpoint(
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         endpoint: &str,
     ) -> Self {
-        Self::build(prompt.into(), api_key.into(), endpoint)
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            endpoint,
+            CrossProviderReasoning::Inline,
+        )
     }
 
     fn request(
@@ -107,13 +117,15 @@ impl OpenAiModel {
         history: &ModelHistory,
     ) -> Result<Value, ModelError> {
         let model = selection.model();
-        let wire_model = model
-            .id
-            .strip_prefix(OPENAI_MODEL_QUALIFIER)
-            .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))?;
+        let wire_model = openai_wire_model(model)?;
         let mut input = Vec::new();
 
         for entry in history.entries() {
+            if let Some(parts) = entry.foreign_parts(OPENAI_PROVIDER, self.cross_provider_reasoning)
+            {
+                input.extend(parts.into_iter().flat_map(foreign_input));
+                continue;
+            }
             match entry {
                 ModelContextEntry::UserRequest { text } => {
                     input.push(json!({"role": "user", "content": text}));
@@ -141,11 +153,7 @@ impl OpenAiModel {
                         }
                     }
                     input.extend(replay);
-                    let output = match completed.result() {
-                        CodeResult::Execution { feedback }
-                        | CodeResult::Cancelled { feedback }
-                        | CodeResult::Failure { feedback } => feedback,
-                    };
+                    let output = completed.result().feedback();
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": completed.call_id().as_str(),
@@ -641,6 +649,7 @@ impl OpenAiModel {
                 .input_tokens_details
                 .as_ref()
                 .and_then(|details| details.cache_write_tokens),
+            cache_write_1h_input_tokens: 0,
             output_tokens: usage.output_tokens,
             reasoning_output_tokens: usage
                 .output_tokens_details
@@ -706,10 +715,7 @@ impl OpenAiModel {
 
     fn summary_request(&self, request: &SummaryRequest) -> Result<Value, ModelError> {
         let model = request.selection.model();
-        let wire_model = model
-            .id
-            .strip_prefix(OPENAI_MODEL_QUALIFIER)
-            .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))?;
+        let wire_model = openai_wire_model(model)?;
 
         Ok(json!({
             "model": wire_model,
@@ -1074,6 +1080,12 @@ enum AttemptFailure {
     },
 }
 
+fn openai_wire_model(model: &ModelConfiguration) -> Result<&'static str, ModelError> {
+    (model.provider() == Provider::OpenAi)
+        .then(|| model.wire_id())
+        .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))
+}
+
 fn redact(value: &str, api_key: &str) -> String {
     if api_key.is_empty() {
         value.to_owned()
@@ -1082,12 +1094,26 @@ fn redact(value: &str, api_key: &str) -> String {
     }
 }
 
-fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
-    if replay.provider() != OPENAI_PROVIDER {
-        return Err(ModelError::InvalidHistory(
-            "opaque replay belongs to another provider",
-        ));
+fn foreign_input(part: ForeignPart<'_>) -> Vec<Value> {
+    match part {
+        ForeignPart::Text(text) => vec![json!({"role": "assistant", "content": text})],
+        ForeignPart::ToolCall {
+            call_id,
+            source,
+            output,
+        } => vec![
+            json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "execute_python",
+                "arguments": json!({"code": source}).to_string()
+            }),
+            json!({"type": "function_call_output", "call_id": call_id, "output": output}),
+        ],
     }
+}
+
+fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
     replay
         .items()
         .iter()
@@ -1638,122 +1664,6 @@ impl ApplicationContentGuard {
     }
 }
 
-const PROGRESS_PAYLOAD_LIMIT: usize = 4 * 1024;
-const PROGRESS_RATE_LIMIT: Duration = Duration::from_millis(50);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PresentationKind {
-    ReasoningSummary,
-    AssistantText,
-    DecodedPython,
-}
-
-impl PresentationKind {
-    fn progress(self, text: String) -> ModelProgress {
-        match self {
-            Self::ReasoningSummary => ModelProgress::ReasoningSummaryChunk { text },
-            Self::AssistantText => ModelProgress::AssistantTextChunk { text },
-            Self::DecodedPython => ModelProgress::DecodedPythonChunk { code: text },
-        }
-    }
-}
-
-struct PendingPresentation {
-    kind: PresentationKind,
-    text: String,
-}
-
-#[derive(Default)]
-struct PresentationBatcher {
-    pending: VecDeque<PendingPresentation>,
-    pending_bytes: usize,
-    last_emission: Option<Instant>,
-}
-
-impl PresentationBatcher {
-    fn push(
-        &mut self,
-        kind: PresentationKind,
-        text: String,
-        now: Instant,
-        progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        self.pending_bytes += text.len();
-        if let Some(pending) = self
-            .pending
-            .back_mut()
-            .filter(|pending| pending.kind == kind)
-        {
-            pending.text.push_str(&text);
-        } else {
-            self.pending.push_back(PendingPresentation { kind, text });
-        }
-
-        if self.rate_window_open(now) {
-            self.flush_all_at(now, progress);
-        } else {
-            self.flush_full_chunks(now, progress);
-        }
-    }
-
-    fn flush_due(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        if !self.pending.is_empty() && self.rate_window_open(now) {
-            self.flush_all_at(now, progress);
-        }
-    }
-
-    fn flush_all(&mut self, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        self.flush_all_at(Instant::now(), progress);
-    }
-
-    fn flush_all_at(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        while !self.pending.is_empty() {
-            self.emit_front(now, progress);
-        }
-    }
-
-    fn flush_full_chunks(
-        &mut self,
-        now: Instant,
-        progress: &mut (dyn FnMut(ModelProgress) + Send),
-    ) {
-        while self.pending_bytes >= PROGRESS_PAYLOAD_LIMIT {
-            self.emit_front(now, progress);
-        }
-    }
-
-    fn emit_front(&mut self, now: Instant, progress: &mut (dyn FnMut(ModelProgress) + Send)) {
-        let mut pending = self.pending.pop_front().expect("pending presentation");
-        let split = utf8_prefix_end(&pending.text, PROGRESS_PAYLOAD_LIMIT);
-        let remainder = pending.text.split_off(split);
-        self.pending_bytes -= pending.text.len();
-        if !remainder.is_empty() {
-            self.pending.push_front(PendingPresentation {
-                kind: pending.kind,
-                text: remainder,
-            });
-        }
-        self.last_emission = Some(now);
-        progress(pending.kind.progress(pending.text));
-    }
-
-    fn rate_window_open(&self, now: Instant) -> bool {
-        self.last_emission
-            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_RATE_LIMIT)
-    }
-}
-
-fn utf8_prefix_end(text: &str, limit: usize) -> usize {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
 fn execute_python_item_id(item: &Value) -> Option<&str> {
     if item.get("type").and_then(Value::as_str) != Some("function_call")
         || item.get("name").and_then(Value::as_str) != Some("execute_python")
@@ -1763,200 +1673,6 @@ fn execute_python_item_id(item: &Value) -> Option<&str> {
     item.get("id")
         .and_then(Value::as_str)
         .filter(|item_id| !item_id.is_empty())
-}
-
-#[derive(Default)]
-struct PythonPreviewDecoder {
-    state: PythonJsonState,
-}
-
-#[derive(Default)]
-enum PythonJsonState {
-    #[default]
-    LeadingWhitespace,
-    BeforeKey,
-    Key(usize),
-    AfterKey,
-    BeforeCode,
-    Code,
-    Escape,
-    Unicode {
-        value: u16,
-        digits: u8,
-    },
-    HighSurrogateBackslash {
-        high: u16,
-    },
-    HighSurrogateU {
-        high: u16,
-    },
-    LowSurrogate {
-        high: u16,
-        value: u16,
-        digits: u8,
-    },
-    AfterCode,
-    TrailingWhitespace,
-    Invalid,
-}
-
-impl PythonPreviewDecoder {
-    fn push(&mut self, fragment: &str) -> String {
-        let mut decoded = String::new();
-        for character in fragment.chars() {
-            let state = std::mem::replace(&mut self.state, PythonJsonState::Invalid);
-            self.state = match state {
-                PythonJsonState::LeadingWhitespace if json_whitespace(character) => {
-                    PythonJsonState::LeadingWhitespace
-                }
-                PythonJsonState::LeadingWhitespace if character == '{' => {
-                    PythonJsonState::BeforeKey
-                }
-                PythonJsonState::BeforeKey if json_whitespace(character) => {
-                    PythonJsonState::BeforeKey
-                }
-                PythonJsonState::BeforeKey if character == '"' => PythonJsonState::Key(0),
-                PythonJsonState::Key(index) => {
-                    let expected = ['c', 'o', 'd', 'e', '"'];
-                    if expected.get(index) == Some(&character) {
-                        if index + 1 == expected.len() {
-                            PythonJsonState::AfterKey
-                        } else {
-                            PythonJsonState::Key(index + 1)
-                        }
-                    } else {
-                        PythonJsonState::Invalid
-                    }
-                }
-                PythonJsonState::AfterKey if json_whitespace(character) => {
-                    PythonJsonState::AfterKey
-                }
-                PythonJsonState::AfterKey if character == ':' => PythonJsonState::BeforeCode,
-                PythonJsonState::BeforeCode if json_whitespace(character) => {
-                    PythonJsonState::BeforeCode
-                }
-                PythonJsonState::BeforeCode if character == '"' => PythonJsonState::Code,
-                PythonJsonState::Code if character == '"' => PythonJsonState::AfterCode,
-                PythonJsonState::Code if character == '\\' => PythonJsonState::Escape,
-                PythonJsonState::Code if character <= '\u{1f}' => PythonJsonState::Invalid,
-                PythonJsonState::Code => {
-                    decoded.push(character);
-                    PythonJsonState::Code
-                }
-                PythonJsonState::Escape => match character {
-                    '"' | '\\' | '/' => {
-                        decoded.push(character);
-                        PythonJsonState::Code
-                    }
-                    'b' => {
-                        decoded.push('\u{0008}');
-                        PythonJsonState::Code
-                    }
-                    'f' => {
-                        decoded.push('\u{000c}');
-                        PythonJsonState::Code
-                    }
-                    'n' => {
-                        decoded.push('\n');
-                        PythonJsonState::Code
-                    }
-                    'r' => {
-                        decoded.push('\r');
-                        PythonJsonState::Code
-                    }
-                    't' => {
-                        decoded.push('\t');
-                        PythonJsonState::Code
-                    }
-                    'u' => PythonJsonState::Unicode {
-                        value: 0,
-                        digits: 0,
-                    },
-                    _ => PythonJsonState::Invalid,
-                },
-                PythonJsonState::Unicode { value, digits } => match hexadecimal(character) {
-                    Some(digit) if digits < 3 => PythonJsonState::Unicode {
-                        value: value * 16 + digit,
-                        digits: digits + 1,
-                    },
-                    Some(digit) => {
-                        let value = value * 16 + digit;
-                        if (0xd800..=0xdbff).contains(&value) {
-                            PythonJsonState::HighSurrogateBackslash { high: value }
-                        } else if (0xdc00..=0xdfff).contains(&value) {
-                            PythonJsonState::Invalid
-                        } else if let Some(character) = char::from_u32(u32::from(value)) {
-                            decoded.push(character);
-                            PythonJsonState::Code
-                        } else {
-                            PythonJsonState::Invalid
-                        }
-                    }
-                    None => PythonJsonState::Invalid,
-                },
-                PythonJsonState::HighSurrogateBackslash { high } if character == '\\' => {
-                    PythonJsonState::HighSurrogateU { high }
-                }
-                PythonJsonState::HighSurrogateU { high } if character == 'u' => {
-                    PythonJsonState::LowSurrogate {
-                        high,
-                        value: 0,
-                        digits: 0,
-                    }
-                }
-                PythonJsonState::LowSurrogate {
-                    high,
-                    value,
-                    digits,
-                } => match hexadecimal(character) {
-                    Some(digit) if digits < 3 => PythonJsonState::LowSurrogate {
-                        high,
-                        value: value * 16 + digit,
-                        digits: digits + 1,
-                    },
-                    Some(digit) => {
-                        let low = value * 16 + digit;
-                        if (0xdc00..=0xdfff).contains(&low) {
-                            let scalar = 0x10000
-                                + ((u32::from(high) - 0xd800) << 10)
-                                + (u32::from(low) - 0xdc00);
-                            if let Some(character) = char::from_u32(scalar) {
-                                decoded.push(character);
-                                PythonJsonState::Code
-                            } else {
-                                PythonJsonState::Invalid
-                            }
-                        } else {
-                            PythonJsonState::Invalid
-                        }
-                    }
-                    None => PythonJsonState::Invalid,
-                },
-                PythonJsonState::AfterCode if json_whitespace(character) => {
-                    PythonJsonState::AfterCode
-                }
-                PythonJsonState::AfterCode if character == '}' => {
-                    PythonJsonState::TrailingWhitespace
-                }
-                PythonJsonState::TrailingWhitespace if json_whitespace(character) => {
-                    PythonJsonState::TrailingWhitespace
-                }
-                PythonJsonState::Invalid => PythonJsonState::Invalid,
-                _ => PythonJsonState::Invalid,
-            };
-        }
-        decoded
-    }
-}
-
-fn json_whitespace(character: char) -> bool {
-    matches!(character, ' ' | '\n' | '\r' | '\t')
-}
-
-fn hexadecimal(character: char) -> Option<u16> {
-    character
-        .to_digit(16)
-        .and_then(|value| u16::try_from(value).ok())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2127,9 +1843,9 @@ struct WireIncompleteDetails {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+pub(crate) mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_openai::Client;
@@ -2138,8 +1854,7 @@ mod tests {
     use async_openai::middleware::ReqwestService;
     use futures::StreamExt;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -2149,9 +1864,11 @@ mod tests {
     use crate::{
         config::{
             ModelSelection,
-            models::{ASTRA, CATALOGUE, SOL, TERRA},
+            models::{ASTRA, CATALOGUE, Provider, SOL, TERRA},
+            settings::CrossProviderReasoning,
         },
-        model::{AttemptAccounting, Model, ModelHistory},
+        model::{AttemptAccounting, Model, ModelError, ModelHistory},
+        sse_fixture::{Fixture, FixtureReply},
     };
 
     fn history() -> ModelHistory {
@@ -2194,7 +1911,11 @@ mod tests {
 
     #[test]
     fn summary_request_has_no_tools_and_uses_captured_selection() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .summary_request(&crate::model::SummaryRequest {
                 instructions: "summary instructions".to_owned(),
@@ -2219,7 +1940,11 @@ mod tests {
 
     #[test]
     fn constructs_qualified_sol_request_with_high_effort() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .request(ModelSelection::new(&SOL, "high").unwrap(), &history())
             .unwrap();
@@ -2230,14 +1955,21 @@ mod tests {
 
     #[test]
     fn constructs_and_serializes_each_configured_openai_model() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         assert_eq!(model.prompt, "system prompt");
         assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
         assert_eq!(
             model.client.config().url("/responses"),
             format!("{OPENAI_API_BASE}/responses")
         );
-        for configuration in CATALOGUE {
+        for configuration in CATALOGUE
+            .into_iter()
+            .filter(|model| model.provider() == Provider::OpenAi)
+        {
             for &thinking in configuration.thinking_levels {
                 let request = model
                     .request(
@@ -2256,9 +1988,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rejects_anthropic_selections_before_networking() {
+        let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
+        let mut model =
+            super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+        let cancellation = CancellationToken::new();
+
+        for id in ["anthropic/claude-opus-5-5", "anthropic/claude-fable-5-1"] {
+            let configuration =
+                crate::config::model_by_id(id).expect("Anthropic model is in the catalogue");
+            let selection =
+                ModelSelection::new(configuration, configuration.default_thinking).unwrap();
+            let mut progress_events = 0;
+            let mut attempts_started = 0;
+
+            let step = model
+                .step(selection, &history(), &cancellation, &mut |_| {
+                    progress_events += 1
+                })
+                .await
+                .unwrap_err();
+            let summary = model
+                .summarise(
+                    crate::model::SummaryRequest {
+                        instructions: "summary instructions".to_owned(),
+                        input: "summary input".to_owned(),
+                        selection,
+                        output_limit: 321,
+                    },
+                    &cancellation,
+                    &mut || attempts_started += 1,
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(step.error(), ModelError::InvalidSelection(_)),
+                "{id}"
+            );
+            assert!(step.attempts().is_empty(), "{id}");
+            assert!(
+                matches!(summary.error(), ModelError::InvalidSelection(_)),
+                "{id}"
+            );
+            assert!(summary.attempts().is_empty(), "{id}");
+            assert_eq!((progress_events, attempts_started), (0, 0), "{id}");
+            assert!(matches!(
+                model.validate_history(&history(), selection),
+                Err(ModelError::InvalidSelection(_))
+            ));
+        }
+        assert_eq!(fixture.request_count(), 0);
+    }
+
     #[test]
     fn constructs_astra_request_with_verified_wire_contract() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .request(
                 ModelSelection::new(&ASTRA, ASTRA.default_thinking).unwrap(),
@@ -2382,253 +2172,6 @@ mod tests {
                 .pricing(),
             TERRA.pricing.identity
         );
-    }
-
-    #[derive(Clone)]
-    enum FixtureReply {
-        Sse(&'static str),
-        OwnedSse(String),
-        Status {
-            code: u16,
-            body: &'static str,
-        },
-        OwnedStatus {
-            code: u16,
-            headers: Vec<(String, String)>,
-            body: String,
-        },
-        AbruptSse(&'static str),
-        CloseBeforeHeaders,
-        IdleSse(&'static str),
-    }
-
-    #[derive(Clone)]
-    struct CapturedRequest {
-        head: String,
-        body: Value,
-    }
-
-    struct Fixture {
-        endpoint: String,
-        requests: Arc<Mutex<Vec<CapturedRequest>>>,
-        requests_received: Arc<AtomicUsize>,
-        request_received: Arc<Notify>,
-        replies_written: Arc<AtomicUsize>,
-        reply_written: Arc<Notify>,
-        disconnected: Arc<AtomicBool>,
-        task: JoinHandle<()>,
-    }
-
-    impl Fixture {
-        async fn start(reply: FixtureReply) -> Self {
-            Self::start_sequence(vec![reply]).await
-        }
-
-        async fn start_sequence(replies: Vec<FixtureReply>) -> Self {
-            assert!(!replies.is_empty());
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_received = Arc::new(AtomicUsize::new(0));
-            let request_received = Arc::new(Notify::new());
-            let replies_written = Arc::new(AtomicUsize::new(0));
-            let reply_written = Arc::new(Notify::new());
-            let disconnected = Arc::new(AtomicBool::new(false));
-            let task = {
-                let requests = requests.clone();
-                let requests_received = requests_received.clone();
-                let request_received = request_received.clone();
-                let replies_written = replies_written.clone();
-                let reply_written = reply_written.clone();
-                let disconnected = disconnected.clone();
-                tokio::spawn(async move {
-                    let mut reply_index = 0;
-                    loop {
-                        let (mut stream, _) = listener.accept().await.unwrap();
-                        let request = read_request(&mut stream).await;
-                        requests.lock().unwrap().push(request);
-                        requests_received.fetch_add(1, Ordering::SeqCst);
-                        request_received.notify_waiters();
-                        let reply = replies
-                            .get(reply_index)
-                            .or_else(|| replies.last())
-                            .expect("fixture reply");
-                        reply_index += 1;
-                        write_reply(&mut stream, reply, &disconnected).await;
-                        replies_written.fetch_add(1, Ordering::SeqCst);
-                        reply_written.notify_waiters();
-                    }
-                })
-            };
-            Self {
-                endpoint,
-                requests,
-                requests_received,
-                request_received,
-                replies_written,
-                reply_written,
-                disconnected,
-                task,
-            }
-        }
-
-        fn request_count(&self) -> usize {
-            self.requests.lock().unwrap().len()
-        }
-
-        fn request(&self) -> CapturedRequest {
-            self.requests.lock().unwrap()[0].clone()
-        }
-
-        async fn wait_for_requests(&self, count: usize) {
-            timeout(Duration::from_secs(1), async {
-                loop {
-                    let notified = self.request_received.notified();
-                    if self.requests_received.load(Ordering::SeqCst) >= count {
-                        break;
-                    }
-                    notified.await;
-                }
-            })
-            .await
-            .expect("fixture should receive a request");
-        }
-
-        async fn wait_for_replies_written(&self, count: usize) {
-            timeout(Duration::from_secs(1), async {
-                loop {
-                    let notified = self.reply_written.notified();
-                    if self.replies_written.load(Ordering::SeqCst) >= count {
-                        break;
-                    }
-                    notified.await;
-                }
-            })
-            .await
-            .expect("fixture should finish writing its reply");
-        }
-
-        async fn wait_for_disconnect(&self) {
-            timeout(Duration::from_secs(1), async {
-                while !self.disconnected.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("dropping the SDK stream should close the fixture connection");
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
-    }
-
-    async fn read_request(stream: &mut TcpStream) -> CapturedRequest {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut buffer).await.unwrap();
-            assert!(read > 0, "fixture connection closed before request headers");
-            bytes.extend_from_slice(&buffer[..read]);
-            if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-        let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-        let content_length = head
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap();
-        while bytes.len() < header_end + content_length {
-            let read = stream.read(&mut buffer).await.unwrap();
-            assert!(read > 0, "fixture connection closed before request body");
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-        let body = serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
-        CapturedRequest { head, body }
-    }
-
-    async fn write_reply(stream: &mut TcpStream, reply: &FixtureReply, disconnected: &AtomicBool) {
-        match reply {
-            FixtureReply::Sse(body) => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            FixtureReply::OwnedSse(body) => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            FixtureReply::Status { code, body } => {
-                let response = format!(
-                    "HTTP/1.1 {code} Fixture Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            FixtureReply::OwnedStatus {
-                code,
-                headers,
-                body,
-            } => {
-                let mut response = format!(
-                    "HTTP/1.1 {code} Fixture Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                    body.len()
-                );
-                for (name, value) in headers {
-                    response.push_str(name);
-                    response.push_str(": ");
-                    response.push_str(value);
-                    response.push_str("\r\n");
-                }
-                response.push_str("\r\n");
-                response.push_str(body);
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            FixtureReply::AbruptSse(body) => {
-                write_chunked_headers(stream).await;
-                write_chunk(stream, body).await;
-            }
-            FixtureReply::CloseBeforeHeaders => stream.shutdown().await.unwrap(),
-            FixtureReply::IdleSse(body) => {
-                write_chunked_headers(stream).await;
-                write_chunk(stream, body).await;
-                let mut byte = [0];
-                if stream.read(&mut byte).await.unwrap_or(0) == 0 {
-                    disconnected.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-    }
-
-    async fn write_chunked_headers(stream: &mut TcpStream) {
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn write_chunk(stream: &mut TcpStream, body: &str) {
-        stream
-            .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
-            .await
-            .unwrap();
     }
 
     fn sdk_client(endpoint: &str) -> Client<OpenAIConfig> {
@@ -3528,7 +3071,7 @@ mod tests {
             invalid_history.append_final_message(
                 "answer".to_owned(),
                 String::new(),
-                ProviderReplay::new("other", Vec::new()),
+                ProviderReplay::new("openai", Vec::new()),
             );
             let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
             let mut model =
@@ -3668,15 +3211,11 @@ mod tests {
 
     mod streaming {
         use std::sync::{Arc, Mutex};
-        use std::time::Instant;
 
         use tokio::time::timeout;
         use tokio_util::sync::CancellationToken;
 
-        use super::super::{
-            OpenAiModel, PROGRESS_PAYLOAD_LIMIT, PROGRESS_RATE_LIMIT, PresentationBatcher,
-            PresentationKind,
-        };
+        use super::super::OpenAiModel;
         use super::*;
         use crate::config::constants::ACCEPTED_MODEL_CONTENT_LIMIT;
         use crate::model::{
@@ -3709,6 +3248,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),
@@ -3940,86 +3480,6 @@ mod tests {
                     expected_progress
                 );
             }
-        }
-
-        #[test]
-        fn presentation_batcher_emits_pending_content_at_the_next_due_producer_event() {
-            let start = Instant::now();
-            let mut batcher = PresentationBatcher::default();
-            let mut progress = Vec::new();
-            {
-                let mut sink = |event| progress.push(event);
-                batcher.push(
-                    PresentationKind::AssistantText,
-                    "first".to_owned(),
-                    start,
-                    &mut sink,
-                );
-                batcher.push(
-                    PresentationKind::AssistantText,
-                    "later".to_owned(),
-                    start + PROGRESS_RATE_LIMIT / 2,
-                    &mut sink,
-                );
-                batcher.flush_due(
-                    start + PROGRESS_RATE_LIMIT - Duration::from_nanos(1),
-                    &mut sink,
-                );
-            }
-            assert_eq!(
-                progress,
-                vec![ModelProgress::AssistantTextChunk {
-                    text: "first".to_owned(),
-                }]
-            );
-
-            {
-                let mut sink = |event| progress.push(event);
-                batcher.flush_due(start + PROGRESS_RATE_LIMIT, &mut sink);
-            }
-            assert_eq!(
-                progress,
-                vec![
-                    ModelProgress::AssistantTextChunk {
-                        text: "first".to_owned(),
-                    },
-                    ModelProgress::AssistantTextChunk {
-                        text: "later".to_owned(),
-                    },
-                ]
-            );
-        }
-
-        #[test]
-        fn presentation_batcher_emits_four_kib_before_an_explicit_flush() {
-            let start = Instant::now();
-            let full_chunk = "x".repeat(PROGRESS_PAYLOAD_LIMIT);
-            let mut batcher = PresentationBatcher::default();
-            let mut progress = Vec::new();
-            let mut sink = |event| progress.push(event);
-
-            batcher.push(
-                PresentationKind::AssistantText,
-                "first".to_owned(),
-                start,
-                &mut sink,
-            );
-            batcher.push(
-                PresentationKind::AssistantText,
-                full_chunk.clone(),
-                start + PROGRESS_RATE_LIMIT / 2,
-                &mut sink,
-            );
-
-            assert_eq!(
-                progress,
-                vec![
-                    ModelProgress::AssistantTextChunk {
-                        text: "first".to_owned(),
-                    },
-                    ModelProgress::AssistantTextChunk { text: full_chunk },
-                ]
-            );
         }
 
         #[tokio::test]
@@ -4661,6 +4121,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),
@@ -5330,6 +4791,7 @@ mod tests {
                 input_tokens: Some(23),
                 cached_input_tokens: Some(5),
                 cache_write_input_tokens: Some(7),
+                cache_write_1h_input_tokens: 0,
                 output_tokens: Some(11),
                 reasoning_output_tokens: Some(3),
                 total_tokens: Some(34),
@@ -6253,17 +5715,6 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_invalid_stored_replays_without_making_a_request() {
-            let mut provider_mismatch = history("first request");
-            provider_mismatch.append_final_message(
-                "answer".to_owned(),
-                String::new(),
-                ProviderReplay::new(
-                    "other-provider",
-                    vec![OpaqueReplayItem::new(b"{}".to_vec())],
-                ),
-            );
-            provider_mismatch.append_user_request("continue");
-
             let mut malformed_json = history("first request");
             malformed_json.append_final_message(
                 "answer".to_owned(),
@@ -6328,11 +5779,6 @@ mod tests {
 
             for (case, history, expected) in [
                 (
-                    "provider mismatch",
-                    provider_mismatch,
-                    ModelError::InvalidHistory("opaque replay belongs to another provider"),
-                ),
-                (
                     "malformed JSON",
                     malformed_json,
                     ModelError::InvalidHistory("opaque OpenAI replay is malformed"),
@@ -6372,6 +5818,141 @@ mod tests {
             }
         }
 
+        fn anthropic_replay(blocks: &[Value]) -> ProviderReplay {
+            ProviderReplay::new(
+                "anthropic",
+                blocks
+                    .iter()
+                    .map(|block| OpaqueReplayItem::new(serde_json::to_vec(block).unwrap()))
+                    .collect(),
+            )
+        }
+
+        fn cross_provider_history(code_reasoning: &str) -> ModelHistory {
+            let mut history = history("first request");
+            history.append_final_message(
+                "own answer".to_owned(),
+                String::new(),
+                replay(&[message("msg_own", "own answer")]),
+            );
+            history.append_user_request("inspect");
+            history
+                .append_completed_code(
+                    "print(1)".to_owned(),
+                    ModelCallId::new("toolu_1"),
+                    Some("I'll run it.".to_owned()),
+                    code_reasoning.to_owned(),
+                    anthropic_replay(&[
+                        json!({"type": "thinking", "thinking": code_reasoning, "signature": "anthropic-signature"}),
+                        json!({"type": "text", "text": "I'll run it."}),
+                        json!({"type": "tool_use", "id": "toolu_1", "name": "execute_python", "input": {"code": "print(1)"}}),
+                    ]),
+                    CodeResult::execution("1\n".to_owned()),
+                )
+                .unwrap();
+            history.append_final_message(
+                "It printed 1.".to_owned(),
+                "Summarising".to_owned(),
+                anthropic_replay(&[
+                    json!({"type": "redacted_thinking", "data": "anthropic-redacted-data"}),
+                    json!({"type": "text", "text": "It printed 1."}),
+                ]),
+            );
+            history.append_user_request("continue");
+            history
+        }
+
+        #[tokio::test]
+        async fn anthropic_entries_replay_as_assistant_text_and_function_calls_with_their_results()
+        {
+            for (reasoning, code_reasoning, reasoning_texts) in [
+                (
+                    CrossProviderReasoning::Inline,
+                    "Checking the file",
+                    [Some("Checking the file"), Some("Summarising")],
+                ),
+                (
+                    CrossProviderReasoning::Inline,
+                    "",
+                    [None, Some("Summarising")],
+                ),
+                (
+                    CrossProviderReasoning::Drop,
+                    "Checking the file",
+                    [None, None],
+                ),
+            ] {
+                let fixture = Fixture::start_sequence(vec![
+                    FixtureReply::OwnedSse(terminal_stream(
+                        "completed",
+                        vec![message("msg_next", "next")],
+                        Some(usage()),
+                    ));
+                    2
+                ])
+                .await;
+                let mut parent = OpenAiModel::build(
+                    "system prompt".to_owned(),
+                    "fixture-key".to_owned(),
+                    &fixture.endpoint,
+                    reasoning,
+                );
+                let mut child = parent.with_prompt("child prompt".to_owned());
+                let history = cross_provider_history(code_reasoning);
+                let original = history.clone();
+                let cancellation = CancellationToken::new();
+
+                for model in [&mut parent, &mut child] {
+                    model
+                        .step(default_selection(), &history, &cancellation, &mut |_| {})
+                        .await
+                        .unwrap();
+                }
+
+                let assistant_text = |text: &str| json!({"role": "assistant", "content": text});
+                let mut input = vec![
+                    json!({"role": "user", "content": "first request"}),
+                    message("msg_own", "own answer"),
+                    json!({"role": "user", "content": "inspect"}),
+                ];
+                input.extend(reasoning_texts[0].map(assistant_text));
+                input.extend([
+                    assistant_text("I'll run it."),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "toolu_1",
+                        "name": "execute_python",
+                        "arguments": r#"{"code":"print(1)"}"#
+                    }),
+                    json!({"type": "function_call_output", "call_id": "toolu_1", "output": "1\n"}),
+                ]);
+                input.extend(reasoning_texts[1].map(assistant_text));
+                input.extend([
+                    assistant_text("It printed 1."),
+                    json!({"role": "user", "content": "continue"}),
+                ]);
+                let requests = fixture.requests.lock().unwrap().clone();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.body.clone())
+                        .collect::<Vec<_>>(),
+                    [
+                        expected_request("system prompt", json!(input)),
+                        expected_request("child prompt", json!(input)),
+                    ],
+                    "{reasoning:?} {code_reasoning:?}"
+                );
+                for request in &requests {
+                    let body = request.body.to_string();
+                    for opaque in ["anthropic-signature", "anthropic-redacted-data", "thinking"] {
+                        assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+                    }
+                }
+                assert_eq!(history, original);
+            }
+        }
+
         #[tokio::test]
         async fn validate_history_accepts_valid_replay_and_rejects_invalid_replay_without_http() {
             let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
@@ -6399,9 +5980,7 @@ mod tests {
             assert_eq!(model.validate_history(&valid, default_selection()), Ok(()));
             assert_eq!(
                 model.validate_history(&foreign, default_selection()),
-                Err(ModelError::InvalidHistory(
-                    "opaque replay belongs to another provider"
-                ))
+                Ok(())
             );
             assert_eq!(
                 model.validate_history(&mismatched, default_selection()),
@@ -6478,8 +6057,12 @@ mod tests {
     const LIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
     const LIVE_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
     const LIVE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-    const LIVE_SETUP_CONFIGURATION: &str =
+    const LIVE_SETUP_OPENAI: &str =
         "live test requires OPENAI_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+    const LIVE_SETUP_ANTHROPIC: &str =
+        "live test requires ANTHROPIC_API_KEY and an absolute MONTY_BIN for monty-runtime 0.0.22";
+    const LIVE_SETUP_MODEL: &str =
+        "live test effective model is not the required model; set KIKI_MODEL to select it";
     const LIVE_SETUP_READ_TOOL: &str =
         "live test could not initialise the workspace read capability";
     const LIVE_SETUP_ARENA: &str = "live test could not initialise the Monty arena";
@@ -6489,7 +6072,7 @@ mod tests {
     const LIVE_OUTER_DEADLINE: &str = "live scenario exceeded its five-minute deadline";
     const LIVE_STEP_LIMIT: &str = "live first run exceeded eight model steps";
     const LIVE_FIRST_SETTLEMENT: &str = "live first run did not settle correctly";
-    const LIVE_SECOND_START: &str = "live cancellation run did not start an OpenAI attempt";
+    const LIVE_SECOND_START: &str = "live cancellation run did not start a provider attempt";
     const LIVE_SECOND_SETTLEMENT: &str = "live cancellation run did not settle correctly";
     const LIVE_THIRD_SETTLEMENT: &str = "live follow-up run did not settle correctly";
     const LIVE_CLEANUP_SHUTDOWN: &str = "live test could not request runtime shutdown";
@@ -6769,23 +6352,35 @@ mod tests {
         third_run_id: crate::runtime::RunId,
     }
 
-    async fn start_live_controller() -> Result<LiveController, &'static str> {
+    async fn start_live_controller(
+        required_model: &'static crate::config::ModelConfiguration,
+    ) -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
+        let effective_model = configuration.snapshot().model();
+        if required_model.id != effective_model.id {
+            return Err(LIVE_SETUP_MODEL);
+        }
+        let setup_failure = match effective_model.provider() {
+            Provider::OpenAi => LIVE_SETUP_OPENAI,
+            Provider::Anthropic => LIVE_SETUP_ANTHROPIC,
+        };
         let persisted_settings = configuration.snapshot().settings().clone();
-        let (worker_path, workspace_root, prompt, prompt_base, api_key, selection, policy) = {
-            let ready = configuration.ready().ok_or(LIVE_SETUP_CONFIGURATION)?;
+        let (worker_path, workspace_root, model, prompt_base, selection, policy) = {
+            let ready = configuration.ready().ok_or(setup_failure)?;
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
-                ready.system_prompt().to_owned(),
+                crate::production_model(
+                    &ready,
+                    persisted_settings.anthropic_cache_ttl(),
+                    persisted_settings.cross_provider_reasoning(),
+                ),
                 ready.prompt_base().to_owned(),
-                ready.api_key().expose().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),
                 configuration.snapshot().subagents(),
             )
         };
-        let model = super::OpenAiModel::new(prompt, api_key.clone());
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
@@ -6796,7 +6391,7 @@ mod tests {
             crate::subagents::SubagentPolicy::from(policy),
             Arc::new(crate::subagents::CompleteChildRunner::new(
                 prompt_base,
-                super::OpenAiChildModelFactory::new(api_key.clone()),
+                model.clone(),
             )),
         );
         let runtime = crate::runtime::RuntimeController::new(
@@ -7173,8 +6768,10 @@ mod tests {
         }
     }
 
-    async fn run_live_sol_smoke_test() -> Result<(), &'static str> {
-        let mut controller = start_live_controller().await?;
+    pub(crate) async fn run_live_smoke_test(
+        required_model: &'static crate::config::ModelConfiguration,
+    ) -> Result<(), &'static str> {
+        let mut controller = start_live_controller(required_model).await?;
         let scenario = match timeout(LIVE_OUTER_TIMEOUT, run_live_scenario(&mut controller)).await {
             Ok(result) => result,
             Err(_) => Err(LIVE_OUTER_DEADLINE),
@@ -7188,9 +6785,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires explicit OPENAI_API_KEY and MONTY_BIN"]
+    #[ignore = "requires explicit OPENAI_API_KEY, KIKI_MODEL=openai/gpt-5.6-sol and MONTY_BIN"]
     async fn live_sol() {
-        if let Err(message) = run_live_sol_smoke_test().await {
+        if let Err(message) = run_live_smoke_test(&SOL).await {
             panic!("{message}");
         }
     }

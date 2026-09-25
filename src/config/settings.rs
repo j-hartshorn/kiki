@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use tempfile::NamedTempFile;
@@ -23,8 +24,28 @@ const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
 const USER_SETTINGS_LABEL: &str = "user settings file `~/.kiki/config.toml`";
 const PROJECT_SETTINGS_LABEL: &str = "project settings file `.kiki/config.toml`";
-const MODEL_REMEDIATION: &str = "Set it to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or remove it, then restart Kiki.";
-const ENVIRONMENT_MODEL_REMEDIATION: &str = "Set KIKI_MODEL to a supported qualified model id (openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, openai/gpt-5.6-luna) or leave it unset, then restart Kiki.";
+static MODEL_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Set it to a supported qualified model id ({}) or remove it, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+static ENVIRONMENT_MODEL_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Set KIKI_MODEL to a supported qualified model id ({}) or leave it unset, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+static THINKING_KEY_REMEDIATION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Use only supported qualified model ids ({}) as [thinking] keys, then restart Kiki.",
+        supported_model_ids()
+    )
+});
+
+fn supported_model_ids() -> String {
+    super::models::CATALOGUE.map(|model| model.id).join(", ")
+}
 
 pub(crate) struct Input {
     pub(crate) home: Option<OsString>,
@@ -143,6 +164,20 @@ impl CompactionSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CacheTtl {
+    #[default]
+    FiveMinutes,
+    OneHour,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CrossProviderReasoning {
+    #[default]
+    Inline,
+    Drop,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SettingsContext {
     user_path: Option<PathBuf>,
@@ -152,6 +187,8 @@ pub(crate) struct SettingsContext {
     thinking: BTreeMap<&'static str, PersistedThinking>,
     environment_thinking_model: Option<&'static str>,
     compaction: CompactionSettings,
+    anthropic_cache_ttl: CacheTtl,
+    cross_provider_reasoning: CrossProviderReasoning,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -177,6 +214,8 @@ impl fmt::Debug for SettingsContext {
                 &self.environment_thinking_model,
             )
             .field("compaction", &self.compaction)
+            .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
+            .field("cross_provider_reasoning", &self.cross_provider_reasoning)
             .finish()
     }
 }
@@ -206,6 +245,14 @@ impl SettingsContext {
 
     pub(crate) fn compaction(&self) -> CompactionSettings {
         self.compaction
+    }
+
+    pub(crate) fn anthropic_cache_ttl(&self) -> CacheTtl {
+        self.anthropic_cache_ttl
+    }
+
+    pub(crate) fn cross_provider_reasoning(&self) -> CrossProviderReasoning {
+        self.cross_provider_reasoning
     }
 
     pub(crate) fn save_model(
@@ -453,6 +500,14 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         &mut subagents,
     );
     apply_compaction_layer(project.as_ref(), &mut compaction);
+    let anthropic_cache_ttl = [&project, &user]
+        .into_iter()
+        .find_map(|layer| layer.as_ref()?.anthropic_cache_ttl)
+        .unwrap_or_default();
+    let cross_provider_reasoning = [&project, &user]
+        .into_iter()
+        .find_map(|layer| layer.as_ref()?.cross_provider_reasoning)
+        .unwrap_or_default();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -479,7 +534,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                 problems.push(environment_problem(
                     StartupProblemKind::ModelInvalidUnicode,
                     "KIKI_MODEL is not valid Unicode.",
-                    ENVIRONMENT_MODEL_REMEDIATION,
+                    &ENVIRONMENT_MODEL_REMEDIATION,
                 ));
                 false
             }
@@ -493,7 +548,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
                     problems.push(environment_problem(
                         StartupProblemKind::ModelUnknown,
                         "KIKI_MODEL is not a supported qualified model id.",
-                        ENVIRONMENT_MODEL_REMEDIATION,
+                        &ENVIRONMENT_MODEL_REMEDIATION,
                     ));
                     false
                 }
@@ -549,6 +604,8 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             thinking,
             environment_thinking_model,
             compaction,
+            anthropic_cache_ttl,
+            cross_provider_reasoning,
         },
         problems,
     }
@@ -670,19 +727,32 @@ fn validate_document(
                 Some(model) => settings.model = Some(model),
                 None if item.as_str().is_some() => problems.push(
                     "field `model` must be a supported qualified model id",
-                    MODEL_REMEDIATION,
+                    &MODEL_REMEDIATION,
                 ),
                 None => problems.push(
                     "field `model` must be a string containing a supported qualified model id",
-                    MODEL_REMEDIATION,
+                    &MODEL_REMEDIATION,
                 ),
             },
             "favourites" => validate_favourites(item, &mut settings.favourites, &mut problems),
             "thinking" => validate_thinking_table(item, &mut settings.thinking, &mut problems),
             "subagents" => validate_subagents_table(item, &mut settings.subagents, &mut problems),
             "compaction" => validate_compaction_table(item, &mut settings.compaction, &mut problems),
+            "anthropic" => {
+                validate_anthropic_table(item, &mut settings.anthropic_cache_ttl, &mut problems);
+            }
+            "cross_provider_reasoning" => match item.as_str() {
+                Some("inline") => {
+                    settings.cross_provider_reasoning = Some(CrossProviderReasoning::Inline);
+                }
+                Some("drop") => settings.cross_provider_reasoning = Some(CrossProviderReasoning::Drop),
+                _ => problems.push(
+                    "field `cross_provider_reasoning` must be \"inline\" or \"drop\"",
+                    "Set it to \"inline\" or \"drop\", then restart Kiki.",
+                ),
+            },
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `[thinking]`, `[subagents]`, and `[compaction]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -751,8 +821,8 @@ fn validate_thinking_table(
     for (key, item) in table.iter() {
         let Some(model) = model_by_id(key) else {
             problems.push(
-                "field `thinking` contains an unknown model key; use openai/gpt-6-astra, openai/gpt-6-sol, openai/gpt-6-luna, openai/gpt-5.6-sol, openai/gpt-5.6-terra, or openai/gpt-5.6-luna",
-                "Use only supported qualified model ids as [thinking] keys, then restart Kiki.",
+                "field `thinking` contains an unknown model key",
+                &THINKING_KEY_REMEDIATION,
             );
             continue;
         };
@@ -853,6 +923,37 @@ fn validate_compaction_table(
             _ => problems.push(
                 "table `compaction` contains an unknown key; only `reserve_tokens` and `keep_recent_tokens` are allowed",
                 "Remove the unknown key from table `compaction`, then restart Kiki.",
+            ),
+        }
+    }
+}
+
+fn validate_anthropic_table(
+    item: &Item,
+    cache_ttl: &mut Option<CacheTtl>,
+    problems: &mut DocumentProblems,
+) {
+    let Some(table) = item.as_table() else {
+        problems.push(
+            "field `anthropic` must be a TOML table",
+            "Use [anthropic] with supported settings, then restart Kiki.",
+        );
+        return;
+    };
+
+    for (key, item) in table.iter() {
+        match key {
+            "cache_ttl" => match item.as_str() {
+                Some("5m") => *cache_ttl = Some(CacheTtl::FiveMinutes),
+                Some("1h") => *cache_ttl = Some(CacheTtl::OneHour),
+                _ => problems.push(
+                    "field `anthropic.cache_ttl` must be \"5m\" or \"1h\"",
+                    "Set it to \"5m\" or \"1h\", then restart Kiki.",
+                ),
+            },
+            _ => problems.push(
+                "table `anthropic` contains an unknown key; only `cache_ttl` is allowed",
+                "Remove the unknown key from table `anthropic`, then restart Kiki.",
             ),
         }
     }
@@ -963,6 +1064,8 @@ struct FileSettings {
     thinking: BTreeMap<&'static str, &'static str>,
     subagents: FileSubagentSettings,
     compaction: FileCompactionSettings,
+    anthropic_cache_ttl: Option<CacheTtl>,
+    cross_provider_reasoning: Option<CrossProviderReasoning>,
 }
 
 #[derive(Default)]
@@ -1157,10 +1260,12 @@ mod tests {
     use crate::config::{
         ModelSelection,
         constants::{SUBAGENT_TIMER_HEADROOM, latest_representable_instant},
-        models::{ASTRA, LUNA, SOL, TERRA},
+        models::{ASTRA, CATALOGUE, LUNA, SOL, TERRA},
     };
 
-    use super::{Input, SessionPreferences, SubagentSettings, resolve};
+    use super::{
+        CacheTtl, CrossProviderReasoning, Input, SessionPreferences, SubagentSettings, resolve,
+    };
 
     #[test]
     fn astra_uses_low_by_default_and_openai_models_reject_none() {
@@ -1318,6 +1423,219 @@ mod tests {
             9_223_372_036_854_775_807
         );
         assert!(resolution.problems().is_empty());
+    }
+
+    #[test]
+    fn anthropic_cache_ttl_defaults_to_five_minutes_and_project_overrides_user() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            defaults.context().anthropic_cache_ttl(),
+            CacheTtl::FiveMinutes
+        );
+        assert!(defaults.problems().is_empty());
+
+        write_settings(home.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        for (project_content, expected) in [
+            ("", CacheTtl::OneHour),
+            ("[anthropic]\n", CacheTtl::OneHour),
+            ("[anthropic]\ncache_ttl = \"5m\"\n", CacheTtl::FiveMinutes),
+        ] {
+            write_settings(project.path(), project_content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(
+                resolution.context().anthropic_cache_ttl(),
+                expected,
+                "{project_content}"
+            );
+            assert!(resolution.problems().is_empty(), "{project_content}");
+        }
+
+        write_settings(home.path(), "");
+        write_settings(project.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        let project_only = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            project_only.context().anthropic_cache_ttl(),
+            CacheTtl::OneHour
+        );
+    }
+
+    #[test]
+    fn invalid_anthropic_settings_discard_their_whole_layer() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for (content, diagnostic) in [
+            (
+                "[anthropic]\ncache_ttl = \"secret-ttl\"\n",
+                "anthropic.cache_ttl",
+            ),
+            ("[anthropic]\ncache_ttl = \"1H\"\n", "anthropic.cache_ttl"),
+            ("[anthropic]\ncache_ttl = 60\n", "anthropic.cache_ttl"),
+            ("[anthropic]\ncache_ttl = [\"1h\"]\n", "anthropic.cache_ttl"),
+            ("anthropic = \"1h\"\n", "field `anthropic`"),
+            ("[[anthropic]]\ncache_ttl = \"1h\"\n", "field `anthropic`"),
+            ("[anthropic]\nunknown = true\n", "table `anthropic`"),
+            (
+                "[anthropic]\ncache_ttl = \"1h\"\nttl = \"1h\"\n",
+                "table `anthropic`",
+            ),
+        ] {
+            write_settings(
+                home.path(),
+                &format!("model = \"openai/gpt-5.6-terra\"\n{content}"),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(resolution.model().id, SOL.id, "{content}");
+            assert_eq!(
+                resolution.context().anthropic_cache_ttl(),
+                CacheTtl::FiveMinutes,
+                "{content}"
+            );
+            let [problem] = resolution.problems() else {
+                panic!("expected one problem for {content}");
+            };
+            assert_eq!(
+                problem.kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{content}"
+            );
+            assert!(problem.diagnostic().contains(diagnostic), "{content}");
+            assert!(!problem.diagnostic().contains("secret-ttl"));
+        }
+
+        write_settings(home.path(), "[anthropic]\ncache_ttl = \"1h\"\n");
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\n[anthropic]\ncache_ttl = \"5m\"\nunknown = true\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_eq!(resolution.model().id, SOL.id);
+        assert_eq!(
+            resolution.context().anthropic_cache_ttl(),
+            CacheTtl::OneHour
+        );
+        assert_eq!(
+            resolution
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [crate::config::StartupProblemKind::ProjectSettingsInvalid]
+        );
+    }
+
+    #[test]
+    fn cross_provider_reasoning_defaults_to_inline_and_project_overrides_user() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            defaults.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Inline
+        );
+        assert!(defaults.problems().is_empty());
+
+        write_settings(home.path(), "cross_provider_reasoning = \"drop\"\n");
+        for (project_content, expected) in [
+            ("", CrossProviderReasoning::Drop),
+            (
+                "cross_provider_reasoning = \"inline\"\n",
+                CrossProviderReasoning::Inline,
+            ),
+        ] {
+            write_settings(project.path(), project_content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(
+                resolution.context().cross_provider_reasoning(),
+                expected,
+                "{project_content}"
+            );
+            assert!(resolution.problems().is_empty(), "{project_content}");
+        }
+
+        write_settings(home.path(), "");
+        write_settings(project.path(), "cross_provider_reasoning = \"drop\"\n");
+        let project_only = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            project_only.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Drop
+        );
+    }
+
+    #[test]
+    fn invalid_cross_provider_reasoning_discards_its_whole_layer() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for value in [
+            "\"secret-mode\"",
+            "\"Drop\"",
+            "\"\"",
+            "true",
+            "[\"drop\"]",
+            "{ mode = \"drop\" }",
+        ] {
+            write_settings(
+                home.path(),
+                &format!("model = \"openai/gpt-5.6-terra\"\ncross_provider_reasoning = {value}\n"),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(resolution.model().id, SOL.id, "{value}");
+            assert_eq!(
+                resolution.context().cross_provider_reasoning(),
+                CrossProviderReasoning::Inline,
+                "{value}"
+            );
+            let [problem] = resolution.problems() else {
+                panic!("expected one problem for {value}");
+            };
+            assert_eq!(
+                problem.kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{value}"
+            );
+            assert!(
+                problem
+                    .diagnostic()
+                    .contains("field `cross_provider_reasoning`"),
+                "{value}"
+            );
+            assert!(!problem.diagnostic().contains("secret-mode"));
+        }
+
+        write_settings(home.path(), "cross_provider_reasoning = \"drop\"\n");
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\ncross_provider_reasoning = \"inline\"\nunknown = true\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_eq!(resolution.model().id, SOL.id);
+        assert_eq!(
+            resolution.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Drop
+        );
+        let [problem] = resolution.problems() else {
+            panic!("expected one project problem");
+        };
+        assert_eq!(
+            problem.kind(),
+            crate::config::StartupProblemKind::ProjectSettingsInvalid
+        );
+        assert!(
+            problem.diagnostic().contains("`cross_provider_reasoning`"),
+            "{}",
+            problem.diagnostic()
+        );
     }
 
     #[test]
@@ -1821,6 +2139,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             [crate::config::StartupProblemKind::ModelUnknown]
         );
+    }
+
+    #[test]
+    fn unknown_model_remediations_list_every_catalogue_model_id() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let untrusted = "openai/typo-SECRET";
+        write_settings(home.path(), &format!("model = \"{untrusted}\"\n"));
+        let file_model = resolve(input(Some(home.path()), Some(project.path())));
+        let mut environment = input(None, Some(project.path()));
+        environment.model = Some(OsString::from(untrusted));
+        let environment_model = resolve(environment);
+        write_settings(
+            home.path(),
+            &format!("[thinking]\n\"{untrusted}\" = \"high\"\n"),
+        );
+        let thinking_key = resolve(input(Some(home.path()), Some(project.path())));
+
+        for resolution in [file_model, environment_model, thinking_key] {
+            let problem = &resolution.problems()[0];
+            let remediation = problem.remediation();
+            for model in CATALOGUE {
+                assert!(
+                    remediation.contains(model.id),
+                    "{remediation} should list {}",
+                    model.id
+                );
+            }
+            assert!(
+                !problem.diagnostic().contains("SECRET"),
+                "{}",
+                problem.diagnostic()
+            );
+            assert!(!remediation.contains("SECRET"), "{remediation}");
+        }
     }
 
     #[test]

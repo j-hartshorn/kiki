@@ -10,7 +10,9 @@ use crate::agent::{
     TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
-use crate::config::{CompactionSettings, ModelSelection, settings::SettingsContext};
+use crate::config::{
+    CompactionSettings, ModelSelection, models::Provider, settings::SettingsContext,
+};
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
@@ -140,9 +142,19 @@ pub(crate) enum Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeDisabledReason {
     OpenAiAuthentication,
+    AnthropicAuthentication,
     ArenaCheckpointRecoveryFailed,
     SessionStorageWriteFailed,
     SessionRestoreFailed,
+}
+
+impl RuntimeDisabledReason {
+    fn authentication(provider: Provider) -> Self {
+        match provider {
+            Provider::OpenAi => Self::OpenAiAuthentication,
+            Provider::Anthropic => Self::AnthropicAuthentication,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +422,7 @@ struct PendingCompaction {
 
 struct ActiveRun<M: Model> {
     operation: ForegroundOperation,
+    provider: Provider,
     run_id: Option<RunId>,
     request_entry: Option<SessionEntryId>,
     correction_requested: bool,
@@ -936,6 +949,11 @@ impl<M: Model> RuntimeController<M> {
         self
     }
 
+    pub(crate) fn with_providers(mut self, providers: Vec<Provider>) -> Self {
+        self.accepted_thinking = self.accepted_thinking.with_providers(providers);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve_child_selection(
         &self,
@@ -1374,6 +1392,7 @@ impl<M: Model> RuntimeController<M> {
                 self.disable_session_storage(events).await;
             }
             RuntimeDisabledReason::OpenAiAuthentication
+            | RuntimeDisabledReason::AnthropicAuthentication
             | RuntimeDisabledReason::SessionRestoreFailed => {
                 unreachable!("restoration only disables for Arena or storage recovery")
             }
@@ -1553,6 +1572,7 @@ impl<M: Model> RuntimeController<M> {
         drop(worker_task);
         self.active = Some(ActiveRun {
             operation: ForegroundOperation::Compaction,
+            provider: selection.model().provider(),
             run_id: None,
             request_entry: None,
             correction_requested: false,
@@ -1784,6 +1804,7 @@ impl<M: Model> RuntimeController<M> {
         drop(worker_task);
         self.active = Some(ActiveRun {
             operation: ForegroundOperation::Run,
+            provider: selection.model().provider(),
             run_id: None,
             request_entry: None,
             correction_requested: false,
@@ -2058,26 +2079,33 @@ impl<M: Model> RuntimeController<M> {
                         let run_id = RunId(outcome.run_id);
                         let record = record_from_persisted_terminal(outcome.terminal);
                         let settlement = root_settlement(&record);
-                        let disabled_reason = outcome
-                            .recovery_failure
-                            .then_some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed)
-                            .or_else(|| {
-                                outcome
-                                    .authentication_failure
-                                    .then_some(RuntimeDisabledReason::OpenAiAuthentication)
-                            });
-                        let (correction_requested, request_entry, caller, persisted_model_steps) = {
+                        let (
+                            provider,
+                            correction_requested,
+                            request_entry,
+                            caller,
+                            persisted_model_steps,
+                        ) = {
                             let active = self
                                 .active
                                 .as_ref()
                                 .expect("finished run remains active until settlement");
                             (
+                                active.provider,
                                 active.correction_requested,
                                 active.request_entry,
                                 active.caller.clone(),
                                 active.persisted_model_steps.clone(),
                             )
                         };
+                        let disabled_reason = outcome
+                            .recovery_failure
+                            .then_some(RuntimeDisabledReason::ArenaCheckpointRecoveryFailed)
+                            .or_else(|| {
+                                outcome
+                                    .authentication_failure
+                                    .then(|| RuntimeDisabledReason::authentication(provider))
+                            });
                         let correction = correction_requested
                             && matches!(&record, Record::CancelledRun { .. })
                             && self.disabled_reason.is_none()
@@ -2333,13 +2361,15 @@ mod tests {
         runtime_event_payload_bytes,
     };
     use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
+    use crate::anthropic::AnthropicModel;
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
         ToolCall, ToolCallSummary, ToolName,
     };
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
-        models::{LUNA, SOL, TERRA},
+        models::{LUNA, OPUS_5_5, Provider, SOL, TERRA},
+        settings::{CacheTtl, CrossProviderReasoning},
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -2347,11 +2377,13 @@ mod tests {
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
         ScriptedAction as ModelAction, ScriptedModel, SummaryRequest, SummaryResult,
     };
+    use crate::openai::OpenAiModel;
     use crate::session::{
         CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, RestoredRecord,
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
         SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
+    use crate::sse_fixture::{Fixture, FixtureReply};
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
         CompleteChildRunner, RunnerFuture, SessionSubagents, StartSubagentTestGate,
@@ -2556,6 +2588,7 @@ mod tests {
             input_tokens: Some(input_tokens),
             cached_input_tokens: Some(cached_input_tokens),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(output_tokens),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(input_tokens + output_tokens),
@@ -3903,6 +3936,7 @@ mod tests {
                 mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             controller.active = Some(ActiveRun {
                 operation: ForegroundOperation::Run,
+                provider: controller.selection.model().provider(),
                 run_id: Some(RunId(admission.run_id)),
                 request_entry: Some(admission.request_entry),
                 correction_requested: false,
@@ -6240,6 +6274,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             operation: ForegroundOperation::Run,
+            provider: controller.selection.model().provider(),
             run_id: None,
             request_entry: None,
             correction_requested: false,
@@ -10047,6 +10082,7 @@ mod tests {
         let (_worker_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         controller.active = Some(ActiveRun {
             operation: ForegroundOperation::Run,
+            provider: controller.selection.model().provider(),
             run_id: Some(RunId(1)),
             request_entry: None,
             correction_requested: false,
@@ -11177,6 +11213,7 @@ mod tests {
             let (_progress_sender, progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             controller.active = Some(ActiveRun {
                 operation: ForegroundOperation::Run,
+                provider: controller.selection.model().provider(),
                 run_id: Some(RunId(1)),
                 request_entry: Some(SessionEntryId(1)),
                 correction_requested: false,
@@ -13212,6 +13249,474 @@ mod tests {
         assert_eq!(shutdown_controller(commands, task).await.len(), 2);
     }
 
+    struct GatedAuthenticationFailureModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Model for GatedAuthenticationFailureModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            _selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                Err(provider_failure(401))
+            }
+        }
+    }
+
+    async fn authentication_failure_after_mid_run_selection(
+        run: ModelSelection,
+        accepted_mid_run: ModelSelection,
+    ) -> Vec<RuntimeEvent> {
+        let workspace = tempfile::tempdir().unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let controller = controller_with_model(
+            &workspace,
+            GatedAuthenticationFailureModel {
+                started: started.clone(),
+                release: release.clone(),
+            },
+        )
+        .await
+        .with_selection(run);
+        let (commands, mut events, _progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: accepted_mid_run,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        while next_event(&mut events).await != (RuntimeEvent::SettingsAccepted { revision: 1 }) {}
+        release.notify_one();
+        let settled = events_until_settled(&mut events).await;
+        shutdown_controller(commands, task).await;
+        settled
+    }
+
+    #[tokio::test]
+    async fn anthropic_authentication_failure_after_an_accepted_openai_selection_disables_as_anthropic()
+     {
+        let settled = authentication_failure_after_mid_run_selection(
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+        )
+        .await;
+
+        let disabled = settled
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RuntimeDisabled { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disabled,
+            [RuntimeDisabledReason::AnthropicAuthentication],
+            "{settled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_authentication_failure_after_an_accepted_anthropic_selection_disables_as_openai()
+     {
+        let settled = authentication_failure_after_mid_run_selection(
+            ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
+        )
+        .await;
+
+        let disabled = settled
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::RuntimeDisabled { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disabled,
+            [RuntimeDisabledReason::OpenAiAuthentication],
+            "{settled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_anthropic_authentication_failure_keeps_the_key_and_request_metadata_private() {
+        const KEY: &str = "sk-ant-runtime-hostile-credential";
+        const METADATA: &str = "req_runtime_hostile_metadata";
+        let fixture = Fixture::start(FixtureReply::OwnedStatus {
+            code: 401,
+            headers: vec![("request-id".to_owned(), METADATA.to_owned())],
+            body: serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": format!("invalid x-api-key {KEY}")
+                },
+                "request_id": METADATA
+            })
+            .to_string(),
+        })
+        .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut controller = controller_with_model(
+            &workspace,
+            AnthropicModel::with_endpoint(
+                "system prompt",
+                KEY,
+                &fixture.endpoint,
+                CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline,
+            ),
+        )
+        .await
+        .with_selection(ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap());
+        let home = controller.test_home.take().expect("persisted test home");
+        let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+        let (commands, mut events, mut progress, task) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        let settled = events_until_settled(&mut events).await;
+        let progress = drain_progress(&mut progress);
+        let records = shutdown_controller(commands, task).await;
+
+        assert_eq!(fixture.request_count(), 1);
+        assert!(
+            settled.contains(&RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::AnthropicAuthentication,
+            }),
+            "{settled:?}"
+        );
+        let [
+            _,
+            StoredRecord {
+                record: Record::FailedRun { message, .. },
+                ..
+            },
+        ] = records.as_slice()
+        else {
+            panic!("expected a failed Run after the request: {records:?}");
+        };
+        assert_eq!(
+            message,
+            "model provider failed: authentication failure (HTTP 401) [authentication_error]: invalid x-api-key [REDACTED]"
+        );
+
+        let mut transcript = Transcript::default();
+        for event in settled.iter().cloned() {
+            transcript.apply(event, false);
+        }
+        let layout = transcript.layout(1024);
+        let height = u16::try_from(layout.total_height()).expect("test transcript height");
+        let mut buffer =
+            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
+        layout.render(buffer.area, 0, &mut buffer);
+        let rendered = buffer
+            .content
+            .chunks(1024)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            transcript.status(),
+            "Anthropic authentication failed; restart Kiki"
+        );
+        assert!(
+            rendered.contains("invalid x-api-key [REDACTED]"),
+            "{rendered}"
+        );
+
+        let observable = format!("{settled:?}\n{progress:?}\n{records:?}\n{rendered}");
+        assert!(!observable.contains(KEY), "{observable}");
+        assert!(!observable.contains(METADATA), "{observable}");
+
+        let session = Session::open(home.path(), &session_id).expect("reopen failed session");
+        let restored = session.restore().expect("restore failed Run");
+        assert_eq!(
+            restored_initial_state(&restored).timeline,
+            records
+                .into_iter()
+                .map(RestoredTimelineItem::Record)
+                .collect::<Vec<_>>()
+        );
+        session.close().expect("close failed session");
+        for entry in fs::read_dir(home.path().join(".kiki/sessions")).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            for secret in [KEY, METADATA] {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "{} persisted {secret}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn openai_completed(output: serde_json::Value) -> FixtureReply {
+        FixtureReply::OwnedSse(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "service_tier": "default",
+                    "output": output,
+                    "usage": {
+                        "input_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                        "output_tokens": 1,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 2
+                    }
+                }
+            })
+        ))
+    }
+
+    fn anthropic_message(text: &str) -> FixtureReply {
+        FixtureReply::OwnedSse(
+            [
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_anthropic",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-opus-5-5",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }
+                }),
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 1}
+                }),
+                serde_json::json!({"type": "message_stop"}),
+            ]
+            .iter()
+            .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+            .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_saved_openai_session_reopens_and_continues_on_anthropic_from_semantic_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let openai = Fixture::start_sequence(vec![
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Checking the sum"}],
+                    "encrypted_content": "openai-encrypted-code",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll add them.", "annotations": []}],
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "arguments": r#"{"code":"print(40 + 2)"}"#,
+                    "status": "completed"
+                }
+            ])),
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "Reporting the sum"}],
+                    "encrypted_content": "openai-encrypted-final",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The sum is 42.", "annotations": []}],
+                    "status": "completed"
+                }
+            ])),
+        ])
+        .await;
+        let mut controller = controller_with_model(
+            &workspace,
+            OpenAiModel::with_endpoint("system prompt", "openai-key", &openai.endpoint),
+        )
+        .await
+        .with_selection(ModelSelection::new(&SOL, SOL.default_thinking).unwrap());
+        let home = controller.test_home.take().expect("persisted test home");
+        let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "add 40 and 2".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "The sum is 42."
+            ),
+            "{records:?}"
+        );
+        assert_eq!(openai.request_count(), 2);
+
+        let session = Session::open(home.path(), &session_id).expect("reopen OpenAI session");
+        let saved_history = session
+            .restore()
+            .expect("restore OpenAI session")
+            .executable
+            .expect("executable OpenAI session")
+            .history;
+        let feedback = saved_history
+            .entries()
+            .iter()
+            .find_map(ModelContextEntry::completed_code)
+            .expect("saved completed code")
+            .result()
+            .feedback()
+            .to_owned();
+        assert!(feedback.contains("42"), "{feedback}");
+        let anthropic = Fixture::start(anthropic_message("Still 42.")).await;
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            AnthropicModel::with_endpoint(
+                "system prompt",
+                "anthropic-key",
+                &anthropic.endpoint,
+                CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline,
+            ),
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions::default(),
+        )
+        .await
+        .expect("restore on Anthropic");
+        assert_eq!(initial.disabled_reason, None);
+
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "double-check".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "Still 42."
+            ),
+            "{records:?}"
+        );
+        let body = anthropic.request().body;
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "add 40 and 2"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Checking the sum"},
+                        {"type": "text", "text": "I'll add them."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "execute_python",
+                            "input": {"code": "print(40 + 2)"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": feedback}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Reporting the sum"},
+                        {"type": "text", "text": "The sum is 42."}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "double-check",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ])
+        );
+        let body = body.to_string();
+        for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
+            assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+        }
+        session.close().expect("close session");
+    }
+
     fn persisted_settings(
         home: &tempfile::TempDir,
         workspace: &Path,
@@ -13289,6 +13794,43 @@ mod tests {
             AcceptedThinking::new(root, persisted_settings(&home, workspace.path()), None);
 
         assert_eq!(accepted.resolve(child, None), child);
+    }
+
+    #[tokio::test]
+    async fn relayed_provider_set_rejects_keyless_subagent_models() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (commands, mut events, _progress, controller) = start_controller(
+            controller(
+                &workspace,
+                vec![
+                    ModelAction::Code {
+                        source: "try:\n    await start_subagent('child', 'anthropic/claude-opus-5-5')\n    outcome = 'started'\nexcept ValueError as error:\n    outcome = str(error)\noutcome".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .with_providers(vec![Provider::OpenAi]),
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "start a child".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, controller).await;
+
+        let outcome = result_head(completed_execution(&records, RunId(1), ModelStepId(1)));
+        assert!(outcome.contains("ANTHROPIC_API_KEY"), "{outcome}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SubagentSpawned { .. }))
+        );
     }
 
     #[tokio::test]

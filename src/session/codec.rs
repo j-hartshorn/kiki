@@ -336,6 +336,8 @@ struct StoredModelUsage {
     input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
     cache_write_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_write_1h_input_tokens: u64,
     output_tokens: Option<u64>,
     reasoning_output_tokens: Option<u64>,
     total_tokens: Option<u64>,
@@ -1498,6 +1500,7 @@ fn encode_usage(usage: &ModelUsage) -> StoredModelUsage {
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
+        cache_write_1h_input_tokens: usage.cache_write_1h_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
@@ -1511,6 +1514,7 @@ fn decode_usage(usage: &StoredModelUsage) -> ModelUsage {
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_input_tokens: usage.cache_write_input_tokens,
+        cache_write_1h_input_tokens: usage.cache_write_1h_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
@@ -1673,7 +1677,7 @@ mod tests {
     use super::{
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
         decode_path, decode_request, decode_session_preferences, decode_task_details,
-        decode_task_record_details, decode_tool_value, decoded_compaction,
+        decode_task_record_details, decode_tool_value, decoded_attempts, decoded_compaction,
         decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
         decoded_request, decoded_request_selection, decoded_terminal_history, encode_checkpoint,
         encode_compaction, encode_execution, encode_execution_value, encode_path, encode_request,
@@ -1686,6 +1690,7 @@ mod tests {
         models::{SOL, TERRA},
     };
     use crate::model::{AttemptAccounting, ModelUsage};
+    use crate::pricing::{RunCostEstimate, estimate_run_cost, estimate_usage};
     use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
     use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
@@ -1698,6 +1703,7 @@ mod tests {
             input_tokens: Some(1),
             cached_input_tokens: Some(2),
             cache_write_input_tokens: Some(3),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(4),
             reasoning_output_tokens: Some(5),
             total_tokens: Some(6),
@@ -1785,6 +1791,53 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn stored_usage_round_trips_1h_cache_writes_and_decodes_legacy_usage_as_zero() {
+        let usage = ModelUsage {
+            model: "openai/gpt-5.6-sol".to_owned(),
+            service_tier: Some("default".to_owned()),
+            input_tokens: Some(200_000),
+            cached_input_tokens: Some(40_000),
+            cache_write_input_tokens: Some(60_000),
+            cache_write_1h_input_tokens: 0,
+            output_tokens: Some(100_000),
+            reasoning_output_tokens: Some(50_000),
+            total_tokens: Some(300_000),
+        };
+        let outcome = |usage: &ModelUsage| CompactionOutcome::Cancelled {
+            reason: CompactionReason::Manual,
+            attempts: vec![AttemptAccounting::KnownUsage(usage.clone())],
+        };
+
+        let split = ModelUsage {
+            cache_write_1h_input_tokens: 10_000,
+            ..usage.clone()
+        };
+        let stored = encode_compaction(&outcome(&split)).expect("encode 1h usage");
+        let decoded = decode_entry(stored.kind, &stored.payload_json).expect("decode 1h usage");
+        assert_eq!(decoded_compaction(&decoded), Some(outcome(&split)));
+
+        let stored = encode_compaction(&outcome(&usage)).expect("encode usage");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&stored.payload_json).expect("decode usage JSON");
+        let removed = legacy["Compaction"]["compaction"]["attempts"][0]["KnownUsage"]
+            .as_object_mut()
+            .expect("stored usage object")
+            .remove("cache_write_1h_input_tokens");
+        assert_eq!(removed, Some(serde_json::json!(0)));
+        let decoded = decode_entry("compaction", &legacy.to_string()).expect("decode legacy usage");
+        assert_eq!(decoded_compaction(&decoded), Some(outcome(&usage)));
+        assert_eq!(
+            estimate_run_cost(&decoded_attempts(&decoded)),
+            RunCostEstimate::Complete(estimate_usage(&usage).unwrap().amount())
+        );
+        assert_eq!(
+            estimate_usage(&usage).unwrap().amount().as_nanos(),
+            2_716_000_000
+        );
+        assert_eq!(crate::session::FORMAT_VERSION, 2);
     }
 
     #[test]
@@ -2074,6 +2127,7 @@ mod tests {
                     input_tokens: Some(1),
                     cached_input_tokens: None,
                     cache_write_input_tokens: Some(3),
+                    cache_write_1h_input_tokens: 0,
                     output_tokens: Some(4),
                     reasoning_output_tokens: None,
                     total_tokens: Some(8),
@@ -2389,6 +2443,7 @@ mod tests {
             input_tokens: Some(1),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(0),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(1),

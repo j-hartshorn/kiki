@@ -16,10 +16,9 @@ use crate::arena::{
     Execution, ExecutionOutcome, Observation, RunPreview, ToolCall, ToolCallSummary, ToolCallToken,
     ToolName,
 };
-use crate::config::models::CATALOGUE;
 use crate::config::{
     ApiKeyPresence, DEFAULT_MODEL, ModelSelection, PromptProvenance, StartupSnapshot,
-    SubmissionAvailability, model_by_id,
+    SubmissionAvailability, model_by_id, models::Provider,
 };
 use crate::highlight::PythonHighlighter;
 use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
@@ -60,6 +59,8 @@ fn markdown<'a>(
 }
 
 const STORE_FALSE_PRIVACY_BOUNDARY: &str = "store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.";
+const ANTHROPIC_PRIVACY_BOUNDARY: &str =
+    "User requests or workspace content printed by Python may be sent to Anthropic.";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 enum RunState {
@@ -147,6 +148,9 @@ impl LivePhase {
 fn disabled_status(reason: &RuntimeDisabledReason) -> &'static str {
     match reason {
         RuntimeDisabledReason::OpenAiAuthentication => "OpenAI authentication failed; restart Kiki",
+        RuntimeDisabledReason::AnthropicAuthentication => {
+            "Anthropic authentication failed; restart Kiki"
+        }
         RuntimeDisabledReason::ArenaCheckpointRecoveryFailed => {
             "Arena recovery failed; restart Kiki"
         }
@@ -1722,15 +1726,19 @@ struct ModelFooter {
 
 impl ModelFooter {
     fn full(&self) -> String {
-        format!(
+        format!("{} • thinking {}", self.id, self.thinking)
+    }
+
+    fn compact(&self) -> FooterField {
+        FooterField::muted(format!(
             "{} • thinking {}",
-            display_model_id(&self.id),
+            unqualified_model_id(&self.id),
             self.thinking
-        )
+        ))
     }
 
     fn truncated(&self, width: usize) -> Option<FooterField> {
-        let model = display_model_id(&self.id);
+        let model = unqualified_model_id(&self.id);
         let thinking = format!("thinking {}", self.thinking);
         let separator = " • ";
         let full = self.full();
@@ -1869,6 +1877,14 @@ impl Footer {
         let identity = if footer_fits(width, full_identity.as_ref(), &statistics, model.as_ref()) {
             full_identity
         } else {
+            if !footer_fits(
+                width,
+                preferred_identity.as_ref(),
+                &statistics,
+                model.as_ref(),
+            ) {
+                model = self.model.as_ref().map(ModelFooter::compact);
+            }
             while !statistics.is_empty()
                 && !footer_fits(
                     width,
@@ -1947,16 +1963,8 @@ fn right_width(statistics: &[FooterField], model: Option<&FooterField>) -> usize
     }
 }
 
-fn display_model_id(id: &str) -> &str {
-    let mut providers = CATALOGUE
-        .iter()
-        .filter_map(|model| model.id.split_once('/').map(|(provider, _)| provider));
-    match providers.next() {
-        Some(provider) if providers.all(|candidate| candidate == provider) => {
-            id.split_once('/').map_or(id, |(_, model)| model)
-        }
-        _ => id,
-    }
+fn unqualified_model_id(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, model)| model)
 }
 
 pub(crate) fn truncate_front(text: &str, width: usize) -> String {
@@ -3580,9 +3588,12 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         PromptProvenance::Bundled { name } => format!("bundled {name}"),
         PromptProvenance::Override { path } => format!("override {}", path.as_str()),
     };
-    let api_key_presence = match snapshot.api_key_presence() {
-        ApiKeyPresence::Missing => "missing",
-        ApiKeyPresence::Present => "present",
+    let api_key_line = |provider: Provider| {
+        let presence = match snapshot.api_key_presence(provider) {
+            ApiKeyPresence::Missing => "missing",
+            ApiKeyPresence::Present => "present",
+        };
+        format!("{} API key: {presence}", provider.display_name())
     };
     let submission = match snapshot.submission_availability() {
         SubmissionAvailability::Available => "available",
@@ -3600,7 +3611,8 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
         ),
         format!("Thinking: {}", snapshot.thinking()),
         format!("Prompt: {prompt_source}"),
-        format!("OpenAI API key: {api_key_presence}"),
+        api_key_line(Provider::OpenAi),
+        api_key_line(Provider::Anthropic),
         format!("Submission: {submission}"),
     ];
     if snapshot.problems().is_empty() {
@@ -3611,7 +3623,16 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             lines.push(format!("Remediation: {}", problem.remediation()));
         }
     }
-    lines.push(STORE_FALSE_PRIVACY_BOUNDARY.to_owned());
+    for (provider, notice) in [
+        (Provider::OpenAi, STORE_FALSE_PRIVACY_BOUNDARY),
+        (Provider::Anthropic, ANTHROPIC_PRIVACY_BOUNDARY),
+    ] {
+        if snapshot.model().provider() == provider
+            || snapshot.api_key_presence(provider) == ApiKeyPresence::Present
+        {
+            lines.push(notice.to_owned());
+        }
+    }
     TranscriptBlock::Startup { lines }
 }
 
@@ -6087,6 +6108,7 @@ mod tests {
             input_tokens: Some(input),
             cached_input_tokens: Some(0),
             cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
             output_tokens: Some(output),
             reasoning_output_tokens: Some(0),
             total_tokens: Some(input + output),
@@ -6127,6 +6149,7 @@ mod tests {
             input_tokens: input,
             cached_input_tokens: cache_read,
             cache_write_input_tokens: cache_write,
+            cache_write_1h_input_tokens: 0,
             output_tokens: output,
             reasoning_output_tokens: reasoning,
             total_tokens: total,
@@ -7103,6 +7126,7 @@ Model: openai/gpt-5.6-sol (context: 1.05m, max output: 128k)
 Thinking: medium
 Prompt: bundled system
 OpenAI API key: present
+Anthropic API key: missing
 Submission: available
 Problems: none
 store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."
@@ -7702,7 +7726,7 @@ truncated"
         assert_eq!(
             footer_text(&layout).as_deref(),
             Some(
-                "~/worktrees/interactive/settings/kiki (Refactor auth) ↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k  gpt-5.6-sol • thinking high"
+                "~/worktrees/interactive/settings/kiki (Refactor auth) ↑218k ↓0 R163k W0 CH75.0% $0.2829 80.0%/272k  openai/gpt-5.6-sol • thinking high"
             )
         );
 
@@ -7757,6 +7781,12 @@ truncated"
             .footer_rule(80);
         assert!(
             model.to_string().contains("~/…/kiki (Refactor auth)"),
+            "{model}"
+        );
+        assert!(
+            model
+                .to_string()
+                .contains("openai/gpt-5.6-sol • thinking high"),
             "{model}"
         );
     }
@@ -8704,6 +8734,24 @@ truncated"
     }
 
     #[test]
+    fn anthropic_authentication_failure_shows_the_anthropic_status() {
+        let mut transcript = Transcript::default();
+
+        assert!(transcript.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::AnthropicAuthentication,
+            },
+            false,
+        ));
+
+        assert!(transcript.is_disabled());
+        assert_eq!(
+            transcript.status(),
+            "Anthropic authentication failed; restart Kiki"
+        );
+    }
+
+    #[test]
     fn execution_paths_remain_private_in_collapsed_and_expanded_cards() {
         let mut transcript = Transcript::default();
         transcript.apply(
@@ -9572,6 +9620,7 @@ truncated"
                             input_tokens: Some(1),
                             cached_input_tokens: Some(0),
                             cache_write_input_tokens: Some(0),
+                            cache_write_1h_input_tokens: 0,
                             output_tokens: Some(1),
                             reasoning_output_tokens: Some(0),
                             total_tokens: Some(2),
