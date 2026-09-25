@@ -36,7 +36,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::Agent;
 use crate::arena::Arena;
-use crate::config::{ApiKey, ModelSelection, models::Provider, settings::CacheTtl};
+use crate::config::{
+    ApiKey, ModelSelection,
+    models::Provider,
+    settings::{CacheTtl, CrossProviderReasoning},
+};
 use crate::provider::ProviderModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
@@ -51,12 +55,14 @@ use crate::tools::ToolHost;
 fn production_model(
     ready: &config::ReadyStartup<'_>,
     anthropic_cache_ttl: CacheTtl,
+    cross_provider_reasoning: CrossProviderReasoning,
 ) -> ProviderModel {
     ProviderModel::new(
         ready.system_prompt(),
         ready.api_key(Provider::OpenAi).map(ApiKey::expose),
         ready.api_key(Provider::Anthropic).map(ApiKey::expose),
         anthropic_cache_ttl,
+        cross_provider_reasoning,
     )
 }
 
@@ -250,7 +256,11 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let model = production_model(&ready, startup.settings().anthropic_cache_ttl());
+    let model = production_model(
+        &ready,
+        startup.settings().anthropic_cache_ttl(),
+        startup.settings().cross_provider_reasoning(),
+    );
     let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
 
@@ -347,7 +357,11 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let model = production_model(&ready, startup.settings().anthropic_cache_ttl());
+    let model = production_model(
+        &ready,
+        startup.settings().anthropic_cache_ttl(),
+        startup.settings().cross_provider_reasoning(),
+    );
     let providers = model.providers();
     let prompt_base = ready.prompt_base().to_owned();
     let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -444,11 +458,15 @@ fn main() {
 mod tests {
     use super::production_model;
 
-    use crate::config::{ReadyStartup, settings::CacheTtl};
+    use crate::config::{
+        ReadyStartup,
+        settings::{CacheTtl, CrossProviderReasoning},
+    };
     use crate::provider::ProviderModel;
 
     #[test]
     fn production_model_composition_is_the_provider_router() {
-        let _: for<'a> fn(&ReadyStartup<'a>, CacheTtl) -> ProviderModel = production_model;
+        let _: for<'a> fn(&ReadyStartup<'a>, CacheTtl, CrossProviderReasoning) -> ProviderModel =
+            production_model;
     }
 }

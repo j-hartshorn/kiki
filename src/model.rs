@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{
     ModelSelection,
     constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT},
+    settings::CrossProviderReasoning,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +249,60 @@ impl ModelContextEntry {
             _ => None,
         }
     }
+
+    pub(crate) fn foreign_parts(
+        &self,
+        provider: &str,
+        reasoning: CrossProviderReasoning,
+    ) -> Option<Vec<ForeignPart<'_>>> {
+        let (replay, reasoning_summary, commentary, action) = match self {
+            Self::CompletedCode(completed) => (
+                completed.replay(),
+                completed.reasoning_summary(),
+                completed.commentary(),
+                ForeignPart::ToolCall {
+                    call_id: completed.call_id().as_str(),
+                    source: completed.source(),
+                    output: completed.result().feedback(),
+                },
+            ),
+            Self::FinalMessage {
+                text,
+                reasoning_summary,
+                replay,
+            } => (
+                replay,
+                reasoning_summary.as_str(),
+                None,
+                ForeignPart::Text(text),
+            ),
+            Self::UserRequest { .. } | Self::CompactionSummary { .. } => return None,
+        };
+        if replay.provider() == provider {
+            return None;
+        }
+        let reasoning_summary =
+            (reasoning == CrossProviderReasoning::Inline).then_some(reasoning_summary);
+        Some(
+            [reasoning_summary, commentary]
+                .into_iter()
+                .flatten()
+                .filter(|text| !text.is_empty())
+                .map(ForeignPart::Text)
+                .chain([action])
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForeignPart<'a> {
+    Text(&'a str),
+    ToolCall {
+        call_id: &'a str,
+        source: &'a str,
+        output: &'a str,
+    },
 }
 
 pub(crate) fn canonical_compaction_summary(summary: &str) -> String {
@@ -696,10 +751,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CodeResult, CompletedCode, Model, ModelAction, ModelCallId, ModelContextEntry, ModelError,
-        ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem, ProviderReplay,
-        ScriptedAction, ScriptedModel, SummaryRequest, canonical_compaction_summary,
+        CodeResult, CompletedCode, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
+        ModelError, ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem,
+        ProviderReplay, ScriptedAction, ScriptedModel, SummaryRequest,
+        canonical_compaction_summary,
     };
+    use crate::config::settings::CrossProviderReasoning;
 
     fn history_with_request(request: &str) -> ModelHistory {
         let mut history = ModelHistory::new();
@@ -993,6 +1050,130 @@ mod tests {
             entry.final_message(),
             Some(("answer", "checked result", &replay("opaque-message")))
         );
+    }
+
+    fn foreign_code(commentary: Option<&str>, reasoning_summary: &str) -> ModelContextEntry {
+        let mut history = ModelHistory::new();
+        history
+            .append_completed_code(
+                "print(1)".to_owned(),
+                ModelCallId::new("toolu_1"),
+                commentary.map(str::to_owned),
+                reasoning_summary.to_owned(),
+                replay("signed-thinking"),
+                CodeResult::execution("1\n".to_owned()),
+            )
+            .unwrap();
+        history.entries()[0].clone()
+    }
+
+    fn foreign_message(reasoning_summary: &str) -> ModelContextEntry {
+        let mut history = ModelHistory::new();
+        history.append_final_message(
+            "Done.".to_owned(),
+            reasoning_summary.to_owned(),
+            replay("signed-thinking"),
+        );
+        history.entries()[0].clone()
+    }
+
+    const TOOL_CALL: ForeignPart<'static> = ForeignPart::ToolCall {
+        call_id: "toolu_1",
+        source: "print(1)",
+        output: "1\n",
+    };
+
+    #[test]
+    fn foreign_code_is_reasoning_then_commentary_then_the_tool_call_with_its_result() {
+        let entry = foreign_code(Some("I'll run it."), "Checking the file");
+
+        assert_eq!(
+            entry.foreign_parts("openai", CrossProviderReasoning::Inline),
+            Some(vec![
+                ForeignPart::Text("Checking the file"),
+                ForeignPart::Text("I'll run it."),
+                TOOL_CALL,
+            ])
+        );
+    }
+
+    #[test]
+    fn foreign_parts_omit_empty_text_and_dropped_reasoning() {
+        for (entry, reasoning, expected) in [
+            (
+                foreign_code(Some("I'll run it."), ""),
+                CrossProviderReasoning::Inline,
+                vec![ForeignPart::Text("I'll run it."), TOOL_CALL],
+            ),
+            (
+                foreign_code(Some("I'll run it."), "Checking the file"),
+                CrossProviderReasoning::Drop,
+                vec![ForeignPart::Text("I'll run it."), TOOL_CALL],
+            ),
+            (
+                foreign_code(Some(""), "Checking the file"),
+                CrossProviderReasoning::Inline,
+                vec![ForeignPart::Text("Checking the file"), TOOL_CALL],
+            ),
+            (
+                foreign_code(None, ""),
+                CrossProviderReasoning::Inline,
+                vec![TOOL_CALL],
+            ),
+        ] {
+            assert_eq!(
+                entry.foreign_parts("openai", reasoning),
+                Some(expected),
+                "{entry:?} {reasoning:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_final_messages_give_their_text_after_any_kept_reasoning() {
+        for (entry, reasoning, expected) in [
+            (
+                foreign_message("Summarising"),
+                CrossProviderReasoning::Inline,
+                vec![ForeignPart::Text("Summarising"), ForeignPart::Text("Done.")],
+            ),
+            (
+                foreign_message("Summarising"),
+                CrossProviderReasoning::Drop,
+                vec![ForeignPart::Text("Done.")],
+            ),
+            (
+                foreign_message(""),
+                CrossProviderReasoning::Inline,
+                vec![ForeignPart::Text("Done.")],
+            ),
+        ] {
+            assert_eq!(
+                entry.foreign_parts("anthropic", reasoning),
+                Some(expected),
+                "{entry:?} {reasoning:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_provider_and_user_entries_have_no_foreign_parts() {
+        for entry in [
+            foreign_code(Some("I'll run it."), "Checking the file"),
+            foreign_message("Summarising"),
+            ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            },
+            ModelContextEntry::CompactionSummary {
+                summary: "saved summary".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                entry.foreign_parts("test-provider", CrossProviderReasoning::Inline),
+                None,
+                "{entry:?}"
+            );
+        }
     }
 
     #[test]

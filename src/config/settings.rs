@@ -171,6 +171,13 @@ pub(crate) enum CacheTtl {
     OneHour,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CrossProviderReasoning {
+    #[default]
+    Inline,
+    Drop,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SettingsContext {
     user_path: Option<PathBuf>,
@@ -181,6 +188,7 @@ pub(crate) struct SettingsContext {
     environment_thinking_model: Option<&'static str>,
     compaction: CompactionSettings,
     anthropic_cache_ttl: CacheTtl,
+    cross_provider_reasoning: CrossProviderReasoning,
 }
 
 impl fmt::Debug for SettingsContext {
@@ -207,6 +215,7 @@ impl fmt::Debug for SettingsContext {
             )
             .field("compaction", &self.compaction)
             .field("anthropic_cache_ttl", &self.anthropic_cache_ttl)
+            .field("cross_provider_reasoning", &self.cross_provider_reasoning)
             .finish()
     }
 }
@@ -240,6 +249,10 @@ impl SettingsContext {
 
     pub(crate) fn anthropic_cache_ttl(&self) -> CacheTtl {
         self.anthropic_cache_ttl
+    }
+
+    pub(crate) fn cross_provider_reasoning(&self) -> CrossProviderReasoning {
+        self.cross_provider_reasoning
     }
 
     pub(crate) fn save_model(
@@ -491,6 +504,10 @@ pub(crate) fn resolve(input: Input) -> Resolution {
         .into_iter()
         .find_map(|layer| layer.as_ref()?.anthropic_cache_ttl)
         .unwrap_or_default();
+    let cross_provider_reasoning = [&project, &user]
+        .into_iter()
+        .find_map(|layer| layer.as_ref()?.cross_provider_reasoning)
+        .unwrap_or_default();
     if let Some(session_preferences) = input.session_preferences {
         model = session_preferences.selection().model();
         model_origin = SettingsOrigin::Session;
@@ -588,6 +605,7 @@ pub(crate) fn resolve(input: Input) -> Resolution {
             environment_thinking_model,
             compaction,
             anthropic_cache_ttl,
+            cross_provider_reasoning,
         },
         problems,
     }
@@ -723,8 +741,18 @@ fn validate_document(
             "anthropic" => {
                 validate_anthropic_table(item, &mut settings.anthropic_cache_ttl, &mut problems);
             }
+            "cross_provider_reasoning" => match item.as_str() {
+                Some("inline") => {
+                    settings.cross_provider_reasoning = Some(CrossProviderReasoning::Inline);
+                }
+                Some("drop") => settings.cross_provider_reasoning = Some(CrossProviderReasoning::Drop),
+                _ => problems.push(
+                    "field `cross_provider_reasoning` must be \"inline\" or \"drop\"",
+                    "Set it to \"inline\" or \"drop\", then restart Kiki.",
+                ),
+            },
             _ => problems.push(
-                "contains an unknown field; only `model`, `favourites`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
+                "contains an unknown field; only `model`, `favourites`, `cross_provider_reasoning`, `[thinking]`, `[subagents]`, `[compaction]`, and `[anthropic]` are allowed",
                 "Remove the unknown field, then restart Kiki.",
             ),
         }
@@ -1037,6 +1065,7 @@ struct FileSettings {
     subagents: FileSubagentSettings,
     compaction: FileCompactionSettings,
     anthropic_cache_ttl: Option<CacheTtl>,
+    cross_provider_reasoning: Option<CrossProviderReasoning>,
 }
 
 #[derive(Default)]
@@ -1234,7 +1263,9 @@ mod tests {
         models::{ASTRA, CATALOGUE, LUNA, SOL, TERRA},
     };
 
-    use super::{CacheTtl, Input, SessionPreferences, SubagentSettings, resolve};
+    use super::{
+        CacheTtl, CrossProviderReasoning, Input, SessionPreferences, SubagentSettings, resolve,
+    };
 
     #[test]
     fn astra_uses_low_by_default_and_openai_models_reject_none() {
@@ -1496,6 +1527,114 @@ mod tests {
                 .map(|problem| problem.kind())
                 .collect::<Vec<_>>(),
             [crate::config::StartupProblemKind::ProjectSettingsInvalid]
+        );
+    }
+
+    #[test]
+    fn cross_provider_reasoning_defaults_to_inline_and_project_overrides_user() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        let defaults = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            defaults.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Inline
+        );
+        assert!(defaults.problems().is_empty());
+
+        write_settings(home.path(), "cross_provider_reasoning = \"drop\"\n");
+        for (project_content, expected) in [
+            ("", CrossProviderReasoning::Drop),
+            (
+                "cross_provider_reasoning = \"inline\"\n",
+                CrossProviderReasoning::Inline,
+            ),
+        ] {
+            write_settings(project.path(), project_content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(
+                resolution.context().cross_provider_reasoning(),
+                expected,
+                "{project_content}"
+            );
+            assert!(resolution.problems().is_empty(), "{project_content}");
+        }
+
+        write_settings(home.path(), "");
+        write_settings(project.path(), "cross_provider_reasoning = \"drop\"\n");
+        let project_only = resolve(input(Some(home.path()), Some(project.path())));
+        assert_eq!(
+            project_only.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Drop
+        );
+    }
+
+    #[test]
+    fn invalid_cross_provider_reasoning_discards_its_whole_layer() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+
+        for value in [
+            "\"secret-mode\"",
+            "\"Drop\"",
+            "\"\"",
+            "true",
+            "[\"drop\"]",
+            "{ mode = \"drop\" }",
+        ] {
+            write_settings(
+                home.path(),
+                &format!("model = \"openai/gpt-5.6-terra\"\ncross_provider_reasoning = {value}\n"),
+            );
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert_eq!(resolution.model().id, SOL.id, "{value}");
+            assert_eq!(
+                resolution.context().cross_provider_reasoning(),
+                CrossProviderReasoning::Inline,
+                "{value}"
+            );
+            let [problem] = resolution.problems() else {
+                panic!("expected one problem for {value}");
+            };
+            assert_eq!(
+                problem.kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{value}"
+            );
+            assert!(
+                problem
+                    .diagnostic()
+                    .contains("field `cross_provider_reasoning`"),
+                "{value}"
+            );
+            assert!(!problem.diagnostic().contains("secret-mode"));
+        }
+
+        write_settings(home.path(), "cross_provider_reasoning = \"drop\"\n");
+        write_settings(
+            project.path(),
+            "model = \"openai/gpt-5.6-terra\"\ncross_provider_reasoning = \"inline\"\nunknown = true\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+        assert_eq!(resolution.model().id, SOL.id);
+        assert_eq!(
+            resolution.context().cross_provider_reasoning(),
+            CrossProviderReasoning::Drop
+        );
+        let [problem] = resolution.problems() else {
+            panic!("expected one project problem");
+        };
+        assert_eq!(
+            problem.kind(),
+            crate::config::StartupProblemKind::ProjectSettingsInvalid
+        );
+        assert!(
+            problem.diagnostic().contains("`cross_provider_reasoning`"),
+            "{}",
+            problem.diagnostic()
         );
     }
 

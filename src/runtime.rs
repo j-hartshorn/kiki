@@ -2350,7 +2350,7 @@ mod tests {
     use crate::config::{
         DEFAULT_MODEL, ModelSelection, SessionPreferences,
         models::{LUNA, OPUS_5_5, Provider, SOL, TERRA},
-        settings::CacheTtl,
+        settings::{CacheTtl, CrossProviderReasoning},
     };
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -2358,6 +2358,7 @@ mod tests {
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
         ScriptedAction as ModelAction, ScriptedModel, SummaryRequest, SummaryResult,
     };
+    use crate::openai::OpenAiModel;
     use crate::session::{
         CompactionOutcome, CompactionReason, PersistedCode, PersistedTerminal, RestoredRecord,
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
@@ -13243,6 +13244,7 @@ mod tests {
                 KEY,
                 &fixture.endpoint,
                 CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline,
             ),
         )
         .await
@@ -13334,6 +13336,246 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn openai_completed(output: serde_json::Value) -> FixtureReply {
+        FixtureReply::OwnedSse(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "service_tier": "default",
+                    "output": output,
+                    "usage": {
+                        "input_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                        "output_tokens": 1,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 2
+                    }
+                }
+            })
+        ))
+    }
+
+    fn anthropic_message(text: &str) -> FixtureReply {
+        FixtureReply::OwnedSse(
+            [
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_anthropic",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-opus-5-5",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }
+                }),
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 1}
+                }),
+                serde_json::json!({"type": "message_stop"}),
+            ]
+            .iter()
+            .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+            .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_saved_openai_session_reopens_and_continues_on_anthropic_from_semantic_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let openai = Fixture::start_sequence(vec![
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Checking the sum"}],
+                    "encrypted_content": "openai-encrypted-code",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll add them.", "annotations": []}],
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "execute_python",
+                    "arguments": r#"{"code":"print(40 + 2)"}"#,
+                    "status": "completed"
+                }
+            ])),
+            openai_completed(serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "Reporting the sum"}],
+                    "encrypted_content": "openai-encrypted-final",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The sum is 42.", "annotations": []}],
+                    "status": "completed"
+                }
+            ])),
+        ])
+        .await;
+        let mut controller = controller_with_model(
+            &workspace,
+            OpenAiModel::with_endpoint("system prompt", "openai-key", &openai.endpoint),
+        )
+        .await
+        .with_selection(ModelSelection::new(&SOL, SOL.default_thinking).unwrap());
+        let home = controller.test_home.take().expect("persisted test home");
+        let session_id = controller.test_session.as_ref().unwrap().id().to_owned();
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "add 40 and 2".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "The sum is 42."
+            ),
+            "{records:?}"
+        );
+        assert_eq!(openai.request_count(), 2);
+
+        let session = Session::open(home.path(), &session_id).expect("reopen OpenAI session");
+        let saved_history = session
+            .restore()
+            .expect("restore OpenAI session")
+            .executable
+            .expect("executable OpenAI session")
+            .history;
+        let feedback = saved_history
+            .entries()
+            .iter()
+            .find_map(ModelContextEntry::completed_code)
+            .expect("saved completed code")
+            .result()
+            .feedback()
+            .to_owned();
+        assert!(feedback.contains("42"), "{feedback}");
+        let anthropic = Fixture::start(anthropic_message("Still 42.")).await;
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let (controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            AnthropicModel::with_endpoint(
+                "system prompt",
+                "anthropic-key",
+                &anthropic.endpoint,
+                CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline,
+            ),
+            ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap(),
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            None,
+        )
+        .await
+        .expect("restore on Anthropic");
+        assert_eq!(initial.disabled_reason, None);
+
+        let (commands, mut events, _progress, task) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "double-check".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let records = shutdown_controller(commands, task).await;
+        assert!(
+            matches!(
+                records.last(),
+                Some(StoredRecord { record: Record::FinalMessage { text, .. }, .. })
+                    if text == "Still 42."
+            ),
+            "{records:?}"
+        );
+        let body = anthropic.request().body;
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "add 40 and 2"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Checking the sum"},
+                        {"type": "text", "text": "I'll add them."},
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "execute_python",
+                            "input": {"code": "print(40 + 2)"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": feedback}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Reporting the sum"},
+                        {"type": "text", "text": "The sum is 42."}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "double-check",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ])
+        );
+        let body = body.to_string();
+        for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
+            assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+        }
+        session.close().expect("close session");
     }
 
     fn persisted_settings(

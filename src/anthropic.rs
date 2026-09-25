@@ -10,14 +10,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{
-        ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT, models::Provider,
-        settings::CacheTtl,
+        ModelSelection,
+        constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+        models::Provider,
+        settings::{CacheTtl, CrossProviderReasoning},
     },
     model::{
-        AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
-        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
-        OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
-        canonical_compaction_summary,
+        AttemptAccounting, CodeResult, ForeignPart, Model, ModelAction, ModelCallId,
+        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
+        ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest,
+        SummaryResult, canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
@@ -41,6 +43,7 @@ pub(crate) struct AnthropicModel {
     api_key: String,
     endpoint: String,
     cache_ttl: CacheTtl,
+    cross_provider_reasoning: CrossProviderReasoning,
     client: reqwest::Client,
     frame_limit: usize,
     #[cfg(test)]
@@ -52,8 +55,15 @@ impl AnthropicModel {
         prompt: impl Into<String>,
         api_key: impl Into<String>,
         cache_ttl: CacheTtl,
+        cross_provider_reasoning: CrossProviderReasoning,
     ) -> Self {
-        Self::with_endpoint(prompt, api_key, ANTHROPIC_API_BASE, cache_ttl)
+        Self::with_endpoint(
+            prompt,
+            api_key,
+            ANTHROPIC_API_BASE,
+            cache_ttl,
+            cross_provider_reasoning,
+        )
     }
 
     pub(crate) fn with_prompt(&self, prompt: String) -> Self {
@@ -68,12 +78,14 @@ impl AnthropicModel {
         api_key: impl Into<String>,
         api_base: &str,
         cache_ttl: CacheTtl,
+        cross_provider_reasoning: CrossProviderReasoning,
     ) -> Self {
         Self {
             prompt: prompt.into(),
             api_key: api_key.into(),
             endpoint: format!("{api_base}/v1/messages"),
             cache_ttl,
+            cross_provider_reasoning,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -96,6 +108,14 @@ impl AnthropicModel {
         let mut messages = Vec::new();
 
         for entry in history.entries() {
+            if let Some(parts) =
+                entry.foreign_parts(ANTHROPIC_PROVIDER, self.cross_provider_reasoning)
+            {
+                for part in parts {
+                    push_foreign(&mut messages, part);
+                }
+                continue;
+            }
             match entry {
                 ModelContextEntry::UserRequest { text } => {
                     push_content(&mut messages, "user", [text_content(text)]);
@@ -741,6 +761,33 @@ fn push_content(messages: &mut Vec<Value>, role: &str, content: impl IntoIterato
     }
 }
 
+fn push_foreign(messages: &mut Vec<Value>, part: ForeignPart<'_>) {
+    match part {
+        ForeignPart::Text(text) => push_content(messages, "assistant", [text_content(text)]),
+        ForeignPart::ToolCall {
+            call_id,
+            source,
+            output,
+        } => {
+            push_content(
+                messages,
+                "assistant",
+                [json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": EXECUTE_PYTHON,
+                    "input": {"code": source}
+                })],
+            );
+            push_content(
+                messages,
+                "user",
+                [json!({"type": "tool_result", "tool_use_id": call_id, "content": output})],
+            );
+        }
+    }
+}
+
 fn block_values(blocks: &[ContentBlock]) -> Vec<Value> {
     blocks
         .iter()
@@ -749,11 +796,6 @@ fn block_values(blocks: &[ContentBlock]) -> Vec<Value> {
 }
 
 fn replay_blocks(replay: &ProviderReplay) -> Result<Vec<ContentBlock>, ModelError> {
-    if replay.provider() != ANTHROPIC_PROVIDER {
-        return Err(ModelError::InvalidHistory(
-            "opaque replay belongs to another provider",
-        ));
-    }
     replay
         .items()
         .iter()
@@ -1252,7 +1294,7 @@ mod tests {
                 ACCEPTED_MODEL_CONTENT_LIMIT, PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT,
             },
             models::{OPUS_5_5, SOL},
-            settings::CacheTtl,
+            settings::{CacheTtl, CrossProviderReasoning},
         },
         model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError,
@@ -1565,6 +1607,7 @@ mod tests {
             key,
             &fixture.endpoint,
             CacheTtl::FiveMinutes,
+            CrossProviderReasoning::Inline,
         )
     }
 
@@ -1610,7 +1653,13 @@ mod tests {
     #[test]
     fn production_model_posts_to_the_anthropic_messages_endpoint() {
         assert_eq!(
-            AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes).endpoint,
+            AnthropicModel::new(
+                "system prompt",
+                KEY,
+                CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline
+            )
+            .endpoint,
             "https://api.anthropic.com/v1/messages"
         );
     }
@@ -1666,6 +1715,7 @@ mod tests {
             KEY,
             &fixture.endpoint,
             CacheTtl::OneHour,
+            CrossProviderReasoning::Inline,
         );
 
         model
@@ -1840,7 +1890,12 @@ mod tests {
 
     #[test]
     fn adjacent_user_content_merges_into_one_user_message() {
-        let model = AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes);
+        let model = AnthropicModel::new(
+            "system prompt",
+            KEY,
+            CacheTtl::FiveMinutes,
+            CrossProviderReasoning::Inline,
+        );
         let mut history = ModelHistory::new();
         history.append_compaction_summary("saved summary");
         history.append_user_request("continue");
@@ -2566,7 +2621,13 @@ mod tests {
         assert_eq!(frame("\u{1}").len(), framing + 6);
         assert!(6 * ACCEPTED_MODEL_CONTENT_LIMIT + framing <= SSE_FRAME_LIMIT);
         assert_eq!(
-            AnthropicModel::new("system prompt", KEY, CacheTtl::FiveMinutes).frame_limit,
+            AnthropicModel::new(
+                "system prompt",
+                KEY,
+                CacheTtl::FiveMinutes,
+                CrossProviderReasoning::Inline
+            )
+            .frame_limit,
             SSE_FRAME_LIMIT
         );
     }
@@ -2583,17 +2644,185 @@ mod tests {
         );
     }
 
+    fn openai_replay(items: &[Value]) -> ProviderReplay {
+        ProviderReplay::new(
+            "openai",
+            items
+                .iter()
+                .map(|item| OpaqueReplayItem::new(serde_json::to_vec(item).unwrap()))
+                .collect(),
+        )
+    }
+
+    fn cross_provider_history(code_reasoning: &str) -> ModelHistory {
+        let mut history = history("first request");
+        history.append_final_message(
+            "Done.".to_owned(),
+            "Summarising".to_owned(),
+            replay(&message_blocks()),
+        );
+        history.append_user_request("inspect");
+        history
+            .append_completed_code(
+                "print(1)".to_owned(),
+                ModelCallId::new("call_1"),
+                Some("I'll run it.".to_owned()),
+                code_reasoning.to_owned(),
+                openai_replay(&[
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{"type": "summary_text", "text": code_reasoning}],
+                        "encrypted_content": "openai-encrypted-code",
+                        "status": "completed"
+                    }),
+                    json!({
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "I'll run it.", "annotations": []}],
+                        "status": "completed"
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "execute_python",
+                        "arguments": r#"{"code":"print(1)"}"#,
+                        "status": "completed"
+                    }),
+                ]),
+                CodeResult::execution("1\n".to_owned()),
+            )
+            .unwrap();
+        history.append_user_request("retry");
+        history.append_final_message(
+            "It printed 1.".to_owned(),
+            "Reading the output".to_owned(),
+            openai_replay(&[
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [{"type": "summary_text", "text": "Reading the output"}],
+                    "encrypted_content": "openai-encrypted-final",
+                    "status": "completed"
+                }),
+                json!({
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "It printed 1.", "annotations": []}],
+                    "status": "completed"
+                }),
+            ]),
+        );
+        history.append_user_request("thanks");
+        history
+    }
+
     #[tokio::test]
-    async fn foreign_replay_and_selections_fail_before_networking() {
+    async fn openai_entries_replay_as_text_and_tool_use_merged_into_alternating_roles() {
+        for (reasoning, code_reasoning, reasoning_texts) in [
+            (
+                CrossProviderReasoning::Inline,
+                "Checking the file",
+                [Some("Checking the file"), Some("Reading the output")],
+            ),
+            (
+                CrossProviderReasoning::Inline,
+                "",
+                [None, Some("Reading the output")],
+            ),
+            (
+                CrossProviderReasoning::Drop,
+                "Checking the file",
+                [None, None],
+            ),
+        ] {
+            let fixture =
+                Fixture::start_sequence(vec![FixtureReply::OwnedSse(message_stream()); 2]).await;
+            let mut parent = AnthropicModel::with_endpoint(
+                "system prompt",
+                KEY,
+                &fixture.endpoint,
+                CacheTtl::FiveMinutes,
+                reasoning,
+            );
+            let mut child = parent.with_prompt("child prompt".to_owned());
+            let history = cross_provider_history(code_reasoning);
+            let original = history.clone();
+            let cancellation = CancellationToken::new();
+
+            for model in [&mut parent, &mut child] {
+                model
+                    .step(selection(), &history, &cancellation, &mut |_| {})
+                    .await
+                    .unwrap();
+            }
+
+            let text = |text: &str| json!({"type": "text", "text": text});
+            let mut code_turn = reasoning_texts[0].map(text).into_iter().collect::<Vec<_>>();
+            code_turn.extend([
+                text("I'll run it."),
+                json!({
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "execute_python",
+                    "input": {"code": "print(1)"}
+                }),
+            ]);
+            let mut final_turn = reasoning_texts[1].map(text).into_iter().collect::<Vec<_>>();
+            final_turn.push(text("It printed 1."));
+            let mut expected = expected_request(json!([
+                {"role": "user", "content": [text("first request")]},
+                {"role": "assistant", "content": message_blocks()},
+                {"role": "user", "content": [text("inspect")]},
+                {"role": "assistant", "content": code_turn},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": "1\n"},
+                        text("retry")
+                    ]
+                },
+                {"role": "assistant", "content": final_turn},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "thanks",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]));
+            let parent_expected = expected.clone();
+            expected["system"][0]["text"] = json!("child prompt");
+            let requests = fixture.requests.lock().unwrap().clone();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.body.clone())
+                    .collect::<Vec<_>>(),
+                [parent_expected, expected],
+                "{reasoning:?} {code_reasoning:?}"
+            );
+            for request in &requests {
+                let body = request.body.to_string();
+                for opaque in ["openai-encrypted", "rs_1", "fc_1", "msg_1", "summary_text"] {
+                    assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+                }
+                assert_eq!(cache_breakpoints(&request.body), 2);
+            }
+            assert_eq!(history, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_replay_and_selections_fail_before_networking() {
         let fixture = Fixture::start(FixtureReply::OwnedSse(message_stream())).await;
         let mut model = model(&fixture, KEY);
         let cancellation = CancellationToken::new();
-        let mut foreign = history("inspect");
-        foreign.append_final_message(
-            "Done.".to_owned(),
-            String::new(),
-            ProviderReplay::new("openai", vec![OpaqueReplayItem::new(b"{}".to_vec())]),
-        );
         let mut malformed = history("inspect");
         malformed.append_final_message(
             "Done.".to_owned(),
@@ -2614,11 +2843,6 @@ mod tests {
         let openai = ModelSelection::new(&SOL, SOL.default_thinking).unwrap();
 
         for (history, selection, expected) in [
-            (
-                &foreign,
-                selection(),
-                ModelError::InvalidHistory("opaque replay belongs to another provider"),
-            ),
             (
                 &malformed,
                 selection(),
@@ -3305,9 +3529,14 @@ mod tests {
     #[test]
     fn summary_requests_carry_no_cache_breakpoints_for_either_ttl() {
         for cache_ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
-            let body = AnthropicModel::new("system prompt", KEY, cache_ttl)
-                .summary_request(&summary_request(selection()))
-                .unwrap();
+            let body = AnthropicModel::new(
+                "system prompt",
+                KEY,
+                cache_ttl,
+                CrossProviderReasoning::Inline,
+            )
+            .summary_request(&summary_request(selection()))
+            .unwrap();
 
             assert_eq!(body, expected_summary_request(), "{cache_ttl:?}");
             assert_eq!(cache_breakpoints(&body), 0, "{cache_ttl:?}");

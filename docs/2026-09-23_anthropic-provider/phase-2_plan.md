@@ -134,7 +134,7 @@
 - `src/openai.rs` and `src/anthropic.rs`: an Anthropic entry replays into an OpenAI request as assistant text plus `function_call`/`function_call_output` with the `toolu_*` ID, and an OpenAI entry replays into an Anthropic request as text plus `tool_use`/`tool_result` with the `call_*` ID, merged into alternating roles; own-provider replay is unchanged.
 - `src/runtime.rs`: a session with a completed OpenAI step is saved, reopened and continued on an Anthropic selection (scripted or fixture model), and the restored foreign entry reaches the request.
 - `src/config/settings.rs`: default, `drop`, invalid value.
-**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/config/settings.rs`, `src/config.rs`, `src/provider.rs` or `src/main.rs`
+**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/config/settings.rs`, `src/provider.rs` and `src/main.rs` (construction from `startup.settings()`); `src/runtime.rs` (save/reopen test and constructor call sites)
 **Verification** — Overall test and clippy commands: all pass, clean.
 
 ### Task 11: Live Anthropic smoke test

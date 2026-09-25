@@ -21,13 +21,13 @@ use tower::ServiceBuilder;
 use crate::{
     config::{
         ModelConfiguration, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT,
-        models::Provider,
+        models::Provider, settings::CrossProviderReasoning,
     },
     model::{
-        AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
-        ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
-        OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
-        canonical_compaction_summary,
+        AttemptAccounting, CodeResult, ForeignPart, Model, ModelAction, ModelCallId,
+        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
+        ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest,
+        SummaryResult, canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
@@ -51,13 +51,23 @@ pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
     api_key: String,
+    cross_provider_reasoning: CrossProviderReasoning,
     #[cfg(test)]
     summary_retry_wait_started: Option<Arc<Notify>>,
 }
 
 impl OpenAiModel {
-    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
+    pub(crate) fn new(
+        prompt: impl Into<String>,
+        api_key: impl Into<String>,
+        cross_provider_reasoning: CrossProviderReasoning,
+    ) -> Self {
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            OPENAI_API_BASE,
+            cross_provider_reasoning,
+        )
     }
 
     pub(crate) fn with_prompt(&self, prompt: String) -> Self {
@@ -67,7 +77,12 @@ impl OpenAiModel {
         }
     }
 
-    fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
+    fn build(
+        prompt: String,
+        api_key: String,
+        endpoint: &str,
+        cross_provider_reasoning: CrossProviderReasoning,
+    ) -> Self {
         let service = ServiceBuilder::new()
             .layer(OpenAIRetryLayer::new(2))
             .service(ReqwestService::default());
@@ -76,6 +91,7 @@ impl OpenAiModel {
             client: Client::with_config(openai_config(api_key.clone(), endpoint))
                 .with_http_service(service),
             api_key,
+            cross_provider_reasoning,
             #[cfg(test)]
             summary_retry_wait_started: None,
         }
@@ -87,7 +103,12 @@ impl OpenAiModel {
         api_key: impl Into<String>,
         endpoint: &str,
     ) -> Self {
-        Self::build(prompt.into(), api_key.into(), endpoint)
+        Self::build(
+            prompt.into(),
+            api_key.into(),
+            endpoint,
+            CrossProviderReasoning::Inline,
+        )
     }
 
     fn request(
@@ -100,6 +121,11 @@ impl OpenAiModel {
         let mut input = Vec::new();
 
         for entry in history.entries() {
+            if let Some(parts) = entry.foreign_parts(OPENAI_PROVIDER, self.cross_provider_reasoning)
+            {
+                input.extend(parts.into_iter().flat_map(foreign_input));
+                continue;
+            }
             match entry {
                 ModelContextEntry::UserRequest { text } => {
                     input.push(json!({"role": "user", "content": text}));
@@ -1072,12 +1098,26 @@ fn redact(value: &str, api_key: &str) -> String {
     }
 }
 
-fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
-    if replay.provider() != OPENAI_PROVIDER {
-        return Err(ModelError::InvalidHistory(
-            "opaque replay belongs to another provider",
-        ));
+fn foreign_input(part: ForeignPart<'_>) -> Vec<Value> {
+    match part {
+        ForeignPart::Text(text) => vec![json!({"role": "assistant", "content": text})],
+        ForeignPart::ToolCall {
+            call_id,
+            source,
+            output,
+        } => vec![
+            json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "execute_python",
+                "arguments": json!({"code": source}).to_string()
+            }),
+            json!({"type": "function_call_output", "call_id": call_id, "output": output}),
+        ],
     }
+}
+
+fn replay_values(replay: &ProviderReplay) -> Result<Vec<Value>, ModelError> {
     replay
         .items()
         .iter()
@@ -1829,6 +1869,7 @@ mod tests {
         config::{
             ModelSelection,
             models::{ASTRA, CATALOGUE, Provider, SOL, TERRA},
+            settings::CrossProviderReasoning,
         },
         model::{AttemptAccounting, Model, ModelError, ModelHistory},
         sse_fixture::{Fixture, FixtureReply},
@@ -1874,7 +1915,11 @@ mod tests {
 
     #[test]
     fn summary_request_has_no_tools_and_uses_captured_selection() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .summary_request(&crate::model::SummaryRequest {
                 instructions: "summary instructions".to_owned(),
@@ -1899,7 +1944,11 @@ mod tests {
 
     #[test]
     fn constructs_qualified_sol_request_with_high_effort() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .request(ModelSelection::new(&SOL, "high").unwrap(), &history())
             .unwrap();
@@ -1910,7 +1959,11 @@ mod tests {
 
     #[test]
     fn constructs_and_serializes_each_configured_openai_model() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         assert_eq!(model.prompt, "system prompt");
         assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
         assert_eq!(
@@ -1995,7 +2048,11 @@ mod tests {
 
     #[test]
     fn constructs_astra_request_with_verified_wire_contract() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        let model = super::OpenAiModel::new(
+            "system prompt",
+            "test-api-key",
+            CrossProviderReasoning::Inline,
+        );
         let request = model
             .request(
                 ModelSelection::new(&ASTRA, ASTRA.default_thinking).unwrap(),
@@ -3018,7 +3075,7 @@ mod tests {
             invalid_history.append_final_message(
                 "answer".to_owned(),
                 String::new(),
-                ProviderReplay::new("other", Vec::new()),
+                ProviderReplay::new("openai", Vec::new()),
             );
             let fixture = Fixture::start(FixtureReply::Sse(COMPLETED_STREAM)).await;
             let mut model =
@@ -5662,17 +5719,6 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_invalid_stored_replays_without_making_a_request() {
-            let mut provider_mismatch = history("first request");
-            provider_mismatch.append_final_message(
-                "answer".to_owned(),
-                String::new(),
-                ProviderReplay::new(
-                    "other-provider",
-                    vec![OpaqueReplayItem::new(b"{}".to_vec())],
-                ),
-            );
-            provider_mismatch.append_user_request("continue");
-
             let mut malformed_json = history("first request");
             malformed_json.append_final_message(
                 "answer".to_owned(),
@@ -5737,11 +5783,6 @@ mod tests {
 
             for (case, history, expected) in [
                 (
-                    "provider mismatch",
-                    provider_mismatch,
-                    ModelError::InvalidHistory("opaque replay belongs to another provider"),
-                ),
-                (
                     "malformed JSON",
                     malformed_json,
                     ModelError::InvalidHistory("opaque OpenAI replay is malformed"),
@@ -5781,6 +5822,141 @@ mod tests {
             }
         }
 
+        fn anthropic_replay(blocks: &[Value]) -> ProviderReplay {
+            ProviderReplay::new(
+                "anthropic",
+                blocks
+                    .iter()
+                    .map(|block| OpaqueReplayItem::new(serde_json::to_vec(block).unwrap()))
+                    .collect(),
+            )
+        }
+
+        fn cross_provider_history(code_reasoning: &str) -> ModelHistory {
+            let mut history = history("first request");
+            history.append_final_message(
+                "own answer".to_owned(),
+                String::new(),
+                replay(&[message("msg_own", "own answer")]),
+            );
+            history.append_user_request("inspect");
+            history
+                .append_completed_code(
+                    "print(1)".to_owned(),
+                    ModelCallId::new("toolu_1"),
+                    Some("I'll run it.".to_owned()),
+                    code_reasoning.to_owned(),
+                    anthropic_replay(&[
+                        json!({"type": "thinking", "thinking": code_reasoning, "signature": "anthropic-signature"}),
+                        json!({"type": "text", "text": "I'll run it."}),
+                        json!({"type": "tool_use", "id": "toolu_1", "name": "execute_python", "input": {"code": "print(1)"}}),
+                    ]),
+                    CodeResult::execution("1\n".to_owned()),
+                )
+                .unwrap();
+            history.append_final_message(
+                "It printed 1.".to_owned(),
+                "Summarising".to_owned(),
+                anthropic_replay(&[
+                    json!({"type": "redacted_thinking", "data": "anthropic-redacted-data"}),
+                    json!({"type": "text", "text": "It printed 1."}),
+                ]),
+            );
+            history.append_user_request("continue");
+            history
+        }
+
+        #[tokio::test]
+        async fn anthropic_entries_replay_as_assistant_text_and_function_calls_with_their_results()
+        {
+            for (reasoning, code_reasoning, reasoning_texts) in [
+                (
+                    CrossProviderReasoning::Inline,
+                    "Checking the file",
+                    [Some("Checking the file"), Some("Summarising")],
+                ),
+                (
+                    CrossProviderReasoning::Inline,
+                    "",
+                    [None, Some("Summarising")],
+                ),
+                (
+                    CrossProviderReasoning::Drop,
+                    "Checking the file",
+                    [None, None],
+                ),
+            ] {
+                let fixture = Fixture::start_sequence(vec![
+                    FixtureReply::OwnedSse(terminal_stream(
+                        "completed",
+                        vec![message("msg_next", "next")],
+                        Some(usage()),
+                    ));
+                    2
+                ])
+                .await;
+                let mut parent = OpenAiModel::build(
+                    "system prompt".to_owned(),
+                    "fixture-key".to_owned(),
+                    &fixture.endpoint,
+                    reasoning,
+                );
+                let mut child = parent.with_prompt("child prompt".to_owned());
+                let history = cross_provider_history(code_reasoning);
+                let original = history.clone();
+                let cancellation = CancellationToken::new();
+
+                for model in [&mut parent, &mut child] {
+                    model
+                        .step(default_selection(), &history, &cancellation, &mut |_| {})
+                        .await
+                        .unwrap();
+                }
+
+                let assistant_text = |text: &str| json!({"role": "assistant", "content": text});
+                let mut input = vec![
+                    json!({"role": "user", "content": "first request"}),
+                    message("msg_own", "own answer"),
+                    json!({"role": "user", "content": "inspect"}),
+                ];
+                input.extend(reasoning_texts[0].map(assistant_text));
+                input.extend([
+                    assistant_text("I'll run it."),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "toolu_1",
+                        "name": "execute_python",
+                        "arguments": r#"{"code":"print(1)"}"#
+                    }),
+                    json!({"type": "function_call_output", "call_id": "toolu_1", "output": "1\n"}),
+                ]);
+                input.extend(reasoning_texts[1].map(assistant_text));
+                input.extend([
+                    assistant_text("It printed 1."),
+                    json!({"role": "user", "content": "continue"}),
+                ]);
+                let requests = fixture.requests.lock().unwrap().clone();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.body.clone())
+                        .collect::<Vec<_>>(),
+                    [
+                        expected_request("system prompt", json!(input)),
+                        expected_request("child prompt", json!(input)),
+                    ],
+                    "{reasoning:?} {code_reasoning:?}"
+                );
+                for request in &requests {
+                    let body = request.body.to_string();
+                    for opaque in ["anthropic-signature", "anthropic-redacted-data", "thinking"] {
+                        assert!(!body.contains(opaque), "{opaque} leaked into {body}");
+                    }
+                }
+                assert_eq!(history, original);
+            }
+        }
+
         #[tokio::test]
         async fn validate_history_accepts_valid_replay_and_rejects_invalid_replay_without_http() {
             let fixture = Fixture::start(FixtureReply::OwnedSse(terminal_stream(
@@ -5808,9 +5984,7 @@ mod tests {
             assert_eq!(model.validate_history(&valid, default_selection()), Ok(()));
             assert_eq!(
                 model.validate_history(&foreign, default_selection()),
-                Err(ModelError::InvalidHistory(
-                    "opaque replay belongs to another provider"
-                ))
+                Ok(())
             );
             assert_eq!(
                 model.validate_history(&mismatched, default_selection()),
@@ -6186,7 +6360,11 @@ mod tests {
             (
                 ready.worker_path().to_path_buf(),
                 ready.workspace_root().to_path_buf(),
-                crate::production_model(&ready, persisted_settings.anthropic_cache_ttl()),
+                crate::production_model(
+                    &ready,
+                    persisted_settings.anthropic_cache_ttl(),
+                    persisted_settings.cross_provider_reasoning(),
+                ),
                 ready.prompt_base().to_owned(),
                 ModelSelection::new(ready.model(), ready.thinking())
                     .expect("ready startup selection must be valid"),

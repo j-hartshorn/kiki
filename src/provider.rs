@@ -4,7 +4,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     anthropic::AnthropicModel,
-    config::{ModelSelection, models::Provider, settings::CacheTtl},
+    config::{
+        ModelSelection,
+        models::Provider,
+        settings::{CacheTtl, CrossProviderReasoning},
+    },
     model::{
         Model, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, SummaryRequest,
         SummaryResult,
@@ -25,11 +29,19 @@ impl ProviderModel {
         openai_api_key: Option<&str>,
         anthropic_api_key: Option<&str>,
         anthropic_cache_ttl: CacheTtl,
+        cross_provider_reasoning: CrossProviderReasoning,
     ) -> Self {
         Self {
-            openai: openai_api_key.map(|api_key| OpenAiModel::new(prompt, api_key)),
-            anthropic: anthropic_api_key
-                .map(|api_key| AnthropicModel::new(prompt, api_key, anthropic_cache_ttl)),
+            openai: openai_api_key
+                .map(|api_key| OpenAiModel::new(prompt, api_key, cross_provider_reasoning)),
+            anthropic: anthropic_api_key.map(|api_key| {
+                AnthropicModel::new(
+                    prompt,
+                    api_key,
+                    anthropic_cache_ttl,
+                    cross_provider_reasoning,
+                )
+            }),
         }
     }
 
@@ -155,7 +167,7 @@ mod tests {
         config::{
             ModelSelection,
             models::{OPUS_5_5, Provider, SOL},
-            settings::CacheTtl,
+            settings::{CacheTtl, CrossProviderReasoning},
         },
         model::{
             Model, ModelAction, ModelError, ModelFailure, ModelHistory, ModelStep, SummaryRequest,
@@ -273,6 +285,7 @@ mod tests {
                     ANTHROPIC_KEY,
                     &fixture.endpoint,
                     CacheTtl::FiveMinutes,
+                    CrossProviderReasoning::Inline,
                 )
             }),
         }
@@ -356,10 +369,7 @@ mod tests {
             model.validate_history(&anthropic_history, anthropic()),
             Ok(())
         );
-        assert!(matches!(
-            model.validate_history(&anthropic_history, openai()),
-            Err(ModelError::InvalidHistory(_))
-        ));
+        assert_eq!(model.validate_history(&anthropic_history, openai()), Ok(()));
 
         let summary = model
             .summarise(summary_request(openai()), &cancellation, &mut || {})
@@ -443,7 +453,8 @@ mod tests {
                     "root prompt",
                     openai_key,
                     anthropic_key,
-                    CacheTtl::FiveMinutes
+                    CacheTtl::FiveMinutes,
+                    CrossProviderReasoning::Inline
                 )
                 .providers(),
                 providers
@@ -471,6 +482,7 @@ mod tests {
                 ANTHROPIC_KEY,
                 &anthropic_fixture.endpoint,
                 CacheTtl::OneHour,
+                CrossProviderReasoning::Inline,
             )),
             ..router(&root, Some(&openai_fixture), None)
         };
