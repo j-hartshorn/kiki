@@ -6357,11 +6357,11 @@ pub(crate) mod tests {
     }
 
     async fn start_live_controller(
-        required_model: Option<&'static crate::config::ModelConfiguration>,
+        required_model: &'static crate::config::ModelConfiguration,
     ) -> Result<LiveController, &'static str> {
         let configuration = crate::config::load();
         let effective_model = configuration.snapshot().model();
-        if required_model.is_some_and(|required| required.id != effective_model.id) {
+        if required_model.id != effective_model.id {
             return Err(LIVE_SETUP_MODEL);
         }
         let setup_failure = match effective_model.provider() {
@@ -6773,7 +6773,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn run_live_smoke_test(
-        required_model: Option<&'static crate::config::ModelConfiguration>,
+        required_model: &'static crate::config::ModelConfiguration,
     ) -> Result<(), &'static str> {
         let mut controller = start_live_controller(required_model).await?;
         let scenario = match timeout(LIVE_OUTER_TIMEOUT, run_live_scenario(&mut controller)).await {
@@ -6789,9 +6789,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires explicit OPENAI_API_KEY and MONTY_BIN"]
+    #[ignore = "requires explicit OPENAI_API_KEY, KIKI_MODEL=openai/gpt-5.6-sol and MONTY_BIN"]
     async fn live_sol() {
-        if let Err(message) = run_live_smoke_test(None).await {
+        if let Err(message) = run_live_smoke_test(&SOL).await {
             panic!("{message}");
         }
     }

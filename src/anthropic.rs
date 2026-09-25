@@ -3856,7 +3856,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires explicit ANTHROPIC_API_KEY, KIKI_MODEL=anthropic/claude-opus-5-5 and MONTY_BIN"]
     async fn live_opus() {
-        if let Err(message) = crate::openai::tests::run_live_smoke_test(Some(&OPUS_5_5)).await {
+        if let Err(message) = crate::openai::tests::run_live_smoke_test(&OPUS_5_5).await {
             panic!("{message}");
         }
     }

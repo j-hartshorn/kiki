@@ -281,7 +281,7 @@ test "$(rg -l '(cap_std|blake3)' src --glob '*.rs')" = "src/tools.rs"
 The ignored live scenarios require a key for the selected provider and the Monty worker. `just` loads the ignored root `.env` if used; the Anthropic recipe explicitly selects Opus 5.5:
 
 ```sh
-OPENAI_API_KEY=... KIKI_MODEL=openai/gpt-5.6-sol MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
+OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
 ANTHROPIC_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test-anthropic
 ```
 
