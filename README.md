@@ -1,6 +1,6 @@
 # Kiki
 
-Kiki runs a production OpenAI Responses API agent against the standard OpenAI endpoint. `KIKI_MODEL` selects `openai/gpt-6-astra` (a frontier model for computer/browser use, software engineering, scientific analysis, and document artifacts), `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), or `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work); each uses the `default` service tier. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
+Kiki runs a Python agent with either the OpenAI Responses API or the Anthropic Messages API. `KIKI_MODEL` selects `openai/gpt-6-astra` (a frontier model for computer/browser use, software engineering, scientific analysis, and document artifacts), `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-sol` (the default flagship model), `openai/gpt-5.6-terra` (the intelligence/cost balance), `openai/gpt-5.6-luna` (for cost-sensitive, high-volume work), `anthropic/claude-opus-5-5`, or `anthropic/claude-fable-5-1`. OpenAI uses the `default` service tier; Anthropic uses `standard`. The agent works in one persistent Python arena: values survive model steps and later requests, while its async, workspace-rooted functions are `read`, `write`, `edit`, `list_dir`, `glob`, `grep`, and `run`. Independent calls can use `asyncio.gather()` and run with at most 16 active host calls.
 
 ## Setup
 
@@ -10,15 +10,15 @@ Install the exact Monty worker:
 cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
 ```
 
-Set a non-empty OpenAI key and an absolute path to that exact worker. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to one of `openai/gpt-6-astra`, `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-sol`, `openai/gpt-5.6-terra`, or `openai/gpt-5.6-luna`, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured but does not change the Sol default. All six OpenAI models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, while Sol and Luna default to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
+Set an absolute path to that exact worker and a non-empty key for the selected model's provider: `OPENAI_API_KEY` for OpenAI or `ANTHROPIC_API_KEY` for Anthropic. The keys are independently optional; with the default `openai/gpt-5.6-sol` model, only `OPENAI_API_KEY` is needed. On resume, the saved model requires its provider's key unless an explicit `KIKI_MODEL` overrides it. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to any supported qualified model ID above, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured and an OpenAI key is present, but does not change the Sol default. All eight models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, Opus to `medium`, Fable to `high`, and the remaining OpenAI models to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
 
 Export the variables:
 
 ```sh
-export OPENAI_API_KEY=...
+export ANTHROPIC_API_KEY=...
 export MONTY_BIN=/tmp/kiki-monty/bin/monty
 export KIKI_SYSTEM_PROMPT=/absolute/path/to/system.md
-export KIKI_MODEL=openai/gpt-5.6-terra
+export KIKI_MODEL=anthropic/claude-opus-5-5
 export KIKI_THINKING=high
 ```
 
@@ -113,8 +113,12 @@ Settings use this precedence: built-in defaults < user settings < project settin
 User defaults live at `~/.kiki/config.toml`:
 
 ```toml
-model = "openai/gpt-5.6-terra"
-favourites = ["openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6-luna"]
+model = "anthropic/claude-opus-5-5"
+favourites = ["anthropic/claude-opus-5-5", "openai/gpt-6-astra", "openai/gpt-6-sol"]
+cross_provider_reasoning = "inline"
+
+[anthropic]
+cache_ttl = "5m"
 
 [thinking]
 "openai/gpt-6-astra" = "low"
@@ -123,21 +127,26 @@ favourites = ["openai/gpt-6-astra", "openai/gpt-6-sol", "openai/gpt-6-luna"]
 "openai/gpt-5.6-sol" = "low"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
+"anthropic/claude-opus-5-5" = "medium"
+"anthropic/claude-fable-5-1" = "high"
 ```
 
 Project settings use the same TOML shape at `.kiki/config.toml` in the exact current working directory; parent directories are not read:
 
 ```toml
-model = "openai/gpt-5.6-terra"
+model = "anthropic/claude-opus-5-5"
 
 [thinking]
+"anthropic/claude-opus-5-5" = "medium"
 "openai/gpt-6-astra" = "low"
 "openai/gpt-5.6-sol" = "low"
 "openai/gpt-5.6-terra" = "high"
 "openai/gpt-5.6-luna" = "medium"
 ```
 
-`favourites` is an optional, non-empty, ordered list of unique supported model IDs. User and project lists use the same precedence as other file settings; a project list replaces the user list. Favourites lead the model picker in their written order, followed by all other models. When set, only favourites may be used by subagents, and the first is the default for every new subagent. The foreground model remains independent of favourites. Without the setting, the picker uses catalogue order and subagents retain the invoking model by default and may use any supported model.
+`cross_provider_reasoning` is `"inline"` (default) or `"drop"`: when switching providers between runs, Kiki reconstructs foreign history from its stored semantic entries, including reasoning summaries as assistant text with `inline`, or omitting those summaries with `drop`. Same-provider history keeps its provider replay. `[anthropic] cache_ttl` is `"5m"` (default) or `"1h"`; Ordinary Anthropic requests place two cache breakpoints, on the system block and the latest message; summaries have none. Both settings use user/project precedence, are read at startup, and have no environment or session override.
+
+`favourites` is an optional, non-empty, ordered list of unique supported model IDs. User and project lists use the same precedence as other file settings; a project list replaces the user list. Available favourites lead the model picker in their written order, followed by the full available catalogue under `OpenAI` and `Anthropic` headings; a favourite also appears in its provider group. Models without their provider's key are hidden from every picker group. A typed `/model <id>` for a keyless provider instead reports an error and retains the current model. When favourites are set, only favourites may be used by subagents, and the first is the default for every new subagent; a missing key for a requested or default subagent model causes a tool error. The foreground model remains independent of favourites. Without the setting, the picker uses provider groups in catalogue order and subagents retain the invoking model by default and may use any supported model whose provider has a key.
 
 `Ctrl-S` in either model or thinking picker writes the user default separately from the active session setting. If project settings or environment variables mask it, Kiki reports that override.
 
@@ -192,11 +201,11 @@ A trace is diagnostic only, not authoritative or resumable history: it cannot re
 
 ## Privacy and costs
 
-`store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
+`store: false` disables retained OpenAI Response objects, but does not prevent user requests or workspace content printed by Python from being sent to the selected provider. Ordinary Anthropic step requests use the configured cache TTL, not OpenAI's `store` setting.
 
 Session storage is local and unencrypted. It includes prompts, outputs, provider replay, Arena contents, and potentially sensitive project data. On Unix, Kiki restricts session directories to `0700` and session files to `0600`; this is not a portable permission guarantee. Configured API credentials are not saved as session configuration or shown in Kiki's display, but credentials included in a prompt, output, or Arena value are ordinary session content. Local persistence does not protect against disk loss.
 
-Returned token usage has a local direct-API Standard/`default`-tier token estimate: version `2026-09-04` for `gpt-6-astra`, snapshot `2026-09-23` for `gpt-6-sol` and `gpt-6-luna`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The estimate selects that model's short-context rates through 272,000 input tokens and its long-context rates above that boundary; it is not billing. Opaque SDK retries can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
+Returned token usage has a local direct-API estimate, not a provider bill. OpenAI `default`-tier rates are version `2026-09-04` for `gpt-6-astra`, snapshot `2026-09-23` for `gpt-6-sol` and `gpt-6-luna`, and version `2026-08-27` for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. OpenAI pricing uses short-context rates through 272,000 input tokens and long-context rates above that boundary. Anthropic `standard` rates for both models use the `2026-09-23` identity from [Anthropic pricing](https://docs.anthropic.com/en/docs/about-claude/pricing), with no long-context price band. Per million tokens, Opus 5.5 costs $4 input, $20 output, $0.20 cache read, $5 five-minute cache write, or $8 one-hour cache write; Fable 5.1 costs $10 input, $50 output, $0.25 cache read, $12.50 five-minute cache write, or $20 one-hour cache write. Opaque or retried attempts can be billed but unreported, so a displayed cost may be a lower bound or unavailable. Batch and Flex (50% of OpenAI Standard), Fast (200%), and separately billed computer/browser action surcharges are not selected, controlled, or estimated by Kiki; token estimates are not a complete provider bill.
 
 ## Controls and availability
 
@@ -222,7 +231,7 @@ Returned token usage has a local direct-API Standard/`default`-tier token estima
 - After a successful copy, the selection remains highlighted, flashes off and on twice, and the header shows `Copied`. A local clipboard failure is nonfatal: the selection remains highlighted and the header shows `Copy failed`.
 - A completed selection survives ordinary history scrolling, but a new primary-button press, display-history content change, `Ctrl-O` expansion toggle, prompt-driven viewport change, or terminal resize clears it. Clipboard copy is local-desktop only; SSH, tmux, and OSC 52 forwarding are not supported.
 
-Missing or invalid startup configuration opens a read-only configuration-only view, where prompt editing and submission are disabled. An OpenAI authentication failure or failed arena checkpoint recovery makes the runtime prompt read-only until Kiki restarts. `Ctrl-T` and `Ctrl-O` affect applicable retained transcript content only, not submission availability.
+Missing or invalid startup configuration opens a read-only configuration-only view, where prompt editing and submission are disabled. A selected-provider authentication failure or failed arena checkpoint recovery makes the runtime prompt read-only until Kiki restarts. `Ctrl-T` and `Ctrl-O` affect applicable retained transcript content only, not submission availability.
 
 ## Transcript presentation
 
@@ -232,14 +241,15 @@ User requests appear in neutral cards without a `you:` label. RunId and ModelSte
 
 Automatic collapse applies only when source exceeds 32 logical lines or combined execution-content lines exceeds 16 logical lines. It keeps the latest 32 source lines and latest 16 combined execution-content lines. Each affected code or execution section owns its skipped-line count in its top border as `<label> · N earlier line(s) omitted`; a non-empty execution section wholly consumed by the shared output budget remains as a closed titled box. Section labels and borders, live activity, failure or cancellation diagnostics, display-gap, and accounting do not consume those budgets. `tool calls` has its own automatic preview: it shows the latest 16 rows, preceded by `[N earlier tool calls omitted]` when needed. The tool-call trace is deliberately unbounded per execution; this display collapse is its only bound. `Ctrl-O` expands every retained source, tool-call, and execution row together or restores automatic collapse; it cannot recover source or execution content outside their existing retention bounds. Tree-sitter highlights exact partial and settled Python source. If highlighting fails, Kiki shows the exact source as plain text.
 
-The configured prompt is a grapheme-aware editor with a visible terminal cursor. It is bottom anchored between full-width top and always-present bottom rules, wraps at display-cell boundaries while preserving explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then follows its tail or keeps a moved caret visible. The one-row footer keeps the current cwd and optional session name on the left, abbreviating home as `~`. On the right it shows reported `↑` input, `↓` output, `R` cached input, `W` cache-write input, `CH` latest cache-hit percentage, local estimated cost, latest settled-request context occupancy, and `model • thinking level`. Counts use compact lowercase `k` and `m` suffixes. Context is `<percent>/<capacity>`, yellow from 80.0% through 89.9% and red from 90.0%; it uses `272k` through the long-context pricing threshold and `1.05m` above it. Missing values are omitted. On narrow terminals Kiki front-truncates cwd, then removes metrics in display order while preserving model and thinking last. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
+The configured prompt is a grapheme-aware editor with a visible terminal cursor. It is bottom anchored between full-width top and always-present bottom rules, wraps at display-cell boundaries while preserving explicit newlines, grows upward to roughly one-third of terminal height with a three-row prompt-box minimum where dimensions permit, then follows its tail or keeps a moved caret visible. The one-row footer keeps the current cwd and optional session name on the left, abbreviating home as `~`. On the right it shows reported `↑` input, `↓` output, `R` cached input, `W` cache-write input, `CH` latest cache-hit percentage, local estimated cost, latest settled-request context occupancy, and `model • thinking level`. Counts use compact lowercase `k` and `m` suffixes. Context is `<percent>/<capacity>`, yellow from 80.0% through 89.9% and red from 90.0%; OpenAI uses `272k` through the long-context pricing threshold and `1.05m` above it; Anthropic uses `1m`. Missing values are omitted. On narrow terminals Kiki front-truncates cwd, then removes metrics in display order while preserving model and thinking last. Complete and lower-bound costs deliberately use the same ordinary, unmarked `$…`; unknown or unpriceable cost is omitted, never invented as zero.
 
 ## Manual interactive transcript demonstration
 
 Start Kiki with live credentials:
 
 ```sh
-OPENAI_API_KEY=... \
+ANTHROPIC_API_KEY=... \
+KIKI_MODEL=anthropic/claude-opus-5-5 \
 MONTY_BIN=/tmp/kiki-monty/bin/monty \
 cargo run
 ```
@@ -259,19 +269,20 @@ The ordinary suite is credential-free and uses local fixtures:
 ```sh
 cargo fmt --all -- --check
 cargo check --all-targets
-env -u OPENAI_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1
 cargo clippy --all-targets -- -D warnings
 test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
 test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"
-test "$(rg -l '(cap_std|rustix|blake3|getrandom)' src --glob '*.rs')" = "src/tools.rs"
+test "$(rg -l '(cap_std|blake3)' src --glob '*.rs')" = "src/tools.rs"
 ```
 
 ## Opt-in live smoke test
 
-The ignored live scenario is selected explicitly and requires the setup above:
+The ignored live scenarios require a key for the selected provider and the Monty worker. `just` loads the ignored root `.env` if used; the Anthropic recipe explicitly selects Opus 5.5:
 
 ```sh
-OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
+OPENAI_API_KEY=... KIKI_MODEL=openai/gpt-5.6-sol MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
+ANTHROPIC_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test-anthropic
 ```
 
-It runs three requests on one controller. The complete scenario has a five-minute watchdog; every provider attempt has a two-minute deadline; if the first request starts a ninth model step, the test cancels it and fails. The cancellation request must start an attempt within 30 seconds and settle within another 30 seconds. The follow-up request must finish within two minutes. Cleanup always requests shutdown, waits up to ten seconds, then aborts and awaits the controller if necessary.
+Each runs three requests on one controller. The complete scenario has a five-minute watchdog; every provider attempt has a two-minute deadline; if the first request starts a ninth model step, the test cancels it and fails. The cancellation request must start an attempt within 30 seconds and settle within another 30 seconds. The follow-up request must finish within two minutes. Cleanup always requests shutdown, waits up to ten seconds, then aborts and awaits the controller if necessary.
