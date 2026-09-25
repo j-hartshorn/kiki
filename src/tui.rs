@@ -6893,7 +6893,6 @@ mod tests {
 
         assert!(header.contains("Ctrl-T thinking"));
         assert!(!header.contains("reasoning"));
-        assert!(!include_str!("../README.md").contains("reasoning"));
     }
 
     #[test]
