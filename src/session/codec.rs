@@ -191,6 +191,8 @@ struct StoredSelection {
 struct StoredSessionPreferences {
     selected_model: String,
     thinking: BTreeMap<String, String>,
+    #[serde(default)]
+    type_check_disabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1076,6 +1078,7 @@ fn decode_selection(selection: &StoredSelection) -> Result<ModelSelection, Codec
 
 pub(super) fn encode_session_preferences(
     preferences: &SessionPreferences,
+    type_check_disabled: bool,
 ) -> Result<String, CodecError> {
     serde_json::to_string(&StoredSessionPreferences {
         selected_model: preferences.selection().model().id.to_owned(),
@@ -1084,13 +1087,17 @@ pub(super) fn encode_session_preferences(
             .iter()
             .map(|(model, thinking)| ((*model).to_owned(), (*thinking).to_owned()))
             .collect(),
+        type_check_disabled,
     })
     .map_err(CodecError::from)
 }
 
-pub(super) fn decode_session_preferences(value: &str) -> Result<SessionPreferences, CodecError> {
-    let preferences: StoredSessionPreferences = serde_json::from_str(value)?;
-    SessionPreferences::from_ids(preferences.selected_model.as_str(), preferences.thinking)
+pub(super) fn decode_session_preferences(
+    value: &str,
+) -> Result<(SessionPreferences, bool), CodecError> {
+    let stored: StoredSessionPreferences = serde_json::from_str(value)?;
+    SessionPreferences::from_ids(stored.selected_model.as_str(), stored.thinking)
+        .map(|preferences| (preferences, stored.type_check_disabled))
         .ok_or(CodecError::InvalidSelection)
 }
 
@@ -1789,13 +1796,19 @@ mod tests {
         )
         .expect("valid preferences");
 
-        let encoded = encode_session_preferences(&preferences).expect("encode preferences");
-        assert_eq!(
-            decode_session_preferences(&encoded).expect("decode preferences"),
-            preferences
-        );
+        for disabled in [false, true] {
+            let encoded =
+                encode_session_preferences(&preferences, disabled).expect("encode preferences");
+            assert_eq!(
+                decode_session_preferences(&encoded).expect("decode preferences"),
+                (preferences.clone(), disabled)
+            );
+        }
+        let older = r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"}}"#;
+        assert!(!decode_session_preferences(older).unwrap().1);
 
         for invalid in [
+            r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"},"type_check_disabled":"off"}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"high"},"extra":true}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{"openai/gpt-5.6-terra":"unsupported"}}"#,
             r#"{"selected_model":"openai/gpt-5.6-terra","thinking":{}}"#,

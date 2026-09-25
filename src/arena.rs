@@ -751,6 +751,7 @@ pub(crate) struct ArenaChildSource {
     tool_host: ToolHost,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
+    model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -804,6 +805,7 @@ impl ArenaChildSource {
             },
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
+            model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -830,6 +832,7 @@ pub struct Arena {
     checkpoint: Checkpoint,
     runtime: RuntimeIdentity,
     repl_config: ReplConfig,
+    model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
     #[cfg(test)]
@@ -933,6 +936,7 @@ impl Arena {
             checkpoint,
             runtime,
             repl_config,
+            model_type_check_disabled: false,
             execution_timeout,
             clock,
             #[cfg(test)]
@@ -959,6 +963,7 @@ impl Arena {
             tool_host: self.tool_host.clone(),
             runtime: self.runtime.clone(),
             repl_config: self.repl_config.clone(),
+            model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
             #[cfg(test)]
@@ -966,6 +971,10 @@ impl Arena {
             #[cfg(test)]
             child_construction_test_gate: self.child_construction_test_gate.clone(),
         }
+    }
+
+    pub(crate) fn disable_model_type_check(&mut self) {
+        self.model_type_check_disabled = true;
     }
 
     #[cfg(test)]
@@ -1018,8 +1027,14 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
-        self.execute_with_context(code, cancellation, progress, invocation, false)
-            .await
+        self.execute_with_context(
+            code,
+            cancellation,
+            progress,
+            invocation,
+            self.model_type_check_disabled,
+        )
+        .await
     }
 
     async fn execute_with_context(
@@ -3023,6 +3038,58 @@ mod tests {
         assert!(!workspace.path().join("created.txt").exists());
         let next = execute_checked(&mut arena, "saved + 1").await.unwrap();
         assert_eq!(complete(&next).unwrap().head, "2");
+    }
+
+    #[tokio::test]
+    async fn disabled_model_type_check_survives_restore_and_child_creation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut arena = arena(&workspace).await;
+        let rejected = execute_checked(
+            &mut arena,
+            "wrong: int = 'text'\nawait write('rejected.txt', 'bad')",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            rejected.outcome,
+            ExecutionOutcome::TypeCheckError(_)
+        ));
+        assert!(!workspace.path().join("rejected.txt").exists());
+
+        arena.disable_model_type_check();
+        let executed = execute_checked(
+            &mut arena,
+            "wrong: int = 'text'\nawait write('accepted.txt', 'ok')",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            executed.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("accepted.txt")).unwrap(),
+            "ok"
+        );
+
+        let checkpoint = arena.checkpoint();
+        arena.restore(checkpoint.clone()).await.unwrap();
+        let restored = execute_checked(&mut arena, "restored: int = 'text'")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+
+        let mut child = arena.child(&checkpoint, false).await.unwrap();
+        let inherited = execute_checked(&mut child, "child: int = 'text'")
+            .await
+            .unwrap();
+        assert!(matches!(
+            inherited.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
     }
 
     #[tokio::test]

@@ -158,6 +158,12 @@ pub(crate) enum RestoredTimelineItem {
     SubagentFinished(TaskRecord),
 }
 
+#[derive(Default)]
+pub(crate) struct ResumeOptions {
+    pub(crate) relocated_cwd: Option<PathBuf>,
+    pub(crate) disable_type_check: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeInitialState {
     pub(crate) metadata: Option<SessionMetadata>,
@@ -772,8 +778,12 @@ impl<M: Model> RuntimeController<M> {
         selection: ModelSelection,
         persisted_settings: SettingsContext,
         subagents: SessionSubagents,
-        relocated_cwd: Option<PathBuf>,
+        options: ResumeOptions,
     ) -> Result<(Self, RuntimeInitialState), SessionError> {
+        let ResumeOptions {
+            relocated_cwd,
+            disable_type_check,
+        } = options;
         let restore = session.restore()?;
         let mut initial = restored_initial_state(&restore);
         let records = restore
@@ -816,10 +826,14 @@ impl<M: Model> RuntimeController<M> {
                 let preferences = accepted_thinking.proposal(selection);
                 match session
                     .writer()
-                    .commit_startup_preferences(preferences.clone(), relocated_cwd)
+                    .commit_startup_preferences(
+                        preferences.clone(),
+                        relocated_cwd,
+                        disable_type_check,
+                    )
                     .await
                 {
-                    Ok(()) => match session
+                    Ok(type_check_disabled) => match session
                         .writer()
                         .activate(
                             restore.effective_entry,
@@ -830,11 +844,15 @@ impl<M: Model> RuntimeController<M> {
                     {
                         Ok(()) => {
                             accepted_thinking.accept(selection);
-                            initial
+                            let metadata = initial
                                 .metadata
                                 .as_mut()
-                                .expect("executable session restore must have metadata")
-                                .update_preferences(preferences);
+                                .expect("executable session restore must have metadata");
+                            metadata.update_preferences(preferences);
+                            if type_check_disabled {
+                                metadata.disable_type_check();
+                                arena.disable_model_type_check();
+                            }
                             Some(Agent::new(arena, model))
                         }
                         Err(_) => {
@@ -2309,9 +2327,10 @@ mod tests {
     use super::{
         AcceptedThinking, ActiveRun, CoordinatorEvent, CorrectionOutcome, ForegroundOperation,
         ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
-        RestoredTimelineItem, RunId, RuntimeCommand, RuntimeController, RuntimeDisabledReason,
-        RuntimeEvent, RuntimeProgressReceiver, StoredRecord, TerminalDetails, WorkerMessage,
-        restored_initial_state, restored_stored_record, runtime_event_payload_bytes,
+        RestoredTimelineItem, ResumeOptions, RunId, RuntimeCommand, RuntimeController,
+        RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord,
+        TerminalDetails, WorkerMessage, restored_initial_state, restored_stored_record,
+        runtime_event_payload_bytes,
     };
     use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
     use crate::arena::{
@@ -7803,6 +7822,7 @@ mod tests {
                     SOL.id: "low",
                     TERRA.id: "high",
                 },
+                "type_check_disabled": false,
             })
         );
         assert!(metadata_after.1 >= metadata_before.1);
@@ -8168,6 +8188,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opt_out_on_resume_survives_restart_and_tree_navigation() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let selection = ModelSelection::new(&SOL, "low").unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let id = session.id().to_owned();
+        let root = session.restore().unwrap().effective_entry;
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "first: int = 'text'\nawait write('first.txt', 'ok')".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ]);
+        let (mut controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            model,
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions {
+                disable_type_check: true,
+                ..ResumeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(initial.metadata.unwrap().type_check_disabled());
+        let writer = session.writer();
+        let mut agent = controller.agent.take().unwrap();
+        agent
+            .run_persisted(
+                selection,
+                "first request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("first.txt")).unwrap(),
+            "ok"
+        );
+        let active = session.restore().unwrap().observed_active_entry;
+        writer.select_active_entry(root, active).await.unwrap();
+        assert!(session.metadata().unwrap().type_check_disabled());
+        drop(agent);
+        drop(controller);
+        drop(writer);
+        session.close().unwrap();
+
+        let session = Session::open(home.path(), &id).unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let model = ScriptedModel::new(vec![
+            ModelAction::Code {
+                source: "second: int = 'text'\nawait write('second.txt', 'ok')".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ]);
+        let (mut controller, initial) = RuntimeController::restore(
+            &session,
+            arena,
+            model,
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            ResumeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(initial.metadata.unwrap().type_check_disabled());
+        let writer = session.writer();
+        let mut agent = controller.agent.take().unwrap();
+        agent
+            .run_persisted(
+                selection,
+                "second request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("second.txt")).unwrap(),
+            "ok"
+        );
+        drop(agent);
+        drop(controller);
+        drop(writer);
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn restore_waits_for_and_reports_the_effective_startup_preferences() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -8215,7 +8353,7 @@ mod tests {
                     SubagentPolicy::from(snapshot.subagents()),
                     Arc::new(super::UnavailableChildRunner),
                 ),
-                None,
+                ResumeOptions::default(),
             )
             .await;
             let _ = returned.send(());
@@ -8302,7 +8440,10 @@ mod tests {
                 SubagentPolicy::from(snapshot.subagents()),
                 Arc::new(super::UnavailableChildRunner),
             ),
-            None,
+            ResumeOptions {
+                disable_type_check: true,
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -8417,7 +8558,10 @@ mod tests {
                 SubagentPolicy::from(snapshot.subagents()),
                 Arc::new(super::UnavailableChildRunner),
             ),
-            Some(relocated_workspace.path().to_path_buf()),
+            ResumeOptions {
+                relocated_cwd: Some(relocated_workspace.path().to_path_buf()),
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -14247,7 +14391,10 @@ mod tests {
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
                 Arc::new(CountingChildRunner(starts.clone())),
             ),
-            Some(relocated.path().to_path_buf()),
+            ResumeOptions {
+                relocated_cwd: Some(relocated.path().to_path_buf()),
+                ..ResumeOptions::default()
+            },
         )
         .await
         .expect("return disabled restored runtime");
@@ -14806,7 +14953,7 @@ mod tests {
                 Arc::new(CountingChildRunner(starts.clone())),
             )
             .with_start_test_gate(start_gate.clone()),
-            None,
+            ResumeOptions::default(),
         )
         .await
         .expect("restore runtime");
@@ -15115,7 +15262,7 @@ mod tests {
                 SubagentPolicy::from(crate::config::ready_snapshot_for_test().subagents()),
                 Arc::new(CountingChildRunner(Arc::new(AtomicUsize::new(0)))),
             ),
-            None,
+            ResumeOptions::default(),
         )
         .await
         .expect("restore navigation runtime");

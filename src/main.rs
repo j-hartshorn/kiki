@@ -19,6 +19,7 @@ mod transcript;
 pub mod tui;
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +35,8 @@ use crate::arena::Arena;
 use crate::config::ModelSelection;
 use crate::openai::{OpenAiChildModelFactory, OpenAiModel};
 use crate::runtime::{
-    PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, RuntimeCommand, RuntimeController, RuntimeEvent,
+    PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ResumeOptions, RuntimeCommand, RuntimeController,
+    RuntimeEvent,
 };
 use crate::session::{Session, SessionListRow};
 use crate::subagents::{
@@ -90,6 +92,18 @@ fn invocation() -> Result<Invocation, io::Error> {
             })
         }
         _ => Err(usage()),
+    }
+}
+
+fn requested_type_check_disabled(value: Option<&OsStr>) -> Result<bool, io::Error> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "on" => Ok(false),
+        Some(value) if value == "off" => Ok(true),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KIKI_TYPE_CHECK must be `on` or `off`",
+        )),
     }
 }
 
@@ -226,6 +240,8 @@ fn run_open_configuration(
 }
 
 fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
+    let disable_type_check =
+        requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
     let trace_owner = TraceOwner::from_path(std::env::var_os("KIKI_TRACE_FILE"))?;
     let trace = trace_owner.handle();
     let configuration = config::load();
@@ -249,14 +265,23 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
             return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
-    let arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
+    let mut arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
             return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
-    let session = Session::create(&home, &workspace_root, selection, arena.checkpoint())?;
+    let session = Session::create_with_type_check_disabled(
+        &home,
+        &workspace_root,
+        selection,
+        arena.checkpoint(),
+        disable_type_check,
+    )?;
+    if disable_type_check {
+        arena.disable_model_type_check();
+    }
     let subagents: SessionSubagents = SubagentCoordinator::new(
         SubagentPolicy::from(startup.subagents()),
         Arc::new(CompleteChildRunner::new(
@@ -294,6 +319,8 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error>> {
+    let disable_type_check =
+        requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
     let current_root = current_workspace_root()?;
     match Session::read_cwd(&home, &id) {
         Ok(saved_cwd) if !here => {
@@ -375,7 +402,10 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         selection,
         startup.settings().clone(),
         subagents,
-        relocated_cwd,
+        ResumeOptions {
+            relocated_cwd,
+            disable_type_check,
+        },
     )) {
         Ok(restored) => restored,
         Err(error) => {
@@ -430,10 +460,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::production_model;
+    use std::ffi::OsStr;
+
+    use super::{production_model, requested_type_check_disabled};
 
     use crate::config::ReadyStartup;
     use crate::openai::OpenAiModel;
+
+    #[test]
+    fn type_check_opt_out_accepts_only_on_and_off() {
+        assert!(!requested_type_check_disabled(None).unwrap());
+        assert!(!requested_type_check_disabled(Some(OsStr::new("on"))).unwrap());
+        assert!(requested_type_check_disabled(Some(OsStr::new("off"))).unwrap());
+        assert!(requested_type_check_disabled(Some(OsStr::new("false"))).is_err());
+        assert!(requested_type_check_disabled(Some(OsStr::new(""))).is_err());
+    }
 
     #[test]
     fn production_model_composition_is_openai() {
