@@ -26,7 +26,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::runtime::Builder;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::Agent;
@@ -43,11 +43,8 @@ use crate::subagents::{
 use crate::telemetry::TraceOwner;
 use crate::tools::ToolHost;
 
-fn production_model(
-    ready: &config::ReadyStartup<'_>,
-    settings: watch::Receiver<ModelSelection>,
-) -> OpenAiModel {
-    OpenAiModel::with_settings(ready.system_prompt(), ready.api_key().expose(), settings)
+fn production_model(ready: &config::ReadyStartup<'_>) -> OpenAiModel {
+    OpenAiModel::new(ready.system_prompt(), ready.api_key().expose())
 }
 
 enum Invocation {
@@ -240,8 +237,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let (settings, model_settings) = watch::channel(selection);
-    let model = production_model(&ready, model_settings);
+    let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
     let api_key = ready.api_key().expose().to_owned();
 
@@ -271,7 +267,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     .with_trace(trace.clone());
     let controller = RuntimeController::with_session(
         Agent::new(arena, model),
-        settings,
+        selection,
         startup.settings().clone(),
         subagents,
         session.writer(),
@@ -339,8 +335,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let workspace_root = ready.workspace_root().to_path_buf();
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
-    let (settings, model_settings) = watch::channel(selection);
-    let model = production_model(&ready, model_settings);
+    let model = production_model(&ready);
     let prompt_base = ready.prompt_base().to_owned();
     let api_key = ready.api_key().expose().to_owned();
     let runtime = match Builder::new_multi_thread().enable_all().build() {
@@ -377,7 +372,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         &session,
         arena,
         model,
-        settings,
+        selection,
         startup.settings().clone(),
         subagents,
         relocated_cwd,
@@ -436,14 +431,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::production_model;
-    use tokio::sync::watch;
 
-    use crate::config::{ModelSelection, ReadyStartup};
+    use crate::config::ReadyStartup;
     use crate::openai::OpenAiModel;
 
     #[test]
     fn production_model_composition_is_openai() {
-        let _: for<'a> fn(&ReadyStartup<'a>, watch::Receiver<ModelSelection>) -> OpenAiModel =
-            production_model;
+        let _: for<'a> fn(&ReadyStartup<'a>) -> OpenAiModel = production_model;
     }
 }

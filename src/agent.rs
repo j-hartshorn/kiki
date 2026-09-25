@@ -99,7 +99,6 @@ pub(crate) enum AgentProgress {
     ModelStepStarted,
     ModelProgress(ModelProgress),
     ExecutionStarted {
-        selection: Option<ModelSelection>,
         commentary: Option<String>,
     },
     ToolUpdated {
@@ -452,7 +451,7 @@ impl AgentError {
 struct PendingCode {
     source: String,
     commentary: Option<String>,
-    selection: Option<ModelSelection>,
+    selection: ModelSelection,
     call_id: ModelCallId,
     reasoning_summary: String,
     replay: ProviderReplay,
@@ -581,8 +580,9 @@ impl<M: Model> Agent<M> {
     pub(crate) fn validate_restored_history(
         &self,
         history: &ModelHistory,
+        selection: ModelSelection,
     ) -> Result<(), ModelError> {
-        self.model.validate_history(history)
+        self.model.validate_history(history, selection)
     }
 
     pub(crate) async fn restore_arena(&mut self, checkpoint: Checkpoint) -> Result<(), ArenaError> {
@@ -692,22 +692,24 @@ impl<M: Model> Agent<M> {
     #[cfg(test)]
     pub(crate) async fn run(
         &mut self,
+        selection: ModelSelection,
         request: impl Into<String>,
         cancellation: &CancellationToken,
     ) -> Result<FinalMessage, AgentError> {
         let mut progress = |_| {};
-        self.run_with_progress(request, cancellation, &mut progress)
+        self.run_with_progress(selection, request, cancellation, &mut progress)
             .await
     }
 
     pub(crate) async fn run_persisted(
         &mut self,
+        selection: ModelSelection,
         request: String,
         cancellation: &CancellationToken,
         writer: &SessionWriter,
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
-        let admission = writer.commit_request(request.clone()).await?;
+        let admission = writer.commit_request(request.clone(), selection).await?;
         let run_id = admission.run_id;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
@@ -770,7 +772,7 @@ impl<M: Model> Agent<M> {
             let history = writer.model_history()?;
             let model_step = match self
                 .model
-                .step(&history, cancellation, &mut model_progress)
+                .step(selection, &history, cancellation, &mut model_progress)
                 .await
             {
                 Ok(step) => step,
@@ -813,7 +815,6 @@ impl<M: Model> Agent<M> {
             };
             let ModelStep {
                 action,
-                selection,
                 reasoning_summary,
                 replay,
                 attempts: step_attempts,
@@ -929,8 +930,9 @@ impl<M: Model> Agent<M> {
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
-                                self.invocation_context.as_ref(),
-                                pending.selection,
+                                self.invocation_context
+                                    .as_ref()
+                                    .map(|context| (context, pending.selection)),
                             )
                             .await
                     };
@@ -1062,6 +1064,7 @@ impl<M: Model> Agent<M> {
 
     pub(crate) async fn run_with_progress(
         &mut self,
+        selection: ModelSelection,
         request: impl Into<String>,
         cancellation: &CancellationToken,
         progress: &mut (impl FnMut(AgentProgress) + Send),
@@ -1094,7 +1097,7 @@ impl<M: Model> Agent<M> {
             };
             let model_step = match self
                 .model
-                .step(&history, cancellation, &mut model_progress)
+                .step(selection, &history, cancellation, &mut model_progress)
                 .await
             {
                 Ok(step) => step,
@@ -1112,7 +1115,6 @@ impl<M: Model> Agent<M> {
             };
             let ModelStep {
                 action,
-                selection,
                 reasoning_summary,
                 replay,
                 attempts: step_attempts,
@@ -1156,7 +1158,6 @@ impl<M: Model> Agent<M> {
                         });
                     }
                     progress(AgentProgress::ExecutionStarted {
-                        selection: pending.selection,
                         commentary: pending.commentary.clone(),
                     });
                     let execution = {
@@ -1179,8 +1180,9 @@ impl<M: Model> Agent<M> {
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
-                                self.invocation_context.as_ref(),
-                                pending.selection,
+                                self.invocation_context
+                                    .as_ref()
+                                    .map(|context| (context, pending.selection)),
                             )
                             .await
                     };
@@ -1259,7 +1261,6 @@ fn persisted_code(
         call_id: pending.call_id.clone(),
         commentary: pending.commentary.clone(),
         reasoning_summary: pending.reasoning_summary.clone(),
-        selection: pending.selection,
         replay: pending.replay.clone(),
         result,
         execution,
@@ -1436,7 +1437,7 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
-    use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection, models::SOL};
+    use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
@@ -1457,6 +1458,10 @@ mod tests {
         env::var_os("MONTY_BIN")
             .map(PathBuf::from)
             .expect("MONTY_BIN must point to the monty-runtime 0.0.22 worker")
+    }
+
+    fn default_selection() -> ModelSelection {
+        ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap()
     }
 
     async fn agent(workspace: &TempDir, actions: Vec<ModelAction>) -> Agent<ScriptedModel> {
@@ -1484,7 +1489,7 @@ mod tests {
         let message = {
             let mut progress = |event| captured.push(event);
             agent
-                .run_with_progress(request, cancellation, &mut progress)
+                .run_with_progress(default_selection(), request, cancellation, &mut progress)
                 .await?
                 .text()
                 .to_owned()
@@ -1504,28 +1509,6 @@ mod tests {
             .collect()
     }
 
-    struct SelectedScriptedModel {
-        model: ScriptedModel,
-        selection: ModelSelection,
-    }
-
-    impl Model for SelectedScriptedModel {
-        #[allow(clippy::manual_async_fn)]
-        fn step<'a>(
-            &'a mut self,
-            history: &'a ModelHistory,
-            cancellation: &'a CancellationToken,
-            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
-        {
-            async move {
-                let mut step = self.model.step(history, cancellation, progress).await?;
-                step.selection = Some(self.selection);
-                Ok(step)
-            }
-        }
-    }
-
     struct HistoryAwareModel {
         contexts: Vec<Vec<ModelContextEntry>>,
     }
@@ -1534,6 +1517,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -1562,7 +1546,6 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("history-aware", Vec::new()),
                     attempts: Vec::new(),
@@ -1574,7 +1557,7 @@ mod tests {
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
-                .commit_request(format!("{label} request"))
+                .commit_request(format!("{label} request"), default_selection())
                 .await
                 .expect("commit compaction fixture request");
             let step_id = writer
@@ -1624,6 +1607,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -1665,6 +1649,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -1802,6 +1787,7 @@ mod tests {
         let mut events = Vec::new();
         agent
             .run_persisted(
+                selection,
                 "next request".to_owned(),
                 &next_cancellation,
                 &writer,
@@ -1838,7 +1824,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request)
+                .commit_request(request, selection)
                 .await
                 .expect("commit request");
             writer
@@ -1916,11 +1902,19 @@ mod tests {
         let cancellation = CancellationToken::new();
 
         assert_eq!(
-            agent.run("first", &cancellation).await.unwrap().text(),
+            agent
+                .run(default_selection(), "first", &cancellation)
+                .await
+                .unwrap()
+                .text(),
             "done"
         );
         assert_eq!(
-            agent.run("second", &cancellation).await.unwrap().text(),
+            agent
+                .run(default_selection(), "second", &cancellation)
+                .await
+                .unwrap()
+                .text(),
             "done"
         );
         assert_eq!(agent.model.contexts.len(), 4);
@@ -2007,35 +2001,32 @@ mod tests {
                 snapshot.settings().clone(),
                 None,
             ));
-        let mut agent = agent_with_model(
+        let mut agent = agent(
             &workspace,
-            SelectedScriptedModel {
-                model: ScriptedModel::new(vec![
-                    ModelAction::Code {
-                        source: "task = await start_subagent('child')".to_owned(),
-                    },
-                    ModelAction::Code {
-                        source: "result = await task.wait()".to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "done".to_owned(),
-                    },
-                ]),
-                selection,
-            },
+            vec![
+                ModelAction::Code {
+                    source: "task = await start_subagent('child')".to_owned(),
+                },
+                ModelAction::Code {
+                    source: "result = await task.wait()".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ],
         )
         .await;
         agent.set_invocation_context(context);
 
         assert_eq!(
             agent
-                .run("inspect", &CancellationToken::new())
+                .run(selection, "inspect", &CancellationToken::new())
                 .await
                 .unwrap()
                 .text(),
             "done"
         );
-        let feedback = agent.model.model.contexts()[2]
+        let feedback = agent.model.contexts()[2]
             .last()
             .and_then(ModelContextEntry::completed_code)
             .expect("final model step receives the wait execution")
@@ -2069,7 +2060,11 @@ mod tests {
         let cancellation = CancellationToken::new();
 
         assert_eq!(
-            agent.run("inspect", &cancellation).await.unwrap().text(),
+            agent
+                .run(default_selection(), "inspect", &cancellation)
+                .await
+                .unwrap()
+                .text(),
             "done"
         );
         assert_eq!(agent.model.contexts().len(), 2);
@@ -2113,7 +2108,11 @@ mod tests {
         let cancellation = CancellationToken::new();
 
         assert_eq!(
-            agent.run("inspect", &cancellation).await.unwrap().text(),
+            agent
+                .run(default_selection(), "inspect", &cancellation)
+                .await
+                .unwrap()
+                .text(),
             "child complete"
         );
         assert_eq!(
@@ -2133,6 +2132,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2159,7 +2159,6 @@ mod tests {
                 self.step += 1;
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary,
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2178,7 +2177,7 @@ mod tests {
         let final_message = {
             let mut capture = |event| progress.push(event);
             agent
-                .run_with_progress("inspect", &cancellation, &mut capture)
+                .run_with_progress(default_selection(), "inspect", &cancellation, &mut capture)
                 .await
                 .unwrap()
         };
@@ -2213,6 +2212,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2225,7 +2225,6 @@ mod tests {
                         call_id: ModelCallId::new("summary-code"),
                         commentary: None,
                     },
-                    selection: None,
                     reasoning_summary: self.reasoning_summary.clone(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
@@ -2234,86 +2233,13 @@ mod tests {
         }
     }
 
-    struct SelectedCodeThenMessageModel {
-        selection: ModelSelection,
-        step: u8,
-    }
-
-    impl Model for SelectedCodeThenMessageModel {
-        #[allow(clippy::manual_async_fn)]
-        fn step<'a>(
-            &'a mut self,
-            _history: &'a ModelHistory,
-            _cancellation: &'a CancellationToken,
-            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
-        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
-        {
-            async move {
-                let action = match self.step {
-                    0 => CompletedModelAction::Code {
-                        source: "value = 1".to_owned(),
-                        call_id: ModelCallId::new("selected-code"),
-                        commentary: None,
-                    },
-                    1 => CompletedModelAction::Message {
-                        text: "done".to_owned(),
-                    },
-                    _ => return Err(ModelError::Exhausted.into()),
-                };
-                self.step += 1;
-                Ok(ModelStep {
-                    action,
-                    selection: Some(self.selection),
-                    reasoning_summary: String::new(),
-                    replay: ProviderReplay::new("test", Vec::new()),
-                    attempts: Vec::new(),
-                })
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_exposes_code_execution_selection_from_the_pending_step() {
-        let workspace = tempfile::tempdir().unwrap();
-        let selection = ModelSelection::new(&SOL, "low").unwrap();
-        let mut agent = agent_with_model(
-            &workspace,
-            SelectedCodeThenMessageModel { selection, step: 0 },
-        )
-        .await;
-        let cancellation = CancellationToken::new();
-        let mut progress = Vec::new();
-
-        {
-            let mut capture = |event| progress.push(event);
-            assert_eq!(
-                agent
-                    .run_with_progress("inspect", &cancellation, &mut capture)
-                    .await
-                    .unwrap()
-                    .text(),
-                "done"
-            );
-        }
-
-        assert_eq!(
-            progress
-                .iter()
-                .filter_map(|event| match event {
-                    AgentProgress::ExecutionStarted { selection, .. } => Some(*selection),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            [Some(selection)]
-        );
-    }
-
     struct MessageWithAccountingModel;
 
     impl Model for MessageWithAccountingModel {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2324,7 +2250,6 @@ mod tests {
                     action: CompletedModelAction::Message {
                         text: "done".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![AttemptAccounting::UsageUnavailable],
@@ -2339,6 +2264,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2391,7 +2317,7 @@ mod tests {
 
         assert_eq!(
             successful
-                .run("inspect", &cancellation)
+                .run(default_selection(), "inspect", &cancellation)
                 .await
                 .unwrap()
                 .attempts(),
@@ -2399,7 +2325,10 @@ mod tests {
         );
 
         let mut failed = agent_with_model(&workspace, PartialFailureModel).await;
-        let error = failed.run("inspect", &cancellation).await.unwrap_err();
+        let error = failed
+            .run(default_selection(), "inspect", &cancellation)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             &error,
@@ -2483,7 +2412,7 @@ mod tests {
             let mut capture = |event| progress.push(event);
             assert_eq!(
                 agent
-                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .run_with_progress(default_selection(), "inspect", &cancellation, &mut capture)
                     .await
                     .unwrap()
                     .text(),
@@ -2524,7 +2453,7 @@ mod tests {
         let error = {
             let mut capture = |event| progress.push(event);
             agent
-                .run_with_progress("inspect", &cancellation, &mut capture)
+                .run_with_progress(default_selection(), "inspect", &cancellation, &mut capture)
                 .await
                 .unwrap_err()
         };
@@ -2545,6 +2474,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2592,7 +2522,10 @@ mod tests {
             cancellation.cancel();
         };
 
-        let ((), error) = tokio::join!(cancel_when_ready, agent.run("inspect", &cancellation));
+        let ((), error) = tokio::join!(
+            cancel_when_ready,
+            agent.run(default_selection(), "inspect", &cancellation)
+        );
         let AgentError::Model {
             evidence: Some(evidence),
             ..
@@ -2716,7 +2649,7 @@ mod tests {
                 }
             };
             agent
-                .run_with_progress("inspect", &cancellation, &mut progress)
+                .run_with_progress(default_selection(), "inspect", &cancellation, &mut progress)
                 .await
                 .unwrap_err()
         };
@@ -2757,7 +2690,7 @@ mod tests {
         .with_delay(Duration::from_millis(50));
         let mut agent = agent_with_model(&workspace, model).await;
         let cancellation = CancellationToken::new();
-        let mut run = Box::pin(agent.run("inspect", &cancellation));
+        let mut run = Box::pin(agent.run(default_selection(), "inspect", &cancellation));
 
         assert!(timeout(Duration::from_millis(5), &mut run).await.is_err());
         assert_eq!(run.await.unwrap().text(), "done");
@@ -2778,6 +2711,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -2787,7 +2721,6 @@ mod tests {
                 cancellation.cancel();
                 Ok(ModelStep {
                     action: self.action.clone(),
-                    selection: None,
                     reasoning_summary: "boundary summary".to_owned(),
                     replay: ProviderReplay::new("boundary", Vec::new()),
                     attempts: Vec::new(),
@@ -2818,7 +2751,7 @@ mod tests {
             let result = {
                 let mut capture = |event| progress.push(event);
                 agent
-                    .run_with_progress("inspect", &cancellation, &mut capture)
+                    .run_with_progress(default_selection(), "inspect", &cancellation, &mut capture)
                     .await
             };
 
@@ -2883,7 +2816,10 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
 
-        let error = agent.run("cancelled", &cancelled).await.unwrap_err();
+        let error = agent
+            .run(default_selection(), "cancelled", &cancelled)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, AgentError::Cancelled { .. }));
         assert_eq!(agent.model.contexts(), observed_contexts.as_slice());
@@ -2907,7 +2843,10 @@ mod tests {
         let mut agent = agent(&workspace, vec![]).await;
         let cancellation = CancellationToken::new();
 
-        let error = agent.run("inspect", &cancellation).await.unwrap_err();
+        let error = agent
+            .run(default_selection(), "inspect", &cancellation)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -2957,7 +2896,10 @@ mod tests {
             cancellation.cancel();
         };
 
-        let ((), error) = tokio::join!(cancel_when_read_starts, agent.run("cancel", &cancellation));
+        let ((), error) = tokio::join!(
+            cancel_when_read_starts,
+            agent.run(default_selection(), "cancel", &cancellation)
+        );
         let error = error.unwrap_err();
 
         let AgentError::Arena {
@@ -3022,7 +2964,7 @@ mod tests {
             .await
             .expect("set checkpoint state");
         let cancellation = CancellationToken::new();
-        let mut run = Box::pin(agent.run("cancel", &cancellation));
+        let mut run = Box::pin(agent.run(default_selection(), "cancel", &cancellation));
         tokio::select! {
             _ = gate.wait_until_read_started() => {}
             result = &mut run => panic!("agent returned before its read started: {result:?}"),
@@ -3060,7 +3002,10 @@ mod tests {
         .await;
         let cancellation = CancellationToken::new();
 
-        let error = agent.run("inspect", &cancellation).await.unwrap_err();
+        let error = agent
+            .run(default_selection(), "inspect", &cancellation)
+            .await
+            .unwrap_err();
 
         let AgentError::Arena {
             error: crate::arena::ArenaError::Infrastructure { .. },
@@ -3114,6 +3059,7 @@ mod tests {
         let outcome = {
             let mut event = |_| {};
             let run = agent.run_persisted(
+                selection,
                 "time out then cancel".to_owned(),
                 &cancellation,
                 &writer,
@@ -3191,6 +3137,7 @@ mod tests {
             let mut event = |event| events.push(event);
             agent
                 .run_persisted(
+                    selection,
                     "request entry".to_owned(),
                     &CancellationToken::new(),
                     &session.writer(),
@@ -3282,7 +3229,11 @@ mod tests {
             let cancellation = CancellationToken::new();
 
             assert_eq!(
-                agent.run("inspect", &cancellation).await.unwrap().text(),
+                agent
+                    .run(default_selection(), "inspect", &cancellation)
+                    .await
+                    .unwrap()
+                    .text(),
                 "done"
             );
             let completed = agent.model.contexts()[1]
@@ -3313,7 +3264,7 @@ mod tests {
                 progress.push(event);
             };
             agent
-                .run_with_progress("inspect", &cancellation, &mut capture)
+                .run_with_progress(default_selection(), "inspect", &cancellation, &mut capture)
                 .await
                 .unwrap_err()
         };
@@ -3327,7 +3278,6 @@ mod tests {
             [
                 AgentProgress::ModelStepStarted,
                 AgentProgress::ExecutionStarted {
-                    selection: None,
                     commentary: Some(commentary),
                 },
                 AgentProgress::ExecutionCompleted {

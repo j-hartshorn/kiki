@@ -849,7 +849,7 @@ impl AgentInvocationContext {
     pub(crate) fn execution(
         &self,
         source: ArenaChildSource,
-        selection: Option<ModelSelection>,
+        selection: ModelSelection,
         checkpoint: Checkpoint,
         cancellation: CancellationToken,
     ) -> TrustedExecutionContext {
@@ -868,7 +868,7 @@ impl AgentInvocationContext {
 #[derive(Clone)]
 pub(crate) struct TrustedExecutionContext {
     caller: Caller,
-    selection: Option<ModelSelection>,
+    selection: ModelSelection,
     checkpoint: Checkpoint,
     source: ArenaChildSource,
     coordinator: SessionSubagents,
@@ -890,9 +890,6 @@ impl TrustedExecutionContext {
     }
 
     fn resolve_selection(&self, model: Option<&str>) -> Result<ModelSelection, ToolError> {
-        let invoking = self.selection.ok_or_else(|| {
-            ToolError::runtime("subagent model selection is unavailable for this execution")
-        })?;
         let target = match model {
             Some(model) => Some(
                 model_by_id(model)
@@ -911,7 +908,7 @@ impl TrustedExecutionContext {
                 target.id
             )));
         }
-        Ok(accepted_thinking.resolve(invoking, target))
+        Ok(accepted_thinking.resolve(self.selection, target))
     }
 
     pub(crate) fn coordinator(&self) -> &SessionSubagents {
@@ -1228,7 +1225,7 @@ fn cost_status_name(status: CostStatus) -> &'static str {
 pub(crate) trait ChildModelFactory: Send + Sync + 'static {
     type Model: Model;
 
-    fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model;
+    fn create(&self, prompt: String) -> Self::Model;
 }
 
 struct ChildExecutionSpan<'a> {
@@ -1315,7 +1312,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let (request, selection, read_only) = parameters.into_parts();
         let accepted_thinking = payload.accepted_thinking.clone();
         let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
-        let model = models.create(child_prompt, selection);
+        let model = models.create(child_prompt);
         Box::pin(async move {
             trace.emit(|| TraceEvent::ChildArenaConstructionStarted {
                 child_id: id.clone(),
@@ -1416,7 +1413,7 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
                 | AgentProgress::ModelProgress(_) => {}
             };
             match agent
-                .run_with_progress(request, &cancellation, &mut progress)
+                .run_with_progress(selection, request, &cancellation, &mut progress)
                 .await
             {
                 Ok(final_message) => {
@@ -3956,7 +3953,7 @@ mod tests {
             .with_accepted_thinking(accepted)
             .execution(
                 arena.child_source(),
-                Some(invoking),
+                invoking,
                 arena.checkpoint(),
                 CancellationToken::new(),
             );
@@ -4010,6 +4007,7 @@ mod tests {
 
     struct RecordingScriptedModel {
         model: ScriptedModel,
+        selections: Arc<Mutex<Vec<ModelSelection>>>,
         histories: Arc<Mutex<Vec<Vec<ModelContextEntry>>>>,
     }
 
@@ -4017,16 +4015,18 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            selection: ModelSelection,
             history: &'a ModelHistory,
             cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
         ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
         {
+            self.selections.lock().unwrap().push(selection);
             self.histories
                 .lock()
                 .unwrap()
                 .push(history.entries().to_vec());
-            self.model.step(history, cancellation, progress)
+            self.model.step(selection, history, cancellation, progress)
         }
     }
 
@@ -4044,9 +4044,8 @@ mod tests {
     impl super::ChildModelFactory for ScriptedChildFactory {
         type Model = RecordingScriptedModel;
 
-        fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
+        fn create(&self, prompt: String) -> Self::Model {
             self.prompts.lock().unwrap().push(prompt);
-            self.selections.lock().unwrap().push(selection);
             RecordingScriptedModel {
                 model: ScriptedModel::new(
                     self.scripts
@@ -4055,6 +4054,7 @@ mod tests {
                         .pop_front()
                         .expect("test configures one child script"),
                 ),
+                selections: self.selections.clone(),
                 histories: self.histories.clone(),
             }
         }
@@ -4100,7 +4100,7 @@ mod tests {
     impl super::ChildModelFactory for TaskStepGatedChildFactory {
         type Model = TaskStepGatedChildModel;
 
-        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
             TaskStepGatedChildModel {
                 calls: self.calls.clone(),
                 histories: self.histories.clone(),
@@ -4115,6 +4115,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -4157,7 +4158,6 @@ mod tests {
                 };
                 Ok(ModelStep {
                     action,
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts,
@@ -4439,7 +4439,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -4848,19 +4848,20 @@ mod tests {
         )
         .await
         .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
         let admission_gate = SessionWriteGate::new(SessionWriteKind::TaskAdmission);
         let session = Session::create_with_write_gate(
             home.path(),
             workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
+            selection,
             arena.checkpoint(),
             admission_gate.clone(),
         )
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -5525,19 +5526,20 @@ mod tests {
         )
         .await
         .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
         let terminal_gate = SessionWriteGate::new(SessionWriteKind::TaskTerminal);
         let session = Session::create_with_write_gate(
             home.path(),
             workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
+            selection,
             arena.checkpoint(),
             terminal_gate.clone(),
         )
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -6395,17 +6397,13 @@ mod tests {
         )
         .await
         .expect("create arena");
-        let session = Session::create(
-            home.path(),
-            workspace.path(),
-            ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
-                .expect("select default model"),
-            arena.checkpoint(),
-        )
-        .expect("create session");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection)
             .await
             .expect("start parent run")
             .run_id;
@@ -7890,7 +7888,7 @@ mod tests {
             ExecutionOutcome::Complete { .. }
         ));
         assert!(execution.attempts().is_empty());
-        assert_eq!(*factory.selections.lock().unwrap(), [selection]);
+        assert_eq!(*factory.selections.lock().unwrap(), [selection, selection]);
         {
             let histories = factory.histories.lock().unwrap();
             assert_eq!(histories.len(), 2);
@@ -7976,7 +7974,7 @@ mod tests {
     impl super::ChildModelFactory for TracedChildFactory {
         type Model = TracedChildModel;
 
-        fn create(&self, _prompt: String, _selection: ModelSelection) -> Self::Model {
+        fn create(&self, _prompt: String) -> Self::Model {
             TracedChildModel {
                 model_step_started: self.model_step_started.clone(),
             }
@@ -7987,6 +7985,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -8004,7 +8003,6 @@ mod tests {
                     action: ModelAction::Message {
                         text: "final-message-SECRET".to_owned(),
                     },
-                    selection: None,
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: vec![accounting],

@@ -29,7 +29,6 @@ pub enum ModelAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStep {
     pub action: ModelAction,
-    pub selection: Option<ModelSelection>,
     pub reasoning_summary: String,
     pub replay: ProviderReplay,
     pub attempts: Vec<AttemptAccounting>,
@@ -495,7 +494,11 @@ pub enum ModelProgress {
 }
 
 pub trait Model: Send + 'static {
-    fn validate_history(&self, _history: &ModelHistory) -> Result<(), ModelError> {
+    fn validate_history(
+        &self,
+        _history: &ModelHistory,
+        _selection: ModelSelection,
+    ) -> Result<(), ModelError> {
         Ok(())
     }
 
@@ -511,6 +514,7 @@ pub trait Model: Send + 'static {
 
     fn step<'a>(
         &'a mut self,
+        selection: ModelSelection,
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -608,6 +612,7 @@ impl Model for ScriptedModel {
     #[allow(clippy::manual_async_fn)]
     fn step<'a>(
         &'a mut self,
+        _selection: ModelSelection,
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
@@ -658,7 +663,6 @@ impl Model for ScriptedModel {
             };
             Ok(ModelStep {
                 action,
-                selection: None,
                 reasoning_summary: String::new(),
                 replay,
                 attempts: Vec::new(),
@@ -709,15 +713,19 @@ mod tests {
         )
     }
 
+    fn selection() -> crate::config::ModelSelection {
+        crate::config::ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap()
+    }
+
     fn summary_request(input: &str) -> SummaryRequest {
         SummaryRequest {
             instructions: "summarise".to_owned(),
             input: input.to_owned(),
-            selection: crate::config::ModelSelection::new(
-                crate::config::DEFAULT_MODEL,
-                crate::config::DEFAULT_MODEL.default_thinking,
-            )
-            .unwrap(),
+            selection: selection(),
             output_limit: 123,
         }
     }
@@ -728,6 +736,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn step<'a>(
             &'a mut self,
+            _selection: crate::config::ModelSelection,
             _history: &'a ModelHistory,
             _cancellation: &'a CancellationToken,
             _progress: &'a mut (dyn FnMut(super::ModelProgress) + Send),
@@ -778,7 +787,7 @@ mod tests {
         assert!(first_result.attempts.is_empty());
         assert_eq!(
             model
-                .step(&history, &cancellation, &mut progress)
+                .step(selection(), &history, &cancellation, &mut progress)
                 .await
                 .unwrap()
                 .action,
@@ -837,7 +846,7 @@ mod tests {
         let history = history_with_request("inspect");
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
-        let mut step = Box::pin(model.step(&history, &cancellation, &mut progress));
+        let mut step = Box::pin(model.step(selection(), &history, &cancellation, &mut progress));
 
         assert!(timeout(Duration::from_millis(5), &mut step).await.is_err());
         let step = step.await.unwrap();
@@ -850,7 +859,6 @@ mod tests {
                 commentary: None,
             }
         );
-        assert_eq!(step.selection, None);
         assert_eq!(step.replay.provider(), "scripted");
         assert_eq!(step.replay.items()[0].as_bytes(), b"scripted-1-1");
         assert_eq!(step.reasoning_summary, "");
@@ -873,7 +881,7 @@ mod tests {
 
         assert!(matches!(
             model
-                .step(&history, &cancellation, &mut progress)
+                .step(selection(), &history, &cancellation, &mut progress)
                 .await
                 .unwrap()
                 .action,
@@ -881,14 +889,16 @@ mod tests {
         ));
         assert!(matches!(
             model
-                .step(&history, &cancellation, &mut progress)
+                .step(selection(), &history, &cancellation, &mut progress)
                 .await
                 .unwrap()
                 .action,
             ModelAction::Message { .. }
         ));
         assert_eq!(
-            model.step(&history, &cancellation, &mut progress).await,
+            model
+                .step(selection(), &history, &cancellation, &mut progress)
+                .await,
             Err(ModelFailure::from(ModelError::Exhausted))
         );
 
@@ -896,7 +906,7 @@ mod tests {
 
         assert_eq!(
             model
-                .step(&history, &cancellation, &mut progress)
+                .step(selection(), &history, &cancellation, &mut progress)
                 .await
                 .unwrap()
                 .action,
@@ -1084,7 +1094,9 @@ mod tests {
         let mut progress = |_| {};
 
         assert_eq!(
-            model.step(&history, &cancellation, &mut progress).await,
+            model
+                .step(selection(), &history, &cancellation, &mut progress)
+                .await,
             Err(ModelFailure::from(ModelError::Cancelled))
         );
         cancel.await.unwrap();

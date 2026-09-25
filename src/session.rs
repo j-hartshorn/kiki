@@ -220,7 +220,6 @@ pub(crate) struct PersistedCode {
     pub(crate) call_id: crate::model::ModelCallId,
     pub(crate) commentary: Option<String>,
     pub(crate) reasoning_summary: String,
-    pub(crate) selection: Option<ModelSelection>,
     pub(crate) replay: crate::model::ProviderReplay,
     pub(crate) result: crate::model::CodeResult,
     pub(crate) execution: Option<crate::arena::Execution>,
@@ -279,6 +278,7 @@ pub(crate) enum ReadableTerminal {
 pub(crate) enum RestoredRecordKind {
     UserRequest {
         request: String,
+        selection: Option<ModelSelection>,
     },
     CompletedExecution {
         step_id: u64,
@@ -1155,11 +1155,13 @@ impl SessionWriter {
     pub(crate) async fn commit_request(
         &self,
         request: String,
+        selection: ModelSelection,
     ) -> Result<RequestAdmission, SessionError> {
         self.write_context(SessionWriteKind::Request, move |connection, context| {
             let mut history = context.history.clone();
             history.append_user_request(request.clone());
-            let admission = commit_request(connection, &request, context.effective_entry)?;
+            let admission =
+                commit_request(connection, &request, selection, context.effective_entry)?;
             context.effective_entry = admission.request_entry;
             context.history = history;
             Ok(admission)
@@ -1439,10 +1441,11 @@ fn activate_entry(
 fn commit_request(
     connection: &mut Connection,
     request: &str,
+    selection: ModelSelection,
     expected_parent: SessionEntryId,
 ) -> Result<RequestAdmission, SessionError> {
-    let payload =
-        codec::encode_request(request).map_err(|error| SessionError::Codec(error.to_string()))?;
+    let payload = codec::encode_request(request, selection)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
     let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3490,6 +3493,7 @@ fn readable_record(
             }
             RestoredRecordKind::UserRequest {
                 request: codec::decoded_request(decoded).ok_or(())?.to_owned(),
+                selection: codec::decoded_request_selection(decoded),
             }
         }
         "execution" => {
@@ -3880,7 +3884,7 @@ mod tests {
 
     async fn append_cancelled_request(writer: &SessionWriter, request: &str) {
         let admission = writer
-            .commit_request(request.to_owned())
+            .commit_request(request.to_owned(), selection())
             .await
             .expect("commit request");
         writer
@@ -3906,7 +3910,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let completed = writer
-            .commit_request("completed branch".to_owned())
+            .commit_request("completed branch".to_owned(), selection())
             .await
             .expect("commit completed branch");
         writer
@@ -3993,7 +3997,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("projection"),
             commentary: None,
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result,
             execution: execution.then(projection_execution),
@@ -4189,7 +4192,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new(format!("fixture-{run_id}")),
             commentary: commentary.map(str::to_owned),
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
@@ -4269,7 +4271,8 @@ mod tests {
 
     #[test]
     fn restore_truncates_selected_history_at_the_first_unreadable_entry() {
-        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let request =
+            |text| super::codec::encode_request(text, selection()).expect("encode request");
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 4,
             session_revision: 4,
@@ -4306,7 +4309,7 @@ mod tests {
         assert!(matches!(
             restore.records.as_slice(),
             [super::RestoredRecord {
-                kind: super::RestoredRecordKind::UserRequest { request },
+                kind: super::RestoredRecordKind::UserRequest { request, .. },
                 ..
             }] if request == "first"
         ));
@@ -4314,7 +4317,8 @@ mod tests {
 
     #[test]
     fn restore_validates_each_applied_compaction_boundary() {
-        let request = super::codec::encode_request("retained request").expect("encode request");
+        let request =
+            super::codec::encode_request("retained request", selection()).expect("encode request");
         let invalid = super::codec::encode_compaction(&super::CompactionOutcome::Applied {
             summary: "older summary".to_owned(),
             first_retained: SessionEntryId(1),
@@ -4362,7 +4366,8 @@ mod tests {
 
     #[test]
     fn restore_rejects_selected_entry_with_a_different_parent_checkpoint() {
-        let request = super::codec::encode_request("invalid checkpoint").expect("encode request");
+        let request = super::codec::encode_request("invalid checkpoint", selection())
+            .expect("encode request");
         let mut child = restore_entry(2, Some(1), Some(1), request, 2);
         child.checkpoint_id = 2;
         let restore = super::restore_projection(super::RestoreSnapshot {
@@ -4388,7 +4393,8 @@ mod tests {
 
     #[test]
     fn restore_rejects_selected_parent_with_a_non_older_revision() {
-        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let request =
+            |text| super::codec::encode_request(text, selection()).expect("encode request");
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 3,
             session_revision: 3,
@@ -4422,7 +4428,8 @@ mod tests {
 
     #[test]
     fn restore_disables_duplicate_global_timeline_revisions_without_hiding_valid_history() {
-        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let request =
+            |text| super::codec::encode_request(text, selection()).expect("encode request");
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 2,
             session_revision: 2,
@@ -4454,7 +4461,7 @@ mod tests {
         assert!(matches!(
             restore.records.as_slice(),
             [super::RestoredRecord {
-                kind: super::RestoredRecordKind::UserRequest { request },
+                kind: super::RestoredRecordKind::UserRequest { request, .. },
                 ..
             }] if request == "selected"
         ));
@@ -4462,7 +4469,8 @@ mod tests {
 
     #[test]
     fn restore_disables_multiple_requests_in_a_run() {
-        let request = |text| super::codec::encode_request(text).expect("encode request");
+        let request =
+            |text| super::codec::encode_request(text, selection()).expect("encode request");
         let restore = super::restore_projection(super::RestoreSnapshot {
             active_entry_id: 2,
             session_revision: 3,
@@ -4522,7 +4530,8 @@ mod tests {
 
     #[test]
     fn restore_keeps_late_visible_task_after_selected_terminal() {
-        let request = super::codec::encode_request("selected request").expect("encode request");
+        let request =
+            super::codec::encode_request("selected request", selection()).expect("encode request");
         let terminal = super::codec::encode_terminal(
             &PersistedTerminal::Final {
                 step_id: 1,
@@ -4622,7 +4631,7 @@ mod tests {
             .expect("read root entry");
 
         let first_run = writer
-            .commit_request("first branch request".to_owned())
+            .commit_request("first branch request".to_owned(), selection())
             .await
             .expect("commit first request")
             .run_id;
@@ -4728,7 +4737,7 @@ mod tests {
             .sync_model_context_for_test()
             .expect("sync root fixture context");
         let sibling_run = writer
-            .commit_request("sibling branch request".to_owned())
+            .commit_request("sibling branch request".to_owned(), selection())
             .await
             .expect("commit sibling request")
             .run_id;
@@ -4835,7 +4844,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("original request".to_owned())
+            .commit_request("original request".to_owned(), selection())
             .await
             .expect("commit original request")
             .run_id;
@@ -4914,7 +4923,7 @@ mod tests {
         assert_eq!(selection_snapshot(&session), after_selection);
         let writer = session.writer();
         writer
-            .commit_request("branched request".to_owned())
+            .commit_request("branched request".to_owned(), selection())
             .await
             .expect("commit branched request");
         let connection = session
@@ -4955,7 +4964,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
 
         let original = writer
-            .commit_request("original request".to_owned())
+            .commit_request("original request".to_owned(), selection())
             .await
             .expect("commit original request");
         assert_eq!(
@@ -4986,7 +4995,7 @@ mod tests {
             .expect("select original request parent");
 
         let corrected = writer
-            .commit_request("corrected request".to_owned())
+            .commit_request("corrected request".to_owned(), selection())
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -5038,7 +5047,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("request to correct".to_owned())
+            .commit_request("request to correct".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -5069,7 +5078,7 @@ mod tests {
         assert_eq!(selected.effective_entry, SessionEntryId(root as u64));
         assert!(selected.records.is_empty());
         writer
-            .commit_request("corrected request".to_owned())
+            .commit_request("corrected request".to_owned(), selection())
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -5131,7 +5140,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let completed_run = writer
-            .commit_request("completed request".to_owned())
+            .commit_request("completed request".to_owned(), selection())
             .await
             .expect("commit completed request")
             .run_id;
@@ -5196,7 +5205,7 @@ mod tests {
         );
 
         let open_run = writer
-            .commit_request("open request".to_owned())
+            .commit_request("open request".to_owned(), selection())
             .await
             .expect("commit open request")
             .run_id;
@@ -5243,7 +5252,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("pending step request".to_owned())
+            .commit_request("pending step request".to_owned(), selection())
             .await
             .expect("commit pending step request")
             .run_id;
@@ -5315,7 +5324,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("task request".to_owned())
+            .commit_request("task request".to_owned(), selection())
             .await
             .expect("commit task request")
             .run_id;
@@ -5415,7 +5424,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("gated request".to_owned())
+            .commit_request("gated request".to_owned(), selection())
             .await
             .expect("commit gated request")
             .run_id;
@@ -5470,7 +5479,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("failing selection request".to_owned())
+            .commit_request("failing selection request".to_owned(), selection())
             .await
             .expect("commit failing selection request")
             .run_id;
@@ -5533,7 +5542,7 @@ mod tests {
         let root_checkpoint = session.initial_checkpoint().expect("load root checkpoint");
 
         let final_run = writer
-            .commit_request("final request".to_owned())
+            .commit_request("final request".to_owned(), selection())
             .await
             .expect("commit final request")
             .run_id;
@@ -5570,7 +5579,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("cancelled request".to_owned())
+            .commit_request("cancelled request".to_owned(), selection())
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -5590,7 +5599,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("failed request".to_owned())
+            .commit_request("failed request".to_owned(), selection())
             .await
             .expect("commit failed request")
             .run_id;
@@ -5712,7 +5721,7 @@ mod tests {
         assert!(matches!(
             ordinary_request.records.as_slice(),
             [super::RestoredRecord {
-                kind: super::RestoredRecordKind::UserRequest { request: text },
+                kind: super::RestoredRecordKind::UserRequest { request: text, .. },
                 ..
             }] if text == "final request"
         ));
@@ -5737,7 +5746,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         writer
-            .commit_request("known request".to_owned())
+            .commit_request("known request".to_owned(), selection())
             .await
             .expect("commit request");
         let before: (i64, i64, i64) = session
@@ -5781,7 +5790,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let final_run = writer
-            .commit_request("catalogue request".to_owned())
+            .commit_request("catalogue request".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -5840,7 +5849,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("catalogue cancelled".to_owned())
+            .commit_request("catalogue cancelled".to_owned(), selection())
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -5860,7 +5869,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("catalogue failed".to_owned())
+            .commit_request("catalogue failed".to_owned(), selection())
             .await
             .expect("commit failed request")
             .run_id;
@@ -5951,7 +5960,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned())
+            .commit_request("selected request".to_owned(), selection())
             .await
             .expect("commit selected request")
             .run_id;
@@ -5994,7 +6003,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let hidden_run = writer
-            .commit_request("hidden request".to_owned())
+            .commit_request("hidden request".to_owned(), selection())
             .await
             .expect("commit hidden request")
             .run_id;
@@ -6103,7 +6112,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned())
+            .commit_request("selected request".to_owned(), selection())
             .await
             .expect("commit selected request")
             .run_id;
@@ -6133,7 +6142,7 @@ mod tests {
 
         set_active_entry(&session, root);
         writer
-            .commit_request("corrupt sibling request".to_owned())
+            .commit_request("corrupt sibling request".to_owned(), selection())
             .await
             .expect("commit sibling request");
         let corrupt_request = active_entry_id(&session);
@@ -6177,7 +6186,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned())
+            .commit_request("selected request".to_owned(), selection())
             .await
             .expect("commit selected request")
             .run_id;
@@ -6207,7 +6216,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned())
+            .commit_request("sibling request".to_owned(), selection())
             .await
             .expect("commit sibling request")
             .run_id;
@@ -6270,7 +6279,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned())
+            .commit_request("selected request".to_owned(), selection())
             .await
             .expect("commit selected request")
             .run_id;
@@ -6300,7 +6309,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned())
+            .commit_request("sibling request".to_owned(), selection())
             .await
             .expect("commit sibling request")
             .run_id;
@@ -6345,7 +6354,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("restore target".to_owned())
+            .commit_request("restore target".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -6807,7 +6816,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         session
             .writer()
-            .commit_request("readable request".to_owned())
+            .commit_request("readable request".to_owned(), selection())
             .await
             .expect("commit request");
         session
@@ -6826,7 +6835,7 @@ mod tests {
         assert!(matches!(
             restore.records.as_slice(),
             [super::RestoredRecord {
-                kind: super::RestoredRecordKind::UserRequest { request },
+                kind: super::RestoredRecordKind::UserRequest { request, .. },
                 ..
             }] if request == "readable request"
         ));
@@ -6883,7 +6892,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("persist file operations".to_owned())
+            .commit_request("persist file operations".to_owned(), selection())
             .await
             .expect("commit request");
         settle_fixture_execution_with(
@@ -7459,7 +7468,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("committed-step"),
             commentary: None,
             reasoning_summary: "commit execution checkpoint".to_owned(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
@@ -7517,124 +7525,124 @@ mod tests {
                 let session = Session::open(&home, &id).expect("open session in recovery process");
                 activate_session(&session).await;
                 let writer = session.writer();
-                let signal =
-                    match milestone.as_str() {
-                        "generation" => {
-                            let run_id = writer
-                                .commit_request("generation interruption".to_owned())
-                                .await
-                                .expect("commit request")
-                                .run_id;
-                            writer
-                                .start_model_step(run_id)
-                                .await
-                                .expect("start generation step");
-                            b'G'
-                        }
-                        "execution" => {
-                            let run_id = writer
-                                .commit_request("execution interruption".to_owned())
-                                .await
-                                .expect("commit request")
-                                .run_id;
-                            writer
-                                .start_model_step(run_id)
-                                .await
-                                .expect("start execution step");
-                            let mut arena = restored_arena(&session, &workspace).await;
-                            let cancellation = CancellationToken::new();
-                            let execution = arena
-                                .execute(
-                                    "uncommitted_value = 1\nresult_values = {'uncommitted': 1}",
-                                    &cancellation,
-                                )
-                                .await
-                                .expect("execute uncommitted Python");
-                            assert!(matches!(
-                                execution.outcome,
-                                ExecutionOutcome::Complete { result: None }
-                            ));
-                            b'E'
-                        }
-                        "committed-step" => {
-                            let run_id = writer
-                                .commit_request("committed step interruption".to_owned())
-                                .await
-                                .expect("commit request")
-                                .run_id;
-                            let settled_step = writer
-                                .start_model_step(run_id)
-                                .await
-                                .expect("start settled step");
-                            let mut arena = restored_arena(&session, &workspace).await;
-                            let cancellation = CancellationToken::new();
-                            let source = "committed_value = 1\nresult_values = {'committed': 1}";
-                            let execution = arena
-                                .execute(source, &cancellation)
-                                .await
-                                .expect("execute committed Python");
-                            assert!(matches!(
-                                &execution.outcome,
-                                ExecutionOutcome::Complete { result: None }
-                            ));
-                            writer
-                                .settle_execution(
-                                    run_id,
-                                    settled_step,
-                                    persisted_execution(source, execution),
-                                    arena.checkpoint(),
-                                )
-                                .await
-                                .expect("commit settled step");
-                            writer
-                                .start_model_step(run_id)
-                                .await
-                                .expect("start pending step");
-                            let execution = arena
-                                .execute(
-                                    "uncommitted_value = 2\nresult_values = {'uncommitted': 2}",
-                                    &cancellation,
-                                )
-                                .await
-                                .expect("execute uncommitted Python");
-                            assert!(matches!(
-                                execution.outcome,
-                                ExecutionOutcome::Complete { result: None }
-                            ));
-                            b'C'
-                        }
-                        "background-only" => {
-                            let run_id = writer
-                                .commit_request("closed foreground".to_owned())
-                                .await
-                                .expect("commit request")
-                                .run_id;
-                            let origin_step_id = writer
-                                .start_model_step(run_id)
-                                .await
-                                .expect("start origin step");
-                            writer
-                                .close_run(
-                                    run_id,
-                                    Some(origin_step_id),
-                                    || PersistedTerminal::Failed {
-                                        message: "closed before interruption".to_owned(),
-                                        evidence: None,
-                                        attempts: Vec::new(),
-                                    },
-                                    None,
-                                )
-                                .await
-                                .expect("close foreground");
-                            let task = crate::subagents::TaskRecord::for_test(
-                                "00",
-                                1,
-                                selection(),
-                                None,
-                                1,
-                                Vec::new(),
+                let signal = match milestone.as_str() {
+                    "generation" => {
+                        let run_id = writer
+                            .commit_request("generation interruption".to_owned(), selection())
+                            .await
+                            .expect("commit request")
+                            .run_id;
+                        writer
+                            .start_model_step(run_id)
+                            .await
+                            .expect("start generation step");
+                        b'G'
+                    }
+                    "execution" => {
+                        let run_id = writer
+                            .commit_request("execution interruption".to_owned(), selection())
+                            .await
+                            .expect("commit request")
+                            .run_id;
+                        writer
+                            .start_model_step(run_id)
+                            .await
+                            .expect("start execution step");
+                        let mut arena = restored_arena(&session, &workspace).await;
+                        let cancellation = CancellationToken::new();
+                        let execution = arena
+                            .execute(
+                                "uncommitted_value = 1\nresult_values = {'uncommitted': 1}",
+                                &cancellation,
                             )
-                            .with_persisted_details_for_test(TaskPersistedDetails {
+                            .await
+                            .expect("execute uncommitted Python");
+                        assert!(matches!(
+                            execution.outcome,
+                            ExecutionOutcome::Complete { result: None }
+                        ));
+                        b'E'
+                    }
+                    "committed-step" => {
+                        let run_id = writer
+                            .commit_request("committed step interruption".to_owned(), selection())
+                            .await
+                            .expect("commit request")
+                            .run_id;
+                        let settled_step = writer
+                            .start_model_step(run_id)
+                            .await
+                            .expect("start settled step");
+                        let mut arena = restored_arena(&session, &workspace).await;
+                        let cancellation = CancellationToken::new();
+                        let source = "committed_value = 1\nresult_values = {'committed': 1}";
+                        let execution = arena
+                            .execute(source, &cancellation)
+                            .await
+                            .expect("execute committed Python");
+                        assert!(matches!(
+                            &execution.outcome,
+                            ExecutionOutcome::Complete { result: None }
+                        ));
+                        writer
+                            .settle_execution(
+                                run_id,
+                                settled_step,
+                                persisted_execution(source, execution),
+                                arena.checkpoint(),
+                            )
+                            .await
+                            .expect("commit settled step");
+                        writer
+                            .start_model_step(run_id)
+                            .await
+                            .expect("start pending step");
+                        let execution = arena
+                            .execute(
+                                "uncommitted_value = 2\nresult_values = {'uncommitted': 2}",
+                                &cancellation,
+                            )
+                            .await
+                            .expect("execute uncommitted Python");
+                        assert!(matches!(
+                            execution.outcome,
+                            ExecutionOutcome::Complete { result: None }
+                        ));
+                        b'C'
+                    }
+                    "background-only" => {
+                        let run_id = writer
+                            .commit_request("closed foreground".to_owned(), selection())
+                            .await
+                            .expect("commit request")
+                            .run_id;
+                        let origin_step_id = writer
+                            .start_model_step(run_id)
+                            .await
+                            .expect("start origin step");
+                        writer
+                            .close_run(
+                                run_id,
+                                Some(origin_step_id),
+                                || PersistedTerminal::Failed {
+                                    message: "closed before interruption".to_owned(),
+                                    evidence: None,
+                                    attempts: Vec::new(),
+                                },
+                                None,
+                            )
+                            .await
+                            .expect("close foreground");
+                        let task = crate::subagents::TaskRecord::for_test(
+                            "00",
+                            1,
+                            selection(),
+                            None,
+                            1,
+                            Vec::new(),
+                        )
+                        .with_persisted_details_for_test(
+                            TaskPersistedDetails {
                                 admitted_at_ms: 100,
                                 terminal_at_ms: None,
                                 state: crate::subagents::TaskState::Running,
@@ -7644,22 +7652,23 @@ mod tests {
                                 attempt_evidence: Vec::new(),
                                 executions: Vec::new(),
                                 outcome: None,
-                            });
-                            assert!(
-                                writer
-                                    .admit_subagent_task(
-                                        TaskAdmission::from_record(&task, origin_step_id)
-                                            .expect("encode background task"),
-                                        || false,
-                                    )
-                                    .await
-                                    .expect("admit background task"),
-                                "commit background task"
-                            );
-                            b'B'
-                        }
-                        _ => panic!("unknown recovery milestone"),
-                    };
+                            },
+                        );
+                        assert!(
+                            writer
+                                .admit_subagent_task(
+                                    TaskAdmission::from_record(&task, origin_step_id)
+                                        .expect("encode background task"),
+                                    || false,
+                                )
+                                .await
+                                .expect("admit background task"),
+                            "commit background task"
+                        );
+                        b'B'
+                    }
+                    _ => panic!("unknown recovery milestone"),
+                };
                 signal_and_block(&mut stream, signal);
             });
     }
@@ -7805,7 +7814,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned())
+            .commit_request("interrupted request".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -7917,7 +7926,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("closed foreground".to_owned())
+            .commit_request("closed foreground".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -8226,7 +8235,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("combined interruption".to_owned())
+            .commit_request("combined interruption".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -8494,7 +8503,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned())
+            .commit_request("interrupted request".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -8600,7 +8609,7 @@ mod tests {
         );
 
         let admission = writer
-            .commit_request("saved request".to_owned())
+            .commit_request("saved request".to_owned(), selection())
             .await
             .expect("commit request");
         let step = writer
@@ -8658,6 +8667,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopened_sessions_restore_each_request_selection_outside_model_context() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let terra = ModelSelection::new(&TERRA, "high").expect("select Terra");
+        for (request, selection) in [("first request", selection()), ("second request", terra)] {
+            let admission = writer
+                .commit_request(request.to_owned(), selection)
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close request");
+        }
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+
+        let session = Session::open(home.path(), &id).expect("open session");
+        let restore = session.restore().expect("restore session");
+        let requests: Vec<_> = restore
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                super::RestoredRecordKind::UserRequest { request, selection } => {
+                    Some((request.as_str(), *selection))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requests,
+            [
+                ("first request", Some(selection())),
+                ("second request", Some(terra)),
+            ]
+        );
+        assert_eq!(
+            restore
+                .executable
+                .expect("restore executable state")
+                .history
+                .entries(),
+            [
+                crate::model::ModelContextEntry::UserRequest {
+                    text: "first request".to_owned(),
+                },
+                crate::model::ModelContextEntry::UserRequest {
+                    text: "second request".to_owned(),
+                },
+            ]
+        );
+
+        session.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
     async fn activation_keeps_live_context_when_durable_or_live_identity_is_stale() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -8665,7 +8741,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let admission = writer
-            .commit_request("branch request".to_owned())
+            .commit_request("branch request".to_owned(), selection())
             .await
             .expect("commit request");
         writer
@@ -8732,7 +8808,7 @@ mod tests {
             let session = create_session(&home, &workspace).await;
             let writer = session.writer();
             let run = writer
-                .commit_request(format!("unfinished {unfinished}"))
+                .commit_request(format!("unfinished {unfinished}"), selection())
                 .await
                 .expect("commit request");
             match unfinished {
@@ -8775,7 +8851,6 @@ mod tests {
                                 call_id: crate::model::ModelCallId::new("unfinished-task"),
                                 commentary: None,
                                 reasoning_summary: String::new(),
-                                selection: None,
                                 replay: crate::model::ProviderReplay::new("test", Vec::new()),
                                 result: crate::model::CodeResult::execution(String::new()),
                                 execution: Some(Execution {
@@ -9006,7 +9081,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid execution projection".to_owned())
+            .commit_request("invalid execution projection".to_owned(), selection())
             .await
             .expect("commit request");
         let step = writer
@@ -9051,7 +9126,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid terminal projection".to_owned())
+            .commit_request("invalid terminal projection".to_owned(), selection())
             .await
             .expect("commit request");
         let before_selection = selection_snapshot(&session);
@@ -9096,7 +9171,9 @@ mod tests {
         let before_database = selection_database_bytes(home.path(), &session);
         let before_history = writer.model_history().expect("read live history");
         assert!(matches!(
-            writer.commit_request("stale request".to_owned()).await,
+            writer
+                .commit_request("stale request".to_owned(), selection())
+                .await,
             Err(SessionError::InvalidTransition)
         ));
         assert_eq!(selection_snapshot(&session), before_selection);
@@ -9115,7 +9192,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale settlement".to_owned())
+            .commit_request("stale settlement".to_owned(), selection())
             .await
             .expect("commit settlement request");
         let step = writer
@@ -9136,7 +9213,6 @@ mod tests {
                         call_id: crate::model::ModelCallId::new("stale-settlement"),
                         commentary: None,
                         reasoning_summary: String::new(),
-                        selection: None,
                         replay: crate::model::ProviderReplay::new("test", Vec::new()),
                         result: crate::model::CodeResult::execution(String::new()),
                         execution: Some(Execution {
@@ -9170,7 +9246,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale closure".to_owned())
+            .commit_request("stale closure".to_owned(), selection())
             .await
             .expect("commit closure request");
         move_durable_active_entry(&session, branch);
@@ -9211,7 +9287,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let admission = writer
-            .commit_request("context request".to_owned())
+            .commit_request("context request".to_owned(), selection())
             .await
             .expect("commit request");
         let before = writer.model_history().expect("read request context");
@@ -9258,7 +9334,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("persist this request".to_owned())
+            .commit_request("persist this request".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -9271,7 +9347,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("call-1"),
             commentary: Some("setting a value".to_owned()),
             reasoning_summary: "set the value".to_owned(),
-            selection: Some(selection()),
             replay: crate::model::ProviderReplay::new(
                 "test",
                 vec![crate::model::OpaqueReplayItem::new(vec![0, 255])],
@@ -9374,7 +9449,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback allocation".to_owned())
+            .commit_request("rollback allocation".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -9420,7 +9495,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback".to_owned())
+            .commit_request("rollback".to_owned(), selection())
             .await
             .expect("commit request")
             .run_id;
@@ -9441,7 +9516,6 @@ mod tests {
             call_id: crate::model::ModelCallId::new("call-rollback"),
             commentary: None,
             reasoning_summary: String::new(),
-            selection: None,
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             result: crate::model::CodeResult::Execution {
                 feedback: String::new(),
@@ -9492,7 +9566,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned())
+            .commit_request("parent".to_owned(), selection())
             .await
             .expect("start parent run")
             .run_id;
@@ -10085,7 +10159,7 @@ mod tests {
         let writer = session.writer();
 
         let discarded = writer
-            .commit_request("discarded request".to_owned())
+            .commit_request("discarded request".to_owned(), selection())
             .await
             .expect("commit discarded request");
         let discarded_step = writer
@@ -10111,7 +10185,7 @@ mod tests {
             .await
             .expect("close discarded run");
         let retained = writer
-            .commit_request("retained request".to_owned())
+            .commit_request("retained request".to_owned(), selection())
             .await
             .expect("commit retained request");
         let retained_step = writer
@@ -10360,7 +10434,7 @@ mod tests {
             .await
             .expect("select reopened compaction");
         let child = reopened_writer
-            .commit_request("branch request".to_owned())
+            .commit_request("branch request".to_owned(), selection())
             .await
             .expect("branch from applied compaction");
         let child_parent: i64 = reopened
@@ -10508,7 +10582,7 @@ mod tests {
                 .await
                 .expect("select compaction branch");
             let child = writer
-                .commit_request(format!("branch from {summary}"))
+                .commit_request(format!("branch from {summary}"), selection())
                 .await
                 .expect("branch from compaction");
             let child_parent: i64 = session
@@ -10595,7 +10669,7 @@ mod tests {
                 .await
                 .expect("select compaction outcome");
             let child = writer
-                .commit_request("branch request".to_owned())
+                .commit_request("branch request".to_owned(), selection())
                 .await
                 .expect("branch from compaction outcome");
             let child_parent: i64 = session

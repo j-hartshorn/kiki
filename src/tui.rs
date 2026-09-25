@@ -40,7 +40,8 @@ use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
-    FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
+    FooterContext, ModelChangeCard, Transcript, TranscriptLayout, model_change_card,
+    normalise_terminal_text, page_style,
 };
 use picker::{Picker, PickerAction, PickerItem};
 use tree::{TreeNavigator, TreeNavigatorAction};
@@ -1010,6 +1011,14 @@ impl App {
             visible_changed: true,
             quit: false,
         }
+    }
+
+    fn settings_pending(&self) -> bool {
+        self.preview.is_some()
+            || self
+                .pending_settings
+                .values()
+                .any(|selection| *selection == self.settings_selection)
     }
 
     fn flush_preview(&mut self, commands: &mut Vec<RuntimeCommand>) {
@@ -2409,15 +2418,23 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     } else {
         THROBBER_ROWS
     };
+    let pending_card = app
+        .transcript
+        .pending_model_change(app.settings_selection)
+        .map(|selection| model_change_card(selection, app.settings_pending(), area.width))
+        .filter(|card| card.height() < history_height.saturating_sub(throbber_height));
+    let card_height = pending_card.as_ref().map_or(0, ModelChangeCard::height);
     let monitor = app.subagent_monitor.layout(
         area.width,
         history_height
             .saturating_sub(throbber_height)
+            .saturating_sub(card_height)
             .saturating_sub(1),
         now,
     );
     let throbber_top = prompt_top.saturating_sub(throbber_height);
-    let monitor_top = throbber_top.saturating_sub(monitor.height());
+    let card_top = throbber_top.saturating_sub(card_height);
+    let monitor_top = card_top.saturating_sub(monitor.height());
     let history = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -2435,6 +2452,12 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
+    if let Some(card) = &pending_card {
+        card.render(
+            Rect::new(area.x, card_top, area.width, card_height),
+            frame.buffer_mut(),
+        );
+    }
     if throbber_height > 0 {
         let throbber_frame = if app.transcript.is_generating() {
             app.generation_throbber.current_frame()
@@ -2902,6 +2925,7 @@ mod tests {
                 run_id: RunId(4),
                 record: Record::UserRequest {
                     request: request.to_owned(),
+                    selection: None,
                 },
             })],
             footer_adjustment: Vec::new(),
@@ -3167,6 +3191,7 @@ mod tests {
                         run_id: RunId(run_id),
                         record: Record::UserRequest {
                             request: format!("benchmark request {run_id:03}"),
+                            selection: None,
                         },
                     },
                     progress_gap: false,
@@ -3363,6 +3388,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -3484,10 +3510,15 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
         });
+        select_history_text(app, text, width, height)
+    }
+
+    fn select_history_text(app: &mut App, text: &str, width: u16, height: u16) -> Instant {
         let buffer = rendered_buffer(app, width, height);
         let (column, row) = cell_start(&buffer, text);
         let end = column + u16::try_from(text.len() - 1).unwrap();
@@ -3506,6 +3537,92 @@ mod tests {
         );
         rendered_buffer(app, width, height);
         now
+    }
+
+    fn completed_run_records(run_id: u64, selection: ModelSelection) -> [StoredRecord; 2] {
+        [
+            StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::UserRequest {
+                    request: format!("request {run_id}"),
+                    selection: Some(selection),
+                },
+            },
+            StoredRecord {
+                run_id: RunId(run_id),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "answer".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+        ]
+    }
+
+    fn branch_state(selections: &[ModelSelection]) -> RuntimeInitialState {
+        RuntimeInitialState {
+            metadata: None,
+            timeline: selections
+                .iter()
+                .zip(1..)
+                .flat_map(|(selection, run_id)| completed_run_records(run_id, *selection))
+                .map(RestoredTimelineItem::Record)
+                .collect(),
+            footer_adjustment: Vec::new(),
+            disabled_reason: None,
+        }
+    }
+
+    fn history_rows(app: &mut App) -> Vec<String> {
+        history_viewport_rows(app)
+            .into_iter()
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    fn history_viewport_rows(app: &mut App) -> Vec<String> {
+        let buffer = rendered_buffer(app, 80, 40);
+        let area = app.history_viewport.expect("history viewport").area;
+        (area.top()..area.bottom())
+            .map(|row| {
+                (area.left()..area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn append_completed_run(app: &mut App, run_id: u64, selection: ModelSelection) {
+        for record in completed_run_records(run_id, selection) {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record,
+                progress_gap: false,
+            });
+        }
+    }
+
+    fn rows_and_prompt_rule(app: &mut App) -> (Vec<String>, usize) {
+        let rows = rendered(app, 80, 40)
+            .lines()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>();
+        let rule = rows
+            .iter()
+            .rposition(|row| *row == "─".repeat(80))
+            .expect("prompt rule");
+        (rows, rule)
+    }
+
+    fn history_bottom(app: &App) -> usize {
+        usize::from(
+            app.history_viewport
+                .expect("history viewport")
+                .area
+                .bottom(),
+        )
     }
 
     struct RecordingTitles {
@@ -5110,6 +5227,54 @@ mod tests {
     }
 
     #[test]
+    fn tree_navigation_rebuilds_model_change_cards_for_the_selected_branch() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let current = app.settings_selection;
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+
+        select_tree_request(&mut app);
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: branch_state(&[current, terra_high]),
+                request_prefill: None,
+            },
+        }));
+        assert_eq!(app.settings_selection, current);
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "Model selected: openai/gpt-5.6-sol · medium"
+        );
+        let rows = history_rows(&mut app);
+        let terra_card = rows
+            .iter()
+            .position(|row| row == "Model selected: openai/gpt-5.6-terra · high")
+            .expect("history card");
+        assert!(rows[terra_card + 1].contains("request 2"), "{rows:?}");
+        assert_eq!(rows.last().map(String::as_str), Some("Session restored."));
+
+        select_tree_request(&mut app);
+        assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
+            outcome: NavigationOutcome::Replaced {
+                state: branch_state(&[terra_high, current]),
+                request_prefill: None,
+            },
+        }));
+        assert_eq!(app.settings_selection, current);
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        let rows = history_rows(&mut app);
+        let cards = rows
+            .iter()
+            .filter(|row| row.contains("Model selected"))
+            .collect::<Vec<_>>();
+        assert_eq!(cards, ["Model selected: openai/gpt-5.6-sol · medium"]);
+        assert_eq!(rows.last().map(String::as_str), Some("Session restored."));
+        let screen = rendered(&mut app, 80, 40);
+        assert!(screen.contains("gpt-5.6-sol • thinking medium"), "{screen}");
+    }
+
+    #[test]
     fn model_argument_opens_a_filtered_picker_without_submitting() {
         let mut app = App::default();
         type_prompt(&mut app, "/model terra");
@@ -5363,6 +5528,197 @@ mod tests {
             assert!(update.commands.is_empty());
             assert_eq!(app.settings_selection.thinking(), expected);
         }
+    }
+
+    #[test]
+    fn pending_model_change_card_sits_above_the_prompt_until_settings_apply() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+
+        let (_, revision) =
+            applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
+        );
+        assert!(rows[rule - 1].is_empty() && rows[rule - 3].is_empty());
+        assert_eq!(history_bottom(&app), rule - 3);
+        let buffer = rendered_buffer(&mut app, 80, 40);
+        let (column, row) = cell_start(&buffer, "[pending]");
+        assert_eq!(buffer[(column, row)].fg, Color::Rgb(128, 128, 128));
+
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "Model selected: openai/gpt-5.6-terra · medium"
+        );
+        assert!(
+            !history_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("Model selected"))
+        );
+    }
+
+    #[test]
+    fn shift_tab_marks_the_pending_model_change_card_until_the_preview_applies() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+        select_history_text(&mut app, "request 1", 80, 40);
+        assert!(app.selection.is_some());
+
+        assert!(
+            app.handle_key_at(key(KeyCode::BackTab), now)
+                .visible_changed
+        );
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-sol · high"
+        );
+        assert!(app.selection.is_none());
+
+        let (_, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-sol · high"
+        );
+
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(rows[rule - 2], "Model selected: openai/gpt-5.6-sol · high");
+    }
+
+    #[test]
+    fn pending_model_change_card_sits_between_the_subagent_monitor_and_the_throbber() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let [request, _] = completed_run_records(1, app.settings_selection);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: request,
+                progress_gap: false,
+            },
+            now,
+        );
+        app.handle_event_at(
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            now,
+        );
+        app.subagent_monitor
+            .insert_for_test("child1", TaskState::Running, now);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert!(rows[rule - 1].starts_with('⠁'), "{rows:?}");
+        assert!(rows[rule - 2].is_empty());
+        assert_eq!(
+            rows[rule - 4],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
+        );
+        let monitor = rows
+            .iter()
+            .position(|row| row.contains("subagent:child1"))
+            .expect("subagent monitor");
+        assert!(
+            history_bottom(&app) <= monitor && monitor < rule - 5,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn pending_model_change_card_stays_put_while_history_scrolls() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        for run_id in 1..=20 {
+            append_completed_run(&mut app, run_id, selection);
+        }
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        let hidden_height = app.history_viewport.expect("history viewport").area.height;
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (following, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            app.history_viewport.expect("history viewport").area.height,
+            hidden_height - 3
+        );
+        assert_eq!(history_bottom(&app), rule - 3);
+        assert_eq!(
+            following[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
+        );
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        assert!(app.handle_key_at(key(KeyCode::PageUp), now).visible_changed);
+        let (scrolled, scrolled_rule) = rows_and_prompt_rule(&mut app);
+        assert_ne!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(scrolled_rule, rule);
+        assert_ne!(scrolled[..rule - 3], following[..rule - 3]);
+        assert_eq!(scrolled[rule - 3..], following[rule - 3..]);
+    }
+
+    #[test]
+    fn pending_model_change_card_clears_when_switched_back_and_settles_into_history() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule - 3);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        assert!(!rows.iter().any(|row| row.contains("Model selected")));
+
+        let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        append_completed_run(&mut app, 2, terra);
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        let rows = history_rows(&mut app);
+        let cards = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("Model selected"))
+            .collect::<Vec<_>>();
+        let second_request = rows
+            .iter()
+            .position(|row| row.contains("request 2"))
+            .expect("second request");
+        assert_eq!(
+            cards,
+            [(
+                second_request - 1,
+                &"Model selected: openai/gpt-5.6-terra · medium".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn pending_model_change_card_leaves_at_least_one_history_row() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+        app.apply_selection(ModelSelection::new(&TERRA, "high").unwrap());
+
+        assert!(!rendered(&mut app, 80, 7).contains("Model selected"));
+        assert_eq!(app.history_height, 3);
+        assert!(rendered(&mut app, 80, 8).contains("[pending] Model selected"));
+        assert_eq!(app.history_height, 1);
     }
 
     #[test]
@@ -6312,6 +6668,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -6345,6 +6702,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7382,6 +7740,7 @@ mod tests {
                 run_id: RunId(run_id),
                 record: Record::UserRequest {
                     request: format!("saved request {run_id}"),
+                    selection: None,
                 },
             })
             .collect::<Vec<_>>();
@@ -7446,6 +7805,7 @@ mod tests {
             run_id: RunId(1),
             record: Record::UserRequest {
                 request: "saved request".to_owned(),
+                selection: None,
             },
         };
         let final_message = StoredRecord {
@@ -7497,6 +7857,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "inspect".to_owned(),
+                        selection: None,
                     },
                 }),
                 RestoredTimelineItem::Record(StoredRecord {
@@ -7537,6 +7898,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "inspect".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7573,6 +7935,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7620,6 +7983,7 @@ mod tests {
                 run_id: RunId(9),
                 record: Record::UserRequest {
                     request: "request 9".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7642,6 +8006,7 @@ mod tests {
                 run_id: RunId(9),
                 record: Record::UserRequest {
                     request: "request 9".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7745,6 +8110,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::UserRequest {
                     request: "followed tail".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7786,6 +8152,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: request.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7812,6 +8179,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: "first second third fourth".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -7890,6 +8258,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "only line".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7908,6 +8277,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -7940,6 +8310,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: request.to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -8117,6 +8488,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "content".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8165,6 +8537,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: text.to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8411,6 +8784,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "selectable text".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -8648,6 +9022,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "small".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -9107,6 +9482,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "accepted".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9460,6 +9836,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "corrected request".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9516,6 +9893,7 @@ mod tests {
                     run_id: RunId(1),
                     record: Record::UserRequest {
                         request: "correct this".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9624,6 +10002,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "correct this".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9688,6 +10067,7 @@ mod tests {
                     run_id: RunId(2),
                     record: Record::UserRequest {
                         request: "second prompt".to_owned(),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -9737,6 +10117,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "history".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10092,6 +10473,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("history line {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,
@@ -10251,6 +10633,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "request".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10334,6 +10717,7 @@ mod tests {
                 run_id: RunId(1),
                 record: Record::UserRequest {
                     request: "first prompt".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10373,6 +10757,7 @@ mod tests {
                 run_id: RunId(2),
                 record: Record::UserRequest {
                     request: "second prompt".to_owned(),
+                    selection: None,
                 },
             },
             progress_gap: false,
@@ -10401,6 +10786,7 @@ mod tests {
                     run_id: RunId(run_id),
                     record: Record::UserRequest {
                         request: format!("request {run_id}"),
+                        selection: None,
                     },
                 },
                 progress_gap: false,

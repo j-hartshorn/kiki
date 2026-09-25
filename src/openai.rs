@@ -15,12 +15,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::Notify;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 
-#[cfg(test)]
-use crate::config::ModelConfiguration;
 use crate::{
     config::{ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT},
     model::{
@@ -50,7 +47,6 @@ fn openai_config(api_key: impl Into<String>, api_base: impl Into<String>) -> Ope
 pub(crate) struct OpenAiModel {
     prompt: String,
     client: Client<OpenAIConfig>,
-    settings: watch::Receiver<ModelSelection>,
     api_key: String,
     #[cfg(test)]
     summary_retry_wait_started: Option<Arc<Notify>>,
@@ -72,49 +68,17 @@ impl OpenAiChildModelFactory {
 impl ChildModelFactory for OpenAiChildModelFactory {
     type Model = OpenAiModel;
 
-    fn create(&self, prompt: String, selection: ModelSelection) -> Self::Model {
-        OpenAiModel::with_fixed_selection(prompt, self.api_key.clone(), selection)
+    fn create(&self, prompt: String) -> Self::Model {
+        OpenAiModel::new(prompt, self.api_key.clone())
     }
 }
 
 impl OpenAiModel {
-    #[cfg(test)]
-    pub(crate) fn new(
-        prompt: impl Into<String>,
-        api_key: impl Into<String>,
-        model: &'static ModelConfiguration,
-        thinking: &'static str,
-    ) -> Self {
-        let selection = ModelSelection::new(model, thinking)
-            .expect("OpenAI model selection must use a supported thinking level");
-        let (_, settings) = watch::channel(selection);
-        Self::with_settings(prompt, api_key, settings)
+    pub(crate) fn new(prompt: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self::build(prompt.into(), api_key.into(), OPENAI_API_BASE)
     }
 
-    pub(crate) fn with_settings(
-        prompt: impl Into<String>,
-        api_key: impl Into<String>,
-        settings: watch::Receiver<ModelSelection>,
-    ) -> Self {
-        Self::build(prompt.into(), api_key.into(), settings, OPENAI_API_BASE)
-    }
-
-    pub(crate) fn with_fixed_selection(
-        prompt: impl Into<String>,
-        api_key: impl Into<String>,
-        selection: ModelSelection,
-    ) -> Self {
-        let (sender, settings) = watch::channel(selection);
-        drop(sender);
-        Self::with_settings(prompt, api_key, settings)
-    }
-
-    fn build(
-        prompt: String,
-        api_key: String,
-        settings: watch::Receiver<ModelSelection>,
-        endpoint: &str,
-    ) -> Self {
+    fn build(prompt: String, api_key: String, endpoint: &str) -> Self {
         let service = ServiceBuilder::new()
             .layer(OpenAIRetryLayer::new(2))
             .service(ReqwestService::default());
@@ -122,7 +86,6 @@ impl OpenAiModel {
             prompt,
             client: Client::with_config(openai_config(api_key.clone(), endpoint))
                 .with_http_service(service),
-            settings,
             api_key,
             #[cfg(test)]
             summary_retry_wait_started: None,
@@ -135,37 +98,7 @@ impl OpenAiModel {
         api_key: impl Into<String>,
         endpoint: &str,
     ) -> Self {
-        Self::with_selection_and_endpoint(
-            prompt,
-            api_key,
-            crate::config::DEFAULT_MODEL,
-            crate::config::DEFAULT_MODEL.default_thinking,
-            endpoint,
-        )
-    }
-
-    #[cfg(test)]
-    fn with_selection_and_endpoint(
-        prompt: impl Into<String>,
-        api_key: impl Into<String>,
-        model: &'static ModelConfiguration,
-        thinking: &'static str,
-        endpoint: &str,
-    ) -> Self {
-        let selection = ModelSelection::new(model, thinking)
-            .expect("OpenAI model selection must use a supported thinking level");
-        let (_, settings) = watch::channel(selection);
-        Self::build(prompt.into(), api_key.into(), settings, endpoint)
-    }
-
-    #[cfg(test)]
-    fn with_selection_receiver_and_endpoint(
-        prompt: impl Into<String>,
-        api_key: impl Into<String>,
-        settings: watch::Receiver<ModelSelection>,
-        endpoint: &str,
-    ) -> Self {
-        Self::build(prompt.into(), api_key.into(), settings, endpoint)
+        Self::build(prompt.into(), api_key.into(), endpoint)
     }
 
     fn request(
@@ -596,7 +529,7 @@ impl OpenAiModel {
                     presentation.flush_all(progress);
                     let accounting = terminal_accounting.expect("terminal response accounting");
                     return self
-                        .completed_step(selection, history, response, &mut content)
+                        .completed_step(history, response, &mut content)
                         .map(|mut step| {
                             step.attempts.push(accounting.clone());
                             step
@@ -719,7 +652,6 @@ impl OpenAiModel {
 
     fn completed_step(
         &self,
-        selection: ModelSelection,
         history: &ModelHistory,
         response: WireResponse,
         content: &mut ApplicationContentGuard,
@@ -766,7 +698,6 @@ impl OpenAiModel {
         );
         Ok(ModelStep {
             action,
-            selection: Some(selection),
             reasoning_summary,
             replay,
             attempts: Vec::new(),
@@ -1106,8 +1037,12 @@ impl OpenAiModel {
 }
 
 impl Model for OpenAiModel {
-    fn validate_history(&self, history: &ModelHistory) -> Result<(), ModelError> {
-        self.request(*self.settings.borrow(), history).map(|_| ())
+    fn validate_history(
+        &self,
+        history: &ModelHistory,
+        selection: ModelSelection,
+    ) -> Result<(), ModelError> {
+        self.request(selection, history).map(|_| ())
     }
 
     fn summarise<'a>(
@@ -1121,11 +1056,11 @@ impl Model for OpenAiModel {
 
     fn step<'a>(
         &'a mut self,
+        selection: ModelSelection,
         history: &'a ModelHistory,
         cancellation: &'a CancellationToken,
         progress: &'a mut (dyn FnMut(ModelProgress) + Send),
     ) -> impl Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a {
-        let selection = *self.settings.borrow_and_update();
         self.step_with_restarts(selection, history, cancellation, progress)
     }
 }
@@ -2205,7 +2140,7 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{Notify, mpsc, watch};
+    use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep, sleep_until, timeout};
     use tokio_util::sync::CancellationToken;
@@ -2225,16 +2160,18 @@ mod tests {
         history
     }
 
+    fn default_selection() -> ModelSelection {
+        ModelSelection::new(
+            crate::config::DEFAULT_MODEL,
+            crate::config::DEFAULT_MODEL.default_thinking,
+        )
+        .unwrap()
+    }
+
     const COMPLETED_STREAM: &str = concat!(
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"code\\\":\\\"print(1)\\\"}\"}\n\n",
         "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":23,\"input_tokens_details\":{\"cached_tokens\":5,\"cache_write_tokens\":7},\"output_tokens\":11,\"output_tokens_details\":{\"reasoning_tokens\":3},\"total_tokens\":34}}}\n\n",
-        "data: [DONE]\n\n",
-    );
-    const COMPLETED_STREAM_WITHOUT_USAGE: &str = concat!(
-        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking\"}\n\n",
-        "data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"code\\\":\\\"print(1)\\\"}\"}\n\n",
-        "data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"service_tier\":\"default\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"encrypted-reasoning\",\"status\":\"completed\"},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"execute_python\",\"arguments\":\"{\\\"code\\\":\\\"print(1)\\\"}\",\"status\":\"completed\"}]}}\n\n",
         "data: [DONE]\n\n",
     );
     const FAILED_STREAM: &str = concat!(
@@ -2257,7 +2194,7 @@ mod tests {
 
     #[test]
     fn summary_request_has_no_tools_and_uses_captured_selection() {
-        let model = super::OpenAiModel::new("system prompt", "test-api-key", &TERRA, "low");
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
         let request = model
             .summary_request(&crate::model::SummaryRequest {
                 instructions: "summary instructions".to_owned(),
@@ -2282,12 +2219,7 @@ mod tests {
 
     #[test]
     fn constructs_qualified_sol_request_with_high_effort() {
-        let model = super::OpenAiModel::new(
-            "system prompt",
-            "test-api-key",
-            &crate::config::models::SOL,
-            "high",
-        );
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
         let request = model
             .request(ModelSelection::new(&SOL, "high").unwrap(), &history())
             .unwrap();
@@ -2298,14 +2230,15 @@ mod tests {
 
     #[test]
     fn constructs_and_serializes_each_configured_openai_model() {
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
+        assert_eq!(model.prompt, "system prompt");
+        assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
+        assert_eq!(
+            model.client.config().url("/responses"),
+            format!("{OPENAI_API_BASE}/responses")
+        );
         for configuration in CATALOGUE {
             for &thinking in configuration.thinking_levels {
-                let model = super::OpenAiModel::new(
-                    "system prompt",
-                    "test-api-key",
-                    configuration,
-                    thinking,
-                );
                 let request = model
                     .request(
                         ModelSelection::new(configuration, thinking).unwrap(),
@@ -2313,12 +2246,6 @@ mod tests {
                     )
                     .unwrap();
 
-                assert_eq!(model.prompt, "system prompt");
-                assert_eq!(model.client.config().api_base(), OPENAI_API_BASE);
-                assert_eq!(
-                    model.client.config().url("/responses"),
-                    format!("{OPENAI_API_BASE}/responses")
-                );
                 assert_eq!(
                     request["model"],
                     json!(configuration.id.strip_prefix("openai/").unwrap())
@@ -2331,12 +2258,7 @@ mod tests {
 
     #[test]
     fn constructs_astra_request_with_verified_wire_contract() {
-        let model = super::OpenAiModel::new(
-            "system prompt",
-            "test-api-key",
-            &ASTRA,
-            ASTRA.default_thinking,
-        );
+        let model = super::OpenAiModel::new("system prompt", "test-api-key");
         let request = model
             .request(
                 ModelSelection::new(&ASTRA, ASTRA.default_thinking).unwrap(),
@@ -2367,18 +2289,18 @@ mod tests {
             FixtureReply::Sse(COMPLETED_STREAM),
         ])
         .await;
-        let mut model = super::OpenAiModel::with_selection_and_endpoint(
-            "system prompt",
-            "fixture-key",
-            &SOL,
-            "high",
-            &fixture.endpoint,
-        );
+        let mut model =
+            super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
 
         let step = model
-            .step(&history(), &cancellation, &mut progress)
+            .step(
+                ModelSelection::new(&SOL, "high").unwrap(),
+                &history(),
+                &cancellation,
+                &mut progress,
+            )
             .await
             .unwrap();
 
@@ -2396,10 +2318,6 @@ mod tests {
         };
         assert_eq!(usage.model, SOL.id);
         assert_eq!(
-            step.selection,
-            Some(ModelSelection::new(&SOL, "high").unwrap())
-        );
-        assert_eq!(
             crate::pricing::estimate_usage(usage)
                 .unwrap()
                 .pricing()
@@ -2409,135 +2327,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_in_flight_step_keeps_its_snapshot_across_a_restart() {
-        let allow_first_reply = Arc::new(Notify::new());
-        let fixture = Fixture::start_sequence(vec![
-            FixtureReply::GatedSse {
-                body: "",
-                allow: allow_first_reply.clone(),
-            },
-            FixtureReply::Sse(COMPLETED_STREAM),
-        ])
-        .await;
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
-        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
-            "system prompt",
-            "fixture-key",
-            selection_receiver,
-            &fixture.endpoint,
-        );
-        let step_history = history();
-        let task = tokio::spawn(async move {
-            let cancellation = CancellationToken::new();
-            let mut progress = |_| {};
-            model
-                .step(&step_history, &cancellation, &mut progress)
-                .await
-        });
-
-        fixture.wait_for_requests(1).await;
-        settings.send_replace(selection_b);
-        allow_first_reply.notify_one();
-        let step = task.await.unwrap().unwrap();
-
-        assert_eq!(fixture.request_count(), 2);
-        for request in fixture.requests.lock().unwrap().iter() {
-            assert_eq!(request.body["model"], json!("gpt-5.6-sol"));
-            assert_eq!(request.body["service_tier"], json!("default"));
-            assert_eq!(request.body["reasoning"]["effort"], json!("low"));
-        }
-        let AttemptAccounting::KnownUsageWithUntrackedRetries(usage) =
-            step.attempts.last().unwrap()
-        else {
-            panic!("completed retry should report known usage")
-        };
-        assert_eq!(usage.model, SOL.id);
-        assert_eq!(step.selection, Some(selection_a));
-        assert_eq!(
-            crate::pricing::estimate_usage(usage).unwrap().pricing(),
-            SOL.pricing.identity
-        );
-    }
-
-    #[test]
-    fn fixed_selection_does_not_follow_foreground_settings() {
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, foreground_settings) = watch::channel(selection_a);
-        let mut foreground =
-            super::OpenAiModel::with_settings("system prompt", "fixture-key", foreground_settings);
-        let mut fixed =
-            super::OpenAiModel::with_fixed_selection("system prompt", "fixture-key", selection_a);
-
-        settings.send_replace(selection_b);
-
-        assert_eq!(*foreground.settings.borrow_and_update(), selection_b);
-        assert_eq!(*fixed.settings.borrow_and_update(), selection_a);
-    }
-
-    #[tokio::test]
-    async fn a_successful_step_keeps_its_selection_when_usage_is_unavailable() {
-        let allow_reply = Arc::new(Notify::new());
-        let fixture = Fixture::start(FixtureReply::GatedSse {
-            body: COMPLETED_STREAM_WITHOUT_USAGE,
-            allow: allow_reply.clone(),
-        })
-        .await;
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
-        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
-            "system prompt",
-            "fixture-key",
-            selection_receiver,
-            &fixture.endpoint,
-        );
-        let step_history = history();
-        let task = tokio::spawn(async move {
-            let cancellation = CancellationToken::new();
-            let mut progress = |_| {};
-            model
-                .step(&step_history, &cancellation, &mut progress)
-                .await
-        });
-
-        fixture.wait_for_requests(1).await;
-        settings.send_replace(selection_b);
-        allow_reply.notify_one();
-        let step = task.await.unwrap().unwrap();
-
-        assert_eq!(step.attempts, [AttemptAccounting::UsageUnavailable]);
-        assert_eq!(step.selection, Some(selection_a));
-    }
-
-    #[tokio::test]
-    async fn each_step_uses_the_selection_available_at_its_start() {
+    async fn each_step_uses_the_selection_it_is_given() {
         let fixture = Fixture::start_sequence(vec![
             FixtureReply::Sse(COMPLETED_STREAM),
             FixtureReply::Sse(COMPLETED_STREAM),
         ])
         .await;
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
-        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
-            "system prompt",
-            "fixture-key",
-            selection_receiver,
-            &fixture.endpoint,
-        );
+        let mut model =
+            super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
 
         let first = model
-            .step(&history(), &cancellation, &mut progress)
+            .step(
+                ModelSelection::new(&SOL, "low").unwrap(),
+                &history(),
+                &cancellation,
+                &mut progress,
+            )
             .await
             .unwrap();
-        settings.send_replace(selection_b);
         let second = model
-            .step(&history(), &cancellation, &mut progress)
+            .step(
+                ModelSelection::new(&TERRA, "high").unwrap(),
+                &history(),
+                &cancellation,
+                &mut progress,
+            )
             .await
             .unwrap();
 
@@ -2568,61 +2384,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sdk_retries_keep_the_step_selection_after_a_settings_change() {
-        let allow_first_reply = Arc::new(Notify::new());
-        let fixture = Fixture::start_sequence(vec![
-            FixtureReply::GatedStatus {
-                code: 429,
-                body: r#"{"error":{"message":"retry later","type":"rate_limit_error","param":null,"code":"rate_limit"}}"#,
-                allow: allow_first_reply.clone(),
-            },
-            FixtureReply::Status {
-                code: 500,
-                body: r#"{"error":{"message":"unavailable","type":"server_error","param":null,"code":"server_error"}}"#,
-            },
-            FixtureReply::Sse(COMPLETED_STREAM),
-        ])
-        .await;
-        let selection_a = ModelSelection::new(&SOL, "low").unwrap();
-        let selection_b = ModelSelection::new(&TERRA, "high").unwrap();
-        let (settings, selection_receiver) = watch::channel(selection_a);
-        let mut model = super::OpenAiModel::with_selection_receiver_and_endpoint(
-            "system prompt",
-            "fixture-key",
-            selection_receiver,
-            &fixture.endpoint,
-        );
-        let step_history = history();
-        let task = tokio::spawn(async move {
-            let cancellation = CancellationToken::new();
-            let mut progress = |_| {};
-            model
-                .step(&step_history, &cancellation, &mut progress)
-                .await
-        });
-
-        fixture.wait_for_requests(1).await;
-        settings.send_replace(selection_b);
-        allow_first_reply.notify_one();
-        let step = task.await.unwrap().unwrap();
-
-        let requests = fixture.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(requests.iter().all(|request| {
-            request.body["model"] == json!("gpt-5.6-sol")
-                && request.body["service_tier"] == json!("default")
-                && request.body["reasoning"]["effort"] == json!("low")
-        }));
-        drop(requests);
-        let AttemptAccounting::KnownUsageWithUntrackedRetries(usage) =
-            step.attempts.first().unwrap()
-        else {
-            panic!("SDK-retried step should report known usage")
-        };
-        assert_eq!(usage.model, SOL.id);
-    }
-
     #[derive(Clone)]
     enum FixtureReply {
         Sse(&'static str),
@@ -2631,11 +2392,6 @@ mod tests {
             code: u16,
             body: &'static str,
         },
-        GatedStatus {
-            code: u16,
-            body: &'static str,
-            allow: Arc<Notify>,
-        },
         OwnedStatus {
             code: u16,
             headers: Vec<(String, String)>,
@@ -2643,10 +2399,6 @@ mod tests {
         },
         AbruptSse(&'static str),
         CloseBeforeHeaders,
-        GatedSse {
-            body: &'static str,
-            allow: Arc<Notify>,
-        },
         IdleSse(&'static str),
     }
 
@@ -2828,15 +2580,6 @@ mod tests {
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
-            FixtureReply::GatedStatus { code, body, allow } => {
-                allow.notified().await;
-                let response = format!(
-                    "HTTP/1.1 {code} Fixture Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
             FixtureReply::OwnedStatus {
                 code,
                 headers,
@@ -2861,15 +2604,6 @@ mod tests {
                 write_chunk(stream, body).await;
             }
             FixtureReply::CloseBeforeHeaders => stream.shutdown().await.unwrap(),
-            FixtureReply::GatedSse { body, allow } => {
-                allow.notified().await;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
             FixtureReply::IdleSse(body) => {
                 write_chunked_headers(stream).await;
                 write_chunk(stream, body).await;
@@ -3222,13 +2956,25 @@ mod tests {
             Result<crate::model::ModelStep, ModelFailure>,
             Vec<ModelProgress>,
         ) {
+            step_with(fixture, default_selection()).await
+        }
+
+        async fn step_with(
+            fixture: &Fixture,
+            selection: ModelSelection,
+        ) -> (
+            Result<crate::model::ModelStep, ModelFailure>,
+            Vec<ModelProgress>,
+        ) {
             let mut model =
                 OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
             let cancellation = CancellationToken::new();
             let mut progress = Vec::new();
             let result = {
                 let mut sink = |event| progress.push(event);
-                model.step(&history(), &cancellation, &mut sink).await
+                model
+                    .step(selection, &history(), &cancellation, &mut sink)
+                    .await
             };
             (result, progress)
         }
@@ -3365,10 +3111,15 @@ mod tests {
             ])
             .await;
 
-            let (result, progress) = step(&fixture).await;
+            let (result, progress) =
+                step_with(&fixture, ModelSelection::new(&TERRA, "high").unwrap()).await;
 
             assert!(result.is_ok());
             assert_eq!(fixture.request_count(), 3);
+            for request in fixture.requests.lock().unwrap().iter() {
+                assert_eq!(request.body["model"], json!("gpt-5.6-terra"));
+                assert_eq!(request.body["reasoning"]["effort"], json!("high"));
+            }
             assert_eq!(starts(&progress), vec![1]);
             assert_eq!(settles(&progress), vec![1]);
         }
@@ -3447,7 +3198,12 @@ mod tests {
             let cancellation = CancellationToken::new();
             let mut progress = Vec::new();
             let failure = model
-                .step(&history(), &cancellation, &mut |event| progress.push(event))
+                .step(
+                    default_selection(),
+                    &history(),
+                    &cancellation,
+                    &mut |event| progress.push(event),
+                )
                 .await
                 .unwrap_err();
 
@@ -3648,7 +3404,14 @@ mod tests {
                 let mut model =
                     OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
                 let mut progress = |_| {};
-                model.step(&history(), &cancellation, &mut progress).await
+                model
+                    .step(
+                        default_selection(),
+                        &history(),
+                        &cancellation,
+                        &mut progress,
+                    )
+                    .await
             });
 
             fixture.wait_for_replies_written(1).await;
@@ -3680,7 +3443,9 @@ mod tests {
                 let mut model =
                     OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
                 let mut sink = |event| captured.lock().unwrap().push(event);
-                model.step(&history(), &cancellation, &mut sink).await
+                model
+                    .step(default_selection(), &history(), &cancellation, &mut sink)
+                    .await
             });
 
             timeout(Duration::from_secs(1), async {
@@ -3772,7 +3537,7 @@ mod tests {
             let mut progress = |_| {};
             assert!(matches!(
                 model
-                    .step(&invalid_history, &cancellation, &mut progress)
+                    .step(default_selection(), &invalid_history, &cancellation, &mut progress)
                     .await,
                 Err(failure) if matches!(failure.error(), ModelError::InvalidHistory(_))
             ));
@@ -3804,7 +3569,12 @@ mod tests {
             let cancellation = CancellationToken::new();
             let mut progress = |_| {};
             model
-                .step(&history(), &cancellation, &mut progress)
+                .step(
+                    default_selection(),
+                    &history(),
+                    &cancellation,
+                    &mut progress,
+                )
                 .await
                 .unwrap_err()
         }
@@ -4036,7 +3806,9 @@ mod tests {
             let mut events = Vec::new();
             let result = {
                 let mut progress = |event| events.push(event);
-                model.step(history, &cancellation, &mut progress).await
+                model
+                    .step(default_selection(), history, &cancellation, &mut progress)
+                    .await
             };
             (result, events)
         }
@@ -4826,7 +4598,9 @@ mod tests {
                 let mut model =
                     OpenAiModel::with_endpoint("system prompt", "fixture-key", &endpoint);
                 let mut sink = |event| collected.lock().unwrap().push(event);
-                model.step(&step_history, &cancellation, &mut sink).await
+                model
+                    .step(default_selection(), &step_history, &cancellation, &mut sink)
+                    .await
             });
 
             timeout(Duration::from_secs(1), async {
@@ -5698,7 +5472,9 @@ mod tests {
             let mut events = Vec::new();
             let result = {
                 let mut progress = |event| events.push(event);
-                model.step(history, &cancellation, &mut progress).await
+                model
+                    .step(default_selection(), history, &cancellation, &mut progress)
+                    .await
             };
             (result, events)
         }
@@ -5837,7 +5613,12 @@ mod tests {
             let mut progress = |_| {};
 
             model
-                .step(&history("inspect"), &cancellation, &mut progress)
+                .step(
+                    default_selection(),
+                    &history("inspect"),
+                    &cancellation,
+                    &mut progress,
+                )
                 .await
                 .unwrap();
 
@@ -6370,7 +6151,8 @@ mod tests {
                 OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
             let cancellation = CancellationToken::new();
             let mut progress = |_| {};
-            let mut pending = Box::pin(model.step(&history, &cancellation, &mut progress));
+            let mut pending =
+                Box::pin(model.step(default_selection(), &history, &cancellation, &mut progress));
 
             assert!(
                 timeout(Duration::from_millis(20), &mut pending)
@@ -6614,15 +6396,15 @@ mod tests {
                 replay(&[message("msg_1", "answer")]),
             );
 
-            assert_eq!(model.validate_history(&valid), Ok(()));
+            assert_eq!(model.validate_history(&valid, default_selection()), Ok(()));
             assert_eq!(
-                model.validate_history(&foreign),
+                model.validate_history(&foreign, default_selection()),
                 Err(ModelError::InvalidHistory(
                     "opaque replay belongs to another provider"
                 ))
             );
             assert_eq!(
-                model.validate_history(&mismatched),
+                model.validate_history(&mismatched, default_selection()),
                 Err(ModelError::InvalidHistory(
                     "final message does not match its OpenAI replay"
                 ))
@@ -7003,8 +6785,7 @@ mod tests {
                 configuration.snapshot().subagents(),
             )
         };
-        let (settings, model_settings) = watch::channel(selection);
-        let model = super::OpenAiModel::with_settings(prompt, api_key.clone(), model_settings);
+        let model = super::OpenAiModel::new(prompt, api_key.clone());
         let tool_host = crate::tools::ToolHost::new(workspace_root)
             .await
             .map_err(|_| LIVE_SETUP_READ_TOOL)?;
@@ -7020,7 +6801,7 @@ mod tests {
         );
         let runtime = crate::runtime::RuntimeController::new(
             crate::agent::Agent::new(arena, model),
-            settings,
+            selection,
             persisted_settings,
             subagents,
         );
@@ -7054,6 +6835,7 @@ mod tests {
         };
         let crate::runtime::Record::UserRequest {
             request: actual_request,
+            ..
         } = &record.record
         else {
             return None;
