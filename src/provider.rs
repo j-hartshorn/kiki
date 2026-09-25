@@ -294,7 +294,11 @@ mod tests {
             openai_message("OpenAI summary"),
         ])
         .await;
-        let anthropic_fixture = Fixture::start(anthropic_message("from Anthropic")).await;
+        let anthropic_fixture = Fixture::start_sequence(vec![
+            anthropic_message("from Anthropic"),
+            anthropic_message("Anthropic summary"),
+        ])
+        .await;
         let mut model = router(
             "root prompt",
             Some(&openai_fixture),
@@ -354,17 +358,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.text, "OpenAI summary");
-        let unsupported = model
+        let summary = model
             .summarise(summary_request(anthropic()), &cancellation, &mut || {})
             .await
-            .unwrap_err();
-        assert_eq!(unsupported.error(), &ModelError::UnsupportedSummarisation);
+            .unwrap();
+        assert_eq!(summary.text, "Anthropic summary");
         assert_eq!(
             (
                 openai_fixture.request_count(),
                 anthropic_fixture.request_count()
             ),
-            (2, 1)
+            (2, 2)
         );
     }
 

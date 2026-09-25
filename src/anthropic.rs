@@ -13,7 +13,8 @@ use crate::{
     model::{
         AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage,
-        OpaqueReplayItem, ProviderFailure, ProviderReplay, canonical_compaction_summary,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+        canonical_compaction_summary,
     },
     presentation::{PresentationBatcher, PresentationKind, PythonPreviewDecoder},
 };
@@ -168,6 +169,22 @@ impl AnthropicModel {
         }))
     }
 
+    fn summary_request(&self, request: &SummaryRequest) -> Result<Value, ModelError> {
+        let model = request.selection.model();
+        if model.provider() != Provider::Anthropic {
+            return Err(ModelError::InvalidSelection("unsupported Anthropic model"));
+        }
+        Ok(json!({
+            "model": model.wire_id(),
+            "max_tokens": request.output_limit,
+            "stream": true,
+            "system": [text_content(&request.instructions)],
+            "messages": [{"role": "user", "content": [text_content(&request.input)]}],
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": request.selection.thinking()}
+        }))
+    }
+
     async fn step_with_restarts(
         &self,
         selection: ModelSelection,
@@ -188,6 +205,34 @@ impl AnthropicModel {
         Ok(step)
     }
 
+    async fn summary_with_restarts(
+        &self,
+        request: SummaryRequest,
+        cancellation: &CancellationToken,
+        attempt_started: &mut (dyn FnMut() + Send),
+    ) -> Result<SummaryResult, ModelFailure> {
+        if cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled.into());
+        }
+        let selection = request.selection;
+        let request = self.summary_request(&request)?;
+        let mut progress = |event: ModelProgress| {
+            if matches!(event, ModelProgress::AttemptStarted { .. }) {
+                attempt_started();
+            }
+        };
+        let (text, attempts) = self
+            .with_restarts(
+                &request,
+                selection,
+                cancellation,
+                &mut progress,
+                |message| self.completed_summary(message),
+            )
+            .await?;
+        Ok(SummaryResult { text, attempts })
+    }
+
     async fn with_restarts<T>(
         &self,
         request: &Value,
@@ -198,6 +243,9 @@ impl AnthropicModel {
     ) -> Result<(T, Vec<AttemptAccounting>), ModelFailure> {
         let mut attempts = Vec::new();
         for attempt in 1..=MAX_STREAM_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                return Err(ModelFailure::new(ModelError::Cancelled, attempts));
+            }
             progress(ModelProgress::AttemptStarted { attempt });
             let mut presentation = PresentationBatcher::default();
             let streamed = self
@@ -445,25 +493,7 @@ impl AnthropicModel {
     ) -> Result<ModelStep, ModelError> {
         let stop_reason = match message.stop_reason.as_deref() {
             Some(reason @ ("tool_use" | "end_turn")) => reason,
-            Some("refusal") => {
-                return Err(self.provider_error(
-                    None,
-                    Some("refusal".to_owned()),
-                    "model refused the request",
-                ));
-            }
-            Some(reason) => {
-                return Err(self.provider_error(
-                    None,
-                    Some(reason.to_owned()),
-                    format!("response incomplete: {reason}"),
-                ));
-            }
-            None => {
-                return Err(ModelError::InvalidResponse(
-                    "response did not include a stop reason",
-                ));
-            }
+            reason => return Err(self.stop_failure(reason)),
         };
         let action = blocks_action(&message.blocks)?;
         match (&action, stop_reason) {
@@ -505,6 +535,52 @@ impl AnthropicModel {
             replay,
             attempts: Vec::new(),
         })
+    }
+
+    fn completed_summary(&self, message: StreamedMessage) -> Result<String, ModelError> {
+        let tool_call = message.stop_reason.as_deref() == Some("tool_use")
+            || message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        if tool_call {
+            return Err(ModelError::InvalidResponse(
+                "summary response contained a tool call",
+            ));
+        }
+        if message.stop_reason.as_deref() != Some("end_turn") {
+            return Err(self.stop_failure(message.stop_reason.as_deref()));
+        }
+        let text: String = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if text.trim().is_empty() {
+            return Err(ModelError::InvalidResponse(
+                "summary text was empty or whitespace",
+            ));
+        }
+        Ok(text)
+    }
+
+    fn stop_failure(&self, reason: Option<&str>) -> ModelError {
+        match reason {
+            Some("refusal") => self.provider_error(
+                None,
+                Some("refusal".to_owned()),
+                "model refused the request",
+            ),
+            Some(reason) => self.provider_error(
+                None,
+                Some(reason.to_owned()),
+                format!("response incomplete: {reason}"),
+            ),
+            None => ModelError::InvalidResponse("response did not include a stop reason"),
+        }
     }
 
     fn usage(&self, usage: &UsageTotals, selection: ModelSelection) -> ModelUsage {
@@ -550,6 +626,15 @@ impl Model for AnthropicModel {
         selection: ModelSelection,
     ) -> Result<(), ModelError> {
         self.request(selection, history).map(|_| ())
+    }
+
+    fn summarise<'a>(
+        &'a mut self,
+        request: SummaryRequest,
+        cancellation: &'a CancellationToken,
+        attempt_started: &'a mut (dyn FnMut() + Send),
+    ) -> impl Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a {
+        self.summary_with_restarts(request, cancellation, attempt_started)
     }
 
     fn step<'a>(
@@ -1144,7 +1229,8 @@ mod tests {
         model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError,
             ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
-            ProviderReplay, canonical_compaction_summary,
+            ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+            canonical_compaction_summary,
         },
         pricing::{RunCostEstimate, estimate_run_cost},
         sse_fixture::{Fixture, FixtureReply},
@@ -3003,5 +3089,426 @@ mod tests {
         assert_eq!(starts(&progress), [1]);
         assert_eq!(settles(&progress), [1]);
         assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+    }
+
+    fn summary_request(selection: ModelSelection) -> SummaryRequest {
+        SummaryRequest {
+            instructions: "summary instructions".to_owned(),
+            input: "conversation".to_owned(),
+            selection,
+            output_limit: 4_096,
+        }
+    }
+
+    fn expected_summary_request() -> Value {
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 4096,
+            "stream": true,
+            "system": [{"type": "text", "text": "summary instructions"}],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "conversation"}]
+            }],
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "medium"}
+        })
+    }
+
+    fn summary_stream() -> String {
+        stream(
+            start_usage(),
+            vec![
+                vec![
+                    block_start(
+                        0,
+                        json!({"type": "redacted_thinking", "data": "opaque-data"}),
+                    ),
+                    block_stop(0),
+                ],
+                thinking(1, &["Reading ", "history"], "sig-3"),
+                vec![
+                    block_start(2, json!({"type": "text", "text": ""})),
+                    delta(2, json!({"type": "text_delta", "text": "Part "})),
+                    delta(2, json!({"type": "text_delta", "text": "one. "})),
+                    block_stop(2),
+                ],
+                text(3, "Part two."),
+            ],
+            "end_turn",
+            final_usage(),
+        )
+    }
+
+    async fn summarise_with(
+        fixture: &Fixture,
+        key: &str,
+        request: SummaryRequest,
+    ) -> (Result<SummaryResult, ModelFailure>, usize) {
+        let mut attempts_started = 0;
+        let result = model(fixture, key)
+            .summarise(request, &CancellationToken::new(), &mut || {
+                attempts_started += 1
+            })
+            .await;
+        (result, attempts_started)
+    }
+
+    async fn summarise(fixture: &Fixture) -> (Result<SummaryResult, ModelFailure>, usize) {
+        summarise_with(fixture, KEY, summary_request(selection())).await
+    }
+
+    fn assert_same_summary_requests(fixture: &Fixture, count: usize) {
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), count);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body == expected_summary_request())
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_sends_the_exact_request_headers_and_body_without_tools_or_cache() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(summary_stream())).await;
+
+        let (result, _) = summarise_with(
+            &fixture,
+            KEY,
+            summary_request(ModelSelection::new(&OPUS_5_5, "high").unwrap()),
+        )
+        .await;
+        result.unwrap();
+
+        let captured = fixture.request();
+        assert!(captured.head.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        let headers = headers(&captured.head);
+        assert_eq!(
+            headers.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "accept",
+                "anthropic-version",
+                "content-length",
+                "content-type",
+                "host",
+                "x-api-key"
+            ]
+        );
+        assert_eq!(headers["x-api-key"], KEY);
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert_eq!(headers["content-type"], "application/json");
+        let mut expected = expected_summary_request();
+        expected["output_config"]["effort"] = json!("high");
+        assert_eq!(captured.body, expected);
+    }
+
+    #[tokio::test]
+    async fn summary_text_concatenates_only_text_blocks_and_reports_usage() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(summary_stream())).await;
+
+        let (result, attempts_started) = summarise(&fixture).await;
+        let summary = result.unwrap();
+
+        assert_eq!(summary.text, "Part one. Part two.");
+        assert_eq!(summary.attempts, vec![expected_accounting()]);
+        assert_eq!(attempts_started, 1);
+        assert_eq!(fixture.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn summary_failures_keep_usage_and_are_not_restarted() {
+        let tool_call = || ModelError::InvalidResponse("summary response contained a tool call");
+        let empty = || ModelError::InvalidResponse("summary text was empty or whitespace");
+        let stopped = |reason: &str, message: &str| {
+            ModelError::Provider(Box::new(ProviderFailure::new(
+                None,
+                Some(reason.to_owned()),
+                message.to_owned(),
+            )))
+        };
+        for (blocks, stop_reason, expected) in [
+            (
+                vec![
+                    text(0, "Summary."),
+                    tool_use(1, "toolu_1", &[r#"{"code":"print(1)"}"#]),
+                ],
+                "end_turn",
+                tool_call(),
+            ),
+            (vec![text(0, "Summary.")], "tool_use", tool_call()),
+            (
+                vec![text(0, "partial")],
+                "max_tokens",
+                stopped("max_tokens", "response incomplete: max_tokens"),
+            ),
+            (
+                vec![text(0, "partial")],
+                "refusal",
+                stopped("refusal", "model refused the request"),
+            ),
+            (vec![thinking(0, &["Nothing"], "sig")], "end_turn", empty()),
+            (vec![text(0, "")], "end_turn", empty()),
+            (
+                vec![text(0, " \n"), text(1, "\u{2003}\t")],
+                "end_turn",
+                empty(),
+            ),
+        ] {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(stream(
+                start_usage(),
+                blocks,
+                stop_reason,
+                final_usage(),
+            )))
+            .await;
+
+            let (result, attempts_started) = summarise(&fixture).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(failure.error(), &expected);
+            assert_eq!(failure.attempts(), &[expected_accounting()]);
+            assert_eq!(attempts_started, 1);
+            assert_eq!(fixture.request_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_rejects_foreign_selections_and_prior_cancellation_before_an_attempt() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(summary_stream())).await;
+        let mut model = model(&fixture, KEY);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let openai = ModelSelection::new(&SOL, SOL.default_thinking).unwrap();
+
+        for (selection, cancellation, expected) in [
+            (
+                openai,
+                CancellationToken::new(),
+                ModelError::InvalidSelection("unsupported Anthropic model"),
+            ),
+            (selection(), cancelled, ModelError::Cancelled),
+        ] {
+            let mut attempts_started = 0;
+            let failure = model
+                .summarise(summary_request(selection), &cancellation, &mut || {
+                    attempts_started += 1
+                })
+                .await
+                .unwrap_err();
+
+            assert_eq!(failure.error(), &expected);
+            assert!(failure.attempts().is_empty());
+            assert_eq!(attempts_started, 0);
+        }
+        assert_eq!(fixture.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_summary_request_construction_starts_no_attempt() {
+        let fixture = Fixture::start(FixtureReply::OwnedSse(summary_stream())).await;
+        let model = model(&fixture, KEY);
+        let selection = selection();
+        let request = model.summary_request(&summary_request(selection)).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut progress = Vec::new();
+
+        let failure = model
+            .with_restarts(
+                &request,
+                selection,
+                &cancellation,
+                &mut |event| progress.push(event),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(failure.is_cancelled());
+        assert!(failure.attempts().is_empty());
+        assert!(progress.is_empty());
+        assert_eq!(fixture.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn summary_restarts_a_dropped_stream_with_the_same_request_and_a_fresh_content_budget() {
+        let half = "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2);
+        let dropped_at_limit = sse([message_start(start_usage())]
+            .into_iter()
+            .chain(thinking(0, &[half.as_str()], ""))
+            .chain([
+                block_start(1, json!({"type": "text", "text": ""})),
+                delta(1, json!({"type": "text_delta", "text": half})),
+            ]));
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::OwnedSse(dropped_at_limit),
+            FixtureReply::OwnedSse(summary_stream()),
+        ])
+        .await;
+
+        let (result, attempts_started) = summarise(&fixture).await;
+        let summary = result.unwrap();
+
+        assert_same_summary_requests(&fixture, 2);
+        assert_eq!(summary.text, "Part one. Part two.");
+        assert_eq!(
+            summary.attempts,
+            vec![AttemptAccounting::UsageUnavailable, expected_accounting()]
+        );
+        assert_eq!(attempts_started, 2);
+    }
+
+    #[tokio::test]
+    async fn summary_retries_http_statuses_within_one_attempt() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after-ms", "0")]),
+            FixtureReply::OwnedSse(summary_stream()),
+        ])
+        .await;
+
+        let (result, attempts_started) = summarise(&fixture).await;
+        let summary = result.unwrap();
+
+        assert_same_summary_requests(&fixture, 2);
+        assert_eq!(summary.text, "Part one. Part two.");
+        assert_eq!(summary.attempts, vec![retried_accounting()]);
+        assert_eq!(attempts_started, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_summary_during_an_http_retry_wait_sends_no_further_request() {
+        let fixture = Fixture::start_sequence(vec![
+            status_reply(429, &[("retry-after", "30")]),
+            FixtureReply::OwnedSse(summary_stream()),
+        ])
+        .await;
+        let mut model = model(&fixture, KEY);
+        let wait_entered = model.wait_entered.clone();
+        let cancellation = CancellationToken::new();
+        let mut attempts_started = 0;
+        let mut attempt_started = || attempts_started += 1;
+
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                model.summarise(
+                    summary_request(selection()),
+                    &cancellation,
+                    &mut attempt_started
+                ),
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(1), wait_entered.notified())
+                    .await
+                    .expect("model should enter the HTTP retry wait");
+                cancellation.cancel();
+            }
+        );
+        let failure = result
+            .expect("cancellation should end the wait")
+            .unwrap_err();
+
+        assert!(failure.is_cancelled());
+        assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        assert_eq!(attempts_started, 1);
+        assert_eq!(fixture.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn hostile_summary_http_and_sse_errors_expose_no_key_or_request_metadata() {
+        let http = FixtureReply::OwnedStatus {
+            code: 401,
+            headers: vec![("request-id".to_owned(), METADATA.to_owned())],
+            body: json!({
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": format!("invalid x-api-key {HOSTILE_KEY}")
+                },
+                "request_id": METADATA
+            })
+            .to_string(),
+        };
+        let stream_error = FixtureReply::OwnedSse(sse([
+            message_start(start_usage()),
+            json!({
+                "type": "error",
+                "error": {
+                    "type": format!("api_error {HOSTILE_KEY}"),
+                    "message": format!("{HOSTILE_KEY} failed")
+                },
+                "request_id": METADATA
+            }),
+        ]));
+
+        for (reply, status, code, message) in [
+            (
+                http,
+                Some(401),
+                "authentication_error",
+                "invalid x-api-key [REDACTED]",
+            ),
+            (
+                stream_error,
+                None,
+                "api_error [REDACTED]",
+                "[REDACTED] failed",
+            ),
+        ] {
+            let fixture = Fixture::start(reply).await;
+
+            let (result, attempts_started) =
+                summarise_with(&fixture, HOSTILE_KEY, summary_request(selection())).await;
+            let failure = result.unwrap_err();
+            let provider = failure.provider_failure().unwrap();
+
+            assert_sanitised(&failure);
+            assert_eq!(
+                (provider.status(), provider.code(), provider.message()),
+                (status, Some(code), message)
+            );
+            assert_eq!(failure.is_authentication(), status == Some(401));
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+            assert_eq!(attempts_started, 1);
+            assert_eq!(fixture.request_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_content_over_the_limit_fails_without_a_summary_or_retry() {
+        let half = "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2);
+        let over = "x".repeat(ACCEPTED_MODEL_CONTENT_LIMIT / 2 + 1);
+        for blocks in [
+            vec![text(0, &half), text(1, &over)],
+            vec![
+                thinking(0, &[&half], ""),
+                thinking(1, &[&over], ""),
+                text(2, "Summary."),
+            ],
+            vec![
+                vec![
+                    block_start(0, json!({"type": "redacted_thinking", "data": half})),
+                    block_stop(0),
+                ],
+                thinking(1, &[], &over),
+                text(2, "Summary."),
+            ],
+        ] {
+            let fixture = Fixture::start(FixtureReply::OwnedSse(stream(
+                start_usage(),
+                blocks,
+                "end_turn",
+                final_usage(),
+            )))
+            .await;
+
+            let (result, attempts_started) = summarise(&fixture).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(failure.error(), &ModelError::ContentTooLarge);
+            assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+            assert_eq!(attempts_started, 1);
+            assert_eq!(fixture.request_count(), 1);
+        }
     }
 }
