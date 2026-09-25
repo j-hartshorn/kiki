@@ -12,6 +12,8 @@ mod prompt_editor;
 pub mod runtime;
 mod selection;
 mod session;
+#[cfg(test)]
+mod sse_fixture;
 mod subagents;
 mod telemetry;
 pub mod tools;
