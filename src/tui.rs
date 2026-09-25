@@ -40,7 +40,8 @@ use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
 use crate::transcript::{
-    FooterContext, Transcript, TranscriptLayout, normalise_terminal_text, page_style,
+    FooterContext, ModelChangeCard, Transcript, TranscriptLayout, model_change_card,
+    normalise_terminal_text, page_style,
 };
 use picker::{Picker, PickerAction, PickerItem};
 use tree::{TreeNavigator, TreeNavigatorAction};
@@ -981,7 +982,7 @@ impl App {
     }
 
     fn apply_selection(&mut self, selection: ModelSelection) -> Update {
-        self.set_settings_selection(selection);
+        self.settings_selection = selection;
         self.preview = None;
         let mut update = Update::with_commands([self.send_settings(selection)]);
         update.visible_changed = true;
@@ -999,7 +1000,7 @@ impl App {
         let next = model.thinking_levels[(index + 1) % model.thinking_levels.len()];
         let selection = ModelSelection::new(model, next)
             .expect("catalogue thinking must be supported by its model");
-        self.set_settings_selection(selection);
+        self.settings_selection = selection;
         self.preview = Some(ThinkingPreview {
             selection,
             deadline: now + Duration::from_secs(2),
@@ -1012,14 +1013,12 @@ impl App {
         }
     }
 
-    fn set_settings_selection(&mut self, selection: ModelSelection) {
-        let pending = self
-            .transcript
-            .pending_model_change(self.settings_selection);
-        self.settings_selection = selection;
-        if self.transcript.pending_model_change(selection) != pending {
-            self.invalidate_layout_selection();
-        }
+    fn settings_pending(&self) -> bool {
+        self.preview.is_some()
+            || self
+                .pending_settings
+                .values()
+                .any(|selection| *selection == self.settings_selection)
     }
 
     fn flush_preview(&mut self, commands: &mut Vec<RuntimeCommand>) {
@@ -2419,15 +2418,23 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
     } else {
         THROBBER_ROWS
     };
+    let pending_card = app
+        .transcript
+        .pending_model_change(app.settings_selection)
+        .map(|selection| model_change_card(selection, app.settings_pending(), area.width))
+        .filter(|card| card.height() < history_height.saturating_sub(throbber_height));
+    let card_height = pending_card.as_ref().map_or(0, ModelChangeCard::height);
     let monitor = app.subagent_monitor.layout(
         area.width,
         history_height
             .saturating_sub(throbber_height)
+            .saturating_sub(card_height)
             .saturating_sub(1),
         now,
     );
     let throbber_top = prompt_top.saturating_sub(throbber_height);
-    let monitor_top = throbber_top.saturating_sub(monitor.height());
+    let card_top = throbber_top.saturating_sub(card_height);
+    let monitor_top = card_top.saturating_sub(monitor.height());
     let history = Rect::new(
         area.x,
         area.y.saturating_add(1),
@@ -2445,6 +2452,12 @@ fn render_at(frame: &mut Frame, app: &mut App, now: Instant) {
         frame,
         Rect::new(area.x, monitor_top, area.width, monitor.height()),
     );
+    if let Some(card) = &pending_card {
+        card.render(
+            Rect::new(area.x, card_top, area.width, card_height),
+            frame.buffer_mut(),
+        );
+    }
     if throbber_height > 0 {
         let throbber_frame = if app.transcript.is_generating() {
             app.generation_throbber.current_frame()
@@ -3580,6 +3593,36 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    fn append_completed_run(app: &mut App, run_id: u64, selection: ModelSelection) {
+        for record in completed_run_records(run_id, selection) {
+            app.handle_event(RuntimeEvent::RecordAppended {
+                record,
+                progress_gap: false,
+            });
+        }
+    }
+
+    fn rows_and_prompt_rule(app: &mut App) -> (Vec<String>, usize) {
+        let rows = rendered(app, 80, 40)
+            .lines()
+            .map(|row| row.trim().to_owned())
+            .collect::<Vec<_>>();
+        let rule = rows
+            .iter()
+            .rposition(|row| *row == "─".repeat(80))
+            .expect("prompt rule");
+        (rows, rule)
+    }
+
+    fn history_bottom(app: &App) -> usize {
+        usize::from(
+            app.history_viewport
+                .expect("history viewport")
+                .area
+                .bottom(),
+        )
     }
 
     struct RecordingTitles {
@@ -5197,16 +5240,18 @@ mod tests {
             },
         }));
         assert_eq!(app.settings_selection, current);
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "Model selected: openai/gpt-5.6-sol · medium"
+        );
         let rows = history_rows(&mut app);
         let terra_card = rows
             .iter()
             .position(|row| row == "Model selected: openai/gpt-5.6-terra · high")
             .expect("history card");
         assert!(rows[terra_card + 1].contains("request 2"), "{rows:?}");
-        assert_eq!(
-            rows.last().map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-sol · medium")
-        );
+        assert_eq!(rows.last().map(String::as_str), Some("Session restored."));
 
         select_tree_request(&mut app);
         assert!(app.handle_event(RuntimeEvent::NavigationCompleted {
@@ -5216,6 +5261,8 @@ mod tests {
             },
         }));
         assert_eq!(app.settings_selection, current);
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
         let rows = history_rows(&mut app);
         let cards = rows
             .iter()
@@ -5484,20 +5531,44 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_after_a_run_shows_the_pending_model_change_card() {
+    fn pending_model_change_card_sits_above_the_prompt_until_settings_apply() {
         let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         let selection = app.settings_selection;
-        for record in completed_run_records(1, selection) {
-            app.handle_event(RuntimeEvent::RecordAppended {
-                record,
-                progress_gap: false,
-            });
-        }
+        append_completed_run(&mut app, 1, selection);
+
+        let (_, revision) =
+            applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(
-            history_rows(&mut app).last().map(String::as_str),
-            Some("answer")
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
         );
+        assert!(rows[rule - 1].is_empty() && rows[rule - 3].is_empty());
+        assert_eq!(history_bottom(&app), rule - 3);
+        let buffer = rendered_buffer(&mut app, 80, 40);
+        let (column, row) = cell_start(&buffer, "[pending]");
+        assert_eq!(buffer[(column, row)].fg, Color::Rgb(128, 128, 128));
+
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "Model selected: openai/gpt-5.6-terra · medium"
+        );
+        assert!(
+            !history_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("Model selected"))
+        );
+    }
+
+    #[test]
+    fn shift_tab_marks_the_pending_model_change_card_until_the_preview_applies() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
         select_history_text(&mut app, "request 1", 80, 40);
         assert!(app.selection.is_some());
 
@@ -5505,51 +5576,149 @@ mod tests {
             app.handle_key_at(key(KeyCode::BackTab), now)
                 .visible_changed
         );
-        assert!(app.selection.is_none());
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
         assert_eq!(
-            history_rows(&mut app).last().map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-sol · high")
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-sol · high"
+        );
+        assert!(app.selection.is_none());
+
+        let (_, revision) = applied_settings(&app.tick(now + Duration::from_secs(2)));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            rows[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-sol · high"
         );
 
-        select_history_text(&mut app, "request 1", 80, 40);
-        app.select_thinking("high");
-        assert!(app.selection.is_some());
+        assert!(app.handle_event(RuntimeEvent::SettingsAccepted { revision }));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(rows[rule - 2], "Model selected: openai/gpt-5.6-sol · high");
+    }
+
+    #[test]
+    fn pending_model_change_card_sits_between_the_subagent_monitor_and_the_throbber() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let [request, _] = completed_run_records(1, app.settings_selection);
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id: RunId(1) }, now);
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: request,
+                progress_gap: false,
+            },
+            now,
+        );
+        app.handle_event_at(
+            RuntimeEvent::ModelStepStarted {
+                run_id: RunId(1),
+                step_id: ModelStepId(1),
+            },
+            now,
+        );
+        app.subagent_monitor
+            .insert_for_test("child1", TaskState::Running, now);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert!(rows[rule - 1].starts_with('⠁'), "{rows:?}");
+        assert!(rows[rule - 2].is_empty());
         assert_eq!(
-            history_rows(&mut app).last().map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-sol · high")
+            rows[rule - 4],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
+        );
+        let monitor = rows
+            .iter()
+            .position(|row| row.contains("subagent:child1"))
+            .expect("subagent monitor");
+        assert!(
+            history_bottom(&app) <= monitor && monitor < rule - 5,
+            "{rows:?}"
         );
     }
 
     #[test]
-    fn pending_model_change_card_keeps_long_history_following_the_bottom() {
+    fn pending_model_change_card_stays_put_while_history_scrolls() {
+        let now = Instant::now();
         let mut app = App::configured(crate::config::ready_snapshot_for_test());
         let selection = app.settings_selection;
         for run_id in 1..=20 {
-            for record in completed_run_records(run_id, selection) {
-                app.handle_event(RuntimeEvent::RecordAppended {
-                    record,
-                    progress_gap: false,
-                });
-            }
+            append_completed_run(&mut app, run_id, selection);
         }
-        let baseline = history_viewport_rows(&mut app);
-        let last_row = baseline
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        let hidden_height = app.history_viewport.expect("history viewport").area.height;
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (following, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(
+            app.history_viewport.expect("history viewport").area.height,
+            hidden_height - 3
+        );
+        assert_eq!(history_bottom(&app), rule - 3);
+        assert_eq!(
+            following[rule - 2],
+            "[pending] Model selected: openai/gpt-5.6-terra · medium"
+        );
+        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
+
+        assert!(app.handle_key_at(key(KeyCode::PageUp), now).visible_changed);
+        let (scrolled, scrolled_rule) = rows_and_prompt_rule(&mut app);
+        assert_ne!(app.history_position, HistoryPosition::FollowingBottom);
+        assert_eq!(scrolled_rule, rule);
+        assert_ne!(scrolled[..rule - 3], following[..rule - 3]);
+        assert_eq!(scrolled[rule - 3..], following[rule - 3..]);
+    }
+
+    #[test]
+    fn pending_model_change_card_clears_when_switched_back_and_settles_into_history() {
+        let now = Instant::now();
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule - 3);
+
+        applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-sol", now));
+        let (rows, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        assert!(!rows.iter().any(|row| row.contains("Model selected")));
+
+        let (terra, _) = applied_settings(&enter_at(&mut app, "/model openai/gpt-5.6-terra", now));
+        append_completed_run(&mut app, 2, terra);
+        let (_, rule) = rows_and_prompt_rule(&mut app);
+        assert_eq!(history_bottom(&app), rule);
+        let rows = history_rows(&mut app);
+        let cards = rows
             .iter()
-            .rposition(|row| !row.is_empty())
-            .expect("history content");
-        assert!(app.newest_history_top() > 0);
-        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
-        assert_eq!(baseline[last_row], "answer");
+            .enumerate()
+            .filter(|(_, row)| row.contains("Model selected"))
+            .collect::<Vec<_>>();
+        let second_request = rows
+            .iter()
+            .position(|row| row.contains("request 2"))
+            .expect("second request");
+        assert_eq!(
+            cards,
+            [(
+                second_request - 1,
+                &"Model selected: openai/gpt-5.6-terra · medium".to_owned()
+            )]
+        );
+    }
 
-        app.handle_key_at(key(KeyCode::BackTab), Instant::now());
-        let rows = history_viewport_rows(&mut app);
-        assert_eq!(app.history_position, HistoryPosition::FollowingBottom);
-        assert_eq!(app.history_document_top(), app.newest_history_top());
-        assert_eq!(rows.iter().rposition(|row| !row.is_empty()), Some(last_row));
-        assert_eq!(rows[last_row], "Model selected: openai/gpt-5.6-sol · high");
+    #[test]
+    fn pending_model_change_card_leaves_at_least_one_history_row() {
+        let mut app = App::configured(crate::config::ready_snapshot_for_test());
+        let selection = app.settings_selection;
+        append_completed_run(&mut app, 1, selection);
+        app.apply_selection(ModelSelection::new(&TERRA, "high").unwrap());
 
-        app.apply_selection(selection);
-        assert_eq!(history_viewport_rows(&mut app), baseline);
+        assert!(!rendered(&mut app, 80, 7).contains("Model selected"));
+        assert_eq!(app.history_height, 3);
+        assert!(rendered(&mut app, 80, 8).contains("[pending] Model selected"));
+        assert_eq!(app.history_height, 1);
     }
 
     #[test]

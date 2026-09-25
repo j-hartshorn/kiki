@@ -329,11 +329,7 @@ impl TranscriptBlock {
                     .collect(),
             },
             Self::ModelChange { selection } => NormalisedBlock::ModelChange {
-                text: format!(
-                    "Model selected: {} · {}",
-                    selection.model().id,
-                    selection.thinking()
-                ),
+                text: model_change_text(selection),
             },
             Self::User { request } => NormalisedBlock::User {
                 request: normalise_terminal_text(&request),
@@ -2893,10 +2889,6 @@ impl Transcript {
     ) -> TranscriptLayout {
         let show_reasoning = self.show_reasoning;
         let expand_arenas = self.expand_arenas;
-        let model_change_source = footer_context
-            .as_ref()
-            .and_then(|context| self.pending_model_change(context.selection))
-            .map(|selection| TranscriptBlock::ModelChange { selection }.normalise());
         let footer = self.footer(footer_context);
         let live_sources = self
             .live_step
@@ -2962,11 +2954,7 @@ impl Transcript {
             };
             blocks.push(block);
         }
-        for source in live_sources
-            .iter()
-            .chain(&pending_sources)
-            .chain(&model_change_source)
-        {
+        for source in live_sources.iter().chain(&pending_sources) {
             blocks.push(LayoutBlock::Fresh(build_render_block(
                 source,
                 show_reasoning,
@@ -3365,6 +3353,48 @@ impl Transcript {
     }
 }
 
+pub(crate) struct ModelChangeCard(RenderBlock);
+
+impl ModelChangeCard {
+    pub(crate) fn height(&self) -> u16 {
+        u16::try_from(self.0.height()).unwrap_or(u16::MAX)
+    }
+
+    pub(crate) fn render(&self, area: Rect, buffer: &mut Buffer) {
+        self.0.render(area, 0, 0, buffer);
+    }
+}
+
+pub(crate) fn model_change_card(
+    selection: ModelSelection,
+    pending: bool,
+    width: u16,
+) -> ModelChangeCard {
+    let prefix = if pending { "[pending] " } else { "" };
+    ModelChangeCard(model_change_block(
+        &format!("{prefix}{}", model_change_text(selection)),
+        width,
+    ))
+}
+
+fn model_change_text(selection: ModelSelection) -> String {
+    format!(
+        "Model selected: {} · {}",
+        selection.model().id,
+        selection.thinking()
+    )
+}
+
+fn model_change_block(text: &str, width: u16) -> RenderBlock {
+    RenderBlock::card(
+        own_styled_text(Text::raw(text), muted_page_style()),
+        muted_page_style(),
+        width,
+        1,
+        1,
+    )
+}
+
 fn build_render_block(
     source: &NormalisedBlock,
     show_reasoning: bool,
@@ -3388,13 +3418,7 @@ fn build_render_block(
                 0,
             )
         }
-        NormalisedBlock::ModelChange { text } => RenderBlock::card(
-            own_styled_text(Text::raw(text.as_str()), muted_page_style()),
-            muted_page_style(),
-            width,
-            1,
-            1,
-        ),
+        NormalisedBlock::ModelChange { text } => model_change_block(text, width),
         NormalisedBlock::User { request } => {
             let style = card_style(USER);
             RenderBlock::card(
@@ -4917,125 +4941,50 @@ mod tests {
     }
 
     #[test]
-    fn pending_model_change_card_ends_the_layout_when_the_selection_differs() {
-        let sol_low = ModelSelection::new(&SOL, "low").unwrap();
-        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
-        let mut transcript = Transcript::default();
-        append_records(&mut transcript, run_records(&[Some(sol_low)]));
-
-        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
-        assert_eq!(
-            rows.last().map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-terra · high")
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.contains("Model selected"))
-                .count(),
-            1
-        );
-
-        let rows = rendered_rows_with_selection(&mut transcript, sol_low);
-        assert!(!rows.iter().any(|row| row.contains("Model selected")));
-        assert!(!rendered_layout_text(&mut transcript).contains("Model selected"));
-    }
-
-    #[test]
-    fn pending_model_change_card_needs_a_known_last_run_selection() {
-        let sol_low = Some(ModelSelection::new(&SOL, "low").unwrap());
-        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
-        for selections in [vec![], vec![None], vec![sol_low, None]] {
-            let mut transcript = Transcript::default();
-            append_records(&mut transcript, run_records(&selections));
-
-            let rows = rendered_rows_with_selection(&mut transcript, terra_high);
-            assert!(
-                !rows.iter().any(|row| row.contains("Model selected")),
-                "{selections:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn pending_model_change_card_follows_live_output() {
-        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
-        let mut transcript = Transcript::default();
-        assert!(transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(1) }, false));
-        append_records(
-            &mut transcript,
-            vec![StoredRecord {
-                run_id: RunId(1),
-                record: Record::UserRequest {
-                    request: "request 1".to_owned(),
-                    selection: Some(ModelSelection::new(&SOL, "low").unwrap()),
-                },
-            }],
-        );
-        assert!(transcript.apply(
-            RuntimeEvent::ExecutionStarted {
-                run_id: RunId(1),
-                step_id: ModelStepId(1),
-                commentary: None,
-            },
-            false,
-        ));
-        assert!(transcript.apply(
-            RuntimeEvent::ModelProgress {
-                run_id: RunId(1),
-                step_id: ModelStepId(1),
-                progress: ModelProgress::DecodedPythonChunk {
-                    code: "live_python()".to_owned(),
-                },
-            },
-            false,
-        ));
-
-        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
-        let live_row = rows
-            .iter()
-            .position(|row| row.contains("live_python()"))
-            .expect("live python");
-        assert_eq!(
-            rows.last().map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-terra · high")
-        );
-        assert!(live_row < rows.len() - 1);
-    }
-
-    #[test]
-    fn next_run_replaces_the_pending_model_change_card_with_its_history_card() {
+    fn layout_with_footer_leaves_the_pending_model_change_to_the_prompt_area() {
         let sol_low = ModelSelection::new(&SOL, "low").unwrap();
         let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
         let mut records = run_records(&[Some(sol_low), Some(terra_high)]);
         let second_run = records.split_off(2);
         let mut transcript = Transcript::default();
         append_records(&mut transcript, records);
+
         assert_eq!(
-            rendered_rows_with_selection(&mut transcript, terra_high)
-                .last()
-                .map(String::as_str),
-            Some("Model selected: openai/gpt-5.6-terra · high")
+            transcript.pending_model_change(terra_high),
+            Some(terra_high)
         );
+        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
+        assert!(!rows.iter().any(|row| row.contains("Model selected")));
+        assert_eq!(rows.last().map(String::as_str), Some("answer"));
 
         append_records(&mut transcript, second_run);
 
-        let rows = rendered_rows_with_selection(&mut transcript, terra_high);
-        let card_rows = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.contains("Model selected"))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let second_request = rows
-            .iter()
-            .position(|row| row.contains("request 2"))
-            .expect("second request");
-        assert_eq!(card_rows, [second_request - 1]);
+        assert_eq!(transcript.pending_model_change(terra_high), None);
+        assert_eq!(transcript.pending_model_change(sol_low), Some(sol_low));
+        let rows = rendered_rows_with_selection(&mut transcript, sol_low);
         assert_eq!(
-            rows[second_request - 1],
-            "Model selected: openai/gpt-5.6-terra · high"
+            rows.iter()
+                .filter(|row| row.contains("Model selected"))
+                .collect::<Vec<_>>(),
+            ["Model selected: openai/gpt-5.6-terra · high"]
         );
         assert_eq!(rows.last().map(String::as_str), Some("answer"));
+    }
+
+    #[test]
+    fn pending_model_change_needs_a_known_last_run_selection() {
+        let sol_low = Some(ModelSelection::new(&SOL, "low").unwrap());
+        let terra_high = ModelSelection::new(&TERRA, "high").unwrap();
+        for selections in [vec![], vec![None], vec![sol_low, None]] {
+            let mut transcript = Transcript::default();
+            append_records(&mut transcript, run_records(&selections));
+
+            assert_eq!(
+                transcript.pending_model_change(terra_high),
+                None,
+                "{selections:?}"
+            );
+        }
     }
 
     #[test]
