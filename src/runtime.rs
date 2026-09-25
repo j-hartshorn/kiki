@@ -2411,6 +2411,29 @@ mod tests {
         controller_with_model(workspace, ScriptedModel::default()).await
     }
 
+    async fn attempts_controller(
+        workspace: &tempfile::TempDir,
+    ) -> RuntimeController<ScriptedModel> {
+        let actions = vec![
+            ModelAction::Code {
+                source: "attempts: int = 1".to_owned(),
+            },
+            ModelAction::Code {
+                source: "if attempts == 1:\n    while True:\n        pass\nattempts".to_owned(),
+            },
+            ModelAction::Message {
+                text: "done".to_owned(),
+            },
+        ];
+        controller_with_model(
+            workspace,
+            ScriptedModel::new(actions).with_subsequent_first_action(ModelAction::Code {
+                source: "attempts += 1".to_owned(),
+            }),
+        )
+        .await
+    }
+
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
@@ -2840,7 +2863,7 @@ mod tests {
                 id if id == TERRA.id => WorkflowChildModel::Scripted {
                     model: ScriptedModel::new(vec![
                         ModelAction::Code {
-                            source: "result_values['handoff'] = handoff\ntry:\n    result_values['same_execution'] = same_execution\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
+                            source: "result_values['handoff'] = handoff\ntry:\n    result_values['same_execution'] = same_execution  # ty: ignore[unresolved-reference]\nexcept NameError:\n    result_values['same_execution'] = 'missing'".to_owned(),
                         },
                         ModelAction::Message {
                             text: "recoverable child completed".to_owned(),
@@ -10216,7 +10239,7 @@ mod tests {
                         source: "value = 1\nraise ValueError('expected')".to_owned(),
                     },
                     ModelAction::Code {
-                        source: "value + 1".to_owned(),
+                        source: "value + 1  # ty: ignore[unresolved-reference]".to_owned(),
                     },
                     ModelAction::Message {
                         text: "done".to_owned(),
@@ -10260,25 +10283,8 @@ mod tests {
     #[tokio::test]
     async fn busy_submission_does_not_allocate_run_or_model_step_ids() {
         let workspace = tempfile::tempdir().unwrap();
-        let (commands, mut events, mut progress, controller) = start_controller(
-            controller(
-                &workspace,
-                vec![
-                    ModelAction::Code {
-                        source: "try:\n    attempts += 1\nexcept NameError:\n    attempts = 1"
-                            .to_owned(),
-                    },
-                    ModelAction::Code {
-                        source: "if attempts == 1:\n    while True:\n        pass\nattempts"
-                            .to_owned(),
-                    },
-                    ModelAction::Message {
-                        text: "done".to_owned(),
-                    },
-                ],
-            )
-            .await,
-        );
+        let (commands, mut events, mut progress, controller) =
+            start_controller(attempts_controller(&workspace).await);
 
         commands
             .send(RuntimeCommand::Submit {
@@ -10498,19 +10504,8 @@ mod tests {
     #[tokio::test]
     async fn a_later_request_succeeds_after_cancellation_recovery() {
         let workspace = tempfile::tempdir().unwrap();
-        let actions = vec![
-            ModelAction::Code {
-                source: "try:\n    attempts += 1\nexcept NameError:\n    attempts = 1".to_owned(),
-            },
-            ModelAction::Code {
-                source: "if attempts == 1:\n    while True:\n        pass\nattempts".to_owned(),
-            },
-            ModelAction::Message {
-                text: "done".to_owned(),
-            },
-        ];
         let (commands, mut events, mut progress, controller) =
-            start_controller(controller(&workspace, actions).await);
+            start_controller(attempts_controller(&workspace).await);
 
         commands
             .send(RuntimeCommand::Submit {
@@ -14508,7 +14503,12 @@ mod tests {
             .expect("restore root checkpoint");
         let source = "sibling_value = 99\nresult_values = {'sibling': sibling_value}";
         let execution = sibling_arena
-            .execute(source, &CancellationToken::new())
+            .execute_model_code_with_progress_and_context(
+                source,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
             .await
             .expect("execute sibling branch");
         assert!(matches!(
@@ -14783,7 +14783,7 @@ mod tests {
                 calls: calls.clone(),
                 actions: vec![
                     RestoredModelAction::Code {
-                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\nvisible = await get_subagent('0.0')\nvisible_result = await visible.wait()\nassert visible_result['message'] == 'late selected result'\nassert visible_result['values']['visible'] == 62\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
+                        source: "assert saved_value == 41\nsaved_result = await saved_task.wait()\nassert saved_result['message'] == 'saved child'\nassert saved_result['values']['answer'] == 7\nvisible = await get_subagent('0.0')\nvisible_result = await visible.wait()\nassert visible_result['message'] == 'late selected result'\nassert visible_result['values']['visible'] == 62\ntry:\n    sibling_value  # ty: ignore[unresolved-reference]\n    assert False\nexcept NameError:\n    pass\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nnext_task = await start_subagent('new child')\nassert next_task.id == '1'\nawait next_task.wait()\nawait write('authorised', 'changed without reread')"
                             .to_owned(),
                         commentary: None,
                         attempts: Vec::new(),
@@ -15331,7 +15331,12 @@ mod tests {
             .await
             .expect("start branch execution");
         let execution = arena
-            .execute(source, &CancellationToken::new())
+            .execute_model_code_with_progress_and_context(
+                source,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+            )
             .await
             .expect("execute branch state");
         let checkpoint = arena.checkpoint();
@@ -15498,7 +15503,7 @@ mod tests {
                         text: "sibling continuation".to_owned(),
                     },
                     2 => CompletedModelAction::Code {
-                        source: "assert saved_value == 41\ntry:\n    sibling_value\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('0.0')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
+                        source: "assert saved_value == 41\ntry:\n    sibling_value  # ty: ignore[unresolved-reference]\n    assert False\nexcept NameError:\n    pass\nvisible = await get_subagent('0.0')\nassert visible.status.state == 'completed'\ntry:\n    await get_subagent('63')\n    assert False\nexcept Exception as error:\n    assert 'subagent caller is not authorised for `63`' in str(error)\nsaved_value".to_owned(),
                         call_id: ModelCallId::new("probe-original"),
                         commentary: None,
                     },

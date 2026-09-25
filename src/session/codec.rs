@@ -214,6 +214,7 @@ struct StoredExecution {
 enum StoredExecutionOutcome {
     Complete { result: Option<StoredObservation> },
     PythonError { text: String, omitted_bytes: usize },
+    TypeCheckError { text: String, omitted_bytes: usize },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1133,6 +1134,10 @@ fn encode_execution_value(execution: &Execution) -> Result<StoredExecution, Code
                 text: error.text.clone(),
                 omitted_bytes: error.omitted_bytes,
             },
+            ExecutionOutcome::TypeCheckError(error) => StoredExecutionOutcome::TypeCheckError {
+                text: error.text.clone(),
+                omitted_bytes: error.omitted_bytes,
+            },
         },
         tool_calls: execution.tool_calls.iter().map(encode_tool_call).collect(),
         read_paths: encode_effect_paths(&execution.read_paths)?,
@@ -1152,6 +1157,13 @@ fn decode_execution_value(execution: &StoredExecution) -> Result<Execution, Code
                 text,
                 omitted_bytes,
             } => ExecutionOutcome::PythonError(PythonError {
+                text: text.clone(),
+                omitted_bytes: *omitted_bytes,
+            }),
+            StoredExecutionOutcome::TypeCheckError {
+                text,
+                omitted_bytes,
+            } => ExecutionOutcome::TypeCheckError(PythonError {
                 text: text.clone(),
                 omitted_bytes: *omitted_bytes,
             }),
@@ -1818,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_codec_preserves_observations_and_python_errors() {
+    fn execution_codec_preserves_observations_and_errors() {
         let observation = |head: &str| Observation {
             head: head.to_owned(),
             tail: Some("tail".to_owned()),
@@ -1832,23 +1844,34 @@ mod tests {
             tail_starts_mid_line: true,
             partial_lines: true,
         };
-        let execution = Execution {
+        let mut execution = Execution {
             stdout: observation("stdout"),
             stderr: observation("stderr"),
-            outcome: ExecutionOutcome::PythonError(crate::arena::PythonError {
-                text: "ValueError".to_owned(),
-                omitted_bytes: 9,
-            }),
+            outcome: ExecutionOutcome::Complete { result: None },
             tool_calls: Vec::new(),
             read_paths: Vec::new(),
             modified_paths: Vec::new(),
         };
 
-        assert_eq!(
-            decode_execution_value(&encode_execution_value(&execution).expect("encode execution"))
+        for outcome in [
+            ExecutionOutcome::PythonError(crate::arena::PythonError {
+                text: "ValueError".to_owned(),
+                omitted_bytes: 9,
+            }),
+            ExecutionOutcome::TypeCheckError(crate::arena::PythonError {
+                text: "invalid-assignment".to_owned(),
+                omitted_bytes: 9,
+            }),
+        ] {
+            execution.outcome = outcome;
+            assert_eq!(
+                decode_execution_value(
+                    &encode_execution_value(&execution).expect("encode execution")
+                )
                 .expect("decode execution"),
-            execution
-        );
+                execution
+            );
+        }
     }
 
     #[test]

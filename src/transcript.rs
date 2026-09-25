@@ -3963,7 +3963,9 @@ fn terminal_evidence_blocks(
 fn arena_state(execution: &Execution) -> ArenaState {
     match execution.outcome {
         ExecutionOutcome::Complete { .. } => ArenaState::Complete,
-        ExecutionOutcome::PythonError(..) => ArenaState::Error,
+        ExecutionOutcome::PythonError(..) | ExecutionOutcome::TypeCheckError(..) => {
+            ArenaState::Error
+        }
     }
 }
 
@@ -3978,6 +3980,10 @@ fn execution_content(execution: &Execution) -> Vec<ArenaContent> {
         ExecutionOutcome::Complete { result: None } => {}
         ExecutionOutcome::PythonError(error) => content.push(ArenaContent {
             label: "error",
+            text: error.text.clone(),
+        }),
+        ExecutionOutcome::TypeCheckError(error) => content.push(ArenaContent {
+            label: "type check",
             text: error.text.clone(),
         }),
     }
