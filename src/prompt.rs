@@ -232,13 +232,19 @@ mod tests {
     fn bundled_prompt_explains_monty_arena_constraints() {
         for guidance in [
             "### Monty/Arena Python primer",
-            "generator expressions materialize as lists",
-            "`enumerate`, `zip`, `map`, `filter`, and `reversed` are eager",
-            "Host functions must be awaited",
-            "There are no third-party packages",
-            "`sys.path`, or ambient filesystem/network/process access",
-            "Unsupported features include `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for`, async comprehensions, and wildcard imports",
-            "consider a Monty incompatibility",
+            "not CPython",
+            "f-strings",
+            "`format()`, `str.format()` and string `%` formatting are missing",
+            "Importable modules (complete list): `asyncio`, `base64`, `binascii`, `collections`, `dataclasses`, `datetime`, `functools`, `itertools`, `json`, `math`, `os`, `pathlib`, `re`, `sys`, `typing`, `unicodedata`",
+            "`functools` only `reduce`/`partial`",
+            "`json` has `loads`/`dumps`/`JSONDecodeError`",
+            "No ambient file, network or process access",
+            "they cannot suspend inside synchronous callbacks",
+            "Generator expressions materialise as lists",
+            "`enumerate`, `zip`, `map`, `filter` and `reversed` return eager lists",
+            "`next(x for x in xs)` fails",
+            "No `yield`, inheritance, method decorators, `match`, `del`, `async with`, `async for` or wildcard imports",
+            "Built-in methods generally work only as direct calls",
         ] {
             assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
         }
