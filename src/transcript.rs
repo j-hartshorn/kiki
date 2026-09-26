@@ -58,10 +58,6 @@ fn markdown<'a>(
     from_str_with_options(source, &options)
 }
 
-const STORE_FALSE_PRIVACY_BOUNDARY: &str = "store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.";
-const ANTHROPIC_PRIVACY_BOUNDARY: &str =
-    "User requests or workspace content printed by Python may be sent to Anthropic.";
-
 #[derive(Debug, Default, PartialEq, Eq)]
 enum RunState {
     #[default]
@@ -3623,16 +3619,6 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             lines.push(format!("Remediation: {}", problem.remediation()));
         }
     }
-    for (provider, notice) in [
-        (Provider::OpenAi, STORE_FALSE_PRIVACY_BOUNDARY),
-        (Provider::Anthropic, ANTHROPIC_PRIVACY_BOUNDARY),
-    ] {
-        if snapshot.model().provider() == provider
-            || snapshot.api_key_presence(provider) == ApiKeyPresence::Present
-        {
-            lines.push(notice.to_owned());
-        }
-    }
     TranscriptBlock::Startup { lines }
 }
 
@@ -7128,8 +7114,7 @@ Prompt: bundled system
 OpenAI API key: present
 Anthropic API key: missing
 Submission: available
-Problems: none
-store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."
+Problems: none"
         );
     }
 
