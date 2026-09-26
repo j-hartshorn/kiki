@@ -41,7 +41,7 @@ use crate::arena::Arena;
 use crate::config::{
     ApiKey, ModelSelection,
     models::Provider,
-    settings::{CacheTtl, CrossProviderReasoning},
+    settings::{self, CacheTtl, CrossProviderReasoning},
 };
 use crate::provider::ProviderModel;
 use crate::runtime::{
@@ -49,6 +49,7 @@ use crate::runtime::{
     RuntimeEvent,
 };
 use crate::session::{Session, SessionListRow};
+use crate::skills::{ProjectScope, SkillCatalog, project_trust_prompt_required};
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -259,6 +260,29 @@ fn run_open_configuration(
     close_result
 }
 
+fn startup_skill_catalog(
+    workspace_root: &Path,
+    home: &Path,
+    has_active_project_skill_in_scope: bool,
+    prompt: impl FnOnce(&Path) -> Result<bool, tui::TuiError>,
+) -> Result<Arc<SkillCatalog>, Box<dyn Error>> {
+    let scope = ProjectScope::discover(workspace_root)?;
+    let saved_trust = settings::is_project_skill_scope_trusted(home, &scope.canonical_scope);
+    let include_project =
+        if project_trust_prompt_required(&scope, saved_trust, has_active_project_skill_in_scope) {
+            prompt(&scope.canonical_scope)?
+                && settings::is_project_skill_scope_trusted(home, &scope.canonical_scope)
+        } else {
+            saved_trust
+        };
+    Ok(Arc::new(SkillCatalog::discover(
+        &scope,
+        home,
+        include_project,
+        "",
+    )))
+}
+
 fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let disable_type_check =
         requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
@@ -271,6 +295,18 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let startup = configuration.snapshot().clone();
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
+    let _skills_catalog = match startup_skill_catalog(&workspace_root, &home, false, |scope| {
+        tui::run_project_skill_trust(scope, || {
+            settings::save_project_skill_scope_trust(&home, scope)
+                .map_err(|error| error.to_string())
+        })
+    }) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = trace_owner.shutdown();
+            return Err(error);
+        }
+    };
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
@@ -383,6 +419,20 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
+    // Task 3 supplies whether the selected session branch has an active
+    // project skill from this effective workspace scope.
+    let _skills_catalog = match startup_skill_catalog(&workspace_root, &home, false, |scope| {
+        tui::run_project_skill_trust(scope, || {
+            settings::save_project_skill_scope_trust(&home, scope)
+                .map_err(|error| error.to_string())
+        })
+    }) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            close_open_session(session, trace_owner)?;
+            return Err(error);
+        }
+    };
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
@@ -488,8 +538,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
 
     use super::requested_type_check_disabled;
+
+    fn write_skill(root: &Path, name: &str, description: &str) {
+        let directory = root.join(".agents/skills").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\ndescription: {description}\n---\nbody"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn type_check_opt_out_accepts_only_on_and_off() {
@@ -498,5 +562,140 @@ mod tests {
         assert!(requested_type_check_disabled(Some(OsStr::new("off"))).unwrap());
         assert!(requested_type_check_disabled(Some(OsStr::new("false"))).is_err());
         assert!(requested_type_check_disabled(Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn startup_catalog_skips_untrusted_project_and_reprompts_after_skip() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let mut prompts = 0;
+        for _ in 0..2 {
+            let catalog = super::startup_skill_catalog(project.path(), home.path(), false, |_| {
+                prompts += 1;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(catalog.lookup("shared").unwrap().description(), "user");
+        }
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn startup_catalog_trust_persists_and_enables_project_snapshot() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let catalog = super::startup_skill_catalog(project.path(), home.path(), false, |scope| {
+            super::config::settings::save_project_skill_scope_trust(home.path(), scope).unwrap();
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
+        let next = super::startup_skill_catalog(project.path(), home.path(), false, |_| {
+            panic!("trusted scope should not prompt again")
+        })
+        .unwrap();
+        assert_eq!(next.lookup("shared").unwrap().description(), "project");
+    }
+
+    #[test]
+    fn startup_catalog_uses_effective_workspace_and_active_resume_input() {
+        let home = tempdir().unwrap();
+        let old = tempdir().unwrap();
+        let here = tempdir().unwrap();
+        fs::create_dir(old.path().join(".git")).unwrap();
+        fs::create_dir(here.path().join(".git")).unwrap();
+        write_skill(old.path(), "old-skill", "old");
+        write_skill(here.path(), "here-skill", "here");
+        let old_scope = old.path().canonicalize().unwrap();
+        super::config::settings::save_project_skill_scope_trust(home.path(), &old_scope).unwrap();
+        let mut prompted_scope = None;
+        let catalog = super::startup_skill_catalog(here.path(), home.path(), false, |scope| {
+            prompted_scope = Some(scope.to_path_buf());
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(prompted_scope, Some(here.path().canonicalize().unwrap()));
+        assert!(catalog.lookup("old-skill").is_err());
+        assert!(catalog.lookup("here-skill").is_err());
+
+        fs::remove_dir_all(here.path().join(".agents/skills")).unwrap();
+        let mut prompted = false;
+        let _catalog = super::startup_skill_catalog(here.path(), home.path(), true, |_| {
+            prompted = true;
+            Ok(false)
+        })
+        .unwrap();
+        assert!(
+            prompted,
+            "active in-scope project skill must prompt after directory removal"
+        );
+    }
+
+    #[test]
+    fn startup_catalog_does_not_prompt_without_project_scope_candidates() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_skill(home.path(), "user-only", "user");
+        let catalog = super::startup_skill_catalog(project.path(), home.path(), false, |_| {
+            panic!("no project root should not prompt")
+        })
+        .unwrap();
+        assert_eq!(catalog.lookup("user-only").unwrap().description(), "user");
+    }
+
+    #[test]
+    fn startup_catalog_failed_trust_save_keeps_project_disabled() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let trust_store = home.path().join(".kiki/trusted-skills.toml");
+        fs::create_dir_all(trust_store.parent().unwrap()).unwrap();
+        fs::write(trust_store, "trusted_skill_scopes = [true]").unwrap();
+        let catalog = super::startup_skill_catalog(project.path(), home.path(), false, |scope| {
+            assert!(
+                super::config::settings::save_project_skill_scope_trust(home.path(), scope)
+                    .is_err()
+            );
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "user");
+        assert!(!super::config::settings::is_project_skill_scope_trusted(
+            home.path(),
+            &project.path().canonicalize().unwrap()
+        ));
+    }
+
+    #[test]
+    fn startup_catalog_uses_launch_scope_without_git_and_worktree_file_scope_with_git() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let launch = project.path().join("nested");
+        fs::create_dir_all(&launch).unwrap();
+        write_skill(&launch, "local", "local");
+        let mut requested = None;
+        let _ = super::startup_skill_catalog(&launch, home.path(), false, |scope| {
+            requested = Some(scope.to_path_buf());
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(requested, Some(launch.canonicalize().unwrap()));
+
+        fs::write(project.path().join(".git"), "gitdir: elsewhere").unwrap();
+        let mut requested = None;
+        let _ = super::startup_skill_catalog(&launch, home.path(), false, |scope| {
+            requested = Some(scope.to_path_buf());
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(requested, Some(project.path().canonicalize().unwrap()));
     }
 }

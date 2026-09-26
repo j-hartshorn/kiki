@@ -87,6 +87,16 @@ impl ProjectScope {
     }
 }
 
+/// `has_active_project_skill_in_scope` is supplied by session ancestry once
+/// activated skills are stored (Task 3). It lets resume prompt after a root is removed.
+pub fn project_trust_prompt_required(
+    scope: &ProjectScope,
+    already_trusted: bool,
+    has_active_project_skill_in_scope: bool,
+) -> bool {
+    !already_trusted && (scope.has_skill_directory() || has_active_project_skill_in_scope)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillOrigin {
     Project,
@@ -986,6 +996,18 @@ pub mod tests {
         assert!(!project.has_skill_directory());
         let catalog = SkillCatalog::discover(&project, &home, true, "guidance");
         assert!(catalog.visible_names().is_empty());
+    }
+
+    #[test]
+    fn trust_prompt_requires_directory_or_active_in_scope_and_no_saved_trust() {
+        let fixture = Fixture::new();
+        let scope = fixture.scope();
+        assert!(!project_trust_prompt_required(&scope, false, false));
+        assert!(project_trust_prompt_required(&scope, false, true));
+        assert!(!project_trust_prompt_required(&scope, true, true));
+        fs::create_dir_all(fixture.project_root(&fixture.launch)).unwrap();
+        assert!(project_trust_prompt_required(&scope, false, false));
+        assert!(!project_trust_prompt_required(&scope, true, false));
     }
 
     #[test]

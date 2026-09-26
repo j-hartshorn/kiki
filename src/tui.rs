@@ -12,14 +12,14 @@ mod tree;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::SetTitle;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rattles::TickedRattler;
 use thiserror::Error;
@@ -1999,6 +1999,215 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
     )
 }
 
+pub(crate) fn run_project_skill_trust(
+    scope: &Path,
+    mut save: impl FnMut() -> Result<(), String>,
+) -> Result<bool, TuiError> {
+    let mut input = CrosstermEvents;
+    let mut trusted = false;
+    with_terminal(
+        || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
+        ratatui::restore,
+        |terminal| {
+            trusted = run_project_skill_trust_loop(terminal, &mut input, scope, &mut save)?;
+            Ok(())
+        },
+    )?;
+    Ok(trusted)
+}
+
+fn run_project_skill_trust_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    input: &mut impl EventSource,
+    scope: &Path,
+    mut save: impl FnMut() -> Result<(), String>,
+) -> Result<bool, TuiError> {
+    let mut trust_selected = false;
+    let mut save_error = None;
+    let mut path_scroll = 0usize;
+    let mut visible_path_rows = None;
+    let mut dirty = true;
+    loop {
+        if dirty {
+            terminal
+                .draw(|frame| {
+                    visible_path_rows = render_project_skill_trust(
+                        frame,
+                        scope,
+                        trust_selected,
+                        save_error.as_deref(),
+                        &mut path_scroll,
+                    );
+                })
+                .map_err(|error| TuiError::Terminal(error.to_string()))?;
+            dirty = false;
+        }
+        if !input.poll(POLL_INTERVAL).map_err(TuiError::Input)? {
+            continue;
+        }
+        match input.read().map_err(TuiError::Input)? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                    return Ok(false);
+                }
+                if key.modifiers != KeyModifiers::NONE {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter if trust_selected && visible_path_rows.is_some() => match save()
+                    {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            save_error = Some(error);
+                            trust_selected = false;
+                            dirty = true;
+                        }
+                    },
+                    KeyCode::Enter | KeyCode::Esc => return Ok(false),
+                    KeyCode::Left | KeyCode::Char('s') => {
+                        trust_selected = false;
+                        dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('t') => {
+                        trust_selected = true;
+                        dirty = true;
+                    }
+                    KeyCode::Tab => {
+                        trust_selected = !trust_selected;
+                        dirty = true;
+                    }
+                    KeyCode::Up => {
+                        path_scroll = path_scroll.saturating_sub(1);
+                        dirty = true;
+                    }
+                    KeyCode::Down => {
+                        path_scroll = path_scroll.saturating_add(1);
+                        dirty = true;
+                    }
+                    KeyCode::PageUp => {
+                        path_scroll = path_scroll.saturating_sub(visible_path_rows.unwrap_or(1));
+                        dirty = true;
+                    }
+                    KeyCode::PageDown => {
+                        path_scroll = path_scroll.saturating_add(visible_path_rows.unwrap_or(1));
+                        dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => dirty = true,
+            _ => {}
+        }
+    }
+}
+
+fn render_project_skill_trust(
+    frame: &mut Frame,
+    scope: &Path,
+    trust_selected: bool,
+    save_error: Option<&str>,
+    path_scroll: &mut usize,
+) -> Option<usize> {
+    let area = frame.area();
+    if area.is_empty() {
+        return None;
+    }
+    frame.buffer_mut().set_style(area, page_style());
+    let width = area.width.min(100);
+    let height = area.height.min(12);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title("Project skills");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return None;
+    }
+    let error_rows = if save_error.is_some() { 2 } else { 0 };
+    let minimum_height = if save_error.is_some() { 9 } else { 8 };
+    if inner.width < 46 || inner.height < minimum_height {
+        frame.render_widget(
+            Paragraph::new("Resize terminal to inspect the full project scope."),
+            inner,
+        );
+        return None;
+    }
+    let path = escaped_project_skill_scope(scope);
+    let path_lines = path
+        .as_bytes()
+        .chunks(inner.width as usize)
+        .map(|bytes| std::str::from_utf8(bytes).expect("escaped scope is ASCII"))
+        .collect::<Vec<_>>();
+    let visible_rows = (inner.height as usize - 6 - error_rows as usize).min(3);
+    let max_scroll = path_lines.len().saturating_sub(visible_rows);
+    *path_scroll = (*path_scroll).min(max_scroll);
+    let visible_end = (*path_scroll + visible_rows).min(path_lines.len());
+    let choices = if trust_selected {
+        "Skip    [Trust]"
+    } else {
+        "[Skip]    Trust"
+    };
+    let mut lines = vec![
+        Line::raw("This project has skills with assistant instructions."),
+        Line::raw("Project scope (escaped bytes):"),
+    ];
+    for line in &path_lines[*path_scroll..visible_end] {
+        lines.push(Line::raw(*line));
+    }
+    lines.extend([
+        Line::raw(format!(
+            "Path lines {}-{}/{} | Up/Down/Page",
+            *path_scroll + 1,
+            visible_end,
+            path_lines.len()
+        )),
+        Line::raw("Trust this project's skills?"),
+        Line::raw(choices),
+        Line::raw("Left/Right choice | Enter confirm | Esc skip"),
+    ]);
+    let content_height = (6 + visible_rows) as u16;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, content_height),
+    );
+    if let Some(error) = save_error {
+        let error_area = Rect::new(inner.x, inner.y + content_height, inner.width, error_rows);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Trust was not saved: {}",
+                normalise_terminal_text(error)
+            ))
+            .wrap(Wrap { trim: false }),
+            error_area,
+        );
+    }
+    Some(visible_rows)
+}
+
+fn escaped_project_skill_scope(scope: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut escaped = String::new();
+    for byte in scope.as_os_str().as_bytes() {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            0x20..=0x7e => escaped.push(*byte as char),
+            _ => {
+                escaped.push_str("\\x");
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    escaped
+}
+
 fn with_terminal<B: Backend>(
     initialize: impl FnOnce() -> Result<Terminal<B>, TuiError>,
     restore: impl FnOnce(),
@@ -2758,6 +2967,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use ratatui::Terminal;
@@ -2801,6 +3011,215 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn project_skill_trust_popup_defaults_to_skip_and_names_canonical_scope() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        let saved = Cell::new(false);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!trusted);
+        assert!(!saved.get());
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("/canonical/repository"));
+        assert!(screen.contains("[Skip]"));
+        assert!(screen.contains("Project scope (escaped bytes):"));
+        assert!(!screen.contains("Repository:"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_ignores_release_and_modified_keys() {
+        let unsafe_keys = [
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        ];
+        for unsafe_key in unsafe_keys {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(unsafe_key)),
+                Some(Event::Key(key(KeyCode::Enter))),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/project"),
+                || panic!("modified or release key must not select Trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
+
+        let unsafe_enter_keys = [
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        ];
+        for unsafe_key in unsafe_enter_keys {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(key(KeyCode::Right))),
+                Some(Event::Key(unsafe_key)),
+                Some(Event::Key(key(KeyCode::Esc))),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/project"),
+                || panic!("modified or release Enter must not confirm Trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
+    }
+
+    #[test]
+    fn project_skill_trust_popup_escapes_control_and_bidi_path_bytes() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/project/line\n\u{202e}tail"),
+            || panic!("default Skip must not save"),
+        )
+        .unwrap();
+        assert!(!trusted);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("/project/line\\x0A\\xE2\\x80\\xAEtail"));
+        assert!(!screen.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_scrolls_to_long_path_suffix() {
+        let path = format!("/project/{}/VISIBLE-SUFFIX", "a".repeat(240));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
+            panic!("default Skip must not save")
+        })
+        .unwrap();
+        let initial = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!initial.contains("VISIBLE-SUFFIX"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::PageDown))),
+            Some(Event::Key(key(KeyCode::PageDown))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
+            panic!("default Skip must not save")
+        })
+        .unwrap();
+        let scrolled = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(scrolled.contains("VISIBLE-SUFFIX"));
+        assert!(scrolled.contains("Path lines"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_only_enables_after_successful_save() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::Right))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        let saved = Cell::new(0);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(saved.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(trusted);
+        assert_eq!(saved.get(), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(48, 11)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::Right))),
+            Some(Event::Key(key(KeyCode::Enter))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        let saved = Cell::new(0);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(saved.get() + 1);
+                Err("could not save project skill trust (PermissionDenied)".to_owned())
+            },
+        )
+        .unwrap();
+        assert!(!trusted);
+        assert_eq!(saved.get(), 1);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("PermissionDenied"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_cancellation_skips_without_saving() {
+        for cancel in [
+            key(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(key(KeyCode::Right))),
+                Some(Event::Key(cancel)),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/repository"),
+                || panic!("cancel must not save trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
     }
 
     fn shifted_key(code: KeyCode) -> KeyEvent {

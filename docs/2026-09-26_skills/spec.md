@@ -109,21 +109,21 @@ Use isolated temporary project and user directories with real `SKILL.md` fixture
 
 ### Task 2: Gate project skills at startup
 
-**Changes** — Before constructing a fresh or resumed model and tool host, show a TUI popup for a project skill directory whose canonical trust scope lacks a saved positive decision. Save Trust only in user-owned settings; Skip applies for one process. Build one catalog from the resulting roots and pass it to startup components. Configuration-only startup and session listing do not prompt.
+**Changes** — Before constructing a fresh or resumed model and tool host, show a TUI popup for a project skill directory whose canonical trust scope lacks a saved positive decision. Save Trust only in user-owned settings; Skip applies for one process. Build one catalog from the resulting roots and retain it for the later prompt and tool wiring tasks. Configuration-only startup and session listing do not prompt.
 
-**Tests** (`src/skills.rs` and `src/config/settings.rs`, unit; `src/tui.rs` and `src/main.rs`, startup) — No popup without project skills or matching active entries, or for a trusted root; Trust survives the next launch; Skip and cancel re-prompt next launch; default is Skip; failed save cannot enable project skills; project configuration cannot self-approve; no-Git scope and worktree Git file resolve correctly; resume with a removed skill directory still prompts for an active in-scope entry; `--here` checks the effective workspace and suppresses old-scope activations; skipped project skills never reach prompts, host calls, or child runners, while user skills remain.
+**Tests** (`src/skills.rs` and `src/config/settings.rs`, unit; `src/tui.rs` and `src/main.rs`, startup) — No popup without project skills or for a trusted root; Trust survives the next launch; Skip and cancel re-prompt next launch; default is Skip; failed save cannot enable project skills; project configuration cannot self-approve; no-Git scope and worktree Git file resolve correctly; a skipped catalog excludes project skills while retaining user skills. Task 3 tests the active-entry resume gate and `--here` filtering; Tasks 4, 5, and 7 test the host, prompt, child, and resource wiring.
 
-**Files** — Modify: `src/skills.rs`, `src/config/settings.rs`, `src/config.rs`, `src/main.rs`, `src/tui.rs`.
+**Files** — Modify: `src/skills.rs`, `src/config/settings.rs`, `src/main.rs`, `src/tui.rs`.
 
 **Verification** — Targeted trust and startup tests pass; `just check` succeeds.
 
 ### Task 3: Persist and project activated instructions
 
-**Changes** — Add a named skill activation to model history and selected session ancestry, project it for both providers, deduplicate it by name on each branch, and keep its captured body through compaction and restore. Count protected text toward context usage and enforce the combined active-text bound. Suppress project-origin activations when trust is skipped on resume.
+**Changes** — Add a named skill activation to model history and selected session ancestry, project it for both providers, deduplicate it by name on each branch, and keep its captured body through compaction and restore. Count protected text toward context usage and enforce the combined active-text bound. Before the resume trust popup, detect an active project entry for the effective scope even if its directory was removed. Suppress project-origin activations when trust is skipped on resume or when navigating branches.
 
-**Tests** (`src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/compaction.rs`, unit and session integration) — Full body appears once in each provider's next request; duplicate activation adds no second copy and changed source or body replaces the old projection; an earlier branch excludes a later activation; compaction preserves active bodies outside summaries and charges their cost; resume restores exact bytes until reactivation; skipped trust or a different `--here` scope suppresses project-origin entries and permits a user-skill fallback with the same name; boundary and over-boundary active-text totals return the documented result.
+**Tests** (`src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/compaction.rs`, unit and session integration) — Full body appears once in each provider's next request; duplicate activation adds no second copy and changed source or body replaces the old projection; an earlier branch excludes a later activation; compaction preserves active bodies outside summaries and charges their cost; resume restores exact bytes until reactivation; a removed project skill directory still triggers the popup for an active in-scope entry; skipped trust or a different `--here` scope suppresses project-origin entries and permits a user-skill fallback with the same name; boundary and over-boundary active-text totals return the documented result.
 
-**Files** — Create: `prompts/skill-activation.md`. Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/session/codec.rs`, `src/session/schema.sql`, `src/compaction.rs`, `src/prompt.rs`, `src/config.rs`.
+**Files** — Create: `prompts/skill-activation.md`. Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/session/codec.rs`, `src/session/schema.sql`, `src/compaction.rs`, `src/prompt.rs`, `src/config.rs`, `src/main.rs`, `src/runtime.rs`.
 
 **Verification** — Focused provider, session, and compaction tests pass; `just check` succeeds.
 
