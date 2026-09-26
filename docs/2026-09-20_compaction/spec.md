@@ -2,7 +2,7 @@
 
 ## Context
 
-Kiki persists immutable Session Entries and Arena Checkpoints, but the selected branch is still replayed in full for every model request. Long sessions will eventually exceed the selected model's context window. The current architecture also has two authorities for Model Context: `Agent` mutates an in-memory `ModelHistory`, while the session module independently reconstructs another history during restoration and interactive branch navigation (`src/agent.rs:537`, `src/session.rs:2754`, `src/runtime.rs:1092`). This conflicts with the intended ownership boundary in which the Session Model owns the Active Leaf and Model Context projection (`docs/VISION.md:134`).
+Phases 1 and 2 are merged: the Session Model owns the selected branch's live and restored Model Context, and `/compact` persists outcomes without rewriting Session Entries or Arena Checkpoints (`src/session.rs:987`, `src/agent.rs:617`). Automatic compaction and overflow recovery are still absent. A long selected context can exceed the active model's window, especially when a new request is appended or a session changes provider.
 
 This change adds Pi-compatible Model Context compaction. It replaces an older prefix of the selected branch with a durable summary while retaining the exact recent tail. It does not delete or rewrite Session Entries, Display History, or Arena Checkpoints. The Python Arena and external filesystem effects therefore survive unchanged.
 
@@ -11,9 +11,9 @@ Kiki also has continuity data which Pi does not: useful persistent Python bindin
 ## Goals
 
 - Make the Session Model the single owner of live and restored Model Context projection; remove independently mutable context ownership from `Agent`.
-- Automatically compact using configured `enabled`, `reserve_tokens`, and `keep_recent_tokens`, while supporting `/compact [instructions]` below the threshold.
-- Recover once from a recognised provider context overflow by compacting and retrying the same Model Step.
-- Match Pi's summary, retained-tail, repeated-compaction, split-Run, output-budget, and cumulative read/modified-file behaviour, with one deterministic Kiki estimator and an evidence-based `Arena State` prompt extension.
+- Automatically compact just before a normal root Model Step when the selected context, including a newly committed request, is estimated above the configured threshold; keep `/compact [instructions]` available below it.
+- Recover once from a recognised provider context overflow by compacting and retrying the same pending Model Step, with provider-specific classification for OpenAI and Anthropic.
+- Preserve the delivered Pi-inspired summary, retained-tail, repeated-compaction, split-Run, output-budget, and cumulative read/modified-file behaviour, while making estimates and summary input consistent with the selected provider's context rendering.
 - Persist every provider-started compaction outcome while the process remains alive through settlement and storage and Session invariants remain valid; only an applied outcome changes Model Context.
 - Preserve cancellation, usage accounting, full Display History, branch navigation, and inspectability through collapsed transcript cards and durable session-tree rows.
 
@@ -23,43 +23,41 @@ Kiki also has continuity data which Pi does not: useful persistent Python bindin
 - A general message/command queue; Runtime retains at most one pending manual compaction, including across a pending correction.
 - A generic session-storage port, alternate persistence backend, migration framework, or compatibility with pre-compaction format-version-1 sessions.
 - Moving Ratatui rendering or terminal layout into the Session Model.
-- A new per-Model-Step Runtime state machine; the existing Agent loop continues to orchestrate generation and Arena execution.
+- A new per-Model-Step Runtime state machine or an automatic foreground operation without a Run; the existing Agent loop owns pre-step decisions and generation.
+- Pi's pre-prompt or post-final automatic trigger timing; Kiki checks only when a normal root Model Step is about to start.
+- Automatic compaction or overflow recovery for task-local subagent histories; only the root Session Model has durable Compaction Entries.
 - Configurable summary models, thinking levels, retry counts, estimators, prompts, or split-Run policy.
 - Authoritative Arena variable enumeration, Monty introspection changes, or claims that the evidence-based `Arena State` section is complete.
-- Exact provider tokenisation, proactive summary chunking, truncated-output recovery, or a hard retained-tail token limit.
+- Exact provider tokenisation, a provider token-count request before generation, proactive summary chunking, truncated-output recovery, or a hard retained-tail token limit.
 - New expansion controls or a compaction-specific viewer; transcript cards reuse global `Ctrl-O`, while the existing tree uses `Ctrl-X` copy.
 
 ## Key discoveries
 
-- The intended Session Model already owns the Session tree, Active Leaf, committed records, Model Context projection, and Arena Checkpoint references (`docs/VISION.md:134`). Current code only partially follows this: `Agent` owns mutable `ModelHistory`, while restoration rebuilds it independently and Runtime installs it after model/Arena validation (`src/agent.rs:537`, `src/session.rs:2754`, `src/runtime.rs:701`, `src/runtime.rs:1092`).
-- A `CompletedCode` Model Context entry keeps provider output, Python source, call identity, reasoning summary, and execution feedback together (`src/model.rs:138`, `src/model.rs:182`). Compaction can retain or summarise whole entries without separating a tool call from its result.
-- OpenAI request construction is the current adapter from provider-neutral Model Context to provider replay (`src/openai.rs:161`). A synthetic compaction-summary entry can remain provider-neutral while each provider chooses its wire representation.
-- Session Entries are immutable, and every non-execution entry must reuse its parent's Arena Checkpoint (`src/session/schema.sql:22`, `src/session/schema.sql:105`, `src/session.rs:2492`). Compaction can advance the Active Leaf without creating or mutating Arena state.
-- Runtime already moves `Agent` into a foreground worker and returns it at settlement, while cloned `SessionWriter` handles share Arc-backed Session state with the controller (`src/runtime.rs:1355`, `src/runtime.rs:1721`, `src/session.rs:315`). Passing that existing shared handle to the worker avoids a per-step controller state machine or another ownership hand-off.
-- User and project TOML settings already support strict field validation and field-wise precedence (`src/config/settings.rs:508`, `src/config/settings.rs:798`). `[compaction]` can extend this mechanism without session or environment overrides.
-- Successful filesystem calls already carry normalised workspace-relative `ToolEffect` paths internally. New effect vectors can be copied into private execution metadata before that structure is discarded without adding them to settled display records; existing source/commentary can independently contain user-written lexical paths (`src/tools.rs:183`, `src/tools.rs:853`, `src/tools.rs:2295`).
-- Monty checkpoints are opaque and Kiki's explicit result-value collection reads a designated dictionary rather than enumerating globals (`docs/research/2026-08-26_monty-feasibility.md:125`, `src/arena.rs:1041`). `Arena State` must therefore describe historically evidenced useful bindings and mark uncertainty.
-- Pi's selected-path projection applies the latest compaction independently of richer session history, matching Kiki's existing separation between Model Context and Display History (`docs/research/2026-08-25_pi-architectural-lessons.md:56`, `docs/VISION.md:151`).
-- Kiki's merged session tree decodes every durable entry, accounts for attempts on abandoned branches, and separately derives row rendering, search text, conversation-mode topology, and `Ctrl-X` copy (`src/session.rs:1965`, `src/session.rs:2175`, `src/tui/tree.rs:102`, `src/tui/tree.rs:1031`). A Compaction Entry must participate in each projection.
-- Runtime and Transcript still model foreground work as a Run identified by `RunId` (`src/runtime.rs:335`, `src/transcript.rs:64`). Manual, pre-request, and post-final compaction require a foreground operation that can be active without inventing a Run.
+- `SessionWriter::prepare_compaction` reads selected ancestry and `settle_compaction` atomically advances the Active Leaf and its projected Model Context only after a guarded append (`src/session.rs:987`, `src/session.rs:1009`). Existing manual compaction already owns summary generation and durable outcome selection (`src/agent.rs:617`).
+- `RuntimeController::start_run` captures one `ModelSelection`; `Agent::run_persisted` uses it for every Model Step (`src/runtime.rs:1590`, `src/agent.rs:704`). Settings accepted mid-Run take effect on the next Run, not a later step or retry.
+- The persisted Agent commits a request before allocating the first Model Step, and settles each successful execution before looping to allocate the next (`src/agent.rs:704`, `src/agent.rs:742`, `src/agent.rs:940`). These are the two instances of one pre-step seam.
+- `ProviderModel` dispatches both steps and standalone summaries by the captured selection to OpenAI or Anthropic (`src/provider.rs:66`). Both adapters send the canonical compaction summary; neither uses a provider token-count call.
+- `ProviderFailure` retains bounded status, code, and message without context-overflow meaning (`src/model.rs:407`). Both adapters see raw diagnostics before redacting and bounding them (`src/openai.rs:577`, `src/anthropic.rs:644`).
+- `src/compaction.rs:293` can use the latest normal call's token usage even when its model differs from the next selection. Its fallback counts opaque replay bytes (`src/compaction.rs:510`), while a foreign provider renders semantic parts and can omit reasoning under `cross_provider_reasoning = "drop"` (`src/model.rs:253`). Summary input still serialises that reasoning unconditionally (`src/compaction.rs:559`).
+- Anthropic's documented thinking-block binding rejects replayed signed thinking when its earlier conversation prefix changes; compaction can change that prefix while retaining native Anthropic entries. The documented `drop_block` behaviour with its beta header lets the adapter keep valid signatures and drop mismatched ones ([Claude API errors](https://platform.claude.com/docs/en/api/errors#thinking-block-no-longer-matches-the-conversation); `src/anthropic.rs:99`).
+- The compaction snapshot currently loads all Session Entries before isolating the selected ancestry (`src/session.rs:2422`). Checking before every Model Step must not make ordinary below-threshold steps disproportionately expensive.
+- Phase 2 already persists file effects, immutable Compaction Entries, transcript/tree projections, and manual non-Run foreground lifecycle; Phase 3 extends those delivered seams rather than creating a second context owner (`src/session.rs:987`, `src/runtime.rs:1532`).
 
 ## Proposed approach
 
 ### Canonical Session Model
 
-Extend the existing session module into the canonical live and durable Model Context owner. It maintains the selected branch projection and supplies immutable snapshots to provider calls. A successful Session Entry commit updates that projection; failed storage leaves it unchanged. Restoration and live operation use the same projection rules.
+The Session Model is the canonical live and durable Model Context owner. It maintains the selected branch projection and supplies immutable snapshots to provider calls. A successful Session Entry commit updates that projection; failed storage leaves it unchanged. Restoration and live operation use the same projection rules.
 
 Runtime remains responsible for provider validation and Arena restoration. After the target history and checkpoint validate, one guarded Session activation operation persists navigation selection when needed and publishes the matching immutable history only after commit. Startup activates the already selected projection through the same seam. Failed validation, Arena restoration, stale selection, or persistence leaves both the prior Active Leaf and live history unchanged.
 
-Remove `model_context` from `Agent`. Agent continues to own the selected model and Arena and to orchestrate model generation and Python execution. The persisted root loop reads and commits context through the Session Model. Ephemeral subagent runs keep task-local history outside Agent rather than requiring a speculative storage abstraction.
+Agent does not own mutable root Model Context. It owns the selected model and Arena, and orchestrates generation and Python execution. The persisted root loop reads and commits context through the Session Model. Ephemeral subagent runs keep task-local history outside Agent.
 
-Runtime moves Agent into the existing foreground worker and passes a cloned Session Model handle, retaining its own shared handle in the controller. Only Agent returns at settlement. Runtime records remain a Display History cache, not a Model Context authority. Navigation replaces the selected Session projection rather than mutating Agent history.
+Runtime moves Agent into the foreground worker and passes a cloned Session Model handle, retaining its own shared handle in the controller. Only Agent returns at settlement. Runtime records remain a Display History cache, not a Model Context authority. Automatic threshold and overflow work stay inside this Run worker; manual compaction retains its existing non-Run foreground worker.
 
 ### Provider-neutral model operations
 
-Extend the provider-neutral model contract with standalone summarisation. A summary request contains Kiki-owned instructions, serialised conversation text, the captured active model selection, and an output limit. A generated summary returns text and attempt accounting without provider replay.
-
-The OpenAI adapter sends summaries through the Responses API with no tools, the captured active selection, normal streaming/cancellation/retry handling, and ordinary usage extraction. Summary output must be a complete, non-empty text response. Tool calls, incomplete responses, and output-limit truncation fail the compaction.
+The provider-neutral `Model` contract already supports standalone summarisation. A summary request contains Kiki-owned instructions, serialised conversation text, the captured model selection, and an output limit. A generated summary returns text and attempt accounting without provider replay. `ProviderModel` routes both normal steps and summaries to OpenAI or Anthropic through that selection; neither Session nor Runtime parses their wire formats. Incomplete, empty, or tool-call summaries fail the compaction.
 
 A provider-neutral compaction-summary Model Context entry owns its canonical text:
 
@@ -73,17 +71,21 @@ The Python Arena and its existing variables, functions, classes, and data persis
 </summary>
 ```
 
-Estimation counts this same text. Provider adapters only encode it into their wire format, preventing wrapper drift. Future OpenAI, Google, and Anthropic adapters implement normal-step and summarisation operations without exposing wire formats to the Session Model.
+Estimation counts this same text. Provider adapters only encode it into their wire format, preventing wrapper drift. New providers use the same Model operations without exposing wire formats to the Session Model.
 
-### OpenAI context-overflow classification
+Anthropic can retain signed thinking in an assistant replay after a compaction changes its preceding conversation. For the supported Anthropic models, the normal-step adapter must request the documented `thinking.block_binding.prefix_mismatch_behavior = "drop_block"` with its required beta header: unchanged signatures remain usable, mismatched blocks are dropped by Anthropic rather than failing the next request. Keep durable replay and the exact retained tail unchanged; summarisation requests have no replayed thinking. Verify request construction and the retained-tail continuation, not just an empty-history summary.
 
-The provider-neutral failure vocabulary exposes whether a normal Model Step failed from recognised context overflow. The OpenAI adapter classifies overflow as follows:
+### Provider-specific context-overflow classification
+
+The provider-neutral failure vocabulary exposes whether a normal Model Step failed from recognised context overflow. Each provider adapter classifies its own raw diagnostic before redaction/bounding and stores the semantic result beside bounded diagnostics. The OpenAI adapter classifies overflow as follows:
 
 - An ASCII case-insensitive exact error code of `context_length_exceeded` or `model_context_window_exceeded` is recognised unless HTTP status is 401 or 429.
 - Without one of those codes, only HTTP 400 or 413 is eligible. Its ASCII case-insensitive message must contain `exceeds the context window`, `maximum context length`, `context length exceeded`, or `context window exceeded`.
 - Generic HTTP 400/413, authentication, rate-limit, `too many tokens`, and unrelated `maximum` messages remain ordinary provider failures.
 
-Code matching takes precedence over message matching subject to the 401/429 exclusion. The OpenAI adapter classifies raw values before redaction/bounding and stores the semantic result beside bounded diagnostics. Overflow recovery consults this classification only for normal Model Steps; a similarly classified summary failure never recursively compacts.
+Code matching takes precedence over message matching subject to the 401/429 exclusion, including when the exact code accompanies an otherwise ineligible status such as 500.
+
+Anthropic's `invalid_request_error` covers unrelated malformed requests, so it is never enough on its own. Recognise only an HTTP 400 `invalid_request_error` with the provider's specific `prompt is too long: <input> tokens > <maximum> maximum` diagnostic, after verifying that shape against a current provider response. A generic HTTP 400/413, `request_too_large` (a request-byte limit), rate limit, overload, `max_tokens` output stop, or a signature-binding error is not context overflow. If the positive signature cannot be verified, leave Anthropic overflow recovery unsupported rather than widening the matcher; automatic thresholds and manual compaction must still work on Anthropic. Neither adapter classifies local response-size limits or transport failures as context overflow. Recovery consults the semantic result only for normal Model Steps; a similarly classified summary failure never recursively compacts.
 
 After recovery starts, composable terminal evidence preserves one initial overflow observation alongside ordinary retry result/evidence. The initial observation owns its bounded structured failure, optional partial generation, and failed pre-compaction normal attempts; immediate overflow before any chunk stores no generation evidence. Retry code/final content or ordinary terminal generation/execution evidence remains the sole retry representation, and retry attempts remain exclusively on that code, Final, Failed, or Cancelled terminal's ordinary attempt field. Session totals include both attempt owners once, but context measurement never treats the initial attempts as post-compaction usage. The initial evidence survives successful final recovery and recovered code whose execution later fails or is cancelled. The final Run message reflects the last surrounding failure. Before retry, a reliable generation-epoch reset separates its live progress from delayed initial chunks while keeping the same durable Model Step. A process crash can lose in-memory evidence/attempts; existing generic interruption recovery uses durable rows only and does not invent them.
 
@@ -98,7 +100,7 @@ reserve_tokens = 16384
 keep_recent_tokens = 20000
 ```
 
-Fields use strict validation and field-wise project precedence. Numeric values must be positive and safely representable. There are no environment, session-preference, runtime-picker, or `Ctrl-S` overrides.
+`enabled` defaults to `true` when omitted, including for existing Phase 2 numeric-only settings. Fields use strict validation and field-wise project precedence. Numeric values must be positive and safely representable. There are no environment, session-preference, runtime-picker, or `Ctrl-S` overrides.
 
 Automatic compaction uses the strict threshold:
 
@@ -106,32 +108,30 @@ Automatic compaction uses the strict threshold:
 context tokens > model context window - reserve tokens
 ```
 
-The subtraction saturates at zero when a configured reserve is at least the selected model's window. When enabled, check before a new user request reaches a provider, between a completed execution and the next Model Step, and after a final response before Run Settlement is reported to the interface. Pre-request measurement and preparation use only the currently selected durable Model Context; the held request is neither measured nor summarised, matching Pi's pre-prompt check. A retained manual compaction suppresses that post-final automatic check, then starts only after terminal publication and `RunSettled`. A non-cancellation threshold failure leaves Model Context unchanged and the existing workflow continues.
+The subtraction saturates at zero when a configured reserve is at least the selected model's window. When enabled, the persisted root Agent checks immediately before each normal Model Step, after the user request or prior execution has committed but before allocating the step. The first check includes the new request in the estimate, while the request remains an ordinary exact retained-tail entry; a later check includes settled execution feedback. No automatic compaction runs before Run admission or after a final response. When nothing can be removed, skip silently and attempt the scheduled step; a non-cancellation provider-started threshold failure persists Failed and also proceeds with unchanged Model Context. The threshold is an estimate with headroom, not a guarantee that the next provider request fits.
 
 `/compact [instructions]` forces preparation below the threshold and remains available when automatic compaction is disabled. Each command receives an immediate Accepted, Busy, or Disabled acknowledgement before later lifecycle events; every acknowledgement, lifecycle transition, and durable card uses the same reliable FIFO event channel rather than lossy progress. The TUI permits only one unacknowledged Compact dispatch and retains a rejected command's exact editor draft. If a foreground Run is active, Runtime retains one pending manual compaction, cancels and settles the Run, then compacts the resulting Active Leaf with a fresh cancellation token. Esc received before that retained operation starts clears it, emits a reliable no-card `Settled(CancelledBeforeStart)` lifecycle, and still lets the already-cancelled Run/correction finish; no later compaction starts. If early-Escape correction is already pending, the retained compaction waits for that correction outcome and then targets whichever Active Leaf remains selected. Additional Submit or Compact commands are rejected busy; this is not a general queue. Background subagents continue because their child histories are isolated until explicitly retrieved.
 
-A recognised provider context overflow compacts and retries the same pending Model Step once. A second overflow, a failed overflow compaction, or any different retry failure settles the Run normally as failed. `enabled = false` disables both threshold compaction and overflow recovery; manual compaction remains available.
+The Run captures one `ModelSelection` at admission. Every normal step, threshold decision, summary budget, overflow compaction and retry in that Run uses it; changes accepted mid-Run apply to the next Run. An idle or retained manual compaction instead captures the then-accepted selection when it starts. A recognised provider context overflow compacts and retries the same pending Model Step once. A second overflow, a failed overflow compaction, or any different retry failure settles the Run normally as failed. `enabled = false` disables both threshold compaction and overflow recovery; manual compaction remains available.
 
 ### Deterministic context measurement
 
-Search attempts newest-first on projected `CompletedCode` and `FinalMessage` entries whose durable Session Entries are descendants of the latest applied compaction. Retained ordinary ancestors appear after the synthetic summary in Model Context order but remain ineligible because their usage measured pre-compaction context; they participate only in full byte-estimation fallback. This includes terminal code only when it projects as completed code. Attempts on failed or cancelled terminals without projected code are ineligible because their output is absent from Model Context. Initial overflow attempts stored in recovery evidence are also always ineligible because they measured the pre-compaction request; only the retry's ordinary owning entry can supply a post-compaction baseline. `KnownUsage` and `KnownUsageWithUntrackedRetries` are both eligible; summary-call attempts are not. Untracked transport retries make cost completeness uncertain, but the final response's usage still measures the context of the response which enters Model Context. The first candidate with a non-zero context count is the baseline:
+Measure the committed selected Model Context immediately before the normal Model Step. Prefer provider usage only for a response under the captured Run's exact model, after the latest applied compaction, when all ordinary replay in the current projection is native to that provider. Search projected `CompletedCode` and `FinalMessage` entries newest-first for usable ordinary attempts; if the newest known response usage belongs to a different model, or any projected replay is foreign, use the full fallback instead of an older baseline. Mixed-provider rendering can change under `cross_provider_reasoning` on resume without changing stored messages, so its previous usage is not a stable baseline. Retained ancestors of an Applied entry are ineligible because their usage describes the pre-compaction prefix. Terminal code is eligible only when it projects as completed code; failed/cancelled terminals without projected code, summary attempts, and initial overflow attempts are never eligible. `KnownUsage` and `KnownUsageWithUntrackedRetries` can contribute when these conditions hold:
 
-1. Use `total_tokens` when present and non-zero.
-2. Otherwise require both `input_tokens` and `output_tokens` and use their checked sum when non-zero.
-3. `cached_input_tokens` and `cache_write_input_tokens` are subsets of Kiki's OpenAI `input_tokens`; `reasoning_output_tokens` is a subset of `output_tokens`. Never add those detail fields again.
-4. Missing, zero, or overflowing candidates are skipped. If none remains, estimate the complete projected context.
+1. Use non-zero `total_tokens` when present.
+2. Otherwise require both `input_tokens` and `output_tokens` and use their checked, non-zero sum.
+3. Both adapters normalise cached input into Kiki's `input_tokens`; cache-read and cache-write fields are subsets, and reasoning output is a subset of `output_tokens`. Never add those details again.
+4. Skip missing, zero, or overflowing candidates. With no eligible baseline, estimate the complete projected context.
 
-The baseline represents context through that assistant response. For a `CompletedCode` or terminal code response, estimate its later execution feedback but do not count its assistant replay again. Then estimate every later projected context segment.
+A usage baseline represents context through that assistant response. For `CompletedCode`, add its later execution feedback, not its assistant replay again; then estimate later projected segments. On the full fallback, count each projected entry for the captured provider's rendering and resolved `cross_provider_reasoning` policy:
 
-Each projected entry contributes these estimation units:
-
-- `UserRequest`: UTF-8 bytes of its text.
-- Compaction summary: UTF-8 bytes of the complete fixed wrapper shown above plus its stored summary.
-- `CompletedCode`, including terminal code: raw bytes of each opaque assistant replay item plus UTF-8 bytes of its execution feedback. Source, commentary, reasoning, and assistant text are not added separately because replay already represents the assistant response.
-- `FinalMessage`: raw bytes of each opaque replay item; its decoded text and reasoning are not added again.
+- `UserRequest`: UTF-8 bytes of its text, including the request just committed before the first Model Step.
+- Compaction summary: UTF-8 bytes of the complete fixed wrapper above plus its stored summary.
+- Native-provider `CompletedCode` and `FinalMessage`: raw bytes of opaque assistant replay items; add execution feedback once for completed code.
+- Foreign-provider `CompletedCode` and `FinalMessage`: UTF-8 bytes of the values in shared `ForeignPart`s, not discarded opaque replay or provider JSON syntax. Count each included reasoning, commentary and final-text part; for a tool call count its call ID, literal tool name `execute_python`, source and execution feedback once each. Apply `drop` to foreign reasoning summaries. Do not add execution feedback again outside the tool-call part.
 - Failed or cancelled terminal records without completed code: zero because they do not enter Model Context.
 
-For a usage baseline inside `CompletedCode`, add only execution-feedback bytes from that same entry. A final-message baseline adds nothing from its own entry. Sum units with saturating arithmetic and divide the aggregate by four, rounding up. Full fallback, trailing additions, and retained-tail selection use this one recipe. It is deterministic and deliberately approximate rather than pretending to be a provider tokenizer.
+Sum units with saturating arithmetic and divide by four, rounding up. Full fallback, trailing additions, and retained-tail selection use one deterministic approximate recipe. Neither a prior provider's usage nor opaque foreign replay may masquerade as the next provider's exact token count. The estimate is for Kiki's selected Model Context, not an exact count of system instructions, tool schema, wire overhead, or future output; reserve headroom and bounded overflow recovery are still necessary.
 
 ### Retained tail and split Runs
 
@@ -167,7 +167,7 @@ Store Pi's system, initial-summary, repeated-compaction, and split-turn-prefix p
 - State "(none identified)" if no useful Arena state is evidenced.
 ```
 
-Serialise the selected prefix with explicit user, assistant reasoning, assistant action, and execution-result labels. Phase 2's implementation plan pins the byte-level mapping of every current Model Context field, separators, wrappers, empty optional fields, split-prefix fallback, and focus suffix. Truncate each execution result to Pi's 2,000-Unicode-scalar summarisation limit without altering durable history. A repeated summary is supplied inside `<previous-summary>` tags. Conversation text is untrusted material to summarise, not an instruction source; fixed system and summary prompts retain authority.
+Serialise the selected prefix with explicit user, assistant reasoning, assistant action, and execution-result labels. For a foreign assistant entry, omit its reasoning summary from new summary inputs when the selected summary provider's resolved `cross_provider_reasoning` is `drop`, as normal cross-provider replay does; leave same-provider reasoning and durable entries unchanged. This does not redact content already included in a stored earlier summary. Phase 2's implementation plan pins the other byte-level mappings, separators, wrappers, empty optional fields, split-prefix fallback, and focus suffix. Truncate each execution result to Pi's 2,000-Unicode-scalar summarisation limit without altering durable history. A repeated summary is supplied inside `<previous-summary>` tags. Conversation text is untrusted material to summarise, not an instruction source; fixed system and summary prompts retain authority.
 
 ### Arena and file continuity
 
@@ -193,9 +193,9 @@ Subject to the process remaining alive through settlement and storage remaining 
 
 Cancellation before a provider attempt starts writes nothing. Failed and cancelled entries remain inspectable and count towards session usage, but Model Context ignores them.
 
-A normal commit verifies that the expected Active Leaf is still selected, reuses its Arena Checkpoint and Run provenance, appends the outcome, and advances the Active Leaf atomically. Compaction is not a Model Step and does not create a synthetic Run or request. Applied, Failed, and Cancelled outcomes are valid branch points: selecting one in `/tree` restores through that entry and a later request becomes its child. Applied changes the projected prefix; Failed and Cancelled retain their parent's Model Context.
+A normal commit verifies that the expected Active Leaf is still selected, reuses its Arena Checkpoint and Run provenance, appends the outcome, and advances the Active Leaf atomically. Threshold compaction happens after its request or preceding execution has committed and inherits that open Run's provenance; overflow compaction happens while its Model Step is pending. Compaction itself creates neither a synthetic Run nor a Model Step. Applied, Failed, and Cancelled outcomes are valid branch points: selecting one in `/tree` restores through that entry and a later request becomes its child. Applied changes the projected prefix; Failed and Cancelled retain their parent's Model Context.
 
-The current single-foreground-operation design makes a stale prepared leaf unreachable. Keep the expected-leaf guard, but do not add speculative off-branch settlement machinery. A mismatch is an invariant/persistence failure: append nothing, leave the current projection unchanged, and disable further state-changing work through existing policy. Storage failure or process loss before append is the physically unavoidable exception to durable outcome recording. Compaction deliberately creates no in-progress Run, Model Step, or transaction journal, so restart recovery does not invent a lost manual, pre-request, inter-step, post-final, or overflow summary attempt.
+The current single-foreground-operation design makes a stale prepared leaf unreachable. Keep the expected-leaf guard, but do not add speculative off-branch settlement machinery. A mismatch is an invariant/persistence failure: append nothing, leave the current projection unchanged, and disable further state-changing work through existing policy. Storage failure or process loss before append is the physically unavoidable exception to durable outcome recording. Compaction deliberately creates no separate in-progress Run, Model Step, or transaction journal, so restart recovery does not invent a lost manual, threshold, or overflow summary attempt. An interrupted containing Run and any pending Model Step use existing generic recovery without replaying work.
 
 The latest applied compaction on selected ancestry controls projection:
 
@@ -215,25 +215,23 @@ Esc cancels the current foreground token. After summary generation settles, orch
 
 - cancellation observed there chooses `Cancelled` when a provider attempt started;
 - otherwise a complete valid summary chooses `Applied`, and a non-cancellation error chooses `Failed`;
-- once the append transaction starts, the chosen outcome wins. Later Esc cannot rewrite or roll back it.
+- once chosen, the outcome wins even if Esc arrives before or during the awaited append transaction. Later Esc cannot rewrite or roll back it, but still cancels the surrounding Run or suppresses an overflow retry.
 
 Cancellation observed by the linearisation point has these surrounding effects:
 
 | Compaction point | Surrounding result |
 | --- | --- |
 | Manual compaction | Leave context unchanged and return idle. |
-| Threshold before request admission | Do not commit or start the submitted Run. |
-| Threshold between Model Steps | Settle the containing Run as cancelled. |
-| Threshold after committed final response | Keep the successful Run and report settlement. |
+| Threshold before the first or a later Model Step | Settle the already admitted Run as cancelled; do not allocate/start another Model Step. |
 | Overflow recovery | Settle the pending Run as cancelled while retaining overflow evidence and accounting. |
 
-If Esc arrives after an `Applied` transaction starts, the compaction remains applied. Manual and post-final work then returns/settles normally; pre-request admission does not start the submitted Run; an in-progress Run settles cancelled before another normal Model Step; overflow recovery does not issue its retry. A cancellation before a summary provider attempt writes no compaction outcome but has the same surrounding result. A manual compaction retained behind correction starts only after correction and `RunSettled`, always preparing against the resulting selected leaf, including when correction is skipped or fails without disabling the Runtime. Esc before `Started` cancels only that retained follow-up through `Settled(CancelledBeforeStart)` while correction/Run settlement continues. If Final or Failed wins the cancellation race and no correction event occurs, terminal publication and `RunSettled` still precede retained manual compaction from that terminal leaf. In either path, settlement which disables state-changing work clears the retained request. Non-cancellation manual failure returns idle. Non-cancellation threshold failure records its attempt and continues. Non-cancellation Failed/NoOp overflow recovery closes the Run with this exact message: `context overflow: {original}\ncompaction recovery failed: {recovery}`. Each substituted component is independently truncated to its first 2,000 UTF-8 bytes at a scalar boundary with no marker, so the complete message is at most 4,047 bytes. `{original}` is the bounded/redacted provider failure display; `{recovery}` is the Failed Compaction diagnostic or literal `compaction could not remove a valid prefix` for NoOp. A Failed Compaction Entry retains its complete separately bounded 4,096-byte diagnostic, while the Run message deliberately repeats only that 2,000-byte excerpt. Storage failure follows existing read-only/disabled policy.
+If Esc arrives after `Applied` is chosen, the compaction remains applied once the append succeeds. Manual work returns normally; a threshold Run settles cancelled without starting the next Model Step; overflow recovery does not issue its retry. A cancellation before a summary provider attempt writes no Compaction Entry but has the same surrounding result. A new request is already durable when the first threshold check starts, so its cancelled Run remains inspectable; there is no held-request preflight or post-final automatic delay. A manual compaction retained behind correction starts only after correction and `RunSettled`, always preparing against the resulting selected leaf, including when correction is skipped or fails without disabling the Runtime. Esc before `Started` cancels only that retained follow-up through `Settled(CancelledBeforeStart)` while correction/Run settlement continues. If Final or Failed wins the cancellation race and no correction event occurs, terminal publication and `RunSettled` still precede retained manual compaction from that terminal leaf. In either path, settlement which disables state-changing work clears the retained request. Non-cancellation manual failure returns idle. Non-cancellation threshold failure records its attempt and continues. Non-cancellation Failed/NoOp overflow recovery closes the Run with this exact message: `context overflow: {original}\ncompaction recovery failed: {recovery}`. Each substituted component is independently truncated to its first 2,000 UTF-8 bytes at a scalar boundary with no marker, so the complete message is at most 4,047 bytes. `{original}` is the bounded/redacted provider failure display; `{recovery}` is the Failed Compaction diagnostic or literal `compaction could not remove a valid prefix` for NoOp. A Failed Compaction Entry retains its complete separately bounded 4,096-byte diagnostic, while the Run message deliberately repeats only that 2,000-byte excerpt. Storage failure follows existing read-only/disabled policy.
 
 Normal Model Steps, failed overflow attempts, and summary calls retain separate attempt accounting. Applied, failed, and cancelled compaction attempts contribute to session totals exactly once. Summary usage never replaces the latest normal context measurement shown in the footer.
 
 ### Presentation
 
-While generating a summary, the status line reads `compacting context`; Esc remains the cancellation control. Compaction is foreground work for submission, tree-navigation, busy, shutdown, and settled-state checks even when no Run ID exists.
+While generating a summary, the status line reads `compacting context`; Esc remains the cancellation control. Automatic threshold/overflow summaries are foreground work inside the containing Run; they do not emit a manual `/compact` acknowledgement or consume its editor draft. Manual compaction keeps the existing foreground operation without a Run ID. Both make submission and tree navigation busy, and use reliable lifecycle/card events rather than lossy model progress.
 
 Applied transcript entries render collapsed by default:
 
@@ -249,10 +247,12 @@ Manual and overflow entries identify their reason. In the transcript, `Ctrl-O` r
 ## Key decisions & tradeoffs
 
 - Session Model ownership over Agent ownership or a standalone Compactor: one authority serves live operation, restoration, and future branch selection.
-- A provider-neutral summarisation operation over OpenAI-specific orchestration: future adapters own their wire formats without a speculative provider registry.
-- The active model and thinking selection over a cheaper fixed summary model: no extra configuration, credentials, or quality policy.
+- The existing provider-neutral summarisation operation over OpenAI/Anthropic-specific orchestration: adapters own wire formats and classify their own errors without a new provider registry.
+- The Run's captured model and thinking selection for every step, summary and retry over a cheaper fixed summary model or mid-Run re-selection: no extra credentials, quality policy, or selection authority.
 - Pi's reserve and retained-tail defaults over percentages: proven behaviour and predictable output headroom.
-- One byte-based estimator over provider tokenisers: deterministic handling of opaque replay with no new dependency, at the cost of not reproducing Pi's UTF-16 arithmetic exactly.
+- One approximate byte-based estimator over provider tokenisers or an extra counting call: deterministic estimates without new dependencies, with model-matched usage baselines and provider-visible foreign history instead of stale cross-provider counts.
+- A just-in-time check before each Model Step over Pi's pre-prompt and post-final checks: the new request contributes to the estimate, final answers settle promptly, and cancelled first-step compaction retains the already committed request.
+- The documented Anthropic `drop_block` binding control over rewriting signed retained replay or accepting persistent post-compaction 400s: unchanged signatures remain native and invalid ones are ignored by the provider.
 - Immutable outcome entries over success-only persistence: failed and cancelled calls remain inspectable and durably accounted.
 - An expected-leaf invariant guard over speculative off-branch settlement: current single-operation sequencing makes stale preparation unreachable.
 - Parent Run provenance over a synthetic compaction Run: compaction is structural post-processing, not a user request or Model Step.
@@ -272,8 +272,10 @@ Manual and overflow entries identify their reason. In the transcript, `Ctrl-O` r
 
 - Summary quality is probabilistic. A summary can omit an important decision or repeat misleading conversation content; immutable history and expansion preserve evidence, but future Model Context still depends on the generated checkpoint.
 - `Arena State` can be stale, incomplete, or type-inaccurate. Its prompt and wrapper must keep that uncertainty visible.
-- Approximate estimation can trigger early or late, especially with opaque replay and large tool results. Overflow recovery covers recognised late cases, not unknown provider failures.
-- Provider overflow diagnostics can change. The deliberately narrow classifier may need a future provider-specific update rather than broad message guessing.
+- Approximate estimation can trigger early or late, especially after model changes and with large tool results. The first-step check includes the new request but still omits an exact provider tokenisation, system/tool overhead and future output. Overflow recovery covers only recognised late cases.
+- Anthropic's precise positive token-overflow wording is not guaranteed by its published error type alone. Confirm the narrow `prompt is too long: ... tokens > ... maximum` signal against a current provider response before enabling its matcher; if unverified, treat it as an ordinary failure rather than confusing byte-size, signature, authentication or rate-limit errors with context overflow. The documented signed-thinking binding control also needs fixture coverage and an opt-in live compaction smoke test.
+- Checking every Model Step against a Session snapshot that currently loads all entries can become expensive on long or heavily branched sessions. Demonstrate an acceptable below-threshold path without adding a second context authority.
+- Provider overflow diagnostics can change. Narrow classifiers may need provider-specific updates rather than broad message guessing.
 - Normalised workspace-relative file paths are sensitive local data. They already exist transiently in tool effects; this change additionally persists them and later exposes cumulative paths to the selected model through summaries and Applied tree copy.
 - File continuity is best-effort. Cancellation can win after an external effect but before its result is observed, and legacy Session Entries contain no path metadata.
 - A single indivisible retained entry can exceed both `keep_recent_tokens` and the provider window. The bounded retry then fails visibly; this change does not chunk one execution.
@@ -286,13 +288,14 @@ Manual and overflow entries identify their reason. In the transcript, `Ctrl-O` r
 - Existing persisted Session tree and immutable-entry rules: [Persisted session trees](../2026-09-15_session-trees/spec.md), its [interactive navigation plan](../2026-09-15_session-trees/phase-2_plan.md), and [tree UX plan](../2026-09-15_session-trees/tree-ux_plan.md).
 - Current merge-impact analysis: [Session-tree merge impact on compaction](../research/2026-09-21_session-tree-compaction-impact.md).
 - Existing Monty limitations and opaque checkpoint guarantees: [Monty feasibility](../research/2026-08-26_monty-feasibility.md).
-- Immutable npm package `@earendil-works/pi-coding-agent@0.85.1` (integrity `sha512-FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ==`) and Pi session-format documentation supply the behavioural and prompt baseline inspected during planning. Kiki copies the four prompt resources into this repository and has no runtime Pi dependency.
-- Existing OpenAI Responses API adapter, layered TOML settings, SQLite session storage, Runtime worker, transcript cards, and global expansion control. No new crate is required.
+- Immutable npm package `@earendil-works/pi-coding-agent@0.85.1` (integrity `sha512-FGRN+OHbWaefBPGaTggAdLjrIHW+s2PzLyglz/5dfLzb9of7uuXMXYC0fJIeZTw+shS32o2cuQ9jF7YSDuL/oQ==`) supplied the original summary/prompt baseline. Installed Pi 0.87.1 confirms the pre-prompt check excludes the incoming prompt (`dist/core/agent-session.js:1273`); Kiki intentionally diverges. Kiki has no runtime Pi dependency.
+- [Anthropic API errors](https://platform.claude.com/docs/en/api/errors#thinking-block-no-longer-matches-the-conversation) document signed-thinking prefix binding and the `thinking-binding-controls-2026-08-01` beta; [request size limits](https://platform.claude.com/docs/en/api/errors#request-size-limits) distinguish HTTP 413 byte limits from context tokens. Pi 0.87.1's overflow matcher lists a candidate Anthropic prompt-too-long phrase (`pi-ai/dist/utils/overflow.js:9`), not a guarantee of current Anthropic wording.
+- Existing OpenAI and Anthropic adapters, layered TOML settings, SQLite session storage, Runtime worker, transcript cards, and global expansion control. No new crate is required.
 
 ## Phase outline
 
 Each phase is one reviewed PR. Later phases build on accepted behaviour and interfaces rather than carrying temporary alternatives.
 
-1. **Canonical Session Model context** — Move root Model Context ownership out of Agent and into the Session Model while preserving all existing live, restored, navigated, subagent, correction, replay, and durability behaviour. Demonstrate that live continuation, branch selection, and restart use the same committed projection.
-2. **Manual compaction and continuity** — Advance sessions to format version 2; add `reserve_tokens` and `keep_recent_tokens` settings, prompt resources, provider summarisation, deterministic preparation, best-effort file-operation persistence, durable outcomes/projection, transcript/tree presentation, and `/compact [instructions]`. Demonstrate manual/repeated compaction, direct tree selection and branching, restart, exact Arena continuity, cumulative modified-dominates-read files, correction-following queueing, and selected/off-branch accounting. The `enabled` field remains absent because no automatic behaviour exists yet.
-3. **Automatic compaction and recovery** — Add the `enabled` setting, all three threshold boundaries, OpenAI overflow classification, and one compact-and-retry of the same pending Model Step. Demonstrate bounded recovery and the complete cancellation matrix.
+1. **Canonical Session Model context (merged)** — Root Model Context ownership moved from Agent to the Session Model; live continuation, branch selection and restart use the committed projection.
+2. **Manual compaction and continuity (merged)** — Format-v2 sessions, numeric compaction settings, summary resources, deterministic preparation, file-operation evidence, durable outcomes and `/compact [instructions]` are available. `enabled` remains invalid until Phase 3.
+3. **Automatic compaction and recovery (next)** — Add `enabled`, one just-in-time threshold check before each normal Model Step, provider-aware measurement and summary input, Anthropic retained-thinking compatibility, narrow provider-specific overflow meaning and one same-step compact-and-retry. Demonstrate cancellation, branch/accounting continuity and bounded recovery without pre-request or post-final automatic work.
