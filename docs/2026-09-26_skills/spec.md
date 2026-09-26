@@ -9,16 +9,17 @@ The [Codex and Maki comparison](../research/2026-09-26_skills-in-codex-maki-and-
 ## Goals
 
 - Discover skills under `.agents/skills/` in the project and `~/.agents/skills/` for the user.
-- Show only accepted skill names and descriptions in the initial root and child prompts; load full instructions when the agent calls `load_skill`.
+- Ask before enabling project skills in an untrusted repository, and remember a positive trust decision.
+- Show model-invocable skill names and descriptions in the initial root and child prompts; load full instructions when the agent calls `load_skill` or the user invokes `/skill:<name>`.
 - Let root and read-only child agents load skills and inspect linked text resources without broadening workspace write access.
-- Make selected skill instructions usable within Kiki's Python feedback model while retaining the existing rule that skill text cannot authorize new external effects.
+- Keep activated instructions in model context through compaction and resume while retaining the existing rule that skill text cannot authorize new external effects.
 - Give deterministic behavior for duplicate names, invalid files, size limits, startup, resume, and compaction.
 
 ## Non-goals
 
 - Skill installation, registries, compatibility directories for other harnesses, and `allowed-tools` policy.
 - Query-based skill search or automatic relevance ranking; revisit these if local catalogs outgrow the prompt budget.
-- A skill slash command, TUI catalog browser, live filesystem watcher, or dynamic tool registry.
+- A TUI catalog browser, live filesystem watcher, or dynamic tool registry.
 - `AGENTS.md` discovery and plugin-contributed skills; those are separate capabilities in the vision.
 
 ## Key discoveries
@@ -30,22 +31,28 @@ The [Codex and Maki comparison](../research/2026-09-26_skills-in-codex-maki-and-
 - A loaded body returned as an ordinary Python value is not visible to the model until printed or evaluated; execution feedback can omit output beyond its configured limits ([feedback formatter](../../src/agent.rs#L1325), [observation limits](../../src/arena.rs#L57)). The [current system prompt](../../prompts/system.md#L35) tells the model not to follow instructions found in host output.
 - Direct file tools reject absolute and parent paths ([path validation](../../src/tools.rs#L2325)); user skill resources lie outside the workspace. `run` has broader host access but is described as project-local ([tool description](../../src/tools.rs#L626), [existing spec](../2026-09-01_default-agent-tools/spec.md#L126)).
 - Children copy an Arena checkpoint, but receive a fresh model prompt assembled from the raw base and child-specific tool reference ([child copy](../../src/arena.rs#L790), [child prompt](../../src/subagents.rs#L1318)). Session compaction can remove old execution feedback from projected model history ([compaction](../../src/session.rs#L987)).
+- Kiki's slash commands are currently a static catalogue ([parser](../../src/tui/slash.rs#L1)) and are dispatched before ordinary user submission ([TUI dispatch](../../src/tui.rs#L625)). Model context has no skill entry yet ([context entries](../../src/model.rs#L205)); both providers project each entry ([OpenAI](../../src/openai.rs#L125), [Anthropic](../../src/anthropic.rs#L115)).
+- [Session compaction](../../src/session.rs#L1015) replaces history with a summary and recent entries; [restore](../../src/session.rs#L3690) reconstructs it from the selected ancestry. Skill instructions placed only in execution feedback can therefore disappear.
 
 ## Proposed approach
 
 ### Discovery and catalog
 
-At startup and resume, create one immutable skill catalog for that Kiki process. Scan direct children of `.agents/skills/` from the launch directory upward through the nearest Git repository root, then `~/.agents/skills/`. If no Git root is found within 32 ancestors, use only the launch directory and user root. A nearer project directory wins over a farther project directory, and any project skill wins over a user skill with the same name. If the highest-priority root containing a name has duplicate candidates for it, that name is ambiguous even if a lower-priority root has one valid candidate; `load_skill` reports the conflict. Duplicates in lower-priority roots cannot invalidate a selected higher-priority skill. Missing roots are empty. Ancestor discovery follows Kiki's repository-scoped project-instruction model ([vision](../VISION.md#L114)).
+Before reading project skill files on fresh launch or resume, detect whether any project `.agents/skills/` directory is present from the launch directory to the nearest Git root within the same 32-ancestor discovery bound. On resume, an active project skill from that same scope also triggers the check, even if its directory is gone. If the canonical repository root has no saved positive trust decision, show a startup popup naming that root. The default choice skips project skills for this process; choosing Trust includes them and atomically saves the canonical root in a user-owned trust store. A skipped or cancelled decision is not remembered, so Kiki asks again on the next launch. With no Git root inside the bound, check only the launch directory and use its canonical path as the trust scope. User skills need no repository trust. Project settings cannot grant it. A failed trust save leaves project skills disabled and shows the error. Resume with `--here` uses the effective new workspace for this check; activations from a different prior trust scope stay suppressed. No popup appears when neither a project skill directory nor an in-scope active project skill is present.
 
-Each candidate is a directory containing a UTF-8 `SKILL.md` with YAML frontmatter and a nonempty body. Frontmatter requires a nonempty string `description`; an omitted `name` defaults to the directory name. Names use lowercase ASCII letters, digits, and hyphens, start and end with a letter or digit, and are at most 64 bytes. Descriptions are flattened to one line and limited to 1,024 UTF-8 bytes. A complete `SKILL.md` is limited to 64 KiB and 700 lines; oversized files are rejected rather than partially loaded. The entire rendered catalog, including guidance and omission notice, is limited to 16 KiB and 32 accepted entries. Enumerate at most 129 entries from each project root, or one more than the remaining 128-entry project budget if smaller; the user root has a separate 128-entry budget. Skip an entire root if it exceeds its budget, so filesystem iteration order cannot choose a partial set. For roots within budget, consider candidates in source priority order, then directory-name order; after precedence and ambiguity resolution, sort final entries by skill name. When the catalog entry or byte cap is reached, omit remaining names in sorted order and report the omission. Omitted skills are unavailable to `load_skill` in that process. Report each skipped over-budget root. These limits cover the existing local skills while staying below Kiki's 800-line execution-feedback head limit for a printed body ([observation limits](../../src/arena.rs#L57)).
+At startup and resume, create one immutable skill catalog for that Kiki process from the trusted roots. Scan direct children of `.agents/skills/` from the launch directory upward through the nearest Git repository root, then `~/.agents/skills/`. If no Git root is found within 32 ancestors, use only the launch directory and user root. A nearer project directory wins over a farther project directory, and any project skill wins over a user skill with the same name. If the highest-priority root containing a name has duplicate candidates for it, that name is ambiguous even if a lower-priority root has one valid candidate; activation reports the conflict. Duplicates in lower-priority roots cannot invalidate a selected higher-priority skill. Missing roots are empty. Ancestor discovery follows Kiki's repository-scoped project-instruction model ([vision](../VISION.md#L114)).
 
-Discovery roots and candidate directories may be symlinks. Resolve them once at catalog creation, and accept project targets only inside the canonical repository root (or launch directory without Git) and user targets only inside the canonical home directory. A symlinked candidate opts its entire target directory into skill resource reads; Kiki confines those reads to that directory, even if it contains files beyond `SKILL.md`. Keep an open directory handle for each accepted skill as its resource boundary. Reject a `SKILL.md` reached through an inner symlink. Invalid, unreadable, or out-of-bound candidates are excluded with diagnostics; an explicit load of their name reports the reason where one can be identified. Retain the complete accepted file bytes and metadata in the process catalog so the advertised description and loaded body agree; changes on disk become available at the next launch or resume.
+Each candidate is a directory containing a UTF-8 `SKILL.md` with YAML frontmatter and a nonempty body. Frontmatter requires a nonempty string `description`; an omitted `name` defaults to the directory name. `disable-model-invocation` is an optional boolean, defaulting to `false`; a true value makes the skill direct-invocation only. Names use lowercase ASCII letters, digits, and hyphens, start and end with a letter or digit, and are at most 64 bytes. Descriptions are flattened to one line and limited to 1,024 UTF-8 bytes. A complete `SKILL.md` is limited to 64 KiB and 700 lines; oversized files are rejected rather than partially loaded. Accept at most 32 model-invocable and 32 direct-only skills; direct-only skills do not consume prompt slots. The entire rendered catalog, including guidance and omission notice, is limited to 16 KiB. Enumerate at most 129 entries from each project root, or one more than the remaining 128-entry project budget if smaller; the user root has a separate 128-entry budget. Skip an entire root if it exceeds its budget, so filesystem iteration order cannot choose a partial set. For roots within budget, consider candidates in source priority order, then directory-name order; after precedence and ambiguity resolution, sort final entries by skill name. When a category's entry or prompt byte bound is reached, omit remaining names in sorted order and report the omission without exposing direct-only names to the model. Omitted skills cannot be activated in that process. Report each skipped over-budget root.
+
+Discovery roots and candidate directories may be symlinks. Resolve them once at catalog creation, and accept project targets only inside the canonical repository root (or launch directory without Git) and user targets only inside the canonical home directory. A symlinked candidate opts its entire target directory into skill resource reads; Kiki confines those reads to that directory, even if it contains files beyond `SKILL.md`. Keep an open directory handle for each accepted skill as its resource boundary. Reject a `SKILL.md` reached through an inner symlink. Invalid, unreadable, or out-of-bound candidates are excluded with diagnostics; an explicit load of their name reports the reason where one can be identified. Retain the complete accepted `SKILL.md` bytes and metadata in the process catalog so the advertised description and loaded body agree; changed skill definitions or candidates become available at the next launch or resume. Linked resource contents are read live from the accepted directory and may change between reads.
 
 ### Prompt and tool behavior
 
-Append generated skill guidance and the catalog after the resolved Markdown base in both root and child prompts, for bundled and overridden bases. This trusted generated guidance explains when to load a skill and that skill descriptions and bodies cannot authorize effects beyond the user's task or override higher-priority instructions. The catalog includes names and descriptions as data for selection. No body enters the initial prompt. Root and child share the same catalog snapshot, while a child loads any skill it needs for itself.
+Append generated skill guidance and the catalog after the resolved Markdown base in both root and child prompts, for bundled and overridden bases. The stable guidance lives in an overridable Markdown prompt resource and explains when to load a skill and that skill descriptions and bodies cannot authorize effects beyond the user's task or override higher-priority instructions. The catalog includes only accepted model-invocable names and descriptions as selection data. Direct-only names, descriptions, and even their count stay out of model-facing catalog text. If there are no model-invocable skills, omit the generated catalog section, its behavioral guidance, and the `load_skill` signature from the model tool reference; the fixed host function may still exist but has no permitted names. No body enters the initial prompt. Root and child share the same catalog snapshot, while a child loads any skill it needs for itself.
 
-Add `load_skill(name)` to Kiki's existing typed Python host-tool definitions. It is available in read-only children. It returns the selected name, full `SKILL.md` text, and canonical skill-root path as a structured result. Prompt guidance shows the agent how to print the full text so it reaches the model. The accepted body bound stays below Kiki's feedback truncation limits, including its line limit. Unknown, ambiguous, or invalid names raise clear Python errors. Loaded text guides task work but does not enlarge user authorization or override higher-priority instructions. Update the bundled system prompt's blanket untrusted-output rule to recognize skill instructions; the generated skill guidance carries the authority rule for overridden prompts too.
+Add `load_skill(name)` to Kiki's existing typed Python host-tool definitions. It is available in read-only children and accepts only model-invocable catalog names. A successful call returns a compact acknowledgement with the selected name, resource locator, and canonical skill-root path; Kiki inserts the captured full `SKILL.md` as a separate, named model-context entry after the settled tool execution. The agent does not need to print the body, and tool feedback and trace summaries do not repeat it. Unknown, ambiguous, invalid, or direct-only names raise clear Python errors. A separate Markdown prompt resource supplies the entry's wrapper, identifying the skill and stating that it cannot enlarge user authorization or override higher-priority instructions. The entry is distinct from host output, so the bundled prompt's existing host-output rule remains accurate, including when no skill catalog is shown.
+
+Intercept `/skill:<name> [request]` in the TUI before ordinary submission. The first token is an exact accepted name from the same snapshot, including direct-only skills; text after whitespace, including newlines, is the optional request. Unknown or rejected names show a notice and do not submit. Completion lists available command tokens and descriptions for the user, including direct-only skills. The command activates the skill before running the request. A bare `/skill:<name>` starts a turn asking the assistant to use that skill, allowing it to request task details. The command text is not used as an instruction to make the model call `load_skill`.
 
 ### Linked resources
 
@@ -53,13 +60,18 @@ Add a read-only `skill://<name>/<relative-path>` locator for the existing `read`
 
 ### Lifecycle and diagnostics
 
-Fresh and resumed root agents, children, and the tool host use one catalog snapshot. After compaction, the catalog remains in the system prompt and the agent can reload a needed body. The full text is visible in durable execution feedback when the agent prints it, using Kiki's existing session mechanism. A skill's contents never establish permission for deployments, writes outside the task, or other external effects.
+Fresh and resumed root agents, children, and the tool host use one catalog snapshot. A successful root activation persists its name, captured body, origin, and trust scope in session ancestry. Each branch projects at most one active entry per name into both providers' model context. Repeating an activation from the same unchanged candidate is a no-op; if the selected snapshot has a different source or body, explicit activation replaces that name's projected body on the branch. Branching before an activation does not inherit it. Compaction retains active entries outside the summarised history, includes their cost in context accounting, and does not duplicate their bodies. Resume restores the exact activated bodies from the selected branch, even if the current catalog has changed; another explicit activation can select the changed snapshot. A child uses the same activation and deduplication rules within its in-memory run; it does not inherit a parent's activated instructions automatically.
+
+Limit the combined active instruction text to 256 KiB per model context. If another activation would exceed that bound, report a clear error and leave the active set unchanged. On resume, a project-origin entry reaches the model only when its recorded trust scope matches the effective workspace scope and that scope is trusted for this process. Skipping trust prevents project skill resource reads, while leaving user skill entries available. A skill's contents never establish permission for deployments, writes outside the task, or other external effects.
 
 ## Key decisions and trade-offs
 
 - Advertise the small local catalog's names and descriptions up front, following the [Agent Skills progressive-disclosure pattern](https://agentskills.io/specification#progressive-disclosure). Defer search until catalog size makes the prompt budget a practical limit; adding search then requires a searchable index separate from the rendered prompt cap.
 - Use Kiki's Python tool path for `load_skill`; Maki's separate model tool would add a second action surface ([Kiki tool architecture](../../src/tools.rs#L589), [Maki tool registration](../../.research/maki/source/plugins/skill/init.lua#L136)).
-- Capture the catalog and bodies at launch or resume for consistency; the bounded 64 KiB per accepted file and 32-entry catalog keep snapshot memory finite. Maki's startup catalog plus per-call rescan can disagree after filesystem changes ([Maki startup](../../.research/maki/source/plugins/skill/init.lua#L132), [Maki handler](../../.research/maki/source/plugins/skill/init.lua#L163)).
+- Keep `disable-model-invocation: true` skills out of model-facing discovery and `load_skill`; the explicit `/skill:<name>` command can still activate them. The TUI can show direct-only names to the user.
+- Deliver activated instructions in a dedicated durable model-context entry. Returning them only as Python output would require printing, is subject to feedback truncation, and can be discarded by compaction.
+- Remember only positive repository trust in user-owned settings. A skipped project is offered again next launch; the project cannot approve itself.
+- Capture the catalog and bodies at launch or resume for consistency; the bounded 64 KiB per accepted file and 64-entry combined cap keep snapshot memory finite. Maki's startup catalog plus per-call rescan can disagree after filesystem changes ([Maki startup](../../.research/maki/source/plugins/skill/init.lua#L132), [Maki handler](../../.research/maki/source/plugins/skill/init.lua#L163)).
 - Give skill resources a named read-only locator; Kiki's normal direct paths are confined to the workspace ([normalisation](../../src/tools.rs#L2325)).
 - Resolve names by nearest project source, then user source; conflicting metadata names at one source do not silently pick a winner.
 - Return a load error for oversized `SKILL.md` rather than a truncated instruction document.
@@ -71,6 +83,7 @@ Fresh and resumed root agents, children, and the tool host use one catalog snaps
 - A project skill can contain adversarial instructions. Prompt wording must let the agent use its workflow while keeping the user's task and Kiki's tool boundary authoritative.
 - Skill scripts run through the existing shell tool, whose host access is broader than Kiki's direct file tools. Returning the skill root does not grant authorization to run a script.
 - The current session format does not store a skill manifest or exact prompt provenance ([session metadata](../../src/session.rs#L372)); a resumed process can discover a different catalog from the one used earlier.
+- A resumed process may have an older pinned `SKILL.md` body while linked resource files have changed on disk. Instructions remain reproducible on the selected branch; resource reads use the current accepted directory snapshot and may differ from the earlier files.
 
 ## Dependencies
 
@@ -82,44 +95,74 @@ Fresh and resumed root agents, children, and the tool host use one catalog snaps
 
 ### Overall validation
 
-Use isolated temporary project and user directories with real `SKILL.md` fixtures. Verify the generated root and child prompts, Python host calls through Monty, read-only child behavior, resource containment, and restart behavior. Run `just format`, `just check`, `just lint`, and `just test` in the `work/skills` worktree after implementation; the runtime version comes from the existing `just monty` prerequisite.
+Use isolated temporary project and user directories with real `SKILL.md` fixtures. Verify trust on fresh and resumed startup, catalog and direct-only filtering, root and child prompts, Python and slash activation, provider projections, compaction and branching, resource containment, and restart behavior. Run `just format`, `just check`, `just lint`, and `just test` in the `work/skills` worktree after implementation; the runtime version comes from the existing `just monty` prerequisite.
 
 ### Task 1: Discover a bounded catalog
 
-**Changes** — Add a skill module that locates project and user roots, parses metadata, applies precedence and bounds, retains accepted full bodies, and reports invalid or ambiguous entries. Resolve the catalog once for fresh and resumed startup.
+**Changes** — Add a skill module that locates project and user roots, parses metadata including `disable-model-invocation`, applies precedence and bounds, retains accepted full bodies, and reports invalid or ambiguous entries. Keep model-visible and direct-only entries separate within one snapshot.
 
-**Tests** (`src/skills.rs`, unit) — Missing roots; `.git` directory and worktree file; ancestor precedence; project versus user override; duplicate names in the highest-priority and lower-priority roots; absent or invalid frontmatter; invalid UTF-8; exact boundary and over-boundary cases for every cap; an over-budget root skipped regardless of directory iteration order; deterministic catalog omission; symlinked roots/directories inside their allowed boundary and rejection of outside targets; `SKILL.md` symlink rejection.
+**Tests** (`src/skills.rs`, unit) — Missing roots; `.git` directory and worktree file; ancestor precedence; project versus user override; duplicate names in the highest-priority and lower-priority roots; absent or invalid frontmatter and boolean opt-out; invalid UTF-8; exact boundary and over-boundary cases for each cap; direct-only skills do not consume prompt slots or reveal names in omission text; an over-budget root skipped regardless of directory iteration order; deterministic omission; symlinked roots/directories inside their allowed boundary and rejection of outside targets; `SKILL.md` symlink rejection.
 
-**Files** — Create: `src/skills.rs`. Modify: `src/main.rs`, `src/config.rs`, `Cargo.toml`, `Cargo.lock`.
+**Files** — Create: `src/skills.rs`. Modify: `src/main.rs`, `Cargo.toml`, `Cargo.lock`.
 
-**Verification** — `just check` compiles the new parser and startup flow; targeted skill module tests pass.
+**Verification** — Targeted skill module tests pass; `just check` compiles the new module.
 
-### Task 2: Advertise skills in root and child prompts
+### Task 2: Gate project skills at startup
 
-**Changes** — Render the same bounded, sorted catalog for bundled and overridden root prompts and for child prompts. Keep the raw base prompt canonical and avoid duplicate tool references. Add concise trigger and loading guidance in Markdown.
+**Changes** — Before constructing a fresh or resumed model and tool host, show a TUI popup for a project skill directory whose canonical trust scope lacks a saved positive decision. Save Trust only in user-owned settings; Skip applies for one process. Build one catalog from the resulting roots and pass it to startup components. Configuration-only startup and session listing do not prompt.
 
-**Tests** (`src/prompt.rs`, unit; `src/subagents.rs`, prompt construction) — Names and descriptions appear once; bodies do not appear initially; bundled and overridden root/child bases include the skill authority rule; read-only children see the same available skills with only their permitted tool signatures.
+**Tests** (`src/skills.rs` and `src/config/settings.rs`, unit; `src/tui.rs` and `src/main.rs`, startup) — No popup without project skills or matching active entries, or for a trusted root; Trust survives the next launch; Skip and cancel re-prompt next launch; default is Skip; failed save cannot enable project skills; project configuration cannot self-approve; no-Git scope and worktree Git file resolve correctly; resume with a removed skill directory still prompts for an active in-scope entry; `--here` checks the effective workspace and suppresses old-scope activations; skipped project skills never reach prompts, host calls, or child runners, while user skills remain.
 
-**Files** — Modify: `src/prompt.rs`, `src/config.rs`, `src/main.rs`, `src/subagents.rs`, `prompts/system.md`, `prompts/subagent.md`.
+**Files** — Modify: `src/skills.rs`, `src/config/settings.rs`, `src/config.rs`, `src/main.rs`, `src/tui.rs`.
 
-**Verification** — Prompt and subagent focused tests pass; `just check` succeeds.
+**Verification** — Targeted trust and startup tests pass; `just check` succeeds.
 
-### Task 3: Load full instructions through Python
+### Task 3: Persist and project activated instructions
 
-**Changes** — Add the read-only `load_skill` host definition, generated record shape, dispatcher, and bounded errors. Keep tool tracing free of skill contents. Clarify in the system prompt how the agent exposes and applies a returned body.
+**Changes** — Add a named skill activation to model history and selected session ancestry, project it for both providers, deduplicate it by name on each branch, and keep its captured body through compaction and restore. Count protected text toward context usage and enforce the combined active-text bound. Suppress project-origin activations when trust is skipped on resume.
 
-**Tests** (`src/tools.rs`, unit; `src/arena.rs`, Monty integration; `src/agent.rs`, feedback) — Accepted body arrives complete through `print`; unknown/ambiguous/invalid names report useful errors; oversized body is rejected; read-only children can load; body text does not leak into trace summaries; a newly constructed catalog sees changed files.
+**Tests** (`src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/compaction.rs`, unit and session integration) — Full body appears once in each provider's next request; duplicate activation adds no second copy and changed source or body replaces the old projection; an earlier branch excludes a later activation; compaction preserves active bodies outside summaries and charges their cost; resume restores exact bytes until reactivation; skipped trust or a different `--here` scope suppresses project-origin entries and permits a user-skill fallback with the same name; boundary and over-boundary active-text totals return the documented result.
 
-**Files** — Modify: `src/tools.rs`, `src/arena.rs`, `src/agent.rs`, `prompts/system.md`.
+**Files** — Create: `prompts/skill-activation.md`. Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `src/session.rs`, `src/session/codec.rs`, `src/session/schema.sql`, `src/compaction.rs`, `src/prompt.rs`, `src/config.rs`.
+
+**Verification** — Focused provider, session, and compaction tests pass; `just check` succeeds.
+
+### Task 4: Activate model-selected skills through Python
+
+**Changes** — Add the read-only `load_skill` host definition and dispatcher. On successful, settled tool execution, persist the selected activation before the next model step and return only a compact acknowledgement to Python. Keep the body out of execution feedback and traces. Only model-invocable names can enter through this path.
+
+**Tests** (`src/tools.rs`, unit; `src/arena.rs` and `src/agent.rs`, integration) — Accepted body reaches the next model step without `print`; unknown, ambiguous, invalid, oversized, and direct-only names report useful errors; failed or cancelled execution does not activate; read-only children can load model-invocable skills; trace summaries omit body text; a new process sees changed files for newly activated names.
+
+**Files** — Modify: `src/skills.rs`, `src/tools.rs`, `src/arena.rs`, `src/agent.rs`, `src/session.rs`.
 
 **Verification** — Focused tool, Arena, and agent tests pass; `just check` succeeds.
 
-### Task 4: Open linked skill resources safely
+### Task 5: Advertise the visible catalog
 
-**Changes** — Resolve `skill://` paths in `read` and `list_dir` through the selected skill's directory handle. Preserve workspace-only mutation rules and existing output bounds. Document how a selected skill links to references and scripts.
+**Changes** — Render the same bounded, sorted model-invocable catalog for bundled and overridden root and child prompts. Omit the generated section and guidance entirely when it has no entries. Keep the raw base prompt canonical and avoid duplicate tool references.
 
-**Tests** (`src/tools.rs`, unit; `src/arena.rs`, Monty integration; `src/main.rs` and `src/agent.rs`, wiring) — Project and user skill resources read correctly; listing works; absolute, parent, and symlink escape attempts fail; replacing a discovered skill directory cannot redirect a read; workspace writes remain gated; skill-resource reads never authorize a later `write`. Fresh and resume startup paths pass one catalog snapshot to the prompt, tool host, and child runner; a resumed process sees a changed skill, and a compacted session can load the same skill body again through its retained host.
+**Tests** (`src/prompt.rs` and `src/tools.rs`, unit; `src/subagents.rs`, prompt construction) — Names and descriptions appear once; direct-only names and bodies do not appear; no visible skills produces no generated skill section, guidance, or model-facing `load_skill` signature; bundled and overridden root and child bases include the authority rule when applicable; read-only children see the same visible catalog with only their permitted tool signatures.
 
-**Files** — Modify: `src/skills.rs`, `src/tools.rs`, `src/arena.rs`, `src/main.rs`, `src/agent.rs`, `prompts/system.md`, `README.md` (authoring, precedence, loading, resources, and restart behavior).
+**Files** — Create: `prompts/skills-catalog.md`. Modify: `src/prompt.rs`, `src/tools.rs`, `src/config.rs`, `src/main.rs`, `src/subagents.rs`.
+
+**Verification** — Focused prompt and subagent tests pass; `just check` succeeds.
+
+### Task 6: Activate user-selected skills with `/skill:<name>`
+
+**Changes** — Parse and complete dynamic `/skill:<name>` commands, including direct-only skills. Pass the exact selection through runtime handling so activation is persisted before the associated user request is run. Show clear notices for unknown or unavailable names. A bare command starts a turn using the skill.
+
+**Tests** (`src/tui/slash.rs`, unit; `src/tui.rs` and `src/runtime.rs`, integration) — Completion includes accepted direct-only names but untrusted project names stay absent; command parsing respects exact names and optional request; bare and request forms activate before the model step; unknown or rejected names submit nothing; deduplicated invocation uses the existing body; navigation to a branch before invocation removes it.
+
+**Files** — Modify: `src/tui/slash.rs`, `src/tui.rs`, `src/runtime.rs`, `src/session.rs`, `src/skills.rs`.
+
+**Verification** — Focused slash, TUI, and runtime tests pass; `just check` succeeds.
+
+### Task 7: Open linked skill resources safely
+
+**Changes** — Resolve `skill://` paths in `read` and `list_dir` through the selected skill's directory handle. Preserve workspace-only mutation rules and existing output bounds. Document authoring, trust, loading, direct invocation, and linked resources.
+
+**Tests** (`src/tools.rs`, unit; `src/arena.rs`, Monty integration; `src/main.rs` and `src/agent.rs`, wiring) — Project and user skill resources read correctly; listing works; absolute, parent, and symlink escape attempts fail; replacing a discovered skill directory cannot redirect a read; workspace writes remain gated; skill-resource reads never authorize a later `write`; live resource edits appear within one process while changed `SKILL.md` bodies need a new catalog; skipped trust denies project resources.
+
+**Files** — Modify: `src/skills.rs`, `src/tools.rs`, `src/arena.rs`, `src/main.rs`, `src/agent.rs`, `README.md`.
 
 **Verification** — Focused resource and Arena tests pass; `just format`, `just check`, `just lint`, and `just test` pass in the worktree.
