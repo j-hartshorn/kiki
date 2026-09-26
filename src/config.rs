@@ -915,9 +915,6 @@ mod tests {
             rendered.contains("Anthropic API key: present"),
             "{rendered}"
         );
-        assert!(rendered.contains("sent to Anthropic"), "{rendered}");
-        assert!(!rendered.contains("store: false"), "{rendered}");
-        assert!(!rendered.contains("sent to OpenAI"), "{rendered}");
         let ready = configuration
             .ready()
             .expect("Anthropic-only startup is ready");
@@ -1093,17 +1090,6 @@ mod tests {
             "[redacted]"
         );
         assert_eq!(super::redact("abcabcabc".into(), &["abcabc"]), "[redacted]");
-    }
-
-    #[test]
-    fn both_keyed_providers_are_named_in_the_startup_privacy_notice() {
-        let mut input = ready_input("openai-key");
-        input.anthropic_api_key = Some(OsString::from("anthropic-key"));
-        let configuration = resolve_startup(input);
-        let rendered = crate::tui::format_startup_configuration(configuration.snapshot());
-
-        assert!(rendered.contains("sent to OpenAI"), "{rendered}");
-        assert!(rendered.contains("sent to Anthropic"), "{rendered}");
     }
 
     #[test]
@@ -1792,7 +1778,6 @@ mod tests {
         ));
         assert!(rendered.contains("Remediation: Check that MONTY_BIN points to a working monty-runtime 0.0.22 executable, then restart Kiki."));
         assert!(rendered.contains("Remediation: Check the workspace directory permissions and filesystem access, then restart Kiki."));
-        assert!(rendered.contains("store: false disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI."));
         assert!(!rendered.contains(api_key), "{rendered}");
         assert!(!rendered.contains('\x1b'), "{rendered}");
 

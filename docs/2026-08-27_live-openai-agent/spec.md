@@ -101,8 +101,6 @@ Before constructing the Agent, Kiki builds one immutable startup snapshot contai
 
 Startup problems open a read-only TUI configuration view and disable submission. A later OpenAI authentication response is a separate runtime-disabled reason until restart; it does not mutate the startup snapshot. Kiki commits a bounded sanitised failure. Public provider failures may retain HTTP status, a provider error code capped at 256 bytes, and at most 4 KiB of provider message; they never retain request IDs, request bodies, headers, SDK debug output, or credential values. Tests inject the configured key into hostile error fields and prove it is absent from configuration, records, events, and rendering.
 
-The configuration view states that `store: false` disables retained Response objects but does not prevent user requests or workspace content printed by Python from being sent to OpenAI.
-
 ### Explicit model context
 
 Kiki remains authoritative for context and sends `store: false`. Model history contains user requests, final messages, and compound completed-code entries. Completed model outputs retain their readable reasoning summary beside provider-tagged opaque replay items. One completed-code entry structurally contains its canonical source, call identifier, readable summary, opaque replay items, and exactly one execution, cancellation, or failure result. A pending call exists only as local active-step state, so admitted history cannot contain a dangling call.
