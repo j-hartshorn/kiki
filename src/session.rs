@@ -21,7 +21,10 @@ use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
-use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
+use crate::model::{
+    AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation, SkillProjectionPolicy,
+    SummaryRequest,
+};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
@@ -74,6 +77,8 @@ pub(crate) enum SessionError {
     InvalidTransition,
     #[error("session name must not be empty")]
     EmptyName,
+    #[error("skill activation failed: {0}")]
+    SkillActivation(String),
     #[error("subagent task provenance does not identify a stored model step")]
     InvalidTaskProvenance,
 }
@@ -326,6 +331,7 @@ pub(crate) struct RestoredTask {
 pub(crate) struct RequestAdmission {
     pub(crate) run_id: u64,
     pub(crate) request_entry: SessionEntryId,
+    pub(crate) effective_entry: SessionEntryId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +339,9 @@ pub(crate) enum SessionCatalogueKind {
     Start,
     Request {
         text: String,
+    },
+    SkillActivation {
+        name: String,
     },
     Execution {
         source: String,
@@ -436,6 +445,9 @@ pub(crate) enum SessionWriteKind {
     Relocation,
     Name,
     Request,
+    // Used by the model-selected activation path added in Task 4.
+    #[allow(dead_code)]
+    SkillActivation,
     Step,
     Settlement,
     Compaction,
@@ -600,6 +612,7 @@ struct LiveSessionContext {
 struct SessionState {
     connection: Mutex<Connection>,
     model_context: Mutex<Option<LiveSessionContext>>,
+    skill_policy: Mutex<Option<SkillProjectionPolicy>>,
     active_execution_step: Mutex<Option<u64>>,
     _writer_lock: File,
     #[cfg(test)]
@@ -862,6 +875,7 @@ impl Session {
             state: Arc::new(SessionState {
                 connection: Mutex::new(connection),
                 model_context: Mutex::new(None),
+                skill_policy: Mutex::new(None),
                 active_execution_step: Mutex::new(None),
                 _writer_lock: writer_lock,
                 #[cfg(test)]
@@ -899,8 +913,34 @@ impl Session {
     }
 
     pub(crate) fn restore(&self) -> Result<SessionRestore, SessionError> {
+        let policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
         let mut connection = self.connection()?;
-        load_session_restore(&mut connection)
+        load_session_restore(&mut connection, policy.as_ref())
+    }
+
+    pub(crate) fn configure_skill_projection(
+        &self,
+        policy: SkillProjectionPolicy,
+    ) -> Result<(), SessionError> {
+        *self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)? = Some(policy);
+        Ok(())
+    }
+
+    pub(crate) fn has_active_project_skill_in_scope(
+        &self,
+        scope: &Path,
+    ) -> Result<bool, SessionError> {
+        let mut connection = self.connection()?;
+        probe_active_project_skill_in_scope(&mut connection, scope)
     }
 
     pub(crate) fn metadata(&self) -> Result<SessionMetadata, SessionError> {
@@ -966,8 +1006,16 @@ impl SessionWriter {
         &self,
         requested_entry: SessionEntryId,
     ) -> Result<SessionRestore, SessionError> {
-        self.read(move |connection| load_session_restore_at(connection, requested_entry))
-            .await
+        let policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
+        self.read(move |connection| {
+            load_session_restore_at(connection, requested_entry, policy.as_ref())
+        })
+        .await
     }
 
     pub(crate) async fn catalogue(&self) -> Result<SessionCatalogue, SessionError> {
@@ -991,7 +1039,15 @@ impl SessionWriter {
         focus: String,
         reason: CompactionReason,
     ) -> Result<Option<PreparedCompaction>, SessionError> {
-        let snapshot = self.read(load_compaction_snapshot).await?;
+        let skill_policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
+        let snapshot = self
+            .read(move |connection| load_compaction_snapshot(connection, skill_policy.as_ref()))
+            .await?;
         let Some(planner) = crate::compaction::prepare(&snapshot.facts, policy, selection, &focus)
             .map_err(|error| SessionError::Codec(error.to_string()))?
         else {
@@ -1039,6 +1095,11 @@ impl SessionWriter {
             let history = match &outcome {
                 CompactionOutcome::Applied { summary, .. } => {
                     let mut history = ModelHistory::new();
+                    for activation in preparation.planner.protected_skills() {
+                        history
+                            .activate_skill(activation.clone())
+                            .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
+                    }
                     history.append_compaction_summary(summary.clone());
                     for entry in preparation.planner.retained_entries() {
                         append_model_context_entry(&mut history, entry.clone())?;
@@ -1207,15 +1268,66 @@ impl SessionWriter {
         request: String,
         selection: ModelSelection,
     ) -> Result<RequestAdmission, SessionError> {
+        self.commit_request_with_skill(request, selection, None)
+            .await
+    }
+
+    pub(crate) async fn commit_request_with_skill(
+        &self,
+        request: String,
+        selection: ModelSelection,
+        activation: Option<SkillActivation>,
+    ) -> Result<RequestAdmission, SessionError> {
         self.write_context(SessionWriteKind::Request, move |connection, context| {
             let mut history = context.history.clone();
             history.append_user_request(request.clone());
-            let admission =
-                commit_request(connection, &request, selection, context.effective_entry)?;
-            context.effective_entry = admission.request_entry;
+            let changed = if let Some(activation) = &activation {
+                history
+                    .activate_skill(activation.clone())
+                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?
+            } else {
+                false
+            };
+            let admission = commit_request(
+                connection,
+                &request,
+                selection,
+                context.effective_entry,
+                activation.as_ref().filter(|_| changed),
+            )?;
+            context.effective_entry = admission.effective_entry;
             context.history = history;
             Ok(admission)
         })
+        .await
+    }
+
+    #[allow(dead_code)] // Task 4 calls this after settled Python execution.
+    pub(crate) async fn commit_skill_activation(
+        &self,
+        run_id: u64,
+        activation: SkillActivation,
+    ) -> Result<bool, SessionError> {
+        self.write_context(
+            SessionWriteKind::SkillActivation,
+            move |connection, context| {
+                let mut history = context.history.clone();
+                let changed = history
+                    .activate_skill(activation.clone())
+                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
+                let entry = commit_skill_activation(
+                    connection,
+                    run_id,
+                    context.effective_entry,
+                    changed.then_some(&activation),
+                )?;
+                if let Some(entry) = entry {
+                    context.effective_entry = entry;
+                    context.history = history;
+                }
+                Ok(changed)
+            },
+        )
         .await
     }
 
@@ -1499,6 +1611,7 @@ fn commit_request(
     request: &str,
     selection: ModelSelection,
     expected_parent: SessionEntryId,
+    activation: Option<&SkillActivation>,
 ) -> Result<RequestAdmission, SessionError> {
     let payload = codec::encode_request(request, selection)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -1526,16 +1639,94 @@ fn commit_request(
         params![parent_id, run_id, checkpoint_id, payload, now, next_revision],
     )?;
     let entry_id = transaction.last_insert_rowid();
+    let mut effective_entry_id = entry_id;
+    let mut effective_revision = next_revision;
+    if let Some(activation) = activation {
+        let stored = codec::encode_skill_activation(activation)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        effective_revision = effective_revision
+            .checked_add(1)
+            .ok_or(SessionError::IdOverflow)?;
+        transaction.execute(
+            "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
+            params![entry_id, run_id, checkpoint_id, stored.payload_json, now, effective_revision],
+        )?;
+        effective_entry_id = transaction.last_insert_rowid();
+    }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![entry_id, now, next_revision],
+        params![effective_entry_id, now, effective_revision],
     )?;
     let admission = RequestAdmission {
         run_id: u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?,
         request_entry: session_entry_id(entry_id)?,
+        effective_entry: session_entry_id(effective_entry_id)?,
     };
     transaction.commit()?;
     Ok(admission)
+}
+
+#[allow(dead_code)] // Task 4 calls through SessionWriter::commit_skill_activation.
+fn commit_skill_activation(
+    connection: &mut Connection,
+    run_id: u64,
+    expected_parent: SessionEntryId,
+    activation: Option<&SkillActivation>,
+) -> Result<Option<SessionEntryId>, SessionError> {
+    let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
+    let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
+    let stored = activation
+        .map(codec::encode_skill_activation)
+        .transpose()
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (parent_id, revision): (i64, i64) = transaction.query_row(
+        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if parent_id != expected_parent {
+        return Err(SessionError::InvalidTransition);
+    }
+    let (parent_run, checkpoint_id): (Option<i64>, i64) = transaction.query_row(
+        "SELECT run_id, checkpoint_id FROM entries WHERE id = ?1",
+        params![parent_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let open: bool = transaction.query_row(
+        "SELECT terminal_entry_id IS NULL FROM runs WHERE id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    let pending: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_steps WHERE run_id = ?1 AND settled_entry_id IS NULL)",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    let settled: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_steps WHERE run_id = ?1 AND settled_entry_id IS NOT NULL)",
+        params![run_id], |row| row.get(0),
+    )?;
+    if parent_run != Some(run_id) || !open || pending || !settled {
+        return Err(SessionError::InvalidTransition);
+    }
+    let Some(stored) = stored else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let now = now_ms()?;
+    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    transaction.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
+        params![parent_id, run_id, checkpoint_id, stored.payload_json, now, next_revision],
+    )?;
+    let entry_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
+        params![entry_id, now, next_revision],
+    )?;
+    transaction.commit()?;
+    session_entry_id(entry_id).map(Some)
 }
 
 fn start_model_step(connection: &mut Connection, run_id: u64) -> Result<u64, SessionError> {
@@ -1766,6 +1957,11 @@ fn append_model_context_entry(
         ModelContextEntry::UserRequest { text } => history.append_user_request(text),
         ModelContextEntry::CompactionSummary { summary } => {
             history.append_compaction_summary(summary)
+        }
+        ModelContextEntry::SkillActivation(activation) => {
+            history
+                .activate_skill(activation)
+                .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
         }
         ModelContextEntry::CompletedCode(code) => history
             .append_completed_code(
@@ -2108,6 +2304,7 @@ fn initialise(
                 effective_entry: session_entry_id(root_entry_id)?,
                 history: ModelHistory::new(),
             })),
+            skill_policy: Mutex::new(None),
             active_execution_step: Mutex::new(None),
             _writer_lock: writer_lock,
             #[cfg(test)]
@@ -2419,8 +2616,72 @@ struct CompactionSnapshot {
     facts: Vec<SelectedAncestryFact>,
 }
 
+fn probe_active_project_skill_in_scope(
+    connection: &mut Connection,
+    scope: &Path,
+) -> Result<bool, SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let active_entry_id: i64 = transaction.query_row(
+        "SELECT active_entry_id FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let entries = {
+        let mut statement = transaction.prepare(
+            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(RestoreEntryRow {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    checkpoint_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    provider_replay: row.get(6)?,
+                    revision: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    transaction.commit()?;
+    let entries_by_id = entries
+        .into_iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let ancestry = selected_ancestry(&entries_by_id, active_entry_id);
+    if !ancestry.intact {
+        return Ok(false);
+    }
+    let mut seen_names = BTreeSet::new();
+    let mut active_in_scope = false;
+    for entry in ancestry.entries.iter().rev() {
+        if entry.kind != "skill_activation" {
+            continue;
+        }
+        if entry.provider_replay.is_some() {
+            return Ok(false);
+        }
+        let Ok(decoded) = codec::decode_entry(&entry.kind, &entry.payload_json) else {
+            return Ok(false);
+        };
+        let Some(activation) = codec::decoded_skill_activation(&decoded) else {
+            return Ok(false);
+        };
+        if seen_names.insert(activation.name().to_owned())
+            && activation.origin() == crate::skills::SkillOrigin::Project
+            && activation.trust_scope() == Some(scope)
+        {
+            active_in_scope = true;
+        }
+    }
+    Ok(active_in_scope)
+}
+
 fn load_compaction_snapshot(
     connection: &mut Connection,
+    policy: Option<&SkillProjectionPolicy>,
 ) -> Result<CompactionSnapshot, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let active_entry_id: i64 = transaction.query_row(
@@ -2469,7 +2730,7 @@ fn load_compaction_snapshot(
         .entries
         .iter()
         .filter(|entry| entry.kind != "session_start")
-        .map(|entry| compaction_fact(entry, &entries))
+        .map(|entry| compaction_fact(entry, &entries, policy))
         .collect::<Result<Vec<_>, _>>()?;
     transaction.commit()?;
     Ok(CompactionSnapshot {
@@ -2483,6 +2744,7 @@ fn load_compaction_snapshot(
 fn compaction_fact(
     entry: &RestoreEntryRow,
     entries: &[RestoreEntryRow],
+    policy: Option<&SkillProjectionPolicy>,
 ) -> Result<SelectedAncestryFact, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -2609,6 +2871,22 @@ fn compaction_fact(
                 }
             }
         }
+        "skill_activation" => {
+            if entry.provider_replay.is_some() {
+                return Err(SessionError::InvalidTransition);
+            }
+            let activation =
+                codec::decoded_skill_activation(&decoded).ok_or(SessionError::InvalidTransition)?;
+            if policy.is_none_or(|policy| policy.permits(activation)) {
+                SelectedAncestryKind::SkillActivation {
+                    activation: activation.clone(),
+                }
+            } else {
+                SelectedAncestryKind::SuppressedSkillActivation {
+                    name: activation.name().to_owned(),
+                }
+            }
+        }
         _ => return Err(SessionError::InvalidTransition),
     };
     Ok(SelectedAncestryFact { entry_id, kind })
@@ -2624,22 +2902,27 @@ fn model_entry_from_code(code: PersistedCode) -> Result<ModelContextEntry, Sessi
         .ok_or(SessionError::InvalidTransition)
 }
 
-fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
-    load_session_restore_for_entry(connection, None)
+fn load_session_restore(
+    connection: &mut Connection,
+    policy: Option<&SkillProjectionPolicy>,
+) -> Result<SessionRestore, SessionError> {
+    load_session_restore_for_entry(connection, None, policy)
 }
 
 fn load_session_restore_at(
     connection: &mut Connection,
     requested_entry: SessionEntryId,
+    policy: Option<&SkillProjectionPolicy>,
 ) -> Result<SessionRestore, SessionError> {
     let requested_entry =
         i64::try_from(requested_entry.0).map_err(|_| SessionError::InvalidTransition)?;
-    load_session_restore_for_entry(connection, Some(requested_entry))
+    load_session_restore_for_entry(connection, Some(requested_entry), policy)
 }
 
 fn load_session_restore_for_entry(
     connection: &mut Connection,
     requested_entry: Option<i64>,
+    policy: Option<&SkillProjectionPolicy>,
 ) -> Result<SessionRestore, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let (observed_active_entry_id, name, preferences_json, session_revision): (
@@ -2734,7 +3017,7 @@ fn load_session_restore_for_entry(
         )
         .optional()?;
     transaction.commit()?;
-    Ok(restore_projection_at(
+    Ok(restore_projection_at_with_policy(
         RestoreSnapshot {
             active_entry_id: observed_active_entry_id,
             session_revision,
@@ -2747,6 +3030,7 @@ fn load_session_restore_for_entry(
         },
         requested_entry_id,
         effective_entry_id,
+        policy,
     ))
 }
 
@@ -2812,6 +3096,12 @@ fn session_catalogue_entry(
                 .expect("decoded request kind has request text")
                 .to_owned(),
         },
+        codec::DecodedEntryKind::SkillActivation => SessionCatalogueKind::SkillActivation {
+            name: codec::decoded_skill_activation(&decoded)
+                .ok_or(SessionError::InvalidTransition)?
+                .name()
+                .to_owned(),
+        },
         codec::DecodedEntryKind::Execution => {
             let (code, execution) = codec::decoded_readable_execution(&decoded)
                 .map_err(|error| SessionError::Codec(error.to_string()))?
@@ -2855,10 +3145,20 @@ fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
     restore_projection_at(snapshot, active_entry_id, active_entry_id)
 }
 
+#[cfg(test)]
 fn restore_projection_at(
     snapshot: RestoreSnapshot,
     requested_entry_id: i64,
     effective_entry_id: i64,
+) -> SessionRestore {
+    restore_projection_at_with_policy(snapshot, requested_entry_id, effective_entry_id, None)
+}
+
+fn restore_projection_at_with_policy(
+    snapshot: RestoreSnapshot,
+    requested_entry_id: i64,
+    effective_entry_id: i64,
+    policy: Option<&SkillProjectionPolicy>,
 ) -> SessionRestore {
     let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
     let observed_active_entry =
@@ -2912,7 +3212,12 @@ fn restore_projection_at(
             .filter(|entry| {
                 matches!(
                     entry.kind.as_str(),
-                    "execution" | "final_reply" | "cancelled" | "failed" | "compaction"
+                    "execution"
+                        | "final_reply"
+                        | "cancelled"
+                        | "failed"
+                        | "compaction"
+                        | "skill_activation"
                 )
             })
             .map(|entry| entry.id),
@@ -3003,6 +3308,13 @@ fn restore_projection_at(
                     continue;
                 };
                 footer_adjustment.extend(codec::decoded_attempts(decoded));
+            }
+            "skill_activation" => {
+                if decoded_restore_entry(&decoded_entries, entry.id).is_err()
+                    || entry.provider_replay.is_some()
+                {
+                    executable = false;
+                }
             }
             "session_start" | "user_request" => {}
             _ => executable = false,
@@ -3168,7 +3480,7 @@ fn restore_projection_at(
     }
     let reserved_task_ids = restored_task_ids.into_values().collect();
     let history = executable
-        .then(|| restored_history(&verified, &decoded_entries, &snapshot.steps, &runs))
+        .then(|| restored_history(&verified, &decoded_entries, &snapshot.steps, &runs, policy))
         .flatten();
     let checkpoint = snapshot
         .checkpoint
@@ -3529,6 +3841,23 @@ fn readable_record(
             .then_some(None)
             .ok_or(());
     }
+    if entry.kind == "skill_activation" {
+        let parent = entry
+            .parent_id
+            .and_then(|parent_id| entries.iter().find(|candidate| candidate.id == parent_id))
+            .ok_or(())?;
+        return (entry.run_id.is_some()
+            && parent.run_id == entry.run_id
+            && entry.provider_replay.is_none()
+            && codec::decoded_skill_activation(decoded).is_some()
+            && runs.contains_key(&entry.run_id.unwrap_or_default())
+            && run_has_one_request(entries, entry.run_id.unwrap_or_default())
+            && steps
+                .iter()
+                .all(|step| step.settled_entry_id != Some(entry.id)))
+        .then_some(None)
+        .ok_or(());
+    }
     let run_id = entry
         .run_id
         .and_then(|id| u64::try_from(id).ok())
@@ -3692,7 +4021,23 @@ fn restored_history(
     decoded_entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
+    policy: Option<&SkillProjectionPolicy>,
 ) -> Option<ModelHistory> {
+    let mut seen_names = BTreeSet::new();
+    let mut latest_activation_indices = BTreeSet::new();
+    for (index, entry) in selected.iter().enumerate().rev() {
+        if entry.kind != "skill_activation" {
+            continue;
+        }
+        if entry.provider_replay.is_some() {
+            return None;
+        }
+        let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
+        let activation = codec::decoded_skill_activation(decoded)?;
+        if seen_names.insert(activation.name().to_owned()) {
+            latest_activation_indices.insert(index);
+        }
+    }
     let latest_applied = selected
         .iter()
         .enumerate()
@@ -3711,6 +4056,7 @@ fn restored_history(
                     CompactionOutcome::Failed { .. } | CompactionOutcome::Cancelled { .. } => None,
                 })
         });
+    let applied_index = latest_applied.as_ref().map(|(index, _, _)| *index);
     let (start, mut history) = match latest_applied {
         Some((applied_index, summary, first_retained)) => {
             let first_retained = i64::try_from(first_retained.0).ok()?;
@@ -3722,12 +4068,23 @@ fn restored_history(
                 return None;
             }
             let mut history = ModelHistory::new();
+            for (index, entry) in selected[..applied_index].iter().enumerate() {
+                if entry.kind == "skill_activation" {
+                    let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
+                    let activation = codec::decoded_skill_activation(decoded)?;
+                    if latest_activation_indices.contains(&index)
+                        && policy.is_none_or(|policy| policy.permits(activation))
+                    {
+                        history.activate_skill(activation.clone()).ok()?;
+                    }
+                }
+            }
             history.append_compaction_summary(summary);
             (boundary, history)
         }
         None => (0, ModelHistory::new()),
     };
-    for entry in &selected[start..] {
+    for (index, entry) in selected.iter().enumerate().skip(start) {
         let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
         match entry.kind.as_str() {
             "session_start" => {
@@ -3799,6 +4156,20 @@ fn restored_history(
             "compaction" => {
                 if entry.provider_replay.is_some() || codec::decoded_compaction(decoded).is_none() {
                     return None;
+                }
+            }
+            "skill_activation" => {
+                if entry.provider_replay.is_some() {
+                    return None;
+                }
+                let activation = codec::decoded_skill_activation(decoded)?;
+                if applied_index.is_some_and(|applied| index <= applied) {
+                    continue;
+                }
+                if latest_activation_indices.contains(&index)
+                    && policy.is_none_or(|policy| policy.permits(activation))
+                {
+                    history.activate_skill(activation.clone()).ok()?;
                 }
             }
             _ => return None,
@@ -3883,6 +4254,8 @@ mod tests {
         ToolName,
     };
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
+    use crate::model::{SkillActivation, SkillProjectionPolicy};
+    use crate::skills::SkillOrigin;
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
 
@@ -3920,6 +4293,895 @@ mod tests {
             checkpoint(workspace).await,
         )
         .expect("create session")
+    }
+
+    fn skill(
+        name: &str,
+        source: PathBuf,
+        body: &str,
+        origin: SkillOrigin,
+        scope: Option<PathBuf>,
+    ) -> SkillActivation {
+        SkillActivation::new(name.to_owned(), source, body.to_owned(), origin, scope).unwrap()
+    }
+
+    async fn close_cancelled(writer: &SessionWriter, run_id: u64) {
+        writer
+            .close_run(
+                run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_ancestry_selects_latest_version_before_trust_and_keeps_independent_user() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let scope = workspace.path().canonicalize().unwrap();
+        let user_body = "---\nname: review\ndescription: User\n---\nUser instructions æ";
+        let project_body = "---\nname: review\ndescription: Project\n---\nProject instructions β";
+        let user = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            user_body,
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request_with_skill("first".to_owned(), selection(), Some(user.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let first_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        let independent = skill(
+            "notes",
+            home.path().join(".agents/skills/notes"),
+            "---\nname: notes\ndescription: User\n---\nIndependent instructions",
+            SkillOrigin::User,
+            None,
+        );
+        let notes_run = writer
+            .commit_request_with_skill("notes".to_owned(), selection(), Some(independent.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, notes_run.run_id).await;
+        let project_source = scope.join(".agents/skills/review");
+        let project = skill(
+            "review",
+            project_source.clone(),
+            project_body,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let second = writer
+            .commit_request_with_skill("second".to_owned(), selection(), Some(project.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, second.run_id).await;
+        let second_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        assert!(!project_source.exists());
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        let active = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(active.active_skills().count(), 2);
+        assert_eq!(
+            active
+                .active_skills()
+                .find(|activation| activation.name() == "review")
+                .unwrap()
+                .body(),
+            project_body
+        );
+        fs::create_dir_all(&project_source).unwrap();
+        fs::write(project_source.join("SKILL.md"), "changed on disk").unwrap();
+        let pinned = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            pinned
+                .active_skills()
+                .find(|activation| activation.name() == "review")
+                .unwrap()
+                .body(),
+            project_body
+        );
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope.clone(), false))
+            .unwrap();
+        let filtered = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(filtered.active_skills().next().unwrap(), &independent);
+        assert_eq!(filtered.active_skills().count(), 1);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(home.path().to_path_buf(), true))
+            .unwrap();
+        let relocated = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            relocated.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let root_restore = writer.restore_at(root).await.unwrap();
+        assert!(
+            root_restore
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            writer
+                .restore_at(first_leaf)
+                .await
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next()
+                .unwrap()
+                .body(),
+            user_body
+        );
+        let navigated = writer
+            .restore_at(second_leaf)
+            .await
+            .unwrap()
+            .executable
+            .unwrap()
+            .history;
+        assert_eq!(
+            navigated.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let prepared = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.planner.protected_skills(),
+            std::slice::from_ref(&independent)
+        );
+        writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let compacted = writer.model_history().unwrap();
+        assert_eq!(
+            compacted.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let restored_compacted = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            restored_compacted.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let reactivated = writer
+            .commit_request_with_skill(
+                "explicit user reactivation".to_owned(),
+                selection(),
+                Some(user.clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(reactivated.effective_entry, reactivated.request_entry);
+        close_cancelled(&writer, reactivated.run_id).await;
+        let reactivated_history = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            reactivated_history
+                .active_skills()
+                .find(|activation| activation.name() == "review"),
+            Some(&user)
+        );
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_uses_latest_version_before_scope_filter() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let scope_a = workspace_a.path().canonicalize().unwrap();
+        let scope_b = workspace_b.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace_b).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let b_source = scope_b.join(".agents/skills/review");
+        let b_skill = skill(
+            "review",
+            b_source.clone(),
+            "---\nname: review\ndescription: B\n---\nB",
+            SkillOrigin::Project,
+            Some(scope_b.clone()),
+        );
+        let b_run = writer
+            .commit_request_with_skill("B".to_owned(), selection(), Some(b_skill))
+            .await
+            .unwrap();
+        close_cancelled(&writer, b_run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope_a.clone(), true))
+            .unwrap();
+        activate_session(&session).await;
+        let writer = session.writer();
+        let a_skill = skill(
+            "review",
+            scope_a.join(".agents/skills/review"),
+            "---\nname: review\ndescription: A\n---\nA",
+            SkillOrigin::Project,
+            Some(scope_a),
+        );
+        let a_run = writer
+            .commit_request_with_skill("A".to_owned(), selection(), Some(a_skill))
+            .await
+            .unwrap();
+        close_cancelled(&writer, a_run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .unwrap();
+        assert!(!b_source.exists());
+        assert!(session.restore().unwrap().executable.is_some());
+        assert!(!session.has_active_project_skill_in_scope(&scope_b).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_ignores_latest_user_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let first = writer
+            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        let user = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            "user version",
+            SkillOrigin::User,
+            None,
+        );
+        let second = writer
+            .commit_request_with_skill("user".to_owned(), selection(), Some(user.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, second.run_id).await;
+        assert!(!session.has_active_project_skill_in_scope(&scope).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&user)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn project_skill_probe_ignores_corrupt_non_skill_replay() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request_with_skill("inspect".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        settle_fixture_execution(&session, &writer, run.run_id, "pass", None, Vec::new()).await;
+        close_cancelled(&writer, run.run_id).await;
+        {
+            let connection = session.connection_for_test().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE entries SET provider_replay = X'00' WHERE kind = 'execution'",
+                    [],
+                )
+                .unwrap();
+        }
+        let restored = session.restore().unwrap();
+        assert!(!restored.records.is_empty());
+        assert!(restored.executable.is_none());
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_is_independent_of_unfiltered_text_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let scope_a = workspace_a.path().canonicalize().unwrap();
+        let scope_b = workspace_b.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace_a).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let body = "x".repeat(50 * 1024);
+        for index in 0..4 {
+            let name = format!("a-{index}");
+            let activation = skill(
+                &name,
+                scope_a.join(".agents/skills").join(&name),
+                &body,
+                SkillOrigin::Project,
+                Some(scope_a.clone()),
+            );
+            let run = writer
+                .commit_request_with_skill(name, selection(), Some(activation))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .unwrap();
+        activate_session(&session).await;
+        let writer = session.writer();
+        for index in 0..4 {
+            let name = format!("b-{index}");
+            let activation = skill(
+                &name,
+                scope_b.join(".agents/skills").join(&name),
+                &body,
+                SkillOrigin::Project,
+                Some(scope_b.clone()),
+            );
+            let run = writer
+                .commit_request_with_skill(name, selection(), Some(activation))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .unwrap();
+        assert!(session.restore().unwrap().executable.is_some());
+        assert!(session.has_active_project_skill_in_scope(&scope_b).unwrap());
+    }
+
+    #[tokio::test]
+    async fn skipped_project_versions_do_not_revive_over_cap_user_history() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let large_body = "x".repeat(60 * 1024);
+        for index in 0..5 {
+            let name = format!("replace-{index}");
+            let user = skill(
+                &name,
+                home.path().join(".agents/skills").join(&name),
+                &large_body,
+                SkillOrigin::User,
+                None,
+            );
+            let user_run = writer
+                .commit_request_with_skill(format!("user {index}"), selection(), Some(user))
+                .await
+                .unwrap();
+            close_cancelled(&writer, user_run.run_id).await;
+            let project = skill(
+                &name,
+                scope.join(".agents/skills").join(&name),
+                "small project version",
+                SkillOrigin::Project,
+                Some(scope.clone()),
+            );
+            let project_run = writer
+                .commit_request_with_skill(format!("project {index}"), selection(), Some(project))
+                .await
+                .unwrap();
+            close_cancelled(&writer, project_run.run_id).await;
+        }
+        let independent = skill(
+            "independent",
+            home.path().join(".agents/skills/independent"),
+            "user instruction",
+            SkillOrigin::User,
+            None,
+        );
+        let last = writer
+            .commit_request_with_skill(
+                "independent".to_owned(),
+                selection(),
+                Some(independent.clone()),
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, last.run_id).await;
+        let leaf = SessionEntryId(active_entry_id(&session) as u64);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope, false))
+            .unwrap();
+        let restored = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            restored.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let navigated = writer
+            .restore_at(leaf)
+            .await
+            .unwrap()
+            .executable
+            .unwrap()
+            .history;
+        assert_eq!(
+            navigated.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let prepared = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.planner.protected_skills(),
+            std::slice::from_ref(&independent)
+        );
+        writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .collect::<Vec<_>>(),
+            vec![&independent]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_and_text_with_changed_origin_persists_new_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let source = scope.join(".agents/skills/shared");
+        let body = "---\nname: shared\ndescription: Same\n---\nSame text";
+        let user = skill("shared", source.clone(), body, SkillOrigin::User, None);
+        let first = writer
+            .commit_request_with_skill("user".to_owned(), selection(), Some(user))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let project = skill(
+            "shared",
+            source,
+            body,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let second = writer
+            .commit_request_with_skill("project".to_owned(), selection(), Some(project.clone()))
+            .await
+            .unwrap();
+        assert_ne!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&project)
+        );
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope, false))
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_and_text_with_changed_project_scope_persists_new_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let nested_scope = scope.join("child");
+        let source = nested_scope.join(".agents/skills/shared");
+        let body = "---\nname: shared\ndescription: Same\n---\nSame text";
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let outer = skill(
+            "shared",
+            source.clone(),
+            body,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let first = writer
+            .commit_request_with_skill("outer".to_owned(), selection(), Some(outer))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let inner = skill(
+            "shared",
+            source,
+            body,
+            SkillOrigin::Project,
+            Some(nested_scope.clone()),
+        );
+        let second = writer
+            .commit_request_with_skill("inner".to_owned(), selection(), Some(inner.clone()))
+            .await
+            .unwrap();
+        assert_ne!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(nested_scope, true))
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&inner)
+        );
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(scope, true))
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_activated_instructions_once_outside_summary() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let body = "---\nname: review\ndescription: User\n---\nExact body 🦀";
+        let activation = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            body,
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request_with_skill(
+                "old request".to_owned(),
+                selection(),
+                Some(activation.clone()),
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        append_cancelled_request(&writer, "new request").await;
+        let prepared = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared.planner.context_tokens() >= (activation.model_text().len() as u64).div_ceil(4)
+        );
+        writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Condensed history".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let live = writer.model_history().unwrap();
+        assert_eq!(live.active_skills().count(), 1);
+        assert_eq!(live.active_skills().next().unwrap().body(), body);
+        assert_eq!(
+            live.entries()
+                .iter()
+                .filter(|entry| entry.compaction_summary().is_some())
+                .count(),
+            1
+        );
+        let restored = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(restored.active_skills().count(), 1);
+        assert_eq!(restored.active_skills().next().unwrap().body(), body);
+        assert_eq!(restored.entries(), live.entries());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn settled_skill_activation_is_durable_and_duplicate_is_a_noop() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("inspect".to_owned(), selection())
+            .await
+            .unwrap();
+        settle_fixture_execution(&session, &writer, run.run_id, "pass", None, Vec::new()).await;
+        let first = skill(
+            "review",
+            home.path().join("first"),
+            "---\nname: review\ndescription: First\n---\nFirst",
+            SkillOrigin::User,
+            None,
+        );
+        let changed = skill(
+            "review",
+            home.path().join("changed"),
+            "---\nname: review\ndescription: Changed\n---\nChanged",
+            SkillOrigin::User,
+            None,
+        );
+        assert!(
+            writer
+                .commit_skill_activation(run.run_id, first.clone())
+                .await
+                .unwrap()
+        );
+        let leaf = active_entry_id(&session);
+        assert!(
+            !writer
+                .commit_skill_activation(run.run_id, first)
+                .await
+                .unwrap()
+        );
+        assert_eq!(active_entry_id(&session), leaf);
+        assert!(
+            writer
+                .commit_skill_activation(run.run_id, changed.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            writer
+                .model_history()
+                .unwrap()
+                .active_skills()
+                .next()
+                .unwrap(),
+            &changed
+        );
+        close_cancelled(&writer, run.run_id).await;
+        assert!(
+            writer
+                .commit_skill_activation(run.run_id, changed.clone())
+                .await
+                .is_err()
+        );
+        let next_run = writer
+            .commit_request("next".to_owned(), selection())
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .commit_skill_activation(run.run_id, changed.clone())
+                .await
+                .is_err()
+        );
+        close_cancelled(&writer, next_run.run_id).await;
+        let restored = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(restored.active_skills().count(), 1);
+        assert_eq!(restored.active_skills().next().unwrap(), &changed);
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_direct_skill_activation_commits_request_without_duplicate_row() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let activation = skill(
+            "review",
+            home.path().join("review"),
+            "---\nname: review\ndescription: Check\n---\nCheck",
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request_with_skill("first".to_owned(), selection(), Some(activation.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let second = writer
+            .commit_request_with_skill("second".to_owned(), selection(), Some(activation.clone()))
+            .await
+            .unwrap();
+        assert_eq!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&activation)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_selected_skill_activation_disables_restore() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let activation = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "---\nname: review\ndescription: Check\n---\nCheck",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request_with_skill("inspect".to_owned(), selection(), Some(activation))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        {
+            let connection = session.connection_for_test().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update;")
+                .unwrap();
+            connection.execute("UPDATE entries SET payload_json = '{\"SkillActivation\":{\"activation\":{\"body\":\"\"}}}' WHERE kind = 'skill_activation'", []).unwrap();
+        }
+        assert!(session.restore().unwrap().executable.is_none());
+        assert!(!session.has_active_project_skill_in_scope(&scope).unwrap());
     }
 
     async fn activate_session(session: &Session) {

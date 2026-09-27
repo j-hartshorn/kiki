@@ -762,7 +762,7 @@ fn read_skill_file(directory: &Dir) -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
-fn line_count(text: &str) -> usize {
+pub(crate) fn line_count(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut count = 0;
     for (index, byte) in bytes.iter().enumerate() {

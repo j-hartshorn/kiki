@@ -1,15 +1,17 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::config::{CompactionSettings, ModelSelection};
 use crate::model::{
-    AttemptAccounting, ModelContextEntry, SummaryRequest, canonical_compaction_summary,
+    AttemptAccounting, ModelContextEntry, SkillActivation, SummaryRequest,
+    canonical_compaction_summary,
 };
 use crate::prompt::{
     compaction_initial_prompt, compaction_split_run_prompt, compaction_system_prompt,
     compaction_update_prompt,
 };
 use crate::session::SessionEntryId;
+use crate::skills::SkillOrigin;
 
 const OUTPUT_RATIO_DENOMINATOR: u64 = 100;
 const HISTORY_OUTPUT_RATIO: u64 = 80;
@@ -35,6 +37,12 @@ pub(crate) enum SelectedAncestryKind {
         read_paths: Vec<PathBuf>,
         modified_paths: Vec<PathBuf>,
     },
+    SkillActivation {
+        activation: SkillActivation,
+    },
+    SuppressedSkillActivation {
+        name: String,
+    },
     Applied {
         summary: String,
         first_retained: SessionEntryId,
@@ -46,6 +54,7 @@ pub(crate) struct CompactionPreparation {
     context_tokens: u64,
     first_retained: SessionEntryId,
     retained_entries: Vec<ModelContextEntry>,
+    protected_skills: Vec<SkillActivation>,
     requests: Vec<SummaryRequest>,
     assembly: SummaryAssembly,
     files: FileSets,
@@ -66,6 +75,10 @@ impl CompactionPreparation {
 
     pub(crate) fn retained_entries(&self) -> &[ModelContextEntry] {
         &self.retained_entries
+    }
+
+    pub(crate) fn protected_skills(&self) -> &[SkillActivation] {
+        &self.protected_skills
     }
 
     pub(crate) fn finish(&self, outputs: &[String]) -> Result<String, CompactionError> {
@@ -125,11 +138,18 @@ pub(crate) fn prepare(
     focus: &str,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
     let latest = latest_applied(facts)?;
+    let active_skills = active_skills(facts);
+    let mut protected_skills = active_skills.values().copied().collect::<Vec<_>>();
+    protected_skills.sort_by_key(|(index, _)| *index);
+    let protected_skills = protected_skills
+        .into_iter()
+        .map(|(_, activation)| activation.clone())
+        .collect();
     let projected = projected_context_indices(facts, latest)?;
-    let context_tokens = measure_context(facts, &projected, latest);
+    let context_tokens = measure_context(facts, &projected, latest, &active_skills);
     let start = latest.map_or(0, |applied| applied.boundary_index);
     let Some(first_retained_index) =
-        first_retained_index(facts, start, policy.keep_recent_tokens())
+        first_retained_index(facts, start, policy.keep_recent_tokens(), &active_skills)
     else {
         return Ok(None);
     };
@@ -210,6 +230,7 @@ pub(crate) fn prepare(
         context_tokens,
         first_retained: facts[first_retained_index].entry_id,
         retained_entries,
+        protected_skills,
         requests,
         assembly: SummaryAssembly {
             history,
@@ -294,6 +315,7 @@ fn measure_context(
     facts: &[SelectedAncestryFact],
     projected: &[usize],
     latest: Option<LatestApplied<'_>>,
+    active_skills: &BTreeMap<&str, (usize, &SkillActivation)>,
 ) -> u64 {
     let baseline_start = latest.map_or(0, |applied| applied.index.saturating_add(1));
     for (position, &index) in projected.iter().enumerate().rev() {
@@ -309,6 +331,19 @@ fn measure_context(
         let Some(attempts) = normal_attempts(&facts[index]) else {
             continue;
         };
+        // A baseline may come from another scope where a project skill was
+        // suppressed. Its saved usage has no projection provenance, so charge
+        // the current protected text again as a bounded conservative estimate.
+        let uncertain_projection_before_baseline = facts[..=index].iter().any(|fact| {
+            matches!(
+                fact.kind,
+                SelectedAncestryKind::SuppressedSkillActivation { .. }
+            ) || matches!(
+                &fact.kind,
+                SelectedAncestryKind::SkillActivation { activation }
+                    if activation.origin() == SkillOrigin::Project
+            )
+        });
         let Some(baseline) = attempts.iter().rev().find_map(context_usage) else {
             continue;
         };
@@ -321,7 +356,17 @@ fn measure_context(
                 context_entry(&facts[later]).expect("projected entries are context entries"),
             ));
         }
-        return baseline.saturating_add(estimate_tokens(bytes));
+        let baseline_skills = active_skills_in_range(facts, 0..=index);
+        let current_bytes = active_text_bytes(active_skills);
+        let previous_bytes = active_text_bytes(&baseline_skills);
+        let adjusted = if uncertain_projection_before_baseline {
+            baseline.saturating_add(estimate_tokens(current_bytes))
+        } else if current_bytes >= previous_bytes {
+            baseline.saturating_add(estimate_tokens(current_bytes - previous_bytes))
+        } else {
+            baseline.saturating_sub(estimate_tokens(previous_bytes - current_bytes))
+        };
+        return adjusted.saturating_add(estimate_tokens(bytes));
     }
 
     let mut bytes = latest
@@ -332,7 +377,37 @@ fn measure_context(
             context_entry(&facts[index]).expect("projected entries are context entries"),
         ));
     }
+    bytes = bytes.saturating_add(active_text_bytes(active_skills));
     estimate_tokens(bytes)
+}
+
+fn active_skills(facts: &[SelectedAncestryFact]) -> BTreeMap<&str, (usize, &SkillActivation)> {
+    active_skills_in_range(facts, 0..facts.len())
+}
+
+fn active_skills_in_range(
+    facts: &[SelectedAncestryFact],
+    range: impl IntoIterator<Item = usize>,
+) -> BTreeMap<&str, (usize, &SkillActivation)> {
+    let mut active = BTreeMap::new();
+    for index in range {
+        match &facts[index].kind {
+            SelectedAncestryKind::SkillActivation { activation } => {
+                active.insert(activation.name(), (index, activation));
+            }
+            SelectedAncestryKind::SuppressedSkillActivation { name } => {
+                active.remove(name.as_str());
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
+fn active_text_bytes(active: &BTreeMap<&str, (usize, &SkillActivation)>) -> u64 {
+    active.values().fold(0, |total, (_, activation)| {
+        total.saturating_add(byte_len(&activation.model_text()))
+    })
 }
 
 fn context_usage(attempt: &AttemptAccounting) -> Option<u64> {
@@ -354,8 +429,9 @@ fn first_retained_index(
     facts: &[SelectedAncestryFact],
     start: usize,
     keep_recent_tokens: u64,
+    active_skills: &BTreeMap<&str, (usize, &SkillActivation)>,
 ) -> Option<usize> {
-    let mut bytes = 0_u64;
+    let mut bytes = active_text_bytes(active_skills);
     for index in (start..facts.len()).rev() {
         if !ordinary_context(&facts[index]) {
             continue;
@@ -489,7 +565,9 @@ fn file_paths(fact: &SelectedAncestryFact) -> (&[PathBuf], &[PathBuf]) {
             read_paths,
             modified_paths,
         } => (read_paths, modified_paths),
-        SelectedAncestryKind::Applied { .. } => (&[], &[]),
+        SelectedAncestryKind::Applied { .. }
+        | SelectedAncestryKind::SkillActivation { .. }
+        | SelectedAncestryKind::SuppressedSkillActivation { .. } => (&[], &[]),
     }
 }
 
@@ -508,6 +586,9 @@ fn user_request(fact: &SelectedAncestryFact) -> Option<&str> {
 }
 
 fn context_bytes(entry: &ModelContextEntry) -> u64 {
+    if let ModelContextEntry::SkillActivation(activation) = entry {
+        return byte_len(&activation.model_text());
+    }
     if let Some(text) = entry.user_request() {
         return byte_len(text);
     }
@@ -735,9 +816,10 @@ mod tests {
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, ModelCallId, ModelContextEntry, ModelHistory, ModelUsage,
-        OpaqueReplayItem, ProviderReplay,
+        OpaqueReplayItem, ProviderReplay, SkillActivation,
     };
     use crate::session::SessionEntryId;
+    use crate::skills::SkillOrigin;
 
     fn selection() -> ModelSelection {
         ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap()
@@ -934,6 +1016,139 @@ mod tests {
             user(3, "later"),
         ];
         assert_eq!(measured(&facts).context_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn suppressed_latest_project_omits_old_user_and_charges_independent_user() {
+        let replaced_user = SkillActivation::new(
+            "review".to_owned(),
+            PathBuf::from("/home/review"),
+            "x".repeat(60 * 1024),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        let independent = SkillActivation::new(
+            "notes".to_owned(),
+            PathBuf::from("/home/notes"),
+            "independent".to_owned(),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        let active_cost = estimate_tokens(independent.model_text().len() as u64);
+        let facts = [
+            user(1, "old"),
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(2),
+                kind: SelectedAncestryKind::SkillActivation {
+                    activation: replaced_user,
+                },
+            },
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(3),
+                kind: SelectedAncestryKind::SkillActivation {
+                    activation: independent.clone(),
+                },
+            },
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(4),
+                kind: SelectedAncestryKind::SuppressedSkillActivation {
+                    name: "review".to_owned(),
+                },
+            },
+            code(
+                5,
+                "pass",
+                None,
+                "",
+                b"",
+                "",
+                vec![usage(Some(100), None, None)],
+            ),
+            user(6, "tail"),
+        ];
+        let preparation = measured(&facts);
+        assert_eq!(preparation.context_tokens(), 101 + active_cost);
+        assert_eq!(preparation.protected_skills(), &[independent]);
+    }
+
+    #[test]
+    fn newest_post_filter_baseline_wins_with_bounded_conservative_skill_cost() {
+        let active = SkillActivation::new(
+            "review".to_owned(),
+            PathBuf::from("/home/review"),
+            "x".repeat(1_000),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        let facts = [
+            user(1, "old"),
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(2),
+                kind: SelectedAncestryKind::SkillActivation { activation: active },
+            },
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(3),
+                kind: SelectedAncestryKind::SuppressedSkillActivation {
+                    name: "review".to_owned(),
+                },
+            },
+            code(
+                4,
+                "old",
+                None,
+                "",
+                b"",
+                "",
+                vec![usage(Some(100), None, None)],
+            ),
+            code(
+                5,
+                "new",
+                None,
+                "",
+                b"",
+                "",
+                vec![usage(Some(500), None, None)],
+            ),
+            user(6, "tail"),
+        ];
+        assert_eq!(measured(&facts).context_tokens(), 501);
+    }
+
+    #[test]
+    fn project_skill_resumed_after_other_scope_charges_uncertain_usage_baseline() {
+        let active = SkillActivation::new(
+            "review".to_owned(),
+            PathBuf::from("/project-b/.agents/skills/review"),
+            "x".repeat(1_000),
+            SkillOrigin::Project,
+            Some(PathBuf::from("/project-b")),
+        )
+        .unwrap();
+        let active_cost = estimate_tokens(active.model_text().len() as u64);
+        let facts = [
+            user(1, "old"),
+            SelectedAncestryFact {
+                entry_id: SessionEntryId(2),
+                kind: SelectedAncestryKind::SkillActivation { activation: active },
+            },
+            // This provider step ran under a different --here scope, where
+            // the project activation was suppressed. The saved usage omits it.
+            code(
+                3,
+                "pass",
+                None,
+                "",
+                b"",
+                "",
+                vec![usage(Some(100), None, None)],
+            ),
+            user(4, "tail"),
+        ];
+        assert_eq!(measured(&facts).context_tokens(), 101 + active_cost);
     }
 
     #[test]
@@ -1478,7 +1693,11 @@ mod tests {
                 read_paths,
                 modified_paths,
             } => (read_paths, modified_paths),
-            SelectedAncestryKind::Applied { .. } => panic!("applied facts have no file paths"),
+            SelectedAncestryKind::Applied { .. }
+            | SelectedAncestryKind::SkillActivation { .. }
+            | SelectedAncestryKind::SuppressedSkillActivation { .. } => {
+                panic!("fact has no file paths")
+            }
         };
         *read_paths = reads
             .iter()

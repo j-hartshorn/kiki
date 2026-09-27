@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -8,6 +9,126 @@ use crate::config::{
     constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT},
     settings::CrossProviderReasoning,
 };
+use crate::skills::{MAX_SKILL_BYTES, MAX_SKILL_LINES, Skill, SkillOrigin, line_count};
+
+pub const MAX_ACTIVE_SKILL_TEXT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillActivation {
+    name: String,
+    source: PathBuf,
+    body: String,
+    origin: SkillOrigin,
+    trust_scope: Option<PathBuf>,
+}
+
+impl SkillActivation {
+    pub fn from_skill(skill: &Skill) -> Self {
+        Self::new(
+            skill.name().to_owned(),
+            skill.canonical_root().to_path_buf(),
+            skill.source_text().to_owned(),
+            skill.origin(),
+            skill.trust_scope().map(Path::to_path_buf),
+        )
+        .expect("catalogued skills have valid activation metadata")
+    }
+
+    pub fn new(
+        name: String,
+        source: PathBuf,
+        body: String,
+        origin: SkillOrigin,
+        trust_scope: Option<PathBuf>,
+    ) -> Result<Self, SkillActivationError> {
+        let valid_name = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && name
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && name
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric);
+        let clean_path = |path: &Path| {
+            path.is_absolute()
+                && path
+                    .components()
+                    .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        };
+        if !valid_name
+            || !clean_path(&source)
+            || body.is_empty()
+            || body.len() > MAX_SKILL_BYTES
+            || line_count(&body) > MAX_SKILL_LINES
+            || matches!(origin, SkillOrigin::Project) != trust_scope.is_some()
+            || trust_scope
+                .as_ref()
+                .is_some_and(|scope| !clean_path(scope) || !source.starts_with(scope))
+        {
+            return Err(SkillActivationError::InvalidMetadata);
+        }
+        Ok(Self {
+            name,
+            source,
+            body,
+            origin,
+            trust_scope,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+    pub fn trust_scope(&self) -> Option<&Path> {
+        self.trust_scope.as_deref()
+    }
+    pub fn model_text(&self) -> String {
+        crate::prompt::skill_activation_text(&self.name, &self.source, &self.body)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SkillActivationError {
+    #[error("skill activation metadata is invalid")]
+    InvalidMetadata,
+    #[error("active skill instruction text would exceed 256 KiB")]
+    ActiveTextLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillProjectionPolicy {
+    scope: PathBuf,
+    project_trusted: bool,
+}
+
+impl SkillProjectionPolicy {
+    pub fn new(scope: PathBuf, project_trusted: bool) -> Self {
+        Self {
+            scope,
+            project_trusted,
+        }
+    }
+
+    pub fn permits(&self, activation: &SkillActivation) -> bool {
+        activation.origin == SkillOrigin::User
+            || (self.project_trusted
+                && activation.trust_scope.as_deref() == Some(self.scope.as_path()))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
@@ -209,6 +330,7 @@ pub enum ModelContextEntry {
     CompactionSummary {
         summary: String,
     },
+    SkillActivation(SkillActivation),
     CompletedCode(CompletedCode),
     FinalMessage {
         text: String,
@@ -276,7 +398,9 @@ impl ModelContextEntry {
                 None,
                 ForeignPart::Text(text),
             ),
-            Self::UserRequest { .. } | Self::CompactionSummary { .. } => return None,
+            Self::UserRequest { .. }
+            | Self::CompactionSummary { .. }
+            | Self::SkillActivation(_) => return None,
         };
         if replay.provider() == provider {
             return None;
@@ -331,6 +455,46 @@ impl ModelHistory {
 
     pub fn entries(&self) -> &[ModelContextEntry] {
         &self.entries
+    }
+
+    pub fn active_skills(&self) -> impl Iterator<Item = &SkillActivation> {
+        self.entries.iter().filter_map(|entry| match entry {
+            ModelContextEntry::SkillActivation(activation) => Some(activation),
+            _ => None,
+        })
+    }
+
+    pub fn activate_skill(
+        &mut self,
+        activation: SkillActivation,
+    ) -> Result<bool, SkillActivationError> {
+        let existing = self.entries.iter().position(|entry| matches!(entry, ModelContextEntry::SkillActivation(active) if active.name() == activation.name()));
+        if existing.is_some_and(|index| {
+            self.entries[index] == ModelContextEntry::SkillActivation(activation.clone())
+        }) {
+            return Ok(false);
+        }
+        let current_bytes: usize = self
+            .active_skills()
+            .map(|active| active.model_text().len())
+            .sum();
+        let replaced_bytes = existing
+            .and_then(|index| match &self.entries[index] {
+                ModelContextEntry::SkillActivation(active) => Some(active.model_text().len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if current_bytes - replaced_bytes + activation.model_text().len()
+            > MAX_ACTIVE_SKILL_TEXT_BYTES
+        {
+            return Err(SkillActivationError::ActiveTextLimit);
+        }
+        if let Some(index) = existing {
+            self.entries.remove(index);
+        }
+        self.entries
+            .push(ModelContextEntry::SkillActivation(activation));
+        Ok(true)
     }
 
     pub fn append_user_request(&mut self, text: impl Into<String>) {
@@ -759,6 +923,7 @@ impl Default for ScriptedModel {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use tokio::time::timeout;
@@ -767,10 +932,68 @@ mod tests {
     use super::{
         CodeResult, CompletedCode, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
         ModelError, ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem,
-        ProviderReplay, ScriptedAction, ScriptedModel, SummaryRequest,
+        ProviderReplay, ScriptedAction, ScriptedModel, SkillActivation, SummaryRequest,
         canonical_compaction_summary,
     };
     use crate::config::settings::CrossProviderReasoning;
+    use crate::skills::SkillOrigin;
+
+    fn activation(name: &str, source: &str, body: String) -> SkillActivation {
+        SkillActivation::new(
+            name.to_owned(),
+            PathBuf::from(source),
+            body,
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn skill_activation_deduplicates_replaces_and_enforces_combined_text_limit() {
+        let mut history = ModelHistory::new();
+        let first = activation("one", "/user/one", "x".repeat(64 * 1024));
+        let second = activation("two", "/user/two", "x".repeat(64 * 1024));
+        assert!(history.activate_skill(first.clone()).unwrap());
+        assert!(!history.activate_skill(first).unwrap());
+        assert!(history.activate_skill(second).unwrap());
+        assert!(
+            history
+                .activate_skill(activation("three", "/user/three", "x".repeat(64 * 1024)))
+                .unwrap()
+        );
+        let fourth_empty = activation("four", "/user/four", "x".to_owned());
+        let occupied = history
+            .active_skills()
+            .map(|active| active.model_text().len())
+            .sum::<usize>();
+        let fourth_size =
+            super::MAX_ACTIVE_SKILL_TEXT_BYTES - occupied - fourth_empty.model_text().len() + 1;
+        assert!(
+            history
+                .activate_skill(activation("four", "/user/four", "x".repeat(fourth_size)))
+                .unwrap()
+        );
+        assert_eq!(
+            history
+                .active_skills()
+                .map(|active| active.model_text().len())
+                .sum::<usize>(),
+            super::MAX_ACTIVE_SKILL_TEXT_BYTES
+        );
+        assert_eq!(history.active_skills().count(), 4);
+        let before = history.clone();
+        let over = activation("five", "/user/five", "x".to_owned());
+        assert!(history.activate_skill(over).is_err());
+        assert_eq!(history, before);
+        let changed = activation("one", "/user/changed", "short".to_owned());
+        assert!(history.activate_skill(changed).unwrap());
+        assert_eq!(history.active_skills().count(), 4);
+        assert_eq!(
+            history.active_skills().last().unwrap().source(),
+            PathBuf::from("/user/changed")
+        );
+    }
 
     fn history_with_request(request: &str) -> ModelHistory {
         let mut history = ModelHistory::new();

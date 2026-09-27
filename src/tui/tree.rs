@@ -1037,6 +1037,10 @@ fn append_kind_row(row: &mut StyledRow, kind: &SessionCatalogueKind, content_sty
             row.push("User:", colour_style(ACCENT));
             append_preview(row, text, content_style);
         }
+        SessionCatalogueKind::SkillActivation { name } => {
+            row.push("Skill:", colour_style(ACCENT));
+            append_preview(row, name, content_style);
+        }
         SessionCatalogueKind::Execution {
             commentary,
             execution,
@@ -1171,6 +1175,7 @@ fn row_text(kind: &SessionCatalogueKind) -> String {
     match kind {
         SessionCatalogueKind::Start => "Session start".to_owned(),
         SessionCatalogueKind::Request { text } => preview("User", text),
+        SessionCatalogueKind::SkillActivation { name } => format!("Skill: {name}"),
         SessionCatalogueKind::Execution {
             commentary,
             execution,
@@ -1257,6 +1262,7 @@ fn copy_text(kind: &SessionCatalogueKind) -> String {
         SessionCatalogueKind::Request { text } | SessionCatalogueKind::Final { text } => {
             normalise_terminal_text(text)
         }
+        SessionCatalogueKind::SkillActivation { name } => format!("Skill: {name}"),
         SessionCatalogueKind::Cancelled => "Cancelled".to_owned(),
         SessionCatalogueKind::Failed => "Failed".to_owned(),
         SessionCatalogueKind::Compaction { outcome } => match outcome {

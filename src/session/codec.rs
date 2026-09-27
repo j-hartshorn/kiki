@@ -18,7 +18,9 @@ use crate::arena::{
 use crate::config::{ModelSelection, SessionPreferences, model_by_id};
 use crate::model::{
     AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
+    SkillActivation,
 };
+use crate::skills::SkillOrigin;
 use crate::subagents::{ChildParameters, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
 use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
 
@@ -87,6 +89,26 @@ enum StoredPayload {
     Compaction {
         compaction: StoredCompactionOutcome,
     },
+    SkillActivation {
+        activation: StoredSkillActivation,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSkillActivation {
+    name: String,
+    source: String,
+    body: String,
+    origin: StoredSkillOrigin,
+    trust_scope: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredSkillOrigin {
+    Project,
+    User,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +158,7 @@ enum DecodedEntryPayload {
         code: Option<StoredCode>,
     },
     Compaction(StoredCompactionOutcome),
+    SkillActivation(SkillActivation),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,6 +170,7 @@ pub(super) enum DecodedEntryKind {
     Cancelled,
     Failed,
     Compaction,
+    SkillActivation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -476,6 +500,28 @@ pub(super) fn encode_request(
     .map_err(CodecError::from)
 }
 
+pub(super) fn encode_skill_activation(
+    activation: &SkillActivation,
+) -> Result<StoredEntry, CodecError> {
+    let origin = match activation.origin() {
+        SkillOrigin::Project => StoredSkillOrigin::Project,
+        SkillOrigin::User => StoredSkillOrigin::User,
+    };
+    Ok(StoredEntry {
+        kind: "skill_activation",
+        payload_json: serde_json::to_string(&StoredPayload::SkillActivation {
+            activation: StoredSkillActivation {
+                name: activation.name().to_owned(),
+                source: encode_path(activation.source())?,
+                body: activation.body().to_owned(),
+                origin,
+                trust_scope: activation.trust_scope().map(encode_path).transpose()?,
+            },
+        })?,
+        provider_replay: None,
+    })
+}
+
 pub(super) fn decode_request(payload_json: &str) -> Result<String, CodecError> {
     let StoredPayload::UserRequest { request, .. } = serde_json::from_str(payload_json)? else {
         return Err(CodecError::InvalidPayload);
@@ -531,6 +577,27 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
             validate_stored_compaction(&compaction)?;
             Ok(DecodedEntry(DecodedEntryPayload::Compaction(compaction)))
         }
+        ("skill_activation", StoredPayload::SkillActivation { activation }) => {
+            let origin = match activation.origin {
+                StoredSkillOrigin::Project => SkillOrigin::Project,
+                StoredSkillOrigin::User => SkillOrigin::User,
+            };
+            let activation = SkillActivation::new(
+                activation.name,
+                decode_path(&activation.source)?,
+                activation.body,
+                origin,
+                activation
+                    .trust_scope
+                    .as_deref()
+                    .map(decode_path)
+                    .transpose()?,
+            )
+            .map_err(|_| CodecError::InvalidPayload)?;
+            Ok(DecodedEntry(DecodedEntryPayload::SkillActivation(
+                activation,
+            )))
+        }
         _ => Err(CodecError::InvalidPayload),
     }
 }
@@ -546,7 +613,15 @@ pub(super) fn decoded_entry_kind(entry: &DecodedEntry) -> DecodedEntryKind {
             StoredTerminal::Failed { .. } => DecodedEntryKind::Failed,
         },
         DecodedEntryPayload::Compaction(_) => DecodedEntryKind::Compaction,
+        DecodedEntryPayload::SkillActivation(_) => DecodedEntryKind::SkillActivation,
     }
+}
+
+pub(super) fn decoded_skill_activation(entry: &DecodedEntry) -> Option<&SkillActivation> {
+    let DecodedEntryPayload::SkillActivation(activation) = &entry.0 else {
+        return None;
+    };
+    Some(activation)
 }
 
 pub(super) fn decoded_request(entry: &DecodedEntry) -> Option<&str> {
@@ -593,7 +668,9 @@ pub(super) fn decoded_terminal_code_result(
 
 pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
     match &entry.0 {
-        DecodedEntryPayload::SessionStart | DecodedEntryPayload::UserRequest { .. } => Vec::new(),
+        DecodedEntryPayload::SessionStart
+        | DecodedEntryPayload::UserRequest { .. }
+        | DecodedEntryPayload::SkillActivation(_) => Vec::new(),
         DecodedEntryPayload::Execution { code, .. } => {
             code.attempts.iter().map(decode_attempt).collect()
         }
@@ -1681,19 +1758,53 @@ mod tests {
         decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
         decoded_request, decoded_request_selection, decoded_terminal_history, encode_checkpoint,
         encode_compaction, encode_execution, encode_execution_value, encode_path, encode_request,
-        encode_session_preferences, encode_task_details, encode_terminal, encode_tool_value,
-        fail_unfinished_task_details,
+        encode_session_preferences, encode_skill_activation, encode_task_details, encode_terminal,
+        encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
         ModelSelection, SessionPreferences,
         models::{SOL, TERRA},
     };
-    use crate::model::{AttemptAccounting, ModelUsage};
+    use crate::model::{AttemptAccounting, ModelUsage, SkillActivation};
     use crate::pricing::{RunCostEstimate, estimate_run_cost, estimate_usage};
     use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
+    use crate::skills::SkillOrigin;
     use crate::subagents::TaskPersistedDetails;
     use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
+
+    #[test]
+    fn skill_activation_codec_keeps_exact_text_and_rejects_invalid_payloads() {
+        let activation = SkillActivation::new(
+            "review".to_owned(),
+            PathBuf::from("/project/.agents/skills/review"),
+            "---\nname: review\ndescription: Check\n---\nExact 🦀\n".to_owned(),
+            SkillOrigin::Project,
+            Some(PathBuf::from("/project")),
+        )
+        .unwrap();
+        let stored = encode_skill_activation(&activation).unwrap();
+        assert_eq!(
+            super::decoded_skill_activation(
+                &decode_entry(stored.kind, &stored.payload_json).unwrap()
+            ),
+            Some(&activation)
+        );
+        let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        payload["SkillActivation"]["activation"]["body"] = serde_json::Value::String(String::new());
+        assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
+        let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        payload["SkillActivation"]["activation"]["body"] =
+            serde_json::Value::String("line\r".repeat(701));
+        assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
+        let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        payload["SkillActivation"]["activation"]["trust_scope"] = serde_json::Value::Null;
+        assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
+        let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        payload["SkillActivation"]["activation"]["unexpected"] = serde_json::json!(true);
+        assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
+        assert!(decode_entry("execution", &stored.payload_json).is_err());
+    }
 
     #[test]
     fn compaction_codec_round_trips_attempts_and_rejects_invalid_payloads() {

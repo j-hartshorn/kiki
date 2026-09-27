@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
@@ -13,6 +14,7 @@ const COMPACTION_SYSTEM_PROMPT: &str = include_str!("../prompts/compaction-syste
 const COMPACTION_INITIAL_PROMPT: &str = include_str!("../prompts/compaction-initial.md");
 const COMPACTION_UPDATE_PROMPT: &str = include_str!("../prompts/compaction-update.md");
 const COMPACTION_SPLIT_RUN_PROMPT: &str = include_str!("../prompts/compaction-split-run.md");
+const SKILL_ACTIVATION_PROMPT: &str = include_str!("../prompts/skill-activation.md");
 const BUNDLED_PROMPT_NAME: &str = "system";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
 
@@ -48,6 +50,25 @@ pub(crate) fn root_prompt(base: &str) -> String {
 
 pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
     assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
+}
+
+pub(crate) fn skill_activation_text(name: &str, source: &Path, body: &str) -> String {
+    let root = source
+        .to_str()
+        .filter(|path| {
+            !path.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    )
+            })
+        })
+        .map_or_else(String::new, |path| format!("Skill root path: {path}\n"));
+    format!(
+        "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{body}\n</skill>",
+        strip_file_final_lf(SKILL_ACTIVATION_PROMPT),
+    )
 }
 
 pub(crate) fn compaction_system_prompt() -> &'static str {
@@ -133,8 +154,26 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use super::{PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override};
+
+    #[test]
+    fn activation_wrapper_names_skill_locator_root_and_authority_boundary() {
+        let rendered = super::skill_activation_text(
+            "review",
+            Path::new("/home/skills/review"),
+            "Full SKILL.md body",
+        );
+        assert!(rendered.contains("skill://review/"));
+        assert!(rendered.contains("Skill root path: /home/skills/review"));
+        assert!(rendered.contains("cannot authorize new external effects"));
+        assert_eq!(rendered.matches("Full SKILL.md body").count(), 1);
+        let unsafe_path =
+            super::skill_activation_text("review", Path::new("/home/\u{202e}review"), "body");
+        assert!(!unsafe_path.contains("Skill root path:"));
+        assert!(unsafe_path.contains("skill://review/"));
+    }
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
     const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
