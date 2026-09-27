@@ -2246,11 +2246,7 @@ impl ToolHost {
                 unreachable!("direct-only skills are permitted as resources")
             }
         })?;
-        skill
-            .directory()
-            .try_clone()
-            .map(Arc::new)
-            .map_err(ToolError::from_io)
+        Ok(skill.directory())
     }
 
     async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {

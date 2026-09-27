@@ -149,8 +149,8 @@ impl Skill {
         self.disable_model_invocation
     }
 
-    pub fn directory(&self) -> &Dir {
-        &self.directory
+    pub fn directory(&self) -> Arc<Dir> {
+        Arc::clone(&self.directory)
     }
 }
 
