@@ -11,7 +11,9 @@ use crate::agent::{
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 use crate::config::{
-    CompactionSettings, ModelSelection, models::Provider, settings::SettingsContext,
+    CompactionSettings, ModelSelection,
+    models::Provider,
+    settings::{CrossProviderReasoning, SettingsContext},
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
@@ -400,6 +402,7 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_record_revisions: BTreeMap<TaskId, u64>,
     subagent_status_revisions: BTreeMap<TaskId, u64>,
     compaction_policy: CompactionSettings,
+    cross_provider_reasoning: CrossProviderReasoning,
     pending_compaction: Option<PendingCompaction>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
@@ -760,6 +763,7 @@ impl<M: Model> RuntimeController<M> {
         session: SessionWriter,
     ) -> Self {
         let compaction = persisted_settings.compaction();
+        let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(selection, persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
         Self {
@@ -774,6 +778,7 @@ impl<M: Model> RuntimeController<M> {
             subagent_record_revisions: BTreeMap::new(),
             subagent_status_revisions: BTreeMap::new(),
             compaction_policy: compaction,
+            cross_provider_reasoning,
             pending_compaction: None,
             active: None,
             trace: Trace::disabled(),
@@ -824,6 +829,7 @@ impl<M: Model> RuntimeController<M> {
             "restoration has no tracked subagent operations"
         );
         let compaction = persisted_settings.compaction();
+        let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(
             selection,
             persisted_settings,
@@ -905,6 +911,7 @@ impl<M: Model> RuntimeController<M> {
                 subagent_record_revisions: BTreeMap::new(),
                 subagent_status_revisions: BTreeMap::new(),
                 compaction_policy: compaction,
+                cross_provider_reasoning,
                 pending_compaction: None,
                 active: None,
                 trace: Trace::disabled(),
@@ -1548,6 +1555,7 @@ impl<M: Model> RuntimeController<M> {
         let writer = self.session.clone();
         let cancellation_for_worker = cancellation.clone();
         let policy = self.compaction_policy;
+        let reasoning = self.cross_provider_reasoning;
         let selection = self.selection;
         let (sender, worker) = mpsc::unbounded_channel();
         let (_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
@@ -1558,6 +1566,7 @@ impl<M: Model> RuntimeController<M> {
                 .compact_manual(
                     policy,
                     selection,
+                    reasoning,
                     focus,
                     &cancellation_for_worker,
                     &writer,
@@ -2507,7 +2516,7 @@ mod tests {
                         text: format!("{label} reply"),
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new(
-                            "fixture",
+                            "openai",
                             vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
                         ),
                         attempts: Vec::new(),
@@ -3719,6 +3728,156 @@ mod tests {
         shutdown_controller(commands, controller).await;
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_uses_resolved_cross_provider_reasoning() {
+        for (settings, reasoning_kept) in
+            [("", true), ("cross_provider_reasoning = \"drop\"\n", false)]
+        {
+            for restored in [false, true] {
+                let case = format!("{settings:?} restored={restored}");
+                let home = tempfile::tempdir().expect("create home");
+                let workspace = tempfile::tempdir().expect("create workspace");
+                let config = home.path().join(".kiki/config.toml");
+                fs::create_dir_all(config.parent().expect("settings parent")).unwrap();
+                fs::write(&config, settings).unwrap();
+                let snapshot = crate::config::ready_snapshot_with_settings_for_test(
+                    Some(home.path()),
+                    workspace.path(),
+                );
+                let arena = Arena::new(
+                    worker_path(),
+                    ToolHost::new(workspace.path())
+                        .await
+                        .expect("open tool host"),
+                )
+                .await
+                .expect("create arena");
+                let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .expect("select model");
+                let session =
+                    Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                        .expect("create session");
+                let writer = session.writer();
+                let admission = writer
+                    .commit_request("inspect".to_owned(), selection)
+                    .await
+                    .expect("commit foreign request");
+                let step_id = writer
+                    .start_model_step(admission.run_id)
+                    .await
+                    .expect("start foreign step");
+                writer
+                    .close_run(
+                        admission.run_id,
+                        Some(step_id),
+                        move || PersistedTerminal::Final {
+                            step_id,
+                            text: "It printed 1.".to_owned(),
+                            reasoning_summary: "FOREIGN_REASONING".to_owned(),
+                            replay: ProviderReplay::new(
+                                "anthropic",
+                                vec![OpaqueReplayItem::new(b"signed-thinking".to_vec())],
+                            ),
+                            attempts: Vec::new(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close foreign run");
+                let tail = writer
+                    .commit_request("tail ".to_owned() + &"z".repeat(100_000), selection)
+                    .await
+                    .expect("commit tail request");
+                writer
+                    .close_run(
+                        tail.run_id,
+                        None,
+                        || PersistedTerminal::Cancelled {
+                            evidence: None,
+                            attempts: Vec::new(),
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close tail run");
+                drop(writer);
+                let summary_requests = Arc::new(Mutex::new(Vec::new()));
+                let model = RetainedCompactionModel {
+                    run_started: Arc::new(Notify::new()),
+                    summary_requests: summary_requests.clone(),
+                };
+                let subagents = SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                );
+                let controller = if restored {
+                    let (controller, initial) = RuntimeController::restore(
+                        &session,
+                        arena,
+                        model,
+                        selection,
+                        snapshot.settings().clone(),
+                        subagents,
+                        ResumeOptions::default(),
+                    )
+                    .await
+                    .expect("restore controller");
+                    assert_eq!(initial.disabled_reason, None, "{case}");
+                    controller
+                } else {
+                    RuntimeController::with_session(
+                        Agent::new(arena, model),
+                        selection,
+                        snapshot.settings().clone(),
+                        subagents,
+                        session.writer(),
+                    )
+                };
+                let (commands, mut events, _progress, controller) = start_controller(controller);
+
+                commands
+                    .send(RuntimeCommand::Compact {
+                        focus: String::new(),
+                    })
+                    .await
+                    .expect("request compaction");
+                let events = events_until_compaction_terminal(&mut events).await;
+
+                assert!(
+                    matches!(
+                        events.last(),
+                        Some(RuntimeEvent::CompactionLifecycle {
+                            lifecycle: super::CompactionLifecycle::Settled(
+                                super::CompactionSettlement::Applied,
+                            ),
+                        })
+                    ),
+                    "{case}: {events:?}"
+                );
+                {
+                    let requests = summary_requests.lock().expect("read summary requests");
+                    assert!(!requests.is_empty(), "{case}");
+                    assert!(
+                        requests.iter().any(|request| request
+                            .input
+                            .contains("[Assistant action]: It printed 1.")),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .any(|request| request.input.contains("FOREIGN_REASONING")),
+                        reasoning_kept,
+                        "{case}"
+                    );
+                }
+
+                shutdown_controller(commands, controller).await;
+                session.close().expect("close session");
+            }
+        }
     }
 
     #[tokio::test]

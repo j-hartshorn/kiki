@@ -8,7 +8,10 @@ use crate::arena::{
     Arena, ArenaError, ArenaProgress, Checkpoint, Execution, ExecutionOutcome,
     InterruptedExecution, Observation, PythonError, RunPreview, ToolCall, ToolCallToken,
 };
-use crate::config::{CompactionSettings, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
+use crate::config::{
+    CompactionSettings, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT,
+    settings::CrossProviderReasoning,
+};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
@@ -614,17 +617,25 @@ impl<M: Model> Agent<M> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn compact_manual(
         &mut self,
         policy: CompactionSettings,
         selection: ModelSelection,
+        reasoning: CrossProviderReasoning,
         focus: String,
         cancellation: &CancellationToken,
         writer: &SessionWriter,
         started: &mut (impl FnMut() + Send),
     ) -> Result<ManualCompactionResult, SessionError> {
         let Some(preparation) = writer
-            .prepare_compaction(policy, selection, focus, CompactionReason::Manual)
+            .prepare_compaction(
+                policy,
+                selection,
+                reasoning,
+                focus,
+                CompactionReason::Manual,
+            )
             .await?
         else {
             return Ok(ManualCompactionResult::NoOp);
@@ -1446,6 +1457,7 @@ mod tests {
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
         ToolCallSummary, ToolName,
     };
+    use crate::config::settings::CrossProviderReasoning;
     use crate::config::{CompactionSettings, DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
@@ -1579,7 +1591,7 @@ mod tests {
                 .await
                 .expect("start compaction fixture step");
             let replay = ProviderReplay::new(
-                "fixture",
+                "openai",
                 vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
             );
             writer
@@ -1699,6 +1711,7 @@ mod tests {
                 .prepare_compaction(
                     policy,
                     selection,
+                    CrossProviderReasoning::Inline,
                     String::new(),
                     crate::session::CompactionReason::Manual,
                 )
@@ -1716,6 +1729,7 @@ mod tests {
             .compact_manual(
                 policy,
                 selection,
+                CrossProviderReasoning::Inline,
                 String::new(),
                 &cancellation,
                 &writer,
@@ -1767,6 +1781,7 @@ mod tests {
             .prepare_compaction(
                 policy,
                 selection,
+                CrossProviderReasoning::Inline,
                 "preserve decisions".to_owned(),
                 crate::session::CompactionReason::Manual,
             )
@@ -1782,6 +1797,7 @@ mod tests {
             .compact_manual(
                 policy,
                 selection,
+                CrossProviderReasoning::Inline,
                 "preserve decisions".to_owned(),
                 &cancellation,
                 &writer,
@@ -1870,6 +1886,7 @@ mod tests {
             .compact_manual(
                 CompactionSettings::new(16_384, 20_000),
                 selection,
+                CrossProviderReasoning::Inline,
                 String::new(),
                 &cancellation,
                 &writer,

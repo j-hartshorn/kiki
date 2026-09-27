@@ -20,6 +20,7 @@ use tokio::task;
 use crate::agent::TerminalEvidence;
 use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
+use crate::config::settings::CrossProviderReasoning;
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
@@ -988,12 +989,14 @@ impl SessionWriter {
         &self,
         policy: CompactionSettings,
         selection: ModelSelection,
+        reasoning: CrossProviderReasoning,
         focus: String,
         reason: CompactionReason,
     ) -> Result<Option<PreparedCompaction>, SessionError> {
         let snapshot = self.read(load_compaction_snapshot).await?;
-        let Some(planner) = crate::compaction::prepare(&snapshot.facts, policy, selection, &focus)
-            .map_err(|error| SessionError::Codec(error.to_string()))?
+        let Some(planner) =
+            crate::compaction::prepare(&snapshot.facts, policy, selection, reasoning, &focus)
+                .map_err(|error| SessionError::Codec(error.to_string()))?
         else {
             return Ok(None);
         };
@@ -3882,6 +3885,7 @@ mod tests {
         Arena, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity, ToolCall, ToolCallSummary,
         ToolName,
     };
+    use crate::config::settings::CrossProviderReasoning;
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
@@ -10382,6 +10386,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 6),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10586,6 +10591,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10645,6 +10651,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10760,6 +10767,7 @@ mod tests {
                 .prepare_compaction(
                     crate::config::CompactionSettings::new(100, 4),
                     selection(),
+                    CrossProviderReasoning::Inline,
                     String::new(),
                     super::CompactionReason::ContextOverflow,
                 )
@@ -10830,6 +10838,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10917,6 +10926,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11012,6 +11022,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11034,6 +11045,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11109,6 +11121,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11136,6 +11149,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11218,6 +11232,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11278,6 +11293,167 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn compaction_preparation_renders_foreign_replay_for_the_selected_provider() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let admission = writer
+            .commit_request("inspect".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step_id),
+                move || PersistedTerminal::Final {
+                    step_id,
+                    text: "It printed 1.".to_owned(),
+                    reasoning_summary: "FOREIGN_REASONING".to_owned(),
+                    replay: crate::model::ProviderReplay::new(
+                        "anthropic",
+                        vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
+                    ),
+                    attempts: vec![crate::model::AttemptAccounting::KnownUsage(
+                        crate::model::ModelUsage {
+                            model: crate::config::models::OPUS_5_5.id.to_owned(),
+                            service_tier: None,
+                            input_tokens: Some(40_000),
+                            cached_input_tokens: Some(30_000),
+                            cache_write_input_tokens: Some(5_000),
+                            cache_write_1h_input_tokens: 0,
+                            output_tokens: Some(10_000),
+                            reasoning_output_tokens: Some(1_000),
+                            total_tokens: Some(50_000),
+                        },
+                    )],
+                },
+                None,
+            )
+            .await
+            .expect("close foreign run");
+        append_cancelled_request(&writer, "tail").await;
+        let live_history = writer.model_history().expect("read live context");
+        let stored_rows = |session: &Session| {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let mut statement = connection
+                .prepare("SELECT id, payload_json, provider_replay FROM entries ORDER BY id")
+                .expect("prepare entry query");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                })
+                .expect("query entries")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read entries")
+        };
+        let rows_before = stored_rows(&session);
+        let prepare = |reasoning| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                reasoning,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+        };
+
+        for (reasoning, semantic) in [
+            (
+                CrossProviderReasoning::Inline,
+                "inspect".len() + "FOREIGN_REASONING".len() + "It printed 1.".len(),
+            ),
+            (
+                CrossProviderReasoning::Drop,
+                "inspect".len() + "It printed 1.".len(),
+            ),
+        ] {
+            let preparation = prepare(reasoning)
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history");
+            assert_eq!(
+                preparation.planner.context_tokens(),
+                (semantic + "tail".len()).div_ceil(4) as u64,
+                "{reasoning:?}"
+            );
+            assert_eq!(
+                preparation.requests()[0]
+                    .input
+                    .contains("FOREIGN_REASONING"),
+                reasoning == CrossProviderReasoning::Inline,
+                "{reasoning:?}"
+            );
+        }
+        assert_eq!(stored_rows(&session), rows_before);
+        assert_eq!(
+            writer.model_history().expect("read live context"),
+            live_history
+        );
+
+        let preparation = prepare(CrossProviderReasoning::Drop)
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "historical FOREIGN_REASONING".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        append_cancelled_request(&writer, "later").await;
+        assert_eq!(stored_rows(&session)[..rows_before.len()], rows_before);
+        let repeated = prepare(CrossProviderReasoning::Drop)
+            .await
+            .expect("prepare repeated compaction")
+            .expect("prepare repeated compactable history");
+        assert!(
+            repeated.requests()[0]
+                .input
+                .contains("<previous-summary>\nhistorical FOREIGN_REASONING\n</previous-summary>")
+        );
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session before restart");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        activate_session(&reopened).await;
+        let restored = reopened
+            .writer()
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                CrossProviderReasoning::Drop,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare restored compaction")
+            .expect("prepare restored compactable history");
+        assert_eq!(
+            restored.planner.context_tokens(),
+            repeated.planner.context_tokens()
+        );
+        assert_eq!(restored.requests(), repeated.requests());
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn stale_compaction_settlement_does_not_append_or_publish() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -11289,6 +11465,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
