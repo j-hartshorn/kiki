@@ -445,9 +445,6 @@ pub(crate) enum SessionWriteKind {
     Relocation,
     Name,
     Request,
-    // Used by the model-selected activation path added in Task 4.
-    #[allow(dead_code)]
-    SkillActivation,
     Step,
     Settlement,
     Compaction,
@@ -1302,35 +1299,6 @@ impl SessionWriter {
         .await
     }
 
-    #[allow(dead_code)] // Task 4 calls this after settled Python execution.
-    pub(crate) async fn commit_skill_activation(
-        &self,
-        run_id: u64,
-        activation: SkillActivation,
-    ) -> Result<bool, SessionError> {
-        self.write_context(
-            SessionWriteKind::SkillActivation,
-            move |connection, context| {
-                let mut history = context.history.clone();
-                let changed = history
-                    .activate_skill(activation.clone())
-                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
-                let entry = commit_skill_activation(
-                    connection,
-                    run_id,
-                    context.effective_entry,
-                    changed.then_some(&activation),
-                )?;
-                if let Some(entry) = entry {
-                    context.effective_entry = entry;
-                    context.history = history;
-                }
-                Ok(changed)
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn start_model_step(&self, run_id: u64) -> Result<u64, SessionError> {
         self.write(SessionWriteKind::Step, move |connection| {
             start_model_step(connection, run_id)
@@ -1697,69 +1665,6 @@ fn commit_request(
     };
     transaction.commit()?;
     Ok(admission)
-}
-
-#[allow(dead_code)] // Task 4 calls through SessionWriter::commit_skill_activation.
-fn commit_skill_activation(
-    connection: &mut Connection,
-    run_id: u64,
-    expected_parent: SessionEntryId,
-    activation: Option<&SkillActivation>,
-) -> Result<Option<SessionEntryId>, SessionError> {
-    let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
-    let expected_parent = i64::try_from(expected_parent.0).map_err(|_| SessionError::IdOverflow)?;
-    let stored = activation
-        .map(codec::encode_skill_activation)
-        .transpose()
-        .map_err(|error| SessionError::Codec(error.to_string()))?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (parent_id, revision): (i64, i64) = transaction.query_row(
-        "SELECT active_entry_id, revision FROM session WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if parent_id != expected_parent {
-        return Err(SessionError::InvalidTransition);
-    }
-    let (parent_run, checkpoint_id): (Option<i64>, i64) = transaction.query_row(
-        "SELECT run_id, checkpoint_id FROM entries WHERE id = ?1",
-        params![parent_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let open: bool = transaction.query_row(
-        "SELECT terminal_entry_id IS NULL FROM runs WHERE id = ?1",
-        params![run_id],
-        |row| row.get(0),
-    )?;
-    let pending: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM model_steps WHERE run_id = ?1 AND settled_entry_id IS NULL)",
-        params![run_id],
-        |row| row.get(0),
-    )?;
-    let settled: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM model_steps WHERE run_id = ?1 AND settled_entry_id IS NOT NULL)",
-        params![run_id], |row| row.get(0),
-    )?;
-    if parent_run != Some(run_id) || !open || pending || !settled {
-        return Err(SessionError::InvalidTransition);
-    }
-    let Some(stored) = stored else {
-        transaction.commit()?;
-        return Ok(None);
-    };
-    let now = now_ms()?;
-    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
-    transaction.execute(
-        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
-        params![parent_id, run_id, checkpoint_id, stored.payload_json, now, next_revision],
-    )?;
-    let entry_id = transaction.last_insert_rowid();
-    transaction.execute(
-        "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![entry_id, now, next_revision],
-    )?;
-    transaction.commit()?;
-    session_entry_id(entry_id).map(Some)
 }
 
 fn start_model_step(connection: &mut Connection, run_id: u64) -> Result<u64, SessionError> {
@@ -5234,94 +5139,6 @@ mod tests {
         assert_eq!(restored.active_skills().count(), 1);
         assert_eq!(restored.active_skills().next().unwrap().body(), body);
         assert_eq!(restored.entries(), live.entries());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn settled_skill_activation_is_durable_and_duplicate_is_a_noop() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let session = create_session(&home, &workspace).await;
-        let writer = session.writer();
-        let run = writer
-            .commit_request("inspect".to_owned(), selection())
-            .await
-            .unwrap();
-        settle_fixture_execution(&session, &writer, run.run_id, "pass", None, Vec::new()).await;
-        let first = skill(
-            "review",
-            home.path().join("first"),
-            "---\nname: review\ndescription: First\n---\nFirst",
-            SkillOrigin::User,
-            None,
-        );
-        let changed = skill(
-            "review",
-            home.path().join("changed"),
-            "---\nname: review\ndescription: Changed\n---\nChanged",
-            SkillOrigin::User,
-            None,
-        );
-        assert!(
-            writer
-                .commit_skill_activation(run.run_id, first.clone())
-                .await
-                .unwrap()
-        );
-        let leaf = active_entry_id(&session);
-        assert!(
-            !writer
-                .commit_skill_activation(run.run_id, first)
-                .await
-                .unwrap()
-        );
-        assert_eq!(active_entry_id(&session), leaf);
-        assert!(
-            writer
-                .commit_skill_activation(run.run_id, changed.clone())
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            writer
-                .model_history()
-                .unwrap()
-                .active_skills()
-                .next()
-                .unwrap(),
-            &changed
-        );
-        close_cancelled(&writer, run.run_id).await;
-        assert!(
-            writer
-                .commit_skill_activation(run.run_id, changed.clone())
-                .await
-                .is_err()
-        );
-        let next_run = writer
-            .commit_request("next".to_owned(), selection())
-            .await
-            .unwrap();
-        assert!(
-            writer
-                .commit_skill_activation(run.run_id, changed.clone())
-                .await
-                .is_err()
-        );
-        close_cancelled(&writer, next_run.run_id).await;
-        let restored = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(restored.active_skills().count(), 1);
-        assert_eq!(restored.active_skills().next().unwrap(), &changed);
-        let stored: i64 = session
-            .connection_for_test()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, 2);
     }
 
     #[tokio::test]
