@@ -748,6 +748,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fresh_and_resumed_startup_retain_skipped_root_diagnostics_only_for_ui() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let root = project.path().join(".agents/skills");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..129 {
+            fs::create_dir(root.join(format!("candidate-{index:03}"))).unwrap();
+        }
+        let direct = home.path().join(".agents/skills/private-workflow");
+        fs::create_dir_all(&direct).unwrap();
+        fs::write(
+            direct.join("SKILL.md"),
+            "---\ndescription: Private workflow\ndisable-model-invocation: true\n---\nBody\n",
+        )
+        .unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::settings::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let base = "exact override base";
+        let root_prompt = super::prompt::root_prompt(base);
+        for has_active in [false, true] {
+            let (catalog, trusted) = super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                has_active,
+                |_| panic!("saved trust should suppress fresh and resume prompts"),
+            )
+            .unwrap();
+            assert!(trusted);
+            assert_eq!(catalog.diagnostics().len(), 1);
+            assert!(
+                catalog.diagnostics()[0]
+                    .reason
+                    .contains("entire root skipped")
+            );
+            let model_prompt = super::production_system_prompt(base, &root_prompt, Some(&catalog));
+            assert_eq!(model_prompt, root_prompt);
+            assert!(!model_prompt.contains("entire root skipped"));
+            assert!(!model_prompt.contains("Private workflow"));
+            assert!(!model_prompt.contains("private-workflow"));
+        }
+    }
+
     #[tokio::test]
     async fn fresh_and_resumed_catalogs_wire_skill_resources_into_the_arena() {
         let home = tempdir().unwrap();

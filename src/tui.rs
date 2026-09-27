@@ -38,7 +38,7 @@ use crate::runtime::{
     RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
-use crate::skills::{SkillCatalog, SkillLookupError};
+use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
@@ -353,6 +353,8 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 
 impl App {
     fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.transcript
+            .append_metadata(skill_diagnostic_report(&catalog));
         self.completion = slash::Completion::with_skills(
             catalog
                 .entries()
@@ -1895,6 +1897,9 @@ impl App {
     ) {
         let mut transcript = self.transcript.restored_replacement(state);
         transcript.append_restoration_card();
+        if let Some(catalog) = &self.skill_catalog {
+            transcript.append_metadata(skill_diagnostic_report(catalog));
+        }
         self.transcript = transcript;
         self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
         self.history_position = HistoryPosition::FollowingBottom;
@@ -2374,18 +2379,84 @@ fn render_project_skill_trust(
 fn escaped_project_skill_scope(scope: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
 
+    escaped_terminal_bytes(scope.as_os_str().as_bytes(), usize::MAX)
+}
+
+const SKILL_DIAGNOSTIC_LINE_BYTES: usize = 512;
+
+fn skill_diagnostic_report(catalog: &SkillCatalog) -> Vec<String> {
+    let diagnostics = catalog.diagnostics();
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Skill discovery diagnostics ({}):",
+        diagnostics.len()
+    )];
+    for diagnostic in diagnostics {
+        lines.push(format_skill_diagnostic(diagnostic));
+    }
+    lines
+}
+
+fn format_skill_diagnostic(diagnostic: &SkillDiagnostic) -> String {
+    let path = escaped_diagnostic_path(&diagnostic.path);
+    let reason = escaped_terminal_bytes(diagnostic.reason.as_bytes(), 176);
+    let line = if let Some(name) = &diagnostic.name {
+        let name = escaped_terminal_bytes(name.as_bytes(), 80);
+        format!("- {path} [skill {name}]: {reason}")
+    } else {
+        format!("- {path}: {reason}")
+    };
+    debug_assert!(line.len() <= SKILL_DIAGNOSTIC_LINE_BYTES);
+    line
+}
+
+fn escaped_diagnostic_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    const PATH_BYTES: usize = 224;
+    let bytes = path.as_os_str().as_bytes();
+    let full = escaped_terminal_bytes(bytes, usize::MAX);
+    if full.len() <= PATH_BYTES {
+        return full;
+    }
+    let hash = bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    let marker = format!("...#{hash:016X}:");
+    let mut suffix = String::new();
+    for byte in bytes.iter().rev() {
+        let encoded = escaped_terminal_bytes(std::slice::from_ref(byte), usize::MAX);
+        if marker.len() + suffix.len() + encoded.len() > PATH_BYTES {
+            break;
+        }
+        suffix.insert_str(0, &encoded);
+    }
+    format!("{marker}{suffix}")
+}
+
+fn escaped_terminal_bytes(bytes: &[u8], limit: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut escaped = String::new();
-    for byte in scope.as_os_str().as_bytes() {
-        match byte {
-            b'\\' => escaped.push_str("\\\\"),
-            0x20..=0x7e => escaped.push(*byte as char),
-            _ => {
-                escaped.push_str("\\x");
-                escaped.push(HEX[(byte >> 4) as usize] as char);
-                escaped.push(HEX[(byte & 0x0f) as usize] as char);
-            }
+    if limit < 3 {
+        return escaped;
+    }
+    for byte in bytes {
+        let encoded = match byte {
+            b'\\' => "\\\\".to_owned(),
+            0x20..=0x7e => (*byte as char).to_string(),
+            _ => format!(
+                "\\x{}{}",
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char
+            ),
+        };
+        if escaped.len() + encoded.len() > limit - 3 {
+            escaped.push_str("...");
+            break;
         }
+        escaped.push_str(&encoded);
     }
     escaped
 }
@@ -3187,7 +3258,7 @@ mod tests {
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
         SessionMetadata,
     };
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
@@ -4680,6 +4751,97 @@ mod tests {
         assert!(update.commands.is_empty());
         assert_eq!(app.prompt.text(), "/skill:");
         assert!(app.notice().unwrap().contains("skill name"));
+    }
+
+    #[test]
+    fn catalog_diagnostics_appear_after_startup_and_restored_navigation() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let invalid = home.path().join(".agents/skills/broken");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        assert_eq!(catalog.diagnostics().len(), 1);
+
+        let mut app = App::default().with_skill_catalog(catalog);
+        let first = rendered(&mut app, 120, 20);
+        assert!(first.contains("Skill discovery diagnostics"), "{first}");
+        assert!(first.contains("description"), "{first}");
+        assert!(first.contains("must be a string"), "{first}");
+
+        app.replace_restored_state(&RuntimeInitialState::empty(), &None);
+        let restored = rendered(&mut app, 120, 20);
+        assert!(
+            restored.contains("Skill discovery diagnostics"),
+            "{restored}"
+        );
+        assert!(restored.contains("description"), "{restored}");
+        assert!(restored.contains("must be a string"), "{restored}");
+    }
+
+    #[test]
+    fn skipped_roots_have_distinct_bounded_escaped_diagnostic_rows() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let repository = project.path().join("a".repeat(100)).join("b".repeat(100));
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        let launch = repository.join("unsafe\n\u{202e}tail");
+        for scope in [&repository, &launch] {
+            let root = scope.join(".agents/skills");
+            fs::create_dir_all(&root).unwrap();
+            for index in 0..129 {
+                fs::create_dir(root.join(format!("candidate-{index:03}"))).unwrap();
+            }
+        }
+        let catalog = SkillCatalog::discover(
+            &ProjectScope::discover(&launch).unwrap(),
+            home.path(),
+            true,
+            "guidance",
+        );
+        let rows = super::skill_diagnostic_report(&catalog);
+        assert_eq!(catalog.diagnostics().len(), 2);
+        assert_eq!(rows.len(), 3, "one heading and one row per skipped root");
+        assert_ne!(rows[1], rows[2], "long roots must stay distinguishable");
+        for row in &rows[1..] {
+            assert!(row.len() <= super::SKILL_DIAGNOSTIC_LINE_BYTES);
+            assert!(row.contains("entire root skipped"), "{row}");
+            assert!(
+                row.contains("...#"),
+                "long path needs hash and suffix: {row}"
+            );
+            assert_eq!(row.lines().count(), 1);
+        }
+        let hostile = rows
+            .iter()
+            .find(|row| row.contains("\\x0A"))
+            .expect("hostile launch path must be visible as escaped bytes");
+        assert!(hostile.contains("\\xE2\\x80\\xAE"), "{hostile}");
+        assert!(!hostile.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn skill_diagnostic_row_escapes_hostile_name_and_reason() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let diagnostic = SkillDiagnostic {
+            path: OsString::from_vec(b"/root/unsafe\n\xe2\x80\xae\xff".to_vec()).into(),
+            name: Some("bad\x1bname".to_owned()),
+            reason: format!("bad\n\u{202e}{}", "x".repeat(1000)),
+        };
+        let row = super::format_skill_diagnostic(&diagnostic);
+        assert!(row.len() <= super::SKILL_DIAGNOSTIC_LINE_BYTES);
+        assert_eq!(row.lines().count(), 1);
+        assert!(row.contains("unsafe\\x0A\\xE2\\x80\\xAE\\xFF"), "{row}");
+        assert!(row.contains("bad\\x1Bname"), "{row}");
+        assert!(row.contains("bad\\x0A\\xE2\\x80\\xAE"), "{row}");
+        assert!(row.ends_with("..."), "{row}");
     }
 
     #[test]

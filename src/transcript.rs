@@ -2375,6 +2375,12 @@ impl Transcript {
         self.append_settled_blocks([TranscriptBlock::SessionRestored]);
     }
 
+    pub(crate) fn append_metadata(&mut self, lines: Vec<String>) {
+        if !lines.is_empty() {
+            self.append_settled_blocks([TranscriptBlock::Metadata { lines }]);
+        }
+    }
+
     fn apply_initial_state(&mut self, initial: &RuntimeInitialState) {
         for item in &initial.timeline {
             match item {
