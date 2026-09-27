@@ -664,12 +664,23 @@ pub(crate) fn type_check_stubs() -> String {
 }
 
 pub(crate) fn prompt_reference() -> String {
+    prompt_reference_with_visibility(false, false)
+}
+
+pub(crate) fn prompt_reference_for_catalog(catalog: &SkillCatalog) -> String {
+    prompt_reference_with_visibility(catalog.rendered_catalog().is_some(), false)
+}
+
+fn prompt_reference_with_visibility(load_skill_visible: bool, read_only: bool) -> String {
     prompt_reference_for(
         &ACTIVE_TOOLS
             .iter()
-            .filter(|definition| definition.name != ToolName::LoadSkill)
+            .filter(|definition| {
+                (load_skill_visible || definition.name != ToolName::LoadSkill)
+                    && (!read_only || definition.name.is_allowed_read_only())
+            })
             .collect::<Vec<_>>(),
-        false,
+        read_only,
     )
 }
 
@@ -1860,14 +1871,16 @@ impl ToolHost {
     }
 
     pub(crate) fn prompt_reference(&self) -> String {
-        let definitions = ACTIVE_TOOLS
-            .iter()
-            .filter(|definition| {
-                definition.name != ToolName::LoadSkill
-                    && (!self.read_only || definition.name.is_allowed_read_only())
-            })
-            .collect::<Vec<_>>();
-        prompt_reference_for(&definitions, self.read_only)
+        prompt_reference_with_visibility(
+            self.skill_catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.rendered_catalog().is_some()),
+            self.read_only,
+        )
+    }
+
+    pub(crate) fn skill_catalog(&self) -> Option<&SkillCatalog> {
+        self.skill_catalog.as_deref()
     }
 
     #[cfg(test)]

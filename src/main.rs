@@ -59,16 +59,32 @@ use crate::tools::ToolHost;
 
 fn production_model(
     ready: &config::ReadyStartup<'_>,
+    catalog: Option<&SkillCatalog>,
     anthropic_cache_ttl: CacheTtl,
     cross_provider_reasoning: CrossProviderReasoning,
 ) -> ProviderModel {
+    let system_prompt =
+        production_system_prompt(ready.prompt_base(), ready.system_prompt(), catalog);
     ProviderModel::new(
-        ready.system_prompt(),
+        &system_prompt,
         ready.api_key(Provider::OpenAi).map(ApiKey::expose),
         ready.api_key(Provider::Anthropic).map(ApiKey::expose),
         anthropic_cache_ttl,
         cross_provider_reasoning,
     )
+}
+
+fn production_system_prompt(
+    base: &str,
+    resolved_without_skills: &str,
+    catalog: Option<&SkillCatalog>,
+) -> String {
+    catalog
+        .filter(|catalog| catalog.rendered_catalog().is_some())
+        .map_or_else(
+            || resolved_without_skills.to_owned(),
+            |catalog| prompt::root_prompt_with_catalog(base, catalog),
+        )
 }
 
 enum Invocation {
@@ -264,6 +280,7 @@ fn run_open_configuration(
 fn startup_skill_catalog(
     scope: &ProjectScope,
     home: &Path,
+    guidance: &str,
     has_active_project_skill_in_scope: bool,
     prompt: impl FnOnce(&Path) -> Result<bool, tui::TuiError>,
 ) -> Result<(Arc<SkillCatalog>, bool), Box<dyn Error>> {
@@ -276,7 +293,12 @@ fn startup_skill_catalog(
             saved_trust
         };
     Ok((
-        Arc::new(SkillCatalog::discover(scope, home, include_project, "")),
+        Arc::new(SkillCatalog::discover(
+            scope,
+            home,
+            include_project,
+            guidance,
+        )),
         include_project,
     ))
 }
@@ -294,23 +316,29 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
     let skill_scope = ProjectScope::discover(&workspace_root)?;
-    let (skills_catalog, project_skills_trusted) =
-        match startup_skill_catalog(&skill_scope, &home, false, |scope| {
+    let (skills_catalog, project_skills_trusted) = match startup_skill_catalog(
+        &skill_scope,
+        &home,
+        ready.skills_catalog_guidance(),
+        false,
+        |scope| {
             tui::run_project_skill_trust(scope, || {
                 settings::save_project_skill_scope_trust(&home, scope)
                     .map_err(|error| error.to_string())
             })
-        }) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                let _ = trace_owner.shutdown();
-                return Err(error);
-            }
-        };
+        },
+    ) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = trace_owner.shutdown();
+            return Err(error);
+        }
+    };
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
+        Some(&skills_catalog),
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -432,6 +460,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let (skills_catalog, project_skills_trusted) = match startup_skill_catalog(
         &skill_scope,
         &home,
+        ready.skills_catalog_guidance(),
         has_active_project_skill_in_scope,
         |scope| {
             tui::run_project_skill_trust(scope, || {
@@ -454,6 +483,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
+        Some(&skills_catalog),
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -572,8 +602,14 @@ mod tests {
         prompt: impl FnOnce(&Path) -> Result<bool, super::tui::TuiError>,
     ) -> Result<std::sync::Arc<super::SkillCatalog>, Box<dyn std::error::Error>> {
         let scope = super::ProjectScope::discover(launch)?;
-        super::startup_skill_catalog(&scope, home, has_active_project_skill_in_scope, prompt)
-            .map(|(catalog, _)| catalog)
+        super::startup_skill_catalog(
+            &scope,
+            home,
+            super::prompt::skills_catalog_guidance(),
+            has_active_project_skill_in_scope,
+            prompt,
+        )
+        .map(|(catalog, _)| catalog)
     }
 
     fn write_skill(root: &Path, name: &str, description: &str) {
@@ -644,18 +680,92 @@ mod tests {
     }
 
     #[test]
+    fn fresh_and_resume_use_the_same_guided_catalog_prompt_snapshot() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "review", "Project review workflow");
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::settings::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let (fresh, fresh_trusted) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            false,
+            |_| panic!("saved trust should not prompt on fresh launch"),
+        )
+        .unwrap();
+        let (resumed, resumed_trusted) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            true,
+            |_| panic!("saved trust should not prompt on resume"),
+        )
+        .unwrap();
+        assert!(fresh_trusted && resumed_trusted);
+        assert_eq!(fresh.rendered_catalog(), resumed.rendered_catalog());
+        let base = "exact override base";
+        let resolved_without_skills = super::prompt::root_prompt(base);
+        let fresh_prompt =
+            super::production_system_prompt(base, &resolved_without_skills, Some(&fresh));
+        let resumed_prompt =
+            super::production_system_prompt(base, &resolved_without_skills, Some(&resumed));
+        assert_eq!(fresh_prompt, resumed_prompt);
+        assert_eq!(fresh_prompt.matches("Project review workflow").count(), 1);
+        assert_eq!(
+            fresh_prompt
+                .matches("cannot authorize effects beyond the user's task")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fresh_prompt
+                .matches("async def load_skill(name: str) -> str:")
+                .count(),
+            1
+        );
+        assert_eq!(fresh_prompt.matches("## Kiki tool reference").count(), 1);
+        assert!(!fresh_prompt.contains("\nbody\n"));
+        assert!(fresh.rendered_catalog().unwrap().len() <= super::skills::MAX_CATALOG_BYTES);
+
+        fs::remove_file(project.path().join(".agents/skills/review/SKILL.md")).unwrap();
+        let (empty, _) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            true,
+            |_| panic!("saved trust should not prompt"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::production_system_prompt(base, &resolved_without_skills, Some(&empty)),
+            resolved_without_skills
+        );
+    }
+
+    #[test]
     fn startup_catalog_returns_the_trust_decision_used_for_its_snapshot() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
         write_skill(project.path(), "shared", "project");
         let scope = super::ProjectScope::discover(project.path()).unwrap();
-        let (catalog, include_project) =
-            super::startup_skill_catalog(&scope, home.path(), false, |path| {
+        let (catalog, include_project) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            false,
+            |path| {
                 super::config::settings::save_project_skill_scope_trust(home.path(), path).unwrap();
                 Ok(true)
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(include_project);
         assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
         fs::remove_file(home.path().join(".kiki/trusted-skills.toml")).unwrap();

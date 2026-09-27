@@ -140,11 +140,11 @@ Use isolated temporary project and user directories with real `SKILL.md` fixture
 
 ### Task 5: Advertise the visible catalog
 
-**Changes** — Render the same bounded, sorted model-invocable catalog for bundled and overridden root and child prompts. Omit the generated section and guidance entirely when it has no entries. Keep the raw base prompt canonical and avoid duplicate tool references.
+**Changes** — Render the same bounded, sorted model-invocable catalog for bundled and overridden root and child prompts. Resolve an optional `KIKI_SKILLS_CATALOG_PROMPT` Markdown file override during startup and count its guidance within the catalog limit. Derive each child catalog and tool reference from its Arena source. Omit the generated section and guidance entirely when it has no entries. Keep the raw base prompt canonical and avoid duplicate tool references.
 
-**Tests** (`src/prompt.rs` and `src/tools.rs`, unit; `src/subagents.rs`, prompt construction) — Names and descriptions appear once; direct-only names and bodies do not appear; no visible skills produces no generated skill section, guidance, or model-facing `load_skill` signature; bundled and overridden root and child bases include the authority rule when applicable; read-only children see the same visible catalog with only their permitted tool signatures.
+**Tests** (`src/prompt.rs` and `src/tools.rs`, unit; `src/subagents.rs`, prompt construction) — Names and descriptions appear once; direct-only names and bodies do not appear; no visible skills produces no generated skill section, guidance, or model-facing `load_skill` signature; bundled and overridden root and child bases include the authority rule when applicable; a custom guidance file appears once and uses the same 16 KiB catalog budget, while unreadable or invalid UTF-8 overrides produce typed startup problems without fallback; read-only children derive the same visible catalog and permitted tool signatures from one Arena source.
 
-**Files** — Create: `prompts/skills-catalog.md`. Modify: `src/prompt.rs`, `src/tools.rs`, `src/config.rs`, `src/main.rs`, `src/subagents.rs`.
+**Files** — Create: `prompts/skills-catalog.md`. Modify: `src/prompt.rs`, `src/tools.rs`, `src/config.rs`, `src/main.rs`, `src/subagents.rs`, `src/arena.rs`, `src/skills.rs`, `src/openai.rs` (test harness).
 
 **Verification** — Focused prompt and subagent tests pass; `just check` succeeds.
 

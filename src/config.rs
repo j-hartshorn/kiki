@@ -61,6 +61,8 @@ pub enum StartupProblemKind {
     ThinkingUnsupported,
     PromptOverrideUnreadable,
     PromptOverrideInvalidUtf8,
+    SkillsCatalogPromptUnreadable,
+    SkillsCatalogPromptInvalidUtf8,
     ApiKeyMissing,
     ApiKeyInvalidUnicode,
 }
@@ -85,7 +87,10 @@ impl StartupProblemKind {
             | Self::ThinkingEmpty
             | Self::ThinkingUnknown
             | Self::ThinkingUnsupported => 7,
-            Self::PromptOverrideUnreadable | Self::PromptOverrideInvalidUtf8 => 8,
+            Self::PromptOverrideUnreadable
+            | Self::PromptOverrideInvalidUtf8
+            | Self::SkillsCatalogPromptUnreadable
+            | Self::SkillsCatalogPromptInvalidUtf8 => 8,
             Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 9,
         }
     }
@@ -278,6 +283,7 @@ impl StartupConfiguration {
             workspace_root: self.construction.workspace_root.as_deref()?,
             system_prompt: self.construction.system_prompt.as_deref()?,
             prompt_base: self.construction.prompt_base.as_deref()?,
+            skills_catalog_guidance: self.construction.skills_catalog_guidance.as_deref()?,
             api_keys: &self.construction.api_keys,
             model: self.construction.model,
             thinking: self.snapshot.thinking,
@@ -318,6 +324,7 @@ struct StartupConstruction {
     workspace_root: Option<PathBuf>,
     system_prompt: Option<String>,
     prompt_base: Option<String>,
+    skills_catalog_guidance: Option<String>,
     api_keys: ApiKeys,
     model: &'static ModelConfiguration,
 }
@@ -327,6 +334,7 @@ pub(crate) struct ReadyStartup<'a> {
     workspace_root: &'a Path,
     system_prompt: &'a str,
     prompt_base: &'a str,
+    skills_catalog_guidance: &'a str,
     api_keys: &'a ApiKeys,
     model: &'static ModelConfiguration,
     thinking: &'static str,
@@ -347,6 +355,10 @@ impl<'a> ReadyStartup<'a> {
 
     pub(crate) fn prompt_base(&self) -> &'a str {
         self.prompt_base
+    }
+
+    pub(crate) fn skills_catalog_guidance(&self) -> &'a str {
+        self.skills_catalog_guidance
     }
 
     pub(crate) fn api_key(&self, provider: Provider) -> Option<&'a ApiKey> {
@@ -406,6 +418,7 @@ struct StartupInput {
     home: Option<OsString>,
     workspace_root: io::Result<PathBuf>,
     prompt: PromptResolution,
+    skills_catalog_guidance: Result<String, PromptError>,
     openai_api_key: Option<OsString>,
     anthropic_api_key: Option<OsString>,
 }
@@ -447,6 +460,10 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
                     detail: source.to_string(),
                 },
             },
+            Err(
+                PromptError::UnreadableSkillsCatalogOverride { .. }
+                | PromptError::InvalidUtf8SkillsCatalogOverride { .. },
+            ) => unreachable!("catalog guidance error cannot resolve a system prompt"),
         }
     }
 }
@@ -465,6 +482,7 @@ pub(crate) fn load_with_session_preferences(
         home: env::var_os("HOME"),
         workspace_root: env::current_dir(),
         prompt: PromptResolution::from(prompt::resolve()),
+        skills_catalog_guidance: prompt::resolve_skills_catalog_guidance(),
         openai_api_key: env::var_os(Provider::OpenAi.api_key_variable()),
         anthropic_api_key: env::var_os(Provider::Anthropic.api_key_variable()),
     };
@@ -487,6 +505,7 @@ fn resolve_startup_with_session_preferences(
         home,
         workspace_root,
         prompt,
+        skills_catalog_guidance,
         openai_api_key,
         anthropic_api_key,
     } = input;
@@ -525,6 +544,8 @@ fn resolve_startup_with_session_preferences(
     let (workspace_root, workspace_problem) = resolve_workspace_root(workspace_root, &secrets);
     let (prompt_source, system_prompt, prompt_base, prompt_problem) =
         resolve_prompt(prompt, &secrets);
+    let (skills_catalog_guidance, skills_catalog_problem) =
+        resolve_skills_catalog_guidance(skills_catalog_guidance, &secrets);
 
     let worker_path_display = worker_path
         .as_deref()
@@ -539,6 +560,7 @@ fn resolve_startup_with_session_preferences(
     problems.extend(workspace_problem);
     problems.extend(settings_problems);
     problems.extend(prompt_problem);
+    problems.extend(skills_catalog_problem);
     problems.extend(api_key_problem);
     problems.sort_by_key(|problem| problem.kind.order());
 
@@ -560,6 +582,7 @@ fn resolve_startup_with_session_preferences(
             workspace_root,
             system_prompt,
             prompt_base,
+            skills_catalog_guidance,
             api_keys,
             model,
         },
@@ -709,6 +732,42 @@ fn resolve_prompt(
     }
 }
 
+fn resolve_skills_catalog_guidance(
+    resolution: Result<String, PromptError>,
+    secrets: &[&str],
+) -> (Option<String>, Option<StartupProblem>) {
+    match resolution {
+        Ok(guidance) => (Some(guidance), None),
+        Err(PromptError::UnreadableSkillsCatalogOverride { path, source }) => (
+            None,
+            Some(StartupProblem::new(
+                StartupProblemKind::SkillsCatalogPromptUnreadable,
+                format!(
+                    "KIKI_SKILLS_CATALOG_PROMPT override `{}` could not be read: {source}",
+                    path.display()
+                ),
+                "Fix or unset KIKI_SKILLS_CATALOG_PROMPT, then restart Kiki.",
+                secrets,
+            )),
+        ),
+        Err(PromptError::InvalidUtf8SkillsCatalogOverride { path, source }) => (
+            None,
+            Some(StartupProblem::new(
+                StartupProblemKind::SkillsCatalogPromptInvalidUtf8,
+                format!(
+                    "KIKI_SKILLS_CATALOG_PROMPT override `{}` is not valid UTF-8: {source}",
+                    path.display()
+                ),
+                "Fix or unset KIKI_SKILLS_CATALOG_PROMPT, then restart Kiki.",
+                secrets,
+            )),
+        ),
+        Err(PromptError::UnreadableOverride { .. } | PromptError::InvalidUtf8Override { .. }) => {
+            unreachable!("system prompt error cannot resolve catalog guidance")
+        }
+    }
+}
+
 fn prompt_source_path(source: &PromptSource) -> &Path {
     let PromptSource::Override { path } = source else {
         unreachable!("prompt failures only come from overrides")
@@ -737,6 +796,7 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
             base: "system instructions".to_owned(),
             source: PromptSource::Bundled { name: "system" },
         },
+        skills_catalog_guidance: Ok(prompt::skills_catalog_guidance().to_owned()),
         openai_api_key: Some(OsString::from("test-api-key")),
         anthropic_api_key: None,
     })
@@ -819,6 +879,7 @@ mod tests {
             home: None,
             workspace_root: Ok(PathBuf::from(WORKSPACE_ROOT)),
             prompt: bundled_prompt(),
+            skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(api_key.into()),
             anthropic_api_key: None,
         }
@@ -1391,6 +1452,7 @@ mod tests {
                     path: prompt_path.clone(),
                 },
             },
+            skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
         };
@@ -1555,6 +1617,57 @@ mod tests {
     }
 
     #[test]
+    fn catalog_guidance_override_is_retained_or_reported_as_a_typed_startup_problem() {
+        let mut valid = ready_input("key");
+        valid.skills_catalog_guidance = Ok("CUSTOM_GUIDANCE  \n".to_owned());
+        let configuration = resolve_startup(valid);
+        assert_eq!(
+            configuration.ready().unwrap().skills_catalog_guidance(),
+            "CUSTOM_GUIDANCE  \n"
+        );
+
+        let path = PathBuf::from("/private/catalog-guidance.md");
+        let mut unreadable = ready_input("key");
+        unreadable.skills_catalog_guidance = Err(PromptError::UnreadableSkillsCatalogOverride {
+            path: path.clone(),
+            source: io::Error::new(io::ErrorKind::NotFound, "missing override"),
+        });
+        let unreadable = resolve_startup(unreadable);
+        assert_eq!(
+            unreadable
+                .snapshot()
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::SkillsCatalogPromptUnreadable]
+        );
+        assert!(
+            unreadable.snapshot().problems()[0]
+                .diagnostic()
+                .contains("KIKI_SKILLS_CATALOG_PROMPT")
+        );
+        assert!(unreadable.ready().is_none());
+
+        let mut invalid = ready_input("key");
+        invalid.skills_catalog_guidance = Err(PromptError::InvalidUtf8SkillsCatalogOverride {
+            path,
+            source: String::from_utf8(vec![0xff]).unwrap_err().utf8_error(),
+        });
+        let invalid = resolve_startup(invalid);
+        assert_eq!(
+            invalid
+                .snapshot()
+                .problems()
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::SkillsCatalogPromptInvalidUtf8]
+        );
+        assert!(invalid.ready().is_none());
+    }
+
+    #[test]
     fn absent_empty_and_whitespace_only_api_keys_are_missing() {
         for api_key in [None, Some(""), Some(" \t\n"), Some("\u{2003}")] {
             let mut input = ready_input("placeholder");
@@ -1636,6 +1749,7 @@ mod tests {
                     detail: "invalid UTF-8".to_owned(),
                 },
             },
+            skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: None,
             anthropic_api_key: None,
         };
@@ -1755,6 +1869,7 @@ mod tests {
                     path: PathBuf::from(format!("/prompts/{api_key}/agent\t\x1b.md")),
                 },
             },
+            skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
         })

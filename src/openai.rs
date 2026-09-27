@@ -6409,6 +6409,7 @@ pub(crate) mod tests {
                 ready.workspace_root().to_path_buf(),
                 crate::production_model(
                     &ready,
+                    None,
                     persisted_settings.anthropic_cache_ttl(),
                     persisted_settings.cross_provider_reasoning(),
                 ),

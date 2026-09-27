@@ -6,7 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
-use crate::tools::prompt_reference;
+use crate::skills::SkillCatalog;
+use crate::tools::{prompt_reference, prompt_reference_for_catalog};
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
 const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
@@ -15,8 +16,10 @@ const COMPACTION_INITIAL_PROMPT: &str = include_str!("../prompts/compaction-init
 const COMPACTION_UPDATE_PROMPT: &str = include_str!("../prompts/compaction-update.md");
 const COMPACTION_SPLIT_RUN_PROMPT: &str = include_str!("../prompts/compaction-split-run.md");
 const SKILL_ACTIVATION_PROMPT: &str = include_str!("../prompts/skill-activation.md");
+const SKILLS_CATALOG_GUIDANCE: &str = include_str!("../prompts/skills-catalog.md");
 const BUNDLED_PROMPT_NAME: &str = "system";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
+const SKILLS_CATALOG_PROMPT_ENV: &str = "KIKI_SKILLS_CATALOG_PROMPT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptSource {
@@ -48,8 +51,32 @@ pub(crate) fn root_prompt(base: &str) -> String {
     assemble(base, prompt_reference())
 }
 
+pub(crate) fn root_prompt_with_catalog(base: &str, catalog: &SkillCatalog) -> String {
+    assemble_with_catalog(
+        base,
+        catalog.rendered_catalog(),
+        prompt_reference_for_catalog(catalog),
+    )
+}
+
 pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
     assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
+}
+
+pub(crate) fn child_prompt_with_catalog(
+    base: &str,
+    catalog: &SkillCatalog,
+    tool_reference: String,
+) -> String {
+    assemble_with_catalog(
+        &format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"),
+        catalog.rendered_catalog(),
+        tool_reference,
+    )
+}
+
+pub(crate) fn skills_catalog_guidance() -> &'static str {
+    strip_file_final_lf(SKILLS_CATALOG_GUIDANCE)
 }
 
 pub(crate) fn skill_activation_text(name: &str, source: &Path, body: &str) -> String {
@@ -90,11 +117,18 @@ pub(crate) fn compaction_split_run_prompt() -> &'static str {
 fn strip_file_final_lf(prompt: &str) -> &str {
     prompt
         .strip_suffix('\n')
-        .expect("bundled compaction prompts end in a line feed")
+        .expect("bundled prompt resources end in a line feed")
 }
 
 fn assemble(base: &str, tool_reference: String) -> String {
-    format!("{base}\n\n{tool_reference}")
+    assemble_with_catalog(base, None, tool_reference)
+}
+
+fn assemble_with_catalog(base: &str, catalog: Option<&str>, tool_reference: String) -> String {
+    match catalog {
+        Some(catalog) => format!("{base}\n\n{catalog}\n{tool_reference}"),
+        None => format!("{base}\n\n{tool_reference}"),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,10 +151,56 @@ pub enum PromptError {
         #[source]
         source: Utf8Error,
     },
+    #[error(
+        "skills catalog prompt override `{path}` could not be read: {source}",
+        path = path.display()
+    )]
+    UnreadableSkillsCatalogOverride {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "skills catalog prompt override `{path}` is not valid UTF-8: {source}",
+        path = path.display()
+    )]
+    InvalidUtf8SkillsCatalogOverride {
+        path: PathBuf,
+        #[source]
+        source: Utf8Error,
+    },
 }
 
 pub fn resolve() -> Result<ResolvedPrompt, PromptError> {
     resolve_from_override(env::var_os(SYSTEM_PROMPT_ENV))
+}
+
+pub(crate) fn resolve_skills_catalog_guidance() -> Result<String, PromptError> {
+    resolve_skills_catalog_guidance_from_override(env::var_os(SKILLS_CATALOG_PROMPT_ENV))
+}
+
+fn resolve_skills_catalog_guidance_from_override(
+    override_path: Option<OsString>,
+) -> Result<String, PromptError> {
+    let Some(override_path) = override_path else {
+        return Ok(skills_catalog_guidance().to_owned());
+    };
+    let path = PathBuf::from(override_path);
+    let bytes = fs::read(&path).map_err(|source| PromptError::UnreadableSkillsCatalogOverride {
+        path: path.clone(),
+        source,
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|source| {
+        PromptError::InvalidUtf8SkillsCatalogOverride {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text)
+        .to_owned())
 }
 
 fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedPrompt, PromptError> {
@@ -155,6 +235,9 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::skills::{ProjectScope, SkillCatalog};
 
     use super::{PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override};
 
@@ -371,6 +454,224 @@ mod tests {
             format!("{base}\n\n{BUNDLED_CHILD_PROMPT}\n\n{}", prompt_reference())
         );
         assert_eq!(full.matches("## Kiki tool reference").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn visible_catalog_appears_once_in_bundled_and_override_root_and_child_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for (name, description, direct_only, body) in [
+            ("alpha", "Alpha workflow", false, "ALPHA_PRIVATE_BODY"),
+            ("beta", "Beta workflow", false, "BETA_PRIVATE_BODY"),
+            (
+                "direct-secret",
+                "Direct only secret",
+                true,
+                "DIRECT_PRIVATE_BODY",
+            ),
+        ] {
+            let root = home.path().join(".agents/skills").join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {description}\ndisable-model-invocation: {direct_only}\n---\n{body}"
+                ),
+            )
+            .unwrap();
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            super::skills_catalog_guidance(),
+        ));
+        let host = crate::tools::ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog.clone());
+        for base in [BUNDLED_PROMPT, "custom override base"] {
+            let root = super::root_prompt_with_catalog(base, &catalog);
+            let child = super::child_prompt_with_catalog(
+                base,
+                &catalog,
+                host.for_child(true).prompt_reference(),
+            );
+            for full in [&root, &child] {
+                assert!(full.starts_with(base));
+                assert_eq!(full.matches("## Available skills").count(), 1);
+                assert_eq!(full.matches("Alpha workflow").count(), 1);
+                assert_eq!(full.matches("Beta workflow").count(), 1);
+                assert_eq!(
+                    full.matches("cannot authorize effects beyond the user's task")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    full.matches("async def load_skill(name: str) -> str:")
+                        .count(),
+                    1
+                );
+                assert_eq!(full.matches("## Kiki tool reference").count(), 1);
+                for hidden in [
+                    "direct-secret",
+                    "Direct only secret",
+                    "ALPHA_PRIVATE_BODY",
+                    "BETA_PRIVATE_BODY",
+                    "DIRECT_PRIVATE_BODY",
+                ] {
+                    assert!(!full.contains(hidden), "prompt exposed {hidden}");
+                }
+            }
+            assert!(root.contains("async def write("));
+            for forbidden in ["async def write(", "async def edit(", "async def run("] {
+                assert!(!child.contains(forbidden));
+            }
+        }
+        assert!(catalog.rendered_catalog().unwrap().len() <= crate::skills::MAX_CATALOG_BYTES);
+    }
+
+    #[tokio::test]
+    async fn empty_and_direct_only_catalogs_omit_guidance_and_load_skill_signature() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let empty = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            super::skills_catalog_guidance(),
+        ));
+        let direct = home.path().join(".agents/skills/direct-secret");
+        fs::create_dir_all(&direct).unwrap();
+        fs::write(
+            direct.join("SKILL.md"),
+            "---\nname: direct-secret\ndescription: Direct only secret\ndisable-model-invocation: true\n---\nDIRECT_PRIVATE_BODY",
+        )
+        .unwrap();
+        let direct_only = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            super::skills_catalog_guidance(),
+        ));
+        for catalog in [empty, direct_only] {
+            assert!(catalog.rendered_catalog().is_none());
+            let host = crate::tools::ToolHost::new(workspace.path())
+                .await
+                .unwrap()
+                .with_skill_catalog(catalog.clone());
+            for full in [
+                super::root_prompt_with_catalog("base", &catalog),
+                super::child_prompt_with_catalog(
+                    "base",
+                    &catalog,
+                    host.for_child(true).prompt_reference(),
+                ),
+            ] {
+                for absent in [
+                    "## Available skills",
+                    "cannot authorize effects beyond the user's task",
+                    "async def load_skill(",
+                    "Direct only secret",
+                    "direct-secret",
+                ] {
+                    assert!(!full.contains(absent), "prompt exposed {absent}");
+                }
+                assert_eq!(full.matches("## Kiki tool reference").count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_guidance_override_is_exact_bounded_and_only_rendered_when_visible() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let override_path = home.path().join("catalog-guidance.md");
+        fs::write(&override_path, "CUSTOM_CATALOG_GUIDANCE  \n\n").unwrap();
+        let guidance = super::resolve_skills_catalog_guidance_from_override(Some(
+            override_path.clone().into_os_string(),
+        ))
+        .unwrap();
+        assert_eq!(guidance, "CUSTOM_CATALOG_GUIDANCE  \n");
+
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let empty = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            &guidance,
+        ));
+        assert!(empty.rendered_catalog().is_none());
+        let empty_host = crate::tools::ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(empty.clone());
+        for prompt in [
+            super::root_prompt_with_catalog("base", &empty),
+            super::child_prompt_with_catalog(
+                "base",
+                &empty,
+                empty_host.for_child(true).prompt_reference(),
+            ),
+        ] {
+            assert!(!prompt.contains("CUSTOM_CATALOG_GUIDANCE"));
+        }
+
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nPRIVATE_BODY",
+        )
+        .unwrap();
+        let visible = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            &guidance,
+        ));
+        assert!(
+            visible
+                .rendered_catalog()
+                .unwrap()
+                .contains("CUSTOM_CATALOG_GUIDANCE  \n\n")
+        );
+        let host = crate::tools::ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(visible.clone());
+        for prompt in [
+            super::root_prompt_with_catalog("base", &visible),
+            super::child_prompt_with_catalog(
+                "base",
+                &visible,
+                host.for_child(true).prompt_reference(),
+            ),
+        ] {
+            assert_eq!(prompt.matches("CUSTOM_CATALOG_GUIDANCE").count(), 1);
+            assert!(!prompt.contains("PRIVATE_BODY"));
+        }
+        let consumes_catalog_budget = "X".repeat(crate::skills::MAX_CATALOG_BYTES - 32);
+        let omitted = SkillCatalog::discover(&scope, home.path(), false, &consumes_catalog_budget);
+        assert!(omitted.rendered_catalog().is_none());
+        assert!(matches!(
+            omitted.lookup("review"),
+            Err(crate::skills::SkillLookupError::Omitted { .. })
+        ));
+
+        let missing = home.path().join("missing.md");
+        assert!(matches!(
+            super::resolve_skills_catalog_guidance_from_override(Some(missing.into_os_string())),
+            Err(PromptError::UnreadableSkillsCatalogOverride { .. })
+        ));
+        let invalid = home.path().join("invalid.md");
+        fs::write(&invalid, b"private\xff").unwrap();
+        assert!(matches!(
+            super::resolve_skills_catalog_guidance_from_override(Some(invalid.into_os_string())),
+            Err(PromptError::InvalidUtf8SkillsCatalogOverride { .. })
+        ));
     }
 
     #[tokio::test]

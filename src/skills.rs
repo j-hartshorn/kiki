@@ -580,7 +580,7 @@ impl Scanner {
             .collect();
         let mut rendered = String::from(CATALOG_HEADER);
         if !guidance.is_empty() {
-            rendered.push_str(guidance.trim_end_matches('\n'));
+            rendered.push_str(guidance);
             rendered.push('\n');
         }
         let mut visible_names = Vec::new();

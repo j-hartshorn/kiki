@@ -31,6 +31,7 @@ use crate::{
         },
     },
     model::SkillActivation,
+    skills::SkillCatalog,
     subagents::{
         AgentInvocationContext, InvocationOperation, TrustedExecutionContext, WaitPhaseSignal,
         invoke as invoke_subagent,
@@ -824,6 +825,10 @@ impl ArenaChildSource {
 
     pub(crate) fn prompt_reference(&self, read_only: bool) -> String {
         self.tool_host.for_child(read_only).prompt_reference()
+    }
+
+    pub(crate) fn skill_catalog(&self) -> Option<&SkillCatalog> {
+        self.tool_host.skill_catalog()
     }
 }
 
