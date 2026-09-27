@@ -9,7 +9,7 @@ use crate::config::{
     constants::{PROVIDER_CODE_LIMIT, PROVIDER_MESSAGE_LIMIT},
     settings::CrossProviderReasoning,
 };
-use crate::skills::{MAX_SKILL_BYTES, MAX_SKILL_LINES, Skill, SkillOrigin, line_count};
+use crate::skills::{MAX_SKILL_BYTES, MAX_SKILL_LINES, Skill, SkillOrigin, line_count, valid_name};
 
 pub const MAX_ACTIVE_SKILL_TEXT_BYTES: usize = 256 * 1024;
 
@@ -41,26 +41,13 @@ impl SkillActivation {
         origin: SkillOrigin,
         trust_scope: Option<PathBuf>,
     ) -> Result<Self, SkillActivationError> {
-        let valid_name = !name.is_empty()
-            && name.len() <= 64
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            && name
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphanumeric)
-            && name
-                .as_bytes()
-                .last()
-                .is_some_and(u8::is_ascii_alphanumeric);
         let clean_path = |path: &Path| {
             path.is_absolute()
                 && path
                     .components()
                     .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
         };
-        if !valid_name
+        if !valid_name(&name)
             || !clean_path(&source)
             || body.is_empty()
             || body.len() > MAX_SKILL_BYTES
