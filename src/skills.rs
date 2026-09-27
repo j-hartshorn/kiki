@@ -203,8 +203,6 @@ impl std::error::Error for SkillLookupError {}
 /// One process snapshot. Only selected entries are available for activation.
 pub struct SkillCatalog {
     selected: BTreeMap<String, Arc<Skill>>,
-    visible_names: Vec<String>,
-    direct_only_names: Vec<String>,
     rejected: BTreeMap<String, SkillLookupError>,
     diagnostics: Vec<SkillDiagnostic>,
     rendered_catalog: Option<String>,
@@ -247,21 +245,23 @@ impl SkillCatalog {
     }
 
     pub fn visible_names(&self) -> Vec<&str> {
-        self.visible_names.iter().map(String::as_str).collect()
+        self.selected
+            .iter()
+            .filter(|(_, skill)| !skill.disable_model_invocation)
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     pub fn direct_only_names(&self) -> Vec<&str> {
-        self.direct_only_names.iter().map(String::as_str).collect()
+        self.selected
+            .iter()
+            .filter(|(_, skill)| skill.disable_model_invocation)
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Skill> {
         self.selected.values().map(Arc::as_ref)
-    }
-
-    pub fn visible_entries(&self) -> impl Iterator<Item = &Skill> {
-        self.visible_names
-            .iter()
-            .filter_map(|name| self.selected.get(name).map(Arc::as_ref))
     }
 
     pub fn lookup(&self, name: &str) -> Result<&Skill, SkillLookupError> {
@@ -551,11 +551,6 @@ impl Scanner {
             .filter(|(_, skill)| skill.disable_model_invocation)
             .map(|(name, _)| name.clone())
             .collect();
-        let direct_only_names: Vec<String> = all_direct
-            .iter()
-            .take(MAX_DIRECT_ONLY_SKILLS)
-            .cloned()
-            .collect();
         for name in all_direct.iter().skip(MAX_DIRECT_ONLY_SKILLS) {
             let skill = selected.remove(name).unwrap();
             let reason = "direct-only skill limit reached".to_owned();
@@ -621,8 +616,6 @@ impl Scanner {
         let rendered_catalog = (!visible_names.is_empty()).then_some(rendered);
         SkillCatalog {
             selected,
-            visible_names,
-            direct_only_names,
             rejected,
             diagnostics,
             rendered_catalog,
