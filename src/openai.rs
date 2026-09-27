@@ -6307,6 +6307,7 @@ pub(crate) mod tests {
                 | RuntimeEvent::CorrectionCompleted { .. }
                 | RuntimeEvent::TreeCatalogue { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. }
+                | RuntimeEvent::SkillActivationRejected { .. }
                 | RuntimeEvent::CompactionAcknowledged { .. }
                 | RuntimeEvent::CompactionLifecycle { .. } => {}
             }

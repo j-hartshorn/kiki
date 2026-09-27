@@ -11,7 +11,7 @@ use crate::arena::{
 use crate::config::{CompactionSettings, ModelSelection, constants::ACCEPTED_MODEL_CONTENT_LIMIT};
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
-    ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
+    ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay, SkillActivation,
 };
 use crate::session::{
     CommittedCompaction, CompactionReason, CompactionSettlement, PersistedCode, PersistedTerminal,
@@ -701,6 +701,7 @@ impl<M: Model> Agent<M> {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_persisted(
         &mut self,
         selection: ModelSelection,
@@ -709,7 +710,26 @@ impl<M: Model> Agent<M> {
         writer: &SessionWriter,
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
-        let admission = writer.commit_request(request.clone(), selection).await?;
+        self.run_persisted_with_skill(selection, request, None, cancellation, writer, event)
+            .await
+    }
+
+    pub(crate) async fn run_persisted_with_skill(
+        &mut self,
+        selection: ModelSelection,
+        request: String,
+        activation: Option<SkillActivation>,
+        cancellation: &CancellationToken,
+        writer: &SessionWriter,
+        event: &mut (impl FnMut(PersistedAgentEvent) + Send),
+    ) -> Result<PersistedRunOutcome, SessionError> {
+        let admission = if let Some(activation) = activation {
+            writer
+                .commit_request_with_skill(request.clone(), selection, Some(activation))
+                .await?
+        } else {
+            writer.commit_request(request.clone(), selection).await?
+        };
         let run_id = admission.run_id;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,

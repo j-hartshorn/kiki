@@ -2704,6 +2704,13 @@ impl Transcript {
             }
             RuntimeEvent::RuntimeDisabled { reason } => self.disable(reason, false),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
+            RuntimeEvent::SkillActivationRejected { .. }
+                if self.disabled_reason.is_none() && self.run_state == RunState::Submitting =>
+            {
+                self.run_state = RunState::Idle;
+                self.compaction_state != CompactionState::Idle || self.set_status("idle".to_owned())
+            }
+            RuntimeEvent::SkillActivationRejected { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { .. } => false,
         }
     }

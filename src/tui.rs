@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod picker;
@@ -30,12 +31,14 @@ use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::{CATALOGUE, Provider};
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
+use crate::model::SkillActivation;
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
     CorrectionOutcome, NavigationOutcome, ProgressEnvelope, RunId, RuntimeCommand, RuntimeEvent,
     RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
+use crate::skills::{SkillCatalog, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
@@ -191,6 +194,11 @@ struct ThinkingPreview {
     sent_revision: Option<u64>,
 }
 
+struct PendingSkillSubmission {
+    draft: String,
+    request: String,
+}
+
 struct App {
     mode: AppMode,
     prompt: PromptEditor,
@@ -230,6 +238,8 @@ struct App {
     manual_navigation_pending: bool,
     next_tree_revision: u64,
     completion: slash::Completion,
+    skill_catalog: Option<Arc<SkillCatalog>>,
+    pending_skill_submission: Option<PendingSkillSubmission>,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
@@ -281,6 +291,8 @@ impl Default for App {
             manual_navigation_pending: false,
             next_tree_revision: 0,
             completion: slash::Completion::default(),
+            skill_catalog: None,
+            pending_skill_submission: None,
             slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
@@ -326,6 +338,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::SkillActivationRejected { .. }
         | RuntimeEvent::CompactionAcknowledged { .. }
         | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
@@ -339,6 +352,17 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 }
 
 impl App {
+    fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.completion = slash::Completion::with_skills(
+            catalog
+                .entries()
+                .map(|skill| (skill.name(), skill.description())),
+        );
+        self.skill_catalog = Some(catalog);
+        self.refresh_completion();
+        self
+    }
+
     fn configured(startup: StartupSnapshot) -> Self {
         let settings_selection = ModelSelection::new(startup.model(), startup.thinking())
             .expect("startup thinking must be supported by its model");
@@ -628,6 +652,13 @@ impl App {
             return update;
         }
         if key.code == KeyCode::Enter && key.modifiers.is_empty() && !self.prompt.is_empty() {
+            if let Some(command) = slash::parse(self.prompt.text())
+                && command.action == slash::Action::Skill
+            {
+                let name = command.skill_name.unwrap_or_default().to_owned();
+                let request = command.argument.to_owned();
+                return self.dispatch_skill(&name, &request, now);
+            }
             let draft = self.prompt.take();
             if let Some(command) = slash::parse(&draft) {
                 return self.handle_slash_command(command);
@@ -694,9 +725,9 @@ impl App {
             KeyCode::Up => self.completion.move_selection(-1),
             KeyCode::Down => self.completion.move_selection(1),
             KeyCode::Tab | KeyCode::Enter => {
-                let token = self.completion.selected_token()?;
+                let token = self.completion.selected_token()?.to_owned();
                 self.prompt.take();
-                self.prompt.insert_paste(token);
+                self.prompt.insert_paste(&token);
                 self.refresh_completion();
                 true
             }
@@ -710,8 +741,27 @@ impl App {
     }
 
     fn refresh_completion(&mut self) -> bool {
-        self.completion
-            .sync(self.prompt.text(), self.prompt.caret_at_end())
+        if self.is_exact_catalog_skill_command() {
+            self.completion.sync("", false)
+        } else {
+            self.completion
+                .sync(self.prompt.text(), self.prompt.caret_at_end())
+        }
+    }
+
+    fn is_exact_catalog_skill_command(&self) -> bool {
+        let Some(command) = slash::parse(self.prompt.text()) else {
+            return false;
+        };
+        if command.action != slash::Action::Skill {
+            return false;
+        }
+        let Some(name) = command.skill_name else {
+            return false;
+        };
+        self.skill_catalog.as_ref().is_some_and(|catalog| {
+            !matches!(catalog.lookup(name), Err(SkillLookupError::Unknown(_)))
+        })
     }
 
     fn dispatch_compact(&mut self, focus: &str) -> Update {
@@ -730,6 +780,62 @@ impl App {
         let mut update = Update::with_commands([RuntimeCommand::Compact {
             focus: focus.to_owned(),
         }]);
+        update.visible_changed = true;
+        update
+    }
+
+    fn dispatch_skill(&mut self, name: &str, request: &str, now: Instant) -> Update {
+        if !self.transcript.is_idle() {
+            self.set_notice("A run is still active.".to_owned());
+            return Update {
+                visible_changed: true,
+                ..Update::default()
+            };
+        }
+        if name.is_empty() {
+            self.set_notice("Enter a skill name after /skill:.".to_owned());
+            return Update {
+                visible_changed: true,
+                ..Update::default()
+            };
+        }
+        let Some(catalog) = &self.skill_catalog else {
+            self.set_notice(normalise_single_line(&format!("Unknown skill `{name}`.")));
+            return Update {
+                visible_changed: true,
+                ..Update::default()
+            };
+        };
+        let activation = match catalog.lookup(name) {
+            Ok(skill) => SkillActivation::from_skill(skill),
+            Err(error) => {
+                self.set_notice(normalise_single_line(&error.to_string()));
+                return Update {
+                    visible_changed: true,
+                    ..Update::default()
+                };
+            }
+        };
+        let draft = self.prompt.take();
+        self.refresh_completion();
+        let request = if request.trim().is_empty() {
+            format!("Use the `{name}` skill for this turn. Ask me for the task details you need.")
+        } else {
+            request.to_owned()
+        };
+        let mut commands = Vec::new();
+        self.flush_preview(&mut commands);
+        self.transcript.begin_submission();
+        self.submission_at = Some(now);
+        self.pending_skill_submission = Some(PendingSkillSubmission {
+            draft,
+            request: request.clone(),
+        });
+        commands.push(RuntimeCommand::SubmitSkill {
+            request,
+            activation,
+        });
+        let mut update = Update::with_commands(commands);
         update.visible_changed = true;
         update
     }
@@ -757,6 +863,9 @@ impl App {
                 }
             }
             slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Skill => {
+                unreachable!("direct skill dispatch precedes editor consumption")
+            }
             slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
                 let argument = command.argument;
@@ -1514,6 +1623,38 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
+        if let RuntimeEvent::RecordAppended {
+            record:
+                crate::runtime::StoredRecord {
+                    record: crate::runtime::Record::UserRequest { request, .. },
+                    ..
+                },
+            ..
+        } = &event
+            && self
+                .pending_skill_submission
+                .as_ref()
+                .is_some_and(|pending| pending.request == *request)
+        {
+            self.pending_skill_submission = None;
+        }
+        let skill_draft_changed = if matches!(
+            &event,
+            RuntimeEvent::SkillActivationRejected { .. }
+                | RuntimeEvent::SubmissionRejectedBusy { .. }
+        ) {
+            self.restore_pending_skill_draft()
+        } else {
+            if matches!(
+                &event,
+                RuntimeEvent::SubmissionRejectedDisabled { .. }
+                    | RuntimeEvent::RuntimeDisabled { .. }
+                    | RuntimeEvent::RunSettled { .. }
+            ) {
+                self.pending_skill_submission = None;
+            }
+            false
+        };
         let compact_draft_changed = if self.compact_acknowledgement_pending
             && let RuntimeEvent::CompactionAcknowledged { acknowledgement } = &event
         {
@@ -1570,6 +1711,13 @@ impl App {
             }
         ) {
             self.submission_at = None;
+        }
+        if let RuntimeEvent::SkillActivationRejected { reason } = &event {
+            self.submission_at = None;
+            self.set_notice(format!(
+                "Skill activation failed: {}",
+                normalise_single_line(reason)
+            ));
         }
         if matches!(
             &event,
@@ -1629,7 +1777,26 @@ impl App {
         if transcript_changed {
             self.invalidate_layout_selection();
         }
-        compact_draft_changed || metadata_changed || monitor_changed || transcript_changed
+        skill_draft_changed
+            || compact_draft_changed
+            || metadata_changed
+            || monitor_changed
+            || transcript_changed
+    }
+
+    fn restore_pending_skill_draft(&mut self) -> bool {
+        let Some(pending) = self.pending_skill_submission.take() else {
+            return false;
+        };
+        if self.prompt.is_empty() {
+            let changed = self.prompt.insert_paste(&pending.draft);
+            if changed {
+                self.refresh_completion();
+            }
+            changed
+        } else {
+            false
+        }
     }
 
     fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
@@ -1919,8 +2086,22 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
     }
 }
 
+pub(crate) struct TuiStartup {
+    snapshot: StartupSnapshot,
+    skills_catalog: Arc<SkillCatalog>,
+}
+
+impl TuiStartup {
+    pub(crate) fn new(snapshot: StartupSnapshot, skills_catalog: Arc<SkillCatalog>) -> Self {
+        Self {
+            snapshot,
+            skills_catalog,
+        }
+    }
+}
+
 pub(crate) fn run(
-    startup: StartupSnapshot,
+    startup: TuiStartup,
     providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
     events: mpsc::UnboundedReceiver<RuntimeEvent>,
@@ -1939,7 +2120,7 @@ pub(crate) fn run(
 }
 
 pub(crate) fn run_restored(
-    startup: StartupSnapshot,
+    startup: TuiStartup,
     initial: RuntimeInitialState,
     providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
@@ -1947,7 +2128,8 @@ pub(crate) fn run_restored(
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app = App::restored(startup, &initial);
+    let mut app =
+        App::restored(startup.snapshot, &initial).with_skill_catalog(startup.skills_catalog);
     app.providers = providers;
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
@@ -2968,6 +3150,7 @@ mod tests {
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use ratatui::Terminal;
@@ -3004,6 +3187,7 @@ mod tests {
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
         SessionMetadata,
     };
+    use crate::skills::{ProjectScope, SkillCatalog};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
@@ -4480,6 +4664,244 @@ mod tests {
             assert!(app.prompt.is_empty());
             assert!(app.picker.is_some());
         }
+    }
+
+    #[test]
+    fn unknown_direct_skill_submits_nothing_and_keeps_draft() {
+        let mut app = app_with_prompt("/skill:missing inspect this");
+        let update = app.handle_key(key(KeyCode::Enter));
+        assert!(update.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:missing inspect this");
+        assert!(app.notice().unwrap_or("").contains("missing"));
+        assert!(app.transcript.is_idle());
+
+        set_prompt(&mut app, "/skill:");
+        let update = app.handle_key(key(KeyCode::Enter));
+        assert!(update.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:");
+        assert!(app.notice().unwrap().contains("skill name"));
+    }
+
+    #[test]
+    fn direct_only_skill_completes_and_submits_captured_activation() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let direct = home.path().join(".agents/skills/direct");
+        fs::create_dir_all(&direct).unwrap();
+        let body = "---\ndescription: A direct workflow\ndisable-model-invocation: true\n---\nFollow the direct workflow.\n";
+        fs::write(direct.join("SKILL.md"), body).unwrap();
+        let rejected = home.path().join(".agents/skills/rejected");
+        fs::create_dir_all(&rejected).unwrap();
+        fs::write(rejected.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        let hidden = project.path().join(".agents/skills/hidden");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(
+            hidden.join("SKILL.md"),
+            "---\ndescription: Hidden\n---\nHidden body\n",
+        )
+        .unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog);
+        set_prompt(&mut app, "/skill:di");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), Some("/skill:direct"));
+        assert_eq!(
+            app.completion.visible_rows(2)[0].purpose,
+            "A direct workflow"
+        );
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:direct");
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [
+            RuntimeCommand::SubmitSkill {
+                request,
+                activation,
+            },
+        ] = update.commands.as_slice()
+        else {
+            panic!("expected direct skill submission");
+        };
+        assert!(request.contains("direct"));
+        assert_eq!(activation.name(), "direct");
+        assert_eq!(activation.body(), body);
+        assert!(app.prompt.is_empty());
+
+        app.transcript.apply(
+            RuntimeEvent::SkillActivationRejected {
+                reason: "limit".to_owned(),
+            },
+            false,
+        );
+        set_prompt(&mut app, "/skill:direct inspect this\n  and this");
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [RuntimeCommand::SubmitSkill { request, .. }] = update.commands.as_slice() else {
+            panic!("expected multiline skill submission");
+        };
+        assert_eq!(request, "inspect this\n  and this");
+
+        let mut skipped = App::default().with_skill_catalog(Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        )));
+        set_prompt(&mut skipped, "/skill:hid");
+        skipped.refresh_completion();
+        assert!(skipped.completion.visible_rows(5).is_empty());
+        set_prompt(&mut skipped, "/skill:hidden");
+        assert!(skipped.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(skipped.notice().unwrap().contains("hidden"));
+        set_prompt(&mut skipped, "/skill:rejected");
+        assert!(skipped.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(skipped.notice().unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn enter_invokes_exact_skill_even_when_a_longer_completion_exists() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for name in ["review", "review-more"] {
+            let directory = home.path().join(format!(".agents/skills/{name}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!("---\ndescription: {name} instructions\ndisable-model-invocation: true\n---\nUse {name}.\n"),
+            ).unwrap();
+        }
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog.clone());
+        set_prompt(&mut app, "/skill:review");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), None);
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [RuntimeCommand::SubmitSkill { activation, .. }] = update.commands.as_slice() else {
+            panic!("exact skill should invoke on Enter");
+        };
+        assert_eq!(activation.name(), "review");
+        assert!(app.prompt.is_empty());
+
+        let mut partial = App::default().with_skill_catalog(catalog.clone());
+        set_prompt(&mut partial, "/skill:rev");
+        assert!(partial.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(partial.prompt.text(), "/skill:review");
+
+        let mut tab = App::default().with_skill_catalog(catalog);
+        set_prompt(&mut tab, "/skill:review");
+        assert!(tab.handle_key(key(KeyCode::Tab)).commands.is_empty());
+        assert_eq!(tab.prompt.text(), "/skill:review");
+    }
+
+    #[test]
+    fn enter_reports_rejected_exact_skill_before_longer_completion() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let invalid = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        let longer = home.path().join(".agents/skills/review-more");
+        fs::create_dir_all(&longer).unwrap();
+        fs::write(
+            longer.join("SKILL.md"),
+            "---\ndescription: Longer\n---\nBody\n",
+        )
+        .unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog);
+        set_prompt(&mut app, "/skill:review");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), None);
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:review");
+        assert!(app.notice().unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn direct_skill_busy_rejection_preserves_draft_and_cap_rejection_restores_idle() {
+        let mut app = app_with_prompt("/skill:review inspect this");
+        app.transcript.begin_submission();
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:review inspect this");
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active skill instruction text exceeds 256 KiB".to_owned(),
+        });
+        assert!(app.transcript.is_idle());
+        assert!(!app.transcript.is_disabled());
+        assert!(app.notice().unwrap().contains("256 KiB"));
+    }
+
+    #[test]
+    fn direct_skill_admission_rejection_restores_unedited_draft_only() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let directory = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            "---\ndescription: Review\n---\nReview this.\n",
+        )
+        .unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog);
+        let draft = "/skill:review inspect this\n  and this";
+        set_prompt(&mut app, draft);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
+            [RuntimeCommand::SubmitSkill { .. }]
+        ));
+        assert!(app.prompt.is_empty());
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active text exceeds 256 KiB".to_owned(),
+        });
+        assert_eq!(app.prompt.text(), draft);
+        assert!(app.transcript.is_idle());
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
+            [RuntimeCommand::SubmitSkill { .. }]
+        ));
+        set_prompt(&mut app, "new draft");
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active text exceeds 256 KiB".to_owned(),
+        });
+        assert_eq!(app.prompt.text(), "new draft");
+
+        set_prompt(&mut app, draft);
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [RuntimeCommand::SubmitSkill { request, .. }] = update.commands.as_slice() else {
+            panic!("expected direct skill submission");
+        };
+        assert!(app.pending_skill_submission.is_some());
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: request.clone(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+        assert!(app.pending_skill_submission.is_none());
     }
 
     #[test]

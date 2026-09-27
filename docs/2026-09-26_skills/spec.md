@@ -154,7 +154,7 @@ Use isolated temporary project and user directories with real `SKILL.md` fixture
 
 **Tests** (`src/tui/slash.rs`, unit; `src/tui.rs` and `src/runtime.rs`, integration) — Completion includes accepted direct-only names but untrusted project names stay absent; command parsing respects exact names and optional request; bare and request forms activate before the model step; unknown or rejected names submit nothing; repeating an unchanged candidate is a no-op while an explicit changed candidate records its new captured text; navigation to a branch before invocation removes it.
 
-**Files** — Modify: `src/tui/slash.rs`, `src/tui.rs`, `src/runtime.rs`, `src/session.rs`, `src/skills.rs`.
+**Files** — Modify: `src/tui/slash.rs`, `src/tui.rs`, `src/runtime.rs`, `src/agent.rs`, `src/transcript.rs`, `src/main.rs`, `src/openai.rs` (test harness). Reuse the existing `src/session.rs` atomic admission and `src/skills.rs` catalog lookup without changing them.
 
 **Verification** — Focused slash, TUI, and runtime tests pass; `just check` succeeds.
 

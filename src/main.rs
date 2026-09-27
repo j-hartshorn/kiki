@@ -355,7 +355,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     };
     let mut arena = match runtime.block_on(Arena::new(
         worker_path,
-        tool_host.with_skill_catalog(skills_catalog),
+        tool_host.with_skill_catalog(skills_catalog.clone()),
     )) {
         Ok(arena) => arena,
         Err(error) => {
@@ -397,7 +397,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run(
-        startup,
+        tui::TuiStartup::new(startup, skills_catalog),
         providers,
         command_sender.clone(),
         event_receiver,
@@ -505,7 +505,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let arena = match runtime.block_on(Arena::new(
         worker_path,
-        tool_host.with_skill_catalog(skills_catalog),
+        tool_host.with_skill_catalog(skills_catalog.clone()),
     )) {
         Ok(arena) => arena,
         Err(error) => {
@@ -551,7 +551,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run_restored(
-        startup,
+        tui::TuiStartup::new(startup, skills_catalog),
         initial,
         providers,
         command_sender.clone(),

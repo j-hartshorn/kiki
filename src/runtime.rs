@@ -15,7 +15,7 @@ use crate::config::{
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
-use crate::model::{AttemptAccounting, Model, ModelProgress};
+use crate::model::{AttemptAccounting, Model, ModelProgress, SkillActivation};
 use crate::session::{
     CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
     Session, SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore,
@@ -41,6 +41,10 @@ pub(crate) struct ModelStepId(pub(crate) u64);
 pub(crate) enum RuntimeCommand {
     Submit {
         request: String,
+    },
+    SubmitSkill {
+        request: String,
+        activation: SkillActivation,
     },
     #[allow(dead_code)]
     Compact {
@@ -313,6 +317,9 @@ pub(crate) enum RuntimeEvent {
     SubmissionRejectedBusy {
         active_run_id: Option<RunId>,
     },
+    SkillActivationRejected {
+        reason: String,
+    },
     CompactionAcknowledged {
         acknowledgement: CompactionAcknowledgement,
     },
@@ -532,6 +539,7 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
         RuntimeCommand::Submit { .. }
+        | RuntimeCommand::SubmitSkill { .. }
         | RuntimeCommand::Compact { .. }
         | RuntimeCommand::ApplySettings { .. }
         | RuntimeCommand::SetSessionName { .. }
@@ -622,6 +630,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::CorrectionCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::SkillActivationRejected { .. }
         | RuntimeEvent::CompactionAcknowledged { .. }
         | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
@@ -1111,7 +1120,15 @@ impl<M: Model> RuntimeController<M> {
                 .emit(|| TraceEvent::RuntimeCommandReceived { command });
         }
         match command {
-            RuntimeCommand::Submit { request } => {
+            command @ (RuntimeCommand::Submit { .. } | RuntimeCommand::SubmitSkill { .. }) => {
+                let (request, activation) = match command {
+                    RuntimeCommand::Submit { request } => (request, None),
+                    RuntimeCommand::SubmitSkill {
+                        request,
+                        activation,
+                    } => (request, Some(activation)),
+                    _ => unreachable!(),
+                };
                 if self.subagents.storage_failure_token().is_cancelled() {
                     self.disable_session_storage(events).await;
                 }
@@ -1148,7 +1165,7 @@ impl<M: Model> RuntimeController<M> {
                         active.pending_busy_submissions += 1;
                     }
                 } else {
-                    self.start_run(request, events, progress).await;
+                    self.start_run(request, activation, events, progress).await;
                 }
             }
             RuntimeCommand::Compact { focus } => {
@@ -1590,6 +1607,7 @@ impl<M: Model> RuntimeController<M> {
     async fn start_run(
         &mut self,
         request: String,
+        activation: Option<SkillActivation>,
         _events: &mpsc::UnboundedSender<RuntimeEvent>,
         _progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
@@ -1776,9 +1794,10 @@ impl<M: Model> RuntimeController<M> {
                     }
                 };
                 agent
-                    .run_persisted(
+                    .run_persisted_with_skill(
                         selection,
                         request,
+                        activation,
                         &cancellation_for_worker,
                         &writer,
                         &mut event,
@@ -2173,6 +2192,31 @@ impl<M: Model> RuntimeController<M> {
                             self.start_pending_compaction().await;
                         }
                     }
+                    Err(SessionError::SkillActivation(reason))
+                        if self
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.run_id.is_none()) =>
+                    {
+                        self.agent = Some(agent);
+                        let active = self
+                            .active
+                            .take()
+                            .expect("rejected admission has active run");
+                        self.subagents
+                            .settle_root_run(&active.caller, std::iter::empty())
+                            .await;
+                        self.emit(events, RuntimeEvent::SkillActivationRejected { reason });
+                        for _ in 0..active.pending_busy_submissions {
+                            self.emit(
+                                events,
+                                RuntimeEvent::SubmissionRejectedBusy {
+                                    active_run_id: None,
+                                },
+                            );
+                        }
+                        self.start_pending_compaction().await;
+                    }
                     Err(_error) => {
                         self.agent = Some(agent);
                         self.subagents.latch_storage_failure().await;
@@ -2375,7 +2419,8 @@ mod tests {
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
-        ScriptedAction as ModelAction, ScriptedModel, SummaryRequest, SummaryResult,
+        ScriptedAction as ModelAction, ScriptedModel, SkillActivation, SummaryRequest,
+        SummaryResult,
     };
     use crate::openai::OpenAiModel;
     use crate::session::{
@@ -2383,6 +2428,7 @@ mod tests {
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
         SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
+    use crate::skills::SkillOrigin;
     use crate::sse_fixture::{Fixture, FixtureReply};
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -4734,6 +4780,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_skill_submission_activates_before_first_model_step_and_pins_versions() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ContextCapturingMessageModel {
+                    contexts: contexts.clone(),
+                },
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "baseline".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let baseline_leaf: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM entries WHERE kind = 'final_reply' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let captured = |body: &str| {
+            SkillActivation::new(
+                "review".to_owned(),
+                home.path().join(".agents/skills/review"),
+                body.to_owned(),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap()
+        };
+        for (index, (body, expected_rows)) in [
+            ("pinned version one", 1),
+            ("pinned version one", 1),
+            ("pinned version two", 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            commands
+                .send(RuntimeCommand::SubmitSkill {
+                    request: "inspect this".to_owned(),
+                    activation: captured(body),
+                })
+                .await
+                .unwrap();
+            events_until_settled(&mut events).await;
+            let stored: i64 = session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, expected_rows);
+            let captured_contexts = contexts.lock().unwrap();
+            let latest = captured_contexts.last().unwrap();
+            let active = latest
+                .iter()
+                .filter_map(|entry| match entry {
+                    ModelContextEntry::SkillActivation(skill) => Some(skill.body()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(active, [body]);
+            if index == 0 {
+                assert!(matches!(
+                    latest.last(),
+                    Some(ModelContextEntry::SkillActivation(_))
+                ));
+            }
+        }
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next()
+                .unwrap()
+                .body(),
+            "pinned version two"
+        );
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(baseline_leaf as u64),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::NavigationCompleted {
+                outcome: super::NavigationOutcome::Replaced { .. }
+            }
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "alternate branch".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        assert!(
+            contexts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .iter()
+                .all(|entry| !matches!(entry, ModelContextEntry::SkillActivation(_)))
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_skill_text_limit_rejects_admission_without_disabling_session() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let writer = session.writer();
+        for index in 0..4 {
+            let name = format!("seed-{index}");
+            let activation = SkillActivation::new(
+                name.clone(),
+                home.path().join(format!(".agents/skills/{name}")),
+                "x".repeat(60 * 1024),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap();
+            let admission = writer
+                .commit_request_with_skill(format!("seed {index}"), selection, Some(activation))
+                .await
+                .unwrap();
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ContextCapturingMessageModel {
+                    contexts: contexts.clone(),
+                },
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::SubmitSkill {
+                request: "must not be admitted".to_owned(),
+                activation: SkillActivation::new(
+                    "extra".to_owned(),
+                    home.path().join(".agents/skills/extra"),
+                    "y".repeat(20 * 1024),
+                    SkillOrigin::User,
+                    None,
+                )
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_event(&mut events).await, RuntimeEvent::SkillActivationRejected { reason } if reason.contains("256 KiB"))
+        );
+        assert!(contexts.lock().unwrap().is_empty());
+        assert_eq!(writer.model_history().unwrap().active_skills().count(), 4);
+        let rows: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'user_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 4);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "session still writable".to_owned(),
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        assert_eq!(contexts.lock().unwrap().len(), 1);
+        let rows: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'user_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 5);
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn request_commit_precedes_provider_call() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -6517,6 +6823,7 @@ mod tests {
             RuntimeEvent::SubmissionRejectedBusy {
                 active_run_id: None,
             } => "busy:compaction".to_owned(),
+            RuntimeEvent::SkillActivationRejected { .. } => "skill-rejected".to_owned(),
             RuntimeEvent::CompactionAcknowledged { acknowledgement } => {
                 format!("compaction-ack:{acknowledgement:?}")
             }

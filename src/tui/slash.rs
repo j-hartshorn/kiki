@@ -5,6 +5,7 @@ pub(super) enum Action {
     Compact,
     Model,
     Name,
+    Skill,
     Tree,
     Thinking,
 }
@@ -47,10 +48,23 @@ const CATALOGUE: [Command; 5] = [
 pub(super) struct Parsed<'a> {
     pub(super) action: Action,
     pub(super) argument: &'a str,
+    pub(super) skill_name: Option<&'a str>,
     token_range: Range<usize>,
 }
 
 pub(super) fn parse(draft: &str) -> Option<Parsed<'_>> {
+    if let Some(rest) = draft.strip_prefix("/skill:") {
+        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let argument = rest[name_end..].chars().next().map_or("", |separator| {
+            rest[name_end + separator.len_utf8()..].trim_start_matches([' ', '\t'])
+        });
+        return Some(Parsed {
+            action: Action::Skill,
+            argument,
+            skill_name: Some(&rest[..name_end]),
+            token_range: 0.."/skill:".len() + name_end,
+        });
+    }
     if draft.contains('\n') {
         return None;
     }
@@ -61,6 +75,7 @@ pub(super) fn parse(draft: &str) -> Option<Parsed<'_>> {
             .map(|argument| Parsed {
                 action: command.action,
                 argument,
+                skill_name: None,
                 token_range: 0..command.token.len(),
             })
     })
@@ -70,24 +85,63 @@ pub(super) fn recognised_token_range(draft: &str) -> Option<Range<usize>> {
     parse(draft).map(|command| command.token_range)
 }
 
-#[derive(Default)]
 pub(super) struct Completion {
-    matches: Vec<&'static Command>,
+    commands: Vec<CompletionCommand>,
+    matches: Vec<usize>,
     selected: usize,
 }
 
-pub(super) struct CompletionRow {
-    pub(super) token: &'static str,
-    pub(super) purpose: &'static str,
+struct CompletionCommand {
+    token: String,
+    purpose: String,
+}
+
+pub(super) struct CompletionRow<'a> {
+    pub(super) token: &'a str,
+    pub(super) purpose: &'a str,
     pub(super) selected: bool,
 }
 
+impl Default for Completion {
+    fn default() -> Self {
+        Self::with_skills(std::iter::empty::<(&str, &str)>())
+    }
+}
+
 impl Completion {
+    pub(super) fn with_skills<'a>(skills: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut commands = CATALOGUE
+            .iter()
+            .map(|command| CompletionCommand {
+                token: command.token.to_owned(),
+                purpose: command.purpose.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut skills = skills
+            .into_iter()
+            .map(|(name, description)| CompletionCommand {
+                token: format!("/skill:{name}"),
+                purpose: description.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        skills.sort_by(|left, right| left.token.cmp(&right.token));
+        commands.extend(skills);
+        Self {
+            commands,
+            matches: Vec::new(),
+            selected: 0,
+        }
+    }
+
     pub(super) fn sync(&mut self, draft: &str, caret_at_end: bool) -> bool {
-        let selected = self.selected_token();
-        let matches = prefix_matches(draft, caret_at_end);
+        let selected = self.selected_token().map(str::to_owned);
+        let matches = prefix_matches(&self.commands, draft, caret_at_end);
         let next_selected = selected
-            .and_then(|token| matches.iter().position(|command| command.token == token))
+            .and_then(|token| {
+                matches
+                    .iter()
+                    .position(|index| self.commands[*index].token == token)
+            })
             .unwrap_or(0);
         let changed = self.selected != next_selected || self.matches != matches;
         self.matches = matches;
@@ -108,11 +162,13 @@ impl Completion {
         }
     }
 
-    pub(super) fn selected_token(&self) -> Option<&'static str> {
-        self.matches.get(self.selected).map(|command| command.token)
+    pub(super) fn selected_token(&self) -> Option<&str> {
+        self.matches
+            .get(self.selected)
+            .map(|index| self.commands[*index].token.as_str())
     }
 
-    pub(super) fn visible_rows(&self, height: usize) -> Vec<CompletionRow> {
+    pub(super) fn visible_rows(&self, height: usize) -> Vec<CompletionRow<'_>> {
         if height == 0 || self.matches.is_empty() {
             return Vec::new();
         }
@@ -122,8 +178,8 @@ impl Completion {
             .enumerate()
             .take(height)
             .map(|(index, command)| CompletionRow {
-                token: command.token,
-                purpose: command.purpose,
+                token: self.commands[*command].token.as_str(),
+                purpose: self.commands[*command].purpose.as_str(),
                 selected: start + index == self.selected,
             })
             .collect()
@@ -141,13 +197,17 @@ fn slash_argument(rest: &str) -> Option<&str> {
     }
 }
 
-fn prefix_matches(draft: &str, caret_at_end: bool) -> Vec<&'static Command> {
+fn prefix_matches(commands: &[CompletionCommand], draft: &str, caret_at_end: bool) -> Vec<usize> {
     if !caret_at_end || draft.contains('\n') || !draft.starts_with('/') {
         return Vec::new();
     }
-    CATALOGUE
+    commands
         .iter()
-        .filter(|command| draft.len() < command.token.len() && command.token.starts_with(draft))
+        .enumerate()
+        .filter(|(_, command)| {
+            draft.len() < command.token.len() && command.token.starts_with(draft)
+        })
+        .map(|(index, _)| index)
         .collect()
 }
 
@@ -169,6 +229,44 @@ mod tests {
             assert_eq!(command.action, Action::Compact);
             assert_eq!(command.argument, focus);
         }
+    }
+
+    #[test]
+    fn direct_skill_command_accepts_bare_and_multiline_requests() {
+        let bare = parse("/skill:review").unwrap();
+        assert_eq!(bare.action, Action::Skill);
+        assert_eq!(bare.skill_name, Some("review"));
+        assert_eq!(bare.argument, "");
+        let request = parse("/skill:review inspect this\n  and this").unwrap();
+        assert_eq!(request.skill_name, Some("review"));
+        assert_eq!(request.argument, "inspect this\n  and this");
+        assert_eq!(
+            parse("/skill:review-more").unwrap().skill_name,
+            Some("review-more")
+        );
+        assert_eq!(parse("/skill:").unwrap().skill_name, Some(""));
+    }
+
+    #[test]
+    fn direct_skill_completion_shows_only_catalog_entries_and_descriptions() {
+        let mut completion = Completion::with_skills([
+            ("review", "Review code"),
+            ("direct", "Only direct invocation"),
+        ]);
+        completion.sync("/skill:", true);
+        assert_eq!(
+            completion
+                .visible_rows(usize::MAX)
+                .iter()
+                .map(|row| (row.token, row.purpose))
+                .collect::<Vec<_>>(),
+            [
+                ("/skill:direct", "Only direct invocation"),
+                ("/skill:review", "Review code"),
+            ]
+        );
+        completion.sync("/skill:direct", true);
+        assert!(completion.visible_rows(usize::MAX).is_empty());
     }
 
     #[test]
