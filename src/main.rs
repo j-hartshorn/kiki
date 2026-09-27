@@ -748,6 +748,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_and_resumed_catalogs_wire_skill_resources_into_the_arena() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let root = project.path().join(".agents/skills/review");
+        fs::create_dir_all(root.join("references")).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\ndescription: Review\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(root.join("references/note.md"), "project resource").unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::settings::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let worker = std::path::PathBuf::from(
+            std::env::var_os("MONTY_BIN").expect("MONTY_BIN must point to the configured worker"),
+        );
+
+        for resume_active in [false, true] {
+            let (catalog, trusted) = super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                resume_active,
+                |_| panic!("saved trust should avoid a fresh or resume popup"),
+            )
+            .unwrap();
+            assert!(trusted);
+            let host = super::ToolHost::new(project.path())
+                .await
+                .unwrap()
+                .with_skill_catalog(catalog);
+            let mut arena = super::Arena::new(worker.clone(), host).await.unwrap();
+            let execution = arena
+                .execute(
+                    "await read('skill://review/references/note.md')",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let super::arena::ExecutionOutcome::Complete {
+                result: Some(result),
+            } = execution.outcome
+            else {
+                panic!("skill resource read should complete");
+            };
+            assert_eq!(result.head, "'project resource'");
+            assert!(execution.read_paths.is_empty());
+        }
+    }
+
     #[test]
     fn startup_catalog_returns_the_trust_decision_used_for_its_snapshot() {
         let home = tempdir().unwrap();

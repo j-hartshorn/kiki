@@ -891,7 +891,7 @@ fn split_frontmatter(source: &str) -> Result<(&str, &str), String> {
     Err("YAML frontmatter has no closing --- delimiter".to_owned())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= MAX_NAME_BYTES

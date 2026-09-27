@@ -162,8 +162,8 @@ Use isolated temporary project and user directories with real `SKILL.md` fixture
 
 **Changes** — Resolve `skill://` paths in `read` and `list_dir` through the selected skill's directory handle. Preserve workspace-only mutation rules and existing output bounds. Document authoring, trust, loading, direct invocation, and linked resources.
 
-**Tests** (`src/tools.rs`, unit; `src/arena.rs`, Monty integration; `src/main.rs` and `src/agent.rs`, wiring) — Project and user skill resources read correctly; listing works; absolute, parent, and symlink escape attempts fail; replacing a discovered skill directory cannot redirect a read; workspace writes remain gated; skill-resource reads never authorize a later `write`; live resource edits appear within one process while changed `SKILL.md` bodies need a new catalog; skipped trust denies project resources.
+**Tests** (`src/tools.rs`, unit; `src/arena.rs`, root and child Monty integration; `src/main.rs`, fresh/resume wiring) — Project and user skill resources read correctly; listing works; absolute, parent, and symlink escape attempts fail; replacing a discovered skill directory cannot redirect a read; workspace writes remain gated; skill-resource reads never authorize a later `write`; live resource edits appear within one process while changed `SKILL.md` bodies need a new catalog; skipped trust denies project resources.
 
-**Files** — Modify: `src/skills.rs`, `src/tools.rs`, `src/arena.rs`, `src/main.rs`, `src/agent.rs`, `README.md`.
+**Files** — Modify: `src/skills.rs`, `src/tools.rs`, `src/arena.rs`, `src/main.rs`, `README.md`. Reuse the existing `src/agent.rs` tool-host wiring for root and child agents.
 
 **Verification** — Focused resource and Arena tests pass; `just format`, `just check`, `just lint`, and `just test` pass in the worktree.

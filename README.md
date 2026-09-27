@@ -32,6 +32,22 @@ cargo run
 
 Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
 
+## Agent Skills
+
+Put a skill in `<project>/.agents/skills/<name>/SKILL.md` or `~/.agents/skills/<name>/SKILL.md`. The UTF-8 file needs YAML frontmatter with a nonempty `description` and a nonempty Markdown body. Kiki flattens the description to one catalog line. Its `name` defaults to the directory name; names use lowercase letters, digits, and hyphens. For a skill that only the user may invoke, add `disable-model-invocation: true` to the frontmatter. For example:
+
+```md
+---
+name: review
+description: Review a change and report concrete findings
+---
+Follow this review workflow...
+```
+
+Kiki looks for project skills from the launch directory up to the nearest Git root within 32 ancestors, then user skills. Without a Git root in that bound, it checks only the launch directory and the user skill root. A nearer project directory wins over a farther one, and project skills win over user skills with the same name. On fresh launch or resume, Kiki asks before enabling project skills from an untrusted scope. **Skip** applies to this process; **Trust** saves a positive decision for later launches. User skills need no project trust. The initial model prompt shows accepted model-invocable names and descriptions, not their bodies. Set `KIKI_SKILLS_CATALOG_PROMPT` to a UTF-8 Markdown file to override the catalog guidance included with those descriptions. The agent can activate one with `await load_skill("review")`; that call returns a short acknowledgement and inserts the captured instructions into its next model context. Use `/skill:review [request]` to activate a skill yourself, including one marked `disable-model-invocation: true`. A bare `/skill:review` starts a turn in which the agent can ask for task details.
+
+Skills may include references and other files. The agent can read UTF-8 text with `await read("skill://review/references/checklist.md")` and list a skill directory with `await list_dir("skill://review/")`. These paths stay inside the selected skill directory and cannot traverse parent paths or inner symlinks. `write` and `edit` do not accept `skill://` paths. Reading a skill resource does not authorize a workspace write. Kiki captures each activated `SKILL.md` body from the process catalog; changing that file takes a new launch or resume and an explicit reactivation. Linked resources are read live, so their contents can change during a process. Skill instructions do not grant permission for actions outside your request.
+
 ## Sessions
 
 Kiki keeps each session in local SQLite storage under `~/.kiki/sessions`. Its five CLI forms are:

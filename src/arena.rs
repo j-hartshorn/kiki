@@ -2939,6 +2939,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_resource_reads_work_in_root_and_read_only_child_without_continuity_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut parent = arena_with_user_skill(&workspace, &home).await;
+        let references = home.path().join(".agents/skills/review/references");
+        fs::create_dir_all(&references).unwrap();
+        fs::write(references.join("note.md"), "live note").unwrap();
+        let initial_authorisations = parent.checkpoint().authorisations.clone();
+
+        let code = "note = await read('skill://review/references/note.md')\nentries = await list_dir('skill://review/references')\nnote == 'live note' and len(entries) == 1 and entries[0].path == 'skill://review/references/note.md'";
+        let execution = execute_without_cancellation(&mut parent, code)
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(execution.read_paths.is_empty());
+        assert!(execution.modified_paths.is_empty());
+        assert_eq!(parent.checkpoint().authorisations, initial_authorisations);
+
+        let checkpoint = parent.checkpoint();
+        let mut child = parent.child(&checkpoint, true).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut child,
+            "note = await read('skill://review/references/note.md')\nnote == 'live note' and (await list_dir('skill://review/references'))[0].path == 'skill://review/references/note.md'",
+        ).await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(execution.read_paths.is_empty());
+        assert_eq!(child.checkpoint().authorisations, initial_authorisations);
+    }
+
+    #[tokio::test]
     async fn python_error_after_load_skill_discards_capture() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();

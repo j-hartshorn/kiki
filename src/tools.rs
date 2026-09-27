@@ -37,7 +37,7 @@ use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
 use crate::model::{ModelHistory, SkillActivation, SkillActivationError};
-use crate::skills::{SkillCatalog, SkillLookupError};
+use crate::skills::{SkillCatalog, SkillLookupError, valid_name as valid_skill_name};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -606,7 +606,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::Read,
         parameters: READ_PARAMETERS,
         result: ToolResultShape::String,
-        description: "Read one complete UTF-8 workspace file.",
+        description: "Read one complete UTF-8 workspace file or skill:// resource.",
     },
     ToolDefinition {
         name: ToolName::Write,
@@ -624,7 +624,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::ListDir,
         parameters: LIST_DIR_PARAMETERS,
         result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
-        description: "List immediate workspace directory entries.",
+        description: "List immediate workspace or skill:// directory entries.",
     },
     ToolDefinition {
         name: ToolName::Glob,
@@ -2150,13 +2150,13 @@ impl ToolHost {
     }
 
     async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
-        let path = read_path(arguments)?;
+        let target = read_path(arguments)?;
         #[cfg(test)]
         if let Some(test_gate) = &self.test_gate {
             test_gate.wait_before_read().await;
         }
 
-        let workspace = Arc::clone(&self.workspace);
+        let (directory, path, is_skill) = self.resolve_resource_path(target)?;
         let limits = self.limits;
         let effect_path = path.clone();
         #[cfg(test)]
@@ -2166,7 +2166,7 @@ impl ToolHost {
             if let Some(test_gate) = &blocking_read_test_gate {
                 test_gate.wait_inside();
             }
-            let read = read_file(&workspace, &path, limits.max_file_bytes);
+            let read = read_file(&directory, &path, limits.max_file_bytes);
             #[cfg(test)]
             if let Some(test_gate) = &blocking_read_test_gate {
                 test_gate.note_finished();
@@ -2175,18 +2175,28 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
-        Ok(ToolOutput {
-            result: ToolValue::String(read.contents),
-            effect: Some(ToolEffect::Read {
-                path: effect_path,
-                fingerprint: read.fingerprint,
-            }),
-        })
+        if is_skill {
+            Ok(ToolOutput::without_effect(ToolValue::String(read.contents)))
+        } else {
+            Ok(ToolOutput {
+                result: ToolValue::String(read.contents),
+                effect: Some(ToolEffect::Read {
+                    path: effect_path,
+                    fingerprint: read.fingerprint,
+                }),
+            })
+        }
     }
 
     async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
-        let path = list_dir_path(arguments)?;
-        let workspace = Arc::clone(&self.workspace);
+        let target = list_dir_path(arguments)?;
+        let (directory, path, prefix) = match target {
+            ResourcePath::Workspace(path) => (Arc::clone(&self.workspace), path, String::new()),
+            ResourcePath::Skill { name, path } => {
+                let directory = self.skill_directory(&name)?;
+                (directory, path, format!("skill://{name}"))
+            }
+        };
         let limits = self.limits;
         #[cfg(test)]
         let test_gate = self.list_dir_test_gate.clone();
@@ -2195,12 +2205,52 @@ impl ToolHost {
             if let Some(test_gate) = test_gate {
                 test_gate.wait_inside();
             }
-            list_directory(&workspace, &path, limits)
+            list_directory(&directory, &path, limits, &prefix)
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
         .map(ToolOutput::without_effect)
+    }
+
+    fn resolve_resource_path(
+        &self,
+        target: ResourcePath,
+    ) -> Result<(Arc<Dir>, PathBuf, bool), ToolError> {
+        match target {
+            ResourcePath::Workspace(path) => Ok((Arc::clone(&self.workspace), path, false)),
+            ResourcePath::Skill { name, path } => Ok((self.skill_directory(&name)?, path, true)),
+        }
+    }
+
+    fn skill_directory(&self, name: &str) -> Result<Arc<Dir>, ToolError> {
+        let catalog = self
+            .skill_catalog
+            .as_ref()
+            .ok_or_else(|| ToolError::value("skill resources are unavailable"))?;
+        let skill = catalog.lookup(name).map_err(|error| match error {
+            SkillLookupError::Unknown(_) => {
+                ToolError::value(format!("unknown or unavailable skill {name:?}"))
+            }
+            SkillLookupError::Ambiguous { paths, .. } => ToolError::value(format!(
+                "skill {name:?} is ambiguous among {} sources",
+                paths.len()
+            )),
+            SkillLookupError::Invalid { reason, .. } => {
+                ToolError::value(format!("skill {name:?} is invalid: {reason:?}"))
+            }
+            SkillLookupError::Omitted { reason, .. } => {
+                ToolError::value(format!("skill {name:?} was omitted: {reason:?}"))
+            }
+            SkillLookupError::DirectOnly(_) => {
+                unreachable!("direct-only skills are permitted as resources")
+            }
+        })?;
+        skill
+            .directory()
+            .try_clone()
+            .map(Arc::new)
+            .map_err(ToolError::from_io)
     }
 
     async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
@@ -2300,7 +2350,7 @@ fn write_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
     let [ToolValue::String(path), ToolValue::String(_)] = arguments.as_slice() else {
         return None;
     };
-    normalise_path(path).ok()
+    workspace_mutation_path(path).ok()
 }
 
 fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
@@ -2315,7 +2365,7 @@ fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
     else {
         return None;
     };
-    normalise_path(path).ok()
+    workspace_mutation_path(path).ok()
 }
 
 fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError> {
@@ -2326,7 +2376,7 @@ fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError>
     };
     match <[ToolValue; 2]>::try_from(arguments) {
         Ok([ToolValue::String(path), ToolValue::String(content)]) => {
-            Ok((normalise_path(&path)?, content))
+            Ok((workspace_mutation_path(&path)?, content))
         }
         _ => Err(ToolError::type_error(
             "write() expects two positional string arguments",
@@ -2347,7 +2397,7 @@ fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), Too
                 ToolValue::String(old),
                 ToolValue::String(new),
             ],
-        ) => Ok((normalise_path(&path)?, old, new)),
+        ) => Ok((workspace_mutation_path(&path)?, old, new)),
         _ => Err(ToolError::type_error(
             "edit() expects three positional string arguments",
         )),
@@ -2393,7 +2443,36 @@ fn map_command_error(error: command::CommandError) -> ToolError {
     }
 }
 
-fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
+enum ResourcePath {
+    Workspace(PathBuf),
+    Skill { name: String, path: PathBuf },
+}
+
+fn parse_resource_path(path: &str) -> Result<ResourcePath, ToolError> {
+    let Some(locator) = path.strip_prefix("skill://") else {
+        return normalise_path(path).map(ResourcePath::Workspace);
+    };
+    let (name, relative) = locator
+        .split_once('/')
+        .ok_or_else(|| ToolError::value("skill locator must include a trailing slash"))?;
+    if !valid_skill_name(name) {
+        return Err(ToolError::value("skill locator has an invalid name"));
+    }
+    let path = normalise_path(relative)?;
+    Ok(ResourcePath::Skill {
+        name: name.to_owned(),
+        path,
+    })
+}
+
+fn workspace_mutation_path(path: &str) -> Result<PathBuf, ToolError> {
+    if path.starts_with("skill://") {
+        return Err(ToolError::permission("skill resources are read-only"));
+    }
+    normalise_path(path)
+}
+
+fn read_path(arguments: ToolValue) -> Result<ResourcePath, ToolError> {
     let ToolValue::List(arguments) = arguments else {
         return Err(ToolError::type_error(
             "read() expects one positional string argument",
@@ -2404,18 +2483,18 @@ fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
             "read() expects one positional string argument",
         ));
     };
-    normalise_path(path)
+    parse_resource_path(path)
 }
 
-fn list_dir_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
+fn list_dir_path(arguments: ToolValue) -> Result<ResourcePath, ToolError> {
     let ToolValue::List(arguments) = arguments else {
         return Err(ToolError::type_error(
             "list_dir() expects zero or one positional string argument",
         ));
     };
     match arguments.as_slice() {
-        [] => Ok(PathBuf::new()),
-        [ToolValue::String(path)] => normalise_path(path),
+        [] => Ok(ResourcePath::Workspace(PathBuf::new())),
+        [ToolValue::String(path)] => parse_resource_path(path),
         _ => Err(ToolError::type_error(
             "list_dir() expects zero or one positional string argument",
         )),
@@ -2523,9 +2602,15 @@ fn list_directory(
     workspace: &Dir,
     path: &Path,
     limits: ToolLimits,
+    display_prefix: &str,
 ) -> Result<Vec<ToolValue>, ToolError> {
     let directory = open_directory_root(workspace, path)?;
-    let base_path = normalised_path_string(path);
+    let relative_base = normalised_path_string(path);
+    let base_path = match (display_prefix.is_empty(), relative_base.is_empty()) {
+        (true, _) => relative_base,
+        (false, true) => display_prefix.to_owned(),
+        (false, false) => format!("{display_prefix}/{relative_base}"),
+    };
     let mut entries = Vec::new();
 
     for entry in directory.entries().map_err(ToolError::from_io)? {
@@ -3909,6 +3994,242 @@ mod tests {
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
         ToolHost::new(workspace.path()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn skill_resources_read_and_list_from_catalogued_directory() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(root.join("references")).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\ndescription: Review\n---\nPinned body\n",
+        )
+        .unwrap();
+        fs::write(root.join("references/checklist.md"), "live resource").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+
+        assert_eq!(
+            read(&host, "skill://review/references/checklist.md")
+                .await
+                .unwrap(),
+            "live resource"
+        );
+        assert_eq!(
+            list_dir_path(&host, "skill://review/references")
+                .await
+                .unwrap(),
+            [directory_entry(
+                "skill://review/references/checklist.md",
+                "file",
+                Some(13)
+            )]
+        );
+        assert!(
+            list_dir_path(&host, "skill://review/")
+                .await
+                .unwrap()
+                .contains(&directory_entry(
+                    "skill://review/references",
+                    "directory",
+                    None
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_reads_are_live_but_effect_free_and_mutations_are_denied() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("SKILL.md");
+        fs::write(&source, "---\ndescription: Review\n---\nPINNED_BODY\n").unwrap();
+        let resource = root.join("reference.txt");
+        fs::write(&resource, "first").unwrap();
+        let workspace_alias = workspace.path().join("skill:/review");
+        fs::create_dir_all(&workspace_alias).unwrap();
+        fs::write(workspace_alias.join("reference.txt"), "workspace file").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace)
+            .await
+            .with_skill_catalog(catalog.clone());
+        let locator = "skill://review/reference.txt";
+
+        let result = host
+            .call(ToolCall {
+                call_id: 8,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String(locator.to_owned())]),
+            })
+            .await;
+        assert_eq!(result.result, Ok(ToolValue::String("first".to_owned())));
+        assert!(result.effect.is_none());
+        let mut reads = BTreeSet::new();
+        let mut modifications = BTreeSet::new();
+        let mut authorisations = WholeFileAuthorisations::default();
+        result.record_observed_file_operation(&mut reads, &mut modifications);
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        assert!(reads.is_empty());
+        assert!(modifications.is_empty());
+        assert_eq!(authorisations, WholeFileAuthorisations::default());
+
+        for (tool, arguments) in [
+            (ToolName::Write, vec![locator, "changed"]),
+            (ToolName::Edit, vec![locator, "first", "changed"]),
+        ] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 9,
+                    tool,
+                    arguments: ToolValue::List(
+                        arguments
+                            .into_iter()
+                            .map(|item| ToolValue::String(item.to_owned()))
+                            .collect(),
+                    ),
+                })
+                .await;
+            assert!(
+                matches!(result.result, Err(ref error) if error.kind == ToolErrorKind::Permission)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace_alias.join("reference.txt")).unwrap(),
+            "workspace file"
+        );
+        assert_eq!(fs::read_to_string(&resource).unwrap(), "first");
+
+        fs::write(&resource, "second").unwrap();
+        fs::write(&source, "---\ndescription: Review\n---\nCHANGED_BODY\n").unwrap();
+        assert_eq!(read(&host, locator).await.unwrap(), "second");
+        assert!(
+            catalog
+                .lookup("review")
+                .unwrap()
+                .source_text()
+                .contains("PINNED_BODY")
+        );
+        assert!(
+            !catalog
+                .lookup("review")
+                .unwrap()
+                .source_text()
+                .contains("CHANGED_BODY")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_resources_reject_escapes_and_stay_on_held_directory_after_replacement() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "outside").unwrap();
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(root.join("references")).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\ndescription: Review\n---\nPinned\n",
+        )
+        .unwrap();
+        fs::write(root.join("references/old.txt"), "old directory").unwrap();
+        fs::write(root.join("%2e%2e"), "literal escape").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("outside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.join("final-link")).unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        for path in [
+            "skill://review/../secret",
+            "skill://review//secret",
+            "skill://review/outside-link/secret",
+            "skill://review/final-link",
+        ] {
+            assert_eq!(
+                read_error(&host, path).await,
+                ToolErrorKind::Permission,
+                "{path}"
+            );
+        }
+        for path in ["skill://review/outside-link", "skill://review/final-link"] {
+            assert_eq!(
+                list_dir_error(&host, path).await,
+                ToolErrorKind::Permission,
+                "{path}"
+            );
+        }
+        for path in ["skill:///secret", "skill://review", "skill://../secret"] {
+            assert_eq!(
+                read_error(&host, path).await,
+                ToolErrorKind::Value,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            read(&host, "skill://review/%2e%2e").await.unwrap(),
+            "literal escape"
+        );
+
+        let old = home.path().join(".agents/skills/review-old");
+        fs::rename(&root, &old).unwrap();
+        fs::create_dir_all(root.join("references")).unwrap();
+        fs::write(root.join("references/old.txt"), "new directory").unwrap();
+        assert_eq!(
+            read(&host, "skill://review/references/old.txt")
+                .await
+                .unwrap(),
+            "old directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_listing_counts_locator_prefix_and_skipped_project_is_unavailable() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let user_root = home.path().join(".agents/skills/user/references");
+        fs::create_dir_all(&user_root).unwrap();
+        fs::write(
+            user_root.parent().unwrap().join("SKILL.md"),
+            "---\ndescription: User\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(user_root.join("x"), "").unwrap();
+        let project_root = workspace.path().join(".agents/skills/project");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(
+            project_root.join("SKILL.md"),
+            "---\ndescription: Project\n---\nBody\n",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let expected_path = "skill://user/references/x";
+        let exact = expected_path.len() + "file".len();
+        let at_limit = tool_host_with_collection_limits(&workspace, 1, exact)
+            .await
+            .with_skill_catalog(catalog.clone());
+        assert_eq!(
+            list_dir_path(&at_limit, "skill://user/references")
+                .await
+                .unwrap(),
+            [directory_entry(expected_path, "file", Some(0))]
+        );
+        let over_limit = tool_host_with_collection_limits(&workspace, 1, exact - 1)
+            .await
+            .with_skill_catalog(catalog);
+        assert_eq!(
+            list_dir_error(&over_limit, "skill://user/references").await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            read_error(&at_limit, "skill://project/SKILL.md").await,
+            ToolErrorKind::Value
+        );
     }
 
     #[tokio::test]
@@ -5634,7 +5955,16 @@ mod tests {
                 .iter()
                 .map(|definition| definition.name.name())
                 .collect::<Vec<_>>(),
-            ["read", "write", "edit", "list_dir", "glob", "grep", "run"]
+            [
+                "read",
+                "write",
+                "edit",
+                "list_dir",
+                "glob",
+                "grep",
+                "run",
+                "load_skill"
+            ]
         );
         assert_eq!(ToolName::Grep.count_label(1), "match");
         assert_eq!(ToolName::Grep.count_label(2), "matches");
@@ -7349,6 +7679,7 @@ mod tests {
                 ToolName::Glob,
                 ToolName::Grep,
                 ToolName::Run,
+                ToolName::LoadSkill,
             ]
         );
         assert_eq!(
@@ -7372,7 +7703,7 @@ mod tests {
                     "    stdout: str\n",
                     "    stderr: str\n\n",
                     "async def read(path: str) -> str:\n",
-                    "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
+                    "    \"\"\"Read one complete UTF-8 workspace file or skill:// resource.\"\"\"\n",
                     "    return await _kiki_read(path)\n\n",
                     "async def write(path: str, content: str) -> None:\n",
                     "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
@@ -7381,7 +7712,7 @@ mod tests {
                     "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
                     "    await _kiki_edit(path, old, new)\n\n",
                     "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
-                    "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
+                    "    \"\"\"List immediate workspace or skill:// directory entries.\"\"\"\n",
                     "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
                     "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
                     "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
@@ -7391,7 +7722,10 @@ mod tests {
                     "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
                     "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
                     "    \"\"\"Run one project-local shell command.\"\"\"\n",
-                    "    return CommandResult(**await _kiki_run(command, cwd))\n\n{}"
+                    "    return CommandResult(**await _kiki_run(command, cwd))\n\n",
+                    "async def load_skill(name: str) -> str:\n",
+                    "    \"\"\"Activate one model-invocable skill from the process catalog.\"\"\"\n",
+                    "    return await _kiki_load_skill(name)\n\n{}"
                 ),
                 invocation_source(false)
             )
