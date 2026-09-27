@@ -104,7 +104,7 @@ Set the documented `thinking.block_binding.prefix_mismatch_behavior = "drop_bloc
 First red: `anthropic::tests::normal_step_requests_drop_only_mismatched_bound_thinking`.
 
 - A normal request with valid prior signed thinking, and a canonical summary followed by a retained signed-thinking/tool-use tail, both carry the field and header. Step replay keeps its original blocks and tool-result pairing; summary requests remain tool-free with no binding control.
-- An `invalid_request_error` about a signed-thinking prefix remains an ordinary failure, not a future overflow signal. Add an opt-in live `/compact` then continue smoke check to the existing Anthropic live harness if credentials are available; do not require it in credential-free CI.
+- An `invalid_request_error` about a signed-thinking prefix remains an ordinary failure, not a future overflow signal. Add an opt-in adapter-level live summary then retained signed-thinking continuation smoke check if credentials are available; existing in-process Runtime tests cover `/compact` orchestration. Do not require live calls in credential-free CI.
 
 **Files** — Modify: `src/anthropic.rs`.
 
