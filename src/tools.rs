@@ -36,6 +36,8 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
+use crate::model::{ModelHistory, SkillActivation, SkillActivationError};
+use crate::skills::{SkillCatalog, SkillLookupError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -57,6 +59,7 @@ pub(crate) enum ToolName {
     Glob,
     Grep,
     Run,
+    LoadSkill,
     StartSubagent,
     GetSubagent,
     RefreshSubagent,
@@ -74,6 +77,7 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Run => "run",
+            Self::LoadSkill => "load_skill",
             Self::StartSubagent => "start_subagent",
             Self::GetSubagent => "get_subagent",
             Self::RefreshSubagent => "refresh_subagent",
@@ -91,6 +95,7 @@ impl ToolName {
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
             Self::Run => "_kiki_run",
+            Self::LoadSkill => "_kiki_load_skill",
             Self::StartSubagent => "_kiki_start_subagent",
             Self::GetSubagent => "_kiki_get_subagent",
             Self::RefreshSubagent => "_kiki_refresh_subagent",
@@ -117,6 +122,7 @@ impl ToolName {
                 | Self::ListDir
                 | Self::Glob
                 | Self::Grep
+                | Self::LoadSkill
                 | Self::StartSubagent
                 | Self::GetSubagent
                 | Self::RefreshSubagent
@@ -133,6 +139,8 @@ impl ToolName {
             (Self::ListDir | Self::Glob, _) => "entries",
             (Self::Grep, 1) => "match",
             (Self::Grep, _) => "matches",
+            (Self::LoadSkill, 1) => "skill",
+            (Self::LoadSkill, _) => "skills",
             (Self::Write | Self::Edit, _) => {
                 unreachable!("mutations have status summaries rather than counts")
             }
@@ -170,6 +178,7 @@ impl ToolCall {
             | ToolName::Glob
             | ToolName::Grep
             | ToolName::Run
+            | ToolName::LoadSkill
             | ToolName::StartSubagent
             | ToolName::GetSubagent
             | ToolName::RefreshSubagent
@@ -586,6 +595,12 @@ const RUN_PARAMETERS: &[ToolParameter] = &[
     },
 ];
 
+const LOAD_SKILL_PARAMETERS: &[ToolParameter] = &[ToolParameter {
+    name: "name",
+    value_type: ToolValueType::String,
+    default: None,
+}];
+
 pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
         name: ToolName::Read,
@@ -629,6 +644,12 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         result: ToolResultShape::Record(&COMMAND_RESULT),
         description: "Run one project-local shell command.",
     },
+    ToolDefinition {
+        name: ToolName::LoadSkill,
+        parameters: LOAD_SKILL_PARAMETERS,
+        result: ToolResultShape::String,
+        description: "Activate one model-invocable skill from the process catalog.",
+    },
 ];
 
 pub(crate) fn bootstrap_source() -> String {
@@ -643,7 +664,13 @@ pub(crate) fn type_check_stubs() -> String {
 }
 
 pub(crate) fn prompt_reference() -> String {
-    prompt_reference_for(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), false)
+    prompt_reference_for(
+        &ACTIVE_TOOLS
+            .iter()
+            .filter(|definition| definition.name != ToolName::LoadSkill)
+            .collect::<Vec<_>>(),
+        false,
+    )
 }
 
 fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
@@ -1019,6 +1046,42 @@ struct BatchDispatch<'a> {
     output: Option<mpsc::Sender<ToolOutputChunk>>,
 }
 
+pub(crate) struct SkillLoadLedger {
+    history: ModelHistory,
+    captured: Vec<SkillActivation>,
+}
+
+impl SkillLoadLedger {
+    pub(crate) fn new(active: &[SkillActivation]) -> Result<Self, SkillActivationError> {
+        let mut history = ModelHistory::new();
+        for activation in active {
+            history.activate_skill(activation.clone())?;
+        }
+        Ok(Self {
+            history,
+            captured: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured(&self) -> &[SkillActivation] {
+        &self.captured
+    }
+
+    pub(crate) fn into_captured(self) -> Vec<SkillActivation> {
+        self.captured
+    }
+
+    fn activate(&mut self, activation: SkillActivation) -> Result<(), SkillActivationError> {
+        if self.history.activate_skill(activation.clone())? {
+            self.captured
+                .retain(|existing| existing.name() != activation.name());
+            self.captured.push(activation);
+        }
+        Ok(())
+    }
+}
+
 impl<'a> BatchDispatch<'a> {
     fn new(
         host: &'a ToolHost,
@@ -1088,6 +1151,7 @@ impl<'a> BatchDispatch<'a> {
 #[derive(Clone)]
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
+    skill_catalog: Option<Arc<SkillCatalog>>,
     limits: ToolLimits,
     read_only: bool,
     #[cfg(test)]
@@ -1707,6 +1771,7 @@ impl ToolHost {
 
         Ok(Self {
             workspace,
+            skill_catalog: None,
             limits,
             read_only: false,
             #[cfg(test)]
@@ -1730,10 +1795,77 @@ impl ToolHost {
         child
     }
 
+    pub(crate) fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = Some(catalog);
+        self
+    }
+
+    pub(crate) fn load_skill(
+        &self,
+        arguments: ToolValue,
+        ledger: &mut SkillLoadLedger,
+    ) -> Result<ToolValue, ToolError> {
+        let ToolValue::List(arguments) = arguments else {
+            return Err(ToolError::type_error("load_skill expects one string name"));
+        };
+        let [ToolValue::String(name)] = arguments.as_slice() else {
+            return Err(ToolError::type_error("load_skill expects one string name"));
+        };
+        let catalog = self
+            .skill_catalog
+            .as_ref()
+            .ok_or_else(|| ToolError::value("no model-invocable skills are available"))?;
+        let skill = catalog.lookup_model_invocable(name).map_err(|error| {
+            let message = match error {
+                SkillLookupError::Unknown(_) => format!("unknown or unavailable skill {name:?}"),
+                SkillLookupError::Ambiguous { paths, .. } => {
+                    format!("skill {name:?} is ambiguous among {} sources", paths.len())
+                }
+                SkillLookupError::Invalid { reason, .. } => {
+                    format!("skill {name:?} is invalid: {reason:?}")
+                }
+                SkillLookupError::Omitted { reason, .. } => {
+                    format!("skill {name:?} was omitted: {reason:?}")
+                }
+                SkillLookupError::DirectOnly(_) => {
+                    format!("skill {name:?} can only be activated directly by the user")
+                }
+            };
+            ToolError::value(message)
+        })?;
+        ledger
+            .activate(SkillActivation::from_skill(skill))
+            .map_err(|error| ToolError::value(error.to_string()))?;
+        let root = skill.canonical_root().to_str().filter(|path| {
+            !path.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+                    )
+            })
+        });
+        let root = root.map_or_else(
+            || "root path unavailable".to_owned(),
+            |path| {
+                format!(
+                    "root={}",
+                    serde_json::to_string(path).expect("path is UTF-8")
+                )
+            },
+        );
+        Ok(ToolValue::String(format!(
+            "Loaded skill {name}; resource skill://{name}/; {root}"
+        )))
+    }
+
     pub(crate) fn prompt_reference(&self) -> String {
         let definitions = ACTIVE_TOOLS
             .iter()
-            .filter(|definition| !self.read_only || definition.name.is_allowed_read_only())
+            .filter(|definition| {
+                definition.name != ToolName::LoadSkill
+                    && (!self.read_only || definition.name.is_allowed_read_only())
+            })
             .collect::<Vec<_>>();
         prompt_reference_for(&definitions, self.read_only)
     }
@@ -1856,6 +1988,9 @@ impl ToolHost {
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
             ToolName::Run => self.run(call_id, arguments, output).await,
+            ToolName::LoadSkill => Err(ToolError::runtime(
+                "load_skill requires an active model execution",
+            )),
             ToolName::StartSubagent
             | ToolName::GetSubagent
             | ToolName::RefreshSubagent
@@ -3749,16 +3884,238 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::config::constants::FILE_MAX_BYTES;
+    use crate::skills::{ProjectScope, SkillCatalog};
 
     use super::{
-        ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolEffect, ToolError, ToolErrorKind, ToolHost,
-        ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
-        WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
-        invocation_source, normalise_path, open_content_no_follow, open_parent, prompt_reference,
+        ACTIVE_TOOLS, ContentFingerprint, SkillLoadLedger, ToolCall, ToolEffect, ToolError,
+        ToolErrorKind, ToolHost, ToolName, ToolResult, ToolValue, Utf8ValidatingReader,
+        WholeFileAuthorisations, WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source,
+        content_fingerprint, invocation_source, normalise_path, open_content_no_follow,
+        open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
         ToolHost::new(workspace.path()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn load_skill_ledger_captures_body_outside_ack_and_enforces_combined_limit() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        for index in 0..5 {
+            let name = format!("large-{index}");
+            let root = home.path().join(".agents/skills").join(&name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: Large\n---\n{}",
+                    "BODY_SENTINEL".repeat(4_700)
+                ),
+            )
+            .unwrap();
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        for index in 0..4 {
+            let name = format!("large-{index}");
+            let ack = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.clone())]),
+                    &mut ledger,
+                )
+                .unwrap();
+            let ToolValue::String(ack) = ack else {
+                panic!("load_skill must return a string acknowledgement")
+            };
+            assert!(ack.contains(&format!("skill://{name}/")));
+            assert!(!ack.contains("BODY_SENTINEL"));
+        }
+        assert_eq!(ledger.captured().len(), 4);
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("large-4".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert_eq!(ledger.captured().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn load_skill_lookup_rejects_direct_only_invalid_ambiguous_and_skipped_project() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let user_root = home.path().join(".agents/skills");
+        for (directory, frontmatter, body) in [
+            (
+                "direct",
+                "name: direct\ndescription: Direct\ndisable-model-invocation: true",
+                "body",
+            ),
+            ("invalid", "name: invalid", "body"),
+            ("one", "name: shared\ndescription: One", "body"),
+            ("two", "name: shared\ndescription: Two", "body"),
+        ] {
+            let root = user_root.join(directory);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\n{frontmatter}\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        let project_root = workspace.path().join(".agents/skills/project");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(
+            project_root.join("SKILL.md"),
+            "---\nname: project\ndescription: Project\n---\nbody",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        for (name, reason) in [
+            ("direct", "directly by the user"),
+            ("invalid", "invalid"),
+            ("shared", "ambiguous"),
+            ("project", "unavailable"),
+            ("missing", "unknown"),
+        ] {
+            let error = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.to_owned())]),
+                    &mut ledger,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::Value);
+            assert!(error.to_string().contains(reason), "{name}: {error}");
+        }
+        assert!(ledger.captured().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_skill_ack_omits_unsafe_root_path_and_is_allowed_in_read_only_host() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/\u{202e}hidden");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: safe\ndescription: Safe\n---\nbody",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace)
+            .await
+            .with_skill_catalog(catalog)
+            .for_child(true);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        let result = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("safe".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap();
+        let ToolValue::String(ack) = result else {
+            panic!("load_skill must return a string")
+        };
+        assert!(ack.contains("skill://safe/"));
+        assert!(ack.contains("root path unavailable"));
+        assert!(!ack.contains('\u{202e}'));
+        assert_eq!(ledger.captured().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_skill_uses_process_catalog_snapshot_after_source_changes() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("SKILL.md");
+        fs::write(
+            &source,
+            "---\nname: review\ndescription: Review\n---\nFIRST_BODY",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let old_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let old_host = tool_host(&workspace).await.with_skill_catalog(old_catalog);
+
+        fs::write(
+            &source,
+            "---\nname: review\ndescription: Review\n---\nSECOND_BODY",
+        )
+        .unwrap();
+        let new_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let new_host = tool_host(&workspace).await.with_skill_catalog(new_catalog);
+        let mut old_ledger = SkillLoadLedger::new(&[]).unwrap();
+        old_host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut old_ledger,
+            )
+            .unwrap();
+        let mut new_ledger = SkillLoadLedger::new(old_ledger.captured()).unwrap();
+        assert!(
+            new_ledger
+                .history
+                .active_skills()
+                .next()
+                .unwrap()
+                .body()
+                .contains("FIRST_BODY")
+        );
+        assert!(new_ledger.captured().is_empty());
+        new_host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut new_ledger,
+            )
+            .unwrap();
+        assert!(old_ledger.captured()[0].body().contains("FIRST_BODY"));
+        assert!(new_ledger.captured()[0].body().contains("SECOND_BODY"));
+        assert!(
+            new_ledger
+                .history
+                .active_skills()
+                .next()
+                .unwrap()
+                .body()
+                .contains("SECOND_BODY")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_skill_reports_catalog_validation_reason() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/oversized");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: oversized\ndescription: Large\n---\n{}",
+                "x".repeat(crate::skills::MAX_SKILL_BYTES)
+            ),
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("oversized".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert!(error.to_string().contains("exceeds 65536 bytes"));
     }
 
     async fn tool_host_with_limits(workspace: &TempDir, max_bytes: usize) -> ToolHost {

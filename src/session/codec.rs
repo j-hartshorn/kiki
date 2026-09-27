@@ -273,6 +273,7 @@ enum StoredToolName {
     Glob,
     Grep,
     Run,
+    LoadSkill,
     StartSubagent,
     GetSubagent,
     RefreshSubagent,
@@ -1351,6 +1352,7 @@ fn encode_tool_call(call: &ToolCall) -> StoredToolCall {
             ToolName::Glob => StoredToolName::Glob,
             ToolName::Grep => StoredToolName::Grep,
             ToolName::Run => StoredToolName::Run,
+            ToolName::LoadSkill => StoredToolName::LoadSkill,
             ToolName::StartSubagent => StoredToolName::StartSubagent,
             ToolName::GetSubagent => StoredToolName::GetSubagent,
             ToolName::RefreshSubagent => StoredToolName::RefreshSubagent,
@@ -1384,6 +1386,7 @@ fn decode_tool_call(call: &StoredToolCall) -> Result<ToolCall, CodecError> {
             StoredToolName::Glob => ToolName::Glob,
             StoredToolName::Grep => ToolName::Grep,
             StoredToolName::Run => ToolName::Run,
+            StoredToolName::LoadSkill => ToolName::LoadSkill,
             StoredToolName::StartSubagent => ToolName::StartSubagent,
             StoredToolName::GetSubagent => ToolName::GetSubagent,
             StoredToolName::RefreshSubagent => ToolName::RefreshSubagent,
@@ -1403,16 +1406,19 @@ fn valid_tool_call_pair(tool: &StoredToolName, summary: &StoredToolCallSummary) 
         ) | (
             StoredToolName::Run,
             StoredToolCallSummary::Exit(_) | StoredToolCallSummary::Signal
-        ) | (
-            StoredToolName::Read
-                | StoredToolName::ListDir
-                | StoredToolName::Glob
-                | StoredToolName::Grep,
-            StoredToolCallSummary::Count(_)
-        ) | (
-            StoredToolName::Write,
-            StoredToolCallSummary::Created | StoredToolCallSummary::Replaced
-        ) | (StoredToolName::Edit, StoredToolCallSummary::Applied)
+        ) | (StoredToolName::LoadSkill, StoredToolCallSummary::Count(1))
+            | (
+                StoredToolName::Read
+                    | StoredToolName::ListDir
+                    | StoredToolName::Glob
+                    | StoredToolName::Grep,
+                StoredToolCallSummary::Count(_)
+            )
+            | (
+                StoredToolName::Write,
+                StoredToolCallSummary::Created | StoredToolCallSummary::Replaced
+            )
+            | (StoredToolName::Edit, StoredToolCallSummary::Applied)
             | (
                 StoredToolName::StartSubagent
                     | StoredToolName::GetSubagent
@@ -2049,6 +2055,25 @@ mod tests {
                 execution
             );
         }
+    }
+
+    #[test]
+    fn load_skill_codec_accepts_only_a_single_successful_count() {
+        let mut execution = task_execution();
+        execution.tool_calls = vec![crate::arena::ToolCall {
+            tool: crate::arena::ToolName::LoadSkill,
+            summary: crate::arena::ToolCallSummary::Count(1),
+        }];
+        let stored = encode_execution_value(&execution).expect("encode skill tool call");
+        assert_eq!(decode_execution_value(&stored).unwrap(), execution);
+
+        let mut invalid = serde_json::to_value(&stored).unwrap();
+        invalid["tool_calls"][0]["summary"]["Count"] = serde_json::json!(2);
+        let invalid: super::StoredExecution = serde_json::from_value(invalid).unwrap();
+        assert!(matches!(
+            decode_execution_value(&invalid),
+            Err(super::CodecError::InvalidPayload)
+        ));
     }
 
     #[test]

@@ -294,7 +294,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
     let skill_scope = ProjectScope::discover(&workspace_root)?;
-    let (_skills_catalog, project_skills_trusted) =
+    let (skills_catalog, project_skills_trusted) =
         match startup_skill_catalog(&skill_scope, &home, false, |scope| {
             tui::run_project_skill_trust(scope, || {
                 settings::save_project_skill_scope_trust(&home, scope)
@@ -325,7 +325,10 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
             return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
-    let mut arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
+    let mut arena = match runtime.block_on(Arena::new(
+        worker_path,
+        tool_host.with_skill_catalog(skills_catalog),
+    )) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
@@ -426,7 +429,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let skill_scope = ProjectScope::discover(&workspace_root)?;
     let has_active_project_skill_in_scope =
         session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?;
-    let (_skills_catalog, project_skills_trusted) = match startup_skill_catalog(
+    let (skills_catalog, project_skills_trusted) = match startup_skill_catalog(
         &skill_scope,
         &home,
         has_active_project_skill_in_scope,
@@ -470,7 +473,10 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             return run_open_configuration(session, configuration.snapshot().clone(), trace_owner);
         }
     };
-    let arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
+    let arena = match runtime.block_on(Arena::new(
+        worker_path,
+        tool_host.with_skill_catalog(skills_catalog),
+    )) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);

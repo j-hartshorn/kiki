@@ -1338,6 +1338,7 @@ impl SessionWriter {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn settle_execution(
         &self,
         run_id: u64,
@@ -1345,10 +1346,41 @@ impl SessionWriter {
         code: PersistedCode,
         checkpoint: Checkpoint,
     ) -> Result<(), SessionError> {
+        self.settle_execution_with_skills(run_id, step_id, code, checkpoint, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn settle_execution_with_skills(
+        &self,
+        run_id: u64,
+        step_id: u64,
+        code: PersistedCode,
+        checkpoint: Checkpoint,
+        activations: Vec<SkillActivation>,
+    ) -> Result<(), SessionError> {
         self.write_context(SessionWriteKind::Settlement, move |connection, context| {
             validate_execution_projection(&code)?;
+            if !activations.is_empty()
+                && !code.execution.as_ref().is_some_and(|execution| {
+                    matches!(
+                        execution.outcome,
+                        crate::arena::ExecutionOutcome::Complete { .. }
+                    )
+                })
+            {
+                return Err(SessionError::InvalidTransition);
+            }
             let mut history = context.history.clone();
             append_persisted_code(&mut history, &code)?;
+            let mut changed = Vec::new();
+            for activation in &activations {
+                if history
+                    .activate_skill(activation.clone())
+                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?
+                {
+                    changed.push(activation.clone());
+                }
+            }
             let entry = settle_execution(
                 connection,
                 run_id,
@@ -1356,6 +1388,7 @@ impl SessionWriter {
                 &code,
                 &checkpoint,
                 context.effective_entry,
+                &changed,
             )?;
             context.effective_entry = entry;
             context.history = history;
@@ -1759,6 +1792,7 @@ fn settle_execution(
     code: &PersistedCode,
     checkpoint: &Checkpoint,
     expected_parent: SessionEntryId,
+    activations: &[SkillActivation],
 ) -> Result<SessionEntryId, SessionError> {
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
     let step_id = i64::try_from(step_id).map_err(|_| SessionError::IdOverflow)?;
@@ -1766,6 +1800,11 @@ fn settle_execution(
     let stored_code =
         codec::encode_execution(code).map_err(|error| SessionError::Codec(error.to_string()))?;
     let stored_checkpoint = codec::encode_checkpoint(checkpoint)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let stored_activations = activations
+        .iter()
+        .map(codec::encode_skill_activation)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1777,7 +1816,7 @@ fn settle_execution(
     if parent_id != expected_parent {
         return Err(SessionError::InvalidTransition);
     }
-    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    let mut next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
     transaction.execute(
         "INSERT INTO checkpoints (runtime_identity, arena_state, authorisations_json) VALUES (?1, ?2, ?3)",
         params![
@@ -1806,12 +1845,23 @@ fn settle_execution(
     )? != 1 {
         return Err(SessionError::InvalidTransition);
     }
+    let mut effective_entry_id = entry_id;
+    for stored in &stored_activations {
+        next_revision = next_revision
+            .checked_add(1)
+            .ok_or(SessionError::IdOverflow)?;
+        transaction.execute(
+            "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
+            params![effective_entry_id, run_id, checkpoint_id, stored.payload_json, now, next_revision],
+        )?;
+        effective_entry_id = transaction.last_insert_rowid();
+    }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![entry_id, now, next_revision],
+        params![effective_entry_id, now, next_revision],
     )?;
     transaction.commit()?;
-    session_entry_id(entry_id)
+    session_entry_id(effective_entry_id)
 }
 
 fn close_run(
@@ -4953,6 +5003,174 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn execution_settlement_persists_skill_batch_atomically() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let run = writer
+            .commit_request("load".to_owned(), selection())
+            .await
+            .unwrap();
+        let step = writer.start_model_step(run.run_id).await.unwrap();
+        let make_code = |call_id: &str| PersistedCode {
+            source: "await load_skill('first')".to_owned(),
+            call_id: crate::model::ModelCallId::new(call_id.to_owned()),
+            commentary: None,
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
+            }),
+            attempts: Vec::new(),
+        };
+        let first = skill(
+            "first",
+            home.path().join("first"),
+            "first body",
+            SkillOrigin::User,
+            None,
+        );
+        let second = skill(
+            "second",
+            home.path().join("second"),
+            "second body",
+            SkillOrigin::User,
+            None,
+        );
+        writer
+            .settle_execution_with_skills(
+                run.run_id,
+                step,
+                make_code("batch-1"),
+                session.initial_checkpoint().unwrap(),
+                vec![first.clone(), second.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .model_history()
+                .unwrap()
+                .active_skills()
+                .collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+        let next_step = writer.start_model_step(run.run_id).await.unwrap();
+        let oversized = (0..5)
+            .map(|index| {
+                let name = format!("large-{index}");
+                skill(
+                    &name,
+                    home.path().join(&name),
+                    &"x".repeat(60 * 1024),
+                    SkillOrigin::User,
+                    None,
+                )
+            })
+            .collect();
+        assert!(
+            writer
+                .settle_execution_with_skills(
+                    run.run_id,
+                    next_step,
+                    make_code("batch-2"),
+                    session.initial_checkpoint().unwrap(),
+                    oversized,
+                )
+                .await
+                .is_err()
+        );
+        {
+            let connection = session.connection_for_test().unwrap();
+            let executions: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = 'execution'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(executions, 1);
+            let still_pending: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
+                    [i64::try_from(next_step).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(still_pending, 1);
+        }
+        session
+            .connection_for_test()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_second_loaded_skill BEFORE INSERT ON entries WHEN NEW.kind = 'skill_activation' AND NEW.payload_json LIKE '%rollback-two%' BEGIN SELECT RAISE(ABORT, 'reject second skill'); END;",
+            )
+            .unwrap();
+        let rollback_one = skill(
+            "rollback-one",
+            home.path().join("rollback-one"),
+            "one",
+            SkillOrigin::User,
+            None,
+        );
+        let rollback_two = skill(
+            "rollback-two",
+            home.path().join("rollback-two"),
+            "two",
+            SkillOrigin::User,
+            None,
+        );
+        assert!(
+            writer
+                .settle_execution_with_skills(
+                    run.run_id,
+                    next_step,
+                    make_code("batch-2"),
+                    session.initial_checkpoint().unwrap(),
+                    vec![rollback_one, rollback_two],
+                )
+                .await
+                .is_err()
+        );
+        let connection = session.connection_for_test().unwrap();
+        let (executions, activations): (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'execution'), (SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((executions, activations), (1, 2));
+        let still_pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
+                [i64::try_from(next_step).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_pending, 1);
     }
 
     #[tokio::test]

@@ -30,13 +30,15 @@ use crate::{
             COLLECTION_MAX_PAYLOAD_BYTES,
         },
     },
+    model::SkillActivation,
     subagents::{
         AgentInvocationContext, InvocationOperation, TrustedExecutionContext, WaitPhaseSignal,
         invoke as invoke_subagent,
     },
     tools::{
-        ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
-        ToolValue, WholeFileAuthorisations, bootstrap_source, type_check_stubs,
+        SkillLoadLedger, ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost,
+        ToolOutputChunk, ToolResult, ToolValue, WholeFileAuthorisations, bootstrap_source,
+        type_check_stubs,
     },
 };
 
@@ -808,6 +810,7 @@ impl ArenaChildSource {
             model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
+            last_skill_activations: Vec::new(),
             #[cfg(test)]
             collection_test_gate: self.collection_test_gate.clone(),
             #[cfg(test)]
@@ -835,6 +838,7 @@ pub struct Arena {
     model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
+    last_skill_activations: Vec<SkillActivation>,
     #[cfg(test)]
     collection_test_gate: Option<CollectionTestGate>,
     #[cfg(test)]
@@ -939,6 +943,7 @@ impl Arena {
             model_type_check_disabled: false,
             execution_timeout,
             clock,
+            last_skill_activations: Vec::new(),
             #[cfg(test)]
             collection_test_gate: None,
             #[cfg(test)]
@@ -1016,10 +1021,11 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
-        self.execute_with_context(code, cancellation, progress, invocation, true)
+        self.execute_with_context(code, cancellation, progress, invocation, true, &[])
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_model_code_with_progress_and_context(
         &mut self,
         code: &str,
@@ -1027,12 +1033,31 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
+        self.execute_model_code_with_skills_and_context(
+            code,
+            cancellation,
+            progress,
+            invocation,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_model_code_with_skills_and_context(
+        &mut self,
+        code: &str,
+        cancellation: &CancellationToken,
+        progress: &mut (impl FnMut(ArenaProgress) + Send),
+        invocation: Option<(&AgentInvocationContext, ModelSelection)>,
+        active_skills: &[SkillActivation],
+    ) -> Result<Execution, ArenaError> {
         self.execute_with_context(
             code,
             cancellation,
             progress,
             invocation,
             self.model_type_check_disabled,
+            active_skills,
         )
         .await
     }
@@ -1044,7 +1069,14 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
         skip_type_check: bool,
+        active_skills: &[SkillActivation],
     ) -> Result<Execution, ArenaError> {
+        self.last_skill_activations.clear();
+        let mut skill_ledger =
+            SkillLoadLedger::new(active_skills).map_err(|error| ArenaError::Infrastructure {
+                message: format!("active skill ledger is invalid: {error}"),
+                execution: None,
+            })?;
         let mut budget = ChargeableBudget::new(self.clock.clone(), self.execution_timeout);
         match budget
             .wait(cancellation, self.restore_current_checkpoint_if_needed())
@@ -1091,11 +1123,15 @@ impl Arena {
             &mut interruption,
             &mut budget,
             cancellation,
+            &mut skill_ledger,
         )
         .await;
 
         match attempt {
             Ok((outcome, state)) => {
+                if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
+                    self.last_skill_activations = skill_ledger.into_captured();
+                }
                 self.checkout = Some(checkout);
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
@@ -1123,6 +1159,10 @@ impl Arena {
 
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint.clone()
+    }
+
+    pub(crate) fn take_skill_activations(&mut self) -> Vec<SkillActivation> {
+        std::mem::take(&mut self.last_skill_activations)
     }
 
     #[cfg(test)]
@@ -1535,6 +1575,7 @@ async fn execute_checkout(
     interruption: &mut InterruptedExecutionState,
     budget: &mut ChargeableBudget,
     cancellation: &CancellationToken,
+    skill_ledger: &mut SkillLoadLedger,
 ) -> Result<(ExecutionOutcome, Vec<u8>), AttemptFailure> {
     let result = drive(
         checkout,
@@ -1547,6 +1588,7 @@ async fn execute_checkout(
         interruption,
         budget,
         cancellation,
+        skill_ledger,
     )
     .await;
     interruption.streams.flush_stdout(Instant::now(), progress);
@@ -1689,6 +1731,7 @@ async fn drive(
     interruption: &mut InterruptedExecutionState,
     budget: &mut ChargeableBudget,
     cancellation: &CancellationToken,
+    skill_ledger: &mut SkillLoadLedger,
 ) -> Result<MontyObject, DriverError> {
     let InterruptedExecutionState {
         streams,
@@ -1854,7 +1897,13 @@ async fn drive(
                                 "a pending run call must have a unique call ID"
                             );
                         }
-                        if let Some(operation) = call.invocation {
+                        if call.tool == ToolName::LoadSkill {
+                            let result = tool_host.load_skill(call.arguments, skill_ledger);
+                            let call_id = call.call_id;
+                            invocation_calls.push(Box::pin(async move {
+                                ToolResult::from_result(call_id, result)
+                            }));
+                        } else if let Some(operation) = call.invocation {
                             let call_id = call.call_id;
                             let arguments = call.arguments;
                             let wait_phase_sender = wait_phase_sender.clone();
@@ -2192,6 +2241,10 @@ fn tool_summary(tool: ToolName, result: &ToolResult) -> ToolCallSummary {
             Ok(_) | Err(_) => ToolCallSummary::Failed,
         },
         ToolName::Write | ToolName::Edit => ToolCallSummary::Failed,
+        ToolName::LoadSkill => match &result.result {
+            Ok(ToolValue::String(_)) => ToolCallSummary::Count(1),
+            _ => ToolCallSummary::Failed,
+        },
         ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => {
             match &result.result {
                 Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
@@ -2803,6 +2856,7 @@ mod tests {
         validate_worker, validate_worker_with_timeout,
     };
     use crate::model::{ScriptedAction, ScriptedModel};
+    use crate::skills::{ProjectScope, SkillCatalog};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
         ChildParameters, ChildPayload, ChildResult, ChildRun, ChildRunner, Clock,
@@ -2838,6 +2892,144 @@ mod tests {
         )
         .await
         .expect("create arena")
+    }
+
+    async fn arena_with_user_skill(workspace: &TempDir, home: &TempDir) -> Arena {
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nPRIVATE_SKILL_BODY",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        Arena::new(worker_path(), host).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_load_skill_is_captured_after_execution_without_body_in_trace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let execution = arena
+            .execute("await load_skill('review')", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(execution.tool_calls.len(), 1);
+        assert_eq!(execution.tool_calls[0].tool, ToolName::LoadSkill);
+        assert_eq!(execution.tool_calls[0].summary, ToolCallSummary::Count(1));
+        assert!(!format!("{execution:?}").contains("PRIVATE_SKILL_BODY"));
+        let captured = arena.take_skill_activations();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].body().contains("PRIVATE_SKILL_BODY"));
+    }
+
+    #[tokio::test]
+    async fn python_error_after_load_skill_discards_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let execution = arena
+            .execute(
+                "await load_skill('review')\nraise ValueError('boom')",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::PythonError(_)
+        ));
+        assert!(arena.take_skill_activations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn caught_load_skill_error_keeps_earlier_successful_loads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            let name = format!("large-{index}");
+            let root = home.path().join(".agents/skills").join(&name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: Large\n---\n{}",
+                    "BODY_SENTINEL".repeat(4_700)
+                ),
+            )
+            .unwrap();
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let code = "await load_skill('large-0')\nawait load_skill('large-1')\nawait load_skill('large-2')\nawait load_skill('large-3')\ntry:\n    await load_skill('large-4')\nexcept ValueError:\n    pass";
+        let execution = arena
+            .execute(code, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(execution.tool_calls.len(), 5);
+        assert_eq!(execution.tool_calls[4].summary, ToolCallSummary::Failed);
+        let captured = arena.take_skill_activations();
+        assert_eq!(captured.len(), 4);
+        assert!(!format!("{execution:?}").contains("BODY_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_load_skill_discards_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("blocked"), "contents").unwrap();
+        let root = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nPRIVATE_SKILL_BODY",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let gate = ReadTestGate::new();
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog)
+            .with_test_gate(gate.clone());
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let mut execution = Box::pin(arena.execute(
+            "await load_skill('review')\nawait read('blocked')",
+            &cancellation,
+        ));
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before skill load settled: {result:?}"),
+        }
+        gate.resume_driver();
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before read started: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(execution.await, Err(ArenaError::Cancelled { .. })));
+        assert!(arena.take_skill_activations().is_empty());
     }
 
     async fn arena_with_collection_limits(
@@ -8763,6 +8955,7 @@ mod tests {
         let mut authorisations = WholeFileAuthorisations::default();
         let cancellation = CancellationToken::new();
         let mut budget = ChargeableBudget::new(arena.clock.clone(), Duration::from_secs(1));
+        let mut skill_ledger = crate::tools::SkillLoadLedger::new(&[]).unwrap();
         let result = drive(
             checkout,
             &arena.tool_host,
@@ -8774,6 +8967,7 @@ mod tests {
             &mut interruption,
             &mut budget,
             &cancellation,
+            &mut skill_ledger,
         )
         .await;
         let Err(DriverError::Runtime(error)) = result else {
