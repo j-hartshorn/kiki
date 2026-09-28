@@ -78,6 +78,21 @@ impl ProjectScope {
         })
     }
 
+    pub(crate) fn excluding_user_root(&self, home: &Path) -> Self {
+        let user_root = fs::canonicalize(home).ok().and_then(|canonical_home| {
+            fs::canonicalize(home.join(".agents/skills"))
+                .ok()
+                .filter(|root| root.is_dir() && root.starts_with(&canonical_home))
+        });
+        let mut project = self.clone();
+        if let Some(user_root) = user_root {
+            project
+                .roots
+                .retain(|root| fs::canonicalize(root).ok().as_deref() != Some(user_root.as_path()));
+        }
+        project
+    }
+
     pub fn has_skill_directory(&self) -> bool {
         self.roots
             .iter()
