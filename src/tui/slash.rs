@@ -55,12 +55,9 @@ pub(super) struct Parsed<'a> {
 pub(super) fn parse(draft: &str) -> Option<Parsed<'_>> {
     if let Some(rest) = draft.strip_prefix("/skill:") {
         let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let argument = rest[name_end..].chars().next().map_or("", |separator| {
-            rest[name_end + separator.len_utf8()..].trim_start_matches([' ', '\t'])
-        });
         return Some(Parsed {
             action: Action::Skill,
-            argument,
+            argument: "",
             skill_name: Some(&rest[..name_end]),
             token_range: 0.."/skill:".len() + name_end,
         });
@@ -236,10 +233,8 @@ mod tests {
         let bare = parse("/skill:review").unwrap();
         assert_eq!(bare.action, Action::Skill);
         assert_eq!(bare.skill_name, Some("review"));
-        assert_eq!(bare.argument, "");
         let request = parse("/skill:review inspect this\n  and this").unwrap();
         assert_eq!(request.skill_name, Some("review"));
-        assert_eq!(request.argument, "inspect this\n  and this");
         assert_eq!(
             parse("/skill:review-more").unwrap().skill_name,
             Some("review-more")
