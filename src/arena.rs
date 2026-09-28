@@ -827,7 +827,7 @@ impl ArenaChildSource {
         self.tool_host.for_child(read_only).prompt_reference()
     }
 
-    pub(crate) fn skill_catalog(&self) -> Option<&SkillCatalog> {
+    pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
         self.tool_host.skill_catalog()
     }
 }
@@ -4354,7 +4354,7 @@ mod tests {
         let mut child = parent.child(&checkpoint, false).await.unwrap();
         assert_eq!(
             child.tool_host.prompt_reference(),
-            crate::tools::prompt_reference()
+            crate::tools::prompt_reference(&SkillCatalog::default())
         );
         assert!(
             python_error(

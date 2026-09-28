@@ -60,32 +60,17 @@ use crate::tools::ToolHost;
 
 fn production_model(
     ready: &config::ReadyStartup<'_>,
-    catalog: Option<&SkillCatalog>,
+    catalog: &SkillCatalog,
     anthropic_cache_ttl: CacheTtl,
     cross_provider_reasoning: CrossProviderReasoning,
 ) -> ProviderModel {
-    let system_prompt =
-        production_system_prompt(ready.prompt_base(), ready.system_prompt(), catalog);
     ProviderModel::new(
-        &system_prompt,
+        &prompt::root_prompt(ready.prompt_base(), catalog),
         ready.api_key(Provider::OpenAi).map(ApiKey::expose),
         ready.api_key(Provider::Anthropic).map(ApiKey::expose),
         anthropic_cache_ttl,
         cross_provider_reasoning,
     )
-}
-
-fn production_system_prompt(
-    base: &str,
-    resolved_without_skills: &str,
-    catalog: Option<&SkillCatalog>,
-) -> String {
-    catalog
-        .filter(|catalog| catalog.rendered_catalog().is_some())
-        .map_or_else(
-            || resolved_without_skills.to_owned(),
-            |catalog| prompt::root_prompt_with_catalog(base, catalog),
-        )
 }
 
 enum Invocation {
@@ -339,7 +324,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
-        Some(&skills_catalog),
+        &skills_catalog,
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -486,7 +471,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
-        Some(&skills_catalog),
+        &skills_catalog,
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -713,11 +698,8 @@ mod tests {
         assert!(fresh_trusted && resumed_trusted);
         assert_eq!(fresh.rendered_catalog(), resumed.rendered_catalog());
         let base = "exact override base";
-        let resolved_without_skills = super::prompt::root_prompt(base);
-        let fresh_prompt =
-            super::production_system_prompt(base, &resolved_without_skills, Some(&fresh));
-        let resumed_prompt =
-            super::production_system_prompt(base, &resolved_without_skills, Some(&resumed));
+        let fresh_prompt = super::prompt::root_prompt(base, &fresh);
+        let resumed_prompt = super::prompt::root_prompt(base, &resumed);
         assert_eq!(fresh_prompt, resumed_prompt);
         assert_eq!(fresh_prompt.matches("Project review workflow").count(), 1);
         assert_eq!(
@@ -746,8 +728,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            super::production_system_prompt(base, &resolved_without_skills, Some(&empty)),
-            resolved_without_skills
+            super::prompt::root_prompt(base, &empty),
+            super::prompt::root_prompt(base, &super::SkillCatalog::default())
         );
     }
 
@@ -775,7 +757,7 @@ mod tests {
         )
         .unwrap();
         let base = "exact override base";
-        let root_prompt = super::prompt::root_prompt(base);
+        let root_prompt = super::prompt::root_prompt(base, &super::SkillCatalog::default());
         for has_active in [false, true] {
             let (catalog, trusted) = super::startup_skill_catalog(
                 &scope,
@@ -792,7 +774,7 @@ mod tests {
                     .reason
                     .contains("entire root skipped")
             );
-            let model_prompt = super::production_system_prompt(base, &root_prompt, Some(&catalog));
+            let model_prompt = super::prompt::root_prompt(base, &catalog);
             assert_eq!(model_prompt, root_prompt);
             assert!(!model_prompt.contains("entire root skipped"));
             assert!(!model_prompt.contains("Private workflow"));

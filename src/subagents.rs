@@ -27,7 +27,7 @@ use crate::config::{
 };
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::pricing::{RunCostEstimate, estimate_run_cost};
-use crate::prompt::{child_prompt, child_prompt_with_catalog};
+use crate::prompt::child_prompt;
 use crate::session::{
     SessionError, SessionWriter, TaskAdmission, TaskSnapshot, TaskStepCommit, TaskTerminal,
 };
@@ -1339,10 +1339,8 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
         let (request, selection, read_only) = parameters.into_parts();
         let accepted_thinking = payload.accepted_thinking.clone();
         let tool_reference = payload.source.prompt_reference(read_only);
-        let child_prompt = match payload.source.skill_catalog() {
-            Some(catalog) => child_prompt_with_catalog(&prompt_base, catalog, tool_reference),
-            None => child_prompt(&prompt_base, tool_reference),
-        };
+        let child_prompt =
+            child_prompt(&prompt_base, payload.source.skill_catalog(), tool_reference);
         let model = models.create(child_prompt);
         Box::pin(async move {
             trace.emit(|| TraceEvent::ChildArenaConstructionStarted {

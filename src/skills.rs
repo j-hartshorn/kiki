@@ -217,6 +217,7 @@ impl fmt::Display for SkillLookupError {
 impl std::error::Error for SkillLookupError {}
 
 /// One process snapshot. Only selected entries are available for activation.
+#[derive(Default)]
 pub struct SkillCatalog {
     selected: BTreeMap<String, Arc<Skill>>,
     rejected: BTreeMap<String, SkillLookupError>,

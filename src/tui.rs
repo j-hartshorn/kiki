@@ -238,7 +238,7 @@ struct App {
     manual_navigation_pending: bool,
     next_tree_revision: u64,
     completion: slash::Completion,
-    skill_catalog: Option<Arc<SkillCatalog>>,
+    skill_catalog: Arc<SkillCatalog>,
     pending_skill_submission: Option<PendingSkillSubmission>,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
@@ -291,7 +291,7 @@ impl Default for App {
             manual_navigation_pending: false,
             next_tree_revision: 0,
             completion: slash::Completion::default(),
-            skill_catalog: None,
+            skill_catalog: Arc::default(),
             pending_skill_submission: None,
             slash_overlay: None,
             preview: None,
@@ -360,7 +360,7 @@ impl App {
                 .entries()
                 .map(|skill| (skill.name(), skill.description())),
         );
-        self.skill_catalog = Some(catalog);
+        self.skill_catalog = catalog;
         self.refresh_completion();
         self
     }
@@ -761,9 +761,10 @@ impl App {
         let Some(name) = command.skill_name else {
             return false;
         };
-        self.skill_catalog.as_ref().is_some_and(|catalog| {
-            !matches!(catalog.lookup(name), Err(SkillLookupError::Unknown(_)))
-        })
+        !matches!(
+            self.skill_catalog.lookup(name),
+            Err(SkillLookupError::Unknown(_))
+        )
     }
 
     fn dispatch_compact(&mut self, focus: &str) -> Update {
@@ -801,14 +802,7 @@ impl App {
                 ..Update::default()
             };
         }
-        let Some(catalog) = &self.skill_catalog else {
-            self.set_notice(normalise_single_line(&format!("Unknown skill `{name}`.")));
-            return Update {
-                visible_changed: true,
-                ..Update::default()
-            };
-        };
-        let activation = match catalog.lookup(name) {
+        let activation = match self.skill_catalog.lookup(name) {
             Ok(skill) => SkillActivation::from_skill(skill),
             Err(error) => {
                 self.set_notice(normalise_single_line(&error.to_string()));
@@ -1897,9 +1891,7 @@ impl App {
     ) {
         let mut transcript = self.transcript.restored_replacement(state);
         transcript.append_restoration_card();
-        if let Some(catalog) = &self.skill_catalog {
-            transcript.append_metadata(skill_diagnostic_report(catalog));
-        }
+        transcript.append_metadata(skill_diagnostic_report(&self.skill_catalog));
         self.transcript = transcript;
         self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
         self.history_position = HistoryPosition::FollowingBottom;

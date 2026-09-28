@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::str::Utf8Error;
 
 use crate::skills::SkillCatalog;
-use crate::tools::{prompt_reference, prompt_reference_for_catalog};
+use crate::tools::prompt_reference;
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
 const BUNDLED_CHILD_PROMPT: &str = include_str!("../prompts/subagent.md");
@@ -29,15 +29,10 @@ pub enum PromptSource {
 
 pub struct ResolvedPrompt {
     base: String,
-    text: String,
     source: PromptSource,
 }
 
 impl ResolvedPrompt {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
     pub(crate) fn base(&self) -> &str {
         &self.base
     }
@@ -47,30 +42,14 @@ impl ResolvedPrompt {
     }
 }
 
-pub(crate) fn root_prompt(base: &str) -> String {
-    assemble(base, prompt_reference())
+pub(crate) fn root_prompt(base: &str, catalog: &SkillCatalog) -> String {
+    assemble(base, catalog, prompt_reference(catalog))
 }
 
-pub(crate) fn root_prompt_with_catalog(base: &str, catalog: &SkillCatalog) -> String {
-    assemble_with_catalog(
-        base,
-        catalog.rendered_catalog(),
-        prompt_reference_for_catalog(catalog),
-    )
-}
-
-pub(crate) fn child_prompt(base: &str, tool_reference: String) -> String {
-    assemble(&format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"), tool_reference)
-}
-
-pub(crate) fn child_prompt_with_catalog(
-    base: &str,
-    catalog: &SkillCatalog,
-    tool_reference: String,
-) -> String {
-    assemble_with_catalog(
+pub(crate) fn child_prompt(base: &str, catalog: &SkillCatalog, tool_reference: String) -> String {
+    assemble(
         &format!("{base}\n\n{BUNDLED_CHILD_PROMPT}"),
-        catalog.rendered_catalog(),
+        catalog,
         tool_reference,
     )
 }
@@ -124,12 +103,8 @@ fn strip_file_final_lf(prompt: &str) -> &str {
         .expect("bundled prompt resources end in a line feed")
 }
 
-fn assemble(base: &str, tool_reference: String) -> String {
-    assemble_with_catalog(base, None, tool_reference)
-}
-
-fn assemble_with_catalog(base: &str, catalog: Option<&str>, tool_reference: String) -> String {
-    match catalog {
+fn assemble(base: &str, catalog: &SkillCatalog, tool_reference: String) -> String {
+    match catalog.rendered_catalog() {
         Some(catalog) => format!("{base}\n\n{catalog}\n{tool_reference}"),
         None => format!("{base}\n\n{tool_reference}"),
     }
@@ -211,7 +186,6 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
     let Some(override_path) = override_path else {
         return Ok(ResolvedPrompt {
             base: BUNDLED_PROMPT.to_owned(),
-            text: root_prompt(BUNDLED_PROMPT),
             source: PromptSource::Bundled {
                 name: BUNDLED_PROMPT_NAME,
             },
@@ -229,7 +203,6 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
     };
 
     Ok(ResolvedPrompt {
-        text: root_prompt(&text),
         base: text,
         source: PromptSource::Override { path },
     })
@@ -243,7 +216,10 @@ mod tests {
 
     use crate::skills::{ProjectScope, SkillCatalog};
 
-    use super::{PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override};
+    use super::{
+        PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override,
+        root_prompt,
+    };
 
     #[test]
     fn activation_wrapper_names_skill_locator_root_and_authority_boundary() {
@@ -409,12 +385,14 @@ mod tests {
     #[test]
     fn resolves_the_named_bundled_prompt_with_one_generated_tool_reference() {
         let resolved = resolve_from_override(None).unwrap();
+        let empty = SkillCatalog::default();
+        let text = root_prompt(resolved.base(), &empty);
 
         assert_eq!(
-            resolved.text(),
-            format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference())
+            text,
+            format!("{BUNDLED_PROMPT}\n\n{}", prompt_reference(&empty))
         );
-        assert_generated_tool_reference(resolved.text());
+        assert_generated_tool_reference(&text);
         assert_eq!(resolved.base(), BUNDLED_PROMPT);
         assert_eq!(resolved.source(), &PromptSource::Bundled { name: "system" });
     }
@@ -432,12 +410,11 @@ mod tests {
             .join("override.md");
 
         let resolved = resolve_from_override(Some(override_path.clone().into_os_string())).unwrap();
+        let empty = SkillCatalog::default();
+        let text = root_prompt(resolved.base(), &empty);
 
-        assert_eq!(
-            resolved.text(),
-            format!("{OVERRIDE}\n\n{}", prompt_reference())
-        );
-        assert_generated_tool_reference(resolved.text());
+        assert_eq!(text, format!("{OVERRIDE}\n\n{}", prompt_reference(&empty)));
+        assert_generated_tool_reference(&text);
         assert_eq!(resolved.base(), OVERRIDE);
         assert_eq!(
             resolved.source(),
@@ -451,11 +428,15 @@ mod tests {
     #[test]
     fn child_prompts_keep_the_canonical_base_and_one_effective_reference() {
         let base = "canonical base";
-        let full = child_prompt(base, prompt_reference());
+        let empty = SkillCatalog::default();
+        let full = child_prompt(base, &empty, prompt_reference(&empty));
 
         assert_eq!(
             full,
-            format!("{base}\n\n{BUNDLED_CHILD_PROMPT}\n\n{}", prompt_reference())
+            format!(
+                "{base}\n\n{BUNDLED_CHILD_PROMPT}\n\n{}",
+                prompt_reference(&empty)
+            )
         );
         assert_eq!(full.matches("## Kiki tool reference").count(), 1);
     }
@@ -496,12 +477,8 @@ mod tests {
             .unwrap()
             .with_skill_catalog(catalog.clone());
         for base in [BUNDLED_PROMPT, "custom override base"] {
-            let root = super::root_prompt_with_catalog(base, &catalog);
-            let child = super::child_prompt_with_catalog(
-                base,
-                &catalog,
-                host.for_child(true).prompt_reference(),
-            );
+            let root = root_prompt(base, &catalog);
+            let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference());
             for full in [&root, &child] {
                 assert!(full.starts_with(base));
                 assert_eq!(full.matches("## Available skills").count(), 1);
@@ -567,12 +544,8 @@ mod tests {
                 .unwrap()
                 .with_skill_catalog(catalog.clone());
             for full in [
-                super::root_prompt_with_catalog("base", &catalog),
-                super::child_prompt_with_catalog(
-                    "base",
-                    &catalog,
-                    host.for_child(true).prompt_reference(),
-                ),
+                root_prompt("base", &catalog),
+                child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
             ] {
                 for absent in [
                     "## Available skills",
@@ -613,8 +586,8 @@ mod tests {
             .unwrap()
             .with_skill_catalog(empty.clone());
         for prompt in [
-            super::root_prompt_with_catalog("base", &empty),
-            super::child_prompt_with_catalog(
+            root_prompt("base", &empty),
+            child_prompt(
                 "base",
                 &empty,
                 empty_host.for_child(true).prompt_reference(),
@@ -647,12 +620,8 @@ mod tests {
             .unwrap()
             .with_skill_catalog(visible.clone());
         for prompt in [
-            super::root_prompt_with_catalog("base", &visible),
-            super::child_prompt_with_catalog(
-                "base",
-                &visible,
-                host.for_child(true).prompt_reference(),
-            ),
+            root_prompt("base", &visible),
+            child_prompt("base", &visible, host.for_child(true).prompt_reference()),
         ] {
             assert_eq!(prompt.matches("CUSTOM_CATALOG_GUIDANCE").count(), 1);
             assert!(!prompt.contains("PRIVATE_BODY"));
@@ -686,7 +655,7 @@ mod tests {
             .unwrap()
             .for_child(true)
             .prompt_reference();
-        let prompt = child_prompt("canonical base", reference);
+        let prompt = child_prompt("canonical base", &SkillCatalog::default(), reference);
 
         assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);
         for signature in ["async def write(", "async def edit(", "async def run("] {

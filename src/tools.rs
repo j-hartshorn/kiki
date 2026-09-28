@@ -663,11 +663,7 @@ pub(crate) fn type_check_stubs() -> String {
     )
 }
 
-pub(crate) fn prompt_reference() -> String {
-    prompt_reference_with_visibility(false, false)
-}
-
-pub(crate) fn prompt_reference_for_catalog(catalog: &SkillCatalog) -> String {
+pub(crate) fn prompt_reference(catalog: &SkillCatalog) -> String {
     prompt_reference_with_visibility(catalog.rendered_catalog().is_some(), false)
 }
 
@@ -1162,7 +1158,7 @@ impl<'a> BatchDispatch<'a> {
 #[derive(Clone)]
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
-    skill_catalog: Option<Arc<SkillCatalog>>,
+    skill_catalog: Arc<SkillCatalog>,
     limits: ToolLimits,
     read_only: bool,
     #[cfg(test)]
@@ -1782,7 +1778,7 @@ impl ToolHost {
 
         Ok(Self {
             workspace,
-            skill_catalog: None,
+            skill_catalog: Arc::default(),
             limits,
             read_only: false,
             #[cfg(test)]
@@ -1807,7 +1803,7 @@ impl ToolHost {
     }
 
     pub(crate) fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
-        self.skill_catalog = Some(catalog);
+        self.skill_catalog = catalog;
         self
     }
 
@@ -1822,28 +1818,29 @@ impl ToolHost {
         let [ToolValue::String(name)] = arguments.as_slice() else {
             return Err(ToolError::type_error("load_skill expects one string name"));
         };
-        let catalog = self
+        let skill = self
             .skill_catalog
-            .as_ref()
-            .ok_or_else(|| ToolError::value("no model-invocable skills are available"))?;
-        let skill = catalog.lookup_model_invocable(name).map_err(|error| {
-            let message = match error {
-                SkillLookupError::Unknown(_) => format!("unknown or unavailable skill {name:?}"),
-                SkillLookupError::Ambiguous { paths, .. } => {
-                    format!("skill {name:?} is ambiguous among {} sources", paths.len())
-                }
-                SkillLookupError::Invalid { reason, .. } => {
-                    format!("skill {name:?} is invalid: {reason:?}")
-                }
-                SkillLookupError::Omitted { reason, .. } => {
-                    format!("skill {name:?} was omitted: {reason:?}")
-                }
-                SkillLookupError::DirectOnly(_) => {
-                    format!("skill {name:?} can only be activated directly by the user")
-                }
-            };
-            ToolError::value(message)
-        })?;
+            .lookup_model_invocable(name)
+            .map_err(|error| {
+                let message = match error {
+                    SkillLookupError::Unknown(_) => {
+                        format!("unknown or unavailable skill {name:?}")
+                    }
+                    SkillLookupError::Ambiguous { paths, .. } => {
+                        format!("skill {name:?} is ambiguous among {} sources", paths.len())
+                    }
+                    SkillLookupError::Invalid { reason, .. } => {
+                        format!("skill {name:?} is invalid: {reason:?}")
+                    }
+                    SkillLookupError::Omitted { reason, .. } => {
+                        format!("skill {name:?} was omitted: {reason:?}")
+                    }
+                    SkillLookupError::DirectOnly(_) => {
+                        format!("skill {name:?} can only be activated directly by the user")
+                    }
+                };
+                ToolError::value(message)
+            })?;
         ledger
             .activate(SkillActivation::from_skill(skill))
             .map_err(|error| ToolError::value(error.to_string()))?;
@@ -1872,15 +1869,13 @@ impl ToolHost {
 
     pub(crate) fn prompt_reference(&self) -> String {
         prompt_reference_with_visibility(
-            self.skill_catalog
-                .as_ref()
-                .is_some_and(|catalog| catalog.rendered_catalog().is_some()),
+            self.skill_catalog.rendered_catalog().is_some(),
             self.read_only,
         )
     }
 
-    pub(crate) fn skill_catalog(&self) -> Option<&SkillCatalog> {
-        self.skill_catalog.as_deref()
+    pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
+        &self.skill_catalog
     }
 
     #[cfg(test)]
@@ -2224,28 +2219,27 @@ impl ToolHost {
     }
 
     fn skill_directory(&self, name: &str) -> Result<Arc<Dir>, ToolError> {
-        let catalog = self
+        let skill = self
             .skill_catalog
-            .as_ref()
-            .ok_or_else(|| ToolError::value("skill resources are unavailable"))?;
-        let skill = catalog.lookup(name).map_err(|error| match error {
-            SkillLookupError::Unknown(_) => {
-                ToolError::value(format!("unknown or unavailable skill {name:?}"))
-            }
-            SkillLookupError::Ambiguous { paths, .. } => ToolError::value(format!(
-                "skill {name:?} is ambiguous among {} sources",
-                paths.len()
-            )),
-            SkillLookupError::Invalid { reason, .. } => {
-                ToolError::value(format!("skill {name:?} is invalid: {reason:?}"))
-            }
-            SkillLookupError::Omitted { reason, .. } => {
-                ToolError::value(format!("skill {name:?} was omitted: {reason:?}"))
-            }
-            SkillLookupError::DirectOnly(_) => {
-                unreachable!("direct-only skills are permitted as resources")
-            }
-        })?;
+            .lookup(name)
+            .map_err(|error| match error {
+                SkillLookupError::Unknown(_) => {
+                    ToolError::value(format!("unknown or unavailable skill {name:?}"))
+                }
+                SkillLookupError::Ambiguous { paths, .. } => ToolError::value(format!(
+                    "skill {name:?} is ambiguous among {} sources",
+                    paths.len()
+                )),
+                SkillLookupError::Invalid { reason, .. } => {
+                    ToolError::value(format!("skill {name:?} is invalid: {reason:?}"))
+                }
+                SkillLookupError::Omitted { reason, .. } => {
+                    ToolError::value(format!("skill {name:?} was omitted: {reason:?}"))
+                }
+                SkillLookupError::DirectOnly(_) => {
+                    unreachable!("direct-only skills are permitted as resources")
+                }
+            })?;
         Ok(skill.directory())
     }
 
@@ -4454,6 +4448,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, ToolErrorKind::Value);
         assert!(error.to_string().contains("exceeds 65536 bytes"));
+    }
+
+    #[tokio::test]
+    async fn host_without_skills_reports_unknown_skill_for_load_and_resources() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+        let unknown = ToolError::value("unknown or unavailable skill \"review\"");
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut SkillLoadLedger::new(&[]).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error, unknown);
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String(
+                    "skill://review/SKILL.md".to_owned(),
+                )]),
+            })
+            .await;
+        assert_eq!(result.result, Err(unknown));
     }
 
     async fn tool_host_with_limits(workspace: &TempDir, max_bytes: usize) -> ToolHost {
@@ -7663,8 +7681,9 @@ mod tests {
 
         assert_eq!(invocation_source(true), expected_reference);
         assert_eq!(invocation_source(false), expected_runtime);
-        assert!(prompt_reference().contains(expected_reference));
-        assert!(!prompt_reference().contains("def __init__(self, value: dict):"));
+        let reference = prompt_reference(&SkillCatalog::default());
+        assert!(reference.contains(expected_reference));
+        assert!(!reference.contains("def __init__(self, value: dict):"));
         assert!(bootstrap_source().contains(&expected_runtime));
     }
 
@@ -7734,7 +7753,7 @@ mod tests {
                 invocation_source(false)
             )
         );
-        let reference = prompt_reference();
+        let reference = prompt_reference(&SkillCatalog::default());
         for signature in [
             "async def read(path: str) -> str:",
             "async def write(path: str, content: str) -> None:",
@@ -7764,7 +7783,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("file"), "before").unwrap();
         let root = tool_host(&workspace).await;
-        let root_reference = prompt_reference();
+        let root_reference = prompt_reference(&SkillCatalog::default());
         assert_eq!(root.prompt_reference(), root_reference);
         assert_eq!(root.for_child(false).prompt_reference(), root_reference);
 

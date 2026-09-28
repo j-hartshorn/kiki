@@ -5105,7 +5105,7 @@ pub(crate) mod tests {
                 Some(usage()),
             )))
             .await;
-            let reference = crate::tools::prompt_reference();
+            let reference = crate::tools::prompt_reference(&crate::skills::SkillCatalog::default());
             let prompt = format!("arbitrary base prompt\n\n{reference}");
             let mut model = OpenAiModel::with_endpoint(&prompt, "fixture-key", &fixture.endpoint);
             let cancellation = CancellationToken::new();
@@ -6410,7 +6410,7 @@ pub(crate) mod tests {
                 ready.workspace_root().to_path_buf(),
                 crate::production_model(
                     &ready,
-                    None,
+                    &crate::skills::SkillCatalog::default(),
                     persisted_settings.anthropic_cache_ttl(),
                     persisted_settings.cross_provider_reasoning(),
                 ),
