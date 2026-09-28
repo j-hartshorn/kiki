@@ -12,8 +12,8 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 #[cfg(unix)]
 use rustix::fs::{Mode, OFlags, openat};
-use yaml_rust::parser::Parser;
-use yaml_rust::{Event, Yaml, YamlLoader};
+use yaml_rust2::parser::Parser;
+use yaml_rust2::{Event, Yaml, YamlLoader};
 
 use crate::model::SkillActivation;
 
@@ -822,19 +822,19 @@ fn parse_metadata(source: &str, path: &Path) -> Result<ParsedMetadata, String> {
 fn validate_yaml_frontmatter(frontmatter: &str) -> Result<(), String> {
     // YamlLoader clones aliases and recursively builds collections. Check both bounds
     // with the iterative event parser before constructing a YAML value tree.
-    let mut parser = Parser::new(frontmatter.chars());
+    let mut parser = Parser::new_from_str(frontmatter);
     let mut depth = 0usize;
     let max_events = frontmatter.len().saturating_mul(4).saturating_add(16);
     for _ in 0..max_events {
         let (event, _) = parser
-            .next()
+            .next_token()
             .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
         match event {
             Event::Alias(_) => return Err("YAML anchors and aliases are not supported".to_owned()),
             Event::Scalar(_, _, anchor, _) if anchor != 0 => {
                 return Err("YAML anchors and aliases are not supported".to_owned());
             }
-            Event::SequenceStart(anchor) | Event::MappingStart(anchor) => {
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
                 if anchor != 0 {
                     return Err("YAML anchors and aliases are not supported".to_owned());
                 }
