@@ -3509,7 +3509,11 @@ fn build_render_block(
         }
         NormalisedBlock::SkillActivation(card) => {
             let style = card_style(COMPLETE_ARENA);
-            let mut lines = vec![Line::raw(card.heading.clone())];
+            let mut lines = vec![Line::raw(if expand_arenas {
+                card.heading.clone()
+            } else {
+                format!("{} \u{b7} Ctrl-O to expand", card.heading)
+            })];
             if expand_arenas {
                 lines.extend(
                     logical_lines(&card.source_text)
@@ -4689,7 +4693,7 @@ mod tests {
 
         let collapsed = rendered_layout_text(&mut transcript);
         let card = collapsed
-            .find("Skill · review · project")
+            .find("Skill · review · project · Ctrl-O to expand")
             .unwrap_or_else(|| panic!("{collapsed}"));
         assert!(
             collapsed.find("/skill:review").unwrap() < card,
@@ -4700,6 +4704,7 @@ mod tests {
         assert!(transcript.toggle_arena_expansion());
         let expanded = rendered_layout_text(&mut transcript);
         assert!(expanded.contains("Skill · review · project"), "{expanded}");
+        assert!(!expanded.contains("Ctrl-O to expand"), "{expanded}");
         assert!(expanded.contains("description: Review"), "{expanded}");
         assert!(expanded.contains("Review every change."), "{expanded}");
     }
