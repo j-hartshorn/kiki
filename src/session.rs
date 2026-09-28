@@ -4222,23 +4222,33 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn skill_ancestry_selects_latest_version_before_trust_and_keeps_independent_user() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let session = create_session(&home, &workspace).await;
+    struct SupersededUserSkill {
+        session: Session,
+        writer: SessionWriter,
+        scope: PathBuf,
+        root: SessionEntryId,
+        user_leaf: SessionEntryId,
+        project_leaf: SessionEntryId,
+        user: SkillActivation,
+        independent: SkillActivation,
+        project: SkillActivation,
+    }
+
+    async fn project_skill_superseding_user_skill(
+        home: &TempDir,
+        workspace: &TempDir,
+    ) -> SupersededUserSkill {
+        let session = create_session(home, workspace).await;
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let scope = workspace.path().canonicalize().unwrap();
         session
             .configure_skill_projection(SkillProjectionPolicy::new(Some(scope.clone())))
             .unwrap();
-        let user_body = "---\nname: review\ndescription: User\n---\nUser instructions æ";
-        let project_body = "---\nname: review\ndescription: Project\n---\nProject instructions β";
         let user = skill(
             "review",
             home.path().join(".agents/skills/review"),
-            user_body,
+            "---\nname: review\ndescription: User\n---\nUser instructions æ",
             SkillOrigin::User,
             None,
         );
@@ -4247,7 +4257,7 @@ mod tests {
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
-        let first_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        let user_leaf = SessionEntryId(active_entry_id(&session) as u64);
         let independent = skill(
             "notes",
             home.path().join(".agents/skills/notes"),
@@ -4260,11 +4270,10 @@ mod tests {
             .await
             .unwrap();
         close_cancelled(&writer, notes_run.run_id).await;
-        let project_source = scope.join(".agents/skills/review");
         let project = skill(
             "review",
-            project_source.clone(),
-            project_body,
+            scope.join(".agents/skills/review"),
+            "---\nname: review\ndescription: Project\n---\nProject instructions β",
             SkillOrigin::Project,
             Some(scope.clone()),
         );
@@ -4273,80 +4282,129 @@ mod tests {
             .await
             .unwrap();
         close_cancelled(&writer, second.run_id).await;
-        let second_leaf = SessionEntryId(active_entry_id(&session) as u64);
-        assert!(!project_source.exists());
-        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
-        let active = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(active.active_skills().count(), 2);
-        assert_eq!(
-            active
-                .active_skills()
-                .find(|activation| activation.name() == "review")
-                .unwrap()
-                .source_text(),
-            project_body
-        );
-        fs::create_dir_all(&project_source).unwrap();
-        fs::write(project_source.join("SKILL.md"), "changed on disk").unwrap();
-        let pinned = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(
-            pinned
-                .active_skills()
-                .find(|activation| activation.name() == "review")
-                .unwrap()
-                .source_text(),
-            project_body
-        );
+        let project_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        SupersededUserSkill {
+            session,
+            writer,
+            scope,
+            root,
+            user_leaf,
+            project_leaf,
+            user,
+            independent,
+            project,
+        }
+    }
+
+    fn restored_skills(session: &Session) -> Vec<SkillActivation> {
         session
-            .configure_skill_projection(SkillProjectionPolicy::default())
-            .unwrap();
-        let filtered = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(filtered.active_skills().next().unwrap(), &independent);
-        assert_eq!(filtered.active_skills().count(), 1);
-        session
-            .configure_skill_projection(SkillProjectionPolicy::new(Some(home.path().to_path_buf())))
-            .unwrap();
-        let relocated = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(
-            relocated.active_skills().collect::<Vec<_>>(),
-            vec![&independent]
-        );
-        let root_restore = writer.restore_at(root).await.unwrap();
-        assert!(
-            root_restore
-                .executable
-                .unwrap()
-                .history
-                .active_skills()
-                .next()
-                .is_none()
-        );
-        assert_eq!(
-            writer
-                .restore_at(first_leaf)
-                .await
-                .unwrap()
-                .executable
-                .unwrap()
-                .history
-                .active_skills()
-                .next()
-                .unwrap()
-                .source_text(),
-            user_body
-        );
-        let navigated = writer
-            .restore_at(second_leaf)
+            .restore()
+            .unwrap()
+            .executable
+            .unwrap()
+            .history
+            .active_skills()
+            .cloned()
+            .collect()
+    }
+
+    async fn skills_at(writer: &SessionWriter, entry: SessionEntryId) -> Vec<SkillActivation> {
+        writer
+            .restore_at(entry)
             .await
             .unwrap()
             .executable
             .unwrap()
-            .history;
-        assert_eq!(
-            navigated.active_skills().collect::<Vec<_>>(),
-            vec![&independent]
+            .history
+            .active_skills()
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_reads_session_history_without_source_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        assert!(!fixture.scope.join(".agents/skills/review").exists());
+        assert!(
+            fixture
+                .session
+                .has_active_project_skill_in_scope(&fixture.scope)
+                .unwrap()
         );
-        let prepared = writer
+    }
+
+    #[tokio::test]
+    async fn latest_project_skill_version_replaces_earlier_user_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        assert_eq!(
+            restored_skills(&fixture.session),
+            [fixture.independent, fixture.project]
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_skill_text_stays_pinned_after_source_changes_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        let source = fixture.scope.join(".agents/skills/review");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "changed on disk").unwrap();
+        assert!(restored_skills(&fixture.session).contains(&fixture.project));
+    }
+
+    #[tokio::test]
+    async fn untrusted_projection_drops_project_version_without_reviving_user_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        for policy in [
+            SkillProjectionPolicy::default(),
+            SkillProjectionPolicy::new(Some(home.path().to_path_buf())),
+        ] {
+            fixture.session.configure_skill_projection(policy).unwrap();
+            assert_eq!(
+                restored_skills(&fixture.session),
+                std::slice::from_ref(&fixture.independent)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_the_skill_ancestry_of_the_target_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        assert!(skills_at(&fixture.writer, fixture.root).await.is_empty());
+        assert_eq!(
+            skills_at(&fixture.writer, fixture.user_leaf).await,
+            [fixture.user]
+        );
+        assert_eq!(
+            skills_at(&fixture.writer, fixture.project_leaf).await,
+            [fixture.independent]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_under_untrusted_projection_keeps_only_permitted_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        let prepared = fixture
+            .writer
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 1),
                 selection(),
@@ -4358,9 +4416,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             prepared.planner.protected_skills(),
-            std::slice::from_ref(&independent)
+            std::slice::from_ref(&fixture.independent)
         );
-        writer
+        fixture
+            .writer
             .settle_compaction(
                 prepared,
                 super::CompactionSettlement::Applied {
@@ -4370,33 +4429,43 @@ mod tests {
             )
             .await
             .unwrap();
-        let compacted = writer.model_history().unwrap();
         assert_eq!(
-            compacted.active_skills().collect::<Vec<_>>(),
-            vec![&independent]
+            fixture
+                .writer
+                .model_history()
+                .unwrap()
+                .active_skills()
+                .collect::<Vec<_>>(),
+            [&fixture.independent]
         );
-        let restored_compacted = session.restore().unwrap().executable.unwrap().history;
         assert_eq!(
-            restored_compacted.active_skills().collect::<Vec<_>>(),
-            vec![&independent]
+            restored_skills(&fixture.session),
+            std::slice::from_ref(&fixture.independent)
         );
-        let reactivated = writer
+    }
+
+    #[tokio::test]
+    async fn explicit_user_reactivation_replaces_filtered_project_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        fixture.session.sync_model_context_for_test().unwrap();
+        let reactivated = fixture
+            .writer
             .commit_request(
                 "explicit user reactivation".to_owned(),
                 selection(),
-                Some(user.clone()),
+                Some(fixture.user.clone()),
             )
             .await
             .unwrap();
         assert_ne!(reactivated.effective_entry, reactivated.request_entry);
-        close_cancelled(&writer, reactivated.run_id).await;
-        let reactivated_history = session.restore().unwrap().executable.unwrap().history;
-        assert_eq!(
-            reactivated_history
-                .active_skills()
-                .find(|activation| activation.name() == "review"),
-            Some(&user)
-        );
+        close_cancelled(&fixture.writer, reactivated.run_id).await;
+        assert!(restored_skills(&fixture.session).contains(&fixture.user));
     }
 
     #[tokio::test]
@@ -5039,36 +5108,81 @@ mod tests {
         );
     }
 
+    struct PendingStep {
+        session: Session,
+        writer: SessionWriter,
+        run_id: u64,
+        step: u64,
+    }
+
+    impl PendingStep {
+        async fn open(home: &TempDir, workspace: &TempDir) -> Self {
+            let session = create_session(home, workspace).await;
+            let writer = session.writer();
+            let run = writer
+                .commit_request("load".to_owned(), selection(), None)
+                .await
+                .unwrap();
+            let step = writer.start_model_step(run.run_id).await.unwrap();
+            Self {
+                session,
+                writer,
+                run_id: run.run_id,
+                step,
+            }
+        }
+
+        async fn settle(
+            &self,
+            activations: Vec<SkillActivation>,
+        ) -> Result<Vec<SkillActivation>, SessionError> {
+            self.writer
+                .settle_execution(
+                    self.run_id,
+                    self.step,
+                    projection_code(
+                        crate::model::CodeResult::Execution {
+                            feedback: String::new(),
+                        },
+                        true,
+                    ),
+                    self.session.initial_checkpoint().unwrap(),
+                    activations,
+                )
+                .await
+        }
+
+        fn count_entries(&self, kind: &str) -> i64 {
+            self.session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = ?1",
+                    [kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn is_unsettled(&self) -> bool {
+            self.session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
+                    [i64::try_from(self.step).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        }
+    }
+
     #[tokio::test]
-    async fn execution_settlement_persists_skill_batch_atomically() {
+    async fn execution_settlement_persists_loaded_skill_batch() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let session = create_session(&home, &workspace).await;
-        let writer = session.writer();
-        let run = writer
-            .commit_request("load".to_owned(), selection(), None)
-            .await
-            .unwrap();
-        let step = writer.start_model_step(run.run_id).await.unwrap();
-        let make_code = |call_id: &str| PersistedCode {
-            source: "await load_skill('first')".to_owned(),
-            call_id: crate::model::ModelCallId::new(call_id.to_owned()),
-            commentary: None,
-            reasoning_summary: String::new(),
-            replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
-            result: crate::model::CodeResult::Execution {
-                feedback: String::new(),
-            },
-            execution: Some(Execution {
-                stdout: empty_observation(),
-                stderr: empty_observation(),
-                outcome: ExecutionOutcome::Complete { result: None },
-                tool_calls: Vec::new(),
-                read_paths: Vec::new(),
-                modified_paths: Vec::new(),
-            }),
-            attempts: Vec::new(),
-        };
+        let step = PendingStep::open(&home, &workspace).await;
         let first = skill(
             "first",
             home.path().join("first"),
@@ -5083,35 +5197,25 @@ mod tests {
             SkillOrigin::User,
             None,
         );
-        writer
-            .settle_execution(
-                run.run_id,
-                step,
-                make_code("batch-1"),
-                session.initial_checkpoint().unwrap(),
-                vec![first.clone(), second.clone()],
-            )
+        step.settle(vec![first.clone(), second.clone()])
             .await
             .unwrap();
         assert_eq!(
-            writer
+            step.writer
                 .model_history()
                 .unwrap()
                 .active_skills()
                 .collect::<Vec<_>>(),
             vec![&first, &second]
         );
-        let stored: i64 = session
-            .connection_for_test()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, 2);
-        let next_step = writer.start_model_step(run.run_id).await.unwrap();
+        assert_eq!(step.count_entries("skill_activation"), 2);
+    }
+
+    #[tokio::test]
+    async fn over_cap_skill_batch_leaves_execution_unsettled() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let step = PendingStep::open(&home, &workspace).await;
         let oversized = (0..5)
             .map(|index| {
                 let name = format!("large-{index}");
@@ -5124,38 +5228,17 @@ mod tests {
                 )
             })
             .collect();
-        assert!(
-            writer
-                .settle_execution(
-                    run.run_id,
-                    next_step,
-                    make_code("batch-2"),
-                    session.initial_checkpoint().unwrap(),
-                    oversized,
-                )
-                .await
-                .is_err()
-        );
-        {
-            let connection = session.connection_for_test().unwrap();
-            let executions: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE kind = 'execution'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(executions, 1);
-            let still_pending: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
-                    [i64::try_from(next_step).unwrap()],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(still_pending, 1);
-        }
-        session
+        assert!(step.settle(oversized).await.is_err());
+        assert_eq!(step.count_entries("execution"), 0);
+        assert!(step.is_unsettled());
+    }
+
+    #[tokio::test]
+    async fn failed_skill_insert_rolls_back_execution_and_whole_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let step = PendingStep::open(&home, &workspace).await;
+        step.session
             .connection_for_test()
             .unwrap()
             .execute_batch(
@@ -5176,35 +5259,10 @@ mod tests {
             SkillOrigin::User,
             None,
         );
-        assert!(
-            writer
-                .settle_execution(
-                    run.run_id,
-                    next_step,
-                    make_code("batch-2"),
-                    session.initial_checkpoint().unwrap(),
-                    vec![rollback_one, rollback_two],
-                )
-                .await
-                .is_err()
-        );
-        let connection = session.connection_for_test().unwrap();
-        let (executions, activations): (i64, i64) = connection
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'execution'), (SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((executions, activations), (1, 2));
-        let still_pending: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
-                [i64::try_from(next_step).unwrap()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(still_pending, 1);
+        assert!(step.settle(vec![rollback_one, rollback_two]).await.is_err());
+        assert_eq!(step.count_entries("execution"), 0);
+        assert_eq!(step.count_entries("skill_activation"), 0);
+        assert!(step.is_unsettled());
     }
 
     #[tokio::test]

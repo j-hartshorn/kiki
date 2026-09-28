@@ -550,38 +550,38 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn catalog_guidance_override_is_exact_bounded_and_only_rendered_when_visible() {
-        let workspace = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let override_path = home.path().join("catalog-guidance.md");
+    async fn root_and_child_prompts(workspace: &Path, catalog: Arc<SkillCatalog>) -> [String; 2] {
+        let host = crate::tools::ToolHost::new(workspace)
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog.clone());
+        [
+            root_prompt("base", &catalog),
+            child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
+        ]
+    }
+
+    #[test]
+    fn catalog_guidance_override_drops_one_file_final_line_feed() {
+        let directory = tempfile::tempdir().unwrap();
+        let override_path = directory.path().join("catalog-guidance.md");
         fs::write(&override_path, "CUSTOM_CATALOG_GUIDANCE  \n\n").unwrap();
         let guidance = super::resolve_skills_catalog_guidance_from_override(Some(
-            override_path.clone().into_os_string(),
+            override_path.into_os_string(),
         ))
         .unwrap();
         assert_eq!(guidance, "CUSTOM_CATALOG_GUIDANCE  \n");
+    }
 
+    #[tokio::test]
+    async fn catalog_guidance_renders_once_only_when_a_skill_is_visible() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let scope = ProjectScope::discover(workspace.path()).unwrap();
-        let empty = Arc::new(SkillCatalog::discover(
-            &scope,
-            home.path(),
-            false,
-            &guidance,
-        ));
+        let guidance = "CUSTOM_CATALOG_GUIDANCE  \n";
+        let empty = Arc::new(SkillCatalog::discover(&scope, home.path(), false, guidance));
         assert!(empty.rendered_catalog().is_none());
-        let empty_host = crate::tools::ToolHost::new(workspace.path())
-            .await
-            .unwrap()
-            .with_skill_catalog(empty.clone());
-        for prompt in [
-            root_prompt("base", &empty),
-            child_prompt(
-                "base",
-                &empty,
-                empty_host.for_child(true).prompt_reference(),
-            ),
-        ] {
+        for prompt in root_and_child_prompts(workspace.path(), empty).await {
             assert!(!prompt.contains("CUSTOM_CATALOG_GUIDANCE"));
         }
 
@@ -591,29 +591,30 @@ mod tests {
             "name: review\ndescription: Review\n",
             "PRIVATE_BODY",
         );
-        let visible = Arc::new(SkillCatalog::discover(
-            &scope,
-            home.path(),
-            false,
-            &guidance,
-        ));
+        let visible = Arc::new(SkillCatalog::discover(&scope, home.path(), false, guidance));
         assert!(
             visible
                 .rendered_catalog()
                 .unwrap()
                 .contains("CUSTOM_CATALOG_GUIDANCE  \n\n")
         );
-        let host = crate::tools::ToolHost::new(workspace.path())
-            .await
-            .unwrap()
-            .with_skill_catalog(visible.clone());
-        for prompt in [
-            root_prompt("base", &visible),
-            child_prompt("base", &visible, host.for_child(true).prompt_reference()),
-        ] {
+        for prompt in root_and_child_prompts(workspace.path(), visible).await {
             assert_eq!(prompt.matches("CUSTOM_CATALOG_GUIDANCE").count(), 1);
             assert!(!prompt.contains("PRIVATE_BODY"));
         }
+    }
+
+    #[test]
+    fn catalog_guidance_counts_toward_the_catalog_byte_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
         let consumes_catalog_budget = "X".repeat(crate::skills::MAX_CATALOG_BYTES - 32);
         let omitted = SkillCatalog::discover(&scope, home.path(), false, &consumes_catalog_budget);
         assert!(omitted.rendered_catalog().is_none());
@@ -621,13 +622,22 @@ mod tests {
             omitted.lookup_model_invocable("review"),
             Err(crate::skills::SkillLookupError::Omitted { .. })
         ));
+    }
 
-        let missing = home.path().join("missing.md");
+    #[test]
+    fn unreadable_catalog_guidance_override_is_a_typed_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
         assert!(matches!(
             super::resolve_skills_catalog_guidance_from_override(Some(missing.into_os_string())),
             Err(PromptError::UnreadableOverride { .. })
         ));
-        let invalid = home.path().join("invalid.md");
+    }
+
+    #[test]
+    fn invalid_utf8_catalog_guidance_override_is_a_typed_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid = directory.path().join("invalid.md");
         fs::write(&invalid, b"private\xff").unwrap();
         assert!(matches!(
             super::resolve_skills_catalog_guidance_from_override(Some(invalid.into_os_string())),

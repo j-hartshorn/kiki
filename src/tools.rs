@@ -4056,31 +4056,37 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn skill_resource_reads_are_live_but_effect_free_and_mutations_are_denied() {
-        let home = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        let source = root.join("SKILL.md");
-        fs::write(&source, "---\ndescription: Review\n---\nPINNED_BODY\n").unwrap();
-        let resource = root.join("reference.txt");
-        fs::write(&resource, "first").unwrap();
-        let workspace_alias = workspace.path().join("skill:/review");
-        fs::create_dir_all(&workspace_alias).unwrap();
-        fs::write(workspace_alias.join("reference.txt"), "workspace file").unwrap();
+    async fn review_resource_host(
+        home: &TempDir,
+        workspace: &TempDir,
+    ) -> (ToolHost, Arc<SkillCatalog>, PathBuf) {
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "PINNED_BODY\n",
+        );
+        fs::write(root.join("reference.txt"), "first").unwrap();
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
-        let host = tool_host(&workspace)
+        let host = tool_host(workspace)
             .await
             .with_skill_catalog(catalog.clone());
-        let locator = "skill://review/reference.txt";
+        (host, catalog, root)
+    }
 
+    #[tokio::test]
+    async fn skill_resource_reads_record_no_file_effects() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let (host, _, _) = review_resource_host(&home, &workspace).await;
         let result = host
             .call(ToolCall {
                 call_id: 8,
                 tool: ToolName::Read,
-                arguments: ToolValue::List(vec![ToolValue::String(locator.to_owned())]),
+                arguments: ToolValue::List(vec![ToolValue::String(
+                    "skill://review/reference.txt".to_owned(),
+                )]),
             })
             .await;
         assert_eq!(result.result, Ok(ToolValue::String("first".to_owned())));
@@ -4093,7 +4099,17 @@ mod tests {
         assert!(reads.is_empty());
         assert!(modifications.is_empty());
         assert_eq!(authorisations, WholeFileAuthorisations::default());
+    }
 
+    #[tokio::test]
+    async fn skill_resource_mutations_are_denied_without_touching_workspace_lookalikes() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_alias = workspace.path().join("skill:/review");
+        fs::create_dir_all(&workspace_alias).unwrap();
+        fs::write(workspace_alias.join("reference.txt"), "workspace file").unwrap();
+        let (host, _, root) = review_resource_host(&home, &workspace).await;
+        let locator = "skill://review/reference.txt";
         for (tool, arguments) in [
             (ToolName::Write, vec![locator, "changed"]),
             (ToolName::Edit, vec![locator, "first", "changed"]),
@@ -4118,25 +4134,31 @@ mod tests {
             fs::read_to_string(workspace_alias.join("reference.txt")).unwrap(),
             "workspace file"
         );
-        assert_eq!(fs::read_to_string(&resource).unwrap(), "first");
+        assert_eq!(
+            fs::read_to_string(root.join("reference.txt")).unwrap(),
+            "first"
+        );
+    }
 
-        fs::write(&resource, "second").unwrap();
-        fs::write(&source, "---\ndescription: Review\n---\nCHANGED_BODY\n").unwrap();
-        assert_eq!(read(&host, locator).await.unwrap(), "second");
-        assert!(
-            catalog
-                .lookup("review")
-                .unwrap()
-                .source_text()
-                .contains("PINNED_BODY")
+    #[tokio::test]
+    async fn skill_resource_reads_are_live_while_catalog_text_stays_pinned() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let (host, catalog, root) = review_resource_host(&home, &workspace).await;
+        fs::write(root.join("reference.txt"), "second").unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "CHANGED_BODY\n",
         );
-        assert!(
-            !catalog
-                .lookup("review")
-                .unwrap()
-                .source_text()
-                .contains("CHANGED_BODY")
+        assert_eq!(
+            read(&host, "skill://review/reference.txt").await.unwrap(),
+            "second"
         );
+        let pinned = catalog.lookup("review").unwrap().source_text();
+        assert!(pinned.contains("PINNED_BODY"));
+        assert!(!pinned.contains("CHANGED_BODY"));
     }
 
     #[cfg(unix)]

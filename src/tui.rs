@@ -4826,30 +4826,26 @@ mod tests {
         assert!(row.ends_with("..."), "{row}");
     }
 
+    fn app_with_user_skills(home: &Path, project: &Path) -> App {
+        App::default().with_skill_catalog(Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project).unwrap(),
+            home,
+            false,
+            "guidance",
+        )))
+    }
+
     #[test]
     fn direct_only_skill_completes_and_submits_captured_activation() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let direct = home.path().join(".agents/skills/direct");
-        fs::create_dir_all(&direct).unwrap();
-        let body = "---\ndescription: A direct workflow\ndisable-model-invocation: true\n---\nFollow the direct workflow.\n";
-        fs::write(direct.join("SKILL.md"), body).unwrap();
-        let rejected = home.path().join(".agents/skills/rejected");
-        fs::create_dir_all(&rejected).unwrap();
-        fs::write(rejected.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
-        write_skill(
-            &project.path().join(".agents/skills"),
-            "hidden",
-            "description: Hidden\n",
-            "Hidden body\n",
+        let direct = write_skill(
+            &home.path().join(".agents/skills"),
+            "direct",
+            "description: A direct workflow\ndisable-model-invocation: true\n",
+            "Follow the direct workflow.\n",
         );
-        let catalog = Arc::new(SkillCatalog::discover(
-            &ProjectScope::discover(project.path()).unwrap(),
-            home.path(),
-            false,
-            "guidance",
-        ));
-        let mut app = App::default().with_skill_catalog(catalog);
+        let mut app = app_with_user_skills(home.path(), project.path());
         set_prompt(&mut app, "/skill:di");
         app.refresh_completion();
         assert_eq!(app.completion.selected_token(), Some("/skill:direct"));
@@ -4871,43 +4867,36 @@ mod tests {
         };
         assert_eq!(request, "/skill:direct");
         assert_eq!(activation.name(), "direct");
-        assert_eq!(activation.source_text(), body);
-        assert!(app.prompt.is_empty());
-
-        app.transcript.apply(
-            RuntimeEvent::SkillActivationRejected {
-                reason: "limit".to_owned(),
-            },
-            false,
+        assert_eq!(
+            activation.source_text(),
+            fs::read_to_string(direct.join("SKILL.md")).unwrap()
         );
-        set_prompt(&mut app, "/skill:direct inspect this\n  and this");
-        let update = app.handle_key(key(KeyCode::Enter));
-        let [
-            RuntimeCommand::Submit {
-                request,
-                activation: Some(_),
-            },
-        ] = update.commands.as_slice()
-        else {
-            panic!("expected multiline skill submission");
-        };
-        assert_eq!(request, "/skill:direct inspect this\n  and this");
+        assert!(app.prompt.is_empty());
+    }
 
-        let mut skipped = App::default().with_skill_catalog(Arc::new(SkillCatalog::discover(
-            &ProjectScope::discover(project.path()).unwrap(),
-            home.path(),
-            false,
-            "guidance",
-        )));
-        set_prompt(&mut skipped, "/skill:hid");
-        skipped.refresh_completion();
-        assert!(skipped.completion.visible_rows(5).is_empty());
-        set_prompt(&mut skipped, "/skill:hidden");
-        assert!(skipped.handle_key(key(KeyCode::Enter)).commands.is_empty());
-        assert!(skipped.notice().unwrap().contains("hidden"));
-        set_prompt(&mut skipped, "/skill:rejected");
-        assert!(skipped.handle_key(key(KeyCode::Enter)).commands.is_empty());
-        assert!(skipped.notice().unwrap().contains("invalid"));
+    #[test]
+    fn skipped_project_and_invalid_skills_are_refused_without_submission() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let rejected = home.path().join(".agents/skills/rejected");
+        fs::create_dir_all(&rejected).unwrap();
+        fs::write(rejected.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        write_skill(
+            &project.path().join(".agents/skills"),
+            "hidden",
+            "description: Hidden\n",
+            "Hidden body\n",
+        );
+        let mut app = app_with_user_skills(home.path(), project.path());
+        set_prompt(&mut app, "/skill:hid");
+        app.refresh_completion();
+        assert!(app.completion.visible_rows(5).is_empty());
+        set_prompt(&mut app, "/skill:hidden");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(app.notice().unwrap().contains("hidden"));
+        set_prompt(&mut app, "/skill:rejected");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(app.notice().unwrap().contains("invalid"));
     }
 
     #[test]
@@ -4926,7 +4915,11 @@ mod tests {
             false,
             "guidance",
         ));
-        for draft in ["/skill:review", "/skill:review fix it"] {
+        for draft in [
+            "/skill:review",
+            "/skill:review fix it",
+            "/skill:review inspect this\n  and this",
+        ] {
             let mut app = App::default().with_skill_catalog(catalog.clone());
             set_prompt(&mut app, draft);
             let update = app.handle_key(key(KeyCode::Enter));
