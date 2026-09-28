@@ -126,7 +126,6 @@ pub struct Skill {
     name: String,
     description: String,
     source_text: Arc<str>,
-    discovery_path: PathBuf,
     canonical_root: PathBuf,
     origin: SkillOrigin,
     trust_scope: Option<PathBuf>,
@@ -299,7 +298,6 @@ struct SourceRoot<'a> {
 
 struct Scanner {
     resolved: BTreeMap<String, Result<Arc<Skill>, SkillLookupError>>,
-    invalid: BTreeMap<String, SkillLookupError>,
     diagnostics: Vec<SkillDiagnostic>,
     project_remaining: usize,
     user_remaining: usize,
@@ -309,7 +307,6 @@ impl Default for Scanner {
     fn default() -> Self {
         Self {
             resolved: BTreeMap::new(),
-            invalid: BTreeMap::new(),
             diagnostics: Vec::new(),
             project_remaining: MAX_PROJECT_ENTRIES,
             user_remaining: MAX_USER_ENTRIES,
@@ -391,42 +388,41 @@ impl Scanner {
             SkillOrigin::User => self.user_remaining -= entries.len(),
         }
         entries.sort();
-        let mut grouped: BTreeMap<String, Vec<Arc<Skill>>> = BTreeMap::new();
+        let mut claims: BTreeMap<String, Vec<_>> = BTreeMap::new();
         for entry_name in entries {
             let path = canonical_root.join(entry_name);
             match self.read_candidate(&source, &path) {
-                Candidate::Skill(skill) => {
-                    grouped.entry(skill.name.clone()).or_default().push(skill)
-                }
+                Candidate::Skill(skill) => claims
+                    .entry(skill.name.clone())
+                    .or_default()
+                    .push((path, Ok(skill))),
                 Candidate::Invalid { name, reason } => {
                     self.diagnostic(&path, name.as_deref(), &reason);
                     if let Some(name) = name {
-                        self.invalid
+                        claims
                             .entry(name.clone())
-                            .or_insert(SkillLookupError::Invalid { name, reason });
+                            .or_default()
+                            .push((path, Err(SkillLookupError::Invalid { name, reason })));
                     }
                 }
                 Candidate::NotDirectory => {}
             }
         }
-        for (name, skills) in grouped {
+        for (name, mut claims) in claims {
             if self.resolved.contains_key(&name) {
                 continue;
             }
-            if skills.len() == 1 {
-                self.resolved
-                    .insert(name, Ok(skills.into_iter().next().unwrap()));
+            let resolution = if claims.len() == 1 {
+                claims.pop().unwrap().1
             } else {
-                let paths: Vec<_> = skills
-                    .iter()
-                    .map(|skill| skill.discovery_path.clone())
-                    .collect();
                 self.diagnostic(source.path, Some(&name), "duplicate skill name in one root");
-                self.resolved.insert(
-                    name.clone(),
-                    Err(SkillLookupError::Ambiguous { name, paths }),
-                );
-            }
+                let paths = claims.into_iter().map(|(path, _)| path).collect();
+                Err(SkillLookupError::Ambiguous {
+                    name: name.clone(),
+                    paths,
+                })
+            };
+            self.resolved.insert(name, resolution);
         }
     }
 
@@ -464,7 +460,6 @@ impl Scanner {
             name: metadata.name,
             description: metadata.description,
             source_text: Arc::from(source_text),
-            discovery_path: path.to_path_buf(),
             canonical_root,
             origin: source.origin,
             trust_scope: source.trust_scope.map(Path::to_path_buf),
@@ -484,11 +479,6 @@ impl Scanner {
                 Err(error) => {
                     rejected.insert(name, error);
                 }
-            }
-        }
-        for (name, error) in self.invalid {
-            if !selected.contains_key(&name) && !rejected.contains_key(&name) {
-                rejected.insert(name, error);
             }
         }
         let mut diagnostics = self.diagnostics;
@@ -1101,6 +1091,58 @@ mod tests {
             error => panic!("unexpected error: {error}"),
         }
         assert!(visible_names(&catalog).is_empty());
+        assert!(
+            catalog
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn invalid_nearer_claim_blocks_farther_skill_of_same_name() {
+        let fixture = Fixture::new();
+        Fixture::skill(
+            &fixture.project_root(&fixture.launch),
+            "shared",
+            "description: 123\n",
+            "near",
+        );
+        Fixture::skill(
+            &fixture.user_root(),
+            "shared",
+            "description: user\n",
+            "user",
+        );
+        let catalog = fixture.catalog();
+        assert_eq!(
+            catalog.lookup("shared").err().unwrap(),
+            SkillLookupError::Invalid {
+                name: "shared".to_owned(),
+                reason: "description must be a string".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn valid_and_invalid_claims_of_one_name_in_a_root_are_ambiguous() {
+        let fixture = Fixture::new();
+        let near = fixture.project_root(&fixture.launch);
+        Fixture::skill(&near, "first", "name: shared\ndescription: first\n", "body");
+        Fixture::skill(&near, "second", "name: shared\ndescription: 123\n", "body");
+        Fixture::skill(
+            &fixture.user_root(),
+            "shared",
+            "description: user\n",
+            "body",
+        );
+        let catalog = fixture.catalog();
+        match catalog.lookup("shared").err().unwrap() {
+            SkillLookupError::Ambiguous { paths, .. } => {
+                assert_eq!(paths, vec![near.join("first"), near.join("second")]);
+            }
+            error => panic!("unexpected error: {error}"),
+        }
         assert!(
             catalog
                 .diagnostics()
