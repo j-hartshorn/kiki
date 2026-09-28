@@ -50,9 +50,7 @@ use crate::runtime::{
     RuntimeEvent,
 };
 use crate::session::{Session, SessionListRow};
-use crate::skills::{
-    ProjectScope, SkillCatalog, SkillProjectionPolicy, project_trust_prompt_required,
-};
+use crate::skills::{ProjectScope, SkillCatalog, SkillProjectionPolicy};
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -268,15 +266,16 @@ fn startup_skill_catalog(
     scope: &ProjectScope,
     home: &Path,
     guidance: &str,
-    has_active_project_skill_in_scope: bool,
+    has_active_project_skill: impl FnOnce() -> Result<bool, Box<dyn Error>>,
     prompt: impl FnOnce(&Path) -> Result<bool, tui::TuiError>,
 ) -> Result<(Arc<SkillCatalog>, bool), Box<dyn Error>> {
-    let saved_trust = skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope);
     let include_project =
-        if project_trust_prompt_required(scope, saved_trust, has_active_project_skill_in_scope) {
+        if skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope) {
+            true
+        } else if scope.has_skill_directory() || has_active_project_skill()? {
             prompt(&scope.canonical_scope)?
         } else {
-            saved_trust
+            false
         };
     Ok((
         Arc::new(SkillCatalog::discover(
@@ -306,7 +305,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         &skill_scope,
         &home,
         ready.skills_catalog_guidance(),
-        false,
+        || Ok(false),
         |scope| {
             tui::run_project_skill_trust(scope, || {
                 skill_trust::save_project_skill_scope_trust(&home, scope)
@@ -441,13 +440,11 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     let workspace_root = ready.workspace_root().to_path_buf();
     let skill_startup = (|| -> Result<Arc<SkillCatalog>, Box<dyn Error>> {
         let skill_scope = ProjectScope::discover(&workspace_root)?;
-        let has_active_project_skill_in_scope =
-            session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?;
         let (skills_catalog, project_skills_trusted) = startup_skill_catalog(
             &skill_scope,
             &home,
             ready.skills_catalog_guidance(),
-            has_active_project_skill_in_scope,
+            || Ok(session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?),
             |scope| {
                 tui::run_project_skill_trust(scope, || {
                     skill_trust::save_project_skill_scope_trust(&home, scope)
@@ -594,7 +591,7 @@ mod tests {
             &scope,
             home,
             super::prompt::skills_catalog_guidance(),
-            has_active_project_skill_in_scope,
+            || Ok(has_active_project_skill_in_scope),
             prompt,
         )
         .map(|(catalog, _)| catalog)
@@ -682,7 +679,7 @@ mod tests {
             &scope,
             home.path(),
             super::prompt::skills_catalog_guidance(),
-            false,
+            || Ok(false),
             |_| panic!("saved trust should not prompt on fresh launch"),
         )
         .unwrap();
@@ -690,7 +687,7 @@ mod tests {
             &scope,
             home.path(),
             super::prompt::skills_catalog_guidance(),
-            true,
+            || Ok(true),
             |_| panic!("saved trust should not prompt on resume"),
         )
         .unwrap();
@@ -722,7 +719,7 @@ mod tests {
             &scope,
             home.path(),
             super::prompt::skills_catalog_guidance(),
-            true,
+            || Ok(true),
             |_| panic!("saved trust should not prompt"),
         )
         .unwrap();
@@ -761,7 +758,7 @@ mod tests {
                 &scope,
                 home.path(),
                 super::prompt::skills_catalog_guidance(),
-                has_active,
+                || Ok(has_active),
                 |_| panic!("saved trust should suppress fresh and resume prompts"),
             )
             .unwrap();
@@ -808,7 +805,7 @@ mod tests {
                 &scope,
                 home.path(),
                 super::prompt::skills_catalog_guidance(),
-                resume_active,
+                || Ok(resume_active),
                 |_| panic!("saved trust should avoid a fresh or resume popup"),
             )
             .unwrap();
@@ -847,7 +844,7 @@ mod tests {
             &scope,
             home.path(),
             super::prompt::skills_catalog_guidance(),
-            false,
+            || Ok(false),
             |path| {
                 super::config::skill_trust::save_project_skill_scope_trust(home.path(), path)
                     .unwrap();
@@ -905,6 +902,43 @@ mod tests {
             prompted,
             "active in-scope project skill must prompt after directory removal"
         );
+    }
+
+    #[test]
+    fn startup_catalog_probes_active_project_skill_only_when_it_decides_the_prompt() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        let startup = || {
+            let (mut probed, mut prompted) = (false, false);
+            super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                || {
+                    probed = true;
+                    Ok(true)
+                },
+                |_| {
+                    prompted = true;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            (probed, prompted)
+        };
+
+        assert_eq!(startup(), (true, true));
+        write_skill(project.path(), "review", "project");
+        assert_eq!(startup(), (false, true));
+        fs::remove_dir_all(project.path().join(".agents/skills")).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        assert_eq!(startup(), (false, false));
     }
 
     #[test]
