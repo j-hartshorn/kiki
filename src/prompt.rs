@@ -621,7 +621,7 @@ mod tests {
         let omitted = SkillCatalog::discover(&scope, home.path(), false, &consumes_catalog_budget);
         assert!(omitted.rendered_catalog().is_none());
         assert!(matches!(
-            omitted.lookup("review"),
+            omitted.lookup_model_invocable("review"),
             Err(crate::skills::SkillLookupError::Omitted { .. })
         ));
 

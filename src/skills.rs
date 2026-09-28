@@ -218,6 +218,7 @@ impl std::error::Error for SkillLookupError {}
 pub struct SkillCatalog {
     selected: BTreeMap<String, Arc<Skill>>,
     rejected: BTreeMap<String, SkillLookupError>,
+    unlisted: BTreeMap<String, SkillLookupError>,
     diagnostics: Vec<SkillDiagnostic>,
     rendered_catalog: Option<String>,
 }
@@ -275,6 +276,8 @@ impl SkillCatalog {
         let skill = self.lookup(name)?;
         if skill.disable_model_invocation {
             Err(SkillLookupError::DirectOnly(name.to_owned()))
+        } else if let Some(error) = self.unlisted.get(name) {
+            Err(error.clone())
         } else {
             Ok(skill)
         }
@@ -504,60 +507,60 @@ impl Scanner {
             );
         }
 
-        let all_visible: Vec<String> = selected
-            .iter()
-            .filter(|(_, skill)| !skill.disable_model_invocation)
-            .map(|(name, _)| name.clone())
+        let visible: Vec<&Skill> = selected
+            .values()
+            .filter(|skill| !skill.disable_model_invocation)
+            .map(Arc::as_ref)
             .collect();
-        let omission = format!("{}\n", prompt::skills_catalog_omission());
-        let mut rendered = format!("{}\n", prompt::skills_catalog_header());
-        if !guidance.is_empty() {
-            rendered.push_str(guidance);
-            rendered.push('\n');
-        }
-        let mut visible_names = Vec::new();
-        for (index, name) in all_visible.iter().enumerate() {
-            if visible_names.len() == MAX_VISIBLE_SKILLS {
-                break;
-            }
-            let skill = selected.get(name).unwrap();
-            let line = format!("- {}: {}\n", skill.name, skill.description);
-            let has_more = index + 1 < all_visible.len();
-            let reserve = if has_more { omission.len() } else { 0 };
-            if rendered.len() + line.len() + reserve > MAX_CATALOG_BYTES {
-                break;
-            }
-            rendered.push_str(&line);
-            visible_names.push(name.clone());
-        }
-        for name in all_visible.iter().skip(visible_names.len()) {
-            let skill = selected.remove(name).unwrap();
-            let reason = "model catalog entry or byte limit reached".to_owned();
+        let (rendered_catalog, listed) = render_catalog(&visible, guidance);
+        let mut unlisted = BTreeMap::new();
+        for skill in &visible[listed..] {
             diagnostics.push(SkillDiagnostic {
                 path: skill.canonical_root.clone(),
-                name: Some(name.clone()),
-                reason: reason.clone(),
+                name: Some(skill.name.clone()),
+                reason: "omitted from model catalog: entry or byte limit reached".to_owned(),
             });
-            rejected.insert(
-                name.clone(),
+            unlisted.insert(
+                skill.name.clone(),
                 SkillLookupError::Omitted {
-                    name: name.clone(),
-                    reason,
+                    name: skill.name.clone(),
+                    reason: "model catalog entry or byte limit reached".to_owned(),
                 },
             );
         }
-        let omitted_visible = visible_names.len() < all_visible.len();
-        if omitted_visible && rendered.len() + omission.len() <= MAX_CATALOG_BYTES {
-            rendered.push_str(&omission);
-        }
-        let rendered_catalog = (!visible_names.is_empty()).then_some(rendered);
         SkillCatalog {
             selected,
             rejected,
+            unlisted,
             diagnostics,
             rendered_catalog,
         }
     }
+}
+
+/// Returns the catalog text and how many leading `visible` skills it lists.
+fn render_catalog(visible: &[&Skill], guidance: &str) -> (Option<String>, usize) {
+    let omission = format!("{}\n", prompt::skills_catalog_omission());
+    let mut rendered = format!("{}\n", prompt::skills_catalog_header());
+    if !guidance.is_empty() {
+        rendered.push_str(guidance);
+        rendered.push('\n');
+    }
+    let mut listed = 0;
+    for skill in visible.iter().take(MAX_VISIBLE_SKILLS) {
+        let line = format!("- {}: {}\n", skill.name, skill.description);
+        let has_more = listed + 1 < visible.len();
+        let reserve = if has_more { omission.len() } else { 0 };
+        if rendered.len() + line.len() + reserve > MAX_CATALOG_BYTES {
+            break;
+        }
+        rendered.push_str(&line);
+        listed += 1;
+    }
+    if listed < visible.len() && rendered.len() + omission.len() <= MAX_CATALOG_BYTES {
+        rendered.push_str(&omission);
+    }
+    ((listed > 0).then_some(rendered), listed)
 }
 
 enum Candidate {
@@ -935,7 +938,7 @@ mod tests {
     fn visible_names(catalog: &SkillCatalog) -> Vec<&str> {
         catalog
             .entries()
-            .filter(|skill| !skill.disable_model_invocation())
+            .filter(|skill| catalog.lookup_model_invocable(skill.name()).is_ok())
             .map(Skill::name)
             .collect()
     }
@@ -1443,7 +1446,7 @@ mod tests {
         assert!(catalog.lookup("visible-31").is_ok());
         assert!(catalog.lookup("secret-31").is_ok());
         assert!(matches!(
-            catalog.lookup("visible-32"),
+            catalog.lookup_model_invocable("visible-32"),
             Err(SkillLookupError::Omitted { .. })
         ));
         assert!(matches!(
@@ -1453,6 +1456,37 @@ mod tests {
         let rendered = catalog.rendered_catalog().unwrap();
         assert!(!rendered.contains("secret"));
         assert!(rendered.contains("omitted"));
+    }
+
+    #[test]
+    fn skill_beyond_model_catalog_limit_stays_directly_invocable() {
+        let fixture = Fixture::new();
+        let root = fixture.user_root();
+        for index in 0..=MAX_VISIBLE_SKILLS {
+            Fixture::skill(
+                &root,
+                &format!("visible-{index:02}"),
+                "description: visible\n",
+                "body",
+            );
+        }
+        let catalog = fixture.catalog();
+        let rendered = catalog.rendered_catalog().unwrap();
+        assert!(rendered.contains("- visible-31: visible\n"));
+        assert!(!rendered.contains("visible-32"));
+        assert_eq!(
+            catalog.lookup_model_invocable("visible-32").err().unwrap(),
+            SkillLookupError::Omitted {
+                name: "visible-32".to_owned(),
+                reason: "model catalog entry or byte limit reached".to_owned(),
+            }
+        );
+        assert_eq!(catalog.lookup("visible-32").unwrap().name(), "visible-32");
+        assert!(catalog.entries().any(|skill| skill.name() == "visible-32"));
+        assert!(catalog.diagnostics().iter().any(|diagnostic| {
+            diagnostic.name.as_deref() == Some("visible-32")
+                && diagnostic.reason == "omitted from model catalog: entry or byte limit reached"
+        }));
     }
 
     #[test]
@@ -1566,9 +1600,10 @@ mod tests {
         );
         assert!(visible_names(&over).is_empty());
         assert!(matches!(
-            over.lookup("one"),
+            over.lookup_model_invocable("one"),
             Err(SkillLookupError::Omitted { .. })
         ));
+        assert!(over.lookup("one").is_ok());
     }
 
     #[test]
