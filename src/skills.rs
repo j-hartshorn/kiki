@@ -15,16 +15,16 @@ use rustix::fs::{Mode, OFlags, openat};
 use yaml_rust::parser::Parser;
 use yaml_rust::{Event, Yaml, YamlLoader};
 
-pub const MAX_ANCESTOR_DIRS: usize = 32;
-pub const MAX_PROJECT_ENTRIES: usize = 128;
-pub const MAX_USER_ENTRIES: usize = 128;
-pub const MAX_SKILL_BYTES: usize = 64 * 1024;
-pub const MAX_SKILL_LINES: usize = 700;
-pub const MAX_NAME_BYTES: usize = 64;
-pub const MAX_DESCRIPTION_BYTES: usize = 1_024;
-pub const MAX_VISIBLE_SKILLS: usize = 32;
-pub const MAX_DIRECT_ONLY_SKILLS: usize = 32;
-pub const MAX_CATALOG_BYTES: usize = 16 * 1024;
+const MAX_ANCESTOR_DIRS: usize = 32;
+const MAX_PROJECT_ENTRIES: usize = 128;
+const MAX_USER_ENTRIES: usize = 128;
+pub(crate) const MAX_SKILL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SKILL_LINES: usize = 700;
+const MAX_NAME_BYTES: usize = 64;
+const MAX_DESCRIPTION_BYTES: usize = 1_024;
+const MAX_VISIBLE_SKILLS: usize = 32;
+const MAX_DIRECT_ONLY_SKILLS: usize = 32;
+pub(crate) const MAX_CATALOG_BYTES: usize = 16 * 1024;
 const MAX_YAML_DEPTH: usize = 64;
 
 const SKILL_FILE: &str = "SKILL.md";
@@ -37,7 +37,6 @@ const CATALOG_OMISSION: &str =
 pub struct ProjectScope {
     pub canonical_scope: PathBuf,
     pub roots: Vec<PathBuf>,
-    pub git_root_found: bool,
 }
 
 impl ProjectScope {
@@ -76,7 +75,6 @@ impl ProjectScope {
         Ok(Self {
             canonical_scope,
             roots,
-            git_root_found,
         })
     }
 
@@ -87,8 +85,7 @@ impl ProjectScope {
     }
 }
 
-/// `has_active_project_skill_in_scope` is supplied by session ancestry once
-/// activated skills are stored (Task 3). It lets resume prompt after a root is removed.
+/// `has_active_project_skill_in_scope` comes from session ancestry, so resume prompts after a root is removed.
 pub fn project_trust_prompt_required(
     scope: &ProjectScope,
     already_trusted: bool,
@@ -131,10 +128,6 @@ impl Skill {
 
     pub fn canonical_root(&self) -> &Path {
         &self.canonical_root
-    }
-
-    pub fn discovery_path(&self) -> &Path {
-        &self.discovery_path
     }
 
     pub fn origin(&self) -> SkillOrigin {
@@ -242,22 +235,6 @@ impl SkillCatalog {
             }
         }
         scanner.finish(guidance)
-    }
-
-    pub fn visible_names(&self) -> Vec<&str> {
-        self.selected
-            .iter()
-            .filter(|(_, skill)| !skill.disable_model_invocation)
-            .map(|(name, _)| name.as_str())
-            .collect()
-    }
-
-    pub fn direct_only_names(&self) -> Vec<&str> {
-        self.selected
-            .iter()
-            .filter(|(_, skill)| skill.disable_model_invocation)
-            .map(|(name, _)| name.as_str())
-            .collect()
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Skill> {
@@ -916,7 +893,7 @@ fn identified_name(source: &str, path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use std::fs;
 
@@ -978,6 +955,22 @@ pub mod tests {
         }
     }
 
+    fn visible_names(catalog: &SkillCatalog) -> Vec<&str> {
+        catalog
+            .entries()
+            .filter(|skill| !skill.disable_model_invocation())
+            .map(Skill::name)
+            .collect()
+    }
+
+    fn direct_only_names(catalog: &SkillCatalog) -> Vec<&str> {
+        catalog
+            .entries()
+            .filter(|skill| skill.disable_model_invocation())
+            .map(Skill::name)
+            .collect()
+    }
+
     #[test]
     fn missing_roots_yield_empty_catalog() {
         let temporary = tempfile::tempdir().unwrap();
@@ -988,7 +981,7 @@ pub mod tests {
         let project = ProjectScope::discover(&launch).unwrap();
         assert!(!project.has_skill_directory());
         let catalog = SkillCatalog::discover(&project, &home, true, "guidance");
-        assert!(catalog.visible_names().is_empty());
+        assert!(visible_names(&catalog).is_empty());
     }
 
     #[test]
@@ -1011,7 +1004,6 @@ pub mod tests {
         fs::create_dir_all(&launch).unwrap();
         fs::write(repo.join(".git"), "gitdir: elsewhere").unwrap();
         let project = ProjectScope::discover(&launch).unwrap();
-        assert!(project.git_root_found);
         assert_eq!(project.canonical_scope, repo.canonicalize().unwrap());
         assert_eq!(project.roots.len(), 2);
     }
@@ -1020,7 +1012,6 @@ pub mod tests {
     fn git_directory_and_no_git_scope_use_the_documented_roots() {
         let fixture = Fixture::new();
         let project = fixture.scope();
-        assert!(project.git_root_found);
         assert_eq!(
             project.canonical_scope,
             fixture.repo.canonicalize().unwrap()
@@ -1031,7 +1022,6 @@ pub mod tests {
 
         fs::remove_dir(fixture.repo.join(".git")).unwrap();
         let without_git = fixture.scope();
-        assert!(!without_git.git_root_found);
         assert_eq!(
             without_git.canonical_scope,
             fixture.launch.canonicalize().unwrap()
@@ -1045,19 +1035,20 @@ pub mod tests {
     #[test]
     fn git_marker_beyond_32_directory_bound_is_ignored() {
         let temporary = tempfile::tempdir().unwrap();
-        let mut launch = temporary.path().join("repo");
+        let repo = temporary.path().join("repo");
+        let mut launch = repo.clone();
         fs::create_dir_all(launch.join(".git")).unwrap();
         for _ in 0..MAX_ANCESTOR_DIRS - 1 {
             launch.push("nested");
         }
         fs::create_dir_all(&launch).unwrap();
         let at_boundary = ProjectScope::discover(&launch).unwrap();
-        assert!(at_boundary.git_root_found);
+        assert_eq!(at_boundary.canonical_scope, repo.canonicalize().unwrap());
         assert_eq!(at_boundary.roots.len(), MAX_ANCESTOR_DIRS);
         launch.push("nested");
         fs::create_dir_all(&launch).unwrap();
         let project = ProjectScope::discover(&launch).unwrap();
-        assert!(!project.git_root_found);
+        assert_eq!(project.canonical_scope, launch.canonicalize().unwrap());
         assert_eq!(
             project.roots,
             vec![launch.canonicalize().unwrap().join(".agents/skills")]
@@ -1122,7 +1113,7 @@ pub mod tests {
             SkillLookupError::Ambiguous { paths, .. } => assert_eq!(paths.len(), 2),
             error => panic!("unexpected error: {error}"),
         }
-        assert!(catalog.visible_names().is_empty());
+        assert!(visible_names(&catalog).is_empty());
         assert!(
             catalog
                 .diagnostics()
@@ -1194,7 +1185,7 @@ pub mod tests {
             catalog.lookup("default-name").unwrap().description(),
             "multi line"
         );
-        assert_eq!(catalog.direct_only_names(), vec!["direct"]);
+        assert_eq!(direct_only_names(&catalog), vec!["direct"]);
         assert!(matches!(
             catalog.lookup_model_invocable("direct"),
             Err(SkillLookupError::DirectOnly(_))
@@ -1382,8 +1373,7 @@ pub mod tests {
             MAX_DESCRIPTION_BYTES
         );
         assert!(
-            catalog
-                .visible_names()
+            visible_names(&catalog)
                 .iter()
                 .all(|name| *name != over_name)
         );
@@ -1419,8 +1409,8 @@ pub mod tests {
             );
         }
         let catalog = fixture.catalog();
-        assert_eq!(catalog.visible_names().len(), MAX_VISIBLE_SKILLS);
-        assert_eq!(catalog.direct_only_names().len(), MAX_DIRECT_ONLY_SKILLS);
+        assert_eq!(visible_names(&catalog).len(), MAX_VISIBLE_SKILLS);
+        assert_eq!(direct_only_names(&catalog).len(), MAX_DIRECT_ONLY_SKILLS);
         assert!(catalog.lookup("visible-31").is_ok());
         assert!(catalog.lookup("secret-31").is_ok());
         assert!(matches!(
@@ -1455,7 +1445,7 @@ pub mod tests {
             "body",
         );
         let catalog = fixture.catalog();
-        assert_eq!(catalog.visible_names(), vec!["user-one"]);
+        assert_eq!(visible_names(&catalog), vec!["user-one"]);
         assert!(matches!(
             catalog.lookup("project-000"),
             Err(SkillLookupError::Unknown(_))
@@ -1485,11 +1475,11 @@ pub mod tests {
         Fixture::skill(&project, "project-one", "description: project\n", "body");
         Fixture::skill(&user, "user-one", "description: user\n", "body");
         let exact = fixture.catalog();
-        assert_eq!(exact.visible_names(), vec!["project-one", "user-one"]);
+        assert_eq!(visible_names(&exact), vec!["project-one", "user-one"]);
         fs::write(project.join("extra"), "not a skill").unwrap();
         fs::write(user.join("extra"), "not a skill").unwrap();
         let over = fixture.catalog();
-        assert!(over.visible_names().is_empty());
+        assert!(visible_names(&over).is_empty());
         for root in [&project, &user] {
             assert!(over.diagnostics().iter().any(|diagnostic| {
                 diagnostic.path == *root && diagnostic.reason.contains("entire root skipped")
@@ -1515,10 +1505,10 @@ pub mod tests {
             );
         }
         let exact = fixture.catalog();
-        assert_eq!(exact.visible_names().len(), 28);
+        assert_eq!(visible_names(&exact).len(), 28);
         Fixture::skill(&far, "far-028", "description: far\n", "body");
         let catalog = fixture.catalog();
-        assert!(catalog.visible_names().is_empty());
+        assert!(visible_names(&catalog).is_empty());
         assert!(
             catalog
                 .diagnostics()
@@ -1537,14 +1527,14 @@ pub mod tests {
         let project = fixture.scope();
         let exact = SkillCatalog::discover(&project, &fixture.home, false, &exact_guidance);
         assert_eq!(exact.rendered_catalog().unwrap().len(), MAX_CATALOG_BYTES);
-        assert_eq!(exact.visible_names(), vec!["one"]);
+        assert_eq!(visible_names(&exact), vec!["one"]);
         let over = SkillCatalog::discover(
             &project,
             &fixture.home,
             false,
             &format!("{exact_guidance}g"),
         );
-        assert!(over.visible_names().is_empty());
+        assert!(visible_names(&over).is_empty());
         assert!(matches!(
             over.lookup("one"),
             Err(SkillLookupError::Omitted { .. })
@@ -1565,12 +1555,11 @@ pub mod tests {
         }
         let first = fixture.catalog();
         let second = fixture.catalog();
-        assert_eq!(first.visible_names(), second.visible_names());
+        assert_eq!(visible_names(&first), visible_names(&second));
         assert_eq!(first.rendered_catalog(), second.rendered_catalog());
-        assert!(first.visible_names().len() < 25);
+        assert!(visible_names(&first).len() < 25);
         assert!(
-            first
-                .visible_names()
+            visible_names(&first)
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
@@ -1617,7 +1606,7 @@ pub mod tests {
         fs::remove_file(&linked_root).unwrap();
         symlink(fixture.temporary.path().join("outside"), &linked_root).unwrap();
         let outside_root = fixture.catalog();
-        assert!(outside_root.visible_names().is_empty());
+        assert!(visible_names(&outside_root).is_empty());
         assert!(
             outside_root
                 .diagnostics()
@@ -1663,7 +1652,7 @@ pub mod tests {
         fs::remove_file(&linked_root).unwrap();
         symlink(fixture.temporary.path().join("outside"), &linked_root).unwrap();
         let rejected_root = fixture.catalog();
-        assert!(rejected_root.visible_names().is_empty());
+        assert!(visible_names(&rejected_root).is_empty());
         assert!(rejected_root.diagnostics().iter().any(|diagnostic| {
             diagnostic.path == linked_root && diagnostic.reason.contains("outside")
         }));

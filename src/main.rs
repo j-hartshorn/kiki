@@ -15,7 +15,7 @@ mod provider;
 pub mod runtime;
 mod selection;
 mod session;
-pub mod skills;
+mod skills;
 #[cfg(test)]
 mod sse_fixture;
 mod subagents;
