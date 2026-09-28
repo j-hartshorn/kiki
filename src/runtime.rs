@@ -247,10 +247,17 @@ pub(crate) enum RuntimeEvent {
     ModelStepStarted {
         run_id: RunId,
         step_id: ModelStepId,
+        epoch: u32,
+    },
+    GenerationRestarted {
+        run_id: RunId,
+        step_id: ModelStepId,
+        epoch: u32,
     },
     ModelProgress {
         run_id: RunId,
         step_id: ModelStepId,
+        epoch: u32,
         progress: ModelProgress,
     },
     ExecutionStarted {
@@ -305,6 +312,7 @@ pub(crate) enum RuntimeEvent {
     },
     AutomaticCompactionStarted {
         run_id: RunId,
+        initial_overflow: Option<(ModelStepId, Vec<AttemptAccounting>)>,
     },
     SettingsAccepted {
         revision: u64,
@@ -461,6 +469,7 @@ enum WorkerMessage<M: Model> {
     },
     AutomaticCompactionStarted {
         run_id: u64,
+        initial_overflow: Option<(u64, Vec<AttemptAccounting>)>,
     },
     AutomaticCompactionCommitted {
         compaction: CommittedCompaction,
@@ -468,6 +477,12 @@ enum WorkerMessage<M: Model> {
     PersistedModelStepStarted {
         run_id: u64,
         step_id: u64,
+        epoch: u32,
+    },
+    GenerationRestarted {
+        run_id: u64,
+        step_id: u64,
+        epoch: u32,
     },
     ExecutionStarted {
         run_id: u64,
@@ -504,6 +519,7 @@ enum WorkerMessage<M: Model> {
 struct WorkerProgress {
     run_id: RunId,
     step_id: ModelStepId,
+    epoch: u32,
     progress: AgentProgress,
 }
 
@@ -636,6 +652,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         }
         RuntimeEvent::RunStarted { .. }
         | RuntimeEvent::ModelStepStarted { .. }
+        | RuntimeEvent::GenerationRestarted { .. }
         | RuntimeEvent::RecordAppended { .. }
         | RuntimeEvent::SubagentSpawned { .. }
         | RuntimeEvent::SubagentStatus { .. }
@@ -1675,17 +1692,40 @@ impl<M: Model> RuntimeController<M> {
                             selection,
                         });
                     }
-                    PersistedAgentEvent::CompactionStarted { run_id } => {
-                        let _ = completion_sender
-                            .send(WorkerMessage::AutomaticCompactionStarted { run_id });
+                    PersistedAgentEvent::CompactionStarted {
+                        run_id,
+                        initial_overflow,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::AutomaticCompactionStarted {
+                            run_id,
+                            initial_overflow,
+                        });
                     }
                     PersistedAgentEvent::CompactionCommitted { compaction } => {
                         let _ = completion_sender
                             .send(WorkerMessage::AutomaticCompactionCommitted { compaction });
                     }
-                    PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
-                        let _ = completion_sender
-                            .send(WorkerMessage::PersistedModelStepStarted { run_id, step_id });
+                    PersistedAgentEvent::ModelStepStarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::PersistedModelStepStarted {
+                            run_id,
+                            step_id,
+                            epoch,
+                        });
+                    }
+                    PersistedAgentEvent::GenerationRestarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::GenerationRestarted {
+                            run_id,
+                            step_id,
+                            epoch,
+                        });
                     }
                     PersistedAgentEvent::ToolUpdated {
                         run_id,
@@ -1731,6 +1771,7 @@ impl<M: Model> RuntimeController<M> {
                     PersistedAgentEvent::ModelProgress {
                         run_id,
                         step_id,
+                        epoch,
                         progress,
                     } => {
                         let progress = AgentProgress::ModelProgress(progress);
@@ -1739,6 +1780,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch,
                                 progress,
                             },
                             false,
@@ -1759,6 +1801,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress,
                             },
                             false,
@@ -1780,6 +1823,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::ToolUpdated { token, call },
                             },
                             false,
@@ -1797,6 +1841,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::RunPreviewUpdated { token, preview },
                             },
                             false,
@@ -1813,6 +1858,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::StdoutDelta { text },
                             },
                             false,
@@ -1824,6 +1870,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::StdoutTruncated,
                             },
                             false,
@@ -1985,10 +2032,15 @@ impl<M: Model> RuntimeController<M> {
                     );
                 }
             }
-            WorkerMessage::AutomaticCompactionStarted { run_id } => self.emit(
+            WorkerMessage::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow,
+            } => self.emit(
                 events,
                 RuntimeEvent::AutomaticCompactionStarted {
                     run_id: RunId(run_id),
+                    initial_overflow: initial_overflow
+                        .map(|(step_id, attempts)| (ModelStepId(step_id), attempts)),
                 },
             ),
             WorkerMessage::AutomaticCompactionCommitted { compaction } => {
@@ -2001,7 +2053,23 @@ impl<M: Model> RuntimeController<M> {
                     false,
                 );
             }
-            WorkerMessage::PersistedModelStepStarted { run_id, step_id } => {
+            WorkerMessage::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch,
+            } => self.emit(
+                events,
+                RuntimeEvent::GenerationRestarted {
+                    run_id: RunId(run_id),
+                    step_id: ModelStepId(step_id),
+                    epoch,
+                },
+            ),
+            WorkerMessage::PersistedModelStepStarted {
+                run_id,
+                step_id,
+                epoch,
+            } => {
                 let run_id = RunId(run_id);
                 let step_id = ModelStepId(step_id);
                 let active = self
@@ -2014,7 +2082,11 @@ impl<M: Model> RuntimeController<M> {
                 active.persisted_model_steps.insert(step_id.0);
                 self.publish_progress(
                     progress,
-                    RuntimeEvent::ModelStepStarted { run_id, step_id },
+                    RuntimeEvent::ModelStepStarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    },
                     false,
                 );
             }
@@ -2104,7 +2176,7 @@ impl<M: Model> RuntimeController<M> {
                             ),
                         },
                     ),
-                    Ok(CompactionResult::FailedBeforeStart) => self.emit(
+                    Ok(CompactionResult::FailedBeforeStart(_)) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Failed),
@@ -2327,6 +2399,7 @@ impl<M: Model> RuntimeController<M> {
         let WorkerProgress {
             run_id,
             step_id,
+            epoch,
             progress: agent_progress,
         } = progress_envelope.item;
         let event = match agent_progress {
@@ -2334,6 +2407,7 @@ impl<M: Model> RuntimeController<M> {
             AgentProgress::ModelProgress(progress) => RuntimeEvent::ModelProgress {
                 run_id,
                 step_id,
+                epoch,
                 progress,
             },
             AgentProgress::ExecutionStarted { commentary, .. } => RuntimeEvent::ExecutionStarted {
@@ -3629,6 +3703,7 @@ mod tests {
                 item: RuntimeEvent::ModelProgress {
                     run_id: RunId(99),
                     step_id: ModelStepId(99),
+                    epoch: 0,
                     progress: ModelProgress::AttemptStarted { attempt: 1 },
                 },
                 gap_before: false,
@@ -4193,6 +4268,7 @@ mod tests {
                 item: RuntimeEvent::ModelProgress {
                     run_id: RunId(99),
                     step_id: ModelStepId(99),
+                    epoch: 0,
                     progress: ModelProgress::AttemptStarted { attempt: 1 },
                 },
                 gap_before: false,
@@ -4569,6 +4645,298 @@ mod tests {
                 )
                 .expect("count compactions and steps"),
             0
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    struct OverflowRetryModel {
+        first_step: Option<(Arc<Notify>, Arc<Notify>)>,
+        steps: Arc<Mutex<Vec<ModelSelection>>>,
+        summaries: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl OverflowRetryModel {
+        fn new() -> Self {
+            Self {
+                first_step: None,
+                steps: Arc::new(Mutex::new(Vec::new())),
+                summaries: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Model for OverflowRetryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let call = {
+                    let mut steps = self.steps.lock().expect("record step selection");
+                    steps.push(selection);
+                    steps.len()
+                };
+                if call == 1
+                    && let Some((started, release)) = &self.first_step
+                {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                progress(ModelProgress::AssistantTextChunk {
+                    text: if call == 1 { "stale" } else { "fresh" }.to_owned(),
+                });
+                if call == 1 {
+                    return Err(ModelFailure::new(
+                        ModelError::Provider(Box::new(
+                            ProviderFailure::new(
+                                Some(400),
+                                Some("context_length_exceeded".to_owned()),
+                                "maximum context length".to_owned(),
+                            )
+                            .with_context_overflow(true),
+                        )),
+                        vec![AttemptAccounting::UsageUnavailable],
+                    ));
+                }
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            _cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                attempt_started();
+                self.summaries
+                    .lock()
+                    .expect("record summary selection")
+                    .push(request.selection);
+                Ok(SummaryResult {
+                    text: "summary".to_owned(),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    const RECOVERY_SETTINGS: &str = "reserve_tokens = 16384\nkeep_recent_tokens = 20000\n";
+
+    fn generation_progress(envelopes: &[ProgressEnvelope<RuntimeEvent>]) -> Vec<(u32, String)> {
+        envelopes
+            .iter()
+            .filter_map(|envelope| match &envelope.item {
+                RuntimeEvent::ModelStepStarted {
+                    run_id: RunId(3),
+                    step_id: ModelStepId(3),
+                    epoch,
+                } => Some((*epoch, "start".to_owned())),
+                RuntimeEvent::ModelProgress {
+                    run_id: RunId(3),
+                    step_id: ModelStepId(3),
+                    epoch,
+                    progress,
+                } => Some((
+                    *epoch,
+                    match progress {
+                        ModelProgress::AttemptStarted { attempt } => format!("attempt {attempt}"),
+                        ModelProgress::AssistantTextChunk { text } => text.clone(),
+                        progress => format!("{progress:?}"),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn overflow_retry_resets_generation_before_its_card_and_tags_progress_epochs() {
+        for saturated in [false, true] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let (controller, session) = threshold_controller(
+                &home,
+                &workspace,
+                OverflowRetryModel::new(),
+                RECOVERY_SETTINGS,
+            )
+            .await;
+            seed_compactable_history(&session.writer()).await;
+            let (command_sender, command_receiver) = mpsc::channel(8);
+            let (event_sender, mut events) = mpsc::unbounded_channel();
+            let (progress_sender, mut progress) = mpsc::channel(if saturated {
+                1
+            } else {
+                PROGRESS_CHANNEL_CAPACITY
+            });
+            if saturated {
+                progress_sender
+                    .try_send(ProgressEnvelope {
+                        item: RuntimeEvent::RunStarted { run_id: RunId(99) },
+                        gap_before: false,
+                    })
+                    .expect("saturate progress channel");
+            }
+            let controller =
+                tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+            command_sender
+                .send(RuntimeCommand::Submit {
+                    request: large_request(),
+                })
+                .await
+                .expect("submit large request");
+            let events = events_until_settled(&mut events).await;
+
+            assert_eq!(
+                automatic_compaction_labels(&events),
+                [
+                    "record:3:user",
+                    "automatic-compaction:3:overflow:3:[UsageUnavailable]",
+                    "generation-restarted:3:3:1",
+                    "record:3:compaction:ContextOverflow:applied",
+                    "record:3:message:3:done",
+                    "settled:3",
+                ],
+                "saturated: {saturated}"
+            );
+            let progress = drain_progress(&mut progress);
+            if saturated {
+                assert!(generation_progress(&progress).is_empty());
+            } else {
+                assert_eq!(
+                    generation_progress(&progress),
+                    [
+                        (0, "start".to_owned()),
+                        (0, "attempt 1".to_owned()),
+                        (0, "stale".to_owned()),
+                        (1, "start".to_owned()),
+                        (1, "attempt 1".to_owned()),
+                        (1, "fresh".to_owned()),
+                    ]
+                );
+            }
+
+            shutdown_controller(command_sender, controller).await;
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_keeps_the_run_selection_after_a_mid_run_model_change() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let model = OverflowRetryModel {
+            first_step: Some((started.clone(), release.clone())),
+            ..OverflowRetryModel::new()
+        };
+        let steps = model.steps.clone();
+        let summaries = model.summaries.clone();
+        let (controller, session) =
+            threshold_controller(&home, &workspace, model, RECOVERY_SETTINGS).await;
+        seed_compactable_history(&session.writer()).await;
+        let admitted = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let changed = ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking)
+            .expect("select changed model");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("start run");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: changed,
+                revision: 1,
+            })
+            .await
+            .expect("change model mid-run");
+        while next_event(&mut events).await != (RuntimeEvent::SettingsAccepted { revision: 1 }) {}
+        release.notify_one();
+        let settled = events_until_settled(&mut events).await;
+
+        assert!(
+            automatic_compaction_labels(&settled)
+                .contains(&"record:3:compaction:ContextOverflow:applied".to_owned())
+        );
+        assert_eq!(*steps.lock().expect("read steps"), [admitted, admitted]);
+        assert_eq!(*summaries.lock().expect("read summaries"), [admitted]);
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn overflow_compaction_storage_failure_disables_without_card_or_retry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let model = OverflowRetryModel::new();
+        let steps = model.steps.clone();
+        let (controller, session) =
+            threshold_controller(&home, &workspace, model, RECOVERY_SETTINGS).await;
+        seed_compactable_history(&session.writer()).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_compaction BEFORE INSERT ON entries WHEN NEW.kind = 'compaction' BEGIN SELECT RAISE(ABORT, 'reject compaction'); END;",
+            )
+            .expect("reject compaction writes");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_disabled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3:overflow:3:[UsageUnavailable]",
+                "disabled:SessionStorageWriteFailed",
+            ]
+        );
+        assert_eq!(steps.lock().expect("read steps").len(), 1);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'compaction'), (SELECT COUNT(*) FROM model_steps WHERE run_id = 3 AND settled_entry_id IS NULL)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("count compactions and open steps"),
+            (0, 1)
         );
 
         shutdown_controller(commands, controller).await;
@@ -7197,7 +7565,9 @@ mod tests {
     fn event_label(event: &RuntimeEvent) -> String {
         match event {
             RuntimeEvent::RunStarted { run_id } => format!("run:{}", run_id.0),
-            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+            RuntimeEvent::ModelStepStarted {
+                run_id, step_id, ..
+            } => {
                 format!("model:{}:{}", run_id.0, step_id.0)
             }
             RuntimeEvent::ModelProgress { .. } => "model-progress".to_owned(),
@@ -7235,9 +7605,22 @@ mod tests {
                 format!("subagent-operation-settled:{id}")
             }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
-            RuntimeEvent::AutomaticCompactionStarted { run_id } => {
-                format!("automatic-compaction:{}", run_id.0)
-            }
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: None,
+            } => format!("automatic-compaction:{}", run_id.0),
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: Some((step_id, attempts)),
+            } => format!(
+                "automatic-compaction:{}:overflow:{}:{attempts:?}",
+                run_id.0, step_id.0
+            ),
+            RuntimeEvent::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch,
+            } => format!("generation-restarted:{}:{}:{epoch}", run_id.0, step_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
@@ -8297,6 +8680,7 @@ mod tests {
         RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk { text },
         }
     }
@@ -11268,7 +11652,9 @@ mod tests {
             first_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -11282,7 +11668,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -11455,7 +11843,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -11624,7 +12014,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),

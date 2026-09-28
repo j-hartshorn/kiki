@@ -12248,6 +12248,229 @@ mod tests {
         reopened.close().expect("close reopened session");
     }
 
+    async fn settle_overflow_compaction_in_pending_step(
+        writer: &SessionWriter,
+    ) -> (u64, u64, SessionEntryId) {
+        append_cancelled_request(writer, "discarded request").await;
+        append_cancelled_request(writer, "retained request").await;
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start overflowed step");
+        let preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::ContextOverflow,
+            )
+            .await
+            .expect("prepare overflow compaction")
+            .expect("prepare compactable history");
+        let committed = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "overflow summary".to_owned(),
+                    attempts: vec![known_usage(7, 1)],
+                },
+            )
+            .await
+            .expect("settle overflow compaction inside the pending step");
+        (admission.run_id, step_id, committed.entry_id)
+    }
+
+    fn run_record_kinds(restore: &super::SessionRestore, run_id: u64) -> Vec<&'static str> {
+        restore
+            .records
+            .iter()
+            .filter(|record| record.run_id == run_id)
+            .map(|record| match &record.kind {
+                super::RestoredRecordKind::UserRequest { .. } => "request",
+                super::RestoredRecordKind::CompletedExecution { .. } => "execution",
+                super::RestoredRecordKind::FinalMessage { .. } => "final",
+                super::RestoredRecordKind::CancelledRun { .. } => "cancelled",
+                super::RestoredRecordKind::FailedRun { .. } => "failed",
+                super::RestoredRecordKind::Compaction { .. } => "compaction",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restart_after_applied_overflow_compaction_interrupts_the_pending_step_without_replay()
+    {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let (run_id, step_id, compaction_entry) =
+            settle_overflow_compaction_in_pending_step(&writer).await;
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close interrupted session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        let restore = reopened.restore().expect("restore interrupted run");
+
+        assert_eq!(
+            run_record_kinds(&restore, run_id),
+            ["request", "compaction", "failed"]
+        );
+        assert!(matches!(
+            restore.records.last().map(|record| &record.kind),
+            Some(super::RestoredRecordKind::FailedRun {
+                message,
+                terminal: super::ReadableTerminal::Failed {
+                    evidence: None,
+                    attempts,
+                    overflow_recovery: None,
+                    ..
+                },
+            }) if message == super::INTERRUPTION_MESSAGE && attempts.is_empty()
+        ));
+        assert!(restore.records.iter().any(|record| matches!(
+            &record.kind,
+            super::RestoredRecordKind::Compaction {
+                outcome: super::CompactionOutcome::Applied {
+                    reason: super::CompactionReason::ContextOverflow,
+                    attempts,
+                    ..
+                },
+            } if attempts == &[known_usage(7, 1)]
+        )));
+        let (settled_parent, open_runs, steps): (i64, i64, i64) = reopened
+            .connection_for_test()
+            .expect("open reopened session")
+            .query_row(
+                "SELECT entries.parent_id, (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE run_id = ?1) FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?2",
+                params![
+                    i64::try_from(run_id).expect("run ID fits SQLite"),
+                    i64::try_from(step_id).expect("step ID fits SQLite"),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read interrupted step settlement");
+        assert_eq!(
+            (settled_parent, open_runs, steps),
+            (
+                i64::try_from(compaction_entry.0).expect("entry ID fits SQLite"),
+                0,
+                1
+            )
+        );
+        assert!(matches!(
+            restore
+                .executable
+                .expect("interrupted run remains executable")
+                .history
+                .entries(),
+            [crate::model::ModelContextEntry::CompactionSummary { summary }, .., crate::model::ModelContextEntry::UserRequest { text }]
+                if summary == "overflow summary" && text == "recover"
+        ));
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    async fn recovered_overflow_run_restores_and_branches_from_the_applied_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let branch_point = {
+            append_cancelled_request(&writer, "sibling base").await;
+            session.restore().expect("restore").observed_active_entry
+        };
+        let (run_id, step_id, compaction_entry) =
+            settle_overflow_compaction_in_pending_step(&writer).await;
+        let summary = known_usage(7, 1);
+        let initial = known_usage(40, 0);
+        let retry = known_usage(41, 2);
+        let terminal = PersistedTerminal::Final {
+            step_id,
+            text: "recovered".to_owned(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("openai", Vec::new()),
+            attempts: vec![retry.clone()],
+            overflow_recovery: Some(overflow_recovery(vec![initial.clone()])),
+        };
+        writer
+            .close_run(run_id, Some(step_id), move || terminal, None)
+            .await
+            .expect("close recovered run");
+        let recovered_leaf = session.restore().expect("restore").observed_active_entry;
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        let restore = reopened.restore().expect("restore recovered run");
+        assert!(restore.footer_adjustment.is_empty());
+        assert_eq!(
+            run_record_kinds(&restore, run_id),
+            ["request", "compaction", "final"]
+        );
+        assert!(matches!(
+            restore.records.last().map(|record| &record.kind),
+            Some(super::RestoredRecordKind::FinalMessage {
+                terminal: super::ReadableTerminal::Final {
+                    attempts,
+                    overflow_recovery: Some(recovery),
+                    ..
+                },
+                ..
+            }) if attempts == std::slice::from_ref(&retry)
+                && recovery.attempts == std::slice::from_ref(&initial)
+        ));
+        let recovered_history = restore
+            .executable
+            .expect("recovered run is executable")
+            .history;
+        assert!(matches!(
+            recovered_history.entries(),
+            [crate::model::ModelContextEntry::CompactionSummary { summary }, .., crate::model::ModelContextEntry::FinalMessage { text, .. }]
+                if summary == "overflow summary" && text == "recovered"
+        ));
+
+        let writer = reopened.writer();
+        let applied = writer
+            .restore_at(compaction_entry)
+            .await
+            .expect("restore applied entry");
+        let applied_history = applied
+            .executable
+            .expect("applied entry is executable")
+            .history;
+        assert_eq!(
+            applied_history.entries(),
+            &recovered_history.entries()[..recovered_history.entries().len() - 1]
+        );
+        assert_eq!(applied.footer_adjustment, [retry.clone(), initial.clone()]);
+        let sibling = writer
+            .restore_at(branch_point)
+            .await
+            .expect("restore sibling branch point");
+        assert!(matches!(
+            sibling.executable.expect("sibling is executable").history.entries(),
+            [crate::model::ModelContextEntry::UserRequest { text }] if text == "sibling base"
+        ));
+        assert_eq!(sibling.footer_adjustment, [summary, retry, initial]);
+        assert_eq!(
+            writer
+                .restore_at(recovered_leaf)
+                .await
+                .expect("restore recovered leaf")
+                .footer_adjustment,
+            Vec::new()
+        );
+        drop(writer);
+        reopened.close().expect("close reopened session");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn writer_ownership_is_process_exclusive_and_keeps_a_stable_lock_file() {

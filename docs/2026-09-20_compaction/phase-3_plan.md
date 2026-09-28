@@ -229,7 +229,7 @@ First red: `agent::tests::context_overflow_compacts_and_retries_same_pending_ste
 - During overflow summarisation, delayed epoch-0 chunks and `ModelStepStarted` cannot replace the compaction spinner or status. Reliable epoch reset precedes retry progress; epoch-0 chunks already buffered at Runtime or forwarded to the TUI cannot repaint epoch 1 even under saturation or reordering across reliable/lossy channels. Settled accounting remains visible; first generation remains epoch 0.
 - Every terminal route after overflow carries the initial observation once: immediate retry Final/Failed/Cancelled, execution failure/cancellation, cancellation between steps, later provider failure, duplicate call ID and a later Final after recovered code. Verify billing once on each route. Restart after Applied before retry leaves the Compaction Entry, settles pending step/Run with the generic interruption terminal, and never reconstructs lost in-memory attempts or replays work. Restart after success restores context, branches, attempt totals and terminal inspection. Direct selection of Applied and a sibling branch preserve their own projections.
 
-**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`.
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`; `src/openai.rs` (test observer for the reliable restart event).
 
 **Verification**
 

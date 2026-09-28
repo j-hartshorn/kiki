@@ -2293,6 +2293,7 @@ pub(crate) struct Transcript {
     run_state: RunState,
     compaction_state: CompactionState,
     automatic_compaction: Option<RunId>,
+    initial_overflow: Option<(RunId, ModelStepId, Vec<AttemptAccounting>)>,
     disabled_reason: Option<RuntimeDisabledReason>,
     latest_run_id: Option<RunId>,
     settled_run_ids: Vec<RunId>,
@@ -2322,6 +2323,7 @@ impl Default for Transcript {
             run_state: RunState::Idle,
             compaction_state: CompactionState::Idle,
             automatic_compaction: None,
+            initial_overflow: None,
             disabled_reason: None,
             latest_run_id: None,
             settled_run_ids: Vec::new(),
@@ -2477,8 +2479,13 @@ impl Transcript {
     pub(crate) fn apply(&mut self, event: RuntimeEvent, gap_before: bool) -> bool {
         match event {
             RuntimeEvent::RunStarted { run_id } => self.start_run(run_id, gap_before),
-            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+            RuntimeEvent::ModelStepStarted {
+                run_id,
+                step_id,
+                epoch,
+            } => {
                 if self.automatic_compaction == Some(run_id)
+                    || self.is_stale_generation(run_id, step_id, epoch)
                     || self.has_settled_run(run_id, step_id)
                 {
                     false
@@ -2491,9 +2498,11 @@ impl Transcript {
             RuntimeEvent::ModelProgress {
                 run_id,
                 step_id,
+                epoch,
                 progress,
             } => {
                 if self.automatic_compaction == Some(run_id)
+                    || self.is_stale_generation(run_id, step_id, epoch)
                     || self.has_settled_run(run_id, step_id)
                 {
                     false
@@ -2664,9 +2673,13 @@ impl Transcript {
             }
             RuntimeEvent::SubagentOperationSettled { .. } => false,
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
-            RuntimeEvent::AutomaticCompactionStarted { run_id } => {
-                self.start_automatic_compaction(run_id)
-            }
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow,
+            } => self.start_automatic_compaction(run_id, initial_overflow),
+            RuntimeEvent::GenerationRestarted {
+                run_id, step_id, ..
+            } => self.restart_generation(run_id, step_id),
             RuntimeEvent::CompactionAcknowledged { acknowledgement } => match acknowledgement {
                 crate::runtime::CompactionAcknowledgement::Accepted
                     if self.disabled_reason.is_none()
@@ -3049,6 +3062,9 @@ impl Transcript {
             foreground_attempts.extend(&live.settled_attempts);
             normal_foreground_attempts.extend(&live.settled_attempts);
         }
+        if let Some((_, _, attempts)) = &self.initial_overflow {
+            foreground_attempts.extend(attempts);
+        }
         let latest_foreground_attempt = normal_foreground_attempts.last().copied();
         let mut attempts = foreground_attempts;
         attempts.extend(
@@ -3112,11 +3128,16 @@ impl Transcript {
         self.latest_run_id = Some(run_id);
         self.pending_run_gap = gap_before;
         self.live_step = None;
+        self.initial_overflow = None;
         self.run_state = RunState::Active(run_id);
         self.set_status("starting run".to_owned())
     }
 
-    fn start_automatic_compaction(&mut self, run_id: RunId) -> bool {
+    fn start_automatic_compaction(
+        &mut self,
+        run_id: RunId,
+        initial_overflow: Option<(ModelStepId, Vec<AttemptAccounting>)>,
+    ) -> bool {
         if self.disabled_reason.is_some()
             || self.is_terminal_run(run_id)
             || self
@@ -3128,8 +3149,43 @@ impl Transcript {
         }
         self.latest_run_id = Some(run_id);
         self.run_state = RunState::Active(run_id);
-        let started = self.automatic_compaction.replace(run_id).is_none();
-        started | self.set_status("compacting context".to_owned())
+        let mut changed = self.automatic_compaction.replace(run_id).is_none();
+        if let Some((step_id, attempts)) = initial_overflow {
+            if let Some(live) = self
+                .live_step
+                .as_mut()
+                .filter(|live| live.run_id == run_id && live.step_id == step_id)
+            {
+                live.settled_attempts.clear();
+            }
+            self.initial_overflow = Some((run_id, step_id, attempts));
+            changed = true;
+        }
+        changed | self.set_status("compacting context".to_owned())
+    }
+
+    fn is_stale_generation(&self, run_id: RunId, step_id: ModelStepId, epoch: u32) -> bool {
+        epoch == 0
+            && self
+                .initial_overflow
+                .as_ref()
+                .is_some_and(|(overflow_run, overflow_step, _)| {
+                    *overflow_run == run_id && *overflow_step == step_id
+                })
+    }
+
+    fn restart_generation(&mut self, run_id: RunId, step_id: ModelStepId) -> bool {
+        let Some(live) = self
+            .live_step
+            .as_mut()
+            .filter(|live| live.run_id == run_id && live.step_id == step_id)
+        else {
+            return false;
+        };
+        let restarted = LiveStep::new(run_id, step_id, live.progress_gap);
+        let changed = *live != restarted;
+        *live = restarted;
+        changed
     }
 
     fn update_live_step(
@@ -3362,6 +3418,13 @@ impl Transcript {
         }
         if self.automatic_compaction == Some(run_id) {
             self.automatic_compaction = None;
+        }
+        if self
+            .initial_overflow
+            .as_ref()
+            .is_some_and(|(overflow_run, ..)| *overflow_run == run_id)
+        {
+            self.initial_overflow = None;
         }
         if self
             .live_step
@@ -4619,6 +4682,13 @@ mod tests {
         assert!(transcript.is_idle());
     }
 
+    fn threshold_compaction_started(run_id: RunId) -> RuntimeEvent {
+        RuntimeEvent::AutomaticCompactionStarted {
+            run_id,
+            initial_overflow: None,
+        }
+    }
+
     fn automatic_compaction_card(run_id: RunId) -> RuntimeEvent {
         RuntimeEvent::RecordAppended {
             record: StoredRecord {
@@ -4661,7 +4731,7 @@ mod tests {
         let run_id = RunId(3);
         let mut transcript = submitted_run(run_id);
 
-        assert!(transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false));
+        assert!(transcript.apply(threshold_compaction_started(run_id), false));
         assert_eq!(transcript.status(), "compacting context");
         assert!(transcript.is_compacting());
         assert!(!transcript.is_generating());
@@ -4671,11 +4741,19 @@ mod tests {
 
         for step_id in [ModelStepId(2), ModelStepId(3)] {
             assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id }, false));
-            assert!(!transcript.apply(RuntimeEvent::ModelStepStarted { run_id, step_id }, false));
+            assert!(!transcript.apply(
+                RuntimeEvent::ModelStepStarted {
+                    run_id,
+                    step_id,
+                    epoch: 0,
+                },
+                false,
+            ));
             assert!(!transcript.apply(
                 RuntimeEvent::ModelProgress {
                     run_id,
                     step_id,
+                    epoch: 0,
                     progress: ModelProgress::AssistantTextChunk {
                         text: "stale streamed text".to_owned(),
                     },
@@ -4696,6 +4774,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id,
                 step_id: ModelStepId(4),
+                epoch: 0,
             },
             false,
         ));
@@ -4723,7 +4802,7 @@ mod tests {
             },
         ] {
             let mut transcript = submitted_run(run_id);
-            assert!(transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false));
+            assert!(transcript.apply(threshold_compaction_started(run_id), false));
 
             assert!(transcript.apply(ending.clone(), false), "{ending:?}");
             assert!(!transcript.is_compacting(), "{ending:?}");
@@ -4731,11 +4810,332 @@ mod tests {
             transcript.apply(RuntimeEvent::RunSettled { run_id }, false);
             assert_ne!(transcript.status(), "compacting context", "{ending:?}");
             assert!(
-                !transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false),
+                !transcript.apply(threshold_compaction_started(run_id), false),
                 "{ending:?}"
             );
             assert!(!transcript.is_compacting(), "{ending:?}");
         }
+    }
+
+    fn overflow_compaction_card(run_id: RunId) -> RuntimeEvent {
+        RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id,
+                record: Record::Compaction {
+                    outcome: CompactionOutcome::Applied {
+                        summary: "summary".to_owned(),
+                        first_retained: SessionEntryId(4),
+                        context_tokens: 1_250,
+                        reason: CompactionReason::ContextOverflow,
+                        attempts: Vec::new(),
+                    },
+                },
+            },
+            progress_gap: false,
+        }
+    }
+
+    #[test]
+    fn overflow_retry_reset_rejects_stale_generation_and_keeps_settled_usage() {
+        let run_id = RunId(3);
+        let step_id = ModelStepId(4);
+        let started = |epoch| RuntimeEvent::ModelStepStarted {
+            run_id,
+            step_id,
+            epoch,
+        };
+        let progress = |epoch, progress| RuntimeEvent::ModelProgress {
+            run_id,
+            step_id,
+            epoch,
+            progress,
+        };
+        let text = |text: &str| ModelProgress::AssistantTextChunk {
+            text: text.to_owned(),
+        };
+        let mut transcript = submitted_run(run_id);
+        for event in [
+            started(0),
+            progress(0, ModelProgress::AttemptStarted { attempt: 1 }),
+            progress(0, text("initial partial")),
+            progress(
+                0,
+                ModelProgress::AttemptSettled {
+                    attempt: 1,
+                    accounting: usage(3, 2),
+                },
+            ),
+        ] {
+            assert!(transcript.apply(event, false));
+        }
+        assert!(rendered_layout_text(&mut transcript).contains("initial partial"));
+        assert!(transcript.apply(
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: Some((step_id, vec![usage(3, 2)])),
+            },
+            false,
+        ));
+
+        assert!(transcript.apply(
+            RuntimeEvent::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch: 1,
+            },
+            false,
+        ));
+        assert_eq!(transcript.status(), "compacting context");
+        assert!(transcript.is_compacting());
+        assert!(!transcript.is_generating());
+        assert!(!rendered_layout_text(&mut transcript).contains("initial partial"));
+
+        assert!(transcript.apply(overflow_compaction_card(run_id), false));
+        assert_eq!(transcript.status(), "starting run");
+        for event in [
+            started(0),
+            progress(0, ModelProgress::AttemptStarted { attempt: 2 }),
+            progress(0, text("delayed stale")),
+        ] {
+            assert!(!transcript.apply(event, false));
+        }
+        assert_eq!(transcript.status(), "starting run");
+        assert!(!rendered_layout_text(&mut transcript).contains("stale"));
+
+        assert!(transcript.apply(started(1), false));
+        assert!(transcript.is_generating());
+        assert_eq!(transcript.status(), "generating");
+        assert!(transcript.apply(
+            progress(1, ModelProgress::AttemptStarted { attempt: 1 }),
+            false
+        ));
+        assert!(transcript.apply(progress(1, text("fresh retry")), false));
+        let rendered = rendered_layout_text(&mut transcript);
+        assert!(rendered.contains("fresh retry"), "{rendered}");
+        assert!(!rendered.contains("partial"), "{rendered}");
+        let live = transcript.live_step.as_ref().expect("retry live step");
+        assert_eq!(live.attempt, Some(1));
+        assert!(live.settled_attempts.is_empty());
+        assert!(
+            footer_text(&transcript.layout(128))
+                .expect("footer")
+                .contains("↑3 ↓2")
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::ModelStepStarted {
+                run_id,
+                step_id: ModelStepId(5),
+                epoch: 0,
+            },
+            false,
+        ));
+    }
+
+    #[test]
+    fn initial_overflow_usage_bills_once_through_recovery_without_occupancy() {
+        let run_id = RunId(1);
+        let step_id = ModelStepId(1);
+        let next_step_id = ModelStepId(2);
+        let initial = detailed_usage(
+            Some(100_000),
+            Some(0),
+            Some(75_000),
+            Some(0),
+            Some(0),
+            Some(100_000),
+        );
+        let next = detailed_usage(
+            Some(1_000),
+            Some(0),
+            Some(500),
+            Some(0),
+            Some(0),
+            Some(1_000),
+        );
+        let started = |step_id, epoch| RuntimeEvent::ModelStepStarted {
+            run_id,
+            step_id,
+            epoch,
+        };
+        let settled = |step_id, epoch, accounting| RuntimeEvent::ModelProgress {
+            run_id,
+            step_id,
+            epoch,
+            progress: ModelProgress::AttemptSettled {
+                attempt: 1,
+                accounting,
+            },
+        };
+        let footer =
+            |transcript: &mut Transcript| footer_text(&transcript.layout(128)).unwrap_or_default();
+        let assert_initial_only = |transcript: &mut Transcript, context: &str| {
+            let footer = footer(transcript);
+            assert!(footer.contains("↑100k"), "{context}: {footer}");
+            assert!(footer.contains('$'), "{context}: {footer}");
+            assert!(!footer.contains("%/"), "{context}: {footer}");
+            assert!(!footer.contains("CH"), "{context}: {footer}");
+        };
+
+        for initial_seen in [true, false] {
+            let case = if initial_seen { "seen" } else { "blocked" };
+            let mut transcript = submitted_run(run_id);
+            assert!(transcript.apply(started(step_id, 0), false));
+            assert!(transcript.apply(
+                RuntimeEvent::ModelProgress {
+                    run_id,
+                    step_id,
+                    epoch: 0,
+                    progress: ModelProgress::AttemptStarted { attempt: 1 },
+                },
+                false,
+            ));
+            if initial_seen {
+                assert!(transcript.apply(settled(step_id, 0, initial.clone()), false));
+            }
+
+            assert!(transcript.apply(
+                RuntimeEvent::AutomaticCompactionStarted {
+                    run_id,
+                    initial_overflow: Some((step_id, vec![initial.clone()])),
+                },
+                false,
+            ));
+            assert_eq!(transcript.status(), "compacting context", "{case}");
+            assert!(transcript.is_compacting(), "{case}");
+            assert!(!transcript.is_generating(), "{case}");
+            assert_initial_only(&mut transcript, &format!("{case} summary"));
+            assert!(!transcript.apply(settled(step_id, 0, initial.clone()), false));
+
+            transcript.apply(
+                RuntimeEvent::GenerationRestarted {
+                    run_id,
+                    step_id,
+                    epoch: 1,
+                },
+                false,
+            );
+            assert!(transcript.apply(overflow_compaction_card(run_id), false));
+            assert!(!transcript.apply(started(step_id, 0), false));
+            assert!(!transcript.apply(settled(step_id, 0, initial.clone()), false));
+            assert_eq!(transcript.status(), "starting run", "{case}");
+            assert_initial_only(&mut transcript, &format!("{case} card"));
+
+            assert!(transcript.apply(started(step_id, 1), false));
+            assert_eq!(transcript.status(), "generating", "{case}");
+            assert!(transcript.apply(
+                settled(step_id, 1, AttemptAccounting::UsageUnavailable),
+                false
+            ));
+            assert_initial_only(&mut transcript, &format!("{case} retry"));
+
+            assert!(transcript.apply(
+                completed_execution(
+                    1,
+                    1,
+                    "retry()",
+                    "",
+                    vec![AttemptAccounting::UsageUnavailable],
+                ),
+                false,
+            ));
+            assert_initial_only(&mut transcript, &format!("{case} code"));
+
+            assert!(transcript.apply(started(next_step_id, 0), false));
+            assert_eq!(transcript.status(), "generating", "{case}");
+            assert_initial_only(&mut transcript, &format!("{case} next step"));
+            assert!(transcript.apply(settled(next_step_id, 0, next.clone()), false));
+            let streaming = footer(&mut transcript);
+            assert!(streaming.contains("↑101k"), "{case}: {streaming}");
+            assert!(streaming.contains("CH50.0%"), "{case}: {streaming}");
+            assert!(streaming.contains("%/"), "{case}: {streaming}");
+
+            assert!(transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record: StoredRecord {
+                        run_id,
+                        record: Record::FinalMessage {
+                            step_id: next_step_id,
+                            text: "done".to_owned(),
+                            reasoning_summary: String::new(),
+                            terminal: TerminalDetails {
+                                evidence: None,
+                                attempts: vec![next.clone()],
+                                overflow_recovery: Some(overflow_recovery(vec![initial.clone()])),
+                            },
+                        },
+                    },
+                    progress_gap: false,
+                },
+                false,
+            ));
+            assert_eq!(footer(&mut transcript), streaming, "{case} terminal");
+            assert!(transcript.apply(RuntimeEvent::RunSettled { run_id }, false));
+            assert!(transcript.begin_submission());
+            transcript.apply(RuntimeEvent::RunStarted { run_id: RunId(2) }, false);
+            assert!(transcript.apply(
+                RuntimeEvent::ModelStepStarted {
+                    run_id: RunId(2),
+                    step_id: ModelStepId(3),
+                    epoch: 0,
+                },
+                false,
+            ));
+            assert_eq!(footer(&mut transcript), streaming, "{case} next run");
+        }
+    }
+
+    #[test]
+    fn initial_overflow_usage_survives_disable_and_counts_once_with_a_later_terminal() {
+        let run_id = RunId(1);
+        let step_id = ModelStepId(1);
+        let mut transcript = submitted_run(run_id);
+        assert!(transcript.apply(
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: Some((step_id, vec![usage(3, 2)])),
+            },
+            false,
+        ));
+        assert!(
+            footer_text(&transcript.layout(128))
+                .expect("footer")
+                .contains("↑3 ↓2")
+        );
+
+        assert!(transcript.apply(
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+            false,
+        ));
+        assert!(
+            footer_text(&transcript.layout(128))
+                .expect("footer after storage failure")
+                .contains("↑3 ↓2")
+        );
+
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::CancelledRun {
+                        terminal: TerminalDetails {
+                            evidence: None,
+                            attempts: Vec::new(),
+                            overflow_recovery: Some(overflow_recovery(vec![usage(3, 2)])),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        assert!(
+            footer_text(&transcript.layout(128))
+                .expect("footer")
+                .contains("↑3 ↓2")
+        );
     }
 
     #[test]
@@ -5208,6 +5608,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "await start_subagent('review')".to_owned(),
                 },
@@ -5254,6 +5655,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "late_python()".to_owned(),
                 },
@@ -5320,6 +5722,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 1 },
             },
             false,
@@ -5328,6 +5731,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "discarded_python()".to_owned(),
                 },
@@ -5346,6 +5750,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 2 },
             },
             false,
@@ -5354,6 +5759,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "Authoritative commentary.".to_owned(),
                 },
@@ -5364,6 +5770,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "executed_python()".to_owned(),
                 },
@@ -5453,6 +5860,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "spawn_python()".to_owned(),
                 },
@@ -5480,6 +5888,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "current_python()".to_owned(),
                 },
@@ -5542,6 +5951,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 2 },
             },
             false,
@@ -5550,6 +5960,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "await start_subagent('review')".to_owned(),
                 },
@@ -5584,6 +5995,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(2),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "later_python()".to_owned(),
                 },
@@ -6601,6 +7013,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::ReasoningSummaryChunk {
                     text: "## Live reasoning 日本 🦀 e\u{301}".to_owned(),
                 },
@@ -6611,6 +7024,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "**Live Markdown** 日本 🦀 e\u{301}".to_owned(),
                 },
@@ -6621,6 +7035,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: usage(2, 3),
@@ -6752,6 +7167,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: usage(3, 2),
@@ -6772,6 +7188,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "live assistant".to_owned(),
                 },
@@ -6812,6 +7229,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "stale".to_owned(),
                 },
@@ -6943,6 +7361,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: usage(1, 1),
@@ -7422,6 +7841,7 @@ warning body"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "gap_code".to_owned(),
                 },
@@ -7551,6 +7971,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "preview()".to_owned(),
                 },
@@ -7579,6 +8000,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
                 step_id: ModelStepId(3),
+                epoch: 0,
             },
             false,
         );
@@ -7597,6 +8019,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "stale step".to_owned(),
                 },
@@ -7615,6 +8038,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 1 },
             },
             true,
@@ -7623,6 +8047,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::ReasoningSummaryChunk {
                     text: "discarded reasoning".to_owned(),
                 },
@@ -7633,6 +8058,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "discarded_code()".to_owned(),
                 },
@@ -7643,6 +8069,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: usage(100, 0),
@@ -7654,6 +8081,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 2 },
             },
             false,
@@ -7662,6 +8090,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "retained answer".to_owned(),
                 },
@@ -7685,6 +8114,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::ReasoningSummaryChunk {
                     text: "partial summary".to_owned(),
                 },
@@ -7722,6 +8152,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(2),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "new live result".to_owned(),
                 },
@@ -7747,6 +8178,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             false,
         );
@@ -7762,6 +8194,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
                 step_id: ModelStepId(3),
+                epoch: 0,
             },
             false,
         );
@@ -8443,6 +8876,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             false,
         );
@@ -8455,6 +8889,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: AttemptAccounting::UsageUnavailable,
@@ -9015,6 +9450,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: first.clone(),
@@ -9356,6 +9792,7 @@ truncated"
                 RuntimeEvent::ModelProgress {
                     run_id: RunId(1),
                     step_id: ModelStepId(1),
+                    epoch: 0,
                     progress,
                 },
                 false,
@@ -9425,6 +9862,7 @@ truncated"
                 RuntimeEvent::ModelProgress {
                     run_id: RunId(1),
                     step_id: ModelStepId(1),
+                    epoch: 0,
                     progress,
                 },
                 gap_before,
@@ -9779,6 +10217,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "I’ll inspect".to_owned(),
                 },
@@ -10137,6 +10576,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "live".to_owned(),
                 },
@@ -10159,6 +10599,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "await read('live-path')".to_owned(),
                 },
@@ -11110,6 +11551,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             false,
         ));
@@ -11117,6 +11559,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "stale()".to_owned(),
                 },
@@ -11353,6 +11796,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "pass".to_owned(),
                 },
@@ -11570,6 +12014,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "live_source".to_owned(),
                 },
@@ -11965,6 +12410,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(2),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::DecodedPythonChunk {
                     code: "def incomplete(".to_owned(),
                 },
@@ -12085,6 +12531,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
+                epoch: 0,
             },
             false,
         );
@@ -12093,6 +12540,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(3),
                 step_id: ModelStepId(8),
+                epoch: 0,
                 progress: ModelProgress::AttemptStarted { attempt: 9 },
             },
             false,
@@ -12233,6 +12681,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AttemptSettled {
                     attempt: 1,
                     accounting: usage(1, 1),
@@ -12244,6 +12693,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "live final".to_owned(),
                 },
@@ -12399,6 +12849,7 @@ truncated"
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(73),
                 step_id: ModelStepId(91),
+                epoch: 0,
             },
             false,
         );
@@ -12411,6 +12862,7 @@ truncated"
             RuntimeEvent::ModelProgress {
                 run_id: RunId(72),
                 step_id: ModelStepId(90),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "stale".to_owned(),
                 },

@@ -17,12 +17,15 @@ use crate::model::{
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderFailure, ProviderReplay,
 };
 use crate::session::{
-    CommittedCompaction, CompactionReason, CompactionSettlement, PersistedCode, PersistedTerminal,
-    SessionEntryId, SessionError, SessionWriter,
+    CommittedCompaction, CompactionOutcome, CompactionReason, CompactionSettlement, PersistedCode,
+    PersistedTerminal, SessionEntryId, SessionError, SessionWriter,
 };
 use crate::subagents::AgentInvocationContext;
 const FAILED_STEP_EVIDENCE_LIMIT: usize = 4 * 1024;
 const FAILED_RUN_MESSAGE_LIMIT: usize = 4 * 1024;
+const OVERFLOW_MESSAGE_COMPONENT_LIMIT: usize = 2_000;
+const NO_REMOVABLE_PREFIX: &str = "compaction could not remove a valid prefix";
+const SUMMARY_NOT_STARTED: &str = "summary finished without starting a provider attempt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvidence {
@@ -141,6 +144,7 @@ pub(crate) enum PersistedAgentEvent {
     },
     CompactionStarted {
         run_id: u64,
+        initial_overflow: Option<(u64, Vec<AttemptAccounting>)>,
     },
     CompactionCommitted {
         compaction: CommittedCompaction,
@@ -148,10 +152,17 @@ pub(crate) enum PersistedAgentEvent {
     ModelStepStarted {
         run_id: u64,
         step_id: u64,
+        epoch: u32,
+    },
+    GenerationRestarted {
+        run_id: u64,
+        step_id: u64,
+        epoch: u32,
     },
     ModelProgress {
         run_id: u64,
         step_id: u64,
+        epoch: u32,
         progress: ModelProgress,
     },
     ExecutionStarted {
@@ -203,7 +214,7 @@ pub(crate) struct PersistedRunOutcome {
 pub(crate) enum CompactionResult {
     NoOp,
     CancelledBeforeStart,
-    FailedBeforeStart,
+    FailedBeforeStart(String),
     Settled(CommittedCompaction),
 }
 
@@ -684,7 +695,9 @@ impl<M: Model> Agent<M> {
             return Ok(if cancellation.is_cancelled() {
                 CompactionResult::CancelledBeforeStart
             } else {
-                CompactionResult::FailedBeforeStart
+                CompactionResult::FailedBeforeStart(
+                    failure.unwrap_or_else(|| SUMMARY_NOT_STARTED.to_owned()),
+                )
             });
         }
 
@@ -743,6 +756,7 @@ impl<M: Model> Agent<M> {
         let mut committed_attempts = 0;
         let mut generation = GenerationEvidenceBuilder::default();
         let mut pending_step_id = None;
+        let mut overflow_recovery = None;
 
         loop {
             if !cancellation.is_cancelled() {
@@ -755,7 +769,12 @@ impl<M: Model> Agent<M> {
                         String::new(),
                         cancellation,
                         writer,
-                        &mut || event(PersistedAgentEvent::CompactionStarted { run_id }),
+                        &mut || {
+                            event(PersistedAgentEvent::CompactionStarted {
+                                run_id,
+                                initial_overflow: None,
+                            })
+                        },
                     )
                     .await?;
                 if let CompactionResult::Settled(compaction) = result {
@@ -777,7 +796,12 @@ impl<M: Model> Agent<M> {
                     overflow_recovery: None,
                 };
                 let terminal = writer
-                    .close_run(run_id, pending_step_id, move || terminal, None)
+                    .close_run(
+                        run_id,
+                        pending_step_id,
+                        move || seal_terminal(terminal, overflow_recovery),
+                        None,
+                    )
                     .await?;
                 return Ok(PersistedRunOutcome {
                     run_id,
@@ -790,45 +814,120 @@ impl<M: Model> Agent<M> {
             if let Some(context) = &mut self.invocation_context {
                 context.set_origin_step_id(step_id);
             }
-            event(PersistedAgentEvent::ModelStepStarted { run_id, step_id });
-            if cancellation.is_cancelled() {
-                let terminal = PersistedTerminal::Cancelled {
-                    evidence: generation.evidence().map(TerminalEvidence::Generation),
-                    attempts: attempts[committed_attempts..].to_vec(),
-                    overflow_recovery: None,
-                };
-                let terminal = writer
-                    .close_run(run_id, pending_step_id, move || terminal, None)
-                    .await?;
-                return Ok(PersistedRunOutcome {
-                    run_id,
-                    terminal,
-                    authentication_failure: false,
-                    recovery_failure: false,
-                });
-            }
+            event(PersistedAgentEvent::ModelStepStarted {
+                run_id,
+                step_id,
+                epoch: 0,
+            });
 
-            let mut model_progress = |progress: ModelProgress| {
-                generation.capture(&progress);
-                event(PersistedAgentEvent::ModelProgress {
-                    run_id,
-                    step_id,
-                    progress,
-                });
-            };
-            let history = writer.model_history()?;
-            let model_step = match self
-                .model
-                .step(selection, &history, cancellation, &mut model_progress)
-                .await
-            {
-                Ok(step) => step,
-                Err(failure) => {
-                    attempts.extend(failure.attempts().iter().cloned());
-                    let failure_is_cancelled = failure.is_cancelled();
-                    let authentication_failure = failure.is_authentication();
-                    let message = bounded_utf8(failure.to_string(), FAILED_RUN_MESSAGE_LIMIT);
-                    let evidence = generation.evidence().map(TerminalEvidence::Generation);
+            let mut epoch = 0;
+            let (history, model_step) = loop {
+                if cancellation.is_cancelled() {
+                    let terminal = PersistedTerminal::Cancelled {
+                        evidence: generation.evidence().map(TerminalEvidence::Generation),
+                        attempts: attempts[committed_attempts..].to_vec(),
+                        overflow_recovery: None,
+                    };
+                    let terminal = writer
+                        .close_run(
+                            run_id,
+                            pending_step_id,
+                            move || seal_terminal(terminal, overflow_recovery),
+                            None,
+                        )
+                        .await?;
+                    return Ok(PersistedRunOutcome {
+                        run_id,
+                        terminal,
+                        authentication_failure: false,
+                        recovery_failure: false,
+                    });
+                }
+                let mut model_progress = |progress: ModelProgress| {
+                    generation.capture(&progress);
+                    event(PersistedAgentEvent::ModelProgress {
+                        run_id,
+                        step_id,
+                        epoch,
+                        progress,
+                    });
+                };
+                let history = writer.model_history()?;
+                let failure = match self
+                    .model
+                    .step(selection, &history, cancellation, &mut model_progress)
+                    .await
+                {
+                    Ok(step) => break (history, step),
+                    Err(failure) => failure,
+                };
+                if overflow_recovery.is_none()
+                    && policy.enabled()
+                    && let Some(provider_failure) = failure
+                        .provider_failure()
+                        .filter(|failure| failure.is_context_overflow())
+                {
+                    let original = provider_failure.to_string();
+                    let initial_attempts = failure.attempts().to_vec();
+                    overflow_recovery = Some(OverflowRecovery {
+                        failure: provider_failure.clone(),
+                        generation: std::mem::take(&mut generation).evidence(),
+                        attempts: initial_attempts.clone(),
+                    });
+                    let result = self
+                        .compact(
+                            CompactionReason::ContextOverflow,
+                            policy,
+                            selection,
+                            reasoning,
+                            String::new(),
+                            cancellation,
+                            writer,
+                            &mut || {
+                                event(PersistedAgentEvent::CompactionStarted {
+                                    run_id,
+                                    initial_overflow: Some((step_id, initial_attempts.clone())),
+                                })
+                            },
+                        )
+                        .await?;
+                    let recovery_failure = match result {
+                        CompactionResult::NoOp => Some(NO_REMOVABLE_PREFIX.to_owned()),
+                        CompactionResult::CancelledBeforeStart => None,
+                        CompactionResult::FailedBeforeStart(diagnostic) => Some(diagnostic),
+                        CompactionResult::Settled(compaction) => {
+                            let diagnostic = match &compaction.outcome {
+                                CompactionOutcome::Failed { diagnostic, .. } => {
+                                    Some(diagnostic.clone())
+                                }
+                                CompactionOutcome::Applied { .. }
+                                | CompactionOutcome::Cancelled { .. } => None,
+                            };
+                            let retry =
+                                matches!(compaction.outcome, CompactionOutcome::Applied { .. })
+                                    && !cancellation.is_cancelled();
+                            if retry {
+                                epoch = 1;
+                                event(PersistedAgentEvent::GenerationRestarted {
+                                    run_id,
+                                    step_id,
+                                    epoch,
+                                });
+                            }
+                            event(PersistedAgentEvent::CompactionCommitted { compaction });
+                            if retry {
+                                event(PersistedAgentEvent::ModelStepStarted {
+                                    run_id,
+                                    step_id,
+                                    epoch,
+                                });
+                                continue;
+                            }
+                            diagnostic
+                        }
+                    };
+                    let message = recovery_failure
+                        .map(|recovery| overflow_recovery_message(original, recovery));
                     let attempts = attempts[committed_attempts..].to_vec();
                     let cancellation = cancellation.clone();
                     let terminal = writer
@@ -836,6 +935,48 @@ impl<M: Model> Agent<M> {
                             run_id,
                             pending_step_id,
                             move || {
+                                seal_terminal(
+                                    match message {
+                                        Some(message) if !cancellation.is_cancelled() => {
+                                            PersistedTerminal::Failed {
+                                                message,
+                                                evidence: None,
+                                                attempts,
+                                                overflow_recovery: None,
+                                            }
+                                        }
+                                        _ => PersistedTerminal::Cancelled {
+                                            evidence: None,
+                                            attempts,
+                                            overflow_recovery: None,
+                                        },
+                                    },
+                                    overflow_recovery,
+                                )
+                            },
+                            None,
+                        )
+                        .await?;
+                    return Ok(PersistedRunOutcome {
+                        run_id,
+                        terminal,
+                        authentication_failure: false,
+                        recovery_failure: false,
+                    });
+                }
+                attempts.extend(failure.attempts().iter().cloned());
+                let failure_is_cancelled = failure.is_cancelled();
+                let authentication_failure = failure.is_authentication();
+                let message = bounded_utf8(failure.to_string(), FAILED_RUN_MESSAGE_LIMIT);
+                let evidence = generation.evidence().map(TerminalEvidence::Generation);
+                let attempts = attempts[committed_attempts..].to_vec();
+                let cancellation = cancellation.clone();
+                let terminal = writer
+                    .close_run(
+                        run_id,
+                        pending_step_id,
+                        move || {
+                            seal_terminal(
                                 if cancellation.is_cancelled() || failure_is_cancelled {
                                     PersistedTerminal::Cancelled {
                                         evidence,
@@ -849,21 +990,20 @@ impl<M: Model> Agent<M> {
                                         attempts,
                                         overflow_recovery: None,
                                     }
-                                }
-                            },
-                            None,
-                        )
-                        .await?;
-                    return Ok(PersistedRunOutcome {
-                        run_id,
-                        authentication_failure: matches!(
-                            &terminal,
-                            PersistedTerminal::Failed { .. }
-                        ) && authentication_failure,
-                        terminal,
-                        recovery_failure: false,
-                    });
-                }
+                                },
+                                overflow_recovery,
+                            )
+                        },
+                        None,
+                    )
+                    .await?;
+                return Ok(PersistedRunOutcome {
+                    run_id,
+                    authentication_failure: matches!(&terminal, PersistedTerminal::Failed { .. })
+                        && authentication_failure,
+                    terminal,
+                    recovery_failure: false,
+                });
             };
             let ModelStep {
                 action,
@@ -891,20 +1031,23 @@ impl<M: Model> Agent<M> {
                                 run_id,
                                 pending_step_id,
                                 move || {
-                                    if cancellation.is_cancelled() {
-                                        PersistedTerminal::Cancelled {
-                                            evidence,
-                                            attempts,
-                                            overflow_recovery: None,
-                                        }
-                                    } else {
-                                        PersistedTerminal::Failed {
-                                            message,
-                                            evidence,
-                                            attempts,
-                                            overflow_recovery: None,
-                                        }
-                                    }
+                                    seal_terminal(
+                                        if cancellation.is_cancelled() {
+                                            PersistedTerminal::Cancelled {
+                                                evidence,
+                                                attempts,
+                                                overflow_recovery: None,
+                                            }
+                                        } else {
+                                            PersistedTerminal::Failed {
+                                                message,
+                                                evidence,
+                                                attempts,
+                                                overflow_recovery: None,
+                                            }
+                                        },
+                                        overflow_recovery,
+                                    )
                                 },
                                 None,
                             )
@@ -940,7 +1083,12 @@ impl<M: Model> Agent<M> {
                             overflow_recovery: None,
                         };
                         let terminal = writer
-                            .close_run(run_id, pending_step_id, move || terminal, Some(code))
+                            .close_run(
+                                run_id,
+                                pending_step_id,
+                                move || seal_terminal(terminal, overflow_recovery),
+                                Some(code),
+                            )
                             .await?;
                         return Ok(PersistedRunOutcome {
                             run_id,
@@ -1054,22 +1202,25 @@ impl<M: Model> Agent<M> {
                                     run_id,
                                     pending_step_id,
                                     move || {
-                                        if !is_recovery_failure
-                                            && (cancellation.is_cancelled() || arena_cancelled)
-                                        {
-                                            PersistedTerminal::Cancelled {
-                                                evidence,
-                                                attempts,
-                                                overflow_recovery: None,
-                                            }
-                                        } else {
-                                            PersistedTerminal::Failed {
-                                                message,
-                                                evidence,
-                                                attempts,
-                                                overflow_recovery: None,
-                                            }
-                                        }
+                                        seal_terminal(
+                                            if !is_recovery_failure
+                                                && (cancellation.is_cancelled() || arena_cancelled)
+                                            {
+                                                PersistedTerminal::Cancelled {
+                                                    evidence,
+                                                    attempts,
+                                                    overflow_recovery: None,
+                                                }
+                                            } else {
+                                                PersistedTerminal::Failed {
+                                                    message,
+                                                    evidence,
+                                                    attempts,
+                                                    overflow_recovery: None,
+                                                }
+                                            },
+                                            overflow_recovery,
+                                        )
                                     },
                                     Some(code),
                                 )
@@ -1096,22 +1247,27 @@ impl<M: Model> Agent<M> {
                             run_id,
                             pending_step_id,
                             move || {
-                                if cancellation.is_cancelled() {
-                                    PersistedTerminal::Cancelled {
-                                        evidence: Some(TerminalEvidence::Generation(generation)),
-                                        attempts,
-                                        overflow_recovery: None,
-                                    }
-                                } else {
-                                    PersistedTerminal::Final {
-                                        step_id,
-                                        text,
-                                        reasoning_summary,
-                                        replay,
-                                        attempts,
-                                        overflow_recovery: None,
-                                    }
-                                }
+                                seal_terminal(
+                                    if cancellation.is_cancelled() {
+                                        PersistedTerminal::Cancelled {
+                                            evidence: Some(TerminalEvidence::Generation(
+                                                generation,
+                                            )),
+                                            attempts,
+                                            overflow_recovery: None,
+                                        }
+                                    } else {
+                                        PersistedTerminal::Final {
+                                            step_id,
+                                            text,
+                                            reasoning_summary,
+                                            replay,
+                                            attempts,
+                                            overflow_recovery: None,
+                                        }
+                                    },
+                                    overflow_recovery,
+                                )
                             },
                             None,
                         )
@@ -1315,6 +1471,31 @@ impl<M: Model> Agent<M> {
     }
 }
 
+fn seal_terminal(
+    mut terminal: PersistedTerminal,
+    recovery: Option<OverflowRecovery>,
+) -> PersistedTerminal {
+    let (PersistedTerminal::Final {
+        overflow_recovery, ..
+    }
+    | PersistedTerminal::Cancelled {
+        overflow_recovery, ..
+    }
+    | PersistedTerminal::Failed {
+        overflow_recovery, ..
+    }) = &mut terminal;
+    *overflow_recovery = recovery;
+    terminal
+}
+
+fn overflow_recovery_message(original: String, recovery: String) -> String {
+    format!(
+        "context overflow: {}\ncompaction recovery failed: {}",
+        bounded_utf8(original, OVERFLOW_MESSAGE_COMPONENT_LIMIT),
+        bounded_utf8(recovery, OVERFLOW_MESSAGE_COMPONENT_LIMIT),
+    )
+}
+
 fn persisted_code(
     pending: &PendingCode,
     result: CodeResult,
@@ -1488,7 +1669,7 @@ fn error_truncation_warning() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -1504,8 +1685,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Agent, AgentError, AgentProgress, CompactionResult, ExecutionFailure,
-        GenerationEvidenceBuilder, TerminalEvidence,
+        Agent, AgentError, AgentProgress, CompactionResult, ExecutionFailure, GenerationEvidence,
+        GenerationEvidenceBuilder, OverflowRecovery, TerminalEvidence,
     };
     use crate::arena::{
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
@@ -1520,8 +1701,9 @@ mod tests {
         SummaryRequest, SummaryResult,
     };
     use crate::session::{
-        CompactionOutcome, CompactionReason, PersistedTerminal, RestoredRecord, RestoredRecordKind,
-        Session, SessionEntryId, SessionWriteGate, SessionWriteKind, SessionWriter,
+        CompactionOutcome, CompactionReason, PersistedTerminal, ReadableTerminal, RestoredRecord,
+        RestoredRecordKind, Session, SessionEntryId, SessionWriteGate, SessionWriteKind,
+        SessionWriter,
     };
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
@@ -2132,7 +2314,11 @@ mod tests {
                         CompactionOutcome::Cancelled { .. } => "compaction:cancelled",
                     })
                 }
-                super::PersistedAgentEvent::ModelStepStarted { .. } => Some("step"),
+                super::PersistedAgentEvent::ModelStepStarted { epoch: 0, .. } => Some("step"),
+                super::PersistedAgentEvent::ModelStepStarted { epoch: 1, .. } => Some("retry-step"),
+                super::PersistedAgentEvent::GenerationRestarted { epoch: 1, .. } => {
+                    Some("generation-restarted")
+                }
                 super::PersistedAgentEvent::ExecutionCommitted { .. } => Some("execution"),
                 _ => None,
             })
@@ -2891,6 +3077,1152 @@ mod tests {
 
         drop(writer);
         session.close().expect("close session");
+    }
+
+    type ScriptedStep = Box<
+        dyn FnOnce(
+                &mut (dyn FnMut(ModelProgress) + Send),
+                &CancellationToken,
+            ) -> Result<ModelStep, ModelFailure>
+            + Send,
+    >;
+
+    enum ScriptedSummary {
+        Text(String),
+        FailedAfterStart(ModelFailure),
+        FailedBeforeStart(ModelFailure),
+        CancelledAfterStart,
+        CancelledBeforeStart,
+    }
+
+    #[derive(Default)]
+    struct RecoveryModel {
+        steps: VecDeque<ScriptedStep>,
+        summaries: VecDeque<ScriptedSummary>,
+        contexts: Vec<Vec<ModelContextEntry>>,
+        selections: Vec<ModelSelection>,
+        summary_requests: Vec<SummaryRequest>,
+    }
+
+    impl RecoveryModel {
+        fn new(steps: Vec<ScriptedStep>, summaries: Vec<ScriptedSummary>) -> Self {
+            Self {
+                steps: steps.into(),
+                summaries: summaries.into(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Model for RecoveryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.summary_requests.push(request);
+                match self.summaries.pop_front().expect("scripted summary") {
+                    ScriptedSummary::Text(text) => {
+                        attempt_started();
+                        Ok(SummaryResult {
+                            text,
+                            attempts: vec![call_usage(100)],
+                        })
+                    }
+                    ScriptedSummary::FailedAfterStart(failure) => {
+                        attempt_started();
+                        Err(failure)
+                    }
+                    ScriptedSummary::FailedBeforeStart(failure) => Err(failure),
+                    ScriptedSummary::CancelledAfterStart => {
+                        attempt_started();
+                        cancellation.cancel();
+                        Err(ModelFailure::new(
+                            ModelError::Cancelled,
+                            vec![call_usage(100)],
+                        ))
+                    }
+                    ScriptedSummary::CancelledBeforeStart => {
+                        cancellation.cancel();
+                        Err(ModelError::Cancelled.into())
+                    }
+                }
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                self.selections.push(selection);
+                self.contexts.push(history.entries().to_vec());
+                let step = self.steps.pop_front().expect("scripted step");
+                step(progress, cancellation)
+            }
+        }
+    }
+
+    fn call_usage(input_tokens: u64) -> AttemptAccounting {
+        AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+            model: DEFAULT_MODEL.id.to_owned(),
+            service_tier: None,
+            input_tokens: Some(input_tokens),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
+            output_tokens: Some(1),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(input_tokens + 1),
+        })
+    }
+
+    fn overflow_failure(message: &str) -> ProviderFailure {
+        ProviderFailure::new(
+            Some(400),
+            Some("context_length_exceeded".to_owned()),
+            message.to_owned(),
+        )
+        .with_context_overflow(true)
+    }
+
+    fn provider_step_failure(
+        failure: ProviderFailure,
+        chunk: Option<&'static str>,
+        attempts: Vec<AttemptAccounting>,
+    ) -> ScriptedStep {
+        Box::new(move |progress, _| {
+            progress(ModelProgress::AttemptStarted { attempt: 1 });
+            if let Some(text) = chunk {
+                progress(ModelProgress::AssistantTextChunk {
+                    text: text.to_owned(),
+                });
+            }
+            Err(ModelFailure::new(
+                ModelError::Provider(Box::new(failure)),
+                attempts,
+            ))
+        })
+    }
+
+    fn overflow_step(
+        chunk: Option<&'static str>,
+        attempts: Vec<AttemptAccounting>,
+    ) -> ScriptedStep {
+        provider_step_failure(overflow_failure("maximum context length"), chunk, attempts)
+    }
+
+    fn action_step(action: CompletedModelAction, attempts: Vec<AttemptAccounting>) -> ScriptedStep {
+        Box::new(move |_, _| {
+            Ok(ModelStep {
+                action,
+                reasoning_summary: String::new(),
+                replay: ProviderReplay::new("openai", Vec::new()),
+                attempts,
+            })
+        })
+    }
+
+    fn code_action(source: &str, call_id: &str) -> CompletedModelAction {
+        CompletedModelAction::Code {
+            source: source.to_owned(),
+            call_id: ModelCallId::new(call_id),
+            commentary: None,
+        }
+    }
+
+    fn message_action(text: &str) -> CompletedModelAction {
+        CompletedModelAction::Message {
+            text: text.to_owned(),
+        }
+    }
+
+    fn initial_overflow(
+        generation: Option<&str>,
+        attempts: Vec<AttemptAccounting>,
+    ) -> OverflowRecovery {
+        OverflowRecovery {
+            failure: overflow_failure("maximum context length"),
+            generation: generation.map(|text| GenerationEvidence {
+                reasoning_summary: String::new(),
+                reasoning: String::new(),
+                assistant_text: text.to_owned(),
+                decoded_python: String::new(),
+            }),
+            attempts,
+        }
+    }
+
+    fn recovery_session(
+        home: &TempDir,
+        workspace: &TempDir,
+        agent: &Agent<RecoveryModel>,
+        gate: Option<SessionWriteGate>,
+    ) -> (Session, SessionWriter) {
+        let session = match gate {
+            Some(gate) => Session::create_with_write_gate(
+                home.path(),
+                workspace.path(),
+                default_selection(),
+                agent.checkpoint(),
+                gate,
+            ),
+            None => Session::create(
+                home.path(),
+                workspace.path(),
+                default_selection(),
+                agent.checkpoint(),
+            ),
+        }
+        .expect("create session");
+        let writer = session.writer();
+        (session, writer)
+    }
+
+    fn billed_attempts(session: &Session, run_id: u64) -> Vec<AttemptAccounting> {
+        let mut billed = Vec::new();
+        for record in session.restore().expect("restore").records {
+            if record.run_id != run_id {
+                continue;
+            }
+            match record.kind {
+                RestoredRecordKind::CompletedExecution { attempts, .. } => billed.extend(attempts),
+                RestoredRecordKind::Compaction { outcome } => {
+                    billed.extend(outcome.attempts().iter().cloned())
+                }
+                RestoredRecordKind::FinalMessage { terminal, .. }
+                | RestoredRecordKind::CancelledRun { terminal }
+                | RestoredRecordKind::FailedRun { terminal, .. } => {
+                    let (ReadableTerminal::Final {
+                        attempts,
+                        overflow_recovery,
+                        ..
+                    }
+                    | ReadableTerminal::Cancelled {
+                        attempts,
+                        overflow_recovery,
+                        ..
+                    }
+                    | ReadableTerminal::Failed {
+                        attempts,
+                        overflow_recovery,
+                        ..
+                    }) = terminal;
+                    billed.extend(attempts);
+                    billed.extend(
+                        overflow_recovery
+                            .into_iter()
+                            .flat_map(|recovery| recovery.attempts),
+                    );
+                }
+                RestoredRecordKind::UserRequest { .. } => {}
+            }
+        }
+        billed
+    }
+
+    fn terminal_parts(
+        terminal: &PersistedTerminal,
+    ) -> (
+        &'static str,
+        &[AttemptAccounting],
+        Option<&OverflowRecovery>,
+    ) {
+        match terminal {
+            PersistedTerminal::Final {
+                attempts,
+                overflow_recovery,
+                ..
+            } => ("final", attempts, overflow_recovery.as_ref()),
+            PersistedTerminal::Cancelled {
+                attempts,
+                overflow_recovery,
+                ..
+            } => ("cancelled", attempts, overflow_recovery.as_ref()),
+            PersistedTerminal::Failed {
+                attempts,
+                overflow_recovery,
+                ..
+            } => ("failed", attempts, overflow_recovery.as_ref()),
+        }
+    }
+
+    fn recovery_policy() -> CompactionSettings {
+        CompactionSettings::new(16_384, 20_000)
+    }
+
+    fn run_step_settlements(session: &Session, run_id: u64) -> Vec<Option<i64>> {
+        let connection = session.connection_for_test().expect("open session");
+        let mut statement = connection
+            .prepare("SELECT settled_entry_id FROM model_steps WHERE run_id = ?1 ORDER BY id")
+            .expect("prepare step settlements");
+        statement
+            .query_map(
+                [i64::try_from(run_id).expect("run ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("query step settlements")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read step settlements")
+    }
+
+    fn entry_parent(session: &Session, entry_id: i64) -> (String, i64) {
+        session
+            .connection_for_test()
+            .expect("open session")
+            .query_row(
+                "SELECT parent.kind, parent.id FROM entries AS child JOIN entries AS parent ON parent.id = child.parent_id WHERE child.id = ?1",
+                [entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read entry parent")
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_same_pending_step_once() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(
+            &workspace,
+            RecoveryModel::new(
+                vec![
+                    overflow_step(Some("partial"), vec![call_usage(1)]),
+                    action_step(code_action("value = 1", "retry-code"), vec![call_usage(2)]),
+                    action_step(message_action("done"), vec![call_usage(3)]),
+                ],
+                vec![ScriptedSummary::Text("overflow summary".to_owned())],
+            ),
+        )
+        .await;
+        let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+        seed_compactable_history(&writer).await;
+        let (runs_before, steps_before) = session_counts(&session);
+        let request = large_request();
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            recovery_policy(),
+            request.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.terminal,
+            PersistedTerminal::Final {
+                step_id: steps_before as u64 + 2,
+                text: "done".to_owned(),
+                reasoning_summary: String::new(),
+                replay: ProviderReplay::new("openai", Vec::new()),
+                attempts: vec![call_usage(3)],
+                overflow_recovery: Some(initial_overflow(Some("partial"), vec![call_usage(1)])),
+            }
+        );
+        assert_eq!(
+            labels,
+            [
+                "request",
+                "step",
+                "compaction-started",
+                "generation-restarted",
+                "compaction:applied",
+                "retry-step",
+                "execution",
+                "step",
+            ]
+        );
+        let model = &agent.model;
+        assert_eq!(model.selections, [default_selection(); 3]);
+        assert_eq!(model.summary_requests.len(), 1);
+        assert_eq!(model.summary_requests[0].selection, default_selection());
+        assert!(matches!(
+            model.contexts[0].first(),
+            Some(ModelContextEntry::UserRequest { text }) if text == "discarded request"
+        ));
+        assert_eq!(
+            model.contexts[1],
+            [
+                ModelContextEntry::CompactionSummary {
+                    summary: "overflow summary".to_owned(),
+                },
+                ModelContextEntry::UserRequest {
+                    text: request.clone(),
+                },
+            ]
+        );
+        assert_eq!(model.contexts[2][..2], model.contexts[1][..]);
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "execution", "final_reply"]
+        );
+        assert_eq!(
+            session_counts(&session),
+            (runs_before + 1, steps_before + 2)
+        );
+        let settlements = run_step_settlements(&session, outcome.run_id);
+        let execution_entry = settlements[0].expect("retried step settles");
+        let (parent_kind, compaction_entry) = entry_parent(&session, execution_entry);
+        assert_eq!(parent_kind, "compaction");
+        assert_eq!(entry_parent(&session, compaction_entry).0, "user_request");
+        let restore = session.restore().expect("restore recovered run");
+        let run_records = restore
+            .records
+            .iter()
+            .filter(|record| record.run_id == outcome.run_id)
+            .map(|record| &record.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                run_records.as_slice(),
+                [
+                    RestoredRecordKind::UserRequest { .. },
+                    RestoredRecordKind::Compaction {
+                        outcome: CompactionOutcome::Applied {
+                            reason: CompactionReason::ContextOverflow,
+                            ..
+                        },
+                    },
+                    RestoredRecordKind::CompletedExecution { attempts, .. },
+                    RestoredRecordKind::FinalMessage { .. },
+                ] if attempts == &[call_usage(2)]
+            ),
+            "{run_records:?}"
+        );
+        assert_eq!(
+            billed_attempts(&session, outcome.run_id),
+            [call_usage(100), call_usage(2), call_usage(3), call_usage(1)]
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn unrecovered_overflow_closes_once_with_independently_bounded_components() {
+        let original = "x".repeat(3_000);
+        let summary_failure = |status, message: String| {
+            ModelFailure::new(
+                ModelError::Provider(Box::new(
+                    ProviderFailure::new(Some(status), None, message).with_context_overflow(true),
+                )),
+                vec![call_usage(100)],
+            )
+        };
+        for case in ["failed", "no-op", "failed-before-start"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let summary = match case {
+                "failed" => vec![ScriptedSummary::FailedAfterStart(summary_failure(
+                    500,
+                    "€".repeat(2_000),
+                ))],
+                "failed-before-start" => vec![ScriptedSummary::FailedBeforeStart(summary_failure(
+                    503,
+                    "y".repeat(3_000),
+                ))],
+                _ => Vec::new(),
+            };
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    vec![provider_step_failure(
+                        overflow_failure(&original),
+                        Some("partial"),
+                        vec![call_usage(1)],
+                    )],
+                    summary,
+                ),
+            )
+            .await;
+            let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+            if case != "no-op" {
+                seed_compactable_history(&writer).await;
+            }
+
+            let (outcome, labels) = run_threshold_request(
+                &mut agent,
+                &writer,
+                recovery_policy(),
+                large_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            let PersistedTerminal::Failed {
+                message,
+                evidence: None,
+                attempts,
+                overflow_recovery: Some(recovery),
+            } = &outcome.terminal
+            else {
+                panic!("{case}: {:?}", outcome.terminal);
+            };
+            assert!(attempts.is_empty(), "{case}");
+            assert_eq!(
+                recovery,
+                &OverflowRecovery {
+                    failure: overflow_failure(&original),
+                    ..initial_overflow(Some("partial"), vec![call_usage(1)])
+                },
+                "{case}"
+            );
+            let (context, recovery_component) = message
+                .split_once("\ncompaction recovery failed: ")
+                .expect("two-part recovery message");
+            assert_eq!(
+                context,
+                format!(
+                    "context overflow: {}",
+                    &overflow_failure(&original).to_string()[..2_000]
+                ),
+                "{case}"
+            );
+            let compactions = session
+                .restore()
+                .expect("restore")
+                .records
+                .into_iter()
+                .filter_map(|record| match record.kind {
+                    RestoredRecordKind::Compaction { outcome } => Some(outcome),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            match case {
+                "failed" => {
+                    let [
+                        CompactionOutcome::Failed {
+                            diagnostic,
+                            reason: CompactionReason::ContextOverflow,
+                            ..
+                        },
+                    ] = compactions.as_slice()
+                    else {
+                        panic!("one failed overflow compaction: {compactions:?}");
+                    };
+                    let prefix = "model provider failed: provider failure (HTTP 500): ";
+                    assert_eq!(diagnostic.len(), 4_096);
+                    assert!(diagnostic.starts_with(prefix));
+                    assert_eq!(recovery_component, &diagnostic[..1_999]);
+                    assert_eq!(message.len(), 4_046);
+                    assert_eq!(
+                        labels,
+                        ["request", "step", "compaction-started", "compaction:failed"]
+                    );
+                }
+                "no-op" => {
+                    assert!(compactions.is_empty());
+                    assert_eq!(
+                        recovery_component,
+                        "compaction could not remove a valid prefix"
+                    );
+                    assert_eq!(labels, ["request", "step"]);
+                }
+                _ => {
+                    assert!(compactions.is_empty());
+                    assert_eq!(
+                        recovery_component,
+                        &format!(
+                            "model provider failed: provider failure (HTTP 503): {}",
+                            "y".repeat(3_000)
+                        )[..2_000]
+                    );
+                    assert_eq!(message.len(), 4_047);
+                    assert_eq!(labels, ["request", "step"]);
+                }
+            }
+            assert_eq!(agent.model.contexts.len(), 1, "{case}");
+            assert_eq!(
+                agent.model.summary_requests.len(),
+                usize::from(case != "no-op"),
+                "{case}"
+            );
+            assert_eq!(
+                run_step_settlements(&session, outcome.run_id).len(),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                run_entry_kinds(&session, outcome.run_id)
+                    .last()
+                    .map(String::as_str),
+                Some("failed"),
+                "{case}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_failure_keeps_initial_generation_separate_and_never_recovers_again() {
+        for case in ["different failure", "second overflow"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let retry: ScriptedStep = if case == "second overflow" {
+                overflow_step(Some("second"), vec![call_usage(2)])
+            } else {
+                Box::new(|_, _| {
+                    Err(ModelFailure::new(
+                        ModelError::Provider(Box::new(ProviderFailure::new(
+                            Some(500),
+                            None,
+                            "retry failed".to_owned(),
+                        ))),
+                        vec![call_usage(2)],
+                    ))
+                })
+            };
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    vec![overflow_step(Some("partial"), vec![call_usage(1)]), retry],
+                    vec![
+                        ScriptedSummary::Text("overflow summary".to_owned()),
+                        ScriptedSummary::Text("unexpected summary".to_owned()),
+                    ],
+                ),
+            )
+            .await;
+            let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+            seed_compactable_history(&writer).await;
+
+            let (outcome, _) = run_threshold_request(
+                &mut agent,
+                &writer,
+                recovery_policy(),
+                large_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            let expected_evidence = (case == "second overflow").then(|| {
+                TerminalEvidence::Generation(GenerationEvidence {
+                    reasoning_summary: String::new(),
+                    reasoning: String::new(),
+                    assistant_text: "second".to_owned(),
+                    decoded_python: String::new(),
+                })
+            });
+            let expected_message = if case == "second overflow" {
+                "model provider failed: provider failure (HTTP 400) [context_length_exceeded]: maximum context length"
+            } else {
+                "model provider failed: provider failure (HTTP 500): retry failed"
+            };
+            assert_eq!(
+                outcome.terminal,
+                PersistedTerminal::Failed {
+                    message: expected_message.to_owned(),
+                    evidence: expected_evidence,
+                    attempts: vec![call_usage(2)],
+                    overflow_recovery: Some(initial_overflow(Some("partial"), vec![call_usage(1)])),
+                },
+                "{case}"
+            );
+            assert_eq!(agent.model.summary_requests.len(), 1, "{case}");
+            assert_eq!(agent.model.contexts.len(), 2, "{case}");
+            assert_eq!(
+                run_entry_kinds(&session, outcome.run_id),
+                ["user_request", "compaction", "failed"],
+                "{case}"
+            );
+            assert_eq!(
+                billed_attempts(&session, outcome.run_id),
+                [call_usage(100), call_usage(2), call_usage(1)],
+                "{case}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unrecognised_overflow_fails_normally_without_summary() {
+        for case in ["disabled", "unrecognised"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let failure = if case == "disabled" {
+                overflow_failure("maximum context length")
+            } else {
+                ProviderFailure::new(Some(400), None, "maximum context length".to_owned())
+            };
+            let expected_message =
+                ModelFailure::new(ModelError::Provider(Box::new(failure.clone())), Vec::new())
+                    .to_string();
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    vec![provider_step_failure(
+                        failure,
+                        Some("partial"),
+                        vec![call_usage(1)],
+                    )],
+                    vec![ScriptedSummary::Text("unexpected summary".to_owned())],
+                ),
+            )
+            .await;
+            let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+            seed_compactable_history(&writer).await;
+            let policy = if case == "disabled" {
+                recovery_policy().disabled()
+            } else {
+                recovery_policy()
+            };
+
+            let (outcome, labels) = run_threshold_request(
+                &mut agent,
+                &writer,
+                policy,
+                large_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                outcome.terminal,
+                PersistedTerminal::Failed {
+                    message: expected_message,
+                    evidence: initial_overflow(Some("partial"), Vec::new())
+                        .generation
+                        .map(TerminalEvidence::Generation),
+                    attempts: vec![call_usage(1)],
+                    overflow_recovery: None,
+                },
+                "{case}"
+            );
+            assert_eq!(labels, ["request", "step"], "{case}");
+            assert!(agent.model.summary_requests.is_empty(), "{case}");
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_cancellation_keeps_initial_evidence() {
+        for case in ["before attempt", "after attempt", "during retry"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let (summary, retry): (ScriptedSummary, Option<ScriptedStep>) = match case {
+                "before attempt" => (ScriptedSummary::CancelledBeforeStart, None),
+                "after attempt" => (ScriptedSummary::CancelledAfterStart, None),
+                _ => (
+                    ScriptedSummary::Text("overflow summary".to_owned()),
+                    Some(Box::new(|progress, cancellation| {
+                        progress(ModelProgress::AttemptStarted { attempt: 1 });
+                        progress(ModelProgress::AssistantTextChunk {
+                            text: "retry".to_owned(),
+                        });
+                        cancellation.cancel();
+                        Err(ModelFailure::new(
+                            ModelError::Cancelled,
+                            vec![call_usage(2)],
+                        ))
+                    })),
+                ),
+            };
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    [overflow_step(Some("partial"), vec![call_usage(1)])]
+                        .into_iter()
+                        .chain(retry)
+                        .collect(),
+                    vec![summary],
+                ),
+            )
+            .await;
+            let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+            seed_compactable_history(&writer).await;
+
+            let (outcome, labels) = run_threshold_request(
+                &mut agent,
+                &writer,
+                recovery_policy(),
+                large_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            let (retry_evidence, retry_attempts, expected_labels, expected_kinds) = match case {
+                "before attempt" => (
+                    None,
+                    Vec::new(),
+                    vec!["request", "step"],
+                    vec!["user_request", "cancelled"],
+                ),
+                "after attempt" => (
+                    None,
+                    Vec::new(),
+                    vec![
+                        "request",
+                        "step",
+                        "compaction-started",
+                        "compaction:cancelled",
+                    ],
+                    vec!["user_request", "compaction", "cancelled"],
+                ),
+                _ => (
+                    Some(TerminalEvidence::Generation(GenerationEvidence {
+                        reasoning_summary: String::new(),
+                        reasoning: String::new(),
+                        assistant_text: "retry".to_owned(),
+                        decoded_python: String::new(),
+                    })),
+                    vec![call_usage(2)],
+                    vec![
+                        "request",
+                        "step",
+                        "compaction-started",
+                        "generation-restarted",
+                        "compaction:applied",
+                        "retry-step",
+                    ],
+                    vec!["user_request", "compaction", "cancelled"],
+                ),
+            };
+            assert_eq!(
+                outcome.terminal,
+                PersistedTerminal::Cancelled {
+                    evidence: retry_evidence,
+                    attempts: retry_attempts,
+                    overflow_recovery: Some(initial_overflow(Some("partial"), vec![call_usage(1)])),
+                },
+                "{case}"
+            );
+            assert_eq!(labels, expected_labels, "{case}");
+            assert_eq!(
+                run_entry_kinds(&session, outcome.run_id),
+                expected_kinds,
+                "{case}"
+            );
+            assert_eq!(
+                run_step_settlements(&session, outcome.run_id).len(),
+                1,
+                "{case}"
+            );
+            assert!(
+                session
+                    .restore()
+                    .expect("restore")
+                    .records
+                    .iter()
+                    .all(|record| !matches!(
+                        &record.kind,
+                        RestoredRecordKind::Compaction { outcome }
+                            if outcome.reason() != CompactionReason::ContextOverflow
+                    )),
+                "{case}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_overflow_compaction_is_applied_suppresses_the_retry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Compaction);
+        let mut agent = agent_with_model(
+            &workspace,
+            RecoveryModel::new(
+                vec![
+                    overflow_step(None, vec![call_usage(1)]),
+                    action_step(message_action("must not run"), Vec::new()),
+                ],
+                vec![ScriptedSummary::Text("overflow summary".to_owned())],
+            ),
+        )
+        .await;
+        let (session, writer) = recovery_session(&home, &workspace, &agent, Some(gate.clone()));
+        seed_compactable_history(&writer).await;
+        let cancellation = CancellationToken::new();
+
+        let ((outcome, labels), ()) = tokio::join!(
+            run_threshold_request(
+                &mut agent,
+                &writer,
+                recovery_policy(),
+                large_request(),
+                &cancellation,
+            ),
+            async {
+                gate.wait_until_started().await;
+                cancellation.cancel();
+                gate.release();
+            }
+        );
+
+        assert_eq!(
+            outcome.terminal,
+            PersistedTerminal::Cancelled {
+                evidence: None,
+                attempts: Vec::new(),
+                overflow_recovery: Some(initial_overflow(None, vec![call_usage(1)])),
+            }
+        );
+        assert_eq!(
+            labels,
+            [
+                "request",
+                "step",
+                "compaction-started",
+                "compaction:applied"
+            ]
+        );
+        assert_eq!(agent.model.contexts.len(), 1);
+        assert!(matches!(
+            writer.model_history().expect("read compacted context").entries(),
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+                if summary == "overflow summary"
+        ));
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "cancelled"]
+        );
+        assert_eq!(run_step_settlements(&session, outcome.run_id).len(), 1);
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_from_retry_reset_events_starts_no_retry_call() {
+        for trigger in ["generation-restarted", "compaction:applied", "retry-step"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    vec![
+                        overflow_step(Some("partial"), vec![call_usage(1)]),
+                        action_step(message_action("must not run"), vec![call_usage(2)]),
+                    ],
+                    vec![ScriptedSummary::Text("overflow summary".to_owned())],
+                ),
+            )
+            .await;
+            let (session, writer) = recovery_session(&home, &workspace, &agent, None);
+            seed_compactable_history(&writer).await;
+            let cancellation = CancellationToken::new();
+            let mut events = Vec::new();
+
+            let outcome = agent
+                .run_persisted(
+                    default_selection(),
+                    recovery_policy(),
+                    CrossProviderReasoning::Inline,
+                    large_request(),
+                    &cancellation,
+                    &writer,
+                    &mut |event| {
+                        events.push(event);
+                        if persisted_event_labels(&events[events.len() - 1..]) == [trigger] {
+                            cancellation.cancel();
+                        }
+                    },
+                )
+                .await
+                .expect("run persisted request");
+
+            assert_eq!(
+                outcome.terminal,
+                PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                    overflow_recovery: Some(initial_overflow(Some("partial"), vec![call_usage(1)])),
+                },
+                "{trigger}"
+            );
+            assert_eq!(agent.model.contexts.len(), 1, "{trigger}");
+            assert_eq!(
+                persisted_event_labels(&events),
+                [
+                    "request",
+                    "step",
+                    "compaction-started",
+                    "generation-restarted",
+                    "compaction:applied",
+                    "retry-step",
+                ],
+                "{trigger}"
+            );
+            assert!(
+                matches!(
+                    writer.model_history().expect("read compacted context").entries(),
+                    [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+                        if summary == "overflow summary"
+                ),
+                "{trigger}"
+            );
+            assert_eq!(
+                run_entry_kinds(&session, outcome.run_id),
+                ["user_request", "compaction", "cancelled"],
+                "{trigger}"
+            );
+            assert_eq!(
+                run_step_settlements(&session, outcome.run_id).len(),
+                1,
+                "{trigger}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_terminal_route_after_recovered_code_carries_the_initial_overflow_once() {
+        for case in [
+            "later final",
+            "later provider failure",
+            "later overflow",
+            "duplicate call",
+            "execution failure",
+            "execution cancelled",
+            "cancelled before execution",
+            "cancelled at step start",
+            "cancelled between steps",
+        ] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            fs::write(workspace.path().join("Cargo.toml"), "[package]\n").unwrap();
+            let later: Option<ScriptedStep> = match case {
+                "later final" => Some(action_step(message_action("done"), vec![call_usage(3)])),
+                "later provider failure" => Some(provider_step_failure(
+                    ProviderFailure::new(Some(500), None, "later failure".to_owned()),
+                    None,
+                    vec![call_usage(3)],
+                )),
+                "later overflow" => Some(overflow_step(None, vec![call_usage(3)])),
+                "duplicate call" => Some(action_step(
+                    code_action("value = 2", "retry-code"),
+                    vec![call_usage(3)],
+                )),
+                "execution failure" => Some(action_step(
+                    code_action("x = ' ' * (1 << 60)", "later-code"),
+                    vec![call_usage(3)],
+                )),
+                "execution cancelled" => Some(action_step(
+                    code_action("contents = await read('Cargo.toml')", "later-code"),
+                    vec![call_usage(3)],
+                )),
+                "cancelled before execution" => Some(Box::new(|_, cancellation| {
+                    cancellation.cancel();
+                    Ok(ModelStep {
+                        action: code_action("value = 2", "later-code"),
+                        reasoning_summary: String::new(),
+                        replay: ProviderReplay::new("openai", Vec::new()),
+                        attempts: vec![call_usage(3)],
+                    })
+                })),
+                _ => None,
+            };
+            let mut agent = agent_with_model(
+                &workspace,
+                RecoveryModel::new(
+                    [
+                        overflow_step(Some("partial"), vec![call_usage(1)]),
+                        action_step(code_action("value = 1", "retry-code"), vec![call_usage(2)]),
+                    ]
+                    .into_iter()
+                    .chain(later)
+                    .collect(),
+                    vec![
+                        ScriptedSummary::Text("overflow summary".to_owned()),
+                        ScriptedSummary::Text("unexpected summary".to_owned()),
+                    ],
+                ),
+            )
+            .await;
+            let gate = (case == "cancelled between steps")
+                .then(|| SessionWriteGate::new(SessionWriteKind::Settlement));
+            let (session, writer) = recovery_session(&home, &workspace, &agent, gate.clone());
+            seed_compactable_history(&writer).await;
+            let cancellation = CancellationToken::new();
+            let canceller = cancellation.clone();
+            let mut steps_started = 0;
+            let mut event = |event| match event {
+                super::PersistedAgentEvent::ToolUpdated { .. } if case == "execution cancelled" => {
+                    canceller.cancel()
+                }
+                super::PersistedAgentEvent::ModelStepStarted { .. } => {
+                    steps_started += 1;
+                    if case == "cancelled at step start" && steps_started == 3 {
+                        canceller.cancel();
+                    }
+                }
+                _ => {}
+            };
+            let run = agent.run_persisted(
+                default_selection(),
+                recovery_policy(),
+                CrossProviderReasoning::Inline,
+                large_request(),
+                &cancellation,
+                &writer,
+                &mut event,
+            );
+            let (outcome, ()) = tokio::join!(run, async {
+                if let Some(gate) = &gate {
+                    gate.wait_until_started().await;
+                    cancellation.cancel();
+                    gate.release();
+                }
+            });
+            let outcome = outcome.expect("run recovered request");
+
+            let (kind, attempts, recovery) = terminal_parts(&outcome.terminal);
+            let expected_kind = match case {
+                "later final" => "final",
+                "later provider failure"
+                | "later overflow"
+                | "duplicate call"
+                | "execution failure" => "failed",
+                _ => "cancelled",
+            };
+            assert_eq!(kind, expected_kind, "{case}: {:?}", outcome.terminal);
+            assert_eq!(
+                recovery,
+                Some(&initial_overflow(Some("partial"), vec![call_usage(1)])),
+                "{case}"
+            );
+            let later_attempts = if later_step_called(case) {
+                vec![call_usage(3)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(attempts, later_attempts.as_slice(), "{case}");
+            assert_eq!(agent.model.summary_requests.len(), 1, "{case}");
+            let mut expected_billing = vec![call_usage(100), call_usage(2)];
+            expected_billing.extend(later_attempts);
+            expected_billing.push(call_usage(1));
+            assert_eq!(
+                billed_attempts(&session, outcome.run_id),
+                expected_billing,
+                "{case}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    fn later_step_called(case: &str) -> bool {
+        !matches!(case, "cancelled at step start" | "cancelled between steps")
     }
 
     #[tokio::test]

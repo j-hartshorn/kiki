@@ -312,6 +312,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
     match event {
         RuntimeEvent::RunStarted { run_id }
         | RuntimeEvent::ModelStepStarted { run_id, .. }
+        | RuntimeEvent::GenerationRestarted { run_id, .. }
         | RuntimeEvent::ModelProgress { run_id, .. }
         | RuntimeEvent::ExecutionStarted { run_id, .. }
         | RuntimeEvent::ToolUpdated { run_id, .. }
@@ -319,7 +320,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::StdoutDelta { run_id, .. }
         | RuntimeEvent::StdoutTruncated { run_id, .. }
         | RuntimeEvent::RunSettled { run_id }
-        | RuntimeEvent::AutomaticCompactionStarted { run_id }
+        | RuntimeEvent::AutomaticCompactionStarted { run_id, .. }
         | RuntimeEvent::CorrectionCompleted { run_id, .. } => Some(*run_id),
         RuntimeEvent::RecordAppended { record, .. } => Some(record.run_id),
         RuntimeEvent::SettingsAccepted { .. }
@@ -3181,6 +3182,7 @@ mod tests {
         RuntimeEvent::ModelProgress {
             run_id: RunId(129),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk { text },
         }
     }
@@ -3276,10 +3278,12 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(129),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             RuntimeEvent::ModelProgress {
                 run_id: RunId(129),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "# live assistant\n\n".to_owned(),
                 },
@@ -3438,6 +3442,7 @@ mod tests {
         assert!(app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(9),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "live update".to_owned(),
             },
@@ -5727,6 +5732,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             now,
         );
@@ -8140,6 +8146,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: format!(
                     "[mutable][id]\n{}",
@@ -8178,6 +8185,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "\n\n[id]: https://example.test".to_owned(),
             },
@@ -8197,6 +8205,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "long live content ".repeat(40),
             },
@@ -8338,6 +8347,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "long live content ".repeat(40),
             },
@@ -8772,6 +8782,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(9),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "new history".to_owned(),
             },
@@ -9114,6 +9125,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "# BoldHeading".to_owned(),
             },
@@ -10070,6 +10082,7 @@ mod tests {
             item: RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "stale progress".to_owned(),
                 },
@@ -10085,6 +10098,7 @@ mod tests {
             item: RuntimeEvent::ModelStepStarted {
                 run_id: RunId(5),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             gap_before: false,
         });
@@ -10092,6 +10106,7 @@ mod tests {
             item: RuntimeEvent::ModelProgress {
                 run_id: RunId(5),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "fresh progress".to_owned(),
                 },
@@ -10364,16 +10379,24 @@ mod tests {
             },
             now,
         );
-        app.handle_event_at(RuntimeEvent::AutomaticCompactionStarted { run_id }, now);
+        app.handle_event_at(
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: None,
+            },
+            now,
+        );
         for progress in [
             RuntimeEvent::RunStarted { run_id },
             RuntimeEvent::ModelStepStarted {
                 run_id,
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             RuntimeEvent::ModelProgress {
                 run_id,
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "stale text".to_owned(),
                 },
@@ -10430,6 +10453,104 @@ mod tests {
     }
 
     #[test]
+    fn overflow_retry_reset_keeps_buffered_initial_progress_off_screen() {
+        let now = Instant::now();
+        let run_id = RunId(1);
+        let step_id = ModelStepId(1);
+        let progress = |epoch, text: &str| ProgressEnvelope {
+            item: RuntimeEvent::ModelProgress {
+                run_id,
+                step_id,
+                epoch,
+                progress: ModelProgress::AssistantTextChunk {
+                    text: text.to_owned(),
+                },
+            },
+            gap_before: true,
+        };
+        let started = |epoch| ProgressEnvelope {
+            item: RuntimeEvent::ModelStepStarted {
+                run_id,
+                step_id,
+                epoch,
+            },
+            gap_before: true,
+        };
+        let mut app = App::default();
+        set_prompt(&mut app, "draft");
+        app.handle_event_at(RuntimeEvent::RunStarted { run_id }, now);
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::UserRequest {
+                        request: "large request".to_owned(),
+                        selection: None,
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(app.handle_progress(started(0)));
+        assert!(app.handle_progress(progress(0, "initial partial")));
+        let screen = rendered_at(&mut app, 40, 16, now);
+        assert!(screen.contains("initial partial"), "{screen}");
+        app.handle_event_at(
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: Some((step_id, Vec::new())),
+            },
+            now,
+        );
+        assert!(!app.handle_progress(progress(0, "buffered during summary")));
+        assert!(app.transcript.is_compacting());
+        assert!(!app.transcript.is_generating());
+
+        app.handle_event_at(
+            RuntimeEvent::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch: 1,
+            },
+            now,
+        );
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::Compaction {
+                        outcome: crate::session::CompactionOutcome::Applied {
+                            summary: "summary".to_owned(),
+                            first_retained: crate::session::SessionEntryId(2),
+                            context_tokens: 1_250,
+                            reason: crate::session::CompactionReason::ContextOverflow,
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        assert!(!app.handle_progress(started(0)));
+        assert!(!app.handle_progress(progress(0, "buffered after card")));
+
+        let screen = rendered_at(&mut app, 40, 16, now);
+        assert!(!screen.contains("partial"), "{screen}");
+        assert!(!screen.contains("buffered"), "{screen}");
+        assert_eq!(app.prompt.text(), "draft");
+        assert!(!app.compact_acknowledgement_pending);
+
+        assert!(app.handle_progress(started(1)));
+        assert!(app.handle_progress(progress(1, "fresh retry")));
+        let screen = rendered_at(&mut app, 40, 16, now);
+        assert!(screen.contains("fresh retry"), "{screen}");
+        assert!(!screen.contains("buffered"), "{screen}");
+        assert!(app.transcript.is_generating());
+    }
+
+    #[test]
     fn generating_throbber_is_animated_and_anchored_above_the_prompt() {
         let now = Instant::now();
         let mut app = App::default();
@@ -10438,6 +10559,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             now,
         );
@@ -10456,6 +10578,7 @@ mod tests {
             RuntimeEvent::ModelProgress {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
                 progress: ModelProgress::AssistantTextChunk {
                     text: "streamed answer".to_owned(),
                 },
@@ -10514,6 +10637,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             now,
         );
@@ -10536,6 +10660,7 @@ mod tests {
             RuntimeEvent::ModelStepStarted {
                 run_id: RunId(1),
                 step_id: ModelStepId(1),
+                epoch: 0,
             },
             now,
         );
@@ -10710,6 +10835,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(9),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AttemptSettled {
                 attempt: 1,
                 accounting: usage(1, 1),
@@ -10930,6 +11056,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AttemptSettled {
                 attempt: 1,
                 accounting: first.clone(),
@@ -11005,6 +11132,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(5),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AttemptSettled {
                 attempt: 1,
                 accounting: usage(1, 1),
@@ -11110,6 +11238,7 @@ mod tests {
         active.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(3),
             step_id: ModelStepId(4),
+            epoch: 0,
             progress: ModelProgress::AttemptSettled {
                 attempt: 1,
                 accounting: usage(0, 100),
@@ -11130,6 +11259,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(2),
             step_id: ModelStepId(5),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "live".to_owned(),
             },
@@ -11151,6 +11281,7 @@ mod tests {
         let event = RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: "once".to_owned(),
             },
@@ -11159,6 +11290,7 @@ mod tests {
         assert!(!app.handle_event(RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk {
                 text: String::new(),
             },
@@ -11453,6 +11585,7 @@ mod tests {
         app.handle_event(RuntimeEvent::ModelStepStarted {
             run_id: RunId(73),
             step_id: ModelStepId(91),
+            epoch: 0,
         });
         assert!(rendered(&mut app, 120, 4).starts_with("Status: generating"));
         app.handle_event(RuntimeEvent::ToolUpdated {

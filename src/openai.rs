@@ -6542,7 +6542,9 @@ pub(crate) mod tests {
                 RuntimeEvent::RunStarted { run_id } => {
                     self.run_mut(*run_id);
                 }
-                RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+                RuntimeEvent::ModelStepStarted {
+                    run_id, step_id, ..
+                } => {
                     self.run_mut(*run_id).add_step(*step_id);
                 }
                 RuntimeEvent::ModelProgress {
@@ -6628,7 +6630,8 @@ pub(crate) mod tests {
                 | RuntimeEvent::SubmissionRejectedBusy { .. }
                 | RuntimeEvent::CompactionAcknowledged { .. }
                 | RuntimeEvent::CompactionLifecycle { .. }
-                | RuntimeEvent::AutomaticCompactionStarted { .. } => {}
+                | RuntimeEvent::AutomaticCompactionStarted { .. }
+                | RuntimeEvent::GenerationRestarted { .. } => {}
             }
         }
 
@@ -6688,6 +6691,7 @@ pub(crate) mod tests {
         let progress = crate::runtime::RuntimeEvent::ModelProgress {
             run_id,
             step_id: crate::runtime::ModelStepId(1),
+            epoch: 0,
             progress: crate::model::ModelProgress::AssistantTextChunk {
                 text: "progress".to_owned(),
             },
