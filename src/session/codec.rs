@@ -98,8 +98,8 @@ enum StoredPayload {
 #[serde(deny_unknown_fields)]
 struct StoredSkillActivation {
     name: String,
-    source: String,
-    body: String,
+    canonical_root: String,
+    source_text: String,
     origin: StoredSkillOrigin,
     trust_scope: Option<String>,
 }
@@ -513,8 +513,8 @@ pub(super) fn encode_skill_activation(
         payload_json: serde_json::to_string(&StoredPayload::SkillActivation {
             activation: StoredSkillActivation {
                 name: activation.name().to_owned(),
-                source: encode_path(activation.source())?,
-                body: activation.body().to_owned(),
+                canonical_root: encode_path(activation.canonical_root())?,
+                source_text: activation.source_text().to_owned(),
                 origin,
                 trust_scope: activation.trust_scope().map(encode_path).transpose()?,
             },
@@ -585,8 +585,8 @@ pub(super) fn decode_entry(kind: &str, payload_json: &str) -> Result<DecodedEntr
             };
             let activation = SkillActivation::new(
                 activation.name,
-                decode_path(&activation.source)?,
-                activation.body,
+                decode_path(&activation.canonical_root)?,
+                activation.source_text,
                 origin,
                 activation
                     .trust_scope
@@ -1797,10 +1797,11 @@ mod tests {
             Some(&activation)
         );
         let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
-        payload["SkillActivation"]["activation"]["body"] = serde_json::Value::String(String::new());
+        payload["SkillActivation"]["activation"]["source_text"] =
+            serde_json::Value::String(String::new());
         assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
         let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
-        payload["SkillActivation"]["activation"]["body"] =
+        payload["SkillActivation"]["activation"]["source_text"] =
             serde_json::Value::String("line\r".repeat(701));
         assert!(decode_entry("skill_activation", &payload.to_string()).is_err());
         let mut payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();

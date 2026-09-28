@@ -4868,7 +4868,7 @@ mod tests {
             let active = latest
                 .iter()
                 .filter_map(|entry| match entry {
-                    ModelContextEntry::SkillActivation(skill) => Some(skill.body()),
+                    ModelContextEntry::SkillActivation(skill) => Some(skill.source_text()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -4890,7 +4890,7 @@ mod tests {
                 .active_skills()
                 .next()
                 .unwrap()
-                .body(),
+                .source_text(),
             "pinned version two"
         );
 

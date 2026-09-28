@@ -16,8 +16,8 @@ pub const MAX_ACTIVE_SKILL_TEXT_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillActivation {
     name: String,
-    source: PathBuf,
-    body: String,
+    canonical_root: PathBuf,
+    source_text: String,
     origin: SkillOrigin,
     trust_scope: Option<PathBuf>,
 }
@@ -36,8 +36,8 @@ impl SkillActivation {
 
     pub fn new(
         name: String,
-        source: PathBuf,
-        body: String,
+        canonical_root: PathBuf,
+        source_text: String,
         origin: SkillOrigin,
         trust_scope: Option<PathBuf>,
     ) -> Result<Self, SkillActivationError> {
@@ -48,21 +48,21 @@ impl SkillActivation {
                     .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
         };
         if !valid_name(&name)
-            || !clean_path(&source)
-            || body.is_empty()
-            || body.len() > MAX_SKILL_BYTES
-            || line_count(&body) > MAX_SKILL_LINES
+            || !clean_path(&canonical_root)
+            || source_text.is_empty()
+            || source_text.len() > MAX_SKILL_BYTES
+            || line_count(&source_text) > MAX_SKILL_LINES
             || matches!(origin, SkillOrigin::Project) != trust_scope.is_some()
             || trust_scope
                 .as_ref()
-                .is_some_and(|scope| !clean_path(scope) || !source.starts_with(scope))
+                .is_some_and(|scope| !clean_path(scope) || !canonical_root.starts_with(scope))
         {
             return Err(SkillActivationError::InvalidMetadata);
         }
         Ok(Self {
             name,
-            source,
-            body,
+            canonical_root,
+            source_text,
             origin,
             trust_scope,
         })
@@ -71,11 +71,11 @@ impl SkillActivation {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn source(&self) -> &Path {
-        &self.source
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_root
     }
-    pub fn body(&self) -> &str {
-        &self.body
+    pub fn source_text(&self) -> &str {
+        &self.source_text
     }
     pub fn origin(&self) -> SkillOrigin {
         self.origin
@@ -84,7 +84,7 @@ impl SkillActivation {
         self.trust_scope.as_deref()
     }
     pub fn model_text(&self) -> String {
-        crate::prompt::skill_activation_text(&self.name, &self.source, &self.body)
+        crate::prompt::skill_activation_text(&self.name, &self.canonical_root, &self.source_text)
     }
 }
 
@@ -977,7 +977,7 @@ mod tests {
         assert!(history.activate_skill(changed).unwrap());
         assert_eq!(history.active_skills().count(), 4);
         assert_eq!(
-            history.active_skills().last().unwrap().source(),
+            history.active_skills().last().unwrap().canonical_root(),
             PathBuf::from("/user/changed")
         );
     }

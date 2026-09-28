@@ -2935,7 +2935,7 @@ mod tests {
         assert!(!format!("{execution:?}").contains("PRIVATE_SKILL_BODY"));
         let captured = arena.take_skill_activations();
         assert_eq!(captured.len(), 1);
-        assert!(captured[0].body().contains("PRIVATE_SKILL_BODY"));
+        assert!(captured[0].source_text().contains("PRIVATE_SKILL_BODY"));
     }
 
     #[tokio::test]

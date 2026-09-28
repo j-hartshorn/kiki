@@ -4890,7 +4890,7 @@ mod tests {
         };
         assert!(request.contains("direct"));
         assert_eq!(activation.name(), "direct");
-        assert_eq!(activation.body(), body);
+        assert_eq!(activation.source_text(), body);
         assert!(app.prompt.is_empty());
 
         app.transcript.apply(

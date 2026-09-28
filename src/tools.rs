@@ -4397,7 +4397,7 @@ mod tests {
                 .active_skills()
                 .next()
                 .unwrap()
-                .body()
+                .source_text()
                 .contains("FIRST_BODY")
         );
         assert!(new_ledger.captured().is_empty());
@@ -4407,15 +4407,23 @@ mod tests {
                 &mut new_ledger,
             )
             .unwrap();
-        assert!(old_ledger.captured()[0].body().contains("FIRST_BODY"));
-        assert!(new_ledger.captured()[0].body().contains("SECOND_BODY"));
+        assert!(
+            old_ledger.captured()[0]
+                .source_text()
+                .contains("FIRST_BODY")
+        );
+        assert!(
+            new_ledger.captured()[0]
+                .source_text()
+                .contains("SECOND_BODY")
+        );
         assert!(
             new_ledger
                 .history
                 .active_skills()
                 .next()
                 .unwrap()
-                .body()
+                .source_text()
                 .contains("SECOND_BODY")
         );
     }

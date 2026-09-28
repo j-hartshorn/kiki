@@ -4333,7 +4333,7 @@ mod tests {
                 .active_skills()
                 .find(|activation| activation.name() == "review")
                 .unwrap()
-                .body(),
+                .source_text(),
             project_body
         );
         fs::create_dir_all(&project_source).unwrap();
@@ -4344,7 +4344,7 @@ mod tests {
                 .active_skills()
                 .find(|activation| activation.name() == "review")
                 .unwrap()
-                .body(),
+                .source_text(),
             project_body
         );
         session
@@ -4382,7 +4382,7 @@ mod tests {
                 .active_skills()
                 .next()
                 .unwrap()
-                .body(),
+                .source_text(),
             user_body
         );
         let navigated = writer
@@ -5127,7 +5127,7 @@ mod tests {
             .unwrap();
         let live = writer.model_history().unwrap();
         assert_eq!(live.active_skills().count(), 1);
-        assert_eq!(live.active_skills().next().unwrap().body(), body);
+        assert_eq!(live.active_skills().next().unwrap().source_text(), body);
         assert_eq!(
             live.entries()
                 .iter()
@@ -5137,7 +5137,7 @@ mod tests {
         );
         let restored = session.restore().unwrap().executable.unwrap().history;
         assert_eq!(restored.active_skills().count(), 1);
-        assert_eq!(restored.active_skills().next().unwrap().body(), body);
+        assert_eq!(restored.active_skills().next().unwrap().source_text(), body);
         assert_eq!(restored.entries(), live.entries());
     }
 
@@ -5213,7 +5213,7 @@ mod tests {
             connection
                 .execute_batch("DROP TRIGGER entries_are_immutable_before_update;")
                 .unwrap();
-            connection.execute("UPDATE entries SET payload_json = '{\"SkillActivation\":{\"activation\":{\"body\":\"\"}}}' WHERE kind = 'skill_activation'", []).unwrap();
+            connection.execute("UPDATE entries SET payload_json = '{\"SkillActivation\":{\"activation\":{\"source_text\":\"\"}}}' WHERE kind = 'skill_activation'", []).unwrap();
         }
         assert!(session.restore().unwrap().executable.is_none());
         assert!(!session.has_active_project_skill_in_scope(&scope).unwrap());

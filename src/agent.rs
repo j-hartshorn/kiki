@@ -1638,7 +1638,7 @@ mod tests {
                 .active_skills()
                 .next()
                 .unwrap()
-                .body()
+                .source_text()
                 .contains("ROOT_PRIVATE_BODY")
         );
         drop(writer);
@@ -1714,7 +1714,7 @@ mod tests {
             .unwrap()
             .history
             .active_skills()
-            .map(|skill| (skill.name().to_owned(), skill.body().to_owned()))
+            .map(|skill| (skill.name().to_owned(), skill.source_text().to_owned()))
             .collect::<Vec<_>>();
         assert_eq!(active.len(), 2);
         assert!(

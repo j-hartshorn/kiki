@@ -79,8 +79,12 @@ pub(crate) fn skills_catalog_guidance() -> &'static str {
     strip_file_final_lf(SKILLS_CATALOG_GUIDANCE)
 }
 
-pub(crate) fn skill_activation_text(name: &str, source: &Path, body: &str) -> String {
-    let root = source
+pub(crate) fn skill_activation_text(
+    name: &str,
+    canonical_root: &Path,
+    source_text: &str,
+) -> String {
+    let root = canonical_root
         .to_str()
         .filter(|path| {
             !path.chars().any(|character| {
@@ -93,7 +97,7 @@ pub(crate) fn skill_activation_text(name: &str, source: &Path, body: &str) -> St
         })
         .map_or_else(String::new, |path| format!("Skill root path: {path}\n"));
     format!(
-        "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{body}\n</skill>",
+        "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
         strip_file_final_lf(SKILL_ACTIVATION_PROMPT),
     )
 }
