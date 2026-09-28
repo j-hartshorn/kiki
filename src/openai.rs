@@ -6281,7 +6281,7 @@ pub(crate) mod tests {
                         }
                         Record::CancelledRun { .. } => run.cancelled_runs += 1,
                         Record::FailedRun { .. } => run.failed_runs += 1,
-                        Record::Compaction { .. } => {}
+                        Record::Compaction { .. } | Record::SkillActivation { .. } => {}
                     }
                 }
                 RuntimeEvent::RunSettled { run_id } => {
@@ -6748,7 +6748,7 @@ pub(crate) mod tests {
                 }
                 Record::CancelledRun { .. } => cancelled_runs += 1,
                 Record::FailedRun { .. } => failed_runs += 1,
-                Record::Compaction { .. } => {}
+                Record::Compaction { .. } | Record::SkillActivation { .. } => {}
             }
         }
         (

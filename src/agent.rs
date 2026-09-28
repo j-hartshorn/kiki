@@ -128,6 +128,7 @@ pub(crate) enum PersistedAgentEvent {
         run_id: u64,
         request_entry: SessionEntryId,
         request: String,
+        activation: Option<SkillActivation>,
     },
     ModelStepStarted {
         run_id: u64,
@@ -172,6 +173,7 @@ pub(crate) enum PersistedAgentEvent {
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
+        activations: Vec<SkillActivation>,
     },
 }
 
@@ -711,13 +713,15 @@ impl<M: Model> Agent<M> {
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
         let admission = writer
-            .commit_request(request.clone(), selection, activation)
+            .commit_request(request.clone(), selection, activation.clone())
             .await?;
         let run_id = admission.run_id;
+        let activation_written = admission.effective_entry != admission.request_entry;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
             request_entry: admission.request_entry,
             request,
+            activation: activation.filter(|_| activation_written),
         });
 
         let mut attempts = Vec::new();
@@ -951,7 +955,7 @@ impl<M: Model> Agent<M> {
                                 step_attempts.clone(),
                             );
                             let checkpoint = self.arena.checkpoint();
-                            writer
+                            let activations = writer
                                 .settle_execution(
                                     run_id,
                                     step_id,
@@ -970,6 +974,7 @@ impl<M: Model> Agent<M> {
                                 reasoning_summary: pending.reasoning_summary,
                                 execution,
                                 attempts: step_attempts,
+                                activations,
                             });
                         }
                         Err(error) => {

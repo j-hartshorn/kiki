@@ -138,6 +138,9 @@ pub(crate) enum Record {
     Compaction {
         outcome: CompactionOutcome,
     },
+    SkillActivation {
+        activation: SkillActivation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +450,7 @@ enum WorkerMessage<M: Model> {
         request_entry: SessionEntryId,
         request: String,
         selection: ModelSelection,
+        activation: Option<SkillActivation>,
     },
     PersistedModelStepStarted {
         run_id: u64,
@@ -471,6 +475,7 @@ enum WorkerMessage<M: Model> {
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
+        activations: Vec<SkillActivation>,
     },
     PersistedFinished {
         agent: Agent<M>,
@@ -579,7 +584,8 @@ fn root_settlement(record: &Record) -> Settlement {
         Record::FailedRun { .. } => Settlement::Failed,
         Record::UserRequest { .. }
         | Record::CompletedExecution { .. }
-        | Record::Compaction { .. } => unreachable!("only terminal root records settle runs"),
+        | Record::Compaction { .. }
+        | Record::SkillActivation { .. } => unreachable!("only terminal root records settle runs"),
     }
 }
 
@@ -749,6 +755,9 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
             terminal: terminal_details(terminal),
         },
         RestoredRecordKind::Compaction { outcome } => Record::Compaction { outcome },
+        RestoredRecordKind::SkillActivation { activation } => {
+            Record::SkillActivation { activation }
+        }
     };
     StoredRecord {
         run_id: RunId(run_id),
@@ -1628,12 +1637,14 @@ impl<M: Model> RuntimeController<M> {
                         run_id,
                         request_entry,
                         request,
+                        activation,
                     } => {
                         let _ = completion_sender.send(WorkerMessage::RequestCommitted {
                             run_id,
                             request_entry,
                             request,
                             selection,
+                            activation,
                         });
                     }
                     PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
@@ -1663,6 +1674,7 @@ impl<M: Model> RuntimeController<M> {
                         reasoning_summary,
                         execution,
                         attempts,
+                        activations,
                     } => {
                         flush_persisted_tool_updates(
                             &completion_sender,
@@ -1679,6 +1691,7 @@ impl<M: Model> RuntimeController<M> {
                                 reasoning_summary,
                                 execution,
                                 attempts,
+                                activations,
                             });
                     }
                     PersistedAgentEvent::ModelProgress {
@@ -1901,6 +1914,7 @@ impl<M: Model> RuntimeController<M> {
                 request_entry,
                 request,
                 selection,
+                activation,
             } => {
                 let run_id = RunId(run_id);
                 let pending_busy_submissions = std::mem::take(
@@ -1928,6 +1942,14 @@ impl<M: Model> RuntimeController<M> {
                     },
                     false,
                 );
+                if let Some(activation) = activation {
+                    self.append_committed_record(
+                        events,
+                        run_id,
+                        Record::SkillActivation { activation },
+                        false,
+                    );
+                }
                 for _ in 0..pending_busy_submissions {
                     self.emit(
                         events,
@@ -1992,6 +2014,7 @@ impl<M: Model> RuntimeController<M> {
                 reasoning_summary,
                 execution,
                 attempts,
+                activations,
             } => {
                 self.append_committed_record(
                     events,
@@ -2006,6 +2029,14 @@ impl<M: Model> RuntimeController<M> {
                     },
                     false,
                 );
+                for activation in activations {
+                    self.append_committed_record(
+                        events,
+                        RunId(run_id),
+                        Record::SkillActivation { activation },
+                        false,
+                    );
+                }
                 self.session.clear_execution(step_id);
             }
             WorkerMessage::CompactionStarted => {
@@ -2419,7 +2450,7 @@ mod tests {
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
         SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
-    use crate::skills::SkillOrigin;
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin};
     use crate::sse_fixture::{Fixture, FixtureReply};
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -4923,6 +4954,126 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, ModelContextEntry::SkillActivation(_)))
         );
+
+        shutdown_controller(commands, controller).await;
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_activations_append_records_after_their_request_and_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let loaded_root = home.path().join(".agents/skills/loaded");
+        fs::create_dir_all(&loaded_root).unwrap();
+        fs::write(
+            loaded_root.join("SKILL.md"),
+            "---\nname: loaded\ndescription: Loaded\n---\nLoaded body",
+        )
+        .unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(workspace.path()).unwrap(),
+            home.path(),
+            false,
+            "",
+        ));
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .unwrap()
+                .with_skill_catalog(catalog),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await load_skill('loaded')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ]),
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        let direct = SkillActivation::new(
+            "direct".to_owned(),
+            home.path().join(".agents/skills/direct"),
+            "direct body".to_owned(),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        let mut live = Vec::new();
+        for (request, expected) in [
+            (
+                "/skill:direct",
+                vec![
+                    "record:1:user:/skill:direct",
+                    "record:1:skill:direct",
+                    "record:1:execution:1",
+                    "record:1:skill:loaded",
+                    "record:1:message:2:done",
+                ],
+            ),
+            (
+                "/skill:direct again",
+                vec![
+                    "record:2:user:/skill:direct again",
+                    "record:2:execution:3",
+                    "record:2:message:4:done",
+                ],
+            ),
+        ] {
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: request.to_owned(),
+                    activation: Some(direct.clone()),
+                })
+                .await
+                .unwrap();
+            let records = committed_records(&events_until_settled(&mut events).await);
+            assert_eq!(
+                records.iter().map(record_label).collect::<Vec<_>>(),
+                expected
+            );
+            live.extend(records);
+        }
+
+        let restored = restored_initial_state(&session.restore().unwrap())
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::Record(record) => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored.iter().map(record_label).collect::<Vec<_>>(),
+            live.iter().map(record_label).collect::<Vec<_>>()
+        );
+        let activations = |records: &[StoredRecord]| {
+            records
+                .iter()
+                .filter(|record| matches!(record.record, Record::SkillActivation { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(activations(&restored), activations(&live));
 
         shutdown_controller(commands, controller).await;
         session.close().unwrap();
@@ -7708,6 +7859,9 @@ mod tests {
                 format!("record:{}:failed:{message}", record.run_id.0)
             }
             Record::Compaction { .. } => format!("record:{}:compaction", record.run_id.0),
+            Record::SkillActivation { activation } => {
+                format!("record:{}:skill:{}", record.run_id.0, activation.name())
+            }
         }
     }
 

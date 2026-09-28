@@ -310,6 +310,9 @@ pub(crate) enum RestoredRecordKind {
     Compaction {
         outcome: CompactionOutcome,
     },
+    SkillActivation {
+        activation: SkillActivation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1303,7 +1306,7 @@ impl SessionWriter {
         code: PersistedCode,
         checkpoint: Checkpoint,
         activations: Vec<SkillActivation>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<SkillActivation>, SessionError> {
         self.write_context(SessionWriteKind::Settlement, move |connection, context| {
             validate_execution_projection(&code)?;
             if !activations.is_empty()
@@ -1338,7 +1341,7 @@ impl SessionWriter {
             )?;
             context.effective_entry = entry;
             context.history = history;
-            Ok(())
+            Ok(changed)
         })
         .await
     }
@@ -3753,23 +3756,6 @@ fn readable_record(
             .then_some(None)
             .ok_or(());
     }
-    if entry.kind == "skill_activation" {
-        let parent = entry
-            .parent_id
-            .and_then(|parent_id| entries.iter().find(|candidate| candidate.id == parent_id))
-            .ok_or(())?;
-        return (entry.run_id.is_some()
-            && parent.run_id == entry.run_id
-            && entry.provider_replay.is_none()
-            && codec::decoded_skill_activation(decoded).is_some()
-            && runs.contains_key(&entry.run_id.unwrap_or_default())
-            && run_has_one_request(entries, entry.run_id.unwrap_or_default())
-            && steps
-                .iter()
-                .all(|step| step.settled_entry_id != Some(entry.id)))
-        .then_some(None)
-        .ok_or(());
-    }
     let run_id = entry
         .run_id
         .and_then(|id| u64::try_from(id).ok())
@@ -3895,6 +3881,23 @@ fn readable_record(
             }
             RestoredRecordKind::Compaction {
                 outcome: codec::decoded_compaction(decoded).ok_or(())?,
+            }
+        }
+        "skill_activation" => {
+            let parent = entry
+                .parent_id
+                .and_then(|parent_id| entries.iter().find(|candidate| candidate.id == parent_id))
+                .ok_or(())?;
+            if parent.run_id != entry.run_id
+                || entry.provider_replay.is_some()
+                || steps
+                    .iter()
+                    .any(|step| step.settled_entry_id == Some(entry.id))
+            {
+                return Err(());
+            }
+            RestoredRecordKind::SkillActivation {
+                activation: codec::decoded_skill_activation(decoded).ok_or(())?.clone(),
             }
         }
         _ => return Err(()),
@@ -4951,6 +4954,88 @@ mod tests {
                 .active_skills()
                 .count(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_reads_skill_activations_after_their_request_and_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let direct = skill(
+            "direct",
+            home.path().join("direct"),
+            "direct body",
+            SkillOrigin::User,
+            None,
+        );
+        let loaded = skill(
+            "loaded",
+            home.path().join("loaded"),
+            "loaded body",
+            SkillOrigin::User,
+            None,
+        );
+        let run = writer
+            .commit_request(
+                "/skill:direct".to_owned(),
+                selection(),
+                Some(direct.clone()),
+            )
+            .await
+            .unwrap();
+        let step = writer.start_model_step(run.run_id).await.unwrap();
+        let code = PersistedCode {
+            source: "await load_skill('loaded')".to_owned(),
+            call_id: crate::model::ModelCallId::new("load".to_owned()),
+            commentary: None,
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
+            }),
+            attempts: Vec::new(),
+        };
+        writer
+            .settle_execution(
+                run.run_id,
+                step,
+                code,
+                session.initial_checkpoint().unwrap(),
+                vec![loaded.clone()],
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+
+        let kinds = session
+            .restore()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    super::RestoredRecordKind::UserRequest { .. },
+                    super::RestoredRecordKind::SkillActivation { activation: first },
+                    super::RestoredRecordKind::CompletedExecution { .. },
+                    super::RestoredRecordKind::SkillActivation { activation: second },
+                    super::RestoredRecordKind::CancelledRun { .. },
+                ] if *first == direct && *second == loaded
+            ),
+            "{kinds:?}"
         );
     }
 
