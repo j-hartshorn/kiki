@@ -3052,10 +3052,11 @@ impl Transcript {
         let mut foreground_attempts = Vec::new();
         let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
-            append_record_attempts(&displayed.record.record, &mut foreground_attempts);
+            let ordinary = record_attempts(&displayed.record.record);
+            foreground_attempts.extend(ordinary);
             append_initial_overflow_attempts(&displayed.record.record, &mut foreground_attempts);
             if !matches!(displayed.record.record, Record::Compaction { .. }) {
-                append_record_attempts(&displayed.record.record, &mut normal_foreground_attempts);
+                normal_foreground_attempts.extend(ordinary);
             }
         }
         if let Some(live) = &self.live_step {
@@ -3733,17 +3734,14 @@ pub(crate) fn format_startup_configuration(snapshot: &StartupSnapshot) -> String
     lines.join("\n")
 }
 
-fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a AttemptAccounting>) {
+fn record_attempts(record: &Record) -> &[AttemptAccounting] {
     match record {
-        Record::CompletedExecution {
-            attempts: record_attempts,
-            ..
-        } => attempts.extend(record_attempts),
+        Record::CompletedExecution { attempts, .. } => attempts,
         Record::FinalMessage { terminal, .. }
         | Record::CancelledRun { terminal }
-        | Record::FailedRun { terminal, .. } => attempts.extend(&terminal.attempts),
-        Record::Compaction { outcome } => attempts.extend(outcome.attempts()),
-        Record::UserRequest { .. } => {}
+        | Record::FailedRun { terminal, .. } => &terminal.attempts,
+        Record::Compaction { outcome } => outcome.attempts(),
+        Record::UserRequest { .. } => &[],
     }
 }
 
