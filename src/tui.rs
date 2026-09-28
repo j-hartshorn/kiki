@@ -319,6 +319,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::StdoutDelta { run_id, .. }
         | RuntimeEvent::StdoutTruncated { run_id, .. }
         | RuntimeEvent::RunSettled { run_id }
+        | RuntimeEvent::AutomaticCompactionStarted { run_id }
         | RuntimeEvent::CorrectionCompleted { run_id, .. } => Some(*run_id),
         RuntimeEvent::RecordAppended { record, .. } => Some(record.run_id),
         RuntimeEvent::SettingsAccepted { .. }
@@ -10338,6 +10339,90 @@ mod tests {
         assert!(!settled.contains('·'));
         assert_eq!(app.history_height, 8);
         assert!(!app.tick(now + Duration::from_millis(100)).visible_changed);
+    }
+
+    #[test]
+    fn automatic_compaction_animates_convergence_over_delayed_generation_progress() {
+        let now = Instant::now();
+        let run_id = RunId(1);
+        let mut app = App::default();
+        set_prompt(&mut app, "draft");
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::UserRequest {
+                        request: "large request".to_owned(),
+                        selection: None,
+                    },
+                },
+                progress_gap: false,
+            },
+            now,
+        );
+        app.handle_event_at(RuntimeEvent::AutomaticCompactionStarted { run_id }, now);
+        for progress in [
+            RuntimeEvent::RunStarted { run_id },
+            RuntimeEvent::ModelStepStarted {
+                run_id,
+                step_id: ModelStepId(1),
+            },
+            RuntimeEvent::ModelProgress {
+                run_id,
+                step_id: ModelStepId(1),
+                progress: ModelProgress::AssistantTextChunk {
+                    text: "stale text".to_owned(),
+                },
+            },
+        ] {
+            app.handle_progress(ProgressEnvelope {
+                item: progress,
+                gap_before: false,
+            });
+        }
+
+        assert!(app.transcript.is_compacting());
+        assert!(!app.transcript.is_generating());
+        assert_eq!(app.prompt.text(), "draft");
+        assert!(!app.compact_acknowledgement_pending);
+        let initial = rendered_at(&mut app, 20, 12, now);
+        assert!(!initial.contains("stale text"), "{initial}");
+        assert!(
+            initial
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ·       ·")),
+            "{initial}"
+        );
+        assert!(app.tick(now + Duration::from_millis(50)).visible_changed);
+        let advanced = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(
+            advanced
+                .lines()
+                .nth(8)
+                .is_some_and(|row| row.starts_with(" ●·     ·●")),
+            "{advanced}"
+        );
+
+        app.handle_event_at(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::Compaction {
+                        outcome: crate::session::CompactionOutcome::Cancelled {
+                            reason: crate::session::CompactionReason::AutomaticThreshold,
+                            attempts: Vec::new(),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            now + Duration::from_millis(50),
+        );
+        let settled = rendered_at(&mut app, 20, 12, now + Duration::from_millis(50));
+        assert!(!settled.contains('●'), "{settled}");
+        assert!(!app.tick(now + Duration::from_millis(100)).visible_changed);
+        assert_eq!(app.prompt.text(), "draft");
     }
 
     #[test]

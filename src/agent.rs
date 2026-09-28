@@ -132,6 +132,12 @@ pub(crate) enum PersistedAgentEvent {
         request_entry: SessionEntryId,
         request: String,
     },
+    CompactionStarted {
+        run_id: u64,
+    },
+    CompactionCommitted {
+        compaction: CommittedCompaction,
+    },
     ModelStepStarted {
         run_id: u64,
         step_id: u64,
@@ -187,7 +193,7 @@ pub(crate) struct PersistedRunOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ManualCompactionResult {
+pub(crate) enum CompactionResult {
     NoOp,
     CancelledBeforeStart,
     FailedBeforeStart,
@@ -618,8 +624,9 @@ impl<M: Model> Agent<M> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn compact_manual(
+    pub(crate) async fn compact(
         &mut self,
+        reason: CompactionReason,
         policy: CompactionSettings,
         selection: ModelSelection,
         reasoning: CrossProviderReasoning,
@@ -627,18 +634,12 @@ impl<M: Model> Agent<M> {
         cancellation: &CancellationToken,
         writer: &SessionWriter,
         started: &mut (impl FnMut() + Send),
-    ) -> Result<ManualCompactionResult, SessionError> {
+    ) -> Result<CompactionResult, SessionError> {
         let Some(preparation) = writer
-            .prepare_compaction(
-                policy,
-                selection,
-                reasoning,
-                focus,
-                CompactionReason::Manual,
-            )
+            .prepare_compaction(policy, selection, reasoning, focus, reason)
             .await?
         else {
-            return Ok(ManualCompactionResult::NoOp);
+            return Ok(CompactionResult::NoOp);
         };
 
         let mut attempts = Vec::new();
@@ -674,9 +675,9 @@ impl<M: Model> Agent<M> {
 
         if !provider_started {
             return Ok(if cancellation.is_cancelled() {
-                ManualCompactionResult::CancelledBeforeStart
+                CompactionResult::CancelledBeforeStart
             } else {
-                ManualCompactionResult::FailedBeforeStart
+                CompactionResult::FailedBeforeStart
             });
         }
 
@@ -697,7 +698,7 @@ impl<M: Model> Agent<M> {
             }
         };
         let committed = writer.settle_compaction(preparation, settlement).await?;
-        Ok(ManualCompactionResult::Settled(committed))
+        Ok(CompactionResult::Settled(committed))
     }
 
     #[cfg(test)]
@@ -712,9 +713,12 @@ impl<M: Model> Agent<M> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_persisted(
         &mut self,
         selection: ModelSelection,
+        policy: CompactionSettings,
+        reasoning: CrossProviderReasoning,
         request: String,
         cancellation: &CancellationToken,
         writer: &SessionWriter,
@@ -734,7 +738,32 @@ impl<M: Model> Agent<M> {
         let mut pending_step_id = None;
 
         loop {
-            if cancellation.is_cancelled() {
+            if !cancellation.is_cancelled() {
+                let result = self
+                    .compact(
+                        CompactionReason::AutomaticThreshold,
+                        policy,
+                        selection,
+                        reasoning,
+                        String::new(),
+                        cancellation,
+                        writer,
+                        &mut || event(PersistedAgentEvent::CompactionStarted { run_id }),
+                    )
+                    .await?;
+                if let CompactionResult::Settled(compaction) = result {
+                    event(PersistedAgentEvent::CompactionCommitted { compaction });
+                }
+            }
+            let step_id = if cancellation.is_cancelled() {
+                None
+            } else {
+                let allocation_cancellation = cancellation.clone();
+                writer
+                    .start_model_step_unless(run_id, move || allocation_cancellation.is_cancelled())
+                    .await?
+            };
+            let Some(step_id) = step_id else {
                 let terminal = PersistedTerminal::Cancelled {
                     evidence: generation.evidence().map(TerminalEvidence::Generation),
                     attempts: attempts[committed_attempts..].to_vec(),
@@ -748,9 +777,7 @@ impl<M: Model> Agent<M> {
                     authentication_failure: false,
                     recovery_failure: false,
                 });
-            }
-
-            let step_id = writer.start_model_step(run_id).await?;
+            };
             pending_step_id = Some(step_id);
             if let Some(context) = &mut self.invocation_context {
                 context.set_origin_step_id(step_id);
@@ -1450,8 +1477,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Agent, AgentError, AgentProgress, ExecutionFailure, GenerationEvidenceBuilder,
-        ManualCompactionResult, TerminalEvidence,
+        Agent, AgentError, AgentProgress, CompactionResult, ExecutionFailure,
+        GenerationEvidenceBuilder, TerminalEvidence,
     };
     use crate::arena::{
         Arena, ArenaError, Execution, ExecutionOutcome, Observation, PythonError, ToolCall,
@@ -1466,8 +1493,8 @@ mod tests {
         SummaryRequest, SummaryResult,
     };
     use crate::session::{
-        CompactionOutcome, PersistedTerminal, Session, SessionEntryId, SessionWriteGate,
-        SessionWriteKind, SessionWriter,
+        CompactionOutcome, CompactionReason, PersistedTerminal, RestoredRecord, RestoredRecordKind,
+        Session, SessionEntryId, SessionWriteGate, SessionWriteKind, SessionWriter,
     };
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
@@ -1726,7 +1753,8 @@ mod tests {
         let mut started = 0;
 
         let result = agent
-            .compact_manual(
+            .compact(
+                CompactionReason::Manual,
                 policy,
                 selection,
                 CrossProviderReasoning::Inline,
@@ -1743,7 +1771,7 @@ mod tests {
         assert_eq!(started, 1);
         assert!(matches!(
             result,
-            ManualCompactionResult::Settled(committed)
+            CompactionResult::Settled(committed)
                 if matches!(
                     committed.outcome,
                     CompactionOutcome::Cancelled { ref attempts, .. }
@@ -1794,7 +1822,8 @@ mod tests {
         let mut started = 0;
 
         let result = agent
-            .compact_manual(
+            .compact(
+                CompactionReason::Manual,
                 policy,
                 selection,
                 CrossProviderReasoning::Inline,
@@ -1810,7 +1839,7 @@ mod tests {
         assert_eq!(started, 1);
         assert!(matches!(
             result,
-            ManualCompactionResult::Settled(committed)
+            CompactionResult::Settled(committed)
                 if matches!(committed.outcome, CompactionOutcome::Applied { .. })
         ));
         let next_cancellation = CancellationToken::new();
@@ -1818,6 +1847,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "next request".to_owned(),
                 &next_cancellation,
                 &writer,
@@ -1883,7 +1914,8 @@ mod tests {
         let mut started = 0;
 
         let result = agent
-            .compact_manual(
+            .compact(
+                CompactionReason::Manual,
                 CompactionSettings::new(16_384, 20_000),
                 selection,
                 CrossProviderReasoning::Inline,
@@ -1895,7 +1927,7 @@ mod tests {
             .await
             .expect("cancelled compaction is not a storage failure");
 
-        assert_eq!(result, ManualCompactionResult::CancelledBeforeStart);
+        assert_eq!(result, CompactionResult::CancelledBeforeStart);
         assert_eq!(started, 0);
         let connection = session.connection_for_test().expect("open session");
         let revision_after: i64 = connection
@@ -1916,6 +1948,915 @@ mod tests {
         assert_eq!(compactions, 0);
 
         drop(connection);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    fn threshold_policy(threshold_tokens: u64) -> CompactionSettings {
+        CompactionSettings::new(
+            DEFAULT_MODEL.context_window_tokens - threshold_tokens,
+            20_000,
+        )
+    }
+
+    #[tokio::test]
+    async fn threshold_compacts_after_committed_request_before_first_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let selection = default_selection();
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![
+                ModelAction::Message {
+                    text: "small done".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "large done".to_owned(),
+                },
+            ])
+            .with_summary_responses(vec!["threshold summary".to_owned()]),
+        )
+        .await;
+        let session = Session::create(home.path(), workspace.path(), selection, agent.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let policy = threshold_policy(60_000);
+
+        let small = agent
+            .run_persisted(
+                selection,
+                policy,
+                CrossProviderReasoning::Inline,
+                "small request".to_owned(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .expect("run small request");
+        assert!(matches!(small.terminal, PersistedTerminal::Final { .. }));
+        assert!(agent.model.summary_requests().is_empty());
+        assert!(matches!(
+            agent.model.contexts()[0].first(),
+            Some(ModelContextEntry::UserRequest { text }) if text == "discarded request"
+        ));
+
+        let large_request = "large ".to_owned() + &"x".repeat(100_000);
+        let mut events = Vec::new();
+        let large = agent
+            .run_persisted(
+                selection,
+                policy,
+                CrossProviderReasoning::Inline,
+                large_request.clone(),
+                &CancellationToken::new(),
+                &writer,
+                &mut |event| events.push(event),
+            )
+            .await
+            .expect("run large request");
+
+        assert_eq!(agent.model.summary_requests().len(), 1);
+        assert_eq!(
+            agent
+                .model
+                .contexts()
+                .last()
+                .expect("capture the first large-request step"),
+            &[
+                ModelContextEntry::CompactionSummary {
+                    summary: "threshold summary".to_owned(),
+                },
+                ModelContextEntry::UserRequest {
+                    text: large_request.clone(),
+                },
+            ]
+        );
+        assert!(matches!(
+            &large.terminal,
+            PersistedTerminal::Final { text, .. } if text == "large done"
+        ));
+        let request_entries = events
+            .iter()
+            .filter_map(|event| match event {
+                super::PersistedAgentEvent::RequestCommitted { request_entry, .. } => {
+                    Some(*request_entry)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [request_entry] = request_entries.as_slice() else {
+            panic!("the large request is admitted once");
+        };
+        let restore = session.restore().expect("restore compacted run");
+        let run_records = restore
+            .records
+            .iter()
+            .filter(|record| record.run_id == large.run_id)
+            .map(|record| &record.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                run_records.as_slice(),
+                [
+                    RestoredRecordKind::UserRequest { request, .. },
+                    RestoredRecordKind::Compaction {
+                        outcome: CompactionOutcome::Applied {
+                            first_retained,
+                            reason: CompactionReason::AutomaticThreshold,
+                            ..
+                        },
+                    },
+                    RestoredRecordKind::FinalMessage { text, .. },
+                ] if request == &large_request
+                    && first_retained == request_entry
+                    && text == "large done"
+            ),
+            "{run_records:?}"
+        );
+        let (steps, requests): (i64, i64) = session
+            .connection_for_test()
+            .expect("open session")
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM model_steps WHERE run_id = ?1), (SELECT COUNT(*) FROM entries WHERE run_id = ?1 AND kind = 'user_request')",
+                [i64::try_from(large.run_id).expect("run ID fits SQLite")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count run steps and requests");
+        assert_eq!((steps, requests), (1, 1));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    fn persisted_event_labels(events: &[super::PersistedAgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                super::PersistedAgentEvent::RequestCommitted { .. } => Some("request"),
+                super::PersistedAgentEvent::CompactionStarted { .. } => Some("compaction-started"),
+                super::PersistedAgentEvent::CompactionCommitted { compaction } => {
+                    Some(match compaction.outcome {
+                        CompactionOutcome::Applied { .. } => "compaction:applied",
+                        CompactionOutcome::Failed { .. } => "compaction:failed",
+                        CompactionOutcome::Cancelled { .. } => "compaction:cancelled",
+                    })
+                }
+                super::PersistedAgentEvent::ModelStepStarted { .. } => Some("step"),
+                super::PersistedAgentEvent::ExecutionCommitted { .. } => Some("execution"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run_entry_kinds(session: &Session, run_id: u64) -> Vec<String> {
+        let connection = session.connection_for_test().expect("open session");
+        let mut statement = connection
+            .prepare("SELECT kind FROM entries WHERE run_id = ?1 ORDER BY id")
+            .expect("prepare entry kinds");
+        statement
+            .query_map(
+                [i64::try_from(run_id).expect("run ID fits SQLite")],
+                |row| row.get(0),
+            )
+            .expect("query entry kinds")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read entry kinds")
+    }
+
+    fn session_counts(session: &Session) -> (i64, i64) {
+        session
+            .connection_for_test()
+            .expect("open session")
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM model_steps)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count runs and steps")
+    }
+
+    fn large_request() -> String {
+        "large ".to_owned() + &"x".repeat(100_000)
+    }
+
+    async fn run_threshold_request<M: Model>(
+        agent: &mut Agent<M>,
+        writer: &SessionWriter,
+        policy: CompactionSettings,
+        request: String,
+        cancellation: &CancellationToken,
+    ) -> (super::PersistedRunOutcome, Vec<&'static str>) {
+        let mut events = Vec::new();
+        let outcome = agent
+            .run_persisted(
+                default_selection(),
+                policy,
+                CrossProviderReasoning::Inline,
+                request,
+                cancellation,
+                writer,
+                &mut |event| events.push(event),
+            )
+            .await
+            .expect("run persisted request");
+        (outcome, persisted_event_labels(&events))
+    }
+
+    #[tokio::test]
+    async fn threshold_compacts_committed_feedback_before_the_next_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let source = format!("payload = '{}'", "y".repeat(40_000));
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: source.clone(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ])
+            .with_summary_responses(vec!["split summary".to_owned()]),
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        let policy = CompactionSettings::new(DEFAULT_MODEL.context_window_tokens - 5_000, 1_000);
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            policy,
+            "inspect".to_owned(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        assert_eq!(
+            labels,
+            [
+                "request",
+                "step",
+                "execution",
+                "compaction-started",
+                "compaction:applied",
+                "step",
+            ]
+        );
+        let contexts = agent.model.contexts();
+        assert_eq!(
+            contexts[0],
+            [ModelContextEntry::UserRequest {
+                text: "inspect".to_owned(),
+            }]
+        );
+        let [
+            ModelContextEntry::CompactionSummary { summary },
+            ModelContextEntry::CompletedCode(code),
+        ] = contexts[1].as_slice()
+        else {
+            panic!("next step receives summary and the whole retained code entry");
+        };
+        assert!(summary.starts_with("No prior history."), "{summary}");
+        assert!(summary.ends_with("split summary"), "{summary}");
+        assert_eq!(code.source(), source);
+        assert_eq!(
+            code.result(),
+            &CodeResult::Execution {
+                feedback: String::new(),
+            }
+        );
+        assert!(
+            agent
+                .model
+                .summary_requests()
+                .iter()
+                .all(|request| request.selection == default_selection())
+        );
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "execution", "compaction", "final_reply"]
+        );
+        assert_eq!(session_counts(&session), (1, 2));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    struct NativeReplayModel {
+        inner: ScriptedModel,
+    }
+
+    impl Model for NativeReplayModel {
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            self.inner.summarise(request, cancellation, attempt_started)
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let mut step = self
+                    .inner
+                    .step(selection, history, cancellation, progress)
+                    .await?;
+                step.replay = ProviderReplay::new("openai", step.replay.items().to_vec());
+                Ok(step)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn later_threshold_checks_ignore_usage_from_before_an_applied_compaction() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(
+            &workspace,
+            NativeReplayModel {
+                inner: ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "value = 1".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ])
+                .with_summary_responses(vec![
+                    "first summary".to_owned(),
+                    "unexpected summary".to_owned(),
+                ]),
+            },
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        append_seed_request(&writer, "oldest request").await;
+        let admission = writer
+            .commit_request("earlier request".to_owned(), default_selection())
+            .await
+            .expect("commit earlier request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start earlier step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step_id),
+                move || PersistedTerminal::Final {
+                    step_id,
+                    text: "earlier reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("openai", Vec::new()),
+                    attempts: vec![AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+                        model: DEFAULT_MODEL.id.to_owned(),
+                        service_tier: None,
+                        input_tokens: Some(450_000),
+                        cached_input_tokens: Some(0),
+                        cache_write_input_tokens: Some(0),
+                        cache_write_1h_input_tokens: 0,
+                        output_tokens: Some(50_000),
+                        reasoning_output_tokens: Some(0),
+                        total_tokens: Some(500_000),
+                    })],
+                },
+                None,
+            )
+            .await
+            .expect("close earlier run");
+        let policy = CompactionSettings::new(DEFAULT_MODEL.context_window_tokens - 100_000, 3);
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            policy,
+            "inspect".to_owned(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        assert_eq!(
+            labels,
+            [
+                "request",
+                "compaction-started",
+                "compaction:applied",
+                "step",
+                "execution",
+                "step",
+            ]
+        );
+        assert_eq!(agent.model.inner.summary_requests().len(), 1);
+        assert!(agent.model.inner.contexts().iter().all(|context| matches!(
+            context.as_slice(),
+            [
+                ModelContextEntry::CompactionSummary { summary },
+                ModelContextEntry::UserRequest { text },
+                ModelContextEntry::FinalMessage { .. },
+                ..
+            ] if summary == "first summary" && text == "earlier request"
+        )));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    struct FailingSummaryModel {
+        steps: ScriptedModel,
+    }
+
+    impl Model for FailingSummaryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            _request: SummaryRequest,
+            _cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                attempt_started();
+                Err(ModelFailure::new(
+                    ModelError::Provider(Box::new(ProviderFailure::new(
+                        Some(500),
+                        None,
+                        "summary provider failed".to_owned(),
+                    ))),
+                    vec![AttemptAccounting::UsageUnavailable],
+                ))
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            history: &'a ModelHistory,
+            cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            self.steps.step(selection, history, cancellation, progress)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_threshold_summary_persists_failed_and_continues_unchanged() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(
+            &workspace,
+            FailingSummaryModel {
+                steps: ScriptedModel::new(vec![ModelAction::Message {
+                    text: "done".to_owned(),
+                }]),
+            },
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let request = large_request();
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            threshold_policy(60_000),
+            request.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        assert_eq!(
+            labels,
+            ["request", "compaction-started", "compaction:failed", "step"]
+        );
+        let context = &agent.model.steps.contexts()[0];
+        assert!(matches!(
+            context.first(),
+            Some(ModelContextEntry::UserRequest { text }) if text == "discarded request"
+        ));
+        assert!(matches!(
+            context.last(),
+            Some(ModelContextEntry::UserRequest { text }) if text == &request
+        ));
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "final_reply"]
+        );
+        assert!(matches!(
+            session.restore().expect("restore").records.as_slice(),
+            [.., RestoredRecord {
+                kind: RestoredRecordKind::Compaction {
+                    outcome: CompactionOutcome::Failed {
+                        diagnostic,
+                        reason: CompactionReason::AutomaticThreshold,
+                        attempts,
+                    },
+                },
+                ..
+            }, _] if diagnostic.contains("summary provider failed")
+                && attempts == &[AttemptAccounting::UsageUnavailable]
+        ));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn skipped_threshold_checks_emit_nothing_and_run_the_step() {
+        for case in ["disabled", "no progress", "failed before start"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let summaries = if case == "failed before start" {
+                Vec::new()
+            } else {
+                vec!["unexpected summary".to_owned()]
+            };
+            let mut agent = agent_with_model(
+                &workspace,
+                ScriptedModel::new(vec![ModelAction::Message {
+                    text: "done".to_owned(),
+                }])
+                .with_summary_responses(summaries),
+            )
+            .await;
+            let session = Session::create(
+                home.path(),
+                workspace.path(),
+                default_selection(),
+                agent.checkpoint(),
+            )
+            .expect("create session");
+            let writer = session.writer();
+            let policy = match case {
+                "disabled" => threshold_policy(60_000).disabled(),
+                "no progress" => threshold_policy(1_000),
+                _ => threshold_policy(60_000),
+            };
+            if case != "no progress" {
+                seed_compactable_history(&writer).await;
+            }
+
+            let (outcome, labels) = run_threshold_request(
+                &mut agent,
+                &writer,
+                policy,
+                large_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert!(
+                matches!(outcome.terminal, PersistedTerminal::Final { .. }),
+                "{case}"
+            );
+            assert_eq!(labels, ["request", "step"], "{case}");
+            assert!(agent.model.summary_requests().is_empty(), "{case}");
+            assert_eq!(
+                run_entry_kinds(&session, outcome.run_id),
+                ["user_request", "final_reply"],
+                "{case}"
+            );
+
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn final_reply_settles_without_a_post_final_threshold_check() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "z".repeat(100_000),
+            }])
+            .with_summary_responses(vec!["unexpected summary".to_owned()]),
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        append_seed_request(&writer, "earlier request").await;
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            CompactionSettings::new(DEFAULT_MODEL.context_window_tokens - 1_000, 1),
+            "inspect".to_owned(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        assert_eq!(labels, ["request", "step"]);
+        assert!(agent.model.summary_requests().is_empty());
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "final_reply"]
+        );
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    async fn append_seed_request(writer: &SessionWriter, request: &str) {
+        let admission = writer
+            .commit_request(request.to_owned(), default_selection())
+            .await
+            .expect("commit seed request");
+        writer
+            .close_run(
+                admission.run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close seed request");
+    }
+
+    #[tokio::test]
+    async fn threshold_cancellation_before_an_attempt_closes_the_run_without_an_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(&workspace, CancelBeforeSummaryAttemptModel).await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let (runs_before, steps_before) = session_counts(&session);
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            threshold_policy(60_000),
+            large_request(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.terminal,
+            PersistedTerminal::Cancelled {
+                evidence: None,
+                attempts: Vec::new(),
+            }
+        );
+        assert_eq!(labels, ["request"]);
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "cancelled"]
+        );
+        assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn threshold_cancellation_after_an_attempt_persists_cancelled_and_closes_the_run() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let mut agent = agent_with_model(
+            &workspace,
+            CancelBetweenSummaryRequestsModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+                attempts: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await;
+        let session = Session::create(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let (runs_before, steps_before) = session_counts(&session);
+
+        let (outcome, labels) = run_threshold_request(
+            &mut agent,
+            &writer,
+            threshold_policy(60_000),
+            large_request(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome.terminal,
+            PersistedTerminal::Cancelled { evidence: None, .. }
+        ));
+        assert_eq!(
+            labels,
+            ["request", "compaction-started", "compaction:cancelled"]
+        );
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "cancelled"]
+        );
+        assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
+        assert!(matches!(
+            session.restore().expect("restore").records.as_slice(),
+            [.., RestoredRecord {
+                kind: RestoredRecordKind::Compaction {
+                    outcome: CompactionOutcome::Cancelled {
+                        reason: CompactionReason::AutomaticThreshold,
+                        attempts,
+                    },
+                },
+                run_id,
+                ..
+            }, _] if *run_id == outcome.run_id
+                && attempts == &[AttemptAccounting::UsageUnavailable]
+        ));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_applied_is_chosen_keeps_it_and_starts_no_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Compaction);
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "must not run".to_owned(),
+            }])
+            .with_summary_responses(vec!["applied summary".to_owned()]),
+        )
+        .await;
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        seed_compactable_history(&writer).await;
+        let (runs_before, steps_before) = session_counts(&session);
+        let cancellation = CancellationToken::new();
+
+        let ((outcome, labels), ()) = tokio::join!(
+            run_threshold_request(
+                &mut agent,
+                &writer,
+                threshold_policy(60_000),
+                large_request(),
+                &cancellation,
+            ),
+            async {
+                gate.wait_until_started().await;
+                cancellation.cancel();
+                gate.release();
+            }
+        );
+
+        assert!(matches!(
+            outcome.terminal,
+            PersistedTerminal::Cancelled { evidence: None, .. }
+        ));
+        assert_eq!(
+            labels,
+            ["request", "compaction-started", "compaction:applied"]
+        );
+        assert!(agent.model.contexts().is_empty());
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "cancelled"]
+        );
+        assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
+        assert!(matches!(
+            writer.model_history().expect("read compacted context").entries(),
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+                if summary == "applied summary"
+        ));
+
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_queued_step_allocation_after_applied_starts_no_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let gate = SessionWriteGate::new(SessionWriteKind::Step);
+        let mut agent = agent_with_model(
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "must not run".to_owned(),
+            }])
+            .with_summary_responses(vec!["applied summary".to_owned()]),
+        )
+        .await;
+        let session = Session::create_with_write_gate(
+            home.path(),
+            workspace.path(),
+            default_selection(),
+            agent.checkpoint(),
+            gate.clone(),
+        )
+        .expect("create session");
+        let writer = session.writer();
+        append_seed_request(&writer, &large_request()).await;
+        append_seed_request(&writer, &large_request()).await;
+        let (runs_before, steps_before) = session_counts(&session);
+        let cancellation = CancellationToken::new();
+
+        let ((outcome, labels), ()) = tokio::join!(
+            run_threshold_request(
+                &mut agent,
+                &writer,
+                threshold_policy(60_000),
+                large_request(),
+                &cancellation,
+            ),
+            async {
+                gate.wait_until_started().await;
+                cancellation.cancel();
+                gate.release();
+            }
+        );
+
+        assert!(matches!(
+            outcome.terminal,
+            PersistedTerminal::Cancelled { evidence: None, .. }
+        ));
+        assert_eq!(
+            labels,
+            ["request", "compaction-started", "compaction:applied"]
+        );
+        assert!(agent.model.contexts().is_empty());
+        assert_eq!(
+            run_entry_kinds(&session, outcome.run_id),
+            ["user_request", "compaction", "cancelled"]
+        );
+        assert_eq!(session_counts(&session), (runs_before + 1, steps_before));
+        assert!(matches!(
+            writer.model_history().expect("read compacted context").entries(),
+            [ModelContextEntry::CompactionSummary { summary }, ModelContextEntry::UserRequest { .. }]
+                if summary == "applied summary"
+        ));
+
         drop(writer);
         session.close().expect("close session");
     }
@@ -2194,6 +3135,8 @@ mod tests {
         let outcome = agent
             .run_persisted(
                 selection,
+                CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "inspect".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -3211,6 +4154,8 @@ mod tests {
             let mut event = |_| {};
             let run = agent.run_persisted(
                 selection,
+                CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "time out then cancel".to_owned(),
                 &cancellation,
                 &writer,
@@ -3289,6 +4234,8 @@ mod tests {
             agent
                 .run_persisted(
                     selection,
+                    CompactionSettings::default(),
+                    CrossProviderReasoning::Inline,
                     "request entry".to_owned(),
                     &CancellationToken::new(),
                     &session.writer(),

@@ -155,7 +155,7 @@ First red: `agent::tests::threshold_compacts_after_committed_request_before_firs
 - Run-scoped Started sets `compacting context` and spinner independently of manual acknowledgement or draft clearing; delayed lossy `ModelStepStarted` and `ModelProgress` chunks from the preceding step, delivered before a retry reset, cannot switch either back to generating or repaint old text. Settled attempt accounting stays visible. Committed card, terminal settlement or disabled event clears presentation. Submit/Compact/tree are busy during active work; a retained manual request cancels and follows Run/correction settlement once.
 - Repeated checks after an Applied entry ignore old normal/summary usage, with no immediate retrigger from that usage. Assert the selected-only SQL/query plan and below-threshold behaviour with large abandoned replay blobs and several Compaction Entries; no abandoned reads, repeated full-chain validation scans or summary-input construction.
 
-**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/compaction.rs`, `src/transcript.rs`, `src/tui.rs`.
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`; `src/openai.rs` (test observer for the new Runtime event). The existing pure compaction policy needs no Task 4 change.
 
 **Verification**
 

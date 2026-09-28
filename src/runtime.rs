@@ -6,7 +6,7 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AgentProgress, ManualCompactionResult, PersistedAgentEvent, PersistedRunOutcome,
+    Agent, AgentProgress, CompactionResult, PersistedAgentEvent, PersistedRunOutcome,
     TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
@@ -19,9 +19,9 @@ use crate::config::{
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
-    Session, SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore,
-    SessionWriter,
+    CommittedCompaction, CompactionOutcome, CompactionReason, PersistedTerminal, ReadableTerminal,
+    RestoredRecord, RestoredRecordKind, Session, SessionCatalogue, SessionEntryId, SessionError,
+    SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -294,6 +294,9 @@ pub(crate) enum RuntimeEvent {
     RunSettled {
         run_id: RunId,
     },
+    AutomaticCompactionStarted {
+        run_id: RunId,
+    },
     SettingsAccepted {
         revision: u64,
     },
@@ -447,6 +450,12 @@ enum WorkerMessage<M: Model> {
         request: String,
         selection: ModelSelection,
     },
+    AutomaticCompactionStarted {
+        run_id: u64,
+    },
+    AutomaticCompactionCommitted {
+        compaction: CommittedCompaction,
+    },
     PersistedModelStepStarted {
         run_id: u64,
         step_id: u64,
@@ -479,7 +488,7 @@ enum WorkerMessage<M: Model> {
     CompactionStarted,
     CompactionFinished {
         agent: Agent<M>,
-        result: Result<ManualCompactionResult, SessionError>,
+        result: Result<CompactionResult, SessionError>,
     },
 }
 
@@ -619,6 +628,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SubagentFinished { .. }
         | RuntimeEvent::SubagentOperationSettled { .. }
         | RuntimeEvent::RunSettled { .. }
+        | RuntimeEvent::AutomaticCompactionStarted { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
         | RuntimeEvent::NavigationCompleted { .. }
@@ -1563,7 +1573,8 @@ impl<M: Model> RuntimeController<M> {
             let mut agent = agent;
             let completion_sender = sender.clone();
             let result = agent
-                .compact_manual(
+                .compact(
+                    CompactionReason::Manual,
                     policy,
                     selection,
                     reasoning,
@@ -1615,6 +1626,8 @@ impl<M: Model> RuntimeController<M> {
         let cancellation_for_worker = cancellation.clone();
         let writer = self.session.clone();
         let selection = self.selection;
+        let policy = self.compaction_policy;
+        let reasoning = self.cross_provider_reasoning;
         let (sender, worker) = mpsc::unbounded_channel();
         let (progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
@@ -1635,6 +1648,14 @@ impl<M: Model> RuntimeController<M> {
                             request,
                             selection,
                         });
+                    }
+                    PersistedAgentEvent::CompactionStarted { run_id } => {
+                        let _ = completion_sender
+                            .send(WorkerMessage::AutomaticCompactionStarted { run_id });
+                    }
+                    PersistedAgentEvent::CompactionCommitted { compaction } => {
+                        let _ = completion_sender
+                            .send(WorkerMessage::AutomaticCompactionCommitted { compaction });
                     }
                     PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
                         let _ = completion_sender
@@ -1787,6 +1808,8 @@ impl<M: Model> RuntimeController<M> {
                 agent
                     .run_persisted(
                         selection,
+                        policy,
+                        reasoning,
                         request,
                         &cancellation_for_worker,
                         &writer,
@@ -1936,6 +1959,22 @@ impl<M: Model> RuntimeController<M> {
                     );
                 }
             }
+            WorkerMessage::AutomaticCompactionStarted { run_id } => self.emit(
+                events,
+                RuntimeEvent::AutomaticCompactionStarted {
+                    run_id: RunId(run_id),
+                },
+            ),
+            WorkerMessage::AutomaticCompactionCommitted { compaction } => {
+                self.append_committed_record(
+                    events,
+                    RunId(compaction.run_id),
+                    Record::Compaction {
+                        outcome: compaction.outcome,
+                    },
+                    false,
+                );
+            }
             WorkerMessage::PersistedModelStepStarted { run_id, step_id } => {
                 let run_id = RunId(run_id);
                 let step_id = ModelStepId(step_id);
@@ -2025,13 +2064,13 @@ impl<M: Model> RuntimeController<M> {
                 self.drain_worker_progress(progress);
                 self.agent = Some(agent);
                 match result {
-                    Ok(ManualCompactionResult::NoOp) => self.emit(
+                    Ok(CompactionResult::NoOp) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::NoOp,
                         },
                     ),
-                    Ok(ManualCompactionResult::CancelledBeforeStart) => self.emit(
+                    Ok(CompactionResult::CancelledBeforeStart) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::Settled(
@@ -2039,13 +2078,13 @@ impl<M: Model> RuntimeController<M> {
                             ),
                         },
                     ),
-                    Ok(ManualCompactionResult::FailedBeforeStart) => self.emit(
+                    Ok(CompactionResult::FailedBeforeStart) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Failed),
                         },
                     ),
-                    Ok(ManualCompactionResult::Settled(committed)) => {
+                    Ok(CompactionResult::Settled(committed)) => {
                         let settlement = match &committed.outcome {
                             CompactionOutcome::Applied { .. } => CompactionSettlement::Applied,
                             CompactionOutcome::Failed { .. } => CompactionSettlement::Failed,
@@ -4011,6 +4050,496 @@ mod tests {
         session.close().expect("close session");
     }
 
+    async fn threshold_controller<M: Model>(
+        home: &tempfile::TempDir,
+        workspace: &tempfile::TempDir,
+        model: M,
+        compaction_settings: &str,
+    ) -> (RuntimeController<M>, Session) {
+        let config = home.path().join(".kiki/config.toml");
+        fs::create_dir_all(config.parent().expect("settings parent")).unwrap();
+        fs::write(&config, format!("[compaction]\n{compaction_settings}")).unwrap();
+        let snapshot = crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        );
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, model),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        (controller, session)
+    }
+
+    fn above_seeded_history_settings() -> String {
+        format!(
+            "reserve_tokens = {}\nkeep_recent_tokens = 20000\n",
+            DEFAULT_MODEL.context_window_tokens - 60_000
+        )
+    }
+
+    fn large_request() -> String {
+        "large ".to_owned() + &"x".repeat(100_000)
+    }
+
+    fn automatic_compaction_labels(events: &[RuntimeEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            run_id,
+                            record: Record::UserRequest { .. },
+                        },
+                    ..
+                } => format!("record:{}:user", run_id.0),
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            run_id,
+                            record: Record::Compaction { outcome },
+                        },
+                    ..
+                } => {
+                    let state = match outcome {
+                        CompactionOutcome::Applied { .. } => "applied",
+                        CompactionOutcome::Failed { .. } => "failed",
+                        CompactionOutcome::Cancelled { .. } => "cancelled",
+                    };
+                    format!(
+                        "record:{}:compaction:{:?}:{state}",
+                        run_id.0,
+                        outcome.reason()
+                    )
+                }
+                event => event_label(event),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn automatic_threshold_events_are_run_scoped_reliable_and_unacknowledged() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }])
+            .with_summary_responses(vec!["threshold summary".to_owned()]),
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (command_sender, command_receiver) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut progress) = mpsc::channel(1);
+        progress_sender
+            .try_send(ProgressEnvelope {
+                item: RuntimeEvent::ModelProgress {
+                    run_id: RunId(99),
+                    step_id: ModelStepId(99),
+                    progress: ModelProgress::AttemptStarted { attempt: 1 },
+                },
+                gap_before: false,
+            })
+            .expect("saturate progress channel");
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        command_sender
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:applied",
+                "record:3:message:3:done",
+                "settled:3",
+            ]
+        );
+        assert!(progress.try_recv().is_ok(), "progress remained saturated");
+        assert!(progress.try_recv().is_err());
+
+        shutdown_controller(command_sender, controller).await;
+        session.close().expect("close session");
+    }
+
+    struct RunSelectionModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        steps: Arc<Mutex<Vec<ModelSelection>>>,
+        summaries: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl Model for RunSelectionModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let call = {
+                    let mut steps = self.steps.lock().expect("record step selection");
+                    steps.push(selection);
+                    steps.len()
+                };
+                let action = if call == 1 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    CompletedModelAction::Code {
+                        source: format!("payload = '{}'", "y".repeat(40_000)),
+                        call_id: ModelCallId::new("big-code"),
+                        commentary: None,
+                    }
+                } else {
+                    CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    }
+                };
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            _cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                attempt_started();
+                self.summaries
+                    .lock()
+                    .expect("record summary selection")
+                    .push(request.selection);
+                Ok(SummaryResult {
+                    text: "summary".to_owned(),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_run_model_change_applies_to_the_next_run_threshold_and_summary() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let summaries = Arc::new(Mutex::new(Vec::new()));
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            RunSelectionModel {
+                started: started.clone(),
+                release: release.clone(),
+                steps: steps.clone(),
+                summaries: summaries.clone(),
+            },
+            "reserve_tokens = 1000000\nkeep_recent_tokens = 1\n",
+        )
+        .await;
+        let admitted = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let changed = ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking)
+            .expect("select smaller-window model");
+        assert!(
+            OPUS_5_5.context_window_tokens < 1_000_000 + 10_000
+                && DEFAULT_MODEL.context_window_tokens > 1_000_000 + 10_000
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .expect("start run");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: changed,
+                revision: 1,
+            })
+            .await
+            .expect("change model mid-run");
+        while next_event(&mut events).await != (RuntimeEvent::SettingsAccepted { revision: 1 }) {}
+        release.notify_one();
+        let first = events_until_settled(&mut events).await;
+
+        assert_eq!(*steps.lock().expect("read steps"), [admitted, admitted]);
+        assert!(summaries.lock().expect("read summaries").is_empty());
+        assert!(
+            !first
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AutomaticCompactionStarted { .. }))
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "next".to_owned(),
+            })
+            .await
+            .expect("start next run");
+        let second = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            *steps.lock().expect("read steps"),
+            [admitted, admitted, changed]
+        );
+        assert_eq!(*summaries.lock().expect("read summaries"), [changed]);
+        assert_eq!(
+            automatic_compaction_labels(&second),
+            [
+                "record:2:user",
+                "automatic-compaction:2",
+                "record:2:compaction:AutomaticThreshold:applied",
+                "record:2:message:3:done",
+                "settled:2",
+            ]
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancelling_automatic_compaction_settles_the_run_without_a_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            GatedSummaryModel {
+                started: started.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (commands, mut events, mut progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel automatic compaction");
+        let events = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:cancelled",
+                "record:3:cancelled",
+                "settled:3",
+            ]
+        );
+        assert!(
+            !drain_progress(&mut progress)
+                .iter()
+                .any(|envelope| matches!(envelope.item, RuntimeEvent::ModelStepStarted { .. }))
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT COUNT(*) FROM model_steps WHERE run_id = 3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count steps"),
+            0
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_retained_during_automatic_compaction_follows_run_settlement() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            GatedSummaryModel {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "manual focus".to_owned(),
+            })
+            .await
+            .expect("retain manual compaction");
+        let mut labels = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            if event
+                == (RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                })
+            {
+                release.notify_one();
+            }
+            let settled = matches!(
+                event,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Settled(_),
+                }
+            );
+            labels.extend(automatic_compaction_labels(&[event]));
+            if settled {
+                break;
+            }
+        }
+
+        let acknowledgements = labels
+            .iter()
+            .filter(|label| label.starts_with("compaction-ack:"))
+            .collect::<Vec<_>>();
+        assert_eq!(acknowledgements, ["compaction-ack:Accepted"]);
+        labels.retain(|label| !label.starts_with("compaction-ack:"));
+        assert_eq!(
+            labels,
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:cancelled",
+                "record:3:cancelled",
+                "settled:3",
+                "compaction:Started",
+                "record:3:compaction:Manual:applied",
+                "compaction:Settled(Applied)",
+            ]
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_storage_failure_disables_without_a_card() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "must not run".to_owned(),
+            }])
+            .with_summary_responses(vec!["summary".to_owned()]),
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_compaction BEFORE INSERT ON entries WHEN NEW.kind = 'compaction' BEGIN SELECT RAISE(ABORT, 'reject compaction'); END;",
+            )
+            .expect("reject compaction writes");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_disabled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "disabled:SessionStorageWriteFailed",
+            ]
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'compaction') + (SELECT COUNT(*) FROM model_steps WHERE run_id = 3)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count compactions and steps"),
+            0
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
     #[tokio::test]
     async fn retained_compaction_uses_terminal_leaf_when_final_or_failed_wins_cancellation() {
         for terminal_kind in ["final", "failed"] {
@@ -4868,6 +5397,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "next request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -6665,6 +7196,9 @@ mod tests {
                 format!("subagent-operation-settled:{id}")
             }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
+            RuntimeEvent::AutomaticCompactionStarted { run_id } => {
+                format!("automatic-compaction:{}", run_id.0)
+            }
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
@@ -8428,6 +8962,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "first request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -8482,6 +9018,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "second request".to_owned(),
                 &CancellationToken::new(),
                 &writer,

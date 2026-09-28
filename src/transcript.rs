@@ -2290,6 +2290,7 @@ pub(crate) struct Transcript {
     startup: Option<StartupSnapshot>,
     run_state: RunState,
     compaction_state: CompactionState,
+    automatic_compaction: Option<RunId>,
     disabled_reason: Option<RuntimeDisabledReason>,
     latest_run_id: Option<RunId>,
     settled_run_ids: Vec<RunId>,
@@ -2318,6 +2319,7 @@ impl Default for Transcript {
             startup: None,
             run_state: RunState::Idle,
             compaction_state: CompactionState::Idle,
+            automatic_compaction: None,
             disabled_reason: None,
             latest_run_id: None,
             settled_run_ids: Vec::new(),
@@ -2433,6 +2435,7 @@ impl Transcript {
 
     pub(crate) fn is_generating(&self) -> bool {
         self.disabled_reason.is_none()
+            && self.automatic_compaction.is_none()
             && self
                 .live_step
                 .as_ref()
@@ -2440,7 +2443,9 @@ impl Transcript {
     }
 
     pub(crate) fn is_compacting(&self) -> bool {
-        self.disabled_reason.is_none() && self.compaction_state == CompactionState::Active
+        self.disabled_reason.is_none()
+            && (self.compaction_state == CompactionState::Active
+                || self.automatic_compaction.is_some())
     }
 
     pub(crate) fn is_disabled(&self) -> bool {
@@ -2471,7 +2476,9 @@ impl Transcript {
         match event {
             RuntimeEvent::RunStarted { run_id } => self.start_run(run_id, gap_before),
             RuntimeEvent::ModelStepStarted { run_id, step_id } => {
-                if self.has_settled_run(run_id, step_id) {
+                if self.automatic_compaction == Some(run_id)
+                    || self.has_settled_run(run_id, step_id)
+                {
                     false
                 } else {
                     let status =
@@ -2484,7 +2491,9 @@ impl Transcript {
                 step_id,
                 progress,
             } => {
-                if self.has_settled_run(run_id, step_id) {
+                if self.automatic_compaction == Some(run_id)
+                    || self.has_settled_run(run_id, step_id)
+                {
                     false
                 } else {
                     let executing = self.is_executing_step(run_id, step_id);
@@ -2653,6 +2662,9 @@ impl Transcript {
             }
             RuntimeEvent::SubagentOperationSettled { .. } => false,
             RuntimeEvent::RunSettled { run_id } => self.settle_run(run_id),
+            RuntimeEvent::AutomaticCompactionStarted { run_id } => {
+                self.start_automatic_compaction(run_id)
+            }
             RuntimeEvent::CompactionAcknowledged { acknowledgement } => match acknowledgement {
                 crate::runtime::CompactionAcknowledgement::Accepted
                     if self.disabled_reason.is_none()
@@ -3063,7 +3075,9 @@ impl Transcript {
         if submitting_cleared {
             self.run_state = RunState::Idle;
         }
-        let compaction_cleared = self.compaction_state != CompactionState::Idle;
+        let automatic_cleared = self.automatic_compaction.take().is_some();
+        let compaction_cleared =
+            automatic_cleared || self.compaction_state != CompactionState::Idle;
         self.compaction_state = CompactionState::Idle;
         let cards_released = self.release_pending_subagent_blocks();
         reason_changed
@@ -3097,6 +3111,22 @@ impl Transcript {
         self.live_step = None;
         self.run_state = RunState::Active(run_id);
         self.set_status("starting run".to_owned())
+    }
+
+    fn start_automatic_compaction(&mut self, run_id: RunId) -> bool {
+        if self.disabled_reason.is_some()
+            || self.is_terminal_run(run_id)
+            || self
+                .latest_run_id
+                .is_some_and(|latest_run_id| run_id < latest_run_id)
+            || matches!(self.run_state, RunState::Active(active_run_id) if active_run_id != run_id)
+        {
+            return false;
+        }
+        self.latest_run_id = Some(run_id);
+        self.run_state = RunState::Active(run_id);
+        let started = self.automatic_compaction.replace(run_id).is_none();
+        started | self.set_status("compacting context".to_owned())
     }
 
     fn update_live_step(
@@ -3244,6 +3274,10 @@ impl Transcript {
                 }
                 self.mark_terminal_run(record.run_id);
             }
+            Record::Compaction { .. } if self.automatic_compaction == Some(record.run_id) => {
+                self.automatic_compaction = None;
+                self.set_status("starting run".to_owned());
+            }
             Record::UserRequest { .. } | Record::Compaction { .. } => {}
         }
         let displayed = DisplayedRecord {
@@ -3322,6 +3356,9 @@ impl Transcript {
     fn mark_terminal_run(&mut self, run_id: RunId) {
         if !self.is_terminal_run(run_id) {
             self.settled_run_ids.push(run_id);
+        }
+        if self.automatic_compaction == Some(run_id) {
+            self.automatic_compaction = None;
         }
         if self
             .live_step
@@ -4536,6 +4573,125 @@ mod tests {
             false,
         ));
         assert!(transcript.is_idle());
+    }
+
+    fn automatic_compaction_card(run_id: RunId) -> RuntimeEvent {
+        RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id,
+                record: Record::Compaction {
+                    outcome: CompactionOutcome::Applied {
+                        summary: "summary".to_owned(),
+                        first_retained: SessionEntryId(4),
+                        context_tokens: 1_250,
+                        reason: CompactionReason::AutomaticThreshold,
+                        attempts: vec![usage(3, 2)],
+                    },
+                },
+            },
+            progress_gap: false,
+        }
+    }
+
+    fn submitted_run(run_id: RunId) -> Transcript {
+        let mut transcript = Transcript::default();
+        assert!(transcript.begin_submission());
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id,
+                    record: Record::UserRequest {
+                        request: "large request".to_owned(),
+                        selection: None,
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        transcript
+    }
+
+    #[test]
+    fn automatic_compaction_owns_status_and_spinner_until_its_card() {
+        let run_id = RunId(3);
+        let mut transcript = submitted_run(run_id);
+
+        assert!(transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false));
+        assert_eq!(transcript.status(), "compacting context");
+        assert!(transcript.is_compacting());
+        assert!(!transcript.is_generating());
+        assert!(!transcript.has_foreground_compaction());
+        assert!(!transcript.is_idle());
+        assert!(!transcript.begin_submission());
+
+        for step_id in [ModelStepId(2), ModelStepId(3)] {
+            assert!(!transcript.apply(RuntimeEvent::RunStarted { run_id }, false));
+            assert!(!transcript.apply(RuntimeEvent::ModelStepStarted { run_id, step_id }, false));
+            assert!(!transcript.apply(
+                RuntimeEvent::ModelProgress {
+                    run_id,
+                    step_id,
+                    progress: ModelProgress::AssistantTextChunk {
+                        text: "stale streamed text".to_owned(),
+                    },
+                },
+                false,
+            ));
+        }
+        assert_eq!(transcript.status(), "compacting context");
+        assert!(transcript.is_compacting());
+        assert!(!transcript.is_generating());
+        assert!(!rendered_layout_text(&mut transcript).contains("stale streamed text"));
+
+        assert!(transcript.apply(automatic_compaction_card(run_id), false));
+        assert!(!transcript.is_compacting());
+        assert!(!transcript.is_idle());
+        assert_eq!(transcript.status(), "starting run");
+        assert!(transcript.apply(
+            RuntimeEvent::ModelStepStarted {
+                run_id,
+                step_id: ModelStepId(4),
+            },
+            false,
+        ));
+        assert!(transcript.is_generating());
+        assert_eq!(transcript.status(), "generating");
+    }
+
+    #[test]
+    fn automatic_compaction_ends_on_terminal_settlement_or_disable() {
+        let run_id = RunId(3);
+        let terminal = RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id,
+                record: Record::CancelledRun {
+                    terminal: TerminalDetails::empty(),
+                },
+            },
+            progress_gap: false,
+        };
+        for ending in [
+            terminal,
+            RuntimeEvent::RunSettled { run_id },
+            RuntimeEvent::RuntimeDisabled {
+                reason: RuntimeDisabledReason::SessionStorageWriteFailed,
+            },
+        ] {
+            let mut transcript = submitted_run(run_id);
+            assert!(transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false));
+
+            assert!(transcript.apply(ending.clone(), false), "{ending:?}");
+            assert!(!transcript.is_compacting(), "{ending:?}");
+            assert!(!transcript.is_generating(), "{ending:?}");
+            transcript.apply(RuntimeEvent::RunSettled { run_id }, false);
+            assert_ne!(transcript.status(), "compacting context", "{ending:?}");
+            assert!(
+                !transcript.apply(RuntimeEvent::AutomaticCompactionStarted { run_id }, false),
+                "{ending:?}"
+            );
+            assert!(!transcript.is_compacting(), "{ending:?}");
+        }
     }
 
     #[test]

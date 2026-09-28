@@ -6271,7 +6271,8 @@ pub(crate) mod tests {
                 | RuntimeEvent::TreeCatalogue { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. }
                 | RuntimeEvent::CompactionAcknowledged { .. }
-                | RuntimeEvent::CompactionLifecycle { .. } => {}
+                | RuntimeEvent::CompactionLifecycle { .. }
+                | RuntimeEvent::AutomaticCompactionStarted { .. } => {}
             }
         }
 

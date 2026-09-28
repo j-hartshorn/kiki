@@ -993,6 +993,9 @@ impl SessionWriter {
         focus: String,
         reason: CompactionReason,
     ) -> Result<Option<PreparedCompaction>, SessionError> {
+        if reason != CompactionReason::Manual && !policy.enabled() {
+            return Ok(None);
+        }
         let snapshot = self.read(load_compaction_snapshot).await?;
         let Some(planner) = crate::compaction::prepare(
             &snapshot.facts,
@@ -1228,9 +1231,25 @@ impl SessionWriter {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_model_step(&self, run_id: u64) -> Result<u64, SessionError> {
         self.write(SessionWriteKind::Step, move |connection| {
             start_model_step(connection, run_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn start_model_step_unless(
+        &self,
+        run_id: u64,
+        reject: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<Option<u64>, SessionError> {
+        self.write(SessionWriteKind::Step, move |connection| {
+            if reject() {
+                Ok(None)
+            } else {
+                start_model_step(connection, run_id).map(Some)
+            }
         })
         .await
     }
@@ -2428,6 +2447,9 @@ struct CompactionSnapshot {
     facts: Vec<SelectedAncestryFact>,
 }
 
+// Each recursive step follows one strictly older parent, so a corrupt cycle ends the chain early.
+const SELECTED_ANCESTRY_SQL: &str = "WITH RECURSIVE selected(id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision) AS (SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries WHERE id = ?1 UNION ALL SELECT entries.id, entries.parent_id, entries.run_id, entries.checkpoint_id, entries.kind, entries.payload_json, entries.provider_replay, entries.revision FROM selected JOIN entries ON entries.id = selected.parent_id WHERE selected.parent_id < selected.id) SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM selected";
+
 fn load_compaction_snapshot(
     connection: &mut Connection,
 ) -> Result<CompactionSnapshot, SessionError> {
@@ -2437,12 +2459,10 @@ fn load_compaction_snapshot(
         [],
         |row| row.get(0),
     )?;
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
+    let entries_by_id = {
+        let mut statement = transaction.prepare(SELECTED_ANCESTRY_SQL)?;
         statement
-            .query_map([], |row| {
+            .query_map([active_entry_id], |row| {
                 Ok(RestoreEntryRow {
                     id: row.get(0)?,
                     parent_id: row.get(1)?,
@@ -2454,16 +2474,15 @@ fn load_compaction_snapshot(
                     revision: row.get(7)?,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?
+            .map(|entry| entry.map(|entry| (entry.id, entry)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?
     };
-    let entries_by_id = entries
-        .iter()
-        .map(|entry| (entry.id, entry.clone()))
-        .collect::<BTreeMap<_, _>>();
     let ancestry = selected_ancestry(&entries_by_id, active_entry_id);
     if !ancestry.intact {
         return Err(SessionError::InvalidTransition);
     }
+    validate_selected_compactions(&ancestry.entries)
+        .map_err(|()| SessionError::InvalidTransition)?;
     let parent = ancestry
         .entries
         .last()
@@ -2478,7 +2497,7 @@ fn load_compaction_snapshot(
         .entries
         .iter()
         .filter(|entry| entry.kind != "session_start")
-        .map(|entry| compaction_fact(entry, &entries))
+        .map(compaction_fact)
         .collect::<Result<Vec<_>, _>>()?;
     transaction.commit()?;
     Ok(CompactionSnapshot {
@@ -2489,10 +2508,43 @@ fn load_compaction_snapshot(
     })
 }
 
-fn compaction_fact(
-    entry: &RestoreEntryRow,
-    entries: &[RestoreEntryRow],
-) -> Result<SelectedAncestryFact, SessionError> {
+fn validate_selected_compactions(selected: &[RestoreEntryRow]) -> Result<(), ()> {
+    let positions = selected
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let mut previous_boundary = None;
+    for (position, entry) in selected.iter().enumerate() {
+        if entry.kind != "compaction" {
+            continue;
+        }
+        if entry.provider_replay.is_some() {
+            return Err(());
+        }
+        let decoded = codec::decode_entry(&entry.kind, &entry.payload_json).map_err(|_| ())?;
+        let Some(CompactionOutcome::Applied { first_retained, .. }) =
+            codec::decoded_compaction(&decoded)
+        else {
+            continue;
+        };
+        let boundary_id = i64::try_from(first_retained.0).map_err(|_| ())?;
+        let boundary = positions
+            .get(&boundary_id)
+            .copied()
+            .filter(|boundary| *boundary < position)
+            .ok_or(())?;
+        if !context_bearing_payload(selected[boundary].payload())
+            || previous_boundary.is_some_and(|previous| previous >= boundary)
+        {
+            return Err(());
+        }
+        previous_boundary = Some(boundary);
+    }
+    Ok(())
+}
+
+fn compaction_fact(entry: &RestoreEntryRow) -> Result<SelectedAncestryFact, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     let entry_id = session_entry_id(entry.id)?;
@@ -2595,12 +2647,6 @@ fn compaction_fact(
             }
         }
         "compaction" => {
-            let payloads = entries
-                .iter()
-                .map(RestoreEntryRow::payload)
-                .collect::<Vec<_>>();
-            validate_compaction_entry(entry.payload(), &payloads)
-                .map_err(|_| SessionError::InvalidTransition)?;
             match codec::decoded_compaction(&decoded).ok_or(SessionError::InvalidTransition)? {
                 CompactionOutcome::Applied {
                     summary,
@@ -11524,6 +11570,52 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn disabled_automatic_preparation_skips_the_session_read() {
+        use super::CompactionReason::{AutomaticThreshold, ContextOverflow, Manual};
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = X'00' WHERE id = (SELECT active_entry_id FROM session WHERE singleton = 1)",
+                    [],
+                )
+                .expect("make the selected leaf unreadable as text");
+        }
+        let prepare = |reason| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(u64::MAX, 4).disabled(),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+
+        for reason in [AutomaticThreshold, ContextOverflow] {
+            assert!(matches!(prepare(reason).await, Ok(None)), "{reason:?}");
+        }
+        assert!(matches!(
+            prepare(Manual).await,
+            Err(SessionError::Sqlite(_))
+        ));
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn below_threshold_preparation_skips_summary_assembly() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -11577,6 +11669,267 @@ mod tests {
         }
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compaction_snapshot_reads_only_the_selected_chain() {
+        use super::CompactionReason::{AutomaticThreshold, Manual};
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let policy = crate::config::CompactionSettings::new(100, 4);
+        let prepare = |reason| {
+            writer.prepare_compaction(
+                policy,
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+        append_cancelled_request(&writer, "first request").await;
+        let branch_point = session.restore().expect("restore").observed_active_entry;
+        let abandoned = writer
+            .commit_request("abandoned request".to_owned(), selection())
+            .await
+            .expect("commit abandoned request");
+        let abandoned_step = writer
+            .start_model_step(abandoned.run_id)
+            .await
+            .expect("start abandoned step");
+        writer
+            .close_run(
+                abandoned.run_id,
+                Some(abandoned_step),
+                move || PersistedTerminal::Final {
+                    step_id: abandoned_step,
+                    text: "abandoned reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "openai",
+                        vec![crate::model::OpaqueReplayItem::new(vec![
+                            b'x';
+                            4 * 1024 * 1024
+                        ])],
+                    ),
+                    attempts: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("close abandoned run");
+        let abandoned_leaf = session.restore().expect("restore").observed_active_entry;
+        writer
+            .select_active_entry(branch_point, abandoned_leaf)
+            .await
+            .expect("return to the selected branch");
+        for round in 0..3 {
+            for request in 0..2 {
+                append_cancelled_request(&writer, &format!("round {round} request {request}"))
+                    .await;
+            }
+            let preparation = prepare(Manual)
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history");
+            writer
+                .settle_compaction(
+                    preparation,
+                    super::CompactionSettlement::Applied {
+                        summary: format!("summary {round}"),
+                        attempts: Vec::new(),
+                    },
+                )
+                .await
+                .expect("settle compaction");
+        }
+        append_cancelled_request(&writer, "newly discarded").await;
+        append_cancelled_request(&writer, "tail").await;
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = X'00' WHERE id = ?1",
+                    [i64::try_from(abandoned.request_entry.0).expect("entry ID fits SQLite")],
+                )
+                .expect("make the abandoned row unreadable as text");
+        }
+
+        assert!(
+            prepare(AutomaticThreshold)
+                .await
+                .expect("below-threshold check ignores abandoned rows")
+                .is_none()
+        );
+        let manual = prepare(Manual)
+            .await
+            .expect("manual preparation ignores abandoned rows")
+            .expect("prepare compactable history");
+        assert!(
+            manual.requests()[0]
+                .input
+                .contains("<previous-summary>\nsummary 2\n</previous-summary>")
+        );
+        assert!(session.restore().is_err());
+        assert!(writer.catalogue().await.is_err());
+        let plan = {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let mut statement = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    super::SELECTED_ANCESTRY_SQL
+                ))
+                .expect("explain selected ancestry query");
+            statement
+                .query_map([1_i64], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read plan")
+        };
+        assert!(
+            plan.iter()
+                .any(|detail| detail.starts_with("SEARCH entries USING INTEGER PRIMARY KEY")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN entries")),
+            "{plan:?}"
+        );
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compaction_snapshot_rejects_corrupt_selected_chains() {
+        async fn append_request(writer: &SessionWriter, request: &str) -> i64 {
+            let admission = writer
+                .commit_request(request.to_owned(), selection())
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("close request");
+            i64::try_from(admission.request_entry.0).expect("entry ID fits SQLite")
+        }
+
+        for corruption in ["off-chain boundary", "backwards boundary", "newer parent"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let session = create_session(&home, &workspace).await;
+            let writer = session.writer();
+            let prepare = || {
+                writer.prepare_compaction(
+                    crate::config::CompactionSettings::new(100, 4),
+                    selection(),
+                    CrossProviderReasoning::Inline,
+                    String::new(),
+                    super::CompactionReason::Manual,
+                )
+            };
+            let first = append_request(&writer, "request1").await;
+            let branch_point = session.restore().expect("restore").observed_active_entry;
+            let abandoned = append_request(&writer, "abandoned").await;
+            let abandoned_leaf = session.restore().expect("restore").observed_active_entry;
+            writer
+                .select_active_entry(branch_point, abandoned_leaf)
+                .await
+                .expect("return to the selected branch");
+            let mut compactions = Vec::new();
+            let mut later_request = 0;
+            for requests in [["request2", "request3"], ["request4", "request5"]] {
+                for request in requests {
+                    let entry = append_request(&writer, request).await;
+                    if request == "request4" {
+                        later_request = entry;
+                    }
+                }
+                let preparation = prepare()
+                    .await
+                    .expect("prepare compaction")
+                    .expect("prepare compactable history");
+                compactions.push(
+                    writer
+                        .settle_compaction(
+                            preparation,
+                            super::CompactionSettlement::Applied {
+                                summary: "summary".to_owned(),
+                                attempts: Vec::new(),
+                            },
+                        )
+                        .await
+                        .expect("settle compaction")
+                        .entry_id,
+                );
+            }
+            let tail = append_request(&writer, "tail").await;
+            prepare().await.expect("valid selected chain");
+            {
+                let connection = session
+                    .connection_for_test()
+                    .expect("lock session connection");
+                connection
+                    .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                    .expect("remove entry immutability trigger");
+                if corruption == "newer parent" {
+                    connection
+                        .execute(
+                            "UPDATE entries SET parent_id = ?1 WHERE id = ?2",
+                            params![tail, later_request],
+                        )
+                        .expect("point a selected parent forwards");
+                } else {
+                    let compaction = i64::try_from(compactions[1].0).expect("entry ID fits SQLite");
+                    let mut payload: serde_json::Value = connection
+                        .query_row(
+                            "SELECT payload_json FROM entries WHERE id = ?1",
+                            [compaction],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map(|payload| serde_json::from_str(&payload).expect("decode payload"))
+                        .expect("read compaction payload");
+                    let boundary = if corruption == "off-chain boundary" {
+                        abandoned
+                    } else {
+                        first
+                    };
+                    payload["Compaction"]["compaction"]["first_retained"] =
+                        serde_json::json!(boundary);
+                    connection
+                        .execute(
+                            "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                            params![payload.to_string(), compaction],
+                        )
+                        .expect("corrupt compaction boundary");
+                }
+            }
+
+            assert!(
+                matches!(prepare().await, Err(SessionError::InvalidTransition)),
+                "{corruption}"
+            );
+            drop(writer);
+            session.close().expect("close session");
+        }
     }
 
     #[tokio::test]
