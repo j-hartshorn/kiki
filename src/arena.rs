@@ -2993,7 +2993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loaded_skill_resources_are_readable_in_the_same_execution() {
+    async fn listed_skill_resources_stay_readable_after_load_skill() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let mut arena = arena_with_user_skill(&workspace, &home).await;
