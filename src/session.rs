@@ -2516,11 +2516,6 @@ fn load_compaction_snapshot(
 }
 
 fn validate_selected_compactions(selected: &[RestoreEntryRow]) -> Result<(), ()> {
-    let positions = selected
-        .iter()
-        .enumerate()
-        .map(|(position, entry)| (entry.id, position))
-        .collect::<BTreeMap<_, _>>();
     let mut previous_boundary = None;
     for (position, entry) in selected.iter().enumerate() {
         if entry.kind != "compaction" {
@@ -2536,11 +2531,9 @@ fn validate_selected_compactions(selected: &[RestoreEntryRow]) -> Result<(), ()>
             continue;
         };
         let boundary_id = i64::try_from(first_retained.0).map_err(|_| ())?;
-        let boundary = positions
-            .get(&boundary_id)
-            .copied()
-            .filter(|boundary| *boundary < position)
-            .ok_or(())?;
+        let boundary = selected[..position]
+            .binary_search_by_key(&boundary_id, |entry| entry.id)
+            .map_err(|_| ())?;
         if !context_bearing_payload(selected[boundary].payload())
             || previous_boundary.is_some_and(|previous| previous >= boundary)
         {
