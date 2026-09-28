@@ -41,7 +41,8 @@ use crate::arena::Arena;
 use crate::config::{
     ApiKey, ModelSelection,
     models::Provider,
-    settings::{self, CacheTtl, CrossProviderReasoning},
+    settings::{CacheTtl, CrossProviderReasoning},
+    skill_trust,
 };
 use crate::provider::ProviderModel;
 use crate::runtime::{
@@ -270,11 +271,11 @@ fn startup_skill_catalog(
     has_active_project_skill_in_scope: bool,
     prompt: impl FnOnce(&Path) -> Result<bool, tui::TuiError>,
 ) -> Result<(Arc<SkillCatalog>, bool), Box<dyn Error>> {
-    let saved_trust = settings::is_project_skill_scope_trusted(home, &scope.canonical_scope);
+    let saved_trust = skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope);
     let include_project =
         if project_trust_prompt_required(scope, saved_trust, has_active_project_skill_in_scope) {
             prompt(&scope.canonical_scope)?
-                && settings::is_project_skill_scope_trusted(home, &scope.canonical_scope)
+                && skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope)
         } else {
             saved_trust
         };
@@ -309,7 +310,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         false,
         |scope| {
             tui::run_project_skill_trust(scope, || {
-                settings::save_project_skill_scope_trust(&home, scope)
+                skill_trust::save_project_skill_scope_trust(&home, scope)
                     .map_err(|error| error.to_string())
             })
         },
@@ -450,7 +451,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             has_active_project_skill_in_scope,
             |scope| {
                 tui::run_project_skill_trust(scope, || {
-                    settings::save_project_skill_scope_trust(&home, scope)
+                    skill_trust::save_project_skill_scope_trust(&home, scope)
                         .map_err(|error| error.to_string())
                 })
             },
@@ -646,7 +647,7 @@ mod tests {
         write_skill(project.path(), "shared", "project");
         write_skill(home.path(), "shared", "user");
         let catalog = startup_catalog(project.path(), home.path(), false, |scope| {
-            super::config::settings::save_project_skill_scope_trust(home.path(), scope).unwrap();
+            super::config::skill_trust::save_project_skill_scope_trust(home.path(), scope).unwrap();
             Ok(true)
         })
         .unwrap();
@@ -674,7 +675,7 @@ mod tests {
         fs::create_dir(project.path().join(".git")).unwrap();
         write_skill(project.path(), "review", "Project review workflow");
         let scope = super::ProjectScope::discover(project.path()).unwrap();
-        super::config::settings::save_project_skill_scope_trust(
+        super::config::skill_trust::save_project_skill_scope_trust(
             home.path(),
             &scope.canonical_scope,
         )
@@ -751,7 +752,7 @@ mod tests {
         )
         .unwrap();
         let scope = super::ProjectScope::discover(project.path()).unwrap();
-        super::config::settings::save_project_skill_scope_trust(
+        super::config::skill_trust::save_project_skill_scope_trust(
             home.path(),
             &scope.canonical_scope,
         )
@@ -796,7 +797,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("references/note.md"), "project resource").unwrap();
         let scope = super::ProjectScope::discover(project.path()).unwrap();
-        super::config::settings::save_project_skill_scope_trust(
+        super::config::skill_trust::save_project_skill_scope_trust(
             home.path(),
             &scope.canonical_scope,
         )
@@ -851,7 +852,8 @@ mod tests {
             super::prompt::skills_catalog_guidance(),
             false,
             |path| {
-                super::config::settings::save_project_skill_scope_trust(home.path(), path).unwrap();
+                super::config::skill_trust::save_project_skill_scope_trust(home.path(), path)
+                    .unwrap();
                 Ok(true)
             },
         )
@@ -859,7 +861,7 @@ mod tests {
         assert!(include_project);
         assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
         fs::remove_file(home.path().join(".kiki/trusted-skills.toml")).unwrap();
-        assert!(!super::config::settings::is_project_skill_scope_trusted(
+        assert!(!super::config::skill_trust::is_project_skill_scope_trusted(
             home.path(),
             &scope.canonical_scope
         ));
@@ -883,7 +885,8 @@ mod tests {
         write_skill(old.path(), "old-skill", "old");
         write_skill(here.path(), "here-skill", "here");
         let old_scope = old.path().canonicalize().unwrap();
-        super::config::settings::save_project_skill_scope_trust(home.path(), &old_scope).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(home.path(), &old_scope)
+            .unwrap();
         let mut prompted_scope = None;
         let catalog = startup_catalog(here.path(), home.path(), false, |scope| {
             prompted_scope = Some(scope.to_path_buf());
@@ -931,14 +934,14 @@ mod tests {
         fs::write(trust_store, "trusted_skill_scopes = [true]").unwrap();
         let catalog = startup_catalog(project.path(), home.path(), false, |scope| {
             assert!(
-                super::config::settings::save_project_skill_scope_trust(home.path(), scope)
+                super::config::skill_trust::save_project_skill_scope_trust(home.path(), scope)
                     .is_err()
             );
             Ok(true)
         })
         .unwrap();
         assert_eq!(catalog.lookup("shared").unwrap().description(), "user");
-        assert!(!super::config::settings::is_project_skill_scope_trusted(
+        assert!(!super::config::skill_trust::is_project_skill_scope_trusted(
             home.path(),
             &project.path().canonicalize().unwrap()
         ));

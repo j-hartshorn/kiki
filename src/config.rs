@@ -10,6 +10,7 @@ use models::Provider;
 pub(crate) mod constants;
 pub mod models;
 pub(crate) mod settings;
+pub(crate) mod skill_trust;
 
 pub use models::{
     DEFAULT_MODEL, ModelConfiguration, ModelPricing, ModelSelection, PricingIdentity, Rates,
