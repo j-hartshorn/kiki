@@ -35,6 +35,14 @@ use crate::{
 const OPENAI_PROVIDER: &str = "openai";
 const MAX_STREAM_ATTEMPTS: u32 = 3;
 const STREAM_RESTART_DELAY: Duration = Duration::from_millis(100);
+const CONTEXT_OVERFLOW_CODES: [&str; 2] =
+    ["context_length_exceeded", "model_context_window_exceeded"];
+const CONTEXT_OVERFLOW_PHRASES: [&str; 4] = [
+    "exceeds the context window",
+    "maximum context length",
+    "context length exceeded",
+    "context window exceeded",
+];
 
 type WireStream = Pin<Box<dyn Stream<Item = Result<WireEvent, OpenAIError>> + Send>>;
 
@@ -576,11 +584,18 @@ impl OpenAiModel {
 
     fn provider_failure(&self, error: OpenAIError) -> ProviderFailure {
         match error {
-            OpenAIError::ApiError(error) => self.diagnostic(
-                Some(error.status_code.as_u16()),
-                error.api_error.code,
-                error.api_error.message,
-            ),
+            OpenAIError::ApiError(error) => {
+                let message = error.api_error.message;
+                // async-openai leaves 5xx bodies raw, so recover a wrapped code itself.
+                let code = error.api_error.code.or_else(|| {
+                    if !error.status_code.is_server_error() {
+                        return None;
+                    }
+                    let body: Value = serde_json::from_str(&message).ok()?;
+                    Some(body.pointer("/error/code")?.as_str()?.to_owned())
+                });
+                self.diagnostic(Some(error.status_code.as_u16()), code, message)
+            }
             OpenAIError::Reqwest(_) => self.diagnostic(None, None, "provider transport failed"),
             OpenAIError::StreamError(_) => self.diagnostic(None, None, "provider stream failed"),
             OpenAIError::JSONDeserialize(_, _) => {
@@ -619,11 +634,14 @@ impl OpenAiModel {
         code: Option<String>,
         message: impl Into<String>,
     ) -> ProviderFailure {
+        let message = message.into();
+        let context_overflow = is_context_overflow(status, code.as_deref(), &message);
         ProviderFailure::new(
             status,
             code.map(|value| redact(&value, &self.api_key)),
-            redact(&message.into(), &self.api_key),
+            redact(&message, &self.api_key),
         )
+        .with_context_overflow(context_overflow)
     }
 
     fn response_accounting(
@@ -792,6 +810,13 @@ impl OpenAiModel {
                 }
                 Err(AttemptFailure::Terminal { error, accounting }) => {
                     attempts.push(*accounting);
+                    let error = match error {
+                        // Only normal Model Steps may recover from context overflow.
+                        ModelError::Provider(failure) => {
+                            ModelError::Provider(Box::new(failure.with_context_overflow(false)))
+                        }
+                        error => error,
+                    };
                     return Err(ModelFailure::new(error, attempts));
                 }
             }
@@ -1084,6 +1109,25 @@ fn openai_wire_model(model: &ModelConfiguration) -> Result<&'static str, ModelEr
     (model.provider() == Provider::OpenAi)
         .then(|| model.wire_id())
         .ok_or(ModelError::InvalidSelection("unsupported OpenAI model"))
+}
+
+fn is_context_overflow(status: Option<u16>, code: Option<&str>, message: &str) -> bool {
+    if matches!(status, Some(401 | 429)) {
+        return false;
+    }
+    if code.is_some_and(|code| {
+        CONTEXT_OVERFLOW_CODES
+            .iter()
+            .any(|overflow| code.eq_ignore_ascii_case(overflow))
+    }) {
+        return true;
+    }
+    matches!(status, Some(400 | 413)) && {
+        let message = message.to_ascii_lowercase();
+        CONTEXT_OVERFLOW_PHRASES
+            .iter()
+            .any(|phrase| message.contains(phrase))
+    }
 }
 
 fn redact(value: &str, api_key: &str) -> String {
@@ -1864,10 +1908,11 @@ pub(crate) mod tests {
     use crate::{
         config::{
             ModelSelection,
+            constants::PROVIDER_MESSAGE_LIMIT,
             models::{ASTRA, CATALOGUE, Provider, SOL, TERRA},
             settings::CrossProviderReasoning,
         },
-        model::{AttemptAccounting, Model, ModelError, ModelHistory},
+        model::{AttemptAccounting, Model, ModelError, ModelFailure, ModelHistory},
         sse_fixture::{Fixture, FixtureReply},
     };
 
@@ -2476,6 +2521,283 @@ pub(crate) mod tests {
         assert!(open_stream(&fixture).await.is_err());
         sleep(Duration::from_millis(100)).await;
         assert_eq!(fixture.request_count(), 1);
+    }
+
+    fn api_error(status: u16, code: Option<&str>, message: &str) -> FixtureReply {
+        FixtureReply::OwnedStatus {
+            code: status,
+            headers: vec![("retry-after".to_owned(), "0".to_owned())],
+            body: json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": code
+                }
+            })
+            .to_string(),
+        }
+    }
+
+    fn one_event(event: Value) -> FixtureReply {
+        FixtureReply::OwnedSse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+    }
+
+    fn stream_error(code: &str, message: &str) -> FixtureReply {
+        one_event(json!({
+            "type": "error",
+            "sequence_number": 1,
+            "code": code,
+            "message": message,
+            "param": null
+        }))
+    }
+
+    fn failed_response(code: &str, message: &str) -> FixtureReply {
+        one_event(json!({
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code, "message": message}
+            }
+        }))
+    }
+
+    async fn step_failure(reply: FixtureReply, key: &str) -> ModelFailure {
+        let fixture = Fixture::start(reply).await;
+        let mut model = super::OpenAiModel::with_endpoint("system prompt", key, &fixture.endpoint);
+        model
+            .step(
+                default_selection(),
+                &history(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err()
+    }
+
+    fn status_and_code(failure: &ModelFailure) -> Option<(Option<u16>, Option<&str>)> {
+        failure
+            .provider_failure()
+            .map(|provider| (provider.status(), provider.code()))
+    }
+
+    #[tokio::test]
+    async fn provider_failure_classifies_approved_context_overflow_signatures() {
+        for (reply, expected) in [
+            (
+                api_error(400, Some("context_length_exceeded"), "request rejected"),
+                (Some(400), Some("context_length_exceeded")),
+            ),
+            (
+                api_error(
+                    422,
+                    Some("MODEL_CONTEXT_WINDOW_EXCEEDED"),
+                    "request rejected",
+                ),
+                (Some(422), Some("MODEL_CONTEXT_WINDOW_EXCEEDED")),
+            ),
+            (
+                stream_error("Context_Length_Exceeded", "stream failed"),
+                (None, Some("Context_Length_Exceeded")),
+            ),
+            (
+                failed_response("model_context_window_exceeded", "failed"),
+                (None, Some("model_context_window_exceeded")),
+            ),
+            (
+                api_error(
+                    400,
+                    None,
+                    "Your input exceeds the context window of this model.",
+                ),
+                (Some(400), None),
+            ),
+            (
+                api_error(
+                    413,
+                    Some("invalid_request_error"),
+                    "This model's MAXIMUM Context Length is 272000 tokens.",
+                ),
+                (Some(413), Some("invalid_request_error")),
+            ),
+            (
+                api_error(400, Some("invalid_value"), "Context Length Exceeded"),
+                (Some(400), Some("invalid_value")),
+            ),
+            (
+                api_error(413, None, "context window exceeded"),
+                (Some(413), None),
+            ),
+        ] {
+            let failure = step_failure(reply, "fixture-key").await;
+
+            assert_eq!(status_and_code(&failure), Some(expected));
+            assert!(failure.is_context_overflow(), "{failure}");
+        }
+
+        let beyond_bound = format!(
+            "{}maximum context length",
+            "x".repeat(PROVIDER_MESSAGE_LIMIT)
+        );
+        let failure = step_failure(api_error(400, None, &beyond_bound), "fixture-key").await;
+        assert!(failure.is_context_overflow());
+        assert_eq!(
+            failure.provider_failure().unwrap().message(),
+            "x".repeat(PROVIDER_MESSAGE_LIMIT)
+        );
+
+        let key = "sk-overflow-secret";
+        let beside_key = format!("{key}maximum context length{key}");
+        let failure = step_failure(api_error(400, None, &beside_key), key).await;
+        assert!(failure.is_context_overflow());
+        assert_eq!(
+            failure.provider_failure().unwrap().message(),
+            "[REDACTED]maximum context length[REDACTED]"
+        );
+
+        let fixture = Fixture::start(api_error(
+            500,
+            Some("context_length_exceeded"),
+            "request rejected",
+        ))
+        .await;
+        let mut model =
+            super::OpenAiModel::with_endpoint("system prompt", "fixture-key", &fixture.endpoint);
+        let failure = model
+            .step(
+                default_selection(),
+                &history(),
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(fixture.request_count(), 3);
+        assert_eq!(
+            status_and_code(&failure),
+            Some((Some(500), Some("context_length_exceeded")))
+        );
+        assert!(failure.is_context_overflow(), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn provider_failure_keeps_near_misses_and_transport_failures_ordinary() {
+        for (reply, expected) in [
+            (
+                api_error(
+                    401,
+                    Some("context_length_exceeded"),
+                    "maximum context length",
+                ),
+                (Some(401), Some("context_length_exceeded")),
+            ),
+            (
+                api_error(
+                    429,
+                    Some("context_length_exceeded"),
+                    "maximum context length",
+                ),
+                (Some(429), Some("context_length_exceeded")),
+            ),
+            (
+                api_error(
+                    429,
+                    Some("rate_limit_exceeded"),
+                    "Rate limit reached for tokens per min",
+                ),
+                (Some(429), Some("rate_limit_exceeded")),
+            ),
+            (
+                api_error(500, None, "maximum context length"),
+                (Some(500), None),
+            ),
+            (
+                api_error(
+                    500,
+                    Some("context_length_exceeded_error"),
+                    "maximum context length",
+                ),
+                (Some(500), Some("context_length_exceeded_error")),
+            ),
+            (
+                FixtureReply::Status {
+                    code: 500,
+                    body: r#"{"error":{"code":"context_length_exceeded""#,
+                },
+                (Some(500), None),
+            ),
+            (
+                FixtureReply::Status {
+                    code: 500,
+                    body: "context_length_exceeded",
+                },
+                (Some(500), None),
+            ),
+            (
+                api_error(
+                    400,
+                    Some("context_length_exceeded_error"),
+                    "request rejected",
+                ),
+                (Some(400), Some("context_length_exceeded_error")),
+            ),
+            (
+                api_error(400, Some("context_length"), "request rejected"),
+                (Some(400), Some("context_length")),
+            ),
+            (
+                stream_error(" model_context_window_exceeded", "stream failed"),
+                (None, Some(" model_context_window_exceeded")),
+            ),
+            (
+                api_error(422, None, "maximum context length"),
+                (Some(422), None),
+            ),
+            (
+                stream_error("stream_error", "context window exceeded"),
+                (None, Some("stream_error")),
+            ),
+            (
+                failed_response("server_error", "exceeds the context window"),
+                (None, Some("server_error")),
+            ),
+            (
+                api_error(400, Some("invalid_request_error"), "request rejected"),
+                (Some(400), Some("invalid_request_error")),
+            ),
+            (api_error(413, None, "Request too large"), (Some(413), None)),
+            (
+                api_error(400, None, "too many tokens in the request"),
+                (Some(400), None),
+            ),
+            (
+                api_error(
+                    400,
+                    Some("invalid_value"),
+                    "max_output_tokens is above the maximum allowed value",
+                ),
+                (Some(400), Some("invalid_value")),
+            ),
+            (
+                api_error(413, None, "input exceeds the context limit"),
+                (Some(413), None),
+            ),
+            (
+                FixtureReply::Sse(INCOMPLETE_STREAM),
+                (None, Some("max_output_tokens")),
+            ),
+            (FixtureReply::CloseBeforeHeaders, (None, None)),
+        ] {
+            let failure = step_failure(reply, "fixture-key").await;
+
+            assert_eq!(status_and_code(&failure), Some(expected), "{failure}");
+            assert!(!failure.is_context_overflow(), "{failure}");
+        }
     }
 
     mod retry_policy {
@@ -4029,6 +4351,7 @@ pub(crate) mod tests {
             assert!(matches!(
                 result,
                 Err(failure) if failure.error() == &ModelError::ContentTooLarge
+                    && !failure.is_context_overflow()
             ));
             assert_eq!(
                 &progress[progress.len() - 2..],
@@ -4620,6 +4943,39 @@ pub(crate) mod tests {
                 assert_eq!(failure.is_authentication(), status == 401);
                 assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
                 assert_eq!(fixture.request_count(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn summary_context_overflow_failures_remain_ordinary() {
+            for (reply, status, message) in [
+                (
+                    api_error(
+                        400,
+                        Some("context_length_exceeded"),
+                        "maximum context length",
+                    ),
+                    Some(400),
+                    "maximum context length",
+                ),
+                (
+                    failed_response("context_length_exceeded", "too long"),
+                    None,
+                    "response failed: too long",
+                ),
+            ] {
+                let fixture = Fixture::start(reply).await;
+
+                let failure = summarise(&fixture, request(), &CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                let provider = failure.provider_failure().unwrap();
+
+                assert_eq!(
+                    (provider.status(), provider.code(), provider.message()),
+                    (status, Some("context_length_exceeded"), message)
+                );
+                assert!(!failure.is_context_overflow());
             }
         }
 

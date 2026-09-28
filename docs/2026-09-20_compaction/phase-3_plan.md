@@ -179,7 +179,7 @@ First red: `openai::tests::provider_failure_classifies_approved_context_overflow
 - Anthropic negatives: generic `invalid_request_error`, byte-size 413, rate limit, overload, signed-thinking prefix mismatch, output `max_tokens` and local content limit. Add the verified positive fixture only if the signature is supported by observed provider evidence; never treat a synthetic fixture as proof of the contract.
 - Normal and summary failures preserve safe bounded diagnostics; only the normal-step caller will consult the semantic flag in Task 7.
 
-**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`.
+**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `README.md` (record the unverified Anthropic diagnostic).
 
 **Verification**
 

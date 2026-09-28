@@ -664,6 +664,7 @@ impl AnthropicModel {
         code: Option<String>,
         message: impl Into<String>,
     ) -> ModelError {
+        // No prompt-too-long signature is verified, so no failure signals context overflow.
         ModelError::Provider(Box::new(ProviderFailure::new(
             status,
             code.map(|code| redact(&code, &self.api_key)),
@@ -3345,6 +3346,96 @@ mod tests {
             assert_eq!(starts(&progress), [1]);
             assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
         }
+    }
+
+    #[tokio::test]
+    async fn no_anthropic_failure_is_classified_as_context_overflow() {
+        let error = |code: u16, kind: &str, message: &str| FixtureReply::OwnedStatus {
+            code,
+            headers: vec![("retry-after-ms".to_owned(), "0".to_owned())],
+            body: json!({"type": "error", "error": {"type": kind, "message": message}}).to_string(),
+        };
+        // Unverified candidate wording; no current provider response confirms it.
+        let prompt_too_long = "prompt is too long: 250000 tokens > 200000 maximum";
+        let quarter = ACCEPTED_MODEL_CONTENT_LIMIT / 4;
+        for (reply, expected) in [
+            (
+                error(400, "invalid_request_error", "messages: field required"),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                error(400, "invalid_request_error", prompt_too_long),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                error(
+                    413,
+                    "request_too_large",
+                    "Request exceeds the maximum allowed number of bytes.",
+                ),
+                Some((Some(413), Some("request_too_large"))),
+            ),
+            (
+                error(429, "rate_limit_error", "input tokens per minute exceeded"),
+                Some((Some(429), Some("rate_limit_error"))),
+            ),
+            (
+                error(529, "overloaded_error", "Overloaded"),
+                Some((Some(529), Some("overloaded_error"))),
+            ),
+            (
+                FixtureReply::OwnedSse(overloaded_stream()),
+                Some((None, Some("overloaded_error"))),
+            ),
+            (
+                error(
+                    400,
+                    "invalid_request_error",
+                    "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
+                ),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                FixtureReply::OwnedSse(stream(
+                    start_usage(),
+                    vec![text(0, "partial")],
+                    "max_tokens",
+                    final_usage(),
+                )),
+                Some((None, Some("max_tokens"))),
+            ),
+            (
+                FixtureReply::OwnedSse(budget_stream(
+                    quarter,
+                    quarter / 2,
+                    quarter / 2,
+                    quarter,
+                    quarter - TOOL_OVERHEAD + 1,
+                )),
+                None,
+            ),
+        ] {
+            let fixture = Fixture::start(reply).await;
+
+            let (result, _) = step(&fixture, &history("inspect")).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(
+                failure
+                    .provider_failure()
+                    .map(|provider| (provider.status(), provider.code())),
+                expected,
+                "{failure}"
+            );
+            assert!(!failure.is_context_overflow(), "{failure}");
+            if expected.is_none() {
+                assert_eq!(failure.error(), &ModelError::ContentTooLarge);
+            }
+        }
+
+        let fixture = Fixture::start(error(400, "invalid_request_error", prompt_too_long)).await;
+        let (result, _) = summarise(&fixture).await;
+        assert!(!result.unwrap_err().is_context_overflow());
     }
 
     #[tokio::test]

@@ -408,6 +408,7 @@ pub struct ProviderFailure {
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    context_overflow: bool,
 }
 
 impl ProviderFailure {
@@ -416,7 +417,13 @@ impl ProviderFailure {
             status,
             code: code.map(|value| bounded_utf8(value, PROVIDER_CODE_LIMIT)),
             message: bounded_utf8(message, PROVIDER_MESSAGE_LIMIT),
+            context_overflow: false,
         }
+    }
+
+    pub(crate) fn with_context_overflow(mut self, context_overflow: bool) -> Self {
+        self.context_overflow = context_overflow;
+        self
     }
 
     pub fn status(&self) -> Option<u16> {
@@ -433,6 +440,10 @@ impl ProviderFailure {
 
     pub fn is_authentication(&self) -> bool {
         self.status == Some(401)
+    }
+
+    pub fn is_context_overflow(&self) -> bool {
+        self.context_overflow
     }
 }
 
@@ -516,6 +527,11 @@ impl ModelFailure {
     pub fn is_authentication(&self) -> bool {
         self.provider_failure()
             .is_some_and(ProviderFailure::is_authentication)
+    }
+
+    pub fn is_context_overflow(&self) -> bool {
+        self.provider_failure()
+            .is_some_and(ProviderFailure::is_context_overflow)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -765,10 +781,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CodeResult, CompletedCode, ForeignPart, Model, ModelAction, ModelCallId, ModelContextEntry,
-        ModelError, ModelFailure, ModelHistory, ModelHistoryError, OpaqueReplayItem,
-        ProviderReplay, ScriptedAction, ScriptedModel, SummaryRequest,
-        canonical_compaction_summary,
+        AttemptAccounting, CodeResult, CompletedCode, ForeignPart, Model, ModelAction, ModelCallId,
+        ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelHistoryError,
+        OpaqueReplayItem, ProviderFailure, ProviderReplay, ScriptedAction, ScriptedModel,
+        SummaryRequest, canonical_compaction_summary,
     };
     use crate::config::settings::CrossProviderReasoning;
 
@@ -1272,6 +1288,57 @@ mod tests {
             feedback.as_str(),
             "é".repeat(super::CODE_RESULT_FEEDBACK_LIMIT / 2)
         );
+    }
+
+    #[test]
+    fn synthetic_provider_failures_are_not_context_overflow() {
+        let failure = ProviderFailure::new(
+            Some(400),
+            Some("context_length_exceeded".to_owned()),
+            "maximum context length".to_owned(),
+        );
+
+        assert!(!failure.is_context_overflow());
+        assert!(!ModelFailure::from(ModelError::Provider(Box::new(failure))).is_context_overflow());
+    }
+
+    #[test]
+    fn model_failures_forward_only_the_provider_context_overflow_flag() {
+        let ordinary =
+            ProviderFailure::new(Some(400), Some("code".to_owned()), "message".to_owned());
+        let overflow = ordinary.clone().with_context_overflow(true);
+        let attempts = vec![AttemptAccounting::UsageUnavailable];
+        let failure = ModelFailure::new(
+            ModelError::Provider(Box::new(overflow.clone())),
+            attempts.clone(),
+        );
+
+        assert!(overflow.is_context_overflow());
+        assert!(failure.is_context_overflow());
+        assert_eq!(failure.attempts(), attempts);
+        assert_eq!(
+            (overflow.status(), overflow.code(), overflow.message()),
+            (Some(400), Some("code"), "message")
+        );
+        assert_eq!(
+            failure.to_string(),
+            ModelFailure::from(ModelError::Provider(Box::new(ordinary))).to_string()
+        );
+        assert!(
+            !ModelFailure::from(ModelError::Provider(Box::new(
+                overflow.with_context_overflow(false)
+            )))
+            .is_context_overflow()
+        );
+        for error in [
+            ModelError::Cancelled,
+            ModelError::UnsupportedSummarisation,
+            ModelError::Exhausted,
+            ModelError::InvalidResponse("context window exceeded"),
+            ModelError::ContentTooLarge,
+        ] {
+            assert!(!ModelFailure::from(error).is_context_overflow());
+        }
     }
 
     #[tokio::test]
