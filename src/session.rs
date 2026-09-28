@@ -2498,6 +2498,27 @@ impl RestoreEntryRow {
     }
 }
 
+fn load_entry_rows(connection: &Connection) -> Result<Vec<RestoreEntryRow>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RestoreEntryRow {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                run_id: row.get(2)?,
+                checkpoint_id: row.get(3)?,
+                kind: row.get(4)?,
+                payload_json: row.get(5)?,
+                provider_replay: row.get(6)?,
+                revision: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 impl CatalogueEntryRow {
     fn payload(&self) -> EntryPayload<'_> {
         EntryPayload {
@@ -2580,25 +2601,7 @@ fn probe_active_project_skill_in_scope(
         [],
         |row| row.get(0),
     )?;
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(RestoreEntryRow {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    checkpoint_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    payload_json: row.get(5)?,
-                    provider_replay: row.get(6)?,
-                    revision: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let entries = load_entry_rows(&transaction)?;
     transaction.commit()?;
     let entries_by_id = entries
         .into_iter()
@@ -2640,25 +2643,7 @@ fn load_compaction_snapshot(
         [],
         |row| row.get(0),
     )?;
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(RestoreEntryRow {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    checkpoint_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    payload_json: row.get(5)?,
-                    provider_replay: row.get(6)?,
-                    revision: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let entries = load_entry_rows(&transaction)?;
     let entries_by_id = entries
         .iter()
         .map(|entry| (entry.id, entry.clone()))
@@ -2887,25 +2872,7 @@ fn load_session_restore_for_entry(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     let metadata = session_metadata(name, preferences_json).ok();
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(RestoreEntryRow {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    checkpoint_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    payload_json: row.get(5)?,
-                    provider_replay: row.get(6)?,
-                    revision: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let entries = load_entry_rows(&transaction)?;
     let requested_entry_id = requested_entry.unwrap_or(observed_active_entry_id);
     let requested = entries
         .iter()
