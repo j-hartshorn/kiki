@@ -4,15 +4,13 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::Mutex;
 
-use rustix::fs::{FlockOperation, fcntl_lock};
+use rustix::fs::{FlockOperation, flock};
 use tempfile::NamedTempFile;
 use toml_edit::{Array, DocumentMut, value};
 
 const SKILL_TRUST_FILE: &str = ".kiki/trusted-skills.toml";
 const SKILL_TRUST_LOCK_FILE: &str = ".kiki/trusted-skills.lock";
-static SKILL_TRUST_WRITE_MUTEX: Mutex<()> = Mutex::new(());
 
 #[derive(Debug)]
 pub(crate) enum SkillTrustSaveError {
@@ -66,9 +64,6 @@ pub(crate) fn save_project_skill_scope_trust(
     let path = home.join(SKILL_TRUST_FILE);
     let parent = path.parent().ok_or(SkillTrustSaveError::InvalidStore)?;
     fs::create_dir_all(parent).map_err(SkillTrustSaveError::Io)?;
-    let _process_lock = SKILL_TRUST_WRITE_MUTEX
-        .lock()
-        .map_err(|_| SkillTrustSaveError::InvalidStore)?;
     let mut lock_options = OpenOptions::new();
     lock_options
         .read(true)
@@ -86,7 +81,7 @@ pub(crate) fn save_project_skill_scope_trust(
     {
         return Err(SkillTrustSaveError::InvalidStore);
     }
-    fcntl_lock(&lock_file, FlockOperation::LockExclusive)
+    flock(&lock_file, FlockOperation::LockExclusive)
         .map_err(|error| SkillTrustSaveError::Io(error.into()))?;
     let mut scopes = read_project_skill_trust_store(&path)?;
     scopes.insert(scope.to_owned());
@@ -238,7 +233,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        use rustix::fs::{FlockOperation, fcntl_lock};
+        use rustix::fs::{FlockOperation, flock};
 
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
@@ -259,7 +254,7 @@ mod tests {
             .mode(0o600)
             .open(&lock_path)
             .unwrap();
-        fcntl_lock(&lock, FlockOperation::LockExclusive).unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
 
         let started = home.path().join("started");
         let done = home.path().join("done");
@@ -285,6 +280,33 @@ mod tests {
         assert!(!completed_while_locked, "save bypassed the writer lock");
         assert!(super::is_project_skill_scope_trusted(home.path(), &first));
         assert!(super::is_project_skill_scope_trusted(home.path(), &second));
+    }
+
+    #[test]
+    fn project_skill_trust_save_waits_for_lock_held_by_another_open_in_process() {
+        use std::thread;
+        use std::time::Duration;
+
+        use rustix::fs::{FlockOperation, flock};
+
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let scope = project.path().canonicalize().unwrap();
+        fs::create_dir_all(home.path().join(".kiki")).unwrap();
+        let lock = fs::File::create(home.path().join(super::SKILL_TRUST_LOCK_FILE)).unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+
+        let save = thread::spawn({
+            let home = home.path().to_path_buf();
+            let scope = scope.clone();
+            move || super::save_project_skill_scope_trust(&home, &scope)
+        });
+        thread::sleep(Duration::from_millis(100));
+        let completed_while_locked = save.is_finished();
+        drop(lock);
+        save.join().unwrap().unwrap();
+        assert!(!completed_while_locked, "save bypassed the writer lock");
+        assert!(super::is_project_skill_scope_trusted(home.path(), &scope));
     }
 
     #[cfg(unix)]
