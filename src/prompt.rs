@@ -188,7 +188,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
 
     use super::{
         PromptError, PromptSource, child_prompt, prompt_reference, resolve_from_override,
@@ -446,15 +446,14 @@ mod tests {
                 "DIRECT_PRIVATE_BODY",
             ),
         ] {
-            let root = home.path().join(".agents/skills").join(name);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                format!(
-                    "---\nname: {name}\ndescription: {description}\ndisable-model-invocation: {direct_only}\n---\n{body}"
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                &format!(
+                    "name: {name}\ndescription: {description}\ndisable-model-invocation: {direct_only}\n"
                 ),
-            )
-            .unwrap();
+                body,
+            );
         }
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(
@@ -515,13 +514,12 @@ mod tests {
             false,
             super::skills_catalog_guidance(),
         ));
-        let direct = home.path().join(".agents/skills/direct-secret");
-        fs::create_dir_all(&direct).unwrap();
-        fs::write(
-            direct.join("SKILL.md"),
-            "---\nname: direct-secret\ndescription: Direct only secret\ndisable-model-invocation: true\n---\nDIRECT_PRIVATE_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "direct-secret",
+            "name: direct-secret\ndescription: Direct only secret\ndisable-model-invocation: true\n",
+            "DIRECT_PRIVATE_BODY",
+        );
         let direct_only = Arc::new(SkillCatalog::discover(
             &scope,
             home.path(),
@@ -587,13 +585,12 @@ mod tests {
             assert!(!prompt.contains("CUSTOM_CATALOG_GUIDANCE"));
         }
 
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review\n---\nPRIVATE_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_BODY",
+        );
         let visible = Arc::new(SkillCatalog::discover(
             &scope,
             home.path(),

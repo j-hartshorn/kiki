@@ -873,6 +873,18 @@ fn valid_directory_name(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn write_skill(root: &Path, directory: &str, frontmatter: &str, body: &str) -> PathBuf {
+    let path = root.join(directory);
+    fs::create_dir_all(&path).unwrap();
+    fs::write(
+        path.join(SKILL_FILE),
+        format!("---\n{frontmatter}---\n{body}"),
+    )
+    .unwrap();
+    path
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -921,17 +933,6 @@ mod tests {
                 true,
                 "Use the appropriate skill.",
             )
-        }
-
-        fn skill(root: &Path, directory: &str, frontmatter: &str, body: &str) -> PathBuf {
-            let path = root.join(directory);
-            fs::create_dir_all(&path).unwrap();
-            fs::write(
-                path.join(SKILL_FILE),
-                format!("---\n{frontmatter}---\n{body}"),
-            )
-            .unwrap();
-            path
         }
     }
 
@@ -1038,19 +1039,19 @@ mod tests {
     #[test]
     fn nearest_project_root_wins_then_project_wins_over_user() {
         let fixture = Fixture::new();
-        Fixture::skill(
+        write_skill(
             &fixture.user_root(),
             "shared",
             "description: user\n",
             "user body",
         );
-        Fixture::skill(
+        write_skill(
             &fixture.project_root(&fixture.repo),
             "shared",
             "description: repo\n",
             "repo body",
         );
-        Fixture::skill(
+        write_skill(
             &fixture.project_root(&fixture.launch),
             "shared",
             "description: near\n",
@@ -1075,14 +1076,14 @@ mod tests {
     fn duplicate_name_at_highest_root_is_ambiguous_even_with_lower_fallback() {
         let fixture = Fixture::new();
         let near = fixture.project_root(&fixture.launch);
-        Fixture::skill(&near, "first", "name: shared\ndescription: first\n", "body");
-        Fixture::skill(
+        write_skill(&near, "first", "name: shared\ndescription: first\n", "body");
+        write_skill(
             &near,
             "second",
             "name: shared\ndescription: second\n",
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &fixture.user_root(),
             "shared",
             "description: user\n",
@@ -1105,13 +1106,13 @@ mod tests {
     #[test]
     fn invalid_nearer_claim_blocks_farther_skill_of_same_name() {
         let fixture = Fixture::new();
-        Fixture::skill(
+        write_skill(
             &fixture.project_root(&fixture.launch),
             "shared",
             "description: 123\n",
             "near",
         );
-        Fixture::skill(
+        write_skill(
             &fixture.user_root(),
             "shared",
             "description: user\n",
@@ -1131,9 +1132,9 @@ mod tests {
     fn valid_and_invalid_claims_of_one_name_in_a_root_are_ambiguous() {
         let fixture = Fixture::new();
         let near = fixture.project_root(&fixture.launch);
-        Fixture::skill(&near, "first", "name: shared\ndescription: first\n", "body");
-        Fixture::skill(&near, "second", "name: shared\ndescription: 123\n", "body");
-        Fixture::skill(
+        write_skill(&near, "first", "name: shared\ndescription: first\n", "body");
+        write_skill(&near, "second", "name: shared\ndescription: 123\n", "body");
+        write_skill(
             &fixture.user_root(),
             "shared",
             "description: user\n",
@@ -1157,15 +1158,15 @@ mod tests {
     #[test]
     fn duplicate_name_in_lower_root_does_not_invalidate_nearer_skill() {
         let fixture = Fixture::new();
-        Fixture::skill(
+        write_skill(
             &fixture.project_root(&fixture.launch),
             "shared",
             "description: near\n",
             "near",
         );
         let farther = fixture.project_root(&fixture.repo);
-        Fixture::skill(&farther, "one", "name: shared\ndescription: one\n", "one");
-        Fixture::skill(&farther, "two", "name: shared\ndescription: two\n", "two");
+        write_skill(&farther, "one", "name: shared\ndescription: one\n", "one");
+        write_skill(&farther, "two", "name: shared\ndescription: two\n", "two");
         let catalog = fixture.catalog();
         assert_eq!(catalog.lookup("shared").unwrap().description(), "near");
     }
@@ -1174,38 +1175,38 @@ mod tests {
     fn frontmatter_requires_valid_description_name_boolean_and_body() {
         let fixture = Fixture::new();
         let root = fixture.user_root();
-        Fixture::skill(
+        write_skill(
             &root,
             "default-name",
             "description: >\n  multi\n  line\n",
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "direct",
             "description: direct\ndisable-model-invocation: true\n",
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "missing-description",
             "name: missing-description\n",
             "body",
         );
-        Fixture::skill(&root, "wrong-description", "description: 123\n", "body");
-        Fixture::skill(
+        write_skill(&root, "wrong-description", "description: 123\n", "body");
+        write_skill(
             &root,
             "wrong-boolean",
             "description: okay\ndisable-model-invocation: 'true'\n",
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "bad-name",
             "name: Bad_Name\ndescription: okay\n",
             "body",
         );
-        Fixture::skill(&root, "empty-body", "description: okay\n", " \n");
+        write_skill(&root, "empty-body", "description: okay\n", " \n");
         fs::create_dir_all(root.join("no-frontmatter")).unwrap();
         fs::write(
             root.join("no-frontmatter/SKILL.md"),
@@ -1241,13 +1242,13 @@ mod tests {
     fn yaml_aliases_and_anchors_are_rejected_without_rejecting_quoted_markers() {
         let fixture = Fixture::new();
         let root = fixture.user_root();
-        Fixture::skill(
+        write_skill(
             &root,
             "alias-bomb",
             "description: safe\nchain: &a [x, x]\nmore: &b [*a, *a]\n",
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "literal-markers",
             "description: 'Use *literal and &literal'\n",
@@ -1270,7 +1271,7 @@ mod tests {
             "[".repeat(MAX_YAML_DEPTH + 1),
             "]".repeat(MAX_YAML_DEPTH + 1)
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "too-deep",
             &format!("description: safe\n{nested}"),
@@ -1377,15 +1378,15 @@ mod tests {
         let root = fixture.user_root();
         let exact_name = "a".repeat(MAX_NAME_BYTES);
         let over_name = "b".repeat(MAX_NAME_BYTES + 1);
-        Fixture::skill(&root, &exact_name, "description: okay\n", "body");
-        Fixture::skill(&root, &over_name, "description: okay\n", "body");
-        Fixture::skill(
+        write_skill(&root, &exact_name, "description: okay\n", "body");
+        write_skill(&root, &over_name, "description: okay\n", "body");
+        write_skill(
             &root,
             "exact-description",
             &format!("description: {}\n", "é".repeat(MAX_DESCRIPTION_BYTES / 2)),
             "body",
         );
-        Fixture::skill(
+        write_skill(
             &root,
             "over-description",
             &format!(
@@ -1427,13 +1428,13 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.user_root();
         for index in (0..=MAX_VISIBLE_SKILLS).rev() {
-            Fixture::skill(
+            write_skill(
                 &root,
                 &format!("visible-{index:02}"),
                 "description: visible\n",
                 "body",
             );
-            Fixture::skill(
+            write_skill(
                 &root,
                 &format!("secret-{index:02}"),
                 "description: secret\ndisable-model-invocation: true\n",
@@ -1463,7 +1464,7 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.user_root();
         for index in 0..=MAX_VISIBLE_SKILLS {
-            Fixture::skill(
+            write_skill(
                 &root,
                 &format!("visible-{index:02}"),
                 "description: visible\n",
@@ -1494,14 +1495,14 @@ mod tests {
         let fixture = Fixture::new();
         let project = fixture.project_root(&fixture.launch);
         for index in (0..=MAX_PROJECT_ENTRIES).rev() {
-            Fixture::skill(
+            write_skill(
                 &project,
                 &format!("project-{index:03}"),
                 "description: project\n",
                 "body",
             );
         }
-        Fixture::skill(
+        write_skill(
             &fixture.user_root(),
             "user-one",
             "description: user\n",
@@ -1535,8 +1536,8 @@ mod tests {
         for index in 0..MAX_USER_ENTRIES - 1 {
             fs::write(user.join(format!("filler-{index:03}")), "not a skill").unwrap();
         }
-        Fixture::skill(&project, "project-one", "description: project\n", "body");
-        Fixture::skill(&user, "user-one", "description: user\n", "body");
+        write_skill(&project, "project-one", "description: project\n", "body");
+        write_skill(&user, "user-one", "description: user\n", "body");
         let exact = fixture.catalog();
         assert_eq!(visible_names(&exact), vec!["project-one", "user-one"]);
         fs::write(project.join("extra"), "not a skill").unwrap();
@@ -1560,7 +1561,7 @@ mod tests {
         }
         let far = fixture.project_root(&fixture.repo);
         for index in 0..28 {
-            Fixture::skill(
+            write_skill(
                 &far,
                 &format!("far-{index:03}"),
                 "description: far\n",
@@ -1569,7 +1570,7 @@ mod tests {
         }
         let exact = fixture.catalog();
         assert_eq!(visible_names(&exact).len(), 28);
-        Fixture::skill(&far, "far-028", "description: far\n", "body");
+        write_skill(&far, "far-028", "description: far\n", "body");
         let catalog = fixture.catalog();
         assert!(visible_names(&catalog).is_empty());
         assert!(
@@ -1584,7 +1585,7 @@ mod tests {
     #[test]
     fn catalog_byte_cap_accepts_exact_boundary_and_omits_over_boundary() {
         let fixture = Fixture::new();
-        Fixture::skill(&fixture.user_root(), "one", "description: one\n", "body");
+        write_skill(&fixture.user_root(), "one", "description: one\n", "body");
         let line = "- one: one\n";
         let header = format!("{}\n", crate::prompt::skills_catalog_header());
         let exact_guidance = "g".repeat(MAX_CATALOG_BYTES - header.len() - line.len() - 1);
@@ -1611,7 +1612,7 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.user_root();
         for index in (0..25).rev() {
-            Fixture::skill(
+            write_skill(
                 &root,
                 &format!("entry-{index:02}"),
                 &format!("description: {}\n", "d".repeat(1_000)),
@@ -1638,7 +1639,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let fixture = Fixture::new();
         let internal_root = fixture.repo.join("actual-skills");
-        Fixture::skill(
+        write_skill(
             &internal_root,
             "inside-root",
             "description: inside root\n",
@@ -1647,14 +1648,14 @@ mod tests {
         let linked_root = fixture.project_root(&fixture.launch);
         fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
         symlink(&internal_root, &linked_root).unwrap();
-        let target = Fixture::skill(
+        let target = write_skill(
             &fixture.repo.join("other"),
             "inside-candidate",
             "description: inside candidate\n",
             "body",
         );
         symlink(&target, internal_root.join("inside-candidate")).unwrap();
-        let external = Fixture::skill(
+        let external = write_skill(
             &fixture.temporary.path().join("outside"),
             "outside-candidate",
             "description: outside\n",
@@ -1688,18 +1689,18 @@ mod tests {
 
         let fixture = Fixture::new();
         let actual_root = fixture.home.join("actual-skills");
-        Fixture::skill(&actual_root, "home-skill", "description: home\n", "body");
+        write_skill(&actual_root, "home-skill", "description: home\n", "body");
         let linked_root = fixture.user_root();
         fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
         symlink(&actual_root, &linked_root).unwrap();
-        let inside = Fixture::skill(
+        let inside = write_skill(
             &fixture.home.join("other"),
             "inside-home",
             "description: inside\n",
             "body",
         );
         symlink(&inside, actual_root.join("inside-home")).unwrap();
-        let outside = Fixture::skill(
+        let outside = write_skill(
             &fixture.temporary.path().join("outside"),
             "outside-home",
             "description: outside\n",
@@ -1746,7 +1747,7 @@ mod tests {
     fn held_directory_handle_stays_on_accepted_candidate_after_replacement() {
         let fixture = Fixture::new();
         let root = fixture.user_root();
-        let original = Fixture::skill(&root, "held", "description: held\n", "body");
+        let original = write_skill(&root, "held", "description: held\n", "body");
         fs::write(original.join("resource.txt"), "original").unwrap();
         let catalog = fixture.catalog();
         fs::rename(&original, root.join("moved")).unwrap();
@@ -1762,11 +1763,7 @@ mod tests {
             .read_to_string(&mut resource)
             .unwrap();
         assert_eq!(resource, "original");
-        fs::write(
-            root.join("moved/SKILL.md"),
-            "---\ndescription: changed\n---\nchanged",
-        )
-        .unwrap();
+        write_skill(&root, "moved", "description: changed\n", "changed");
         assert!(
             catalog
                 .lookup("held")

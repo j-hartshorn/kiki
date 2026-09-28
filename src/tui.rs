@@ -3236,7 +3236,7 @@ mod tests {
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
         SessionMetadata,
     };
-    use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic};
+    use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic, write_skill};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
@@ -4837,13 +4837,12 @@ mod tests {
         let rejected = home.path().join(".agents/skills/rejected");
         fs::create_dir_all(&rejected).unwrap();
         fs::write(rejected.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
-        let hidden = project.path().join(".agents/skills/hidden");
-        fs::create_dir_all(&hidden).unwrap();
-        fs::write(
-            hidden.join("SKILL.md"),
-            "---\ndescription: Hidden\n---\nHidden body\n",
-        )
-        .unwrap();
+        write_skill(
+            &project.path().join(".agents/skills"),
+            "hidden",
+            "description: Hidden\n",
+            "Hidden body\n",
+        );
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
             home.path(),
@@ -4915,13 +4914,12 @@ mod tests {
     fn direct_skill_submits_the_typed_command_as_the_request() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let directory = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("SKILL.md"),
-            "---\ndescription: Review\n---\nReview this.\n",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Review this.\n",
+        );
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
             home.path(),
@@ -4951,12 +4949,12 @@ mod tests {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         for name in ["review", "review-more"] {
-            let directory = home.path().join(format!(".agents/skills/{name}"));
-            fs::create_dir_all(&directory).unwrap();
-            fs::write(
-                directory.join("SKILL.md"),
-                format!("---\ndescription: {name} instructions\ndisable-model-invocation: true\n---\nUse {name}.\n"),
-            ).unwrap();
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                &format!("description: {name} instructions\ndisable-model-invocation: true\n"),
+                &format!("Use {name}.\n"),
+            );
         }
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
@@ -4999,13 +4997,12 @@ mod tests {
         let invalid = home.path().join(".agents/skills/review");
         fs::create_dir_all(&invalid).unwrap();
         fs::write(invalid.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
-        let longer = home.path().join(".agents/skills/review-more");
-        fs::create_dir_all(&longer).unwrap();
-        fs::write(
-            longer.join("SKILL.md"),
-            "---\ndescription: Longer\n---\nBody\n",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review-more",
+            "description: Longer\n",
+            "Body\n",
+        );
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
             home.path(),
@@ -5039,13 +5036,12 @@ mod tests {
     fn direct_skill_admission_rejection_restores_unedited_draft_only() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let directory = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("SKILL.md"),
-            "---\ndescription: Review\n---\nReview this.\n",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Review this.\n",
+        );
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
             home.path(),

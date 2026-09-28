@@ -3936,7 +3936,7 @@ mod tests {
         ModelHistory, ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
     use crate::session::{Session, SessionWriteGate, SessionWriteKind};
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolErrorKind, ToolHost, ToolValue};
 
@@ -7941,13 +7941,12 @@ mod tests {
     async fn complete_runner_derives_catalog_from_child_source_in_read_only_prompt() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review workflow\n---\nPRIVATE_SKILL_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review workflow\n",
+            "PRIVATE_SKILL_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(
             &scope,

@@ -1480,7 +1480,7 @@ mod tests {
         CompactionOutcome, PersistedTerminal, Session, SessionEntryId, SessionWriteGate,
         SessionWriteKind, SessionWriter,
     };
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -1517,13 +1517,12 @@ mod tests {
     async fn read_only_child_loads_skill_into_next_model_context_without_printing_body() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review\n---\nCHILD_PRIVATE_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "CHILD_PRIVATE_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let tool_host = ToolHost::new(workspace.path())
@@ -1565,13 +1564,12 @@ mod tests {
     async fn persisted_root_load_skill_reaches_next_model_step_and_restore() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review\n---\nROOT_PRIVATE_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "ROOT_PRIVATE_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let tool_host = ToolHost::new(workspace.path())
@@ -1640,13 +1638,12 @@ mod tests {
             ("alpha", "ALPHA_PRIVATE_BODY"),
             ("beta", "BETA_PRIVATE_BODY"),
         ] {
-            let root = home.path().join(".agents/skills").join(name);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: {name}\n---\n{body}"),
-            )
-            .unwrap();
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                &format!("name: {name}\ndescription: {name}\n"),
+                body,
+            );
         }
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));

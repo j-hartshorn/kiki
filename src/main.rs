@@ -601,13 +601,12 @@ mod tests {
     }
 
     fn write_skill(root: &Path, name: &str, description: &str) {
-        let directory = root.join(".agents/skills").join(name);
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("SKILL.md"),
-            format!("---\ndescription: {description}\n---\nbody"),
-        )
-        .unwrap();
+        super::skills::write_skill(
+            &root.join(".agents/skills"),
+            name,
+            &format!("description: {description}\n"),
+            "body",
+        );
     }
 
     #[test]
@@ -743,13 +742,12 @@ mod tests {
         for index in 0..129 {
             fs::create_dir(root.join(format!("candidate-{index:03}"))).unwrap();
         }
-        let direct = home.path().join(".agents/skills/private-workflow");
-        fs::create_dir_all(&direct).unwrap();
-        fs::write(
-            direct.join("SKILL.md"),
-            "---\ndescription: Private workflow\ndisable-model-invocation: true\n---\nBody\n",
-        )
-        .unwrap();
+        super::skills::write_skill(
+            &home.path().join(".agents/skills"),
+            "private-workflow",
+            "description: Private workflow\ndisable-model-invocation: true\n",
+            "Body\n",
+        );
         let scope = super::ProjectScope::discover(project.path()).unwrap();
         super::config::skill_trust::save_project_skill_scope_trust(
             home.path(),
@@ -787,13 +785,13 @@ mod tests {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
-        let root = project.path().join(".agents/skills/review");
-        fs::create_dir_all(root.join("references")).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\ndescription: Review\n---\nBody\n",
-        )
-        .unwrap();
+        let root = super::skills::write_skill(
+            &project.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Body\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
         fs::write(root.join("references/note.md"), "project resource").unwrap();
         let scope = super::ProjectScope::discover(project.path()).unwrap();
         super::config::skill_trust::save_project_skill_scope_trust(

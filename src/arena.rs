@@ -2842,7 +2842,7 @@ mod tests {
         validate_worker, validate_worker_with_timeout,
     };
     use crate::model::{ScriptedAction, ScriptedModel, SkillActivation};
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
         ChildParameters, ChildPayload, ChildResult, ChildRun, ChildRunner, Clock,
@@ -2881,13 +2881,12 @@ mod tests {
     }
 
     async fn arena_with_user_skill(workspace: &TempDir, home: &TempDir) -> Arena {
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review\n---\nPRIVATE_SKILL_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_SKILL_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let host = ToolHost::new(workspace.path())
@@ -2958,13 +2957,12 @@ mod tests {
     async fn direct_only_skill_resources_require_the_skill_to_be_active() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".agents/skills/direct");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\ndescription: Direct\ndisable-model-invocation: true\n---\nbody",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "direct",
+            "description: Direct\ndisable-model-invocation: true\n",
+            "body",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let active = [SkillActivation::from_skill(
@@ -3041,16 +3039,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         for index in 0..5 {
             let name = format!("large-{index}");
-            let root = home.path().join(".agents/skills").join(&name);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                format!(
-                    "---\nname: {name}\ndescription: Large\n---\n{}",
-                    "BODY_SENTINEL".repeat(4_700)
-                ),
-            )
-            .unwrap();
+            write_skill(
+                &home.path().join(".agents/skills"),
+                &name,
+                &format!("name: {name}\ndescription: Large\n"),
+                &"BODY_SENTINEL".repeat(4_700),
+            );
         }
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
@@ -3079,13 +3073,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("blocked"), "contents").unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: review\ndescription: Review\n---\nPRIVATE_SKILL_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_SKILL_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let gate = ReadTestGate::new();

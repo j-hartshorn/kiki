@@ -2450,7 +2450,7 @@ mod tests {
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
         SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
-    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin};
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin, write_skill};
     use crate::sse_fixture::{Fixture, FixtureReply};
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -4963,13 +4963,12 @@ mod tests {
     async fn skill_activations_append_records_after_their_request_and_execution() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let loaded_root = home.path().join(".agents/skills/loaded");
-        fs::create_dir_all(&loaded_root).unwrap();
-        fs::write(
-            loaded_root.join("SKILL.md"),
-            "---\nname: loaded\ndescription: Loaded\n---\nLoaded body",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "loaded",
+            "name: loaded\ndescription: Loaded\n",
+            "Loaded body",
+        );
         let catalog = Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(workspace.path()).unwrap(),
             home.path(),

@@ -3998,7 +3998,7 @@ mod tests {
 
     use crate::config::constants::FILE_MAX_BYTES;
     use crate::model::SkillActivation;
-    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin};
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin, write_skill};
 
     use super::{
         ACTIVE_TOOLS, ContentFingerprint, SkillLoadLedger, ToolCall, ToolEffect, ToolError,
@@ -4016,13 +4016,13 @@ mod tests {
     async fn skill_resources_read_and_list_from_catalogued_directory() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(root.join("references")).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\ndescription: Review\n---\nPinned body\n",
-        )
-        .unwrap();
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Pinned body\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
         fs::write(root.join("references/checklist.md"), "live resource").unwrap();
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
@@ -4146,13 +4146,13 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret"), "outside").unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(root.join("references")).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\ndescription: Review\n---\nPinned\n",
-        )
-        .unwrap();
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Pinned\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
         fs::write(root.join("references/old.txt"), "old directory").unwrap();
         fs::write(root.join("%2e%2e"), "literal escape").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("outside-link")).unwrap();
@@ -4207,21 +4207,20 @@ mod tests {
     async fn skill_resource_listing_counts_locator_prefix_and_skipped_project_is_unavailable() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
-        let user_root = home.path().join(".agents/skills/user/references");
-        fs::create_dir_all(&user_root).unwrap();
-        fs::write(
-            user_root.parent().unwrap().join("SKILL.md"),
-            "---\ndescription: User\n---\nBody\n",
-        )
-        .unwrap();
-        fs::write(user_root.join("x"), "").unwrap();
-        let project_root = workspace.path().join(".agents/skills/project");
-        fs::create_dir_all(&project_root).unwrap();
-        fs::write(
-            project_root.join("SKILL.md"),
-            "---\ndescription: Project\n---\nBody\n",
-        )
-        .unwrap();
+        let user_root = write_skill(
+            &home.path().join(".agents/skills"),
+            "user",
+            "description: User\n",
+            "Body\n",
+        );
+        fs::create_dir(user_root.join("references")).unwrap();
+        fs::write(user_root.join("references/x"), "").unwrap();
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "project",
+            "description: Project\n",
+            "Body\n",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let expected_path = "skill://user/references/x";
@@ -4253,21 +4252,19 @@ mod tests {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
         let skills = home.path().join(".agents/skills");
-        let direct = skills.join("direct");
-        fs::create_dir_all(&direct).unwrap();
-        fs::write(
-            direct.join("SKILL.md"),
-            "---\ndescription: Direct\ndisable-model-invocation: true\n---\nbody",
-        )
-        .unwrap();
+        write_skill(
+            &skills,
+            "direct",
+            "description: Direct\ndisable-model-invocation: true\n",
+            "body",
+        );
         for index in 0..33 {
-            let root = skills.join(format!("visible-{index:02}"));
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                "---\ndescription: Visible\n---\nbody",
-            )
-            .unwrap();
+            write_skill(
+                &skills,
+                &format!("visible-{index:02}"),
+                "description: Visible\n",
+                "body",
+            );
         }
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
@@ -4332,16 +4329,12 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         for index in 0..5 {
             let name = format!("large-{index}");
-            let root = home.path().join(".agents/skills").join(&name);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                format!(
-                    "---\nname: {name}\ndescription: Large\n---\n{}",
-                    "BODY_SENTINEL".repeat(4_700)
-                ),
-            )
-            .unwrap();
+            write_skill(
+                &home.path().join(".agents/skills"),
+                &name,
+                &format!("name: {name}\ndescription: Large\n"),
+                &"BODY_SENTINEL".repeat(4_700),
+            );
         }
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
@@ -4380,28 +4373,21 @@ mod tests {
         for (directory, frontmatter, body) in [
             (
                 "direct",
-                "name: direct\ndescription: Direct\ndisable-model-invocation: true",
+                "name: direct\ndescription: Direct\ndisable-model-invocation: true\n",
                 "body",
             ),
-            ("invalid", "name: invalid", "body"),
-            ("one", "name: shared\ndescription: One", "body"),
-            ("two", "name: shared\ndescription: Two", "body"),
+            ("invalid", "name: invalid\n", "body"),
+            ("one", "name: shared\ndescription: One\n", "body"),
+            ("two", "name: shared\ndescription: Two\n", "body"),
         ] {
-            let root = user_root.join(directory);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(
-                root.join("SKILL.md"),
-                format!("---\n{frontmatter}\n---\n{body}"),
-            )
-            .unwrap();
+            write_skill(&user_root, directory, frontmatter, body);
         }
-        let project_root = workspace.path().join(".agents/skills/project");
-        fs::create_dir_all(&project_root).unwrap();
-        fs::write(
-            project_root.join("SKILL.md"),
-            "---\nname: project\ndescription: Project\n---\nbody",
-        )
-        .unwrap();
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "project",
+            "name: project\ndescription: Project\n",
+            "body",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let host = tool_host(&workspace).await.with_skill_catalog(catalog);
@@ -4429,13 +4415,12 @@ mod tests {
     async fn load_skill_ack_omits_unsafe_root_path_and_is_allowed_in_read_only_host() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
-        let root = home.path().join(".agents/skills/\u{202e}hidden");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: safe\ndescription: Safe\n---\nbody",
-        )
-        .unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "\u{202e}hidden",
+            "name: safe\ndescription: Safe\n",
+            "body",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let host = tool_host(&workspace)
@@ -4462,23 +4447,23 @@ mod tests {
     async fn load_skill_uses_process_catalog_snapshot_after_source_changes() {
         let home = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
-        let root = home.path().join(".agents/skills/review");
-        fs::create_dir_all(&root).unwrap();
-        let source = root.join("SKILL.md");
-        fs::write(
-            &source,
-            "---\nname: review\ndescription: Review\n---\nFIRST_BODY",
-        )
-        .unwrap();
+        let skills = home.path().join(".agents/skills");
+        write_skill(
+            &skills,
+            "review",
+            "name: review\ndescription: Review\n",
+            "FIRST_BODY",
+        );
         let scope = ProjectScope::discover(workspace.path()).unwrap();
         let old_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let old_host = tool_host(&workspace).await.with_skill_catalog(old_catalog);
 
-        fs::write(
-            &source,
-            "---\nname: review\ndescription: Review\n---\nSECOND_BODY",
-        )
-        .unwrap();
+        write_skill(
+            &skills,
+            "review",
+            "name: review\ndescription: Review\n",
+            "SECOND_BODY",
+        );
         let new_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
         let new_host = tool_host(&workspace).await.with_skill_catalog(new_catalog);
         let mut old_ledger = SkillLoadLedger::new(&[]).unwrap();
