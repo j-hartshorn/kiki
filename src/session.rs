@@ -17,9 +17,10 @@ use rustix::io::Errno;
 use thiserror::Error;
 use tokio::task;
 
-use crate::agent::TerminalEvidence;
+use crate::agent::{OverflowRecovery, TerminalEvidence};
 use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
+use crate::config::settings::CrossProviderReasoning;
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
@@ -234,15 +235,18 @@ pub(crate) enum PersistedTerminal {
         reasoning_summary: String,
         replay: crate::model::ProviderReplay,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Cancelled {
         evidence: Option<crate::agent::TerminalEvidence>,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Failed {
         message: String,
         evidence: Option<crate::agent::TerminalEvidence>,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
 }
 
@@ -261,15 +265,18 @@ pub(crate) enum ReadableTerminal {
         text: String,
         reasoning_summary: String,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Cancelled {
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Failed {
         message: String,
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
 }
 
@@ -988,12 +995,23 @@ impl SessionWriter {
         &self,
         policy: CompactionSettings,
         selection: ModelSelection,
+        reasoning: CrossProviderReasoning,
         focus: String,
         reason: CompactionReason,
     ) -> Result<Option<PreparedCompaction>, SessionError> {
+        if reason != CompactionReason::Manual && !policy.enabled() {
+            return Ok(None);
+        }
         let snapshot = self.read(load_compaction_snapshot).await?;
-        let Some(planner) = crate::compaction::prepare(&snapshot.facts, policy, selection, &focus)
-            .map_err(|error| SessionError::Codec(error.to_string()))?
+        let Some(planner) = crate::compaction::prepare(
+            &snapshot.facts,
+            policy,
+            selection,
+            reasoning,
+            &focus,
+            reason,
+        )
+        .map_err(|error| SessionError::Codec(error.to_string()))?
         else {
             return Ok(None);
         };
@@ -1219,9 +1237,25 @@ impl SessionWriter {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_model_step(&self, run_id: u64) -> Result<u64, SessionError> {
         self.write(SessionWriteKind::Step, move |connection| {
             start_model_step(connection, run_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn start_model_step_unless(
+        &self,
+        run_id: u64,
+        reject: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<Option<u64>, SessionError> {
+        self.write(SessionWriteKind::Step, move |connection| {
+            if reject() {
+                Ok(None)
+            } else {
+                start_model_step(connection, run_id).map(Some)
+            }
         })
         .await
     }
@@ -1995,6 +2029,7 @@ fn recover_interrupted_operations(connection: &mut Connection) -> Result<(), Ses
             message: INTERRUPTION_MESSAGE.to_owned(),
             evidence: None,
             attempts: Vec::new(),
+            overflow_recovery: None,
         };
         let stored_terminal = codec::encode_terminal(&terminal, None)
             .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -2419,6 +2454,9 @@ struct CompactionSnapshot {
     facts: Vec<SelectedAncestryFact>,
 }
 
+// Each recursive step follows one strictly older parent, so a corrupt cycle ends the chain early.
+const SELECTED_ANCESTRY_SQL: &str = "WITH RECURSIVE selected(id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision) AS (SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries WHERE id = ?1 UNION ALL SELECT entries.id, entries.parent_id, entries.run_id, entries.checkpoint_id, entries.kind, entries.payload_json, entries.provider_replay, entries.revision FROM selected JOIN entries ON entries.id = selected.parent_id WHERE selected.parent_id < selected.id) SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM selected";
+
 fn load_compaction_snapshot(
     connection: &mut Connection,
 ) -> Result<CompactionSnapshot, SessionError> {
@@ -2428,12 +2466,10 @@ fn load_compaction_snapshot(
         [],
         |row| row.get(0),
     )?;
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
+    let entries_by_id = {
+        let mut statement = transaction.prepare(SELECTED_ANCESTRY_SQL)?;
         statement
-            .query_map([], |row| {
+            .query_map([active_entry_id], |row| {
                 Ok(RestoreEntryRow {
                     id: row.get(0)?,
                     parent_id: row.get(1)?,
@@ -2445,16 +2481,15 @@ fn load_compaction_snapshot(
                     revision: row.get(7)?,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?
+            .map(|entry| entry.map(|entry| (entry.id, entry)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?
     };
-    let entries_by_id = entries
-        .iter()
-        .map(|entry| (entry.id, entry.clone()))
-        .collect::<BTreeMap<_, _>>();
     let ancestry = selected_ancestry(&entries_by_id, active_entry_id);
     if !ancestry.intact {
         return Err(SessionError::InvalidTransition);
     }
+    validate_selected_compactions(&ancestry.entries)
+        .map_err(|()| SessionError::InvalidTransition)?;
     let parent = ancestry
         .entries
         .last()
@@ -2469,7 +2504,7 @@ fn load_compaction_snapshot(
         .entries
         .iter()
         .filter(|entry| entry.kind != "session_start")
-        .map(|entry| compaction_fact(entry, &entries))
+        .map(compaction_fact)
         .collect::<Result<Vec<_>, _>>()?;
     transaction.commit()?;
     Ok(CompactionSnapshot {
@@ -2480,10 +2515,36 @@ fn load_compaction_snapshot(
     })
 }
 
-fn compaction_fact(
-    entry: &RestoreEntryRow,
-    entries: &[RestoreEntryRow],
-) -> Result<SelectedAncestryFact, SessionError> {
+fn validate_selected_compactions(selected: &[RestoreEntryRow]) -> Result<(), ()> {
+    let mut previous_boundary = None;
+    for (position, entry) in selected.iter().enumerate() {
+        if entry.kind != "compaction" {
+            continue;
+        }
+        if entry.provider_replay.is_some() {
+            return Err(());
+        }
+        let decoded = codec::decode_entry(&entry.kind, &entry.payload_json).map_err(|_| ())?;
+        let Some(CompactionOutcome::Applied { first_retained, .. }) =
+            codec::decoded_compaction(&decoded)
+        else {
+            continue;
+        };
+        let boundary_id = i64::try_from(first_retained.0).map_err(|_| ())?;
+        let boundary = selected[..position]
+            .binary_search_by_key(&boundary_id, |entry| entry.id)
+            .map_err(|_| ())?;
+        if !context_bearing_payload(selected[boundary].payload())
+            || previous_boundary.is_some_and(|previous| previous >= boundary)
+        {
+            return Err(());
+        }
+        previous_boundary = Some(boundary);
+    }
+    Ok(())
+}
+
+fn compaction_fact(entry: &RestoreEntryRow) -> Result<SelectedAncestryFact, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     let entry_id = session_entry_id(entry.id)?;
@@ -2586,12 +2647,6 @@ fn compaction_fact(
             }
         }
         "compaction" => {
-            let payloads = entries
-                .iter()
-                .map(RestoreEntryRow::payload)
-                .collect::<Vec<_>>();
-            validate_compaction_entry(entry.payload(), &payloads)
-                .map_err(|_| SessionError::InvalidTransition)?;
             match codec::decoded_compaction(&decoded).ok_or(SessionError::InvalidTransition)? {
                 CompactionOutcome::Applied {
                     summary,
@@ -2992,6 +3047,7 @@ fn restore_projection_at(
                     continue;
                 };
                 footer_adjustment.extend(codec::decoded_attempts(decoded));
+                footer_adjustment.extend(codec::decoded_initial_overflow_attempts(decoded));
             }
             "compaction" => {
                 if validate_compaction_entry(entry.payload(), &payloads).is_err() {
@@ -3882,6 +3938,7 @@ mod tests {
         Arena, Checkpoint, Execution, ExecutionOutcome, RuntimeIdentity, ToolCall, ToolCallSummary,
         ToolName,
     };
+    use crate::config::settings::CrossProviderReasoning;
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
@@ -3948,6 +4005,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -3974,6 +4032,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4594,6 +4653,7 @@ mod tests {
                 reasoning_summary: String::new(),
                 replay: crate::model::ProviderReplay::new("test", Vec::new()),
                 attempts: Vec::new(),
+                overflow_recovery: None,
             },
             None,
         )
@@ -4729,6 +4789,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4823,6 +4884,7 @@ mod tests {
                     message: "sibling failed".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4927,6 +4989,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5034,6 +5097,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5085,6 +5149,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5115,6 +5180,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5207,6 +5273,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5289,6 +5356,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5329,6 +5397,7 @@ mod tests {
                     message: "closed with a pending step".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5415,6 +5484,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5491,6 +5561,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5547,6 +5618,7 @@ mod tests {
                     message: "selection failure fixture".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5626,6 +5698,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5646,6 +5719,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5667,6 +5741,7 @@ mod tests {
                     message: "failure".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5896,6 +5971,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5916,6 +5992,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5937,6 +6014,7 @@ mod tests {
                     message: "catalogue failure".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6043,6 +6121,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6086,6 +6165,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6189,6 +6269,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6263,6 +6344,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6356,6 +6438,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -7749,6 +7832,7 @@ mod tests {
                                     message: "closed before interruption".to_owned(),
                                     evidence: None,
                                     attempts: Vec::new(),
+                                    overflow_recovery: None,
                                 },
                                 None,
                             )
@@ -8063,6 +8147,7 @@ mod tests {
                     message: "already closed".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -8747,6 +8832,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -8806,6 +8892,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -8872,6 +8959,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -8952,6 +9040,7 @@ mod tests {
                                 message: "close with a pending step".to_owned(),
                                 evidence: None,
                                 attempts: Vec::new(),
+                                overflow_recovery: None,
                             },
                             None,
                         )
@@ -9017,6 +9106,7 @@ mod tests {
                             || PersistedTerminal::Cancelled {
                                 evidence: None,
                                 attempts: Vec::new(),
+                                overflow_recovery: None,
                             },
                             None,
                         )
@@ -9057,6 +9147,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
             (
@@ -9064,6 +9155,7 @@ mod tests {
                 PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
             (
@@ -9072,6 +9164,7 @@ mod tests {
                     message: String::new(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
         ];
@@ -9259,6 +9352,7 @@ mod tests {
             reasoning_summary: String::new(),
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             attempts: Vec::new(),
+            overflow_recovery: None,
         };
 
         assert!(matches!(
@@ -9382,6 +9476,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -9434,6 +9529,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -9511,6 +9607,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(vec![1, 2, 3])],
                     ),
                     attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10300,6 +10397,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(b"discarded".to_vec())],
                     ),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10326,6 +10424,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(b"retained".to_vec())],
                     ),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10382,6 +10481,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 6),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10586,6 +10686,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10645,6 +10746,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10727,6 +10829,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -10760,6 +10863,7 @@ mod tests {
                 .prepare_compaction(
                     crate::config::CompactionSettings::new(100, 4),
                     selection(),
+                    CrossProviderReasoning::Inline,
                     String::new(),
                     super::CompactionReason::ContextOverflow,
                 )
@@ -10830,6 +10934,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -10917,6 +11022,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11012,6 +11118,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11034,6 +11141,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11109,6 +11217,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11136,6 +11245,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11218,6 +11328,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11278,6 +11389,598 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn compaction_preparation_renders_foreign_replay_for_the_selected_provider() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let admission = writer
+            .commit_request("inspect".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step_id),
+                move || PersistedTerminal::Final {
+                    step_id,
+                    text: "It printed 1.".to_owned(),
+                    reasoning_summary: "FOREIGN_REASONING".to_owned(),
+                    replay: crate::model::ProviderReplay::new(
+                        "anthropic",
+                        vec![crate::model::OpaqueReplayItem::new(vec![b'x'; 100_000])],
+                    ),
+                    attempts: vec![crate::model::AttemptAccounting::KnownUsage(
+                        crate::model::ModelUsage {
+                            model: crate::config::models::OPUS_5_5.id.to_owned(),
+                            service_tier: None,
+                            input_tokens: Some(40_000),
+                            cached_input_tokens: Some(30_000),
+                            cache_write_input_tokens: Some(5_000),
+                            cache_write_1h_input_tokens: 0,
+                            output_tokens: Some(10_000),
+                            reasoning_output_tokens: Some(1_000),
+                            total_tokens: Some(50_000),
+                        },
+                    )],
+                    overflow_recovery: None,
+                },
+                None,
+            )
+            .await
+            .expect("close foreign run");
+        append_cancelled_request(&writer, "tail").await;
+        let live_history = writer.model_history().expect("read live context");
+        let stored_rows = |session: &Session| {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let mut statement = connection
+                .prepare("SELECT id, payload_json, provider_replay FROM entries ORDER BY id")
+                .expect("prepare entry query");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                })
+                .expect("query entries")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read entries")
+        };
+        let rows_before = stored_rows(&session);
+        let prepare = |reasoning| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                reasoning,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+        };
+
+        for (reasoning, semantic) in [
+            (
+                CrossProviderReasoning::Inline,
+                "inspect".len() + "FOREIGN_REASONING".len() + "It printed 1.".len(),
+            ),
+            (
+                CrossProviderReasoning::Drop,
+                "inspect".len() + "It printed 1.".len(),
+            ),
+        ] {
+            let preparation = prepare(reasoning)
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history");
+            assert_eq!(
+                preparation.planner.context_tokens(),
+                (semantic + "tail".len()).div_ceil(4) as u64,
+                "{reasoning:?}"
+            );
+            assert_eq!(
+                preparation.requests()[0]
+                    .input
+                    .contains("FOREIGN_REASONING"),
+                reasoning == CrossProviderReasoning::Inline,
+                "{reasoning:?}"
+            );
+        }
+        assert_eq!(stored_rows(&session), rows_before);
+        assert_eq!(
+            writer.model_history().expect("read live context"),
+            live_history
+        );
+
+        let preparation = prepare(CrossProviderReasoning::Drop)
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "historical FOREIGN_REASONING".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        append_cancelled_request(&writer, "later").await;
+        assert_eq!(stored_rows(&session)[..rows_before.len()], rows_before);
+        let repeated = prepare(CrossProviderReasoning::Drop)
+            .await
+            .expect("prepare repeated compaction")
+            .expect("prepare repeated compactable history");
+        assert!(
+            repeated.requests()[0]
+                .input
+                .contains("<previous-summary>\nhistorical FOREIGN_REASONING\n</previous-summary>")
+        );
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session before restart");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        activate_session(&reopened).await;
+        let restored = reopened
+            .writer()
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                CrossProviderReasoning::Drop,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare restored compaction")
+            .expect("prepare restored compactable history");
+        assert_eq!(
+            restored.planner.context_tokens(),
+            repeated.planner.context_tokens()
+        );
+        assert_eq!(restored.requests(), repeated.requests());
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn automatic_preparation_honours_enabled_threshold_and_progress() {
+        use super::CompactionReason::{AutomaticThreshold, ContextOverflow, Manual};
+        use crate::config::CompactionSettings;
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "only request").await;
+        let prepares = |policy, reason| {
+            let writer = &writer;
+            async move {
+                writer
+                    .prepare_compaction(
+                        policy,
+                        selection(),
+                        CrossProviderReasoning::Inline,
+                        String::new(),
+                        reason,
+                    )
+                    .await
+                    .expect("prepare compaction")
+                    .is_some()
+            }
+        };
+        let above = CompactionSettings::new(u64::MAX, 4);
+        let below = CompactionSettings::new(100, 4);
+        for reason in [Manual, AutomaticThreshold, ContextOverflow] {
+            assert!(!prepares(above, reason).await, "no progress: {reason:?}");
+        }
+
+        append_cancelled_request(&writer, "retained request").await;
+        let history = writer.model_history().expect("read context");
+        let entry_count = || -> i64 {
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .expect("count entries")
+        };
+        let entries = entry_count();
+        for (policy, reason, expected) in [
+            (above.disabled(), AutomaticThreshold, false),
+            (above.disabled(), ContextOverflow, false),
+            (above.disabled(), Manual, true),
+            (below.disabled(), Manual, true),
+            (below, AutomaticThreshold, false),
+            (below, ContextOverflow, true),
+            (above, AutomaticThreshold, true),
+        ] {
+            assert_eq!(
+                prepares(policy, reason).await,
+                expected,
+                "{policy:?} {reason:?}"
+            );
+        }
+        assert_eq!(entry_count(), entries);
+        assert_eq!(writer.model_history().expect("read context"), history);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disabled_automatic_preparation_skips_the_session_read() {
+        use super::CompactionReason::{AutomaticThreshold, ContextOverflow, Manual};
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = X'00' WHERE id = (SELECT active_entry_id FROM session WHERE singleton = 1)",
+                    [],
+                )
+                .expect("make the selected leaf unreadable as text");
+        }
+        let prepare = |reason| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(u64::MAX, 4).disabled(),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+
+        for reason in [AutomaticThreshold, ContextOverflow] {
+            assert!(matches!(prepare(reason).await, Ok(None)), "{reason:?}");
+        }
+        assert!(matches!(
+            prepare(Manual).await,
+            Err(SessionError::Sqlite(_))
+        ));
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn below_threshold_preparation_skips_summary_assembly() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let prepare = |reserve, reason| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(reserve, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+        let preparation = prepare(100, super::CompactionReason::Manual)
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "malformed <read-files>".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        append_cancelled_request(&writer, "newly discarded").await;
+        append_cancelled_request(&writer, "tail").await;
+
+        assert!(
+            prepare(100, super::CompactionReason::AutomaticThreshold)
+                .await
+                .expect("below-threshold check")
+                .is_none()
+        );
+        for (reserve, reason) in [
+            (100, super::CompactionReason::Manual),
+            (u64::MAX, super::CompactionReason::AutomaticThreshold),
+        ] {
+            assert!(
+                matches!(
+                    prepare(reserve, reason).await,
+                    Err(super::SessionError::Codec(message)) if message.contains("reserved file tag")
+                ),
+                "{reason:?}"
+            );
+        }
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compaction_snapshot_reads_only_the_selected_chain() {
+        use super::CompactionReason::{AutomaticThreshold, Manual};
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let policy = crate::config::CompactionSettings::new(100, 4);
+        let prepare = |reason| {
+            writer.prepare_compaction(
+                policy,
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+        append_cancelled_request(&writer, "first request").await;
+        let branch_point = session.restore().expect("restore").observed_active_entry;
+        let abandoned = writer
+            .commit_request("abandoned request".to_owned(), selection())
+            .await
+            .expect("commit abandoned request");
+        let abandoned_step = writer
+            .start_model_step(abandoned.run_id)
+            .await
+            .expect("start abandoned step");
+        writer
+            .close_run(
+                abandoned.run_id,
+                Some(abandoned_step),
+                move || PersistedTerminal::Final {
+                    step_id: abandoned_step,
+                    text: "abandoned reply".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "openai",
+                        vec![crate::model::OpaqueReplayItem::new(vec![
+                            b'x';
+                            4 * 1024 * 1024
+                        ])],
+                    ),
+                    attempts: Vec::new(),
+                    overflow_recovery: None,
+                },
+                None,
+            )
+            .await
+            .expect("close abandoned run");
+        let abandoned_leaf = session.restore().expect("restore").observed_active_entry;
+        writer
+            .select_active_entry(branch_point, abandoned_leaf)
+            .await
+            .expect("return to the selected branch");
+        for round in 0..3 {
+            for request in 0..2 {
+                append_cancelled_request(&writer, &format!("round {round} request {request}"))
+                    .await;
+            }
+            let preparation = prepare(Manual)
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history");
+            writer
+                .settle_compaction(
+                    preparation,
+                    super::CompactionSettlement::Applied {
+                        summary: format!("summary {round}"),
+                        attempts: Vec::new(),
+                    },
+                )
+                .await
+                .expect("settle compaction");
+        }
+        append_cancelled_request(&writer, "newly discarded").await;
+        append_cancelled_request(&writer, "tail").await;
+        {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .expect("remove entry immutability trigger");
+            connection
+                .execute(
+                    "UPDATE entries SET payload_json = X'00' WHERE id = ?1",
+                    [i64::try_from(abandoned.request_entry.0).expect("entry ID fits SQLite")],
+                )
+                .expect("make the abandoned row unreadable as text");
+        }
+
+        assert!(
+            prepare(AutomaticThreshold)
+                .await
+                .expect("below-threshold check ignores abandoned rows")
+                .is_none()
+        );
+        let manual = prepare(Manual)
+            .await
+            .expect("manual preparation ignores abandoned rows")
+            .expect("prepare compactable history");
+        assert!(
+            manual.requests()[0]
+                .input
+                .contains("<previous-summary>\nsummary 2\n</previous-summary>")
+        );
+        assert!(session.restore().is_err());
+        assert!(writer.catalogue().await.is_err());
+        let plan = {
+            let connection = session
+                .connection_for_test()
+                .expect("lock session connection");
+            let mut statement = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    super::SELECTED_ANCESTRY_SQL
+                ))
+                .expect("explain selected ancestry query");
+            statement
+                .query_map([1_i64], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read plan")
+        };
+        assert!(
+            plan.iter()
+                .any(|detail| detail.starts_with("SEARCH entries USING INTEGER PRIMARY KEY")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN entries")),
+            "{plan:?}"
+        );
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn compaction_snapshot_rejects_corrupt_selected_chains() {
+        async fn append_request(writer: &SessionWriter, request: &str) -> i64 {
+            let admission = writer
+                .commit_request(request.to_owned(), selection())
+                .await
+                .expect("commit request");
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                        overflow_recovery: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("close request");
+            i64::try_from(admission.request_entry.0).expect("entry ID fits SQLite")
+        }
+
+        for corruption in ["off-chain boundary", "backwards boundary", "newer parent"] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let session = create_session(&home, &workspace).await;
+            let writer = session.writer();
+            let prepare = || {
+                writer.prepare_compaction(
+                    crate::config::CompactionSettings::new(100, 4),
+                    selection(),
+                    CrossProviderReasoning::Inline,
+                    String::new(),
+                    super::CompactionReason::Manual,
+                )
+            };
+            let first = append_request(&writer, "request1").await;
+            let branch_point = session.restore().expect("restore").observed_active_entry;
+            let abandoned = append_request(&writer, "abandoned").await;
+            let abandoned_leaf = session.restore().expect("restore").observed_active_entry;
+            writer
+                .select_active_entry(branch_point, abandoned_leaf)
+                .await
+                .expect("return to the selected branch");
+            let mut compactions = Vec::new();
+            let mut later_request = 0;
+            for requests in [["request2", "request3"], ["request4", "request5"]] {
+                for request in requests {
+                    let entry = append_request(&writer, request).await;
+                    if request == "request4" {
+                        later_request = entry;
+                    }
+                }
+                let preparation = prepare()
+                    .await
+                    .expect("prepare compaction")
+                    .expect("prepare compactable history");
+                compactions.push(
+                    writer
+                        .settle_compaction(
+                            preparation,
+                            super::CompactionSettlement::Applied {
+                                summary: "summary".to_owned(),
+                                attempts: Vec::new(),
+                            },
+                        )
+                        .await
+                        .expect("settle compaction")
+                        .entry_id,
+                );
+            }
+            let tail = append_request(&writer, "tail").await;
+            prepare().await.expect("valid selected chain");
+            {
+                let connection = session
+                    .connection_for_test()
+                    .expect("lock session connection");
+                connection
+                    .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                    .expect("remove entry immutability trigger");
+                if corruption == "newer parent" {
+                    connection
+                        .execute(
+                            "UPDATE entries SET parent_id = ?1 WHERE id = ?2",
+                            params![tail, later_request],
+                        )
+                        .expect("point a selected parent forwards");
+                } else {
+                    let compaction = i64::try_from(compactions[1].0).expect("entry ID fits SQLite");
+                    let mut payload: serde_json::Value = connection
+                        .query_row(
+                            "SELECT payload_json FROM entries WHERE id = ?1",
+                            [compaction],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map(|payload| serde_json::from_str(&payload).expect("decode payload"))
+                        .expect("read compaction payload");
+                    let boundary = if corruption == "off-chain boundary" {
+                        abandoned
+                    } else {
+                        first
+                    };
+                    payload["Compaction"]["compaction"]["first_retained"] =
+                        serde_json::json!(boundary);
+                    connection
+                        .execute(
+                            "UPDATE entries SET payload_json = ?1 WHERE id = ?2",
+                            params![payload.to_string(), compaction],
+                        )
+                        .expect("corrupt compaction boundary");
+                }
+            }
+
+            assert!(
+                matches!(prepare().await, Err(SessionError::InvalidTransition)),
+                "{corruption}"
+            );
+            drop(writer);
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn stale_compaction_settlement_does_not_append_or_publish() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -11289,6 +11992,7 @@ mod tests {
             .prepare_compaction(
                 crate::config::CompactionSettings::new(100, 4),
                 selection(),
+                CrossProviderReasoning::Inline,
                 String::new(),
                 super::CompactionReason::Manual,
             )
@@ -11331,6 +12035,433 @@ mod tests {
         );
         drop(writer);
         session.close().expect("close session");
+    }
+
+    fn overflow_recovery(
+        attempts: Vec<crate::model::AttemptAccounting>,
+    ) -> crate::agent::OverflowRecovery {
+        crate::agent::OverflowRecovery {
+            failure: crate::model::ProviderFailure::new(
+                Some(400),
+                Some("context_length_exceeded".to_owned()),
+                "maximum context length".to_owned(),
+            )
+            .with_context_overflow(true),
+            generation: None,
+            attempts,
+        }
+    }
+
+    fn known_usage(input: u64, output: u64) -> crate::model::AttemptAccounting {
+        crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+            model: DEFAULT_MODEL.id.to_owned(),
+            service_tier: None,
+            input_tokens: Some(input),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
+            output_tokens: Some(output),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(input + output),
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn overflow_recovery_attempts_count_once_per_owner_across_branches() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let branch_point = session.restore().expect("restore").observed_active_entry;
+        let call = known_usage(40, 2);
+        let summary = known_usage(7, 1);
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "summary".to_owned(),
+                    attempts: vec![summary.clone()],
+                },
+            )
+            .await
+            .expect("settle compaction");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        let terminal = PersistedTerminal::Final {
+            step_id,
+            text: "recovered".to_owned(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("openai", Vec::new()),
+            attempts: vec![call.clone()],
+            overflow_recovery: Some(overflow_recovery(vec![call.clone()])),
+        };
+        let expected = terminal.clone();
+        assert_eq!(
+            writer
+                .close_run(admission.run_id, Some(step_id), move || terminal, None)
+                .await
+                .expect("close recovered run"),
+            expected
+        );
+        let recovered_leaf = session.restore().expect("restore").observed_active_entry;
+        let assert_selected = |restore: super::SessionRestore| {
+            assert!(restore.footer_adjustment.is_empty());
+            assert!(restore.records.iter().any(|record| matches!(
+                &record.kind,
+                super::RestoredRecordKind::Compaction { outcome }
+                    if outcome.attempts() == std::slice::from_ref(&summary)
+            )));
+            assert!(matches!(
+                restore.records.last().map(|record| &record.kind),
+                Some(super::RestoredRecordKind::FinalMessage {
+                    terminal: super::ReadableTerminal::Final {
+                        attempts,
+                        overflow_recovery: Some(recovery),
+                        ..
+                    },
+                    ..
+                }) if attempts == std::slice::from_ref(&call)
+                    && recovery == &overflow_recovery(vec![call.clone()])
+            ));
+        };
+        let abandoned = vec![summary.clone(), call.clone(), call.clone()];
+        assert_selected(session.restore().expect("restore selected branch"));
+        writer
+            .select_active_entry(branch_point, recovered_leaf)
+            .await
+            .expect("abandon recovered branch");
+        assert_eq!(
+            session
+                .restore()
+                .expect("restore abandoning branch")
+                .footer_adjustment,
+            abandoned
+        );
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        assert_eq!(
+            reopened
+                .restore()
+                .expect("restore reopened branch point")
+                .footer_adjustment,
+            abandoned
+        );
+        assert_selected(
+            reopened
+                .writer()
+                .restore_at(recovered_leaf)
+                .await
+                .expect("restore reopened recovered branch"),
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn initial_overflow_usage_never_becomes_a_compaction_baseline() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step_id),
+                move || PersistedTerminal::Final {
+                    step_id,
+                    text: "recovered".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "openai",
+                        vec![crate::model::OpaqueReplayItem::new(b"done".to_vec())],
+                    ),
+                    attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                    overflow_recovery: Some(overflow_recovery(vec![known_usage(50_000, 0)])),
+                },
+                None,
+            )
+            .await
+            .expect("close recovered run");
+        append_cancelled_request(&writer, "tail").await;
+        let fallback = ("recover".len() + "done".len() + "tail".len()).div_ceil(4) as u64;
+        let measure = |writer: SessionWriter| async move {
+            writer
+                .prepare_compaction(
+                    crate::config::CompactionSettings::new(100, 1),
+                    selection(),
+                    CrossProviderReasoning::Inline,
+                    String::new(),
+                    super::CompactionReason::Manual,
+                )
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history")
+                .planner
+                .context_tokens()
+        };
+        assert_eq!(measure(writer.clone()).await, fallback);
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        activate_session(&reopened).await;
+        assert_eq!(measure(reopened.writer()).await, fallback);
+        reopened.close().expect("close reopened session");
+    }
+
+    async fn settle_overflow_compaction_in_pending_step(
+        writer: &SessionWriter,
+    ) -> (u64, u64, SessionEntryId) {
+        append_cancelled_request(writer, "discarded request").await;
+        append_cancelled_request(writer, "retained request").await;
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start overflowed step");
+        let preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::ContextOverflow,
+            )
+            .await
+            .expect("prepare overflow compaction")
+            .expect("prepare compactable history");
+        let committed = writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "overflow summary".to_owned(),
+                    attempts: vec![known_usage(7, 1)],
+                },
+            )
+            .await
+            .expect("settle overflow compaction inside the pending step");
+        (admission.run_id, step_id, committed.entry_id)
+    }
+
+    fn run_record_kinds(restore: &super::SessionRestore, run_id: u64) -> Vec<&'static str> {
+        restore
+            .records
+            .iter()
+            .filter(|record| record.run_id == run_id)
+            .map(|record| match &record.kind {
+                super::RestoredRecordKind::UserRequest { .. } => "request",
+                super::RestoredRecordKind::CompletedExecution { .. } => "execution",
+                super::RestoredRecordKind::FinalMessage { .. } => "final",
+                super::RestoredRecordKind::CancelledRun { .. } => "cancelled",
+                super::RestoredRecordKind::FailedRun { .. } => "failed",
+                super::RestoredRecordKind::Compaction { .. } => "compaction",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restart_after_applied_overflow_compaction_interrupts_the_pending_step_without_replay()
+    {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let (run_id, step_id, compaction_entry) =
+            settle_overflow_compaction_in_pending_step(&writer).await;
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close interrupted session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        let restore = reopened.restore().expect("restore interrupted run");
+
+        assert_eq!(
+            run_record_kinds(&restore, run_id),
+            ["request", "compaction", "failed"]
+        );
+        assert!(matches!(
+            restore.records.last().map(|record| &record.kind),
+            Some(super::RestoredRecordKind::FailedRun {
+                message,
+                terminal: super::ReadableTerminal::Failed {
+                    evidence: None,
+                    attempts,
+                    overflow_recovery: None,
+                    ..
+                },
+            }) if message == super::INTERRUPTION_MESSAGE && attempts.is_empty()
+        ));
+        assert!(restore.records.iter().any(|record| matches!(
+            &record.kind,
+            super::RestoredRecordKind::Compaction {
+                outcome: super::CompactionOutcome::Applied {
+                    reason: super::CompactionReason::ContextOverflow,
+                    attempts,
+                    ..
+                },
+            } if attempts == &[known_usage(7, 1)]
+        )));
+        let (settled_parent, open_runs, steps): (i64, i64, i64) = reopened
+            .connection_for_test()
+            .expect("open reopened session")
+            .query_row(
+                "SELECT entries.parent_id, (SELECT COUNT(*) FROM runs WHERE terminal_entry_id IS NULL), (SELECT COUNT(*) FROM model_steps WHERE run_id = ?1) FROM model_steps JOIN entries ON entries.id = model_steps.settled_entry_id WHERE model_steps.id = ?2",
+                params![
+                    i64::try_from(run_id).expect("run ID fits SQLite"),
+                    i64::try_from(step_id).expect("step ID fits SQLite"),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read interrupted step settlement");
+        assert_eq!(
+            (settled_parent, open_runs, steps),
+            (
+                i64::try_from(compaction_entry.0).expect("entry ID fits SQLite"),
+                0,
+                1
+            )
+        );
+        assert!(matches!(
+            restore
+                .executable
+                .expect("interrupted run remains executable")
+                .history
+                .entries(),
+            [crate::model::ModelContextEntry::CompactionSummary { summary }, .., crate::model::ModelContextEntry::UserRequest { text }]
+                if summary == "overflow summary" && text == "recover"
+        ));
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    async fn recovered_overflow_run_restores_and_branches_from_the_applied_entry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let branch_point = {
+            append_cancelled_request(&writer, "sibling base").await;
+            session.restore().expect("restore").observed_active_entry
+        };
+        let (run_id, step_id, compaction_entry) =
+            settle_overflow_compaction_in_pending_step(&writer).await;
+        let summary = known_usage(7, 1);
+        let initial = known_usage(40, 0);
+        let retry = known_usage(41, 2);
+        let terminal = PersistedTerminal::Final {
+            step_id,
+            text: "recovered".to_owned(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("openai", Vec::new()),
+            attempts: vec![retry.clone()],
+            overflow_recovery: Some(overflow_recovery(vec![initial.clone()])),
+        };
+        writer
+            .close_run(run_id, Some(step_id), move || terminal, None)
+            .await
+            .expect("close recovered run");
+        let recovered_leaf = session.restore().expect("restore").observed_active_entry;
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        let restore = reopened.restore().expect("restore recovered run");
+        assert!(restore.footer_adjustment.is_empty());
+        assert_eq!(
+            run_record_kinds(&restore, run_id),
+            ["request", "compaction", "final"]
+        );
+        assert!(matches!(
+            restore.records.last().map(|record| &record.kind),
+            Some(super::RestoredRecordKind::FinalMessage {
+                terminal: super::ReadableTerminal::Final {
+                    attempts,
+                    overflow_recovery: Some(recovery),
+                    ..
+                },
+                ..
+            }) if attempts == std::slice::from_ref(&retry)
+                && recovery.attempts == std::slice::from_ref(&initial)
+        ));
+        let recovered_history = restore
+            .executable
+            .expect("recovered run is executable")
+            .history;
+        assert!(matches!(
+            recovered_history.entries(),
+            [crate::model::ModelContextEntry::CompactionSummary { summary }, .., crate::model::ModelContextEntry::FinalMessage { text, .. }]
+                if summary == "overflow summary" && text == "recovered"
+        ));
+
+        let writer = reopened.writer();
+        let applied = writer
+            .restore_at(compaction_entry)
+            .await
+            .expect("restore applied entry");
+        let applied_history = applied
+            .executable
+            .expect("applied entry is executable")
+            .history;
+        assert_eq!(
+            applied_history.entries(),
+            &recovered_history.entries()[..recovered_history.entries().len() - 1]
+        );
+        assert_eq!(applied.footer_adjustment, [retry.clone(), initial.clone()]);
+        let sibling = writer
+            .restore_at(branch_point)
+            .await
+            .expect("restore sibling branch point");
+        assert!(matches!(
+            sibling.executable.expect("sibling is executable").history.entries(),
+            [crate::model::ModelContextEntry::UserRequest { text }] if text == "sibling base"
+        ));
+        assert_eq!(sibling.footer_adjustment, [summary, retry, initial]);
+        assert_eq!(
+            writer
+                .restore_at(recovered_leaf)
+                .await
+                .expect("restore recovered leaf")
+                .footer_adjustment,
+            Vec::new()
+        );
+        drop(writer);
+        reopened.close().expect("close reopened session");
     }
 
     #[tokio::test]

@@ -2,30 +2,30 @@
 
 ## Source
 
-- [Model context compaction spec](spec.md), Phase 3: Automatic compaction and recovery.
-- Requires completed Phases 1 and 2, including canonical Session context, format-v2 Compaction Entries, tree/transcript projection, manual orchestration, and non-Run foreground lifecycle.
-- Current code baseline before those phases: `45583c0`; re-check line references after Phase 2.
-- [Session-tree merge impact analysis](../research/2026-09-21_session-tree-compaction-impact.md).
-- This phase adds only `enabled`, three threshold boundaries, OpenAI overflow classification, and one compact-and-retry of the same pending Model Step.
+- [Model context compaction spec](spec.md), Phase 3. Phases 1 and 2 are merged on `main`.
+- Baseline reviewed at `d5212a0`, after the Anthropic provider merge. Re-check code locations if `main` advances.
+- [Anthropic provider spec](../2026-09-23_anthropic-provider/spec.md) defines one selection per Run and cross-provider reasoning policy.
+- [Anthropic API errors](https://platform.claude.com/docs/en/api/errors#thinking-block-no-longer-matches-the-conversation) document signed-thinking prefix binding; HTTP 413 `request_too_large` is a byte-size limit, not a token-overflow signal.
 
 ## Acceptance criteria
 
-1. `[compaction] enabled` is a strict user/project boolean with default `true`. `false` suppresses threshold compaction and overflow recovery but leaves `/compact` available.
-2. Automatic threshold uses `context_tokens > context_window - reserve_tokens` with saturating subtraction and Phase 2 measurement. Equality does not compact.
-3. Threshold checks run before request admission, between completed execution and the next Model Step, and after a committed final response before `RunSettled`. No-progress preparation skips silently.
-4. Non-cancellation threshold failure persists Failed and continues the scheduled workflow with unchanged Model Context. Cancellation and late cancellation follow the boundary-specific matrix in the spec.
-5. Threshold preparation captures one currently accepted `ModelSelection`; model changes after capture do not alter that summary request or its budgets. A later normal Model Step follows existing accepted-selection semantics.
-6. Pre-request and post-final work reuse Phase 2's non-Run foreground state: Submit/Compact/tree are busy, cancellation/shutdown cannot invent a Run ID, and held requests are admitted at most once.
-7. OpenAI overflow classification implements the exact code/status/message rules without classifying generic 400/413, authentication, rate limiting, broad token text, local response-size failures, or summary failures.
-8. A recognised normal-step overflow compacts and retries the same pending durable Model Step at most once. Failed normal attempts, summary attempts, and retry attempts remain distinct and count once.
-9. Second overflow, different retry failure, failed/no-op overflow compaction, disabled automation, persistence failure, interruption, and cancellation settle the pending Run exactly as specified without loops or orphaned steps.
-10. Automatic/overflow Compaction Entries render, search, copy, navigate, branch, account, and restore through the Phase 2 transcript/tree projections. Applied work does not immediately retrigger from stale pre-compaction usage.
+1. `[compaction] enabled` is a strict user/project boolean, defaults to `true` even with existing numeric-only settings, and uses field-wise precedence. `false` disables automatic thresholds and overflow recovery, not `/compact`.
+2. Just before every root normal Model Step, after the request or prior execution commits and before step allocation, estimate the selected context against the captured Run model: strictly `context_tokens > context_window.saturating_sub(reserve_tokens)`. Equality skips. A first-step check includes the committed request; there is no automatic pre-admission or post-final operation.
+3. Applied threshold compaction changes the projected context before the next provider call; no-progress does nothing and a provider-started non-cancellation Failed outcome persists without blocking that call. Cancellation settles the already admitted Run as Cancelled, including at the first check; a late cancellation cannot roll back an Applied entry or start a Model Step.
+4. Every normal step, threshold summary, overflow compaction and retry uses the Run's immutable `ModelSelection`. A mid-Run accepted setting affects the next Run; existing queued/idle manual compaction captures the accepted selection when it starts.
+5. Measurement never bases a new model's threshold on another model's reported usage. Foreign-provider replay uses the existing shared semantic parts consumed by both adapters, respecting `cross_provider_reasoning = "drop"`; the same policy removes foreign reasoning from new summary inputs. Cache read/write fields are not added twice. Below-threshold checks read only selected ancestry, reuse indexed ancestor validation and skip prompt construction; abandoned replay blobs are not loaded.
+6. Anthropic normal steps retain native replay while requesting documented `drop_block` thinking-binding behaviour and its required beta header. A summary followed by retained signed thinking must not create an avoidable prefix-binding 400; ordinary unchanged replay still works.
+7. OpenAI recognises only the spec's exact raw code/status/message overflow signatures; authentication, rate limits, generic 400/413, broad token text, local response-size and summary failures remain ordinary. Anthropic recognises only a verified positive prompt-too-long signature; if none can be verified, it fails closed with no Anthropic overflow recovery, without disabling Anthropic threshold or manual compaction. Byte-size 413, output `max_tokens`, overload and signature-binding errors never masquerade as context overflow.
+8. A recognised normal-step overflow compacts and retries the same pending durable Model Step at most once with the same Run selection. Initial failure, summary and retry attempt accounting have disjoint owners and count once on selected and abandoned branches; ordinary attempts remain eligible for context measurement while initial overflow attempts are billable-only and never supply a post-compaction baseline.
+9. Applied/Failed/Cancelled overflow Compaction Entries remain branchable, searchable, restorable, copyable and inspectable. Final/Failed/Cancelled terminal evidence composes the initial overflow with ordinary retry evidence; Phase-2-shaped format-v2 records remain readable and ordinary new records omit the new field.
+10. Second overflow, different retry failure, Failed/NoOp/pre-start-failed compaction, interruption, persistence failure and Esc settle or recover the open Run/step without another retry, missing settlement, or invented provider work. A retry begins a new live generation epoch before lossy progress, without erasing settled usage or allowing delayed normal-step progress to repaint automatic compaction or the retry.
+11. Final replies publish and settle without automatic post-final summary latency. Existing manual acknowledgement/draft, retained-manual/correction ordering, and non-Run lifecycle stay unchanged. No automatic compaction is added to task-local subagent histories.
 
 ## Overall validation
 
-Use real temporary format-v2 SQLite sessions and existing write/runner/operation gates for pending-step provenance, compaction ancestry, settlement, branch navigation, restart, and accounting. Use scripted models for threshold boundaries, setting changes, and retry sequences. Use the local OpenAI fixture server for exact overflow diagnostics. No live-provider tests are required.
+Use scripted `Model` tests with real temporary format-v2 SQLite sessions, existing writer/operation gates and both providers' local HTTP/SSE fixtures. Verify the affected production adapter with an opt-in live Anthropic manual-compaction smoke test if credentials are available. Do not manufacture an Anthropic overflow signature from a synthetic fixture or run an expensive over-window live prompt as a required test; an unverified signature remains unrecognised and documented.
 
-Before tests which execute Python:
+Before tests that execute Python:
 
 ```sh
 just monty
@@ -49,195 +49,206 @@ cargo clippy --all-targets -- -D warnings
 just test
 ```
 
-Each task is one atomic signed-off commit. Affected unit tests live in the binary target, so focused commands use `cargo test --bin kiki`; the whole-phase gate also covers integration targets.
+Each task is one atomic signed-off commit. Unit tests live in the binary target, so focused commands use `cargo test --bin kiki`; the whole-phase gate also covers integration targets.
 
 ## Planning context
 
-- Phase 2 supplies one preparation path, one guarded outcome commit, one Compaction Entry projection, and one foreground compaction lifecycle. Automatic triggers reuse them with reasons `Threshold` or `Overflow`.
-- Effective settings resolve file layers field by field (`src/config/settings.rs:508`, `src/config/settings.rs:590`). Phase 2 carries resolved compaction policy on the existing startup/settings context; `enabled` joins that policy without a new authority.
-- Catalogue models expose `context_window_tokens` and `max_output_tokens` (`src/config/models.rs:27`). Thresholds use the context window, never the long-context pricing threshold.
-- Runtime publishes accepted selection through its existing watch channel and OpenAI samples it for each normal step (`src/runtime.rs:335`, `src/openai.rs:757`). Automatic preparation clones that receiver and samples once; it does not add selection state.
-- Phase 2 broadens foreground state beyond `ActiveRun`. Preflight and post-final compaction use that operation protocol; inter-step and overflow compaction remain inside the persisted Agent worker.
-- The persisted Agent loop allocates a Model Step before the provider call and currently closes it immediately on failure (`src/agent.rs:675`, `src/agent.rs:705`). Overflow recovery intercepts before closure, leaves that row pending, appends Compaction beneath the current Active Leaf, and settles the same step after retry.
-- OpenAI transport/API failures become bounded `ProviderFailure { status, code, message }` (`src/model.rs:290`, `src/openai.rs:616`). Classification belongs in provider failure vocabulary, not Runtime string matching.
-- Interrupted-operation recovery already appends one terminal beneath the current Active Leaf, settles pending Model Steps, and closes the open Run without replaying work (`src/session.rs:1418`). An Applied Overflow Compaction Entry therefore needs codec/projection support and regression coverage, not a second recovery algorithm.
-- Summary failures, even when their provider diagnostic resembles overflow, settle that Compaction outcome. Only the normal Model Step path invokes overflow recovery.
+- `SessionWriter::prepare_compaction` snapshots ancestry and `settle_compaction` guards the selected leaf, checkpoint and Run provenance before publishing projected context (`src/session.rs:987`, `src/session.rs:1009`). The current snapshot reads all Session Entries and provider replay blobs (`src/session.rs:2422`); for each Compaction Entry, it rebuilds payloads and linearly looks up ancestors (`src/session.rs:2589`, `src/session.rs:3422`). Pre-step preparation must read only the selected chain and validate against indexed selected rows.
+- Manual summary orchestration currently hard-codes `CompactionReason::Manual` (`src/agent.rs:617`); its summary loop and settlement should serve all reasons. `FailedBeforeStart` loses its diagnostic (`src/agent.rs:662`). Transcript enters its *manual* state on `/compact` acknowledgement (`src/transcript.rs:2660`); automatic work needs a Run-scoped notification for status and spinner (`src/transcript.rs:2442`), not a fake acknowledgement.
+- Runtime captures the accepted selection at `start_run` (`src/runtime.rs:1590`). `Agent::run_persisted` commits the request, allocates a Model Step, and loops after durable execution settlement (`src/agent.rs:704`, `src/agent.rs:742`, `src/agent.rs:940`). The normal failure path closes the step immediately (`src/agent.rs:779`); intercept overflow before it closes.
+- `SettingsContext` already carries resolved compaction numbers and `cross_provider_reasoning` (`src/config/settings.rs:136`, `src/config/settings.rs:189`). Runtime receives both through `with_session` (`src/runtime.rs:756`); provider adapters already use the reasoning policy (`src/provider.rs:21`, `src/model.rs:253`). No new configuration authority is needed.
+- `src/compaction.rs:293` does not verify the reported-usage model; `src/compaction.rs:510` counts opaque replay even when both adapters render shared `ModelContextEntry::foreign_parts` (`src/model.rs:253`), and `src/compaction.rs:559` includes foreign reasoning in summary input under `drop`. Ordinary Anthropic usage already normalises uncached, cache-read and cache-write input (`src/anthropic.rs:622`).
+- Anthropic replays native signed thinking verbatim (`src/anthropic.rs:99`, `src/anthropic.rs:794`). The documented binding-control beta and `drop_block` field belong in that normal-step adapter, not in Session history or the summary request.
+- Both adapters produce bounded `ProviderFailure` only after seeing raw provider diagnostics (`src/model.rs:407`, `src/openai.rs:577`, `src/anthropic.rs:644`). `ProviderModel` routes both operations by selection (`src/provider.rs:66`). The official Anthropic error reference documents `invalid_request_error` as broad and `request_too_large` as a byte-size limit; Pi's prompt-too-long example alone does not verify current Anthropic positive wording.
+- The existing `model_steps` row has one settled entry, while attempts are stored on completed execution, terminal or Compaction Entries (`src/session/schema.sql:25`, `src/session/codec.rs:594`). `codec::decoded_attempts` serves both context facts (`src/session.rs:2553`) and off-branch footer adjustments (`src/session.rs:2994`); initial overflow attempts need a separate billable view. Seven `Agent::run_persisted` paths close the Run (`src/agent.rs:732–1032`). Interruption recovery already closes a pending step and Run without replay (`src/session.rs:1955`).
 
 ## Tasks
 
-### Task 1: Add automatic policy enablement
+### Task 1: Make compaction input and measurement provider-aware
 
 **Changes**
 
-Add `enabled = true` to effective/file compaction settings with strict boolean validation and field-wise user/project precedence. Preserve Phase 2 numeric policy and immutable Runtime carrier; keep environment/session/runtime overrides absent.
+Carry the resolved cross-provider reasoning policy through Agent's existing manual-compaction caller and Runtime into Session preparation and its pure compaction planner. New manual and automatic summaries omit foreign reasoning under `drop` while preserving same-provider reasoning and stored history. Retained-tail and threshold byte estimates count native replay as before, but use `ModelContextEntry::foreign_parts`, the same decision consumed by both provider adapters, to count foreign text and tool-call values (including ID, `execute_python`, source and feedback) once. Do not reimplement adapter wire rendering, count opaque foreign replay or estimate provider JSON syntax.
 
-Add a pure threshold decision to the compaction module. It takes measured context and the captured selection's context window, subtracts reserve with saturation, and returns true only for strict greater-than when enabled. Keep orchestration out of this task.
+Use a normal usage baseline only when its recorded model matches the selected model, its owning response follows the latest Applied compaction, and projected ordinary replay has no foreign-provider entries. When the newest known usage belongs to another model, or any projected replay is foreign, use the full projected estimate rather than searching back to an older baseline. Keep summary/initial-overflow attempts ineligible. Do not add persisted rendering fingerprints or a new provider-estimator trait.
 
-**Tests** (`src/config/settings.rs`, resolution; `src/compaction.rs`, policy unit tests)
+**Tests** (`src/compaction.rs`, unit; `src/session.rs`, real SQLite; `src/runtime.rs`, resolution)
+
+First red: `compaction::tests::foreign_history_uses_semantic_bytes_and_drops_reasoning_for_summary`.
+
+- OpenAI→Anthropic and Anthropic→OpenAI with large opaque replay but small semantic output: threshold/tail measurement uses the destination view derived from shared foreign parts. Compare both adapters' existing foreign-rendering fixtures under `inline` and `drop`; same-provider summary keeps reasoning, foreign summary with `drop` omits a sentinel.
+- Latest known usage from another model, same provider or foreign, forces fallback rather than an older matching baseline; own-model usage after an Applied entry can baseline again when eligible. A changed reasoning setting on resume cannot reuse a baseline over foreign replay. Cache read/write counts are subsets, not extra context tokens.
+- Root and restored branch projections agree; prior summaries can still contain historical text, and no stored Session Entry is rewritten.
+
+**Files** — Modify: `src/agent.rs`, `src/compaction.rs`, `src/session.rs`, `src/runtime.rs`.
+
+**Verification**
+
+```sh
+cargo test --bin kiki compaction::tests
+cargo test --bin kiki session::tests
+cargo test --bin kiki agent::tests
+cargo test --bin kiki runtime::tests
+cargo test --bin kiki anthropic_entries_replay_as_assistant_text_and_function_calls_with_their_results
+cargo test --bin kiki openai_entries_replay_as_text_and_tool_use_merged_into_alternating_roles
+```
+
+### Task 2: Preserve Anthropic continuation through compaction
+
+**Changes**
+
+Set the documented `thinking.block_binding.prefix_mismatch_behavior = "drop_block"` and `thinking-binding-controls-2026-08-01` beta header on Anthropic normal steps, leaving summary requests without signed replay. Do not rewrite durable native replay or change foreign semantic rendering. Keep adapter error sanitisation and retry behaviour intact.
+
+**Tests** (`src/anthropic.rs`, local SSE fixture)
+
+First red: `anthropic::tests::normal_step_requests_drop_only_mismatched_bound_thinking`.
+
+- A normal request with valid prior signed thinking, and a canonical summary followed by a retained signed-thinking/tool-use tail, both carry the field and header. Step replay keeps its original blocks and tool-result pairing; summary requests remain tool-free with no binding control.
+- An `invalid_request_error` about a signed-thinking prefix remains an ordinary failure, not a future overflow signal. Add an opt-in adapter-level live summary then retained signed-thinking continuation smoke check if credentials are available; existing in-process Runtime tests cover `/compact` orchestration. Do not require live calls in credential-free CI.
+
+**Files** — Modify: `src/anthropic.rs`.
+
+**Verification**
+
+```sh
+cargo test --bin kiki anthropic::tests
+```
+
+### Task 3: Enable the automatic threshold policy
+
+**Changes**
+
+Add `enabled = true` with strict boolean user/project resolution and unchanged numeric precedence. Keep environment/session/picker overrides absent. Put strict threshold arithmetic and no-progress gating behind existing compaction preparation, not in Runtime string checks; manual preparation ignores `enabled`, overflow preparation honours it. On a below-threshold check, return after context measurement, before retained-tail selection and summary-input assembly; do not call a summary provider or introduce a second context estimator.
+
+**Tests** (`src/config/settings.rs`, layered settings; `src/compaction.rs`, pure policy; `src/session.rs`, temporary SQLite)
 
 First red: `config::settings::tests::compaction_enabled_defaults_true_and_project_overrides_user`.
 
-- Cover default, user/project precedence, explicit false, wrong type, unknown neighbouring fields, Runtime-facing resolved policy, and unchanged numeric precedence.
-- Cover below/equal/above threshold, reserve equal/greater than window, zero measured context, large checked values, enabled false, and context versus pricing thresholds.
-- Manual preparation remains available regardless of `enabled`.
+- Omitted field (including Phase-2-shaped config), explicit false, user/project precedence, wrong type, unknown neighbouring field, numeric precedence and Runtime-facing resolved value.
+- Below/equal/above strict threshold; reserve equal to or larger than window; zero context and checked large values. Use context-window limits, not the pricing-band threshold. Below-threshold preparation skips summary-input assembly. Disabled/no-progress have no provider attempt or Compaction Entry; `/compact` still prepares.
 
-**Files**
-
-- Modify: `src/config/settings.rs`, `src/compaction.rs`.
+**Files** — Modify: `src/config/settings.rs`, `src/compaction.rs`, `src/session.rs`.
 
 **Verification**
 
 ```sh
 cargo test --bin kiki config::settings::tests
 cargo test --bin kiki compaction::tests
+cargo test --bin kiki session::tests
 ```
 
-### Task 2: Trigger threshold compaction at all boundaries
+### Task 4: Compact immediately before each root Model Step
 
 **Changes**
 
-Reuse Phase 2 preparation/orchestration with reason `Threshold`:
+Make Agent's existing manual summary loop, provider-started signal, cancellation choice and settlement one internal reason-neutral operation for manual, threshold and (in Task 7) overflow compaction. In `run_persisted`, check after committed request and after each committed execution, before allocating the next Model Step, with the selection captured at Run admission. Only a triggered provider attempt emits a reliable Run-scoped Started event and committed outcome card; do not emit a manual `/compact` acknowledgement or consume the editor draft. Applied continues from the new Session projection; provider-started Failed persists and proceeds with the old context; no-progress skips silently. Cancellation before or during summary settles the admitted Run as Cancelled, and late cancellation after Applied still starts no next step. A final commits and reports `RunSettled` immediately, with no automatic post-final slot. Manual queue/correction semantics remain as in Phase 2; subagents remain task-local.
 
-- **Pre-request:** Runtime owns the submitted request in a preflight compaction operation before any Run/request entry exists. Measure and prepare only the current durable Active Leaf; the held request contributes zero bytes and cannot be summarised. Applied, non-cancellation Failed, or NoOp admits it exactly once; cancellation, shutdown, or disablement discards it without a Run.
-- **Inter-step:** after durable execution settlement, Agent compacts before allocating/calling the next normal Model Step.
-- **Post-final:** Runtime publishes the durable final record, runs post-final compaction while withholding `RunSettled`, then settles the already successful Run.
+Make Session's compaction snapshot fetch only the selected parent chain in a consistent read transaction, reusing an index of those rows for validation rather than rebuilding and linearly scanning payloads per Compaction Entry. Retain the guarded commit. Check the selected-only SQL shape or query plan and below-threshold behaviour with large abandoned branches; avoid elapsed-time assertions or a test-only fetch port. A long selected branch still costs work to measure; defer broader history storage changes until that remaining cost is demonstrated. Do not add a context cache or generic storage port.
 
-Clone the accepted-selection receiver into foreground workers and sample once per preparation. Use Phase 2's non-Run busy submission event (`active_run_id = None`) for preflight/post-final work. Reject Submit/Compact/tree while active. Shutdown cancels/awaits current work and never admits the held request or starts post-final work. A pending manual compaction suppresses automatic post-final work. It never runs in the pre-`RunSettled` automatic slot: when Final or Failed wins its cancellation race, publish that terminal, emit `RunSettled`, then start the retained manual operation from the terminal Active Leaf with unchanged focus, exactly as Phase 2 requires.
+**Tests** (`src/agent.rs`, scripted Run; `src/runtime.rs`, controller; `src/session.rs`, SQLite; `src/transcript.rs` and `src/tui.rs`, state)
 
-No-progress emits no automatic notice/card. Applied continues from the new projection. Non-cancellation Failed persists and continues with the parent context. Apply the complete cancellation/late-commit matrix. Exclude pre-compaction and summary usage from later baseline search so Applied cannot immediately retrigger.
+First red: `agent::tests::threshold_compacts_after_committed_request_before_first_step`.
 
-**Tests** (`src/agent.rs`, inter-step scripted tests; `src/runtime.rs`, pre/post integration; `src/session.rs`, ancestry/accounting; `src/compaction.rs`, measurement regressions; `src/transcript.rs` and `src/tui.rs`, foreground lifecycle)
+- Request whose size crosses the threshold triggers before the first step, retains that request exactly, and is admitted once; the same earlier context with a small request does not trigger. Inter-step tool feedback triggers before allocation, never splits code/feedback, and the next provider sees summary plus tail.
+- Cancel before attempt: no Compaction Entry but a durable Cancelled Run; after attempt: Cancelled Compaction Entry and Run; after Applied is chosen: Applied remains and no next Model Step. Check settlement and absence of synthetic Run/step IDs. Storage failure disables Runtime and does not publish an uncommitted card.
+- Failed threshold provider attempt persists Failed and continues unchanged; NoOp/disabled issues no event, entry or summary call. `RunSettled` follows Final promptly. A mid-Run `/model` changes neither threshold window, summary selection nor the next normal step's selection; the next Run uses it.
+- Run-scoped Started sets `compacting context` and spinner independently of manual acknowledgement or draft clearing; delayed lossy `ModelStepStarted` and `ModelProgress` chunks from the preceding step, delivered before a retry reset, cannot switch either back to generating or repaint old text. Settled attempt accounting stays visible. Committed card, terminal settlement or disabled event clears presentation. Submit/Compact/tree are busy during active work; a retained manual request cancels and follows Run/correction settlement once.
+- Repeated checks after an Applied entry ignore old normal/summary usage, with no immediate retrigger from that usage. Assert the selected-only SQL/query plan and below-threshold behaviour with large abandoned replay blobs and several Compaction Entries; no abandoned reads, repeated full-chain validation scans or summary-input construction.
 
-First red: `agent::tests::threshold_compacts_between_execution_and_next_model_step`.
-
-- Exercise one above-threshold case at each boundary and prove the next provider sees summary plus exact retained tail. Task 1 owns exhaustive arithmetic.
-- Preflight owns the request across Applied/Failed/NoOp and admits once. Tiny and very large held requests produce the same below/equal/above decision for identical selected context; vary selected context itself across all three boundaries. Cancellation by the linearisation point admits none; late cancellation keeps Applied but still admits none.
-- Preflight shutdown/storage disablement discards the request, returns Agent, creates no Run, and clears non-Run foreground state. Further Submit/Compact/tree receives busy while active.
-- Inter-step cancellation settles the Run cancelled; late cancellation keeps Applied and starts no next normal step.
-- Post-final publishes final record before Applied/Failed/Cancelled card, then `RunSettled`; NoOp settles directly. Storage failure cannot undo the durable final and still emits settlement plus disabled state without a successful compaction card.
-- Pending manual compaction suppresses redundant post-final automatic work. For both Final-wins and Failed-wins races, assert immediate `Accepted` when the command arrives, then terminal publication, `RunSettled`, and exactly one `Started` against that terminal leaf with unchanged focus. If settlement disables Runtime, assert no `Started`.
-- Non-cancellation provider/validation failure persists Failed and the original scheduled call/settlement continues unchanged.
-- Disabled/no-progress performs no summary, entry, event, or delay.
-- A settings change before capture affects selection/window/budget; a later change leaves the summary fixed.
-- Applied does not retrigger from retained-ancestor usage: only ordinary durable descendants of the latest Applied entry are baseline candidates. With no eligible descendant usage, measure the complete projected summary/tail by byte fallback. Summary attempts count once but never drive context percentage.
-- Automatic rows/cards use existing reason, search, conversation, copy, branch-order, and navigation projection.
-
-**Files**
-
-- Modify: `src/agent.rs`, `src/compaction.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`.
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`; `src/openai.rs` (test observer for the new Runtime event). The existing pure compaction policy needs no Task 4 change.
 
 **Verification**
 
 ```sh
-for filter in agent::tests compaction::tests runtime::tests session:: transcript::tests tui::tests; do
+for filter in agent::tests runtime::tests session::tests transcript::tests tui::tests; do
   cargo test --bin kiki "$filter" -- --test-threads=1 || exit
 done
 ```
 
-### Task 3: Classify OpenAI context overflow
+### Task 5: Classify provider context overflow narrowly
 
 **Changes**
 
-Classify raw OpenAI status/code/message before diagnostic redaction or length bounding, then store the semantic overflow flag alongside the existing bounded/redacted provider diagnostic. Expose that provider-neutral flag on model failures and implement the exact OpenAI rules from the spec:
+Expose a semantic overflow predicate on shared `ModelFailure`/`ProviderFailure`. Each adapter classifies raw provider fields before redaction or bounding, then retains only the semantic result and existing safe diagnostic. Implement the spec's exact OpenAI code/status/message rules. For Anthropic, verify a positive HTTP 400 `invalid_request_error` prompt-too-long diagnostic from a current provider response before adding a narrow matcher; if it cannot be verified without an expensive live over-window call, keep all Anthropic failures ordinary and record that limitation in README. Never classify HTTP 413 `request_too_large`, output `max_tokens`, signature-binding, local `ContentTooLarge` or summary failures. This task does not yet alter ordinary failed-Run settlement.
 
-- exact ASCII case-insensitive code `context_length_exceeded` or `model_context_window_exceeded`, except status 401/429;
-- otherwise status 400/413 plus one approved ASCII case-insensitive message phrase;
-- no generic status-only, broad token matching, or local `ContentTooLarge` classification.
-
-The semantic flag remains stable even when the approved phrase occurs beyond the retained diagnostic prefix or redaction changes stored text. Classification is otherwise a predicate only in this task; ordinary failure settlement remains unchanged until Task 4.
-
-**Tests** (`src/model.rs`, predicate forwarding; `src/openai.rs`, diagnostic fixture/table tests)
+**Tests** (`src/model.rs`, predicate; `src/openai.rs` and `src/anthropic.rs`, local fixtures)
 
 First red: `openai::tests::provider_failure_classifies_approved_context_overflow_signatures`.
 
-- Cover exact codes with absent/400/413 status, an otherwise ineligible status such as 500 plus unrelated message, and mixed case.
-- Cover every approved phrase under 400 and 413.
-- Exclude 401/429 even with matching code/message; approved phrases under absent/500 status; generic 400/413; `too many tokens`; unrelated maximum text; rate limits; authentication; transport failure; local `ContentTooLarge`; and near-match codes.
-- Expose the stored semantic flag through `ModelFailure` without adapter parsing in Agent/Runtime.
-- Put an approved phrase beyond the bounded diagnostic limit and around redacted material; classification remains true while stored diagnostics remain bounded/redacted.
+- OpenAI exact codes (including status absent/500), approved phrases under 400/413, mixed case, and a positive phrase beyond diagnostic bounding or near redacted material. Exclude 401/429 even with a code; code near-misses, phrase without 400/413, generic 400/413, broad token text, auth/rate limiting, transport and local response-size errors.
+- Anthropic negatives: generic `invalid_request_error`, byte-size 413, rate limit, overload, signed-thinking prefix mismatch, output `max_tokens` and local content limit. Add the verified positive fixture only if the signature is supported by observed provider evidence; never treat a synthetic fixture as proof of the contract.
+- Normal and summary failures preserve safe bounded diagnostics; only the normal-step caller will consult the semantic flag in Task 7.
 
-**Files**
-
-- Modify: `src/model.rs`, `src/openai.rs`.
+**Files** — Modify: `src/model.rs`, `src/openai.rs`, `src/anthropic.rs`, `README.md` (record the unverified Anthropic diagnostic).
 
 **Verification**
 
 ```sh
 cargo test --bin kiki model::tests
 cargo test --bin kiki openai::tests
+cargo test --bin kiki anthropic::tests
 ```
 
-### Task 4: Compact and retry one overflowed step
+### Task 6: Persist composable overflow evidence without changing format version
 
 **Changes**
 
-Intercept recognised normal Model Step overflow before terminal closure when automation is enabled. Keep its durable `model_steps` row pending, retain failed-attempt accounting in memory, and run Phase 2 compaction with reason `Overflow`. On Applied, retry the normal provider call under the same step ID once. Retry uses the accepted selection at retry through existing normal-step semantics; compaction uses its captured selection.
+Keep the existing optional ordinary `Generation`/`Execution` evidence wire shape. Add an omitted-by-default optional `overflow_recovery` sibling to v2 Final, Cancelled and Failed terminal payloads, carrying one bounded structured initial diagnostic, optional partial Generation evidence and initial failed-call attempts. A Final continues to own its ordinary replay/result; retried code or terminal owns only retry attempts. Restore and inspect both evidence parts without projecting the initial failure into Model Context or tree-copy content. Keep the existing decoded ordinary attempts for context facts; expose initial-overflow attempts separately for billing on both selected terminal records and off-branch restore totals. The Transcript footer counts ordinary, initial-overflow and summary attempts once without treating initial usage as latest normal context occupancy. No pending-attempt journal, overloaded attempt accessor, or format bump.
 
-Replace the domain's exclusive terminal-evidence enum with a composable record containing optional ordinary primary evidence (`Generation` or `Execution`) and optional `OverflowRecovery`. Keep the format-v2 wire additive: preserve the existing optional `evidence` enum exactly for primary evidence and add an omitted-by-default optional `overflow_recovery` sibling to Final, Cancelled, and Failed payloads. Phase-2-shaped v2 records must decode and newly encoded ordinary terminals retain their old shape.
+**Tests** (`src/session/codec.rs`, literal old-v2 payloads; `src/session.rs`, temporary SQLite; `src/runtime.rs`, live/restored terminal mapping; `src/transcript.rs`, inspection)
 
-`OverflowRecovery` is one initial-overflow record containing the recognised bounded structured provider diagnostic, optional bounded partial `GenerationEvidence`, and the initial failed call's `Vec<AttemptAccounting>`. The generation field is absent/`None` when overflow arrives before any content; do not manufacture an empty evidence value. Retry code/final content or ordinary terminal generation/execution evidence remains the sole retry representation; retry attempts remain exclusively on the retried code, Final, Failed, or Cancelled terminal's existing ordinary attempt field. Session totals traverse both owners once, while deterministic context measurement categorically ignores initial-overflow attempts and considers only eligible ordinary retry/result attempts. Keep this as one Agent-owned `Option<OverflowRecovery>` and derive the once-per-Run recovery guard from its presence; do not add tags, a collection, or a separate retry flag.
+First red: `session::codec::tests::old_v2_terminals_and_additive_overflow_evidence_round_trip`.
 
-Before issuing retry generation, increment a per-step generation epoch from 0 to 1. Add exact reliable `RuntimeEvent::ModelGenerationRestarted { run_id, step_id, epoch }` and add `epoch` to `RuntimeEvent::ModelProgress`; ordinary generation uses 0 and retry progress uses 1. Emit the reset before any epoch-1 progress. Transcript resets partial reasoning, assistant text, decoded Python, and provider attempt number while retaining settled live accounting, then ignores delayed progress whose epoch is older than the live step. Retry provider attempt numbering may restart at one without concatenating initial output.
+- Open literal Phase-2-shaped Final/Failed/Cancelled payloads, including existing execution evidence and file effects. New ordinary payloads omit the sibling. New recovered terminals round-trip with immediate failure (`generation = None`) and bounded partial-generation evidence, including a successful Final and a later failed/cancelled execution.
+- Same-valued initial and retry attempt vectors count twice for billing (two calls) but each owner exactly once on selected and abandoned branches, live and restored; summary attempts on Compaction Entries count once. Initial known usage with unavailable retry usage changes cost but neither the compaction baseline nor the latest normal footer occupancy. Take a recovered Final through both live and restored Runtime terminal mappings into Transcript: neither drops initial evidence, and inspection renders it separately from the last surrounding failure.
 
-Carry the initial-overflow evidence until the Run terminal. Every non-crash terminal after recovery, including a successful final retry or successful recovered code followed by a later final, persists it. If recovered code execution fails or is cancelled, compose the same initial evidence with primary `ExecutionEvidence`; that execution outcome is the final surrounding failure/cancellation. A later ordinary generation failure composes its primary Generation evidence likewise. The interruption-recovery exception is explicit: after process loss, only durable rows survive, so the generic interruption terminal has no reconstructed in-memory overflow evidence or attempts.
-
-For Failed/NoOp compaction, construct the exact terminal message `context overflow: {original}\ncompaction recovery failed: {recovery}`. Truncate each substituted component independently to its first 2,000 UTF-8 bytes at a scalar boundary without a marker; the total is at most 4,047 bytes. `{original}` is the bounded/redacted provider-failure display. `{recovery}` is the Failed Compaction diagnostic or literal `compaction could not remove a valid prefix`; the Failed Compaction Entry still owns its complete independently bounded 4,096-byte diagnostic, while the Run deliberately repeats the 2,000-byte excerpt. Second/different retry failure uses the existing bounded retry diagnostic; recovered-code execution failure uses the execution diagnostic. The initial structured overflow remains inspectable beside ordinary retry evidence. Restore/render this evidence through terminal inspection without adding it to Model Context or tree-copy payload.
-
-Never recover recursively from a summary request. Second overflow or a different retry failure closes the pending Run without another compaction. Cancellation closes Cancelled according to the spec, including late Applied with no retry. Disabled automation follows the ordinary failure path.
-
-**Tests** (`src/agent.rs`, scripted failure/summary/retry; `src/runtime.rs`, settlement/events; `src/session.rs` and `src/session/codec.rs`, evidence/provenance/accounting/recovery; `src/transcript.rs` and `src/tui.rs`, restored evidence)
-
-First red: `agent::tests::context_overflow_compacts_and_retries_same_pending_step_once`.
-
-- One Model Step allocation spans initial failure, Applied Overflow Compaction Entry, and successful code/final retry; settled entry descends from compaction.
-- Initial normal attempts live only on the initial OverflowRecovery evidence, summary attempts only on the Compaction Entry, and retry attempts only on the retried ordinary result. Assert vectors/call counts on every branch and full totals once using deliberately identical values. With known initial usage followed by unavailable/zero retry usage, measurement skips Initial and uses full fallback rather than stale pre-compaction usage.
-- Second overflow, different retry failure, or Failed/NoOp compaction closes once and starts no additional summary/retry. Assert exact 2,000-byte component truncation, scalar boundaries, separator, 4,047-byte maximum, no-progress literal, and the Failed Compaction entry's independent 4,096-byte diagnostic; initial overflow and ordinary retry evidence remain distinct.
-- Immediate overflow with no streamed chunks stores `generation = None`; partial initial output stores bounded evidence. Both round-trip and render without a synthetic empty block.
-- `ModelGenerationRestarted { epoch: 1 }` is reliable and precedes epoch-1 progress: partial/delayed epoch-0 progress cannot reappear, retry attempt 1 starts a clean live view, and settled live accounting remains visible even when the progress channel is saturated. All normal constructors/observers use epoch 0.
-- Esc before summary writes no Compaction outcome and cancels with initial overflow/optional partial-generation evidence. Esc after an attempt persists Cancelled Compaction plus the same Run evidence. Late Esc after Applied prevents retry; cancellation during retry retains initial overflow plus ordinary primary generation evidence and stores retry attempts only on the ordinary Cancelled terminal.
-- Exercise normal selection A, summary capture B, change to C while B is in flight, and retry C.
-- Disabled, non-overflow, authentication, local response-size failure, and summary overflow never enter recovery.
-- A successful final retry persists the initial OverflowRecovery evidence but no duplicate retry primary evidence because Final already stores the retry result. A recovered code response whose execution fails/cancels composes initial overflow with primary Execution evidence and uses execution as the final diagnostic.
-- Open literal Phase-2-shaped format-v2 Final, Cancelled, and Failed fixtures using the old `evidence` enum (including Phase 2 execution file vectors), then round-trip new additive recovery fields without bumping format version.
-- Outcome persistence failure leaves the step for existing interruption recovery, disables work, and reports no retry.
-- Reopen after Applied but before retry: generic recovery retains the Compaction Entry, appends one interruption terminal beneath it, settles the same step once, keeps tree/catalogue/context readable, and never replays provider work. Lost in-memory overflow evidence/attempts are not reconstructed; no pending-attempt journal is added.
-- Directly select the Applied Overflow entry, branch from it, return to the retry descendant, and verify selected/off-branch normal and summary attempts count once while latest normal context usage remains correct.
-- Reopen after successful code/final retry restores one settled step beneath the Overflow entry, exact context/card/tree row, initial-overflow evidence, and once-counted attempts.
-
-**Files**
-
-- Modify: `src/agent.rs`, `src/openai.rs`, `src/runtime.rs`, `src/session.rs`, `src/session/codec.rs`, `src/subagents.rs`, `src/transcript.rs`, `src/tui.rs`.
+**Files** — Modify: `src/agent.rs`, `src/session.rs`, `src/session/codec.rs`, `src/runtime.rs`, `src/transcript.rs`, `src/tui.rs`, `src/subagents.rs` (terminal construction sites).
 
 **Verification**
 
 ```sh
-for filter in agent::tests runtime::tests session:: transcript::tests tui::tests; do
+cargo test --bin kiki session::codec::tests
+cargo test --bin kiki session::tests
+cargo test --bin kiki runtime::tests
+cargo test --bin kiki transcript::tests
+```
+
+### Task 7: Recover one pending Model Step
+
+**Changes**
+
+Intercept the first recognised normal-step overflow before ordinary terminal closure, retaining one Run-long initial observation outside ordinary attempt slices and clearing the ordinary generation evidence builder immediately after capturing its partial output. Reuse Task 4's reason-neutral Agent summary operation for `ContextOverflow`; on Applied and absent cancellation, send one reliable generation restart with epoch 1 before retry progress and call the model again under the same step ID and captured selection. Tag lossy generation progress with its epoch; after the reliable reset, reject delayed epoch-0 chunks at presentation even if Runtime already forwarded them to the TUI buffer. Reset partial live output/attempt number without clearing settled accounting. Keep a small terminal-sealing path in Agent to attach the observation once after each existing late-cancellation closure chooses Final, Failed or Cancelled, including after later successful code; do not add a Run state machine. Never retry an overflowed summary or recover a second/different retry failure. Failed/NoOp/pre-start-failed recovery uses the spec's exact two-part bounded diagnostic, retaining a safely redacted pre-start error without inventing a Compaction Entry; cancellation and persistence follow existing Run/Session rules.
+
+**Tests** (`src/agent.rs`, scripted sequence; `src/runtime.rs`, events/gates; `src/session.rs`, provenance/restart; `src/transcript.rs` and `src/tui.rs`, progress/inspection)
+
+First red: `agent::tests::context_overflow_compacts_and_retries_same_pending_step_once`.
+
+- One step allocation spans initial failed call, Applied Compaction Entry and successful code/final retry; capture both provider histories and assert retry uses the new canonical summary plus exact retained tail, not the discarded prefix or the first call's snapshot. Settlement entry descends from compaction, and a later final carries the same initial evidence. Use one selection despite accepted mid-Run changes.
+- Failed/NoOp/pre-start-failed recovery closes once with exact 2,000-byte UTF-8 component bounds and 4,047-byte total; pre-start failure retains a safely redacted diagnostic but has no Compaction Entry. Partial initial generation followed by retry failure without any progress or `AttemptStarted` preserves the initial output only in overflow evidence, not ordinary retry evidence. Second overflow or different retry error makes no new summary. Disabled/unrecognised failure and summary failure never recover. A failed Compaction Entry retains its separately bounded 4,096-byte diagnostic.
+- Esc before provider attempt creates no Compaction outcome; Esc after attempt persists Cancelled; Esc after Applied prevents retry; Esc during retry preserves initial and ordinary retry evidence separately. Error at outcome persistence disables without a false successful card or retry.
+- During overflow summarisation, delayed epoch-0 chunks and `ModelStepStarted` cannot replace the compaction spinner or status. Reliable epoch reset precedes retry progress; epoch-0 chunks already buffered at Runtime or forwarded to the TUI cannot repaint epoch 1 even under saturation or reordering across reliable/lossy channels. Settled accounting remains visible; first generation remains epoch 0.
+- Every terminal route after overflow carries the initial observation once: immediate retry Final/Failed/Cancelled, execution failure/cancellation, cancellation between steps, later provider failure, duplicate call ID and a later Final after recovered code. Verify billing once on each route. Restart after Applied before retry leaves the Compaction Entry, settles pending step/Run with the generic interruption terminal, and never reconstructs lost in-memory attempts or replays work. Restart after success restores context, branches, attempt totals and terminal inspection. Direct selection of Applied and a sibling branch preserve their own projections.
+
+**Files** — Modify: `src/agent.rs`, `src/runtime.rs`, `src/session.rs`, `src/transcript.rs`, `src/tui.rs`; `src/openai.rs` (test observer for the reliable restart event).
+
+**Verification**
+
+```sh
+for filter in agent::tests runtime::tests session::tests transcript::tests tui::tests; do
   cargo test --bin kiki "$filter" -- --test-threads=1 || exit
 done
 ```
 
-### Task 5: Document automatic compaction
+### Task 8: Document the enabled behaviour
 
 **Changes**
 
-Update compaction documentation with `enabled = true`, all threshold boundaries, strict arithmetic, disabled/manual behaviour, one recognised-overflow retry, cancellation outcomes, branch/tree presentation, and recovery limits. Remove Phase 2's statement that automation is unavailable. Keep estimator, Arena, path privacy, format, and no-deletion caveats accurate.
+Update README to state default `enabled = true`, root-only pre-step triggers including the new request, no pre-admission/post-final work, model selection captured for the Run, disabled/manual behaviour, both providers' threshold support, narrow recognised-overflow recovery and any unverified Anthropic limitation. Preserve Arena, file-path privacy, approximation, branch/tree, session-v2 and no-history-deletion caveats. Remove Phase 2's statement that automation is unavailable.
 
 **Tests** (documentation review)
 
-No first-red test applies. Check every setting/default, trigger, status/card/tree row, retry bound, and failure claim against implemented tests.
+No first-red test applies. Compare every setting, trigger, status, cancellation, retry limit and provider claim with the preceding behavioural tests.
 
-**Files**
+**Files** — Modify: `README.md`.
 
-- Modify: `README.md`.
-
-**Verification**
-
-Run the whole-phase gates:
-
-```sh
-cargo fmt --all -- --check
-git diff --check main...HEAD
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-just test
-```
+**Verification** — Run the whole-phase gates above.

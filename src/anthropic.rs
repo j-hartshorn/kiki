@@ -27,6 +27,7 @@ use crate::{
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const EXECUTE_PYTHON: &str = "execute_python";
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
 // Room for 16 MiB of content escaped as `\u00XX` (6 bytes per byte) in one frame.
@@ -200,7 +201,11 @@ impl AnthropicModel {
                 }
             }],
             "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+            },
             "output_config": {"effort": selection.thinking()}
         }))
     }
@@ -233,9 +238,14 @@ impl AnthropicModel {
         }
         let request = self.request(selection, history)?;
         let (mut step, attempts) = self
-            .with_restarts(&request, selection, cancellation, progress, |message| {
-                self.completed_step(history, message)
-            })
+            .with_restarts(
+                &request,
+                Some(THINKING_BINDING_BETA),
+                selection,
+                cancellation,
+                progress,
+                |message| self.completed_step(history, message),
+            )
             .await?;
         step.attempts = attempts;
         Ok(step)
@@ -260,6 +270,7 @@ impl AnthropicModel {
         let (text, attempts) = self
             .with_restarts(
                 &request,
+                None,
                 selection,
                 cancellation,
                 &mut progress,
@@ -272,6 +283,7 @@ impl AnthropicModel {
     async fn with_restarts<T>(
         &self,
         request: &Value,
+        beta: Option<&str>,
         selection: ModelSelection,
         cancellation: &CancellationToken,
         progress: &mut (dyn FnMut(ModelProgress) + Send),
@@ -287,6 +299,7 @@ impl AnthropicModel {
             let streamed = self
                 .stream(
                     request,
+                    beta,
                     selection.model().wire_id(),
                     cancellation,
                     &mut presentation,
@@ -350,17 +363,20 @@ impl AnthropicModel {
     async fn send(
         &self,
         request: &Value,
+        beta: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<(reqwest::Response, bool), AttemptFailure> {
         let mut retry = 0;
         loop {
-            let send = self
+            let mut builder = self
                 .client
                 .post(&self.endpoint)
                 .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .json(request)
-                .send();
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(beta) = beta {
+                builder = builder.header("anthropic-beta", beta);
+            }
+            let send = builder.json(request).send();
             let response = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(ModelError::Cancelled.into()),
@@ -393,12 +409,13 @@ impl AnthropicModel {
     async fn stream(
         &self,
         request: &Value,
+        beta: Option<&str>,
         model: &str,
         cancellation: &CancellationToken,
         presentation: &mut PresentationBatcher,
         progress: &mut (dyn FnMut(ModelProgress) + Send),
     ) -> Result<StreamedMessage, AttemptFailure> {
-        let (response, retried_requests) = self.send(request, cancellation).await?;
+        let (response, retried_requests) = self.send(request, beta, cancellation).await?;
         let mut frames = SseFrameLimit::new(self.frame_limit);
         let chunks = response.bytes_stream().map(move |chunk| match chunk {
             Ok(chunk) => Ok(frames.complete_lines(&chunk)?),
@@ -647,6 +664,7 @@ impl AnthropicModel {
         code: Option<String>,
         message: impl Into<String>,
     ) -> ModelError {
+        // No prompt-too-long signature is verified, so no failure signals context overflow.
         ModelError::Provider(Box::new(ProviderFailure::new(
             status,
             code.map(|code| redact(&code, &self.api_key)),
@@ -1567,7 +1585,11 @@ mod tests {
                 }
             }],
             "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking": {
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+            },
             "output_config": {"effort": "medium"}
         })
     }
@@ -1680,6 +1702,7 @@ mod tests {
             headers.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "accept",
+                "anthropic-beta",
                 "anthropic-version",
                 "content-length",
                 "content-type",
@@ -1688,6 +1711,10 @@ mod tests {
             ]
         );
         assert_eq!(headers["x-api-key"], KEY);
+        assert_eq!(
+            headers["anthropic-beta"],
+            "thinking-binding-controls-2026-08-01"
+        );
         assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert_eq!(headers["content-type"], "application/json");
         let mut expected = expected_request(json!([{
@@ -1927,6 +1954,109 @@ mod tests {
                 }
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn normal_step_requests_drop_only_mismatched_bound_thinking() {
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::OwnedSse(message_stream()),
+            FixtureReply::OwnedSse(message_stream()),
+            FixtureReply::OwnedSse(summary_stream()),
+        ])
+        .await;
+        let mut model = model(&fixture, KEY);
+        let cancellation = CancellationToken::new();
+        let mut compacted = ModelHistory::new();
+        compacted.append_compaction_summary("saved summary");
+        compacted
+            .append_completed_code(
+                "print(1)".to_owned(),
+                ModelCallId::new("toolu_1"),
+                Some("I'll run it.".to_owned()),
+                "Checking the file".to_owned(),
+                replay(&tool_blocks()),
+                CodeResult::execution("1\n".to_owned()),
+            )
+            .unwrap();
+
+        for history in [&history_with_code("inspect"), &compacted] {
+            model
+                .step(selection(), history, &cancellation, &mut |_| {})
+                .await
+                .unwrap();
+        }
+        model
+            .summarise(summary_request(selection()), &cancellation, &mut || {})
+            .await
+            .unwrap();
+
+        let requests = fixture.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        let summary = canonical_compaction_summary("saved summary");
+        for (request, prefix) in requests.iter().zip(["inspect", summary.as_str()]) {
+            let expected = expected_request(json!([
+                {"role": "user", "content": [{"type": "text", "text": prefix}]},
+                {"role": "assistant", "content": tool_blocks()},
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "1\n",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }
+            ]));
+            assert_eq!(
+                (
+                    headers(&request.head).get("anthropic-beta").cloned(),
+                    &request.body["thinking"]
+                ),
+                (
+                    Some("thinking-binding-controls-2026-08-01".to_owned()),
+                    &json!({
+                        "type": "adaptive",
+                        "display": "summarized",
+                        "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                    })
+                ),
+                "{prefix}"
+            );
+            assert_eq!(request.body, expected, "{prefix}");
+        }
+        assert_eq!(headers(&requests[2].head).get("anthropic-beta"), None);
+        assert_eq!(requests[2].body, expected_summary_request());
+    }
+
+    #[tokio::test]
+    async fn signed_thinking_binding_rejection_is_an_ordinary_provider_failure() {
+        let message = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".";
+        let fixture = Fixture::start_sequence(vec![
+            FixtureReply::OwnedStatus {
+                code: 400,
+                headers: Vec::new(),
+                body: json!({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": message}
+                })
+                .to_string(),
+            },
+            FixtureReply::OwnedSse(message_stream()),
+        ])
+        .await;
+
+        let (result, progress) = step(&fixture, &history_with_code("inspect")).await;
+        let failure = result.unwrap_err();
+        let provider = failure.provider_failure().unwrap();
+
+        assert_eq!(
+            (provider.status(), provider.code(), provider.message()),
+            (Some(400), Some("invalid_request_error"), message)
+        );
+        assert!(!failure.is_authentication());
+        assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
+        assert_eq!(starts(&progress), [1]);
+        assert_eq!(fixture.request_count(), 1);
     }
 
     #[tokio::test]
@@ -2953,6 +3083,12 @@ mod tests {
             }]
         }]));
         assert!(requests.iter().all(|request| request.body == expected));
+        assert!(requests.iter().all(|request| {
+            headers(&request.head)
+                .get("anthropic-beta")
+                .map(String::as_str)
+                == Some(super::THINKING_BINDING_BETA)
+        }));
     }
 
     fn interrupted_stream() -> String {
@@ -3210,6 +3346,96 @@ mod tests {
             assert_eq!(starts(&progress), [1]);
             assert_eq!(failure.attempts(), &[AttemptAccounting::UsageUnavailable]);
         }
+    }
+
+    #[tokio::test]
+    async fn no_anthropic_failure_is_classified_as_context_overflow() {
+        let error = |code: u16, kind: &str, message: &str| FixtureReply::OwnedStatus {
+            code,
+            headers: vec![("retry-after-ms".to_owned(), "0".to_owned())],
+            body: json!({"type": "error", "error": {"type": kind, "message": message}}).to_string(),
+        };
+        // Unverified candidate wording; no current provider response confirms it.
+        let prompt_too_long = "prompt is too long: 250000 tokens > 200000 maximum";
+        let quarter = ACCEPTED_MODEL_CONTENT_LIMIT / 4;
+        for (reply, expected) in [
+            (
+                error(400, "invalid_request_error", "messages: field required"),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                error(400, "invalid_request_error", prompt_too_long),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                error(
+                    413,
+                    "request_too_large",
+                    "Request exceeds the maximum allowed number of bytes.",
+                ),
+                Some((Some(413), Some("request_too_large"))),
+            ),
+            (
+                error(429, "rate_limit_error", "input tokens per minute exceeded"),
+                Some((Some(429), Some("rate_limit_error"))),
+            ),
+            (
+                error(529, "overloaded_error", "Overloaded"),
+                Some((Some(529), Some("overloaded_error"))),
+            ),
+            (
+                FixtureReply::OwnedSse(overloaded_stream()),
+                Some((None, Some("overloaded_error"))),
+            ),
+            (
+                error(
+                    400,
+                    "invalid_request_error",
+                    "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
+                ),
+                Some((Some(400), Some("invalid_request_error"))),
+            ),
+            (
+                FixtureReply::OwnedSse(stream(
+                    start_usage(),
+                    vec![text(0, "partial")],
+                    "max_tokens",
+                    final_usage(),
+                )),
+                Some((None, Some("max_tokens"))),
+            ),
+            (
+                FixtureReply::OwnedSse(budget_stream(
+                    quarter,
+                    quarter / 2,
+                    quarter / 2,
+                    quarter,
+                    quarter - TOOL_OVERHEAD + 1,
+                )),
+                None,
+            ),
+        ] {
+            let fixture = Fixture::start(reply).await;
+
+            let (result, _) = step(&fixture, &history("inspect")).await;
+            let failure = result.unwrap_err();
+
+            assert_eq!(
+                failure
+                    .provider_failure()
+                    .map(|provider| (provider.status(), provider.code())),
+                expected,
+                "{failure}"
+            );
+            assert!(!failure.is_context_overflow(), "{failure}");
+            if expected.is_none() {
+                assert_eq!(failure.error(), &ModelError::ContentTooLarge);
+            }
+        }
+
+        let fixture = Fixture::start(error(400, "invalid_request_error", prompt_too_long)).await;
+        let (result, _) = summarise(&fixture).await;
+        assert!(!result.unwrap_err().is_context_overflow());
     }
 
     #[tokio::test]
@@ -3653,6 +3879,7 @@ mod tests {
         let failure = model
             .with_restarts(
                 &request,
+                None,
                 selection,
                 &cancellation,
                 &mut |event| progress.push(event),
@@ -3855,5 +4082,76 @@ mod tests {
         if let Err(message) = crate::openai::tests::run_live_smoke_test(&OPUS_5_5).await {
             panic!("{message}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit ANTHROPIC_API_KEY"]
+    async fn live_opus_continues_after_compaction_with_retained_signed_thinking() {
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
+        let mut model = AnthropicModel::new(
+            "Use execute_python for every calculation.",
+            key,
+            CacheTtl::FiveMinutes,
+            CrossProviderReasoning::Inline,
+        );
+        let selection = ModelSelection::new(&OPUS_5_5, "high").unwrap();
+        let cancellation = CancellationToken::new();
+
+        let first = model
+            .step(
+                selection,
+                &history("Think it through, then call execute_python to compute 17 * 23."),
+                &cancellation,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        let ModelAction::Code {
+            source,
+            call_id,
+            commentary,
+        } = first.action
+        else {
+            panic!("expected code");
+        };
+        assert!(
+            replay_values(&first.replay)
+                .iter()
+                .any(|block| block["type"] == "thinking"
+                    && block["signature"]
+                        .as_str()
+                        .is_some_and(|signature| !signature.is_empty())),
+            "no signed thinking to retain"
+        );
+        let summary = model
+            .summarise(
+                SummaryRequest {
+                    instructions: "Summarise the conversation in one sentence.".to_owned(),
+                    input: "User: compute 17 * 23 with execute_python.".to_owned(),
+                    selection,
+                    output_limit: 16_384,
+                },
+                &cancellation,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        let mut compacted = ModelHistory::new();
+        compacted.append_compaction_summary(summary.text);
+        compacted
+            .append_completed_code(
+                source,
+                call_id,
+                commentary,
+                first.reasoning_summary,
+                first.replay,
+                CodeResult::execution("391\n".to_owned()),
+            )
+            .unwrap();
+
+        model
+            .step(selection, &compacted, &cancellation, &mut |_| {})
+            .await
+            .unwrap();
     }
 }

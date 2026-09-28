@@ -6,20 +6,22 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AgentProgress, ManualCompactionResult, PersistedAgentEvent, PersistedRunOutcome,
-    TerminalEvidence,
+    Agent, AgentProgress, CompactionResult, OverflowRecovery, PersistedAgentEvent,
+    PersistedRunOutcome, TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 use crate::config::{
-    CompactionSettings, ModelSelection, models::Provider, settings::SettingsContext,
+    CompactionSettings, ModelSelection,
+    models::Provider,
+    settings::{CrossProviderReasoning, SettingsContext},
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
 use crate::model::{AttemptAccounting, Model, ModelProgress};
 use crate::session::{
-    CompactionOutcome, PersistedTerminal, ReadableTerminal, RestoredRecord, RestoredRecordKind,
-    Session, SessionCatalogue, SessionEntryId, SessionError, SessionMetadata, SessionRestore,
-    SessionWriter,
+    CommittedCompaction, CompactionOutcome, CompactionReason, PersistedTerminal, ReadableTerminal,
+    RestoredRecord, RestoredRecordKind, Session, SessionCatalogue, SessionEntryId, SessionError,
+    SessionMetadata, SessionRestore, SessionWriter,
 };
 use crate::subagents::{
     AcceptedThinking, AgentInvocationContext, Caller, CoordinatorEvent, SessionSubagents, TaskId,
@@ -93,16 +95,25 @@ pub(crate) enum CompactionSettlement {
 pub(crate) struct TerminalDetails {
     pub(crate) evidence: Option<TerminalEvidence>,
     pub(crate) attempts: Vec<AttemptAccounting>,
+    pub(crate) overflow_recovery: Option<OverflowRecovery>,
 }
 
 impl TerminalDetails {
-    fn new(evidence: Option<TerminalEvidence>, attempts: Vec<AttemptAccounting>) -> Self {
-        Self { evidence, attempts }
+    fn new(
+        evidence: Option<TerminalEvidence>,
+        attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
+    ) -> Self {
+        Self {
+            evidence,
+            attempts,
+            overflow_recovery,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self::new(None, Vec::new())
+        Self::new(None, Vec::new(), None)
     }
 }
 
@@ -236,10 +247,17 @@ pub(crate) enum RuntimeEvent {
     ModelStepStarted {
         run_id: RunId,
         step_id: ModelStepId,
+        epoch: u32,
+    },
+    GenerationRestarted {
+        run_id: RunId,
+        step_id: ModelStepId,
+        epoch: u32,
     },
     ModelProgress {
         run_id: RunId,
         step_id: ModelStepId,
+        epoch: u32,
         progress: ModelProgress,
     },
     ExecutionStarted {
@@ -291,6 +309,10 @@ pub(crate) enum RuntimeEvent {
     },
     RunSettled {
         run_id: RunId,
+    },
+    AutomaticCompactionStarted {
+        run_id: RunId,
+        initial_overflow: Option<(ModelStepId, Vec<AttemptAccounting>)>,
     },
     SettingsAccepted {
         revision: u64,
@@ -400,6 +422,7 @@ pub(crate) struct RuntimeController<M: Model> {
     subagent_record_revisions: BTreeMap<TaskId, u64>,
     subagent_status_revisions: BTreeMap<TaskId, u64>,
     compaction_policy: CompactionSettings,
+    cross_provider_reasoning: CrossProviderReasoning,
     pending_compaction: Option<PendingCompaction>,
     active: Option<ActiveRun<M>>,
     trace: Trace,
@@ -444,9 +467,22 @@ enum WorkerMessage<M: Model> {
         request: String,
         selection: ModelSelection,
     },
+    AutomaticCompactionStarted {
+        run_id: u64,
+        initial_overflow: Option<(u64, Vec<AttemptAccounting>)>,
+    },
+    AutomaticCompactionCommitted {
+        compaction: CommittedCompaction,
+    },
     PersistedModelStepStarted {
         run_id: u64,
         step_id: u64,
+        epoch: u32,
+    },
+    GenerationRestarted {
+        run_id: u64,
+        step_id: u64,
+        epoch: u32,
     },
     ExecutionStarted {
         run_id: u64,
@@ -476,13 +512,14 @@ enum WorkerMessage<M: Model> {
     CompactionStarted,
     CompactionFinished {
         agent: Agent<M>,
-        result: Result<ManualCompactionResult, SessionError>,
+        result: Result<CompactionResult, SessionError>,
     },
 }
 
 struct WorkerProgress {
     run_id: RunId,
     step_id: ModelStepId,
+    epoch: u32,
     progress: AgentProgress,
 }
 
@@ -547,23 +584,29 @@ fn record_from_persisted_terminal(terminal: PersistedTerminal) -> Record {
             text,
             reasoning_summary,
             attempts,
+            overflow_recovery,
             ..
         } => Record::FinalMessage {
             step_id: ModelStepId(step_id),
             text,
             reasoning_summary,
-            terminal: TerminalDetails::new(None, attempts),
+            terminal: TerminalDetails::new(None, attempts, overflow_recovery),
         },
-        PersistedTerminal::Cancelled { evidence, attempts } => Record::CancelledRun {
-            terminal: TerminalDetails::new(evidence, attempts),
+        PersistedTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        } => Record::CancelledRun {
+            terminal: TerminalDetails::new(evidence, attempts, overflow_recovery),
         },
         PersistedTerminal::Failed {
             message,
             evidence,
             attempts,
+            overflow_recovery,
         } => Record::FailedRun {
             message,
-            terminal: TerminalDetails::new(evidence, attempts),
+            terminal: TerminalDetails::new(evidence, attempts, overflow_recovery),
         },
     }
 }
@@ -609,6 +652,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         }
         RuntimeEvent::RunStarted { .. }
         | RuntimeEvent::ModelStepStarted { .. }
+        | RuntimeEvent::GenerationRestarted { .. }
         | RuntimeEvent::RecordAppended { .. }
         | RuntimeEvent::SubagentSpawned { .. }
         | RuntimeEvent::SubagentStatus { .. }
@@ -616,6 +660,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::SubagentFinished { .. }
         | RuntimeEvent::SubagentOperationSettled { .. }
         | RuntimeEvent::RunSettled { .. }
+        | RuntimeEvent::AutomaticCompactionStarted { .. }
         | RuntimeEvent::SettingsAccepted { .. }
         | RuntimeEvent::NameAccepted { .. }
         | RuntimeEvent::NavigationCompleted { .. }
@@ -700,11 +745,22 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
 fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
     let run_id = record.run_id;
     let terminal_details = |terminal: ReadableTerminal| match terminal {
-        ReadableTerminal::Final { attempts, .. } => TerminalDetails::new(None, attempts),
-        ReadableTerminal::Cancelled { evidence, attempts }
+        ReadableTerminal::Final {
+            attempts,
+            overflow_recovery,
+            ..
+        } => TerminalDetails::new(None, attempts, overflow_recovery),
+        ReadableTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        }
         | ReadableTerminal::Failed {
-            evidence, attempts, ..
-        } => TerminalDetails::new(evidence, attempts),
+            evidence,
+            attempts,
+            overflow_recovery,
+            ..
+        } => TerminalDetails::new(evidence, attempts, overflow_recovery),
     };
     let record = match record.kind {
         RestoredRecordKind::UserRequest { request, selection } => {
@@ -760,6 +816,7 @@ impl<M: Model> RuntimeController<M> {
         session: SessionWriter,
     ) -> Self {
         let compaction = persisted_settings.compaction();
+        let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(selection, persisted_settings, None);
         let subagents = subagents.with_session(session.clone());
         Self {
@@ -774,6 +831,7 @@ impl<M: Model> RuntimeController<M> {
             subagent_record_revisions: BTreeMap::new(),
             subagent_status_revisions: BTreeMap::new(),
             compaction_policy: compaction,
+            cross_provider_reasoning,
             pending_compaction: None,
             active: None,
             trace: Trace::disabled(),
@@ -824,6 +882,7 @@ impl<M: Model> RuntimeController<M> {
             "restoration has no tracked subagent operations"
         );
         let compaction = persisted_settings.compaction();
+        let cross_provider_reasoning = persisted_settings.cross_provider_reasoning();
         let accepted_thinking = AcceptedThinking::new(
             selection,
             persisted_settings,
@@ -905,6 +964,7 @@ impl<M: Model> RuntimeController<M> {
                 subagent_record_revisions: BTreeMap::new(),
                 subagent_status_revisions: BTreeMap::new(),
                 compaction_policy: compaction,
+                cross_provider_reasoning,
                 pending_compaction: None,
                 active: None,
                 trace: Trace::disabled(),
@@ -1548,6 +1608,7 @@ impl<M: Model> RuntimeController<M> {
         let writer = self.session.clone();
         let cancellation_for_worker = cancellation.clone();
         let policy = self.compaction_policy;
+        let reasoning = self.cross_provider_reasoning;
         let selection = self.selection;
         let (sender, worker) = mpsc::unbounded_channel();
         let (_progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
@@ -1555,9 +1616,11 @@ impl<M: Model> RuntimeController<M> {
             let mut agent = agent;
             let completion_sender = sender.clone();
             let result = agent
-                .compact_manual(
+                .compact(
+                    CompactionReason::Manual,
                     policy,
                     selection,
+                    reasoning,
                     focus,
                     &cancellation_for_worker,
                     &writer,
@@ -1606,6 +1669,8 @@ impl<M: Model> RuntimeController<M> {
         let cancellation_for_worker = cancellation.clone();
         let writer = self.session.clone();
         let selection = self.selection;
+        let policy = self.compaction_policy;
+        let reasoning = self.cross_provider_reasoning;
         let (sender, worker) = mpsc::unbounded_channel();
         let (progress_sender, worker_progress) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let worker_task = tokio::spawn(async move {
@@ -1627,9 +1692,40 @@ impl<M: Model> RuntimeController<M> {
                             selection,
                         });
                     }
-                    PersistedAgentEvent::ModelStepStarted { run_id, step_id } => {
+                    PersistedAgentEvent::CompactionStarted {
+                        run_id,
+                        initial_overflow,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::AutomaticCompactionStarted {
+                            run_id,
+                            initial_overflow,
+                        });
+                    }
+                    PersistedAgentEvent::CompactionCommitted { compaction } => {
                         let _ = completion_sender
-                            .send(WorkerMessage::PersistedModelStepStarted { run_id, step_id });
+                            .send(WorkerMessage::AutomaticCompactionCommitted { compaction });
+                    }
+                    PersistedAgentEvent::ModelStepStarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::PersistedModelStepStarted {
+                            run_id,
+                            step_id,
+                            epoch,
+                        });
+                    }
+                    PersistedAgentEvent::GenerationRestarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    } => {
+                        let _ = completion_sender.send(WorkerMessage::GenerationRestarted {
+                            run_id,
+                            step_id,
+                            epoch,
+                        });
                     }
                     PersistedAgentEvent::ToolUpdated {
                         run_id,
@@ -1675,6 +1771,7 @@ impl<M: Model> RuntimeController<M> {
                     PersistedAgentEvent::ModelProgress {
                         run_id,
                         step_id,
+                        epoch,
                         progress,
                     } => {
                         let progress = AgentProgress::ModelProgress(progress);
@@ -1683,6 +1780,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch,
                                 progress,
                             },
                             false,
@@ -1703,6 +1801,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress,
                             },
                             false,
@@ -1724,6 +1823,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::ToolUpdated { token, call },
                             },
                             false,
@@ -1741,6 +1841,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::RunPreviewUpdated { token, preview },
                             },
                             false,
@@ -1757,6 +1858,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::StdoutDelta { text },
                             },
                             false,
@@ -1768,6 +1870,7 @@ impl<M: Model> RuntimeController<M> {
                             WorkerProgress {
                                 run_id: RunId(run_id),
                                 step_id: ModelStepId(step_id),
+                                epoch: 0,
                                 progress: AgentProgress::StdoutTruncated,
                             },
                             false,
@@ -1778,6 +1881,8 @@ impl<M: Model> RuntimeController<M> {
                 agent
                     .run_persisted(
                         selection,
+                        policy,
+                        reasoning,
                         request,
                         &cancellation_for_worker,
                         &writer,
@@ -1927,7 +2032,44 @@ impl<M: Model> RuntimeController<M> {
                     );
                 }
             }
-            WorkerMessage::PersistedModelStepStarted { run_id, step_id } => {
+            WorkerMessage::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow,
+            } => self.emit(
+                events,
+                RuntimeEvent::AutomaticCompactionStarted {
+                    run_id: RunId(run_id),
+                    initial_overflow: initial_overflow
+                        .map(|(step_id, attempts)| (ModelStepId(step_id), attempts)),
+                },
+            ),
+            WorkerMessage::AutomaticCompactionCommitted { compaction } => {
+                self.append_committed_record(
+                    events,
+                    RunId(compaction.run_id),
+                    Record::Compaction {
+                        outcome: compaction.outcome,
+                    },
+                    false,
+                );
+            }
+            WorkerMessage::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch,
+            } => self.emit(
+                events,
+                RuntimeEvent::GenerationRestarted {
+                    run_id: RunId(run_id),
+                    step_id: ModelStepId(step_id),
+                    epoch,
+                },
+            ),
+            WorkerMessage::PersistedModelStepStarted {
+                run_id,
+                step_id,
+                epoch,
+            } => {
                 let run_id = RunId(run_id);
                 let step_id = ModelStepId(step_id);
                 let active = self
@@ -1940,7 +2082,11 @@ impl<M: Model> RuntimeController<M> {
                 active.persisted_model_steps.insert(step_id.0);
                 self.publish_progress(
                     progress,
-                    RuntimeEvent::ModelStepStarted { run_id, step_id },
+                    RuntimeEvent::ModelStepStarted {
+                        run_id,
+                        step_id,
+                        epoch,
+                    },
                     false,
                 );
             }
@@ -2016,13 +2162,13 @@ impl<M: Model> RuntimeController<M> {
                 self.drain_worker_progress(progress);
                 self.agent = Some(agent);
                 match result {
-                    Ok(ManualCompactionResult::NoOp) => self.emit(
+                    Ok(CompactionResult::NoOp) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::NoOp,
                         },
                     ),
-                    Ok(ManualCompactionResult::CancelledBeforeStart) => self.emit(
+                    Ok(CompactionResult::CancelledBeforeStart) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::Settled(
@@ -2030,13 +2176,13 @@ impl<M: Model> RuntimeController<M> {
                             ),
                         },
                     ),
-                    Ok(ManualCompactionResult::FailedBeforeStart) => self.emit(
+                    Ok(CompactionResult::FailedBeforeStart(_)) => self.emit(
                         events,
                         RuntimeEvent::CompactionLifecycle {
                             lifecycle: CompactionLifecycle::Settled(CompactionSettlement::Failed),
                         },
                     ),
-                    Ok(ManualCompactionResult::Settled(committed)) => {
+                    Ok(CompactionResult::Settled(committed)) => {
                         let settlement = match &committed.outcome {
                             CompactionOutcome::Applied { .. } => CompactionSettlement::Applied,
                             CompactionOutcome::Failed { .. } => CompactionSettlement::Failed,
@@ -2253,6 +2399,7 @@ impl<M: Model> RuntimeController<M> {
         let WorkerProgress {
             run_id,
             step_id,
+            epoch,
             progress: agent_progress,
         } = progress_envelope.item;
         let event = match agent_progress {
@@ -2260,6 +2407,7 @@ impl<M: Model> RuntimeController<M> {
             AgentProgress::ModelProgress(progress) => RuntimeEvent::ModelProgress {
                 run_id,
                 step_id,
+                epoch,
                 progress,
             },
             AgentProgress::ExecutionStarted { commentary, .. } => RuntimeEvent::ExecutionStarted {
@@ -2357,10 +2505,13 @@ mod tests {
         ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
         RestoredTimelineItem, ResumeOptions, RunId, RuntimeCommand, RuntimeController,
         RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord,
-        TerminalDetails, WorkerMessage, restored_initial_state, restored_stored_record,
-        runtime_event_payload_bytes,
+        TerminalDetails, WorkerMessage, record_from_persisted_terminal, restored_initial_state,
+        restored_stored_record, runtime_event_payload_bytes,
     };
-    use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
+    use crate::agent::{
+        Agent, ArenaRestoreTestGate, ExecutionFailure, GenerationEvidence, OverflowRecovery,
+        TerminalEvidence,
+    };
     use crate::anthropic::AnthropicModel;
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
@@ -2507,10 +2658,11 @@ mod tests {
                         text: format!("{label} reply"),
                         reasoning_summary: String::new(),
                         replay: ProviderReplay::new(
-                            "fixture",
+                            "openai",
                             vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
                         ),
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3290,6 +3442,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3550,6 +3703,7 @@ mod tests {
                 item: RuntimeEvent::ModelProgress {
                     run_id: RunId(99),
                     step_id: ModelStepId(99),
+                    epoch: 0,
                     progress: ModelProgress::AttemptStarted { attempt: 1 },
                 },
                 gap_before: false,
@@ -3628,6 +3782,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3722,6 +3877,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_compaction_uses_resolved_cross_provider_reasoning() {
+        for (settings, reasoning_kept) in
+            [("", true), ("cross_provider_reasoning = \"drop\"\n", false)]
+        {
+            for restored in [false, true] {
+                let case = format!("{settings:?} restored={restored}");
+                let home = tempfile::tempdir().expect("create home");
+                let workspace = tempfile::tempdir().expect("create workspace");
+                let config = home.path().join(".kiki/config.toml");
+                fs::create_dir_all(config.parent().expect("settings parent")).unwrap();
+                fs::write(&config, settings).unwrap();
+                let snapshot = crate::config::ready_snapshot_with_settings_for_test(
+                    Some(home.path()),
+                    workspace.path(),
+                );
+                let arena = Arena::new(
+                    worker_path(),
+                    ToolHost::new(workspace.path())
+                        .await
+                        .expect("open tool host"),
+                )
+                .await
+                .expect("create arena");
+                let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+                    .expect("select model");
+                let session =
+                    Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+                        .expect("create session");
+                let writer = session.writer();
+                let admission = writer
+                    .commit_request("inspect".to_owned(), selection)
+                    .await
+                    .expect("commit foreign request");
+                let step_id = writer
+                    .start_model_step(admission.run_id)
+                    .await
+                    .expect("start foreign step");
+                writer
+                    .close_run(
+                        admission.run_id,
+                        Some(step_id),
+                        move || PersistedTerminal::Final {
+                            step_id,
+                            text: "It printed 1.".to_owned(),
+                            reasoning_summary: "FOREIGN_REASONING".to_owned(),
+                            replay: ProviderReplay::new(
+                                "anthropic",
+                                vec![OpaqueReplayItem::new(b"signed-thinking".to_vec())],
+                            ),
+                            attempts: Vec::new(),
+                            overflow_recovery: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close foreign run");
+                let tail = writer
+                    .commit_request("tail ".to_owned() + &"z".repeat(100_000), selection)
+                    .await
+                    .expect("commit tail request");
+                writer
+                    .close_run(
+                        tail.run_id,
+                        None,
+                        || PersistedTerminal::Cancelled {
+                            evidence: None,
+                            attempts: Vec::new(),
+                            overflow_recovery: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("close tail run");
+                drop(writer);
+                let summary_requests = Arc::new(Mutex::new(Vec::new()));
+                let model = RetainedCompactionModel {
+                    run_started: Arc::new(Notify::new()),
+                    summary_requests: summary_requests.clone(),
+                };
+                let subagents = SubagentCoordinator::new(
+                    SubagentPolicy::from(snapshot.subagents()),
+                    Arc::new(super::UnavailableChildRunner),
+                );
+                let controller = if restored {
+                    let (controller, initial) = RuntimeController::restore(
+                        &session,
+                        arena,
+                        model,
+                        selection,
+                        snapshot.settings().clone(),
+                        subagents,
+                        ResumeOptions::default(),
+                    )
+                    .await
+                    .expect("restore controller");
+                    assert_eq!(initial.disabled_reason, None, "{case}");
+                    controller
+                } else {
+                    RuntimeController::with_session(
+                        Agent::new(arena, model),
+                        selection,
+                        snapshot.settings().clone(),
+                        subagents,
+                        session.writer(),
+                    )
+                };
+                let (commands, mut events, _progress, controller) = start_controller(controller);
+
+                commands
+                    .send(RuntimeCommand::Compact {
+                        focus: String::new(),
+                    })
+                    .await
+                    .expect("request compaction");
+                let events = events_until_compaction_terminal(&mut events).await;
+
+                assert!(
+                    matches!(
+                        events.last(),
+                        Some(RuntimeEvent::CompactionLifecycle {
+                            lifecycle: super::CompactionLifecycle::Settled(
+                                super::CompactionSettlement::Applied,
+                            ),
+                        })
+                    ),
+                    "{case}: {events:?}"
+                );
+                {
+                    let requests = summary_requests.lock().expect("read summary requests");
+                    assert!(!requests.is_empty(), "{case}");
+                    assert!(
+                        requests.iter().any(|request| request
+                            .input
+                            .contains("[Assistant action]: It printed 1.")),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        requests
+                            .iter()
+                            .any(|request| request.input.contains("FOREIGN_REASONING")),
+                        reasoning_kept,
+                        "{case}"
+                    );
+                }
+
+                shutdown_controller(commands, controller).await;
+                session.close().expect("close session");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cancelling_retained_compaction_before_start_leaves_no_card_or_entry() {
         let home = tempfile::tempdir().expect("create home");
         let workspace = tempfile::tempdir().expect("create workspace");
@@ -3753,6 +4060,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3852,6 +4160,789 @@ mod tests {
         session.close().expect("close session");
     }
 
+    async fn threshold_controller<M: Model>(
+        home: &tempfile::TempDir,
+        workspace: &tempfile::TempDir,
+        model: M,
+        compaction_settings: &str,
+    ) -> (RuntimeController<M>, Session) {
+        let config = home.path().join(".kiki/config.toml");
+        fs::create_dir_all(config.parent().expect("settings parent")).unwrap();
+        fs::write(&config, format!("[compaction]\n{compaction_settings}")).unwrap();
+        let snapshot = crate::config::ready_snapshot_with_settings_for_test(
+            Some(home.path()),
+            workspace.path(),
+        );
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let controller = RuntimeController::with_session(
+            Agent::new(arena, model),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        (controller, session)
+    }
+
+    fn above_seeded_history_settings() -> String {
+        format!(
+            "reserve_tokens = {}\nkeep_recent_tokens = 20000\n",
+            DEFAULT_MODEL.context_window_tokens - 60_000
+        )
+    }
+
+    fn large_request() -> String {
+        "large ".to_owned() + &"x".repeat(100_000)
+    }
+
+    fn automatic_compaction_labels(events: &[RuntimeEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            run_id,
+                            record: Record::UserRequest { .. },
+                        },
+                    ..
+                } => format!("record:{}:user", run_id.0),
+                RuntimeEvent::RecordAppended {
+                    record:
+                        StoredRecord {
+                            run_id,
+                            record: Record::Compaction { outcome },
+                        },
+                    ..
+                } => {
+                    let state = match outcome {
+                        CompactionOutcome::Applied { .. } => "applied",
+                        CompactionOutcome::Failed { .. } => "failed",
+                        CompactionOutcome::Cancelled { .. } => "cancelled",
+                    };
+                    format!(
+                        "record:{}:compaction:{:?}:{state}",
+                        run_id.0,
+                        outcome.reason()
+                    )
+                }
+                event => event_label(event),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn automatic_threshold_events_are_run_scoped_reliable_and_unacknowledged() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "done".to_owned(),
+            }])
+            .with_summary_responses(vec!["threshold summary".to_owned()]),
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (command_sender, command_receiver) = mpsc::channel(8);
+        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (progress_sender, mut progress) = mpsc::channel(1);
+        progress_sender
+            .try_send(ProgressEnvelope {
+                item: RuntimeEvent::ModelProgress {
+                    run_id: RunId(99),
+                    step_id: ModelStepId(99),
+                    epoch: 0,
+                    progress: ModelProgress::AttemptStarted { attempt: 1 },
+                },
+                gap_before: false,
+            })
+            .expect("saturate progress channel");
+        let controller =
+            tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+        command_sender
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:applied",
+                "record:3:message:3:done",
+                "settled:3",
+            ]
+        );
+        assert!(progress.try_recv().is_ok(), "progress remained saturated");
+        assert!(progress.try_recv().is_err());
+
+        shutdown_controller(command_sender, controller).await;
+        session.close().expect("close session");
+    }
+
+    struct RunSelectionModel {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        steps: Arc<Mutex<Vec<ModelSelection>>>,
+        summaries: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl Model for RunSelectionModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let call = {
+                    let mut steps = self.steps.lock().expect("record step selection");
+                    steps.push(selection);
+                    steps.len()
+                };
+                let action = if call == 1 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    CompletedModelAction::Code {
+                        source: format!("payload = '{}'", "y".repeat(40_000)),
+                        call_id: ModelCallId::new("big-code"),
+                        commentary: None,
+                    }
+                } else {
+                    CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    }
+                };
+                Ok(ModelStep {
+                    action,
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            _cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                attempt_started();
+                self.summaries
+                    .lock()
+                    .expect("record summary selection")
+                    .push(request.selection);
+                Ok(SummaryResult {
+                    text: "summary".to_owned(),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_run_model_change_applies_to_the_next_run_threshold_and_summary() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let summaries = Arc::new(Mutex::new(Vec::new()));
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            RunSelectionModel {
+                started: started.clone(),
+                release: release.clone(),
+                steps: steps.clone(),
+                summaries: summaries.clone(),
+            },
+            "reserve_tokens = 1000000\nkeep_recent_tokens = 1\n",
+        )
+        .await;
+        let admitted = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let changed = ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking)
+            .expect("select smaller-window model");
+        assert!(
+            OPUS_5_5.context_window_tokens < 1_000_000 + 10_000
+                && DEFAULT_MODEL.context_window_tokens > 1_000_000 + 10_000
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "inspect".to_owned(),
+            })
+            .await
+            .expect("start run");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: changed,
+                revision: 1,
+            })
+            .await
+            .expect("change model mid-run");
+        while next_event(&mut events).await != (RuntimeEvent::SettingsAccepted { revision: 1 }) {}
+        release.notify_one();
+        let first = events_until_settled(&mut events).await;
+
+        assert_eq!(*steps.lock().expect("read steps"), [admitted, admitted]);
+        assert!(summaries.lock().expect("read summaries").is_empty());
+        assert!(
+            !first
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AutomaticCompactionStarted { .. }))
+        );
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "next".to_owned(),
+            })
+            .await
+            .expect("start next run");
+        let second = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            *steps.lock().expect("read steps"),
+            [admitted, admitted, changed]
+        );
+        assert_eq!(*summaries.lock().expect("read summaries"), [changed]);
+        assert_eq!(
+            automatic_compaction_labels(&second),
+            [
+                "record:2:user",
+                "automatic-compaction:2",
+                "record:2:compaction:AutomaticThreshold:applied",
+                "record:2:message:3:done",
+                "settled:2",
+            ]
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn cancelling_automatic_compaction_settles_the_run_without_a_step() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            GatedSummaryModel {
+                started: started.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (commands, mut events, mut progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::Cancel { correction: false })
+            .await
+            .expect("cancel automatic compaction");
+        let events = events_until_settled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:cancelled",
+                "record:3:cancelled",
+                "settled:3",
+            ]
+        );
+        assert!(
+            !drain_progress(&mut progress)
+                .iter()
+                .any(|envelope| matches!(envelope.item, RuntimeEvent::ModelStepStarted { .. }))
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT COUNT(*) FROM model_steps WHERE run_id = 3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count steps"),
+            0
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_retained_during_automatic_compaction_follows_run_settlement() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            GatedSummaryModel {
+                started: started.clone(),
+                release: release.clone(),
+            },
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::Compact {
+                focus: "manual focus".to_owned(),
+            })
+            .await
+            .expect("retain manual compaction");
+        let mut labels = Vec::new();
+        loop {
+            let event = next_event(&mut events).await;
+            if event
+                == (RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Started,
+                })
+            {
+                release.notify_one();
+            }
+            let settled = matches!(
+                event,
+                RuntimeEvent::CompactionLifecycle {
+                    lifecycle: super::CompactionLifecycle::Settled(_),
+                }
+            );
+            labels.extend(automatic_compaction_labels(&[event]));
+            if settled {
+                break;
+            }
+        }
+
+        let acknowledgements = labels
+            .iter()
+            .filter(|label| label.starts_with("compaction-ack:"))
+            .collect::<Vec<_>>();
+        assert_eq!(acknowledgements, ["compaction-ack:Accepted"]);
+        labels.retain(|label| !label.starts_with("compaction-ack:"));
+        assert_eq!(
+            labels,
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "record:3:compaction:AutomaticThreshold:cancelled",
+                "record:3:cancelled",
+                "settled:3",
+                "compaction:Started",
+                "record:3:compaction:Manual:applied",
+                "compaction:Settled(Applied)",
+            ]
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_storage_failure_disables_without_a_card() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let (controller, session) = threshold_controller(
+            &home,
+            &workspace,
+            ScriptedModel::new(vec![ModelAction::Message {
+                text: "must not run".to_owned(),
+            }])
+            .with_summary_responses(vec!["summary".to_owned()]),
+            &above_seeded_history_settings(),
+        )
+        .await;
+        seed_compactable_history(&session.writer()).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_compaction BEFORE INSERT ON entries WHEN NEW.kind = 'compaction' BEGIN SELECT RAISE(ABORT, 'reject compaction'); END;",
+            )
+            .expect("reject compaction writes");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_disabled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3",
+                "disabled:SessionStorageWriteFailed",
+            ]
+        );
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'compaction') + (SELECT COUNT(*) FROM model_steps WHERE run_id = 3)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count compactions and steps"),
+            0
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    struct OverflowRetryModel {
+        first_step: Option<(Arc<Notify>, Arc<Notify>)>,
+        steps: Arc<Mutex<Vec<ModelSelection>>>,
+        summaries: Arc<Mutex<Vec<ModelSelection>>>,
+    }
+
+    impl OverflowRetryModel {
+        fn new() -> Self {
+            Self {
+                first_step: None,
+                steps: Arc::new(Mutex::new(Vec::new())),
+                summaries: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Model for OverflowRetryModel {
+        #[allow(clippy::manual_async_fn)]
+        fn step<'a>(
+            &'a mut self,
+            selection: ModelSelection,
+            _history: &'a ModelHistory,
+            _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(ModelProgress) + Send),
+        ) -> impl std::future::Future<Output = Result<ModelStep, ModelFailure>> + Send + 'a
+        {
+            async move {
+                let call = {
+                    let mut steps = self.steps.lock().expect("record step selection");
+                    steps.push(selection);
+                    steps.len()
+                };
+                if call == 1
+                    && let Some((started, release)) = &self.first_step
+                {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                progress(ModelProgress::AttemptStarted { attempt: 1 });
+                progress(ModelProgress::AssistantTextChunk {
+                    text: if call == 1 { "stale" } else { "fresh" }.to_owned(),
+                });
+                if call == 1 {
+                    return Err(ModelFailure::new(
+                        ModelError::Provider(Box::new(
+                            ProviderFailure::new(
+                                Some(400),
+                                Some("context_length_exceeded".to_owned()),
+                                "maximum context length".to_owned(),
+                            )
+                            .with_context_overflow(true),
+                        )),
+                        vec![AttemptAccounting::UsageUnavailable],
+                    ));
+                }
+                Ok(ModelStep {
+                    action: CompletedModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("test", Vec::new()),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn summarise<'a>(
+            &'a mut self,
+            request: SummaryRequest,
+            _cancellation: &'a CancellationToken,
+            attempt_started: &'a mut (dyn FnMut() + Send),
+        ) -> impl std::future::Future<Output = Result<SummaryResult, ModelFailure>> + Send + 'a
+        {
+            async move {
+                attempt_started();
+                self.summaries
+                    .lock()
+                    .expect("record summary selection")
+                    .push(request.selection);
+                Ok(SummaryResult {
+                    text: "summary".to_owned(),
+                    attempts: Vec::new(),
+                })
+            }
+        }
+    }
+
+    const RECOVERY_SETTINGS: &str = "reserve_tokens = 16384\nkeep_recent_tokens = 20000\n";
+
+    fn generation_progress(envelopes: &[ProgressEnvelope<RuntimeEvent>]) -> Vec<(u32, String)> {
+        envelopes
+            .iter()
+            .filter_map(|envelope| match &envelope.item {
+                RuntimeEvent::ModelStepStarted {
+                    run_id: RunId(3),
+                    step_id: ModelStepId(3),
+                    epoch,
+                } => Some((*epoch, "start".to_owned())),
+                RuntimeEvent::ModelProgress {
+                    run_id: RunId(3),
+                    step_id: ModelStepId(3),
+                    epoch,
+                    progress,
+                } => Some((
+                    *epoch,
+                    match progress {
+                        ModelProgress::AttemptStarted { attempt } => format!("attempt {attempt}"),
+                        ModelProgress::AssistantTextChunk { text } => text.clone(),
+                        progress => format!("{progress:?}"),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn overflow_retry_resets_generation_before_its_card_and_tags_progress_epochs() {
+        for saturated in [false, true] {
+            let home = tempfile::tempdir().expect("create home");
+            let workspace = tempfile::tempdir().expect("create workspace");
+            let (controller, session) = threshold_controller(
+                &home,
+                &workspace,
+                OverflowRetryModel::new(),
+                RECOVERY_SETTINGS,
+            )
+            .await;
+            seed_compactable_history(&session.writer()).await;
+            let (command_sender, command_receiver) = mpsc::channel(8);
+            let (event_sender, mut events) = mpsc::unbounded_channel();
+            let (progress_sender, mut progress) = mpsc::channel(if saturated {
+                1
+            } else {
+                PROGRESS_CHANNEL_CAPACITY
+            });
+            if saturated {
+                progress_sender
+                    .try_send(ProgressEnvelope {
+                        item: RuntimeEvent::RunStarted { run_id: RunId(99) },
+                        gap_before: false,
+                    })
+                    .expect("saturate progress channel");
+            }
+            let controller =
+                tokio::spawn(controller.run(command_receiver, event_sender, progress_sender));
+
+            command_sender
+                .send(RuntimeCommand::Submit {
+                    request: large_request(),
+                })
+                .await
+                .expect("submit large request");
+            let events = events_until_settled(&mut events).await;
+
+            assert_eq!(
+                automatic_compaction_labels(&events),
+                [
+                    "record:3:user",
+                    "automatic-compaction:3:overflow:3:[UsageUnavailable]",
+                    "generation-restarted:3:3:1",
+                    "record:3:compaction:ContextOverflow:applied",
+                    "record:3:message:3:done",
+                    "settled:3",
+                ],
+                "saturated: {saturated}"
+            );
+            let progress = drain_progress(&mut progress);
+            if saturated {
+                assert!(generation_progress(&progress).is_empty());
+            } else {
+                assert_eq!(
+                    generation_progress(&progress),
+                    [
+                        (0, "start".to_owned()),
+                        (0, "attempt 1".to_owned()),
+                        (0, "stale".to_owned()),
+                        (1, "start".to_owned()),
+                        (1, "attempt 1".to_owned()),
+                        (1, "fresh".to_owned()),
+                    ]
+                );
+            }
+
+            shutdown_controller(command_sender, controller).await;
+            session.close().expect("close session");
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_keeps_the_run_selection_after_a_mid_run_model_change() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let model = OverflowRetryModel {
+            first_step: Some((started.clone(), release.clone())),
+            ..OverflowRetryModel::new()
+        };
+        let steps = model.steps.clone();
+        let summaries = model.summaries.clone();
+        let (controller, session) =
+            threshold_controller(&home, &workspace, model, RECOVERY_SETTINGS).await;
+        seed_compactable_history(&session.writer()).await;
+        let admitted = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select default model");
+        let changed = ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking)
+            .expect("select changed model");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("start run");
+        started.notified().await;
+        commands
+            .send(RuntimeCommand::ApplySettings {
+                selection: changed,
+                revision: 1,
+            })
+            .await
+            .expect("change model mid-run");
+        while next_event(&mut events).await != (RuntimeEvent::SettingsAccepted { revision: 1 }) {}
+        release.notify_one();
+        let settled = events_until_settled(&mut events).await;
+
+        assert!(
+            automatic_compaction_labels(&settled)
+                .contains(&"record:3:compaction:ContextOverflow:applied".to_owned())
+        );
+        assert_eq!(*steps.lock().expect("read steps"), [admitted, admitted]);
+        assert_eq!(*summaries.lock().expect("read summaries"), [admitted]);
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn overflow_compaction_storage_failure_disables_without_card_or_retry() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let model = OverflowRetryModel::new();
+        let steps = model.steps.clone();
+        let (controller, session) =
+            threshold_controller(&home, &workspace, model, RECOVERY_SETTINGS).await;
+        seed_compactable_history(&session.writer()).await;
+        session
+            .connection_for_test()
+            .expect("lock session connection")
+            .execute_batch(
+                "CREATE TRIGGER reject_compaction BEFORE INSERT ON entries WHEN NEW.kind = 'compaction' BEGIN SELECT RAISE(ABORT, 'reject compaction'); END;",
+            )
+            .expect("reject compaction writes");
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: large_request(),
+            })
+            .await
+            .expect("submit large request");
+        let events = events_until_disabled(&mut events).await;
+
+        assert_eq!(
+            automatic_compaction_labels(&events),
+            [
+                "record:3:user",
+                "automatic-compaction:3:overflow:3:[UsageUnavailable]",
+                "disabled:SessionStorageWriteFailed",
+            ]
+        );
+        assert_eq!(steps.lock().expect("read steps").len(), 1);
+        assert_eq!(
+            session
+                .connection_for_test()
+                .expect("open session")
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM entries WHERE kind = 'compaction'), (SELECT COUNT(*) FROM model_steps WHERE run_id = 3 AND settled_entry_id IS NULL)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("count compactions and open steps"),
+            (0, 1)
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().expect("close session");
+    }
+
     #[tokio::test]
     async fn retained_compaction_uses_terminal_leaf_when_final_or_failed_wins_cancellation() {
         for terminal_kind in ["final", "failed"] {
@@ -3891,6 +4982,7 @@ mod tests {
                             reasoning_summary: String::new(),
                             replay: ProviderReplay::new("fixture", Vec::new()),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -3905,6 +4997,7 @@ mod tests {
                             message: "failed wins".to_owned(),
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -4607,6 +5700,7 @@ mod tests {
                             reasoning_summary: String::new(),
                             replay: ProviderReplay::new("fixture", Vec::new()),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -4692,6 +5786,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4709,6 +5804,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "next request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -6468,7 +7565,9 @@ mod tests {
     fn event_label(event: &RuntimeEvent) -> String {
         match event {
             RuntimeEvent::RunStarted { run_id } => format!("run:{}", run_id.0),
-            RuntimeEvent::ModelStepStarted { run_id, step_id } => {
+            RuntimeEvent::ModelStepStarted {
+                run_id, step_id, ..
+            } => {
                 format!("model:{}:{}", run_id.0, step_id.0)
             }
             RuntimeEvent::ModelProgress { .. } => "model-progress".to_owned(),
@@ -6506,6 +7605,22 @@ mod tests {
                 format!("subagent-operation-settled:{id}")
             }
             RuntimeEvent::RunSettled { run_id } => format!("settled:{}", run_id.0),
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: None,
+            } => format!("automatic-compaction:{}", run_id.0),
+            RuntimeEvent::AutomaticCompactionStarted {
+                run_id,
+                initial_overflow: Some((step_id, attempts)),
+            } => format!(
+                "automatic-compaction:{}:overflow:{}:{attempts:?}",
+                run_id.0, step_id.0
+            ),
+            RuntimeEvent::GenerationRestarted {
+                run_id,
+                step_id,
+                epoch,
+            } => format!("generation-restarted:{}:{}:{epoch}", run_id.0, step_id.0),
             RuntimeEvent::SettingsAccepted { revision } => format!("settings:{revision}"),
             RuntimeEvent::NameAccepted { revision, name } => format!("name:{revision}:{name}"),
             RuntimeEvent::NavigationCompleted { .. } => "navigation-completed".to_owned(),
@@ -7304,6 +8419,159 @@ mod tests {
         assert_eq!(restored.record, Record::Compaction { outcome });
     }
 
+    #[tokio::test]
+    async fn recovered_terminals_keep_initial_overflow_through_live_and_restored_mapping() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        let recovery = |index: usize| OverflowRecovery {
+            failure: ProviderFailure::new(
+                Some(400),
+                Some("context_length_exceeded".to_owned()),
+                format!("maximum context length {index}"),
+            )
+            .with_context_overflow(true),
+            generation: Some(GenerationEvidence {
+                reasoning_summary: String::new(),
+                reasoning: String::new(),
+                assistant_text: format!("INITIAL_PARTIAL_{index}"),
+                decoded_python: String::new(),
+            }),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let mut live = Vec::new();
+        for index in 0..3 {
+            let admission = writer
+                .commit_request(format!("request {index}"), selection)
+                .await
+                .expect("commit request");
+            let step_id = writer
+                .start_model_step(admission.run_id)
+                .await
+                .expect("start step");
+            let overflow_recovery = Some(recovery(index));
+            let attempts = vec![AttemptAccounting::UsageUnavailable];
+            let terminal = match index {
+                0 => PersistedTerminal::Final {
+                    step_id,
+                    text: "RETRY_FINAL".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("openai", Vec::new()),
+                    attempts,
+                    overflow_recovery,
+                },
+                1 => PersistedTerminal::Failed {
+                    message: "RETRY_FAILURE".to_owned(),
+                    evidence: None,
+                    attempts,
+                    overflow_recovery,
+                },
+                _ => PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts,
+                    overflow_recovery,
+                },
+            };
+            let terminal = writer
+                .close_run(admission.run_id, Some(step_id), move || terminal, None)
+                .await
+                .expect("close recovered run");
+            live.push(StoredRecord {
+                run_id: RunId(admission.run_id),
+                record: record_from_persisted_terminal(terminal),
+            });
+        }
+        for (index, record) in live.iter().enumerate() {
+            assert!(matches!(
+                &record.record,
+                Record::FinalMessage { terminal, .. }
+                    | Record::CancelledRun { terminal }
+                    | Record::FailedRun { terminal, .. }
+                    if terminal.overflow_recovery == Some(recovery(index))
+            ));
+        }
+        let initial = restored_initial_state(&session.restore().expect("restore recovered runs"));
+        let restored = initial
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::Record(record)
+                    if !matches!(record.record, Record::UserRequest { .. }) =>
+                {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(restored, live);
+
+        let render = |transcript: &mut Transcript| {
+            let layout = transcript.layout(1024);
+            let height = u16::try_from(layout.total_height()).expect("test transcript height");
+            let mut buffer =
+                ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
+            layout.render(buffer.area, 0, &mut buffer);
+            buffer
+                .content
+                .chunks(1024)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut live_transcript = Transcript::default();
+        for record in live {
+            live_transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record,
+                    progress_gap: false,
+                },
+                false,
+            );
+        }
+        let mut restored_transcript =
+            Transcript::restored(crate::config::ready_snapshot_for_test(), &initial);
+        for rendered in [
+            render(&mut live_transcript),
+            render(&mut restored_transcript),
+        ] {
+            let mut record_start = 0;
+            for (index, outcome) in ["RETRY_FINAL", "failed: RETRY_FAILURE", "cancelled"]
+                .into_iter()
+                .enumerate()
+            {
+                let outcome_start = record_start
+                    + rendered[record_start..]
+                        .find(outcome)
+                        .expect("record outcome");
+                let record = &rendered[record_start..outcome_start];
+                for marker in [
+                    format!(
+                        "context overflow: provider failure (HTTP 400) [context_length_exceeded]: maximum context length {index}"
+                    ),
+                    format!("INITIAL_PARTIAL_{index}"),
+                ] {
+                    assert_eq!(rendered.matches(&marker).count(), 1, "{marker}\n{rendered}");
+                    assert!(record.contains(&marker), "{outcome}: {marker}\n{rendered}");
+                }
+                record_start = outcome_start + outcome.len();
+            }
+        }
+        drop(writer);
+        session.close().expect("close session");
+    }
+
     #[test]
     fn mutation_evidence_labels_are_path_free() {
         assert_eq!(
@@ -7412,6 +8680,7 @@ mod tests {
         RuntimeEvent::ModelProgress {
             run_id: RunId(1),
             step_id: ModelStepId(1),
+            epoch: 0,
             progress: ModelProgress::AssistantTextChunk { text },
         }
     }
@@ -8269,6 +9538,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "first request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -8323,6 +9594,8 @@ mod tests {
         agent
             .run_persisted(
                 selection,
+                crate::config::CompactionSettings::default(),
+                CrossProviderReasoning::Inline,
                 "second request".to_owned(),
                 &CancellationToken::new(),
                 &writer,
@@ -10108,6 +11381,7 @@ mod tests {
                         terminal: PersistedTerminal::Cancelled {
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         authentication_failure: false,
                         recovery_failure: false,
@@ -10378,7 +11652,9 @@ mod tests {
             first_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -10392,7 +11668,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -10565,7 +11843,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -10734,7 +12014,9 @@ mod tests {
             second_progress
                 .iter()
                 .filter_map(|envelope| match &envelope.item {
-                    RuntimeEvent::ModelStepStarted { run_id, step_id } => Some((*run_id, *step_id)),
+                    RuntimeEvent::ModelStepStarted {
+                        run_id, step_id, ..
+                    } => Some((*run_id, *step_id)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -11174,6 +12456,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 "final",
             ),
@@ -11182,6 +12465,7 @@ mod tests {
                     message: "failed wins".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 "failed",
             ),
@@ -14617,6 +15901,7 @@ mod tests {
                             text: "saved answer".to_owned(),
                             reasoning_summary: String::new(),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -14693,6 +15978,7 @@ mod tests {
                             text: "origin answer".to_owned(),
                             reasoning_summary: String::new(),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -14758,6 +16044,7 @@ mod tests {
                 text: text.to_owned(),
                 reasoning_summary: String::new(),
                 attempts: Vec::new(),
+                overflow_recovery: None,
             },
         };
         let initial = restored_initial_state(&SessionRestore {
@@ -15240,6 +16527,7 @@ mod tests {
                         message: "sibling terminal failure".to_owned(),
                         evidence: None,
                         attempts: vec![sibling_terminal_attempt],
+                        overflow_recovery: None,
                     }
                 },
                 Some(PersistedCode {
@@ -16063,6 +17351,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: terminal_replay,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -17623,6 +18912,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )

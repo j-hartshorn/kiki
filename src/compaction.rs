@@ -1,21 +1,25 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use crate::config::models::Provider;
+use crate::config::settings::CrossProviderReasoning;
 use crate::config::{CompactionSettings, ModelSelection};
 use crate::model::{
-    AttemptAccounting, ModelContextEntry, SummaryRequest, canonical_compaction_summary,
+    AttemptAccounting, ForeignPart, ModelContextEntry, ModelUsage, SummaryRequest,
+    canonical_compaction_summary,
 };
 use crate::prompt::{
     compaction_initial_prompt, compaction_split_run_prompt, compaction_system_prompt,
     compaction_update_prompt,
 };
-use crate::session::SessionEntryId;
+use crate::session::{CompactionReason, SessionEntryId};
 
 const OUTPUT_RATIO_DENOMINATOR: u64 = 100;
 const HISTORY_OUTPUT_RATIO: u64 = 80;
 const SPLIT_OUTPUT_RATIO: u64 = 50;
 const FEEDBACK_SCALAR_LIMIT: usize = 2_000;
 const SPLIT_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
+const FOREIGN_TOOL_NAME: &str = "execute_python";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectedAncestryFact {
@@ -122,14 +126,30 @@ pub(crate) fn prepare(
     facts: &[SelectedAncestryFact],
     policy: CompactionSettings,
     selection: ModelSelection,
+    reasoning: CrossProviderReasoning,
     focus: &str,
+    reason: CompactionReason,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
+    if reason != CompactionReason::Manual && !policy.enabled() {
+        return Ok(None);
+    }
+    let destination = Destination::new(selection, reasoning);
     let latest = latest_applied(facts)?;
     let projected = projected_context_indices(facts, latest)?;
-    let context_tokens = measure_context(facts, &projected, latest);
+    let context_tokens =
+        measure_context(facts, &projected, latest, destination, selection.model().id);
+    if reason == CompactionReason::AutomaticThreshold
+        && !exceeds_threshold(
+            context_tokens,
+            selection.model().context_window_tokens,
+            policy.reserve_tokens(),
+        )
+    {
+        return Ok(None);
+    }
     let start = latest.map_or(0, |applied| applied.boundary_index);
     let Some(first_retained_index) =
-        first_retained_index(facts, start, policy.keep_recent_tokens())
+        first_retained_index(facts, start, policy.keep_recent_tokens(), destination)
     else {
         return Ok(None);
     };
@@ -137,7 +157,8 @@ pub(crate) fn prepare(
         return Ok(None);
     }
 
-    let (history_blocks, split_blocks) = split_blocks(facts, start, first_retained_index);
+    let (history_blocks, split_blocks) =
+        split_blocks(facts, start, first_retained_index, destination);
     let previous = latest
         .map(|applied| strip_reserved_blocks(applied.summary))
         .transpose()?;
@@ -221,6 +242,30 @@ pub(crate) fn prepare(
 }
 
 #[derive(Clone, Copy)]
+struct Destination {
+    provider: &'static str,
+    reasoning: CrossProviderReasoning,
+}
+
+impl Destination {
+    fn new(selection: ModelSelection, reasoning: CrossProviderReasoning) -> Self {
+        // Must match the replay provider names written by each adapter.
+        let provider = match selection.model().provider() {
+            Provider::OpenAi => "openai",
+            Provider::Anthropic => "anthropic",
+        };
+        Self {
+            provider,
+            reasoning,
+        }
+    }
+
+    fn foreign_parts<'a>(self, entry: &'a ModelContextEntry) -> Option<Vec<ForeignPart<'a>>> {
+        entry.foreign_parts(self.provider, self.reasoning)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct LatestApplied<'a> {
     index: usize,
     boundary_index: usize,
@@ -294,7 +339,49 @@ fn measure_context(
     facts: &[SelectedAncestryFact],
     projected: &[usize],
     latest: Option<LatestApplied<'_>>,
+    destination: Destination,
+    model_id: &str,
 ) -> u64 {
+    let projected_entry =
+        |index: usize| context_entry(&facts[index]).expect("projected entries are context entries");
+    if let Some((position, baseline)) =
+        usage_baseline(facts, projected, latest, destination, model_id)
+    {
+        let mut bytes = completed_feedback_bytes(projected_entry(projected[position]));
+        for &later in &projected[position + 1..] {
+            bytes = bytes.saturating_add(context_bytes(projected_entry(later), destination));
+        }
+        return baseline.saturating_add(estimate_tokens(bytes));
+    }
+
+    let mut bytes = latest
+        .map(|applied| byte_len(&canonical_compaction_summary(applied.summary)))
+        .unwrap_or(0);
+    for &index in projected {
+        bytes = bytes.saturating_add(context_bytes(projected_entry(index), destination));
+    }
+    estimate_tokens(bytes)
+}
+
+fn exceeds_threshold(context_tokens: u64, context_window: u64, reserve_tokens: u64) -> bool {
+    context_tokens > context_window.saturating_sub(reserve_tokens)
+}
+
+fn usage_baseline(
+    facts: &[SelectedAncestryFact],
+    projected: &[usize],
+    latest: Option<LatestApplied<'_>>,
+    destination: Destination,
+    model_id: &str,
+) -> Option<(usize, u64)> {
+    let any_foreign = projected.iter().any(|&index| {
+        context_entry(&facts[index])
+            .and_then(|entry| destination.foreign_parts(entry))
+            .is_some()
+    });
+    if any_foreign {
+        return None;
+    }
     let baseline_start = latest.map_or(0, |applied| applied.index.saturating_add(1));
     for (position, &index) in projected.iter().enumerate().rev() {
         if index < baseline_start {
@@ -309,38 +396,27 @@ fn measure_context(
         let Some(attempts) = normal_attempts(&facts[index]) else {
             continue;
         };
-        let Some(baseline) = attempts.iter().rev().find_map(context_usage) else {
-            continue;
-        };
-        let mut bytes = match context_entry(&facts[index]) {
-            Some(entry) if entry.completed_code().is_some() => completed_feedback_bytes(entry),
-            _ => 0,
-        };
-        for &later in &projected[position + 1..] {
-            bytes = bytes.saturating_add(context_bytes(
-                context_entry(&facts[later]).expect("projected entries are context entries"),
-            ));
+        for usage in attempts.iter().rev().filter_map(known_usage) {
+            if usage.model != model_id {
+                return None;
+            }
+            if let Some(tokens) = usage_tokens(usage) {
+                return Some((position, tokens));
+            }
         }
-        return baseline.saturating_add(estimate_tokens(bytes));
     }
-
-    let mut bytes = latest
-        .map(|applied| byte_len(&canonical_compaction_summary(applied.summary)))
-        .unwrap_or(0);
-    for &index in projected {
-        bytes = bytes.saturating_add(context_bytes(
-            context_entry(&facts[index]).expect("projected entries are context entries"),
-        ));
-    }
-    estimate_tokens(bytes)
+    None
 }
 
-fn context_usage(attempt: &AttemptAccounting) -> Option<u64> {
-    let usage = match attempt {
+fn known_usage(attempt: &AttemptAccounting) -> Option<&ModelUsage> {
+    match attempt {
         AttemptAccounting::KnownUsage(usage)
-        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => usage,
-        AttemptAccounting::UsageUnavailable => return None,
-    };
+        | AttemptAccounting::KnownUsageWithUntrackedRetries(usage) => Some(usage),
+        AttemptAccounting::UsageUnavailable => None,
+    }
+}
+
+fn usage_tokens(usage: &ModelUsage) -> Option<u64> {
     usage.total_tokens.filter(|total| *total != 0).or_else(|| {
         usage
             .input_tokens
@@ -354,6 +430,7 @@ fn first_retained_index(
     facts: &[SelectedAncestryFact],
     start: usize,
     keep_recent_tokens: u64,
+    destination: Destination,
 ) -> Option<usize> {
     let mut bytes = 0_u64;
     for index in (start..facts.len()).rev() {
@@ -362,6 +439,7 @@ fn first_retained_index(
         }
         bytes = bytes.saturating_add(context_bytes(
             context_entry(&facts[index]).expect("ordinary entries are context entries"),
+            destination,
         ));
         if estimate_tokens(bytes) >= keep_recent_tokens {
             return Some(index);
@@ -378,19 +456,20 @@ fn split_blocks(
     facts: &[SelectedAncestryFact],
     start: usize,
     retained: usize,
+    destination: Destination,
 ) -> (String, Option<String>) {
     if user_request(&facts[retained]).is_some() {
-        return (serialise_range(facts, start, retained), None);
+        return (serialise_range(facts, start, retained, destination), None);
     }
     let split_start = (start..retained)
         .rev()
         .find(|index| user_request(&facts[*index]).is_some());
     match split_start {
         Some(split_start) => (
-            serialise_range(facts, start, split_start),
-            Some(serialise_range(facts, split_start, retained)),
+            serialise_range(facts, start, split_start, destination),
+            Some(serialise_range(facts, split_start, retained, destination)),
         ),
-        None => (serialise_range(facts, start, retained), None),
+        None => (serialise_range(facts, start, retained, destination), None),
     }
 }
 
@@ -507,7 +586,12 @@ fn user_request(fact: &SelectedAncestryFact) -> Option<&str> {
     context_entry(fact).and_then(ModelContextEntry::user_request)
 }
 
-fn context_bytes(entry: &ModelContextEntry) -> u64 {
+fn context_bytes(entry: &ModelContextEntry, destination: Destination) -> u64 {
+    if let Some(parts) = destination.foreign_parts(entry) {
+        return parts.into_iter().fold(0, |total, part| {
+            total.saturating_add(foreign_part_bytes(part))
+        });
+    }
     if let Some(text) = entry.user_request() {
         return byte_len(text);
     }
@@ -522,6 +606,19 @@ fn context_bytes(entry: &ModelContextEntry) -> u64 {
         return 0;
     };
     replay_bytes(replay)
+}
+
+fn foreign_part_bytes(part: ForeignPart<'_>) -> u64 {
+    match part {
+        ForeignPart::Text(text) => byte_len(text),
+        ForeignPart::ToolCall {
+            call_id,
+            source,
+            output,
+        } => [call_id, FOREIGN_TOOL_NAME, source, output]
+            .into_iter()
+            .fold(0, |total, value| total.saturating_add(byte_len(value))),
+    }
 }
 
 fn completed_feedback_bytes(entry: &ModelContextEntry) -> u64 {
@@ -548,21 +645,30 @@ fn estimate_tokens(bytes: u64) -> u64 {
     bytes / 4 + u64::from(!bytes.is_multiple_of(4))
 }
 
-fn serialise_range(facts: &[SelectedAncestryFact], start: usize, end: usize) -> String {
+fn serialise_range(
+    facts: &[SelectedAncestryFact],
+    start: usize,
+    end: usize,
+    destination: Destination,
+) -> String {
     facts[start..end]
         .iter()
-        .filter_map(|fact| context_entry(fact).and_then(serialise_entry))
+        .filter_map(|fact| {
+            context_entry(fact).and_then(|entry| serialise_entry(entry, destination))
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-fn serialise_entry(entry: &ModelContextEntry) -> Option<String> {
+fn serialise_entry(entry: &ModelContextEntry, destination: Destination) -> Option<String> {
     if let Some(text) = entry.user_request() {
         return Some(format!("[User]: {text}"));
     }
+    let reasoning_dropped = destination.reasoning == CrossProviderReasoning::Drop
+        && destination.foreign_parts(entry).is_some();
     if let Some(completed) = entry.completed_code() {
         let mut blocks = Vec::new();
-        if !completed.reasoning_summary().is_empty() {
+        if !reasoning_dropped && !completed.reasoning_summary().is_empty() {
             blocks.push(format!(
                 "[Assistant reasoning]: {}",
                 completed.reasoning_summary()
@@ -587,7 +693,7 @@ fn serialise_entry(entry: &ModelContextEntry) -> Option<String> {
     }
     if let Some((text, reasoning_summary, _)) = entry.final_message() {
         let mut blocks = Vec::new();
-        if !reasoning_summary.is_empty() {
+        if !reasoning_dropped && !reasoning_summary.is_empty() {
             blocks.push(format!("[Assistant reasoning]: {reasoning_summary}"));
         }
         blocks.push(format!("[Assistant action]: {text}"));
@@ -728,19 +834,35 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CompactionError, SPLIT_SEPARATOR, SelectedAncestryFact, SelectedAncestryKind,
-        estimate_tokens, output_budget, prepare, serialise_entry, strip_reserved_blocks,
-        truncate_feedback,
+        CompactionError, Destination, SPLIT_SEPARATOR, SelectedAncestryFact, SelectedAncestryKind,
+        estimate_tokens, exceeds_threshold, output_budget, prepare, serialise_entry,
+        strip_reserved_blocks, truncate_feedback,
     };
+    use crate::config::models::{OPUS_5_5, TERRA};
+    use crate::config::settings::CrossProviderReasoning;
     use crate::config::{DEFAULT_MODEL, ModelSelection};
     use crate::model::{
         AttemptAccounting, CodeResult, ModelCallId, ModelContextEntry, ModelHistory, ModelUsage,
         OpaqueReplayItem, ProviderReplay,
     };
-    use crate::session::SessionEntryId;
+    use crate::session::{CompactionReason, SessionEntryId};
+
+    const INLINE: CrossProviderReasoning = CrossProviderReasoning::Inline;
+    const MANUAL: CompactionReason = CompactionReason::Manual;
+    const THRESHOLD: CompactionReason = CompactionReason::AutomaticThreshold;
+    const OVERFLOW: CompactionReason = CompactionReason::ContextOverflow;
+    const NATIVE: &str = "openai";
 
     fn selection() -> ModelSelection {
         ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap()
+    }
+
+    fn native() -> Destination {
+        Destination::new(selection(), INLINE)
+    }
+
+    fn anthropic_selection() -> ModelSelection {
+        ModelSelection::new(&OPUS_5_5, OPUS_5_5.default_thinking).unwrap()
     }
 
     fn policy(keep_recent_tokens: u64) -> crate::config::CompactionSettings {
@@ -773,6 +895,44 @@ mod tests {
         )
     }
 
+    fn completed_entry(
+        provider: &str,
+        call_id: &str,
+        source: &str,
+        commentary: Option<&str>,
+        reasoning: &str,
+        replay: &[u8],
+        feedback: &str,
+    ) -> ModelContextEntry {
+        let mut history = ModelHistory::new();
+        history
+            .append_completed_code(
+                source.to_owned(),
+                ModelCallId::new(call_id),
+                commentary.map(str::to_owned),
+                reasoning.to_owned(),
+                ProviderReplay::new(provider, vec![OpaqueReplayItem::new(replay.to_vec())]),
+                CodeResult::Execution {
+                    feedback: feedback.to_owned(),
+                },
+            )
+            .unwrap();
+        history.entries()[0].clone()
+    }
+
+    fn final_entry(
+        provider: &str,
+        text: &str,
+        reasoning: &str,
+        replay: &[u8],
+    ) -> ModelContextEntry {
+        ModelContextEntry::FinalMessage {
+            text: text.to_owned(),
+            reasoning_summary: reasoning.to_owned(),
+            replay: ProviderReplay::new(provider, vec![OpaqueReplayItem::new(replay.to_vec())]),
+        }
+    }
+
     fn code(
         id: u64,
         source: &str,
@@ -782,20 +942,19 @@ mod tests {
         feedback: &str,
         normal_attempts: Vec<AttemptAccounting>,
     ) -> SelectedAncestryFact {
-        let mut history = ModelHistory::new();
-        history
-            .append_completed_code(
-                source.to_owned(),
-                ModelCallId::new(format!("call-{id}")),
-                commentary.map(str::to_owned),
-                reasoning.to_owned(),
-                ProviderReplay::new("test", vec![OpaqueReplayItem::new(replay.to_vec())]),
-                CodeResult::Execution {
-                    feedback: feedback.to_owned(),
-                },
-            )
-            .unwrap();
-        context(id, history.entries()[0].clone(), normal_attempts)
+        context(
+            id,
+            completed_entry(
+                NATIVE,
+                &format!("call-{id}"),
+                source,
+                commentary,
+                reasoning,
+                replay,
+                feedback,
+            ),
+            normal_attempts,
+        )
     }
 
     fn final_message(
@@ -807,11 +966,7 @@ mod tests {
     ) -> SelectedAncestryFact {
         context(
             id,
-            ModelContextEntry::FinalMessage {
-                text: text.to_owned(),
-                reasoning_summary: reasoning.to_owned(),
-                replay: ProviderReplay::new("test", vec![OpaqueReplayItem::new(replay.to_vec())]),
-            },
+            final_entry(NATIVE, text, reasoning, replay),
             normal_attempts,
         )
     }
@@ -837,8 +992,17 @@ mod tests {
     }
 
     fn usage(total: Option<u64>, input: Option<u64>, output: Option<u64>) -> AttemptAccounting {
+        model_usage(DEFAULT_MODEL.id, total, input, output)
+    }
+
+    fn model_usage(
+        model: &str,
+        total: Option<u64>,
+        input: Option<u64>,
+        output: Option<u64>,
+    ) -> AttemptAccounting {
         AttemptAccounting::KnownUsage(ModelUsage {
-            model: "test".to_owned(),
+            model: model.to_owned(),
             service_tier: None,
             input_tokens: input,
             cached_input_tokens: Some(999),
@@ -851,15 +1015,388 @@ mod tests {
     }
 
     fn prepared(facts: &[SelectedAncestryFact]) -> super::CompactionPreparation {
-        prepare(facts, policy(1), selection(), "")
+        prepare(facts, policy(1), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("a removable prefix")
     }
 
     fn measured(facts: &[SelectedAncestryFact]) -> super::CompactionPreparation {
-        prepare(facts, policy(0), selection(), "")
+        prepare(facts, policy(0), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("a removable prefix")
+    }
+
+    #[test]
+    fn foreign_history_uses_semantic_bytes_and_drops_reasoning_for_summary() {
+        let opaque = vec![b'x'; 100_000];
+        let padding = "p".repeat(40);
+        for (destination, foreign, call_id, final_reasoning) in [
+            (selection(), "anthropic", "toolu_1", "Summarising"),
+            (
+                anthropic_selection(),
+                "openai",
+                "call_1",
+                "Reading the output",
+            ),
+        ] {
+            for reasoning in [CrossProviderReasoning::Inline, CrossProviderReasoning::Drop] {
+                let case = format!("{foreign} history under {reasoning:?}");
+                let facts = [
+                    user(1, "inspect"),
+                    context(
+                        2,
+                        completed_entry(
+                            foreign,
+                            call_id,
+                            "print(1)",
+                            Some("I'll run it."),
+                            "Checking the file",
+                            &opaque,
+                            "1\n",
+                        ),
+                        Vec::new(),
+                    ),
+                    context(
+                        3,
+                        final_entry(foreign, "It printed 1.", final_reasoning, &opaque),
+                        Vec::new(),
+                    ),
+                    user(4, &padding),
+                    user(5, "tail"),
+                ];
+                let inline = reasoning == CrossProviderReasoning::Inline;
+                let kept = |text: &str| if inline { text.len() } else { 0 };
+                let semantic_bytes = "inspect".len()
+                    + kept("Checking the file")
+                    + "I'll run it.".len()
+                    + call_id.len()
+                    + "execute_python".len()
+                    + "print(1)".len()
+                    + "1\n".len()
+                    + kept(final_reasoning)
+                    + "It printed 1.".len()
+                    + padding.len()
+                    + "tail".len();
+
+                let summarised = prepare(&facts, policy(1), destination, reasoning, "", MANUAL)
+                    .unwrap()
+                    .expect("a removable prefix");
+                assert_eq!(
+                    summarised.context_tokens(),
+                    semantic_bytes.div_ceil(4) as u64,
+                    "{case}"
+                );
+                assert_eq!(summarised.first_retained(), SessionEntryId(5), "{case}");
+                let input = &summarised.requests()[0].input;
+                assert!(
+                    input.contains(
+                        "[Assistant action]: I'll run it.\n\nPython:\nprint(1)\n\n[Execution result]: 1\n"
+                    ),
+                    "{case}"
+                );
+                assert!(
+                    input.contains("[Assistant action]: It printed 1."),
+                    "{case}"
+                );
+                for sentinel in ["Checking the file", final_reasoning] {
+                    assert_eq!(
+                        input.contains(&format!("[Assistant reasoning]: {sentinel}")),
+                        inline,
+                        "{case}"
+                    );
+                    assert_eq!(input.contains(sentinel), inline, "{case}");
+                }
+
+                let tail = prepare(&facts, policy(20), destination, reasoning, "", MANUAL)
+                    .unwrap()
+                    .expect("a removable prefix");
+                assert_eq!(tail.first_retained(), SessionEntryId(2), "{case}");
+                assert_eq!(tail.retained_entries()[0], facts_entry(&facts[1]), "{case}");
+            }
+        }
+    }
+
+    fn facts_entry(fact: &SelectedAncestryFact) -> ModelContextEntry {
+        match &fact.kind {
+            SelectedAncestryKind::Context { entry, .. } => entry.clone(),
+            _ => panic!("fact is not context-bearing"),
+        }
+    }
+
+    #[test]
+    fn native_history_counts_opaque_replay_and_keeps_reasoning_under_drop() {
+        for (destination, native) in [
+            (selection(), "openai"),
+            (anthropic_selection(), "anthropic"),
+        ] {
+            let facts = [
+                user(1, "inspect"),
+                context(
+                    2,
+                    completed_entry(
+                        native,
+                        "call_1",
+                        "print(1)",
+                        Some("I'll run it."),
+                        "Checking the file",
+                        b"opaque code replay",
+                        "1\n",
+                    ),
+                    Vec::new(),
+                ),
+                context(
+                    3,
+                    final_entry(native, "It printed 1.", "Summarising", b"opaque final"),
+                    Vec::new(),
+                ),
+                user(4, "tail"),
+            ];
+            let bytes = "inspect".len()
+                + "opaque code replay".len()
+                + "1\n".len()
+                + "opaque final".len()
+                + "tail".len();
+
+            let preparation = prepare(
+                &facts,
+                policy(1),
+                destination,
+                CrossProviderReasoning::Drop,
+                "",
+                MANUAL,
+            )
+            .unwrap()
+            .expect("a removable prefix");
+
+            assert_eq!(
+                preparation.context_tokens(),
+                bytes.div_ceil(4) as u64,
+                "{native}"
+            );
+            let input = &preparation.requests()[0].input;
+            assert!(
+                input.contains("[Assistant reasoning]: Checking the file"),
+                "{native}"
+            );
+            assert!(
+                input.contains("[Assistant reasoning]: Summarising"),
+                "{native}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_baselines_require_the_selected_model_and_native_projection() {
+        let own = |total| usage(Some(total), None, None);
+        let opaque = vec![b'x'; 100_000];
+
+        let newer_same_provider_model = [
+            user(1, "abcd"),
+            final_message(2, "old", "", b"abcd", vec![own(900)]),
+            final_message(
+                3,
+                "new",
+                "",
+                b"abcd",
+                vec![model_usage(TERRA.id, Some(700), None, None)],
+            ),
+            user(4, "abcd"),
+        ];
+        assert_eq!(measured(&newer_same_provider_model).context_tokens(), 4);
+
+        let newer_foreign_model = [
+            user(1, "abcd"),
+            final_message(2, "old", "", b"abcd", vec![own(900)]),
+            context(
+                3,
+                final_entry("anthropic", "abcd", "", &opaque),
+                vec![model_usage(OPUS_5_5.id, Some(700), None, None)],
+            ),
+            user(4, "abcd"),
+        ];
+        assert_eq!(measured(&newer_foreign_model).context_tokens(), 4);
+
+        for (reasoning, expected) in [(INLINE, 5), (CrossProviderReasoning::Drop, 4)] {
+            let own_after_foreign = [
+                user(1, "abcd"),
+                context(
+                    2,
+                    final_entry("anthropic", "abcd", "wxyz", &opaque),
+                    Vec::new(),
+                ),
+                final_message(3, "new", "", b"abcd", vec![own(900)]),
+                user(4, "abcd"),
+            ];
+            let preparation = prepare(
+                &own_after_foreign,
+                policy(0),
+                selection(),
+                reasoning,
+                "",
+                MANUAL,
+            )
+            .unwrap()
+            .expect("a removable prefix");
+            assert_eq!(preparation.context_tokens(), expected, "{reasoning:?}");
+        }
+
+        let own_after_applied = [
+            user(1, "boundary"),
+            final_message(
+                2,
+                "old",
+                "",
+                b"",
+                vec![model_usage(TERRA.id, Some(999), None, None)],
+            ),
+            applied(3, "prior", 1),
+            final_message(4, "new", "", b"", vec![own(10)]),
+            user(5, "abcd"),
+        ];
+        assert_eq!(measured(&own_after_applied).context_tokens(), 11);
+
+        let other_after_applied = [
+            user(1, "abcd"),
+            final_message(2, "old", "", b"abcd", vec![own(999)]),
+            applied(3, "s", 1),
+            final_message(
+                4,
+                "new",
+                "",
+                b"abcd",
+                vec![model_usage(TERRA.id, Some(10), None, None)],
+            ),
+            user(5, "abcd"),
+        ];
+        let summary = crate::model::canonical_compaction_summary("s").len();
+        assert_eq!(
+            measured(&other_after_applied).context_tokens(),
+            (summary + 16).div_ceil(4) as u64
+        );
+    }
+
+    fn measured_at(tokens: u64) -> [SelectedAncestryFact; 3] {
+        [
+            user(1, "old"),
+            final_message(2, "answer", "", b"", vec![usage(Some(tokens), None, None)]),
+            user(3, ""),
+        ]
+    }
+
+    fn prepares(
+        facts: &[SelectedAncestryFact],
+        policy: crate::config::CompactionSettings,
+        reason: CompactionReason,
+    ) -> bool {
+        prepare(facts, policy, selection(), INLINE, "", reason)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn threshold_is_strict_against_the_model_context_window() {
+        let model = selection().model();
+        let window = model.context_window_tokens;
+        assert!(model.pricing.long_context_threshold < window - 100);
+        let cases = [
+            (model.pricing.long_context_threshold + 1, false),
+            (window - 101, false),
+            (window - 100, false),
+            (window - 99, true),
+            (u64::MAX, true),
+        ];
+        for (tokens, expected) in cases {
+            let facts = measured_at(tokens);
+            assert_eq!(measured(&facts).context_tokens(), tokens, "{tokens} tokens");
+            assert_eq!(
+                prepares(&facts, policy(0), THRESHOLD),
+                expected,
+                "{tokens} tokens"
+            );
+            assert!(prepares(&facts, policy(0), MANUAL), "{tokens} tokens");
+        }
+    }
+
+    #[test]
+    fn threshold_saturates_when_reserve_reaches_the_window() {
+        let window = selection().model().context_window_tokens;
+        let empty = [user(1, ""), user(2, "")];
+        let one_token = [user(1, "a"), user(2, "")];
+        for reserve in [window, window + 1, u64::MAX] {
+            let policy = crate::config::CompactionSettings::new(reserve, 0);
+            assert!(!prepares(&empty, policy, THRESHOLD), "{reserve}");
+            assert!(prepares(&one_token, policy, THRESHOLD), "{reserve}");
+            assert!(prepares(&empty, policy, MANUAL), "{reserve}");
+        }
+        assert!(!prepares(&empty, policy(0), THRESHOLD));
+
+        let cases = [
+            (0, 0, 0, false),
+            (1, 0, 0, true),
+            (0, 0, u64::MAX, false),
+            (u64::MAX, u64::MAX, 0, false),
+            (u64::MAX, u64::MAX, 1, true),
+            (0, u64::MAX, u64::MAX, false),
+            (1, u64::MAX, u64::MAX, true),
+        ];
+        for (context, window, reserve, expected) in cases {
+            assert_eq!(
+                exceeds_threshold(context, window, reserve),
+                expected,
+                "{context} > {window} - {reserve}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_policy_skips_automatic_reasons_but_not_manual() {
+        let above = measured_at(u64::MAX);
+        let below = measured_at(1);
+        let disabled = policy(0).disabled();
+        assert!(!prepares(&above, disabled, THRESHOLD));
+        assert!(!prepares(&above, disabled, OVERFLOW));
+        assert!(prepares(&above, disabled, MANUAL));
+        assert!(prepares(&below, disabled, MANUAL));
+
+        assert!(prepares(&below, policy(0), OVERFLOW));
+        assert!(!prepares(&below, policy(0), THRESHOLD));
+
+        let no_progress = [
+            user(1, "boundary"),
+            applied(2, "prior", 1),
+            final_message(3, "", "", b"", vec![usage(Some(u64::MAX), None, None)]),
+        ];
+        for reason in [MANUAL, THRESHOLD, OVERFLOW] {
+            assert!(!prepares(&no_progress, policy(1), reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn below_threshold_returns_before_summary_assembly() {
+        let facts = [
+            user(1, "old"),
+            applied(2, "inline <read-files>", 1),
+            user(3, "tail"),
+        ];
+        assert!(matches!(
+            prepare(&facts, policy(1), selection(), INLINE, "", MANUAL),
+            Err(CompactionError::MalformedReservedTag(_))
+        ));
+        assert_eq!(
+            prepare(&facts, policy(1), selection(), INLINE, "", THRESHOLD),
+            Ok(None)
+        );
+        assert!(matches!(
+            prepare(
+                &facts,
+                crate::config::CompactionSettings::new(u64::MAX, 1),
+                selection(),
+                INLINE,
+                "",
+                THRESHOLD,
+            ),
+            Err(CompactionError::MalformedReservedTag(_))
+        ));
     }
 
     #[test]
@@ -871,7 +1408,7 @@ mod tests {
             user(4, "tail"),
         ];
 
-        let preparation = prepare(&facts, policy(1), selection(), "")
+        let preparation = prepare(&facts, policy(1), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("new context after the previous boundary is removable");
 
@@ -984,7 +1521,7 @@ mod tests {
     #[test]
     fn usage_baselines_accept_untracked_retries_and_skip_unusable_attempts() {
         let retried = AttemptAccounting::KnownUsageWithUntrackedRetries(ModelUsage {
-            model: "test".to_owned(),
+            model: DEFAULT_MODEL.id.to_owned(),
             service_tier: None,
             input_tokens: Some(5),
             cached_input_tokens: Some(50),
@@ -1068,7 +1605,7 @@ mod tests {
         let initial = [user(1, "aaaa"), user(2, "bbbb"), user(3, "cccc")];
         let cases = [(1, Some(3)), (2, Some(2)), (3, None)];
         for (keep, expected) in cases {
-            let result = prepare(&initial, policy(keep), selection(), "").unwrap();
+            let result = prepare(&initial, policy(keep), selection(), INLINE, "", MANUAL).unwrap();
             assert_eq!(
                 result.map(|preparation| preparation.first_retained().0),
                 expected
@@ -1090,9 +1627,16 @@ mod tests {
 
         let no_progress = [user(1, "boundary"), applied(2, "prior", 1), neutral(3)];
         assert!(
-            prepare(&no_progress, policy(1), selection(), "focus")
-                .unwrap()
-                .is_none()
+            prepare(
+                &no_progress,
+                policy(1),
+                selection(),
+                INLINE,
+                "focus",
+                MANUAL
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1100,7 +1644,7 @@ mod tests {
     fn invalid_applied_boundaries_are_rejected() {
         let missing = [user(1, "old"), applied(2, "prior", 99), user(3, "tail")];
         assert!(matches!(
-            prepare(&missing, policy(1), selection(), ""),
+            prepare(&missing, policy(1), selection(), INLINE, "", MANUAL),
             Err(CompactionError::InvalidAncestry(_))
         ));
 
@@ -1111,7 +1655,14 @@ mod tests {
             user(4, "tail"),
         ];
         assert!(matches!(
-            prepare(&neutral_boundary, policy(1), selection(), ""),
+            prepare(
+                &neutral_boundary,
+                policy(1),
+                selection(),
+                INLINE,
+                "",
+                MANUAL
+            ),
             Err(CompactionError::InvalidAncestry(_))
         ));
     }
@@ -1224,7 +1775,7 @@ mod tests {
             applied(2, "previous", 1),
             code(3, "tail", None, "", b"", "tail", Vec::new()),
         ];
-        let no_focus = prepare(&facts, policy(1), selection(), "  ")
+        let no_focus = prepare(&facts, policy(1), selection(), INLINE, "  ", MANUAL)
             .unwrap()
             .unwrap();
         assert_eq!(no_focus.requests().len(), 1);
@@ -1234,9 +1785,16 @@ mod tests {
             format!("previous{SPLIT_SEPARATOR}turn")
         );
 
-        let focused = prepare(&facts, policy(1), selection(), "  keep variables  ")
-            .unwrap()
-            .unwrap();
+        let focused = prepare(
+            &facts,
+            policy(1),
+            selection(),
+            INLINE,
+            "  keep variables  ",
+            MANUAL,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(focused.requests().len(), 2);
         assert_eq!(
             focused.requests()[0].input,
@@ -1271,26 +1829,35 @@ mod tests {
         );
         let final_message = final_message(2, "", "", b"", Vec::new());
         assert_eq!(
-            serialise_entry(match &code.kind {
-                SelectedAncestryKind::Context { entry, .. } => entry,
-                _ => unreachable!(),
-            }),
+            serialise_entry(
+                match &code.kind {
+                    SelectedAncestryKind::Context { entry, .. } => entry,
+                    _ => unreachable!(),
+                },
+                native()
+            ),
             Some(
                 "[Assistant reasoning]: reason\n\n[Assistant action]: commentary\n\nPython:\nprint()\n\n[Execution result]: ok"
                     .to_owned()
             )
         );
         assert_eq!(
-            serialise_entry(match &final_message.kind {
-                SelectedAncestryKind::Context { entry, .. } => entry,
-                _ => unreachable!(),
-            }),
+            serialise_entry(
+                match &final_message.kind {
+                    SelectedAncestryKind::Context { entry, .. } => entry,
+                    _ => unreachable!(),
+                },
+                native()
+            ),
             Some("[Assistant action]: ".to_owned())
         );
         assert_eq!(
-            serialise_entry(&ModelContextEntry::UserRequest {
-                text: String::new(),
-            }),
+            serialise_entry(
+                &ModelContextEntry::UserRequest {
+                    text: String::new(),
+                },
+                native()
+            ),
             Some("[User]: ".to_owned())
         );
         for result in [
@@ -1311,12 +1878,12 @@ mod tests {
                     ModelCallId::new("empty"),
                     Some(String::new()),
                     String::new(),
-                    ProviderReplay::new("test", Vec::new()),
+                    ProviderReplay::new(NATIVE, Vec::new()),
                     result,
                 )
                 .unwrap();
             assert_eq!(
-                serialise_entry(&history.entries()[0]),
+                serialise_entry(&history.entries()[0], native()),
                 Some("[Assistant action]: Python:\n\n\n[Execution result]: ".to_owned())
             );
         }
@@ -1444,7 +2011,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            prepare(&facts, policy(1), selection(), ""),
+            prepare(&facts, policy(1), selection(), INLINE, "", MANUAL),
             Err(CompactionError::NonUtf8Path)
         );
     }

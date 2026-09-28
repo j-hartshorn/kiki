@@ -5754,6 +5754,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6249,6 +6250,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
