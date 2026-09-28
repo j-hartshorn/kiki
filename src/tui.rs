@@ -194,11 +194,6 @@ struct ThinkingPreview {
     sent_revision: Option<u64>,
 }
 
-struct PendingSkillSubmission {
-    draft: String,
-    request: String,
-}
-
 struct App {
     mode: AppMode,
     prompt: PromptEditor,
@@ -239,7 +234,7 @@ struct App {
     next_tree_revision: u64,
     completion: slash::Completion,
     skill_catalog: Arc<SkillCatalog>,
-    pending_skill_submission: Option<PendingSkillSubmission>,
+    pending_skill_draft: Option<String>,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
@@ -292,7 +287,7 @@ impl Default for App {
             next_tree_revision: 0,
             completion: slash::Completion::default(),
             skill_catalog: Arc::default(),
-            pending_skill_submission: None,
+            pending_skill_draft: None,
             slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
@@ -658,8 +653,7 @@ impl App {
                 && command.action == slash::Action::Skill
             {
                 let name = command.skill_name.unwrap_or_default().to_owned();
-                let request = command.argument.to_owned();
-                return self.dispatch_skill(&name, &request, now);
+                return self.dispatch_skill(&name, now);
             }
             let draft = self.prompt.take();
             if let Some(command) = slash::parse(&draft) {
@@ -790,7 +784,7 @@ impl App {
         update
     }
 
-    fn dispatch_skill(&mut self, name: &str, request: &str, now: Instant) -> Update {
+    fn dispatch_skill(&mut self, name: &str, now: Instant) -> Update {
         if !self.transcript.is_idle() {
             self.set_notice("A run is still active.".to_owned());
             return Update {
@@ -815,21 +809,13 @@ impl App {
                 };
             }
         };
-        let draft = self.prompt.take();
+        let request = self.prompt.take();
         self.refresh_completion();
-        let request = if request.trim().is_empty() {
-            format!("Use the `{name}` skill for this turn. Ask me for the task details you need.")
-        } else {
-            request.to_owned()
-        };
         let mut commands = Vec::new();
         self.flush_preview(&mut commands);
         self.transcript.begin_submission();
         self.submission_at = Some(now);
-        self.pending_skill_submission = Some(PendingSkillSubmission {
-            draft,
-            request: request.clone(),
-        });
+        self.pending_skill_draft = Some(request.clone());
         commands.push(RuntimeCommand::Submit {
             request,
             activation: Some(activation),
@@ -1630,12 +1616,9 @@ impl App {
                 },
             ..
         } = &event
-            && self
-                .pending_skill_submission
-                .as_ref()
-                .is_some_and(|pending| pending.request == *request)
+            && self.pending_skill_draft.as_ref() == Some(request)
         {
-            self.pending_skill_submission = None;
+            self.pending_skill_draft = None;
         }
         let skill_draft_changed = if matches!(
             &event,
@@ -1650,7 +1633,7 @@ impl App {
                     | RuntimeEvent::RuntimeDisabled { .. }
                     | RuntimeEvent::RunSettled { .. }
             ) {
-                self.pending_skill_submission = None;
+                self.pending_skill_draft = None;
             }
             false
         };
@@ -1784,11 +1767,11 @@ impl App {
     }
 
     fn restore_pending_skill_draft(&mut self) -> bool {
-        let Some(pending) = self.pending_skill_submission.take() else {
+        let Some(draft) = self.pending_skill_draft.take() else {
             return false;
         };
         if self.prompt.is_empty() {
-            let changed = self.prompt.insert_paste(&pending.draft);
+            let changed = self.prompt.insert_paste(&draft);
             if changed {
                 self.refresh_completion();
             }
@@ -4887,7 +4870,7 @@ mod tests {
         else {
             panic!("expected direct skill submission");
         };
-        assert!(request.contains("direct"));
+        assert_eq!(request, "/skill:direct");
         assert_eq!(activation.name(), "direct");
         assert_eq!(activation.source_text(), body);
         assert!(app.prompt.is_empty());
@@ -4909,7 +4892,7 @@ mod tests {
         else {
             panic!("expected multiline skill submission");
         };
-        assert_eq!(request, "inspect this\n  and this");
+        assert_eq!(request, "/skill:direct inspect this\n  and this");
 
         let mut skipped = App::default().with_skill_catalog(Arc::new(SkillCatalog::discover(
             &ProjectScope::discover(project.path()).unwrap(),
@@ -4926,6 +4909,41 @@ mod tests {
         set_prompt(&mut skipped, "/skill:rejected");
         assert!(skipped.handle_key(key(KeyCode::Enter)).commands.is_empty());
         assert!(skipped.notice().unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn direct_skill_submits_the_typed_command_as_the_request() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let directory = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            "---\ndescription: Review\n---\nReview this.\n",
+        )
+        .unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        for draft in ["/skill:review", "/skill:review fix it"] {
+            let mut app = App::default().with_skill_catalog(catalog.clone());
+            set_prompt(&mut app, draft);
+            let update = app.handle_key(key(KeyCode::Enter));
+            let [
+                RuntimeCommand::Submit {
+                    request,
+                    activation: Some(activation),
+                },
+            ] = update.commands.as_slice()
+            else {
+                panic!("expected direct skill submission for {draft:?}");
+            };
+            assert_eq!(request, draft);
+            assert_eq!(activation.name(), "review");
+        }
     }
 
     #[test]
@@ -5075,7 +5093,7 @@ mod tests {
         else {
             panic!("expected direct skill submission");
         };
-        assert!(app.pending_skill_submission.is_some());
+        assert!(app.pending_skill_draft.is_some());
         app.handle_event(RuntimeEvent::RecordAppended {
             record: StoredRecord {
                 run_id: RunId(1),
@@ -5086,7 +5104,7 @@ mod tests {
             },
             progress_gap: false,
         });
-        assert!(app.pending_skill_submission.is_none());
+        assert!(app.pending_skill_draft.is_none());
     }
 
     #[test]
