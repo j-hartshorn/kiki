@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
-    ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderReplay,
+    ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderFailure, ProviderReplay,
 };
 use crate::session::{
     CommittedCompaction, CompactionReason, CompactionSettlement, PersistedCode, PersistedTerminal,
@@ -36,6 +36,13 @@ pub struct GenerationEvidence {
     pub(crate) reasoning: String,
     pub(crate) assistant_text: String,
     pub(crate) decoded_python: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverflowRecovery {
+    pub(crate) failure: ProviderFailure,
+    pub(crate) generation: Option<GenerationEvidence>,
+    pub(crate) attempts: Vec<AttemptAccounting>,
 }
 
 impl GenerationEvidence {
@@ -767,6 +774,7 @@ impl<M: Model> Agent<M> {
                 let terminal = PersistedTerminal::Cancelled {
                     evidence: generation.evidence().map(TerminalEvidence::Generation),
                     attempts: attempts[committed_attempts..].to_vec(),
+                    overflow_recovery: None,
                 };
                 let terminal = writer
                     .close_run(run_id, pending_step_id, move || terminal, None)
@@ -787,6 +795,7 @@ impl<M: Model> Agent<M> {
                 let terminal = PersistedTerminal::Cancelled {
                     evidence: generation.evidence().map(TerminalEvidence::Generation),
                     attempts: attempts[committed_attempts..].to_vec(),
+                    overflow_recovery: None,
                 };
                 let terminal = writer
                     .close_run(run_id, pending_step_id, move || terminal, None)
@@ -828,12 +837,17 @@ impl<M: Model> Agent<M> {
                             pending_step_id,
                             move || {
                                 if cancellation.is_cancelled() || failure_is_cancelled {
-                                    PersistedTerminal::Cancelled { evidence, attempts }
+                                    PersistedTerminal::Cancelled {
+                                        evidence,
+                                        attempts,
+                                        overflow_recovery: None,
+                                    }
                                 } else {
                                     PersistedTerminal::Failed {
                                         message,
                                         evidence,
                                         attempts,
+                                        overflow_recovery: None,
                                     }
                                 }
                             },
@@ -878,12 +892,17 @@ impl<M: Model> Agent<M> {
                                 pending_step_id,
                                 move || {
                                     if cancellation.is_cancelled() {
-                                        PersistedTerminal::Cancelled { evidence, attempts }
+                                        PersistedTerminal::Cancelled {
+                                            evidence,
+                                            attempts,
+                                            overflow_recovery: None,
+                                        }
                                     } else {
                                         PersistedTerminal::Failed {
                                             message,
                                             evidence,
                                             attempts,
+                                            overflow_recovery: None,
                                         }
                                     }
                                 },
@@ -918,6 +937,7 @@ impl<M: Model> Agent<M> {
                         let terminal = PersistedTerminal::Cancelled {
                             evidence: Some(TerminalEvidence::Execution(Box::new(evidence))),
                             attempts: attempts[committed_attempts..].to_vec(),
+                            overflow_recovery: None,
                         };
                         let terminal = writer
                             .close_run(run_id, pending_step_id, move || terminal, Some(code))
@@ -1037,12 +1057,17 @@ impl<M: Model> Agent<M> {
                                         if !is_recovery_failure
                                             && (cancellation.is_cancelled() || arena_cancelled)
                                         {
-                                            PersistedTerminal::Cancelled { evidence, attempts }
+                                            PersistedTerminal::Cancelled {
+                                                evidence,
+                                                attempts,
+                                                overflow_recovery: None,
+                                            }
                                         } else {
                                             PersistedTerminal::Failed {
                                                 message,
                                                 evidence,
                                                 attempts,
+                                                overflow_recovery: None,
                                             }
                                         }
                                     },
@@ -1075,6 +1100,7 @@ impl<M: Model> Agent<M> {
                                     PersistedTerminal::Cancelled {
                                         evidence: Some(TerminalEvidence::Generation(generation)),
                                         attempts,
+                                        overflow_recovery: None,
                                     }
                                 } else {
                                     PersistedTerminal::Final {
@@ -1083,6 +1109,7 @@ impl<M: Model> Agent<M> {
                                         reasoning_summary,
                                         replay,
                                         attempts,
+                                        overflow_recovery: None,
                                     }
                                 }
                             },
@@ -1631,6 +1658,7 @@ mod tests {
                         reasoning_summary: String::new(),
                         replay,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -1895,6 +1923,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -2348,6 +2377,7 @@ mod tests {
                         reasoning_output_tokens: Some(0),
                         total_tokens: Some(500_000),
                     })],
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -2616,6 +2646,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -2653,6 +2684,7 @@ mod tests {
             PersistedTerminal::Cancelled {
                 evidence: None,
                 attempts: Vec::new(),
+                overflow_recovery: None,
             }
         );
         assert_eq!(labels, ["request"]);

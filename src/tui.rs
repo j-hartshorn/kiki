@@ -9250,7 +9250,11 @@ mod tests {
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
     ) -> TerminalDetails {
-        TerminalDetails { evidence, attempts }
+        TerminalDetails {
+            evidence,
+            attempts,
+            overflow_recovery: None,
+        }
     }
 
     fn completed_record(

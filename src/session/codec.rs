@@ -10,14 +10,17 @@ use super::{
     COMPACTION_DIAGNOSTIC_LIMIT, CompactionOutcome, CompactionReason, PersistedCode,
     PersistedTerminal, ReadableCode, ReadableTerminal, SessionEntryId,
 };
-use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
+use crate::agent::{
+    ExecutionEvidence, ExecutionFailure, GenerationEvidence, OverflowRecovery, TerminalEvidence,
+};
 use crate::arena::{
     Checkpoint, Execution, ExecutionOutcome, Observation, PythonError, ToolCall, ToolCallSummary,
     ToolName,
 };
 use crate::config::{ModelSelection, SessionPreferences, model_by_id};
 use crate::model::{
-    AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderReplay,
+    AttemptAccounting, CodeResult, ModelCallId, ModelUsage, OpaqueReplayItem, ProviderFailure,
+    ProviderReplay,
 };
 use crate::subagents::{ChildParameters, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
 use crate::tools::{ContentFingerprint, ToolValue, WholeFileAuthorisations};
@@ -270,21 +273,44 @@ enum StoredToolCallSummary {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum StoredTerminal {
     Final {
         text: String,
         reasoning_summary: String,
         attempts: Vec<StoredAttemptAccounting>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overflow_recovery: Option<StoredOverflowRecovery>,
     },
     Cancelled {
         evidence: Option<StoredTerminalEvidence>,
         attempts: Vec<StoredAttemptAccounting>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overflow_recovery: Option<StoredOverflowRecovery>,
     },
     Failed {
         message: String,
         evidence: Option<StoredTerminalEvidence>,
         attempts: Vec<StoredAttemptAccounting>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overflow_recovery: Option<StoredOverflowRecovery>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredOverflowRecovery {
+    failure: StoredProviderFailure,
+    generation: Option<StoredGenerationEvidence>,
+    attempts: Vec<StoredAttemptAccounting>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredProviderFailure {
+    status: Option<u16>,
+    code: Option<String>,
+    message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -609,6 +635,29 @@ pub(super) fn decoded_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
             .map(decode_attempt)
             .collect(),
     }
+}
+
+pub(super) fn decoded_initial_overflow_attempts(entry: &DecodedEntry) -> Vec<AttemptAccounting> {
+    let DecodedEntryPayload::Terminal {
+        terminal:
+            StoredTerminal::Final {
+                overflow_recovery, ..
+            }
+            | StoredTerminal::Cancelled {
+                overflow_recovery, ..
+            }
+            | StoredTerminal::Failed {
+                overflow_recovery, ..
+            },
+        ..
+    } = &entry.0
+    else {
+        return Vec::new();
+    };
+    overflow_recovery
+        .iter()
+        .flat_map(|recovery| recovery.attempts.iter().map(decode_attempt))
+        .collect()
 }
 
 pub(super) fn decoded_compaction(entry: &DecodedEntry) -> Option<CompactionOutcome> {
@@ -1003,23 +1052,32 @@ fn decode_readable_terminal_value(
             text,
             reasoning_summary,
             attempts,
+            overflow_recovery,
         } => ReadableTerminal::Final {
             text: text.clone(),
             reasoning_summary: reasoning_summary.clone(),
             attempts: attempts.iter().map(decode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(decode_overflow_recovery),
         },
-        StoredTerminal::Cancelled { evidence, attempts } => ReadableTerminal::Cancelled {
+        StoredTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        } => ReadableTerminal::Cancelled {
             evidence: evidence.as_ref().map(decode_evidence).transpose()?,
             attempts: attempts.iter().map(decode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(decode_overflow_recovery),
         },
         StoredTerminal::Failed {
             message,
             evidence,
             attempts,
+            overflow_recovery,
         } => ReadableTerminal::Failed {
             message: message.clone(),
             evidence: evidence.as_ref().map(decode_evidence).transpose()?,
             attempts: attempts.iter().map(decode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(decode_overflow_recovery),
         },
     })
 }
@@ -1367,37 +1425,84 @@ fn encode_terminal_value(terminal: &PersistedTerminal) -> Result<StoredTerminal,
             text,
             reasoning_summary,
             attempts,
+            overflow_recovery,
             ..
         } => StoredTerminal::Final {
             text: text.clone(),
             reasoning_summary: reasoning_summary.clone(),
             attempts: attempts.iter().map(encode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(encode_overflow_recovery),
         },
-        PersistedTerminal::Cancelled { evidence, attempts } => StoredTerminal::Cancelled {
+        PersistedTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        } => StoredTerminal::Cancelled {
             evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(encode_overflow_recovery),
         },
         PersistedTerminal::Failed {
             message,
             evidence,
             attempts,
+            overflow_recovery,
         } => StoredTerminal::Failed {
             message: message.clone(),
             evidence: evidence.as_ref().map(encode_evidence).transpose()?,
             attempts: attempts.iter().map(encode_attempt).collect(),
+            overflow_recovery: overflow_recovery.as_ref().map(encode_overflow_recovery),
         },
     })
+}
+
+fn encode_overflow_recovery(recovery: &OverflowRecovery) -> StoredOverflowRecovery {
+    StoredOverflowRecovery {
+        failure: StoredProviderFailure {
+            status: recovery.failure.status(),
+            code: recovery.failure.code().map(str::to_owned),
+            message: recovery.failure.message().to_owned(),
+        },
+        generation: recovery.generation.as_ref().map(encode_generation),
+        attempts: recovery.attempts.iter().map(encode_attempt).collect(),
+    }
+}
+
+fn decode_overflow_recovery(recovery: &StoredOverflowRecovery) -> OverflowRecovery {
+    OverflowRecovery {
+        failure: ProviderFailure::new(
+            recovery.failure.status,
+            recovery.failure.code.clone(),
+            recovery.failure.message.clone(),
+        )
+        .with_context_overflow(true),
+        generation: recovery.generation.as_ref().map(decode_generation),
+        attempts: recovery.attempts.iter().map(decode_attempt).collect(),
+    }
+}
+
+fn encode_generation(evidence: &GenerationEvidence) -> StoredGenerationEvidence {
+    StoredGenerationEvidence {
+        reasoning_summary: evidence.reasoning_summary.clone(),
+        reasoning: evidence.reasoning.clone(),
+        assistant_text: evidence.assistant_text.clone(),
+        decoded_python: evidence.decoded_python.clone(),
+    }
+}
+
+fn decode_generation(evidence: &StoredGenerationEvidence) -> GenerationEvidence {
+    GenerationEvidence {
+        reasoning_summary: evidence.reasoning_summary.clone(),
+        reasoning: evidence.reasoning.clone(),
+        assistant_text: evidence.assistant_text.clone(),
+        decoded_python: evidence.decoded_python.clone(),
+    }
 }
 
 fn encode_evidence(evidence: &TerminalEvidence) -> Result<StoredTerminalEvidence, CodecError> {
     match evidence {
         TerminalEvidence::Generation(evidence) => Ok(StoredTerminalEvidence::Generation(
-            StoredGenerationEvidence {
-                reasoning_summary: evidence.reasoning_summary.clone(),
-                reasoning: evidence.reasoning.clone(),
-                assistant_text: evidence.assistant_text.clone(),
-                decoded_python: evidence.decoded_python.clone(),
-            },
+            encode_generation(evidence),
         )),
         TerminalEvidence::Execution(evidence) => Ok(StoredTerminalEvidence::Execution(Box::new(
             StoredExecutionEvidence {
@@ -1430,12 +1535,7 @@ fn encode_evidence(evidence: &TerminalEvidence) -> Result<StoredTerminalEvidence
 fn decode_evidence(evidence: &StoredTerminalEvidence) -> Result<TerminalEvidence, CodecError> {
     Ok(match evidence {
         StoredTerminalEvidence::Generation(evidence) => {
-            TerminalEvidence::Generation(GenerationEvidence {
-                reasoning_summary: evidence.reasoning_summary.clone(),
-                reasoning: evidence.reasoning.clone(),
-                assistant_text: evidence.assistant_text.clone(),
-                decoded_python: evidence.decoded_python.clone(),
-            })
+            TerminalEvidence::Generation(decode_generation(evidence))
         }
         StoredTerminalEvidence::Execution(evidence) => {
             TerminalEvidence::Execution(Box::new(ExecutionEvidence {
@@ -1678,11 +1778,11 @@ mod tests {
         DecodedTerminalHistory, decode_checkpoint, decode_entry, decode_execution_value,
         decode_path, decode_request, decode_session_preferences, decode_task_details,
         decode_task_record_details, decode_tool_value, decoded_attempts, decoded_compaction,
-        decoded_execution_history, decoded_readable_execution, decoded_readable_terminal,
-        decoded_request, decoded_request_selection, decoded_terminal_history, encode_checkpoint,
-        encode_compaction, encode_execution, encode_execution_value, encode_path, encode_request,
-        encode_session_preferences, encode_task_details, encode_terminal, encode_tool_value,
-        fail_unfinished_task_details,
+        decoded_execution_history, decoded_initial_overflow_attempts, decoded_readable_execution,
+        decoded_readable_terminal, decoded_request, decoded_request_selection,
+        decoded_terminal_history, encode_checkpoint, encode_compaction, encode_execution,
+        encode_execution_value, encode_path, encode_request, encode_session_preferences,
+        encode_task_details, encode_terminal, encode_tool_value, fail_unfinished_task_details,
     };
     use crate::arena::{Checkpoint, Execution, ExecutionOutcome, Observation, RuntimeIdentity};
     use crate::config::{
@@ -2033,6 +2133,7 @@ mod tests {
                 },
             ))),
             attempts: Vec::new(),
+            overflow_recovery: None,
         };
         let stored = encode_terminal(&terminal, None).expect("encode terminal evidence");
         let mut terminal: serde_json::Value =
@@ -2223,6 +2324,7 @@ mod tests {
                 },
             ))),
             attempts,
+            overflow_recovery: None,
         };
         let terminal_code = crate::session::PersistedCode {
             execution: None,
@@ -2243,18 +2345,26 @@ mod tests {
             decoded_terminal_history(&decoded, stored.provider_replay.as_deref()).unwrap(),
             DecodedTerminalHistory::Cancelled { code: Some(code) } if code == stored_terminal_code
         ));
-        let crate::session::PersistedTerminal::Cancelled { evidence, attempts } = terminal else {
+        let crate::session::PersistedTerminal::Cancelled {
+            evidence, attempts, ..
+        } = terminal
+        else {
             unreachable!("test terminal is cancelled");
         };
         assert_eq!(
             decoded_readable_terminal(&decoded).expect("decode readable terminal"),
-            Some(crate::session::ReadableTerminal::Cancelled { evidence, attempts })
+            Some(crate::session::ReadableTerminal::Cancelled {
+                evidence,
+                attempts,
+                overflow_recovery: None
+            })
         );
 
         let stored = encode_terminal(
             &crate::session::PersistedTerminal::Cancelled {
                 evidence: None,
                 attempts: Vec::new(),
+                overflow_recovery: None,
             },
             None,
         )
@@ -2265,6 +2375,355 @@ mod tests {
             DecodedTerminalHistory::Cancelled { code: None }
         ));
         assert!(decoded_terminal_history(&decoded, Some(&[0])).is_err());
+    }
+
+    #[test]
+    fn old_v2_terminals_and_additive_overflow_evidence_round_trip() {
+        use crate::agent::{
+            ExecutionEvidence, ExecutionFailure, GenerationEvidence, OverflowRecovery,
+            TerminalEvidence,
+        };
+        use crate::config::constants::PROVIDER_MESSAGE_LIMIT;
+        use crate::model::{
+            CodeResult, ModelCallId, OpaqueReplayItem, ProviderFailure, ProviderReplay,
+        };
+        use crate::session::{PersistedCode, PersistedTerminal, ReadableTerminal};
+
+        let empty_observation = serde_json::json!({
+            "head": "",
+            "tail": null,
+            "head_lines": 0,
+            "tail_lines": 0,
+            "total_lines": 0,
+            "total_bytes": 0,
+            "omitted_lines": 0,
+            "omitted_bytes": 0,
+            "head_ends_mid_line": false,
+            "tail_starts_mid_line": false,
+            "partial_lines": false,
+        });
+        let legacy = [
+            (
+                "final_reply",
+                serde_json::json!({ "Terminal": { "terminal": { "Final": {
+                    "text": "done",
+                    "reasoning_summary": "why",
+                    "attempts": ["UsageUnavailable"],
+                } }, "code": null } }),
+            ),
+            (
+                "failed",
+                serde_json::json!({ "Terminal": { "terminal": { "Failed": {
+                    "message": "arena failed",
+                    "evidence": { "Execution": {
+                        "source": "write()",
+                        "commentary": null,
+                        "reasoning_summary": "",
+                        "began": true,
+                        "stdout": empty_observation,
+                        "stderr": empty_observation,
+                        "tool_calls": [{ "tool": "Write", "summary": "Created" }],
+                        "read_paths": ["7372632f6c69622e7273"],
+                        "modified_paths": ["6e6f7465732e6d64"],
+                        "cancellation_warning": null,
+                        "failure": { "Arena": { "message": "arena failed" } },
+                    } },
+                    "attempts": ["UsageUnavailable"],
+                } }, "code": {
+                    "source": "write()",
+                    "call_id": "call-1",
+                    "commentary": null,
+                    "reasoning_summary": "",
+                    "result": { "Failure": { "feedback": "failed" } },
+                    "attempts": [],
+                } } }),
+            ),
+            (
+                "cancelled",
+                serde_json::json!({ "Terminal": { "terminal": { "Cancelled": {
+                    "evidence": { "Generation": {
+                        "reasoning_summary": "",
+                        "reasoning": "thinking",
+                        "assistant_text": "partial",
+                        "decoded_python": "x =",
+                    } },
+                    "attempts": [],
+                } }, "code": null } }),
+            ),
+        ];
+
+        let observation = Observation {
+            head: String::new(),
+            tail: None,
+            head_lines: 0,
+            tail_lines: 0,
+            total_lines: 0,
+            total_bytes: 0,
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            head_ends_mid_line: false,
+            tail_starts_mid_line: false,
+            partial_lines: false,
+        };
+        let execution_evidence = ExecutionEvidence {
+            source: "write()".to_owned(),
+            commentary: None,
+            reasoning_summary: String::new(),
+            began: true,
+            stdout: observation.clone(),
+            stderr: observation,
+            tool_calls: vec![crate::arena::ToolCall {
+                tool: crate::arena::ToolName::Write,
+                summary: crate::arena::ToolCallSummary::Created,
+            }],
+            read_paths: vec![PathBuf::from("src/lib.rs")],
+            modified_paths: vec![PathBuf::from("notes.md")],
+            cancellation_warning: None,
+            failure: Some(ExecutionFailure::Arena {
+                message: "arena failed".to_owned(),
+            }),
+        };
+        let code = |result| PersistedCode {
+            source: "write()".to_owned(),
+            call_id: ModelCallId::new("call-1"),
+            commentary: None,
+            reasoning_summary: String::new(),
+            replay: ProviderReplay::new("openai", vec![OpaqueReplayItem::new(b"call".to_vec())]),
+            result,
+            execution: None,
+            attempts: Vec::new(),
+        };
+        let failed_code = code(CodeResult::Failure {
+            feedback: "failed".to_owned(),
+        });
+        let final_reply = |overflow_recovery| PersistedTerminal::Final {
+            step_id: 1,
+            text: "done".to_owned(),
+            reasoning_summary: "why".to_owned(),
+            replay: ProviderReplay::new("openai", vec![OpaqueReplayItem::new(b"done".to_vec())]),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+            overflow_recovery,
+        };
+        let failed = |overflow_recovery| PersistedTerminal::Failed {
+            message: "arena failed".to_owned(),
+            evidence: Some(TerminalEvidence::Execution(Box::new(
+                execution_evidence.clone(),
+            ))),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+            overflow_recovery,
+        };
+        let readable = |terminal: &PersistedTerminal| match terminal.clone() {
+            PersistedTerminal::Final {
+                text,
+                reasoning_summary,
+                attempts,
+                overflow_recovery,
+                ..
+            } => ReadableTerminal::Final {
+                text,
+                reasoning_summary,
+                attempts,
+                overflow_recovery,
+            },
+            PersistedTerminal::Cancelled {
+                evidence,
+                attempts,
+                overflow_recovery,
+            } => ReadableTerminal::Cancelled {
+                evidence,
+                attempts,
+                overflow_recovery,
+            },
+            PersistedTerminal::Failed {
+                message,
+                evidence,
+                attempts,
+                overflow_recovery,
+            } => ReadableTerminal::Failed {
+                message,
+                evidence,
+                attempts,
+                overflow_recovery,
+            },
+        };
+        let ordinary = [
+            (final_reply(None), None),
+            (failed(None), Some(failed_code.clone())),
+            (
+                PersistedTerminal::Cancelled {
+                    evidence: Some(TerminalEvidence::Generation(GenerationEvidence {
+                        reasoning_summary: String::new(),
+                        reasoning: "thinking".to_owned(),
+                        assistant_text: "partial".to_owned(),
+                        decoded_python: "x =".to_owned(),
+                    })),
+                    attempts: Vec::new(),
+                    overflow_recovery: None,
+                },
+                None,
+            ),
+        ];
+        for ((kind, payload), (terminal, code)) in legacy.into_iter().zip(&ordinary) {
+            let decoded =
+                decode_entry(kind, &payload.to_string()).expect("decode Phase-2 terminal");
+            assert_eq!(
+                decoded_readable_terminal(&decoded).expect("read Phase-2 terminal"),
+                Some(readable(terminal)),
+                "{kind}"
+            );
+            assert_eq!(decoded_initial_overflow_attempts(&decoded), Vec::new());
+            let reencoded = encode_terminal(terminal, code.as_ref()).expect("re-encode terminal");
+            assert_eq!(reencoded.kind, kind);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&reencoded.payload_json)
+                    .expect("parse re-encoded terminal"),
+                payload,
+                "{kind}"
+            );
+        }
+
+        let initial = vec![AttemptAccounting::KnownUsage(ModelUsage {
+            model: SOL.id.to_owned(),
+            service_tier: None,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
+            output_tokens: Some(10),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(110),
+        })];
+        let failure = ProviderFailure::new(
+            Some(400),
+            Some("context_length_exceeded".to_owned()),
+            format!(
+                "maximum context length {}",
+                "é".repeat(PROVIDER_MESSAGE_LIMIT)
+            ),
+        )
+        .with_context_overflow(true);
+        assert!(failure.message().len() <= PROVIDER_MESSAGE_LIMIT);
+        let immediate = OverflowRecovery {
+            failure: failure.clone(),
+            generation: None,
+            attempts: initial.clone(),
+        };
+        let interrupted = OverflowRecovery {
+            failure,
+            generation: Some(GenerationEvidence {
+                reasoning_summary: String::new(),
+                reasoning: "initial reasoning".to_owned(),
+                assistant_text: "initial partial".to_owned(),
+                decoded_python: "initial_code(".to_owned(),
+            }),
+            attempts: initial.clone(),
+        };
+        let recovered = [
+            (final_reply(Some(immediate)), None),
+            (failed(Some(interrupted.clone())), Some(failed_code)),
+            (
+                PersistedTerminal::Cancelled {
+                    evidence: Some(TerminalEvidence::Execution(Box::new(ExecutionEvidence {
+                        cancellation_warning: Some("cancelled".to_owned()),
+                        failure: None,
+                        ..execution_evidence.clone()
+                    }))),
+                    attempts: vec![AttemptAccounting::UsageUnavailable],
+                    overflow_recovery: Some(interrupted),
+                },
+                Some(code(CodeResult::Cancelled {
+                    feedback: "cancelled".to_owned(),
+                })),
+            ),
+        ];
+        for (terminal, code) in &recovered {
+            let stored =
+                encode_terminal(terminal, code.as_ref()).expect("encode recovered terminal");
+            let payload: serde_json::Value =
+                serde_json::from_str(&stored.payload_json).expect("parse recovered terminal");
+            let variant = payload["Terminal"]["terminal"]
+                .as_object()
+                .and_then(|variant| variant.values().next())
+                .expect("stored terminal variant");
+            let mut misspelt = payload.clone();
+            let misspelt_variant = misspelt["Terminal"]["terminal"]
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("stored terminal variant");
+            let recovery = misspelt_variant
+                .remove("overflow_recovery")
+                .expect("stored overflow recovery");
+            misspelt_variant.insert("overflow_recovry".to_owned(), recovery);
+            assert!(
+                decode_entry(stored.kind, &misspelt.to_string()).is_err(),
+                "{}",
+                stored.kind
+            );
+            let decoded =
+                decode_entry(stored.kind, &stored.payload_json).expect("decode recovered terminal");
+            let expected = readable(terminal);
+            let (ReadableTerminal::Final {
+                attempts,
+                overflow_recovery: Some(recovery),
+                ..
+            }
+            | ReadableTerminal::Cancelled {
+                attempts,
+                overflow_recovery: Some(recovery),
+                ..
+            }
+            | ReadableTerminal::Failed {
+                attempts,
+                overflow_recovery: Some(recovery),
+                ..
+            }) = &expected
+            else {
+                unreachable!("recovered terminals carry overflow evidence");
+            };
+            assert_eq!(
+                variant["overflow_recovery"]["generation"].is_null(),
+                recovery.generation.is_none(),
+                "{}",
+                stored.kind
+            );
+            assert_eq!(decoded_attempts(&decoded), *attempts, "{}", stored.kind);
+            assert_eq!(decoded_initial_overflow_attempts(&decoded), initial);
+            assert_eq!(
+                decoded_readable_terminal(&decoded).expect("read recovered terminal"),
+                Some(expected.clone()),
+                "{}",
+                stored.kind
+            );
+        }
+
+        let (terminal, _) = &recovered[0];
+        let stored = encode_terminal(terminal, None).expect("encode recovered final");
+        let decoded =
+            decode_entry(stored.kind, &stored.payload_json).expect("decode recovered final");
+        assert!(matches!(
+            decoded_terminal_history(&decoded, stored.provider_replay.as_deref()),
+            Ok(DecodedTerminalHistory::Final { text, replay, .. })
+                if text == "done" && replay.items()[0].as_bytes() == b"done"
+        ));
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&stored.payload_json).expect("parse recovered final");
+        let recovery = &mut payload["Terminal"]["terminal"]["Final"]["overflow_recovery"];
+        recovery["failure"]["message"] = serde_json::json!("é".repeat(PROVIDER_MESSAGE_LIMIT));
+        let decoded =
+            decode_entry("final_reply", &payload.to_string()).expect("decode oversized diagnostic");
+        let Some(ReadableTerminal::Final {
+            overflow_recovery: Some(recovery),
+            ..
+        }) = decoded_readable_terminal(&decoded).expect("read oversized diagnostic")
+        else {
+            panic!("recovered final keeps its overflow evidence");
+        };
+        assert!(recovery.failure.message().len() <= PROVIDER_MESSAGE_LIMIT);
+        assert!(recovery.failure.is_context_overflow());
+        payload["Terminal"]["terminal"]["Final"]["overflow_recovery"]["unknown"] =
+            serde_json::json!(true);
+        assert!(decode_entry("final_reply", &payload.to_string()).is_err());
     }
 
     fn foreground_code() -> crate::session::PersistedCode {
@@ -2286,6 +2745,7 @@ mod tests {
         crate::session::PersistedTerminal::Cancelled {
             evidence: None,
             attempts: Vec::new(),
+            overflow_recovery: None,
         }
     }
 

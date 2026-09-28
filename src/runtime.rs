@@ -6,8 +6,8 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AgentProgress, CompactionResult, PersistedAgentEvent, PersistedRunOutcome,
-    TerminalEvidence,
+    Agent, AgentProgress, CompactionResult, OverflowRecovery, PersistedAgentEvent,
+    PersistedRunOutcome, TerminalEvidence,
 };
 use crate::arena::{Execution, RunPreview, ToolCall, ToolCallSummary, ToolCallToken, ToolName};
 use crate::config::{
@@ -95,16 +95,25 @@ pub(crate) enum CompactionSettlement {
 pub(crate) struct TerminalDetails {
     pub(crate) evidence: Option<TerminalEvidence>,
     pub(crate) attempts: Vec<AttemptAccounting>,
+    pub(crate) overflow_recovery: Option<OverflowRecovery>,
 }
 
 impl TerminalDetails {
-    fn new(evidence: Option<TerminalEvidence>, attempts: Vec<AttemptAccounting>) -> Self {
-        Self { evidence, attempts }
+    fn new(
+        evidence: Option<TerminalEvidence>,
+        attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
+    ) -> Self {
+        Self {
+            evidence,
+            attempts,
+            overflow_recovery,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
-        Self::new(None, Vec::new())
+        Self::new(None, Vec::new(), None)
     }
 }
 
@@ -559,23 +568,29 @@ fn record_from_persisted_terminal(terminal: PersistedTerminal) -> Record {
             text,
             reasoning_summary,
             attempts,
+            overflow_recovery,
             ..
         } => Record::FinalMessage {
             step_id: ModelStepId(step_id),
             text,
             reasoning_summary,
-            terminal: TerminalDetails::new(None, attempts),
+            terminal: TerminalDetails::new(None, attempts, overflow_recovery),
         },
-        PersistedTerminal::Cancelled { evidence, attempts } => Record::CancelledRun {
-            terminal: TerminalDetails::new(evidence, attempts),
+        PersistedTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        } => Record::CancelledRun {
+            terminal: TerminalDetails::new(evidence, attempts, overflow_recovery),
         },
         PersistedTerminal::Failed {
             message,
             evidence,
             attempts,
+            overflow_recovery,
         } => Record::FailedRun {
             message,
-            terminal: TerminalDetails::new(evidence, attempts),
+            terminal: TerminalDetails::new(evidence, attempts, overflow_recovery),
         },
     }
 }
@@ -713,11 +728,22 @@ fn restored_initial_state(restore: &SessionRestore) -> RuntimeInitialState {
 fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
     let run_id = record.run_id;
     let terminal_details = |terminal: ReadableTerminal| match terminal {
-        ReadableTerminal::Final { attempts, .. } => TerminalDetails::new(None, attempts),
-        ReadableTerminal::Cancelled { evidence, attempts }
+        ReadableTerminal::Final {
+            attempts,
+            overflow_recovery,
+            ..
+        } => TerminalDetails::new(None, attempts, overflow_recovery),
+        ReadableTerminal::Cancelled {
+            evidence,
+            attempts,
+            overflow_recovery,
+        }
         | ReadableTerminal::Failed {
-            evidence, attempts, ..
-        } => TerminalDetails::new(evidence, attempts),
+            evidence,
+            attempts,
+            overflow_recovery,
+            ..
+        } => TerminalDetails::new(evidence, attempts, overflow_recovery),
     };
     let record = match record.kind {
         RestoredRecordKind::UserRequest { request, selection } => {
@@ -2405,10 +2431,13 @@ mod tests {
         ModelStepId, PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ProgressPublisher, Record,
         RestoredTimelineItem, ResumeOptions, RunId, RuntimeCommand, RuntimeController,
         RuntimeDisabledReason, RuntimeEvent, RuntimeProgressReceiver, StoredRecord,
-        TerminalDetails, WorkerMessage, restored_initial_state, restored_stored_record,
-        runtime_event_payload_bytes,
+        TerminalDetails, WorkerMessage, record_from_persisted_terminal, restored_initial_state,
+        restored_stored_record, runtime_event_payload_bytes,
     };
-    use crate::agent::{Agent, ArenaRestoreTestGate, ExecutionFailure, TerminalEvidence};
+    use crate::agent::{
+        Agent, ArenaRestoreTestGate, ExecutionFailure, GenerationEvidence, OverflowRecovery,
+        TerminalEvidence,
+    };
     use crate::anthropic::AnthropicModel;
     use crate::arena::{
         Arena, Checkpoint, Execution, ExecutionOutcome, RecoveryTestGate, RuntimeIdentity,
@@ -2559,6 +2588,7 @@ mod tests {
                             vec![OpaqueReplayItem::new(vec![b'x'; 100_000])],
                         ),
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3338,6 +3368,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3676,6 +3707,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -3820,6 +3852,7 @@ mod tests {
                                 vec![OpaqueReplayItem::new(b"signed-thinking".to_vec())],
                             ),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -3836,6 +3869,7 @@ mod tests {
                         || PersistedTerminal::Cancelled {
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -3951,6 +3985,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -4579,6 +4614,7 @@ mod tests {
                             reasoning_summary: String::new(),
                             replay: ProviderReplay::new("fixture", Vec::new()),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -4593,6 +4629,7 @@ mod tests {
                             message: "failed wins".to_owned(),
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -5295,6 +5332,7 @@ mod tests {
                             reasoning_summary: String::new(),
                             replay: ProviderReplay::new("fixture", Vec::new()),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         None,
                     )
@@ -5380,6 +5418,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -7995,6 +8034,159 @@ mod tests {
         });
         assert_eq!(restored.run_id, RunId(3));
         assert_eq!(restored.record, Record::Compaction { outcome });
+    }
+
+    #[tokio::test]
+    async fn recovered_terminals_keep_initial_overflow_through_live_and_restored_mapping() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .expect("open tool host"),
+        )
+        .await
+        .expect("create arena");
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking)
+            .expect("select model");
+        let session = Session::create(home.path(), workspace.path(), selection, arena.checkpoint())
+            .expect("create session");
+        let writer = session.writer();
+        let recovery = |index: usize| OverflowRecovery {
+            failure: ProviderFailure::new(
+                Some(400),
+                Some("context_length_exceeded".to_owned()),
+                format!("maximum context length {index}"),
+            )
+            .with_context_overflow(true),
+            generation: Some(GenerationEvidence {
+                reasoning_summary: String::new(),
+                reasoning: String::new(),
+                assistant_text: format!("INITIAL_PARTIAL_{index}"),
+                decoded_python: String::new(),
+            }),
+            attempts: vec![AttemptAccounting::UsageUnavailable],
+        };
+        let mut live = Vec::new();
+        for index in 0..3 {
+            let admission = writer
+                .commit_request(format!("request {index}"), selection)
+                .await
+                .expect("commit request");
+            let step_id = writer
+                .start_model_step(admission.run_id)
+                .await
+                .expect("start step");
+            let overflow_recovery = Some(recovery(index));
+            let attempts = vec![AttemptAccounting::UsageUnavailable];
+            let terminal = match index {
+                0 => PersistedTerminal::Final {
+                    step_id,
+                    text: "RETRY_FINAL".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: ProviderReplay::new("openai", Vec::new()),
+                    attempts,
+                    overflow_recovery,
+                },
+                1 => PersistedTerminal::Failed {
+                    message: "RETRY_FAILURE".to_owned(),
+                    evidence: None,
+                    attempts,
+                    overflow_recovery,
+                },
+                _ => PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts,
+                    overflow_recovery,
+                },
+            };
+            let terminal = writer
+                .close_run(admission.run_id, Some(step_id), move || terminal, None)
+                .await
+                .expect("close recovered run");
+            live.push(StoredRecord {
+                run_id: RunId(admission.run_id),
+                record: record_from_persisted_terminal(terminal),
+            });
+        }
+        for (index, record) in live.iter().enumerate() {
+            assert!(matches!(
+                &record.record,
+                Record::FinalMessage { terminal, .. }
+                    | Record::CancelledRun { terminal }
+                    | Record::FailedRun { terminal, .. }
+                    if terminal.overflow_recovery == Some(recovery(index))
+            ));
+        }
+        let initial = restored_initial_state(&session.restore().expect("restore recovered runs"));
+        let restored = initial
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::Record(record)
+                    if !matches!(record.record, Record::UserRequest { .. }) =>
+                {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(restored, live);
+
+        let render = |transcript: &mut Transcript| {
+            let layout = transcript.layout(1024);
+            let height = u16::try_from(layout.total_height()).expect("test transcript height");
+            let mut buffer =
+                ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1024, height));
+            layout.render(buffer.area, 0, &mut buffer);
+            buffer
+                .content
+                .chunks(1024)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut live_transcript = Transcript::default();
+        for record in live {
+            live_transcript.apply(
+                RuntimeEvent::RecordAppended {
+                    record,
+                    progress_gap: false,
+                },
+                false,
+            );
+        }
+        let mut restored_transcript =
+            Transcript::restored(crate::config::ready_snapshot_for_test(), &initial);
+        for rendered in [
+            render(&mut live_transcript),
+            render(&mut restored_transcript),
+        ] {
+            let mut record_start = 0;
+            for (index, outcome) in ["RETRY_FINAL", "failed: RETRY_FAILURE", "cancelled"]
+                .into_iter()
+                .enumerate()
+            {
+                let outcome_start = record_start
+                    + rendered[record_start..]
+                        .find(outcome)
+                        .expect("record outcome");
+                let record = &rendered[record_start..outcome_start];
+                for marker in [
+                    format!(
+                        "context overflow: provider failure (HTTP 400) [context_length_exceeded]: maximum context length {index}"
+                    ),
+                    format!("INITIAL_PARTIAL_{index}"),
+                ] {
+                    assert_eq!(rendered.matches(&marker).count(), 1, "{marker}\n{rendered}");
+                    assert!(record.contains(&marker), "{outcome}: {marker}\n{rendered}");
+                }
+                record_start = outcome_start + outcome.len();
+            }
+        }
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[test]
@@ -10805,6 +10997,7 @@ mod tests {
                         terminal: PersistedTerminal::Cancelled {
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                         authentication_failure: false,
                         recovery_failure: false,
@@ -11871,6 +12064,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 "final",
             ),
@@ -11879,6 +12073,7 @@ mod tests {
                     message: "failed wins".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 "failed",
             ),
@@ -15314,6 +15509,7 @@ mod tests {
                             text: "saved answer".to_owned(),
                             reasoning_summary: String::new(),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -15390,6 +15586,7 @@ mod tests {
                             text: "origin answer".to_owned(),
                             reasoning_summary: String::new(),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -15455,6 +15652,7 @@ mod tests {
                 text: text.to_owned(),
                 reasoning_summary: String::new(),
                 attempts: Vec::new(),
+                overflow_recovery: None,
             },
         };
         let initial = restored_initial_state(&SessionRestore {
@@ -15937,6 +16135,7 @@ mod tests {
                         message: "sibling terminal failure".to_owned(),
                         evidence: None,
                         attempts: vec![sibling_terminal_attempt],
+                        overflow_recovery: None,
                     }
                 },
                 Some(PersistedCode {
@@ -16760,6 +16959,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: terminal_replay,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -18320,6 +18520,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )

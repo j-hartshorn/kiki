@@ -11,7 +11,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use tui_markdown::{ImageFallback, Options, StyleSheet, from_str_with_options};
 
-use crate::agent::{ExecutionEvidence, ExecutionFailure, GenerationEvidence, TerminalEvidence};
+use crate::agent::{
+    ExecutionEvidence, ExecutionFailure, GenerationEvidence, OverflowRecovery, TerminalEvidence,
+};
 use crate::arena::{
     Execution, ExecutionOutcome, Observation, RunPreview, ToolCall, ToolCallSummary, ToolCallToken,
     ToolName,
@@ -3038,6 +3040,7 @@ impl Transcript {
         let mut normal_foreground_attempts = Vec::new();
         for displayed in &self.records {
             append_record_attempts(&displayed.record.record, &mut foreground_attempts);
+            append_initial_overflow_attempts(&displayed.record.record, &mut foreground_attempts);
             if !matches!(displayed.record.record, Record::Compaction { .. }) {
                 append_record_attempts(&displayed.record.record, &mut normal_foreground_attempts);
             }
@@ -3681,6 +3684,19 @@ fn append_record_attempts<'a>(record: &'a Record, attempts: &mut Vec<&'a Attempt
     }
 }
 
+fn append_initial_overflow_attempts<'a>(
+    record: &'a Record,
+    attempts: &mut Vec<&'a AttemptAccounting>,
+) {
+    if let Record::FinalMessage { terminal, .. }
+    | Record::CancelledRun { terminal }
+    | Record::FailedRun { terminal, .. } = record
+        && let Some(recovery) = &terminal.overflow_recovery
+    {
+        attempts.extend(&recovery.attempts);
+    }
+}
+
 fn record_blocks(
     displayed: &DisplayedRecord,
     previous_selection: Option<ModelSelection>,
@@ -3730,6 +3746,7 @@ fn record_blocks(
             ..
         } => {
             let mut blocks = Vec::new();
+            append_overflow_recovery(&mut blocks, terminal.overflow_recovery.as_ref());
             append_reasoning(&mut blocks, reasoning_summary, "");
             terminal_evidence_blocks(&mut blocks, terminal.evidence.as_ref());
             blocks.push(TranscriptBlock::Assistant {
@@ -3740,13 +3757,25 @@ fn record_blocks(
             blocks
         }
         Record::CancelledRun { terminal } => {
-            terminal_blocks("cancelled".to_owned(), terminal, displayed.progress_gap)
+            let mut blocks = Vec::new();
+            append_overflow_recovery(&mut blocks, terminal.overflow_recovery.as_ref());
+            blocks.extend(terminal_blocks(
+                "cancelled".to_owned(),
+                terminal,
+                displayed.progress_gap,
+            ));
+            blocks
         }
-        Record::FailedRun { message, terminal } => terminal_blocks(
-            format!("failed: {message}"),
-            terminal,
-            displayed.progress_gap,
-        ),
+        Record::FailedRun { message, terminal } => {
+            let mut blocks = Vec::new();
+            append_overflow_recovery(&mut blocks, terminal.overflow_recovery.as_ref());
+            blocks.extend(terminal_blocks(
+                format!("failed: {message}"),
+                terminal,
+                displayed.progress_gap,
+            ));
+            blocks
+        }
         Record::Compaction { outcome } => {
             vec![TranscriptBlock::Compaction(compaction_card(outcome))]
         }
@@ -3966,32 +3995,8 @@ fn terminal_evidence_blocks(
     evidence: Option<&TerminalEvidence>,
 ) {
     match evidence {
-        Some(TerminalEvidence::Generation(GenerationEvidence {
-            reasoning_summary,
-            reasoning,
-            assistant_text,
-            decoded_python,
-        })) => {
-            append_reasoning(blocks, reasoning_summary, reasoning);
-            if !assistant_text.is_empty() {
-                blocks.push(TranscriptBlock::Assistant {
-                    markdown: assistant_text.clone(),
-                    accounting: None,
-                });
-            }
-            if !decoded_python.is_empty() {
-                blocks.push(TranscriptBlock::Arena(ArenaBlock {
-                    state: ArenaState::Error,
-                    heading: None,
-                    status: None,
-                    source: Some(decoded_python.clone()),
-                    tool_calls: Vec::new(),
-                    run_previews: Vec::new(),
-                    content: Vec::new(),
-                    progress_gap: false,
-                    accounting: None,
-                }));
-            }
+        Some(TerminalEvidence::Generation(evidence)) => {
+            append_generation_evidence(blocks, evidence)
         }
         Some(TerminalEvidence::Execution(evidence)) => {
             append_reasoning(blocks, &evidence.reasoning_summary, "");
@@ -4001,6 +4006,45 @@ fn terminal_evidence_blocks(
             )));
         }
         None => {}
+    }
+}
+
+fn append_overflow_recovery(
+    blocks: &mut Vec<TranscriptBlock>,
+    recovery: Option<&OverflowRecovery>,
+) {
+    let Some(recovery) = recovery else {
+        return;
+    };
+    blocks.push(TranscriptBlock::Status {
+        text: format!("context overflow: {}", recovery.failure),
+    });
+    if let Some(generation) = &recovery.generation {
+        append_generation_evidence(blocks, generation);
+    }
+    append_accounting(blocks, step_accounting(&recovery.attempts));
+}
+
+fn append_generation_evidence(blocks: &mut Vec<TranscriptBlock>, evidence: &GenerationEvidence) {
+    append_reasoning(blocks, &evidence.reasoning_summary, &evidence.reasoning);
+    if !evidence.assistant_text.is_empty() {
+        blocks.push(TranscriptBlock::Assistant {
+            markdown: evidence.assistant_text.clone(),
+            accounting: None,
+        });
+    }
+    if !evidence.decoded_python.is_empty() {
+        blocks.push(TranscriptBlock::Arena(ArenaBlock {
+            state: ArenaState::Error,
+            heading: None,
+            status: None,
+            source: Some(evidence.decoded_python.clone()),
+            tool_calls: Vec::new(),
+            run_previews: Vec::new(),
+            content: Vec::new(),
+            progress_gap: false,
+            accounting: None,
+        }));
     }
 }
 
@@ -5345,6 +5389,7 @@ mod tests {
                         terminal: TerminalDetails {
                             evidence: None,
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -6443,6 +6488,7 @@ mod tests {
                     terminal: TerminalDetails {
                         evidence: None,
                         attempts,
+                        overflow_recovery: None,
                     },
                 },
             },
@@ -7333,6 +7379,7 @@ Problems: none"
                                 },
                             ))),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -8210,6 +8257,158 @@ truncated"
         assert!(!footer.contains("CH25.0%"), "{footer}");
     }
 
+    fn overflow_recovery(attempts: Vec<AttemptAccounting>) -> crate::agent::OverflowRecovery {
+        crate::agent::OverflowRecovery {
+            failure: crate::model::ProviderFailure::new(
+                Some(400),
+                Some("context_length_exceeded".to_owned()),
+                "maximum context length".to_owned(),
+            )
+            .with_context_overflow(true),
+            generation: Some(GenerationEvidence {
+                reasoning_summary: String::new(),
+                reasoning: "initial reasoning".to_owned(),
+                assistant_text: "initial partial".to_owned(),
+                decoded_python: "initial_code()".to_owned(),
+            }),
+            attempts,
+        }
+    }
+
+    fn recovered_final(
+        attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<crate::agent::OverflowRecovery>,
+    ) -> RuntimeEvent {
+        RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::FinalMessage {
+                    step_id: ModelStepId(1),
+                    text: "retry final".to_owned(),
+                    reasoning_summary: String::new(),
+                    terminal: TerminalDetails {
+                        evidence: None,
+                        attempts,
+                        overflow_recovery,
+                    },
+                },
+            },
+            progress_gap: false,
+        }
+    }
+
+    #[test]
+    fn overflow_recovery_renders_initial_evidence_before_the_last_outcome() {
+        let initial_blocks = |attempts: &[AttemptAccounting]| {
+            let mut blocks = vec![
+                TranscriptBlock::Status {
+                    text: "context overflow: provider failure (HTTP 400) [context_length_exceeded]: maximum context length".to_owned(),
+                },
+                TranscriptBlock::Reasoning {
+                    markdown: "initial reasoning".to_owned(),
+                },
+                TranscriptBlock::Assistant {
+                    markdown: "initial partial".to_owned(),
+                    accounting: None,
+                },
+                TranscriptBlock::Arena(ArenaBlock {
+                    state: super::ArenaState::Error,
+                    heading: None,
+                    status: None,
+                    source: Some("initial_code()".to_owned()),
+                    tool_calls: Vec::new(),
+                    run_previews: Vec::new(),
+                    content: Vec::new(),
+                    progress_gap: false,
+                    accounting: None,
+                }),
+            ];
+            if let Some(text) = step_accounting(attempts) {
+                blocks.push(TranscriptBlock::Accounting { text });
+            }
+            blocks
+        };
+        let initial = vec![usage(1, 1)];
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            recovered_final(vec![usage(2, 2)], Some(overflow_recovery(initial.clone()))),
+            false,
+        );
+        let mut expected = initial_blocks(&initial);
+        expected.push(TranscriptBlock::Assistant {
+            markdown: "retry final".to_owned(),
+            accounting: step_accounting(&[usage(2, 2)]),
+        });
+        assert_eq!(transcript.blocks(), expected);
+
+        let mut transcript = Transcript::default();
+        transcript.apply(
+            RuntimeEvent::RecordAppended {
+                record: StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::FailedRun {
+                        message: "retry failed".to_owned(),
+                        terminal: TerminalDetails {
+                            evidence: None,
+                            attempts: Vec::new(),
+                            overflow_recovery: Some(overflow_recovery(Vec::new())),
+                        },
+                    },
+                },
+                progress_gap: false,
+            },
+            false,
+        );
+        let mut expected = initial_blocks(&[]);
+        expected.push(TranscriptBlock::Status {
+            text: "failed: retry failed".to_owned(),
+        });
+        assert_eq!(transcript.blocks(), expected);
+    }
+
+    #[test]
+    fn footer_bills_initial_overflow_attempts_without_replacing_normal_occupancy() {
+        let footer = |event| {
+            let mut transcript = Transcript::default();
+            transcript.apply(event, false);
+            footer_text(&transcript.layout(128)).unwrap_or_default()
+        };
+        let known = detailed_usage(
+            Some(100_000),
+            Some(0),
+            Some(75_000),
+            Some(0),
+            Some(0),
+            Some(100_000),
+        );
+
+        let unavailable = footer(recovered_final(
+            vec![AttemptAccounting::UsageUnavailable],
+            None,
+        ));
+        let recovered = footer(recovered_final(
+            vec![AttemptAccounting::UsageUnavailable],
+            Some(overflow_recovery(vec![known.clone()])),
+        ));
+        assert!(!unavailable.contains('$'), "{unavailable}");
+        assert!(recovered.contains("↑100k"), "{recovered}");
+        assert!(recovered.contains('$'), "{recovered}");
+        assert!(!recovered.contains("%/"), "{recovered}");
+        assert!(!recovered.contains("CH"), "{recovered}");
+
+        let ordinary = footer(recovered_final(vec![known.clone()], None));
+        let doubled = footer(recovered_final(
+            vec![known.clone()],
+            Some(overflow_recovery(vec![known])),
+        ));
+        assert!(ordinary.contains("↑100k"), "{ordinary}");
+        assert!(doubled.contains("↑200k"), "{doubled}");
+        for footer in [ordinary, doubled] {
+            assert!(footer.contains("CH75.0% "), "{footer}");
+            assert!(footer.contains("36.8%/272k"), "{footer}");
+        }
+    }
+
     #[test]
     fn footer_uses_the_latest_settled_attempt_during_streaming() {
         let first = detailed_usage(
@@ -8637,6 +8836,7 @@ truncated"
                         terminal: TerminalDetails {
                             evidence: None,
                             attempts: vec![AttemptAccounting::UsageUnavailable; 3],
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -8987,6 +9187,7 @@ truncated"
                                 },
                             ))),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -9007,6 +9208,7 @@ truncated"
                                 decoded_python: "interrupted_code()".to_owned(),
                             })),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -9311,6 +9513,7 @@ truncated"
                                     decoded_python: code.to_owned(),
                                 })),
                                 attempts: Vec::new(),
+                                overflow_recovery: None,
                             },
                         },
                     },
@@ -9411,6 +9614,7 @@ truncated"
                             cancellation_warning: None,
                         }))),
                         attempts: vec![usage(1, 1)],
+                        overflow_recovery: None,
                     },
                 },
             ),
@@ -9428,6 +9632,7 @@ truncated"
                             decoded_python: "failed_code()".to_owned(),
                         })),
                         attempts: vec![usage(1, 1)],
+                        overflow_recovery: None,
                     },
                 },
             ),
@@ -9499,6 +9704,7 @@ truncated"
                                 decoded_python: "partial_code()".to_owned(),
                             })),
                             attempts: vec![usage(1, 1)],
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -9800,6 +10006,7 @@ truncated"
                                 decoded_python: hostile.to_owned(),
                             })),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -9835,6 +10042,7 @@ truncated"
                                 },
                             ))),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -11428,6 +11636,7 @@ truncated"
                             failure: None,
                         }))),
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                 },
             ),
@@ -11453,6 +11662,7 @@ truncated"
                             }),
                         }))),
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                 },
             ),
@@ -11494,6 +11704,7 @@ truncated"
                                 decoded_python: "terminal_decoded_source".to_owned(),
                             })),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },
@@ -11639,6 +11850,7 @@ truncated"
                                 },
                             ))),
                             attempts: Vec::new(),
+                            overflow_recovery: None,
                         },
                     },
                 },

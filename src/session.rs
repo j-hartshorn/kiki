@@ -17,7 +17,7 @@ use rustix::io::Errno;
 use thiserror::Error;
 use tokio::task;
 
-use crate::agent::TerminalEvidence;
+use crate::agent::{OverflowRecovery, TerminalEvidence};
 use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::settings::CrossProviderReasoning;
@@ -235,15 +235,18 @@ pub(crate) enum PersistedTerminal {
         reasoning_summary: String,
         replay: crate::model::ProviderReplay,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Cancelled {
         evidence: Option<crate::agent::TerminalEvidence>,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Failed {
         message: String,
         evidence: Option<crate::agent::TerminalEvidence>,
         attempts: Vec<crate::model::AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
 }
 
@@ -262,15 +265,18 @@ pub(crate) enum ReadableTerminal {
         text: String,
         reasoning_summary: String,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Cancelled {
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
     Failed {
         message: String,
         evidence: Option<TerminalEvidence>,
         attempts: Vec<AttemptAccounting>,
+        overflow_recovery: Option<OverflowRecovery>,
     },
 }
 
@@ -2023,6 +2029,7 @@ fn recover_interrupted_operations(connection: &mut Connection) -> Result<(), Ses
             message: INTERRUPTION_MESSAGE.to_owned(),
             evidence: None,
             attempts: Vec::new(),
+            overflow_recovery: None,
         };
         let stored_terminal = codec::encode_terminal(&terminal, None)
             .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -3047,6 +3054,7 @@ fn restore_projection_at(
                     continue;
                 };
                 footer_adjustment.extend(codec::decoded_attempts(decoded));
+                footer_adjustment.extend(codec::decoded_initial_overflow_attempts(decoded));
             }
             "compaction" => {
                 if validate_compaction_entry(entry.payload(), &payloads).is_err() {
@@ -4004,6 +4012,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4030,6 +4039,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4650,6 +4660,7 @@ mod tests {
                 reasoning_summary: String::new(),
                 replay: crate::model::ProviderReplay::new("test", Vec::new()),
                 attempts: Vec::new(),
+                overflow_recovery: None,
             },
             None,
         )
@@ -4785,6 +4796,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4879,6 +4891,7 @@ mod tests {
                     message: "sibling failed".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -4983,6 +4996,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5090,6 +5104,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5141,6 +5156,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5171,6 +5187,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5263,6 +5280,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5345,6 +5363,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5385,6 +5404,7 @@ mod tests {
                     message: "closed with a pending step".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5471,6 +5491,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5547,6 +5568,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5603,6 +5625,7 @@ mod tests {
                     message: "selection failure fixture".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5682,6 +5705,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5702,6 +5726,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5723,6 +5748,7 @@ mod tests {
                     message: "failure".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5952,6 +5978,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5972,6 +5999,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -5993,6 +6021,7 @@ mod tests {
                     message: "catalogue failure".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6099,6 +6128,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6142,6 +6172,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6245,6 +6276,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6319,6 +6351,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -6412,6 +6445,7 @@ mod tests {
                     message: "selected terminal".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -7805,6 +7839,7 @@ mod tests {
                                     message: "closed before interruption".to_owned(),
                                     evidence: None,
                                     attempts: Vec::new(),
+                                    overflow_recovery: None,
                                 },
                                 None,
                             )
@@ -8119,6 +8154,7 @@ mod tests {
                     message: "already closed".to_owned(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -8803,6 +8839,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -8862,6 +8899,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -8928,6 +8966,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -9008,6 +9047,7 @@ mod tests {
                                 message: "close with a pending step".to_owned(),
                                 evidence: None,
                                 attempts: Vec::new(),
+                                overflow_recovery: None,
                             },
                             None,
                         )
@@ -9073,6 +9113,7 @@ mod tests {
                             || PersistedTerminal::Cancelled {
                                 evidence: None,
                                 attempts: Vec::new(),
+                                overflow_recovery: None,
                             },
                             None,
                         )
@@ -9113,6 +9154,7 @@ mod tests {
                     reasoning_summary: String::new(),
                     replay: crate::model::ProviderReplay::new("test", Vec::new()),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
             (
@@ -9120,6 +9162,7 @@ mod tests {
                 PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
             (
@@ -9128,6 +9171,7 @@ mod tests {
                     message: String::new(),
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
             ),
         ];
@@ -9315,6 +9359,7 @@ mod tests {
             reasoning_summary: String::new(),
             replay: crate::model::ProviderReplay::new("test", Vec::new()),
             attempts: Vec::new(),
+            overflow_recovery: None,
         };
 
         assert!(matches!(
@@ -9438,6 +9483,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -9490,6 +9536,7 @@ mod tests {
                 || PersistedTerminal::Cancelled {
                     evidence: None,
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -9567,6 +9614,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(vec![1, 2, 3])],
                     ),
                     attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10356,6 +10404,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(b"discarded".to_vec())],
                     ),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10382,6 +10431,7 @@ mod tests {
                         vec![crate::model::OpaqueReplayItem::new(b"retained".to_vec())],
                     ),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -10786,6 +10836,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -11383,6 +11434,7 @@ mod tests {
                             total_tokens: Some(50_000),
                         },
                     )],
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -11716,6 +11768,7 @@ mod tests {
                         ])],
                     ),
                     attempts: Vec::new(),
+                    overflow_recovery: None,
                 },
                 None,
             )
@@ -11824,6 +11877,7 @@ mod tests {
                     || PersistedTerminal::Cancelled {
                         evidence: None,
                         attempts: Vec::new(),
+                        overflow_recovery: None,
                     },
                     None,
                 )
@@ -11988,6 +12042,210 @@ mod tests {
         );
         drop(writer);
         session.close().expect("close session");
+    }
+
+    fn overflow_recovery(
+        attempts: Vec<crate::model::AttemptAccounting>,
+    ) -> crate::agent::OverflowRecovery {
+        crate::agent::OverflowRecovery {
+            failure: crate::model::ProviderFailure::new(
+                Some(400),
+                Some("context_length_exceeded".to_owned()),
+                "maximum context length".to_owned(),
+            )
+            .with_context_overflow(true),
+            generation: None,
+            attempts,
+        }
+    }
+
+    fn known_usage(input: u64, output: u64) -> crate::model::AttemptAccounting {
+        crate::model::AttemptAccounting::KnownUsage(crate::model::ModelUsage {
+            model: DEFAULT_MODEL.id.to_owned(),
+            service_tier: None,
+            input_tokens: Some(input),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            cache_write_1h_input_tokens: 0,
+            output_tokens: Some(output),
+            reasoning_output_tokens: Some(0),
+            total_tokens: Some(input + output),
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn overflow_recovery_attempts_count_once_per_owner_across_branches() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let branch_point = session.restore().expect("restore").observed_active_entry;
+        let call = known_usage(40, 2);
+        let summary = known_usage(7, 1);
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let preparation = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "summary".to_owned(),
+                    attempts: vec![summary.clone()],
+                },
+            )
+            .await
+            .expect("settle compaction");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        let terminal = PersistedTerminal::Final {
+            step_id,
+            text: "recovered".to_owned(),
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("openai", Vec::new()),
+            attempts: vec![call.clone()],
+            overflow_recovery: Some(overflow_recovery(vec![call.clone()])),
+        };
+        let expected = terminal.clone();
+        assert_eq!(
+            writer
+                .close_run(admission.run_id, Some(step_id), move || terminal, None)
+                .await
+                .expect("close recovered run"),
+            expected
+        );
+        let recovered_leaf = session.restore().expect("restore").observed_active_entry;
+        let assert_selected = |restore: super::SessionRestore| {
+            assert!(restore.footer_adjustment.is_empty());
+            assert!(restore.records.iter().any(|record| matches!(
+                &record.kind,
+                super::RestoredRecordKind::Compaction { outcome }
+                    if outcome.attempts() == std::slice::from_ref(&summary)
+            )));
+            assert!(matches!(
+                restore.records.last().map(|record| &record.kind),
+                Some(super::RestoredRecordKind::FinalMessage {
+                    terminal: super::ReadableTerminal::Final {
+                        attempts,
+                        overflow_recovery: Some(recovery),
+                        ..
+                    },
+                    ..
+                }) if attempts == std::slice::from_ref(&call)
+                    && recovery == &overflow_recovery(vec![call.clone()])
+            ));
+        };
+        let abandoned = vec![summary.clone(), call.clone(), call.clone()];
+        assert_selected(session.restore().expect("restore selected branch"));
+        writer
+            .select_active_entry(branch_point, recovered_leaf)
+            .await
+            .expect("abandon recovered branch");
+        assert_eq!(
+            session
+                .restore()
+                .expect("restore abandoning branch")
+                .footer_adjustment,
+            abandoned
+        );
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        assert_eq!(
+            reopened
+                .restore()
+                .expect("restore reopened branch point")
+                .footer_adjustment,
+            abandoned
+        );
+        assert_selected(
+            reopened
+                .writer()
+                .restore_at(recovered_leaf)
+                .await
+                .expect("restore reopened recovered branch"),
+        );
+        reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn initial_overflow_usage_never_becomes_a_compaction_baseline() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let admission = writer
+            .commit_request("recover".to_owned(), selection())
+            .await
+            .expect("commit request");
+        let step_id = writer
+            .start_model_step(admission.run_id)
+            .await
+            .expect("start step");
+        writer
+            .close_run(
+                admission.run_id,
+                Some(step_id),
+                move || PersistedTerminal::Final {
+                    step_id,
+                    text: "recovered".to_owned(),
+                    reasoning_summary: String::new(),
+                    replay: crate::model::ProviderReplay::new(
+                        "openai",
+                        vec![crate::model::OpaqueReplayItem::new(b"done".to_vec())],
+                    ),
+                    attempts: vec![crate::model::AttemptAccounting::UsageUnavailable],
+                    overflow_recovery: Some(overflow_recovery(vec![known_usage(50_000, 0)])),
+                },
+                None,
+            )
+            .await
+            .expect("close recovered run");
+        append_cancelled_request(&writer, "tail").await;
+        let fallback = ("recover".len() + "done".len() + "tail".len()).div_ceil(4) as u64;
+        let measure = |writer: SessionWriter| async move {
+            writer
+                .prepare_compaction(
+                    crate::config::CompactionSettings::new(100, 1),
+                    selection(),
+                    CrossProviderReasoning::Inline,
+                    String::new(),
+                    super::CompactionReason::Manual,
+                )
+                .await
+                .expect("prepare compaction")
+                .expect("prepare compactable history")
+                .planner
+                .context_tokens()
+        };
+        assert_eq!(measure(writer.clone()).await, fallback);
+
+        let id = session.id().to_owned();
+        drop(writer);
+        session.close().expect("close session");
+        let reopened = Session::open(home.path(), &id).expect("reopen session");
+        activate_session(&reopened).await;
+        assert_eq!(measure(reopened.writer()).await, fallback);
+        reopened.close().expect("close reopened session");
     }
 
     #[tokio::test]
