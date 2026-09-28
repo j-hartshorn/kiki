@@ -22,7 +22,11 @@ use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::settings::CrossProviderReasoning;
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
-use crate::model::{AttemptAccounting, ModelContextEntry, ModelHistory, SummaryRequest};
+use crate::model::{
+    ActiveSkills, AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation,
+    SummaryRequest,
+};
+use crate::skills::SkillProjectionPolicy;
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
@@ -75,6 +79,8 @@ pub(crate) enum SessionError {
     InvalidTransition,
     #[error("session name must not be empty")]
     EmptyName,
+    #[error("skill activation failed: {0}")]
+    SkillActivation(String),
     #[error("subagent task provenance does not identify a stored model step")]
     InvalidTaskProvenance,
 }
@@ -311,6 +317,9 @@ pub(crate) enum RestoredRecordKind {
     Compaction {
         outcome: CompactionOutcome,
     },
+    SkillActivation {
+        activation: SkillActivation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +342,7 @@ pub(crate) struct RestoredTask {
 pub(crate) struct RequestAdmission {
     pub(crate) run_id: u64,
     pub(crate) request_entry: SessionEntryId,
+    pub(crate) effective_entry: SessionEntryId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +350,9 @@ pub(crate) enum SessionCatalogueKind {
     Start,
     Request {
         text: String,
+    },
+    SkillActivation {
+        name: String,
     },
     Execution {
         source: String,
@@ -607,6 +620,7 @@ struct LiveSessionContext {
 struct SessionState {
     connection: Mutex<Connection>,
     model_context: Mutex<Option<LiveSessionContext>>,
+    skill_policy: Mutex<SkillProjectionPolicy>,
     active_execution_step: Mutex<Option<u64>>,
     _writer_lock: File,
     #[cfg(test)]
@@ -869,6 +883,7 @@ impl Session {
             state: Arc::new(SessionState {
                 connection: Mutex::new(connection),
                 model_context: Mutex::new(None),
+                skill_policy: Mutex::new(SkillProjectionPolicy::default()),
                 active_execution_step: Mutex::new(None),
                 _writer_lock: writer_lock,
                 #[cfg(test)]
@@ -906,8 +921,34 @@ impl Session {
     }
 
     pub(crate) fn restore(&self) -> Result<SessionRestore, SessionError> {
+        let policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
         let mut connection = self.connection()?;
-        load_session_restore(&mut connection)
+        load_session_restore(&mut connection, &policy)
+    }
+
+    pub(crate) fn configure_skill_projection(
+        &self,
+        policy: SkillProjectionPolicy,
+    ) -> Result<(), SessionError> {
+        *self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)? = policy;
+        Ok(())
+    }
+
+    pub(crate) fn has_active_project_skill_in_scope(
+        &self,
+        scope: &Path,
+    ) -> Result<bool, SessionError> {
+        let mut connection = self.connection()?;
+        probe_active_project_skill_in_scope(&mut connection, scope)
     }
 
     pub(crate) fn metadata(&self) -> Result<SessionMetadata, SessionError> {
@@ -973,7 +1014,13 @@ impl SessionWriter {
         &self,
         requested_entry: SessionEntryId,
     ) -> Result<SessionRestore, SessionError> {
-        self.read(move |connection| load_session_restore_at(connection, requested_entry))
+        let policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
+        self.read(move |connection| load_session_restore_at(connection, requested_entry, &policy))
             .await
     }
 
@@ -1002,7 +1049,15 @@ impl SessionWriter {
         if reason != CompactionReason::Manual && !policy.enabled() {
             return Ok(None);
         }
-        let snapshot = self.read(load_compaction_snapshot).await?;
+        let skill_policy = self
+            .state
+            .skill_policy
+            .lock()
+            .map_err(|_| SessionError::WriterUnavailable)?
+            .clone();
+        let snapshot = self
+            .read(move |connection| load_compaction_snapshot(connection, &skill_policy))
+            .await?;
         let Some(planner) = crate::compaction::prepare(
             &snapshot.facts,
             policy,
@@ -1057,6 +1112,11 @@ impl SessionWriter {
             let history = match &outcome {
                 CompactionOutcome::Applied { summary, .. } => {
                     let mut history = ModelHistory::new();
+                    for activation in preparation.planner.protected_skills() {
+                        history
+                            .activate_skill(activation.clone())
+                            .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
+                    }
                     history.append_compaction_summary(summary.clone());
                     for entry in preparation.planner.retained_entries() {
                         append_model_context_entry(&mut history, entry.clone())?;
@@ -1224,13 +1284,26 @@ impl SessionWriter {
         &self,
         request: String,
         selection: ModelSelection,
+        activation: Option<SkillActivation>,
     ) -> Result<RequestAdmission, SessionError> {
         self.write_context(SessionWriteKind::Request, move |connection, context| {
             let mut history = context.history.clone();
             history.append_user_request(request.clone());
-            let admission =
-                commit_request(connection, &request, selection, context.effective_entry)?;
-            context.effective_entry = admission.request_entry;
+            let changed = if let Some(activation) = &activation {
+                history
+                    .activate_skill(activation.clone())
+                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?
+            } else {
+                false
+            };
+            let admission = commit_request(
+                connection,
+                &request,
+                selection,
+                context.effective_entry,
+                activation.as_ref().filter(|_| changed),
+            )?;
+            context.effective_entry = admission.effective_entry;
             context.history = history;
             Ok(admission)
         })
@@ -1266,11 +1339,31 @@ impl SessionWriter {
         step_id: u64,
         code: PersistedCode,
         checkpoint: Checkpoint,
-    ) -> Result<(), SessionError> {
+        activations: Vec<SkillActivation>,
+    ) -> Result<Vec<SkillActivation>, SessionError> {
         self.write_context(SessionWriteKind::Settlement, move |connection, context| {
             validate_execution_projection(&code)?;
+            if !activations.is_empty()
+                && !code.execution.as_ref().is_some_and(|execution| {
+                    matches!(
+                        execution.outcome,
+                        crate::arena::ExecutionOutcome::Complete { .. }
+                    )
+                })
+            {
+                return Err(SessionError::InvalidTransition);
+            }
             let mut history = context.history.clone();
             append_persisted_code(&mut history, &code)?;
+            let mut changed = Vec::new();
+            for activation in &activations {
+                if history
+                    .activate_skill(activation.clone())
+                    .map_err(|error| SessionError::SkillActivation(error.to_string()))?
+                {
+                    changed.push(activation.clone());
+                }
+            }
             let entry = settle_execution(
                 connection,
                 run_id,
@@ -1278,10 +1371,11 @@ impl SessionWriter {
                 &code,
                 &checkpoint,
                 context.effective_entry,
+                &changed,
             )?;
             context.effective_entry = entry;
             context.history = history;
-            Ok(())
+            Ok(changed)
         })
         .await
     }
@@ -1533,6 +1627,7 @@ fn commit_request(
     request: &str,
     selection: ModelSelection,
     expected_parent: SessionEntryId,
+    activation: Option<&SkillActivation>,
 ) -> Result<RequestAdmission, SessionError> {
     let payload = codec::encode_request(request, selection)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -1560,13 +1655,29 @@ fn commit_request(
         params![parent_id, run_id, checkpoint_id, payload, now, next_revision],
     )?;
     let entry_id = transaction.last_insert_rowid();
+    let mut effective_entry_id = entry_id;
+    let mut effective_revision = next_revision;
+    if let Some(activation) = activation {
+        let stored = codec::encode_skill_activation(activation)
+            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        effective_entry_id = insert_skill_activation(
+            &transaction,
+            entry_id,
+            run_id,
+            checkpoint_id,
+            &stored.payload_json,
+            now,
+            &mut effective_revision,
+        )?;
+    }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![entry_id, now, next_revision],
+        params![effective_entry_id, now, effective_revision],
     )?;
     let admission = RequestAdmission {
         run_id: u64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?,
         request_entry: session_entry_id(entry_id)?,
+        effective_entry: session_entry_id(effective_entry_id)?,
     };
     transaction.commit()?;
     Ok(admission)
@@ -1602,6 +1713,7 @@ fn settle_execution(
     code: &PersistedCode,
     checkpoint: &Checkpoint,
     expected_parent: SessionEntryId,
+    activations: &[SkillActivation],
 ) -> Result<SessionEntryId, SessionError> {
     let run_id = i64::try_from(run_id).map_err(|_| SessionError::IdOverflow)?;
     let step_id = i64::try_from(step_id).map_err(|_| SessionError::IdOverflow)?;
@@ -1609,6 +1721,11 @@ fn settle_execution(
     let stored_code =
         codec::encode_execution(code).map_err(|error| SessionError::Codec(error.to_string()))?;
     let stored_checkpoint = codec::encode_checkpoint(checkpoint)
+        .map_err(|error| SessionError::Codec(error.to_string()))?;
+    let stored_activations = activations
+        .iter()
+        .map(codec::encode_skill_activation)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     let now = now_ms()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1620,7 +1737,7 @@ fn settle_execution(
     if parent_id != expected_parent {
         return Err(SessionError::InvalidTransition);
     }
-    let next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    let mut next_revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
     transaction.execute(
         "INSERT INTO checkpoints (runtime_identity, arena_state, authorisations_json) VALUES (?1, ?2, ?3)",
         params![
@@ -1649,12 +1766,41 @@ fn settle_execution(
     )? != 1 {
         return Err(SessionError::InvalidTransition);
     }
+    let mut effective_entry_id = entry_id;
+    for stored in &stored_activations {
+        effective_entry_id = insert_skill_activation(
+            &transaction,
+            effective_entry_id,
+            run_id,
+            checkpoint_id,
+            &stored.payload_json,
+            now,
+            &mut next_revision,
+        )?;
+    }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
-        params![entry_id, now, next_revision],
+        params![effective_entry_id, now, next_revision],
     )?;
     transaction.commit()?;
-    session_entry_id(entry_id)
+    session_entry_id(effective_entry_id)
+}
+
+fn insert_skill_activation(
+    connection: &Connection,
+    parent_id: i64,
+    run_id: i64,
+    checkpoint_id: i64,
+    payload_json: &str,
+    now: i64,
+    revision: &mut i64,
+) -> Result<i64, SessionError> {
+    *revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    connection.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
+        params![parent_id, run_id, checkpoint_id, payload_json, now, *revision],
+    )?;
+    Ok(connection.last_insert_rowid())
 }
 
 fn close_run(
@@ -1800,6 +1946,11 @@ fn append_model_context_entry(
         ModelContextEntry::UserRequest { text } => history.append_user_request(text),
         ModelContextEntry::CompactionSummary { summary } => {
             history.append_compaction_summary(summary)
+        }
+        ModelContextEntry::SkillActivation(activation) => {
+            history
+                .activate_skill(activation)
+                .map_err(|error| SessionError::SkillActivation(error.to_string()))?;
         }
         ModelContextEntry::CompletedCode(code) => history
             .append_completed_code(
@@ -2143,6 +2294,7 @@ fn initialise(
                 effective_entry: session_entry_id(root_entry_id)?,
                 history: ModelHistory::new(),
             })),
+            skill_policy: Mutex::new(SkillProjectionPolicy::default()),
             active_execution_step: Mutex::new(None),
             _writer_lock: writer_lock,
             #[cfg(test)]
@@ -2382,6 +2534,27 @@ impl RestoreEntryRow {
     }
 }
 
+fn load_entry_rows(connection: &Connection) -> Result<Vec<RestoreEntryRow>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RestoreEntryRow {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                run_id: row.get(2)?,
+                checkpoint_id: row.get(3)?,
+                kind: row.get(4)?,
+                payload_json: row.get(5)?,
+                provider_replay: row.get(6)?,
+                revision: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 impl CatalogueEntryRow {
     fn payload(&self) -> EntryPayload<'_> {
         EntryPayload {
@@ -2457,8 +2630,51 @@ struct CompactionSnapshot {
 // Each recursive step follows one strictly older parent, so a corrupt cycle ends the chain early.
 const SELECTED_ANCESTRY_SQL: &str = "WITH RECURSIVE selected(id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision) AS (SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries WHERE id = ?1 UNION ALL SELECT entries.id, entries.parent_id, entries.run_id, entries.checkpoint_id, entries.kind, entries.payload_json, entries.provider_replay, entries.revision FROM selected JOIN entries ON entries.id = selected.parent_id WHERE selected.parent_id < selected.id) SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM selected";
 
+fn probe_active_project_skill_in_scope(
+    connection: &mut Connection,
+    scope: &Path,
+) -> Result<bool, SessionError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let active_entry_id: i64 = transaction.query_row(
+        "SELECT active_entry_id FROM session WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let entries = load_entry_rows(&transaction)?;
+    transaction.commit()?;
+    let entries_by_id = entries
+        .into_iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let ancestry = selected_ancestry(&entries_by_id, active_entry_id);
+    if !ancestry.intact {
+        return Ok(false);
+    }
+    let mut active = ActiveSkills::default();
+    for entry in &ancestry.entries {
+        if entry.kind != "skill_activation" {
+            continue;
+        }
+        if entry.provider_replay.is_some() {
+            return Ok(false);
+        }
+        let Ok(decoded) = codec::decode_entry(&entry.kind, &entry.payload_json) else {
+            return Ok(false);
+        };
+        let Some(activation) = codec::decoded_skill_activation(&decoded) else {
+            return Ok(false);
+        };
+        active.replay(activation.clone());
+    }
+    Ok(active.iter().any(|activation| {
+        activation.origin() == crate::skills::SkillOrigin::Project
+            && activation.trust_scope() == Some(scope)
+    }))
+}
+
 fn load_compaction_snapshot(
     connection: &mut Connection,
+    policy: &SkillProjectionPolicy,
 ) -> Result<CompactionSnapshot, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let active_entry_id: i64 = transaction.query_row(
@@ -2504,7 +2720,7 @@ fn load_compaction_snapshot(
         .entries
         .iter()
         .filter(|entry| entry.kind != "session_start")
-        .map(compaction_fact)
+        .map(|entry| compaction_fact(entry, policy))
         .collect::<Result<Vec<_>, _>>()?;
     transaction.commit()?;
     Ok(CompactionSnapshot {
@@ -2544,7 +2760,10 @@ fn validate_selected_compactions(selected: &[RestoreEntryRow]) -> Result<(), ()>
     Ok(())
 }
 
-fn compaction_fact(entry: &RestoreEntryRow) -> Result<SelectedAncestryFact, SessionError> {
+fn compaction_fact(
+    entry: &RestoreEntryRow,
+    policy: &SkillProjectionPolicy,
+) -> Result<SelectedAncestryFact, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
     let entry_id = session_entry_id(entry.id)?;
@@ -2664,6 +2883,22 @@ fn compaction_fact(entry: &RestoreEntryRow) -> Result<SelectedAncestryFact, Sess
                 }
             }
         }
+        "skill_activation" => {
+            if entry.provider_replay.is_some() {
+                return Err(SessionError::InvalidTransition);
+            }
+            let activation =
+                codec::decoded_skill_activation(&decoded).ok_or(SessionError::InvalidTransition)?;
+            if policy.permits(activation) {
+                SelectedAncestryKind::SkillActivation {
+                    activation: activation.clone(),
+                }
+            } else {
+                SelectedAncestryKind::SuppressedSkillActivation {
+                    name: activation.name().to_owned(),
+                }
+            }
+        }
         _ => return Err(SessionError::InvalidTransition),
     };
     Ok(SelectedAncestryFact { entry_id, kind })
@@ -2679,22 +2914,27 @@ fn model_entry_from_code(code: PersistedCode) -> Result<ModelContextEntry, Sessi
         .ok_or(SessionError::InvalidTransition)
 }
 
-fn load_session_restore(connection: &mut Connection) -> Result<SessionRestore, SessionError> {
-    load_session_restore_for_entry(connection, None)
+fn load_session_restore(
+    connection: &mut Connection,
+    policy: &SkillProjectionPolicy,
+) -> Result<SessionRestore, SessionError> {
+    load_session_restore_for_entry(connection, None, policy)
 }
 
 fn load_session_restore_at(
     connection: &mut Connection,
     requested_entry: SessionEntryId,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SessionRestore, SessionError> {
     let requested_entry =
         i64::try_from(requested_entry.0).map_err(|_| SessionError::InvalidTransition)?;
-    load_session_restore_for_entry(connection, Some(requested_entry))
+    load_session_restore_for_entry(connection, Some(requested_entry), policy)
 }
 
 fn load_session_restore_for_entry(
     connection: &mut Connection,
     requested_entry: Option<i64>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SessionRestore, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let (observed_active_entry_id, name, preferences_json, session_revision): (
@@ -2708,25 +2948,7 @@ fn load_session_restore_for_entry(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     let metadata = session_metadata(name, preferences_json).ok();
-    let entries = {
-        let mut statement = transaction.prepare(
-            "SELECT id, parent_id, run_id, checkpoint_id, kind, payload_json, provider_replay, revision FROM entries ORDER BY id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(RestoreEntryRow {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    checkpoint_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    payload_json: row.get(5)?,
-                    provider_replay: row.get(6)?,
-                    revision: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let entries = load_entry_rows(&transaction)?;
     let requested_entry_id = requested_entry.unwrap_or(observed_active_entry_id);
     let requested = entries
         .iter()
@@ -2802,6 +3024,7 @@ fn load_session_restore_for_entry(
         },
         requested_entry_id,
         effective_entry_id,
+        policy,
     ))
 }
 
@@ -2867,6 +3090,12 @@ fn session_catalogue_entry(
                 .expect("decoded request kind has request text")
                 .to_owned(),
         },
+        codec::DecodedEntryKind::SkillActivation => SessionCatalogueKind::SkillActivation {
+            name: codec::decoded_skill_activation(&decoded)
+                .ok_or(SessionError::InvalidTransition)?
+                .name()
+                .to_owned(),
+        },
         codec::DecodedEntryKind::Execution => {
             let (code, execution) = codec::decoded_readable_execution(&decoded)
                 .map_err(|error| SessionError::Codec(error.to_string()))?
@@ -2907,13 +3136,19 @@ fn session_catalogue_entry(
 #[cfg(test)]
 fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
     let active_entry_id = snapshot.active_entry_id;
-    restore_projection_at(snapshot, active_entry_id, active_entry_id)
+    restore_projection_at(
+        snapshot,
+        active_entry_id,
+        active_entry_id,
+        &SkillProjectionPolicy::default(),
+    )
 }
 
 fn restore_projection_at(
     snapshot: RestoreSnapshot,
     requested_entry_id: i64,
     effective_entry_id: i64,
+    policy: &SkillProjectionPolicy,
 ) -> SessionRestore {
     let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
     let observed_active_entry =
@@ -2967,7 +3202,12 @@ fn restore_projection_at(
             .filter(|entry| {
                 matches!(
                     entry.kind.as_str(),
-                    "execution" | "final_reply" | "cancelled" | "failed" | "compaction"
+                    "execution"
+                        | "final_reply"
+                        | "cancelled"
+                        | "failed"
+                        | "compaction"
+                        | "skill_activation"
                 )
             })
             .map(|entry| entry.id),
@@ -3059,6 +3299,13 @@ fn restore_projection_at(
                     continue;
                 };
                 footer_adjustment.extend(codec::decoded_attempts(decoded));
+            }
+            "skill_activation" => {
+                if decoded_restore_entry(&decoded_entries, entry.id).is_err()
+                    || entry.provider_replay.is_some()
+                {
+                    executable = false;
+                }
             }
             "session_start" | "user_request" => {}
             _ => executable = false,
@@ -3224,7 +3471,7 @@ fn restore_projection_at(
     }
     let reserved_task_ids = restored_task_ids.into_values().collect();
     let history = executable
-        .then(|| restored_history(&verified, &decoded_entries, &snapshot.steps, &runs))
+        .then(|| restored_history(&verified, &decoded_entries, &snapshot.steps, &runs, policy))
         .flatten();
     let checkpoint = snapshot
         .checkpoint
@@ -3712,6 +3959,23 @@ fn readable_record(
                 outcome: codec::decoded_compaction(decoded).ok_or(())?,
             }
         }
+        "skill_activation" => {
+            let parent = entry
+                .parent_id
+                .and_then(|parent_id| entries.iter().find(|candidate| candidate.id == parent_id))
+                .ok_or(())?;
+            if parent.run_id != entry.run_id
+                || entry.provider_replay.is_some()
+                || steps
+                    .iter()
+                    .any(|step| step.settled_entry_id == Some(entry.id))
+            {
+                return Err(());
+            }
+            RestoredRecordKind::SkillActivation {
+                activation: codec::decoded_skill_activation(decoded).ok_or(())?.clone(),
+            }
+        }
         _ => return Err(()),
     };
     Ok(Some(RestoredRecord {
@@ -3748,7 +4012,15 @@ fn restored_history(
     decoded_entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
+    policy: &SkillProjectionPolicy,
 ) -> Option<ModelHistory> {
+    let replay_activation = |history: &mut ModelHistory, activation: &SkillActivation| {
+        if policy.permits(activation) {
+            history.replay_skill(activation.clone());
+        } else {
+            history.deactivate_skill(activation.name());
+        }
+    };
     let latest_applied = selected
         .iter()
         .enumerate()
@@ -3767,6 +4039,7 @@ fn restored_history(
                     CompactionOutcome::Failed { .. } | CompactionOutcome::Cancelled { .. } => None,
                 })
         });
+    let applied_index = latest_applied.as_ref().map(|(index, _, _)| *index);
     let (start, mut history) = match latest_applied {
         Some((applied_index, summary, first_retained)) => {
             let first_retained = i64::try_from(first_retained.0).ok()?;
@@ -3778,12 +4051,21 @@ fn restored_history(
                 return None;
             }
             let mut history = ModelHistory::new();
+            for entry in &selected[..applied_index] {
+                if entry.kind == "skill_activation" {
+                    if entry.provider_replay.is_some() {
+                        return None;
+                    }
+                    let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
+                    replay_activation(&mut history, codec::decoded_skill_activation(decoded)?);
+                }
+            }
             history.append_compaction_summary(summary);
             (boundary, history)
         }
         None => (0, ModelHistory::new()),
     };
-    for entry in &selected[start..] {
+    for (index, entry) in selected.iter().enumerate().skip(start) {
         let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
         match entry.kind.as_str() {
             "session_start" => {
@@ -3857,10 +4139,21 @@ fn restored_history(
                     return None;
                 }
             }
+            "skill_activation" => {
+                if entry.provider_replay.is_some() {
+                    return None;
+                }
+                let activation = codec::decoded_skill_activation(decoded)?;
+                if applied_index.is_some_and(|applied| index <= applied) {
+                    continue;
+                }
+                replay_activation(&mut history, activation);
+            }
             _ => return None,
         }
     }
-    Some(history)
+    // Superseded activations never count towards the limit, so check only the final set.
+    history.active_skills_within_text_limit().then_some(history)
 }
 
 fn append_history_code(history: &mut ModelHistory, code: PersistedCode) -> Result<(), ()> {
@@ -3940,6 +4233,8 @@ mod tests {
     };
     use crate::config::settings::CrossProviderReasoning;
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
+    use crate::model::SkillActivation;
+    use crate::skills::{SkillOrigin, SkillProjectionPolicy};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
 
@@ -3979,6 +4274,1219 @@ mod tests {
         .expect("create session")
     }
 
+    fn skill(
+        name: &str,
+        source: PathBuf,
+        body: &str,
+        origin: SkillOrigin,
+        scope: Option<PathBuf>,
+    ) -> SkillActivation {
+        SkillActivation::new(name.to_owned(), source, body.to_owned(), origin, scope).unwrap()
+    }
+
+    async fn close_cancelled(writer: &SessionWriter, run_id: u64) {
+        writer
+            .close_run(
+                run_id,
+                None,
+                || PersistedTerminal::Cancelled {
+                    evidence: None,
+                    attempts: Vec::new(),
+                    overflow_recovery: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    struct SupersededUserSkill {
+        session: Session,
+        writer: SessionWriter,
+        scope: PathBuf,
+        root: SessionEntryId,
+        user_leaf: SessionEntryId,
+        project_leaf: SessionEntryId,
+        user: SkillActivation,
+        independent: SkillActivation,
+        project: SkillActivation,
+    }
+
+    async fn project_skill_superseding_user_skill(
+        home: &TempDir,
+        workspace: &TempDir,
+    ) -> SupersededUserSkill {
+        let session = create_session(home, workspace).await;
+        let writer = session.writer();
+        let root = SessionEntryId(active_entry_id(&session) as u64);
+        let scope = workspace.path().canonicalize().unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope.clone())))
+            .unwrap();
+        let user = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            "---\nname: review\ndescription: User\n---\nUser instructions æ",
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request("first".to_owned(), selection(), Some(user.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let user_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        let independent = skill(
+            "notes",
+            home.path().join(".agents/skills/notes"),
+            "---\nname: notes\ndescription: User\n---\nIndependent instructions",
+            SkillOrigin::User,
+            None,
+        );
+        let notes_run = writer
+            .commit_request("notes".to_owned(), selection(), Some(independent.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, notes_run.run_id).await;
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "---\nname: review\ndescription: Project\n---\nProject instructions β",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let second = writer
+            .commit_request("second".to_owned(), selection(), Some(project.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, second.run_id).await;
+        let project_leaf = SessionEntryId(active_entry_id(&session) as u64);
+        SupersededUserSkill {
+            session,
+            writer,
+            scope,
+            root,
+            user_leaf,
+            project_leaf,
+            user,
+            independent,
+            project,
+        }
+    }
+
+    fn restored_skills(session: &Session) -> Vec<SkillActivation> {
+        session
+            .restore()
+            .unwrap()
+            .executable
+            .unwrap()
+            .history
+            .active_skills()
+            .cloned()
+            .collect()
+    }
+
+    async fn skills_at(writer: &SessionWriter, entry: SessionEntryId) -> Vec<SkillActivation> {
+        writer
+            .restore_at(entry)
+            .await
+            .unwrap()
+            .executable
+            .unwrap()
+            .history
+            .active_skills()
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_reads_session_history_without_source_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        assert!(!fixture.scope.join(".agents/skills/review").exists());
+        assert!(
+            fixture
+                .session
+                .has_active_project_skill_in_scope(&fixture.scope)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_project_skill_version_replaces_earlier_user_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        assert_eq!(
+            restored_skills(&fixture.session),
+            [fixture.independent, fixture.project]
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_skill_text_stays_pinned_after_source_changes_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        let source = fixture.scope.join(".agents/skills/review");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "changed on disk").unwrap();
+        assert!(restored_skills(&fixture.session).contains(&fixture.project));
+    }
+
+    #[tokio::test]
+    async fn untrusted_projection_drops_project_version_without_reviving_user_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        for policy in [
+            SkillProjectionPolicy::default(),
+            SkillProjectionPolicy::new(Some(home.path().to_path_buf())),
+        ] {
+            fixture.session.configure_skill_projection(policy).unwrap();
+            assert_eq!(
+                restored_skills(&fixture.session),
+                std::slice::from_ref(&fixture.independent)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_the_skill_ancestry_of_the_target_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        assert!(skills_at(&fixture.writer, fixture.root).await.is_empty());
+        assert_eq!(
+            skills_at(&fixture.writer, fixture.user_leaf).await,
+            [fixture.user]
+        );
+        assert_eq!(
+            skills_at(&fixture.writer, fixture.project_leaf).await,
+            [fixture.independent]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_under_untrusted_projection_keeps_only_permitted_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        let prepared = fixture
+            .writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.planner.protected_skills(),
+            std::slice::from_ref(&fixture.independent)
+        );
+        fixture
+            .writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .writer
+                .model_history()
+                .unwrap()
+                .active_skills()
+                .collect::<Vec<_>>(),
+            [&fixture.independent]
+        );
+        assert_eq!(
+            restored_skills(&fixture.session),
+            std::slice::from_ref(&fixture.independent)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_user_reactivation_replaces_filtered_project_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let fixture = project_skill_superseding_user_skill(&home, &workspace).await;
+        fixture
+            .session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        fixture.session.sync_model_context_for_test().unwrap();
+        let reactivated = fixture
+            .writer
+            .commit_request(
+                "explicit user reactivation".to_owned(),
+                selection(),
+                Some(fixture.user.clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(reactivated.effective_entry, reactivated.request_entry);
+        close_cancelled(&fixture.writer, reactivated.run_id).await;
+        assert!(restored_skills(&fixture.session).contains(&fixture.user));
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_uses_latest_version_before_scope_filter() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let scope_a = workspace_a.path().canonicalize().unwrap();
+        let scope_b = workspace_b.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace_b).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let b_source = scope_b.join(".agents/skills/review");
+        let b_skill = skill(
+            "review",
+            b_source.clone(),
+            "---\nname: review\ndescription: B\n---\nB",
+            SkillOrigin::Project,
+            Some(scope_b.clone()),
+        );
+        let b_run = writer
+            .commit_request("B".to_owned(), selection(), Some(b_skill))
+            .await
+            .unwrap();
+        close_cancelled(&writer, b_run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_a.clone())))
+            .unwrap();
+        activate_session(&session).await;
+        let writer = session.writer();
+        let a_skill = skill(
+            "review",
+            scope_a.join(".agents/skills/review"),
+            "---\nname: review\ndescription: A\n---\nA",
+            SkillOrigin::Project,
+            Some(scope_a),
+        );
+        let a_run = writer
+            .commit_request("A".to_owned(), selection(), Some(a_skill))
+            .await
+            .unwrap();
+        close_cancelled(&writer, a_run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
+            .unwrap();
+        assert!(!b_source.exists());
+        assert!(session.restore().unwrap().executable.is_some());
+        assert!(!session.has_active_project_skill_in_scope(&scope_b).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_ignores_latest_user_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let first = writer
+            .commit_request("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        let user = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            "user version",
+            SkillOrigin::User,
+            None,
+        );
+        let second = writer
+            .commit_request("user".to_owned(), selection(), Some(user.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, second.run_id).await;
+        assert!(!session.has_active_project_skill_in_scope(&scope).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&user)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_limits_only_latest_skill_activations_after_trust_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let trusted = SkillProjectionPolicy::new(Some(scope.clone()));
+        session.configure_skill_projection(trusted.clone()).unwrap();
+        let large = "x".repeat(crate::skills::MAX_SKILL_BYTES);
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            &large,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        session.sync_model_context_for_test().unwrap();
+        for (name, body) in [
+            ("one", large.as_str()),
+            ("two", large.as_str()),
+            ("three", large.as_str()),
+            ("review", "user version"),
+        ] {
+            let user = skill(
+                name,
+                home.path().join(".agents/skills").join(name),
+                body,
+                SkillOrigin::User,
+                None,
+            );
+            let run = writer
+                .commit_request(name.to_owned(), selection(), Some(user))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        session.configure_skill_projection(trusted).unwrap();
+        let history = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            history
+                .active_skills()
+                .map(SkillActivation::name)
+                .collect::<Vec<_>>(),
+            ["one", "two", "three", "review"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_session_does_not_project_stored_project_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn project_skill_probe_ignores_corrupt_non_skill_replay() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request("inspect".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        settle_fixture_execution(&session, &writer, run.run_id, "pass", None, Vec::new()).await;
+        close_cancelled(&writer, run.run_id).await;
+        {
+            let connection = session.connection_for_test().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE entries SET provider_replay = X'00' WHERE kind = 'execution'",
+                    [],
+                )
+                .unwrap();
+        }
+        let restored = session.restore().unwrap();
+        assert!(!restored.records.is_empty());
+        assert!(restored.executable.is_none());
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+    }
+
+    #[tokio::test]
+    async fn project_skill_probe_is_independent_of_unfiltered_text_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let scope_a = workspace_a.path().canonicalize().unwrap();
+        let scope_b = workspace_b.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace_a).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let body = "x".repeat(50 * 1024);
+        for index in 0..4 {
+            let name = format!("a-{index}");
+            let activation = skill(
+                &name,
+                scope_a.join(".agents/skills").join(&name),
+                &body,
+                SkillOrigin::Project,
+                Some(scope_a.clone()),
+            );
+            let run = writer
+                .commit_request(name, selection(), Some(activation))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
+            .unwrap();
+        activate_session(&session).await;
+        let writer = session.writer();
+        for index in 0..4 {
+            let name = format!("b-{index}");
+            let activation = skill(
+                &name,
+                scope_b.join(".agents/skills").join(&name),
+                &body,
+                SkillOrigin::Project,
+                Some(scope_b.clone()),
+            );
+            let run = writer
+                .commit_request(name, selection(), Some(activation))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
+            .unwrap();
+        assert!(session.restore().unwrap().executable.is_some());
+        assert!(session.has_active_project_skill_in_scope(&scope_b).unwrap());
+    }
+
+    #[tokio::test]
+    async fn skipped_project_versions_do_not_revive_over_cap_user_history() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let large_body = "x".repeat(60 * 1024);
+        for index in 0..5 {
+            let name = format!("replace-{index}");
+            let user = skill(
+                &name,
+                home.path().join(".agents/skills").join(&name),
+                &large_body,
+                SkillOrigin::User,
+                None,
+            );
+            let user_run = writer
+                .commit_request(format!("user {index}"), selection(), Some(user))
+                .await
+                .unwrap();
+            close_cancelled(&writer, user_run.run_id).await;
+            let project = skill(
+                &name,
+                scope.join(".agents/skills").join(&name),
+                "small project version",
+                SkillOrigin::Project,
+                Some(scope.clone()),
+            );
+            let project_run = writer
+                .commit_request(format!("project {index}"), selection(), Some(project))
+                .await
+                .unwrap();
+            close_cancelled(&writer, project_run.run_id).await;
+        }
+        let independent = skill(
+            "independent",
+            home.path().join(".agents/skills/independent"),
+            "user instruction",
+            SkillOrigin::User,
+            None,
+        );
+        let last = writer
+            .commit_request(
+                "independent".to_owned(),
+                selection(),
+                Some(independent.clone()),
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, last.run_id).await;
+        let leaf = SessionEntryId(active_entry_id(&session) as u64);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        let restored = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            restored.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let navigated = writer
+            .restore_at(leaf)
+            .await
+            .unwrap()
+            .executable
+            .unwrap()
+            .history;
+        assert_eq!(
+            navigated.active_skills().collect::<Vec<_>>(),
+            vec![&independent]
+        );
+        let prepared = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.planner.protected_skills(),
+            std::slice::from_ref(&independent)
+        );
+        writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Summary".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .collect::<Vec<_>>(),
+            vec![&independent]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_and_text_with_changed_origin_persists_new_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope.clone())))
+            .unwrap();
+        let writer = session.writer();
+        let source = scope.join(".agents/skills/shared");
+        let body = "---\nname: shared\ndescription: Same\n---\nSame text";
+        let user = skill("shared", source.clone(), body, SkillOrigin::User, None);
+        let first = writer
+            .commit_request("user".to_owned(), selection(), Some(user))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let project = skill(
+            "shared",
+            source,
+            body,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let second = writer
+            .commit_request("project".to_owned(), selection(), Some(project.clone()))
+            .await
+            .unwrap();
+        assert_ne!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&project)
+        );
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_and_text_with_changed_project_scope_persists_new_version() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let nested_scope = scope.join("child");
+        let source = nested_scope.join(".agents/skills/shared");
+        let body = "---\nname: shared\ndescription: Same\n---\nSame text";
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let outer = skill(
+            "shared",
+            source.clone(),
+            body,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let first = writer
+            .commit_request("outer".to_owned(), selection(), Some(outer))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let inner = skill(
+            "shared",
+            source,
+            body,
+            SkillOrigin::Project,
+            Some(nested_scope.clone()),
+        );
+        let second = writer
+            .commit_request("inner".to_owned(), selection(), Some(inner.clone()))
+            .await
+            .unwrap();
+        assert_ne!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 2);
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(nested_scope)))
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&inner)
+        );
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope)))
+            .unwrap();
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_reads_skill_activations_after_their_request_and_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let direct = skill(
+            "direct",
+            home.path().join("direct"),
+            "direct body",
+            SkillOrigin::User,
+            None,
+        );
+        let loaded = skill(
+            "loaded",
+            home.path().join("loaded"),
+            "loaded body",
+            SkillOrigin::User,
+            None,
+        );
+        let run = writer
+            .commit_request(
+                "/skill:direct".to_owned(),
+                selection(),
+                Some(direct.clone()),
+            )
+            .await
+            .unwrap();
+        let step = writer.start_model_step(run.run_id).await.unwrap();
+        let code = PersistedCode {
+            source: "await load_skill('loaded')".to_owned(),
+            call_id: crate::model::ModelCallId::new("load".to_owned()),
+            commentary: None,
+            reasoning_summary: String::new(),
+            replay: crate::model::ProviderReplay::new("fixture", Vec::new()),
+            result: crate::model::CodeResult::Execution {
+                feedback: String::new(),
+            },
+            execution: Some(Execution {
+                stdout: empty_observation(),
+                stderr: empty_observation(),
+                outcome: ExecutionOutcome::Complete { result: None },
+                tool_calls: Vec::new(),
+                read_paths: Vec::new(),
+                modified_paths: Vec::new(),
+            }),
+            attempts: Vec::new(),
+        };
+        writer
+            .settle_execution(
+                run.run_id,
+                step,
+                code,
+                session.initial_checkpoint().unwrap(),
+                vec![loaded.clone()],
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+
+        let kinds = session
+            .restore()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| record.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    super::RestoredRecordKind::UserRequest { .. },
+                    super::RestoredRecordKind::SkillActivation { activation: first },
+                    super::RestoredRecordKind::CompletedExecution { .. },
+                    super::RestoredRecordKind::SkillActivation { activation: second },
+                    super::RestoredRecordKind::CancelledRun { .. },
+                ] if *first == direct && *second == loaded
+            ),
+            "{kinds:?}"
+        );
+    }
+
+    struct PendingStep {
+        session: Session,
+        writer: SessionWriter,
+        run_id: u64,
+        step: u64,
+    }
+
+    impl PendingStep {
+        async fn open(home: &TempDir, workspace: &TempDir) -> Self {
+            let session = create_session(home, workspace).await;
+            let writer = session.writer();
+            let run = writer
+                .commit_request("load".to_owned(), selection(), None)
+                .await
+                .unwrap();
+            let step = writer.start_model_step(run.run_id).await.unwrap();
+            Self {
+                session,
+                writer,
+                run_id: run.run_id,
+                step,
+            }
+        }
+
+        async fn settle(
+            &self,
+            activations: Vec<SkillActivation>,
+        ) -> Result<Vec<SkillActivation>, SessionError> {
+            self.writer
+                .settle_execution(
+                    self.run_id,
+                    self.step,
+                    projection_code(
+                        crate::model::CodeResult::Execution {
+                            feedback: String::new(),
+                        },
+                        true,
+                    ),
+                    self.session.initial_checkpoint().unwrap(),
+                    activations,
+                )
+                .await
+        }
+
+        fn count_entries(&self, kind: &str) -> i64 {
+            self.session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = ?1",
+                    [kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn is_unsettled(&self) -> bool {
+            self.session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM model_steps WHERE id = ?1 AND settled_entry_id IS NULL",
+                    [i64::try_from(self.step).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_settlement_persists_loaded_skill_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let step = PendingStep::open(&home, &workspace).await;
+        let first = skill(
+            "first",
+            home.path().join("first"),
+            "first body",
+            SkillOrigin::User,
+            None,
+        );
+        let second = skill(
+            "second",
+            home.path().join("second"),
+            "second body",
+            SkillOrigin::User,
+            None,
+        );
+        step.settle(vec![first.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            step.writer
+                .model_history()
+                .unwrap()
+                .active_skills()
+                .collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        assert_eq!(step.count_entries("skill_activation"), 2);
+    }
+
+    #[tokio::test]
+    async fn over_cap_skill_batch_leaves_execution_unsettled() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let step = PendingStep::open(&home, &workspace).await;
+        let oversized = (0..5)
+            .map(|index| {
+                let name = format!("large-{index}");
+                skill(
+                    &name,
+                    home.path().join(&name),
+                    &"x".repeat(60 * 1024),
+                    SkillOrigin::User,
+                    None,
+                )
+            })
+            .collect();
+        assert!(step.settle(oversized).await.is_err());
+        assert_eq!(step.count_entries("execution"), 0);
+        assert!(step.is_unsettled());
+    }
+
+    #[tokio::test]
+    async fn failed_skill_insert_rolls_back_execution_and_whole_batch() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let step = PendingStep::open(&home, &workspace).await;
+        step.session
+            .connection_for_test()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_second_loaded_skill BEFORE INSERT ON entries WHEN NEW.kind = 'skill_activation' AND NEW.payload_json LIKE '%rollback-two%' BEGIN SELECT RAISE(ABORT, 'reject second skill'); END;",
+            )
+            .unwrap();
+        let rollback_one = skill(
+            "rollback-one",
+            home.path().join("rollback-one"),
+            "one",
+            SkillOrigin::User,
+            None,
+        );
+        let rollback_two = skill(
+            "rollback-two",
+            home.path().join("rollback-two"),
+            "two",
+            SkillOrigin::User,
+            None,
+        );
+        assert!(step.settle(vec![rollback_one, rollback_two]).await.is_err());
+        assert_eq!(step.count_entries("execution"), 0);
+        assert_eq!(step.count_entries("skill_activation"), 0);
+        assert!(step.is_unsettled());
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_activated_instructions_once_outside_summary() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let body = "---\nname: review\ndescription: User\n---\nExact body 🦀";
+        let activation = skill(
+            "review",
+            home.path().join(".agents/skills/review"),
+            body,
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request(
+                "old request".to_owned(),
+                selection(),
+                Some(activation.clone()),
+            )
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        append_cancelled_request(&writer, "new request").await;
+        let prepared = writer
+            .prepare_compaction(
+                crate::config::CompactionSettings::new(100, 1),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                super::CompactionReason::Manual,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared.planner.context_tokens() >= (activation.model_text().len() as u64).div_ceil(4)
+        );
+        writer
+            .settle_compaction(
+                prepared,
+                super::CompactionSettlement::Applied {
+                    summary: "Condensed history".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let live = writer.model_history().unwrap();
+        assert_eq!(live.active_skills().count(), 1);
+        assert_eq!(live.active_skills().next().unwrap().source_text(), body);
+        assert_eq!(
+            live.entries()
+                .iter()
+                .filter(|entry| entry.compaction_summary().is_some())
+                .count(),
+            1
+        );
+        let restored = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(restored.active_skills().count(), 1);
+        assert_eq!(restored.active_skills().next().unwrap().source_text(), body);
+        assert_eq!(restored.entries(), live.entries());
+    }
+
+    #[tokio::test]
+    async fn repeated_direct_skill_activation_commits_request_without_duplicate_row() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let activation = skill(
+            "review",
+            home.path().join("review"),
+            "---\nname: review\ndescription: Check\n---\nCheck",
+            SkillOrigin::User,
+            None,
+        );
+        let first = writer
+            .commit_request("first".to_owned(), selection(), Some(activation.clone()))
+            .await
+            .unwrap();
+        close_cancelled(&writer, first.run_id).await;
+        let second = writer
+            .commit_request("second".to_owned(), selection(), Some(activation.clone()))
+            .await
+            .unwrap();
+        assert_eq!(second.effective_entry, second.request_entry);
+        close_cancelled(&writer, second.run_id).await;
+        let stored: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next(),
+            Some(&activation)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_selected_skill_activation_disables_restore() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let activation = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "---\nname: review\ndescription: Check\n---\nCheck",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request("inspect".to_owned(), selection(), Some(activation))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        {
+            let connection = session.connection_for_test().unwrap();
+            connection
+                .execute_batch("DROP TRIGGER entries_are_immutable_before_update;")
+                .unwrap();
+            connection.execute("UPDATE entries SET payload_json = '{\"SkillActivation\":{\"activation\":{\"source_text\":\"\"}}}' WHERE kind = 'skill_activation'", []).unwrap();
+        }
+        assert!(session.restore().unwrap().executable.is_none());
+        assert!(!session.has_active_project_skill_in_scope(&scope).unwrap());
+    }
+
     async fn activate_session(session: &Session) {
         let restore = session.restore().expect("restore session");
         let executable = restore.executable.expect("restore executable state");
@@ -3995,7 +5503,7 @@ mod tests {
 
     async fn append_cancelled_request(writer: &SessionWriter, request: &str) {
         let admission = writer
-            .commit_request(request.to_owned(), selection())
+            .commit_request(request.to_owned(), selection(), None)
             .await
             .expect("commit request");
         writer
@@ -4022,7 +5530,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let completed = writer
-            .commit_request("completed branch".to_owned(), selection())
+            .commit_request("completed branch".to_owned(), selection(), None)
             .await
             .expect("commit completed branch");
         writer
@@ -4320,6 +5828,7 @@ mod tests {
                 session
                     .initial_checkpoint()
                     .expect("load fixture checkpoint"),
+                Vec::new(),
             )
             .await
             .expect("settle fixture execution");
@@ -4747,7 +6256,7 @@ mod tests {
             .expect("read root entry");
 
         let first_run = writer
-            .commit_request("first branch request".to_owned(), selection())
+            .commit_request("first branch request".to_owned(), selection(), None)
             .await
             .expect("commit first request")
             .run_id;
@@ -4767,6 +6276,7 @@ mod tests {
                 first_step,
                 persisted_execution("first_value = 1", first_execution),
                 first_checkpoint.clone(),
+                Vec::new(),
             )
             .await
             .expect("settle first execution");
@@ -4854,7 +6364,7 @@ mod tests {
             .sync_model_context_for_test()
             .expect("sync root fixture context");
         let sibling_run = writer
-            .commit_request("sibling branch request".to_owned(), selection())
+            .commit_request("sibling branch request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -4873,6 +6383,7 @@ mod tests {
                 sibling_step,
                 persisted_execution("sibling_value = 2", sibling_execution),
                 sibling_arena.checkpoint(),
+                Vec::new(),
             )
             .await
             .expect("settle sibling execution");
@@ -4962,7 +6473,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("original request".to_owned(), selection())
+            .commit_request("original request".to_owned(), selection(), None)
             .await
             .expect("commit original request")
             .run_id;
@@ -5042,7 +6553,7 @@ mod tests {
         assert_eq!(selection_snapshot(&session), after_selection);
         let writer = session.writer();
         writer
-            .commit_request("branched request".to_owned(), selection())
+            .commit_request("branched request".to_owned(), selection(), None)
             .await
             .expect("commit branched request");
         let connection = session
@@ -5083,7 +6594,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
 
         let original = writer
-            .commit_request("original request".to_owned(), selection())
+            .commit_request("original request".to_owned(), selection(), None)
             .await
             .expect("commit original request");
         assert_eq!(
@@ -5115,7 +6626,7 @@ mod tests {
             .expect("select original request parent");
 
         let corrected = writer
-            .commit_request("corrected request".to_owned(), selection())
+            .commit_request("corrected request".to_owned(), selection(), None)
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -5168,7 +6679,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("request to correct".to_owned(), selection())
+            .commit_request("request to correct".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -5200,7 +6711,7 @@ mod tests {
         assert_eq!(selected.effective_entry, SessionEntryId(root as u64));
         assert!(selected.records.is_empty());
         writer
-            .commit_request("corrected request".to_owned(), selection())
+            .commit_request("corrected request".to_owned(), selection(), None)
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -5262,7 +6773,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let completed_run = writer
-            .commit_request("completed request".to_owned(), selection())
+            .commit_request("completed request".to_owned(), selection(), None)
             .await
             .expect("commit completed request")
             .run_id;
@@ -5328,7 +6839,7 @@ mod tests {
         );
 
         let open_run = writer
-            .commit_request("open request".to_owned(), selection())
+            .commit_request("open request".to_owned(), selection(), None)
             .await
             .expect("commit open request")
             .run_id;
@@ -5376,7 +6887,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("pending step request".to_owned(), selection())
+            .commit_request("pending step request".to_owned(), selection(), None)
             .await
             .expect("commit pending step request")
             .run_id;
@@ -5449,7 +6960,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("task request".to_owned(), selection())
+            .commit_request("task request".to_owned(), selection(), None)
             .await
             .expect("commit task request")
             .run_id;
@@ -5550,7 +7061,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("gated request".to_owned(), selection())
+            .commit_request("gated request".to_owned(), selection(), None)
             .await
             .expect("commit gated request")
             .run_id;
@@ -5606,7 +7117,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("failing selection request".to_owned(), selection())
+            .commit_request("failing selection request".to_owned(), selection(), None)
             .await
             .expect("commit failing selection request")
             .run_id;
@@ -5670,7 +7181,7 @@ mod tests {
         let root_checkpoint = session.initial_checkpoint().expect("load root checkpoint");
 
         let final_run = writer
-            .commit_request("final request".to_owned(), selection())
+            .commit_request("final request".to_owned(), selection(), None)
             .await
             .expect("commit final request")
             .run_id;
@@ -5708,7 +7219,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("cancelled request".to_owned(), selection())
+            .commit_request("cancelled request".to_owned(), selection(), None)
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -5729,7 +7240,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("failed request".to_owned(), selection())
+            .commit_request("failed request".to_owned(), selection(), None)
             .await
             .expect("commit failed request")
             .run_id;
@@ -5877,7 +7388,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         writer
-            .commit_request("known request".to_owned(), selection())
+            .commit_request("known request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before: (i64, i64, i64) = session
@@ -5921,7 +7432,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let final_run = writer
-            .commit_request("catalogue request".to_owned(), selection())
+            .commit_request("catalogue request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -5981,7 +7492,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("catalogue cancelled".to_owned(), selection())
+            .commit_request("catalogue cancelled".to_owned(), selection(), None)
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -6002,7 +7513,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("catalogue failed".to_owned(), selection())
+            .commit_request("catalogue failed".to_owned(), selection(), None)
             .await
             .expect("commit failed request")
             .run_id;
@@ -6094,7 +7605,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -6138,7 +7649,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let hidden_run = writer
-            .commit_request("hidden request".to_owned(), selection())
+            .commit_request("hidden request".to_owned(), selection(), None)
             .await
             .expect("commit hidden request")
             .run_id;
@@ -6248,7 +7759,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -6279,7 +7790,7 @@ mod tests {
 
         set_active_entry(&session, root);
         writer
-            .commit_request("corrupt sibling request".to_owned(), selection())
+            .commit_request("corrupt sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request");
         let corrupt_request = active_entry_id(&session);
@@ -6323,7 +7834,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -6354,7 +7865,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned(), selection())
+            .commit_request("sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -6417,7 +7928,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -6448,7 +7959,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned(), selection())
+            .commit_request("sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -6493,7 +8004,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("restore target".to_owned(), selection())
+            .commit_request("restore target".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -7020,7 +8531,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         session
             .writer()
-            .commit_request("readable request".to_owned(), selection())
+            .commit_request("readable request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         session
@@ -7096,7 +8607,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("persist file operations".to_owned(), selection())
+            .commit_request("persist file operations".to_owned(), selection(), None)
             .await
             .expect("commit request");
         settle_fixture_execution_with(
@@ -7732,7 +9243,7 @@ mod tests {
                 let signal = match milestone.as_str() {
                     "generation" => {
                         let run_id = writer
-                            .commit_request("generation interruption".to_owned(), selection())
+                            .commit_request("generation interruption".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -7744,7 +9255,7 @@ mod tests {
                     }
                     "execution" => {
                         let run_id = writer
-                            .commit_request("execution interruption".to_owned(), selection())
+                            .commit_request("execution interruption".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -7769,7 +9280,11 @@ mod tests {
                     }
                     "committed-step" => {
                         let run_id = writer
-                            .commit_request("committed step interruption".to_owned(), selection())
+                            .commit_request(
+                                "committed step interruption".to_owned(),
+                                selection(),
+                                None,
+                            )
                             .await
                             .expect("commit request")
                             .run_id;
@@ -7794,6 +9309,7 @@ mod tests {
                                 settled_step,
                                 persisted_execution(source, execution),
                                 arena.checkpoint(),
+                                Vec::new(),
                             )
                             .await
                             .expect("commit settled step");
@@ -7816,7 +9332,7 @@ mod tests {
                     }
                     "background-only" => {
                         let run_id = writer
-                            .commit_request("closed foreground".to_owned(), selection())
+                            .commit_request("closed foreground".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -8019,7 +9535,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned(), selection())
+            .commit_request("interrupted request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -8131,7 +9647,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("closed foreground".to_owned(), selection())
+            .commit_request("closed foreground".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -8441,7 +9957,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("combined interruption".to_owned(), selection())
+            .commit_request("combined interruption".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -8709,7 +10225,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned(), selection())
+            .commit_request("interrupted request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -8815,7 +10331,7 @@ mod tests {
         );
 
         let admission = writer
-            .commit_request("saved request".to_owned(), selection())
+            .commit_request("saved request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step = writer
@@ -8882,7 +10398,7 @@ mod tests {
         let terra = ModelSelection::new(&TERRA, "high").expect("select Terra");
         for (request, selection) in [("first request", selection()), ("second request", terra)] {
             let admission = writer
-                .commit_request(request.to_owned(), selection)
+                .commit_request(request.to_owned(), selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -8949,7 +10465,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let admission = writer
-            .commit_request("branch request".to_owned(), selection())
+            .commit_request("branch request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         writer
@@ -9017,7 +10533,7 @@ mod tests {
             let session = create_session(&home, &workspace).await;
             let writer = session.writer();
             let run = writer
-                .commit_request(format!("unfinished {unfinished}"), selection())
+                .commit_request(format!("unfinished {unfinished}"), selection(), None)
                 .await
                 .expect("commit request");
             match unfinished {
@@ -9074,6 +10590,7 @@ mod tests {
                                 attempts: Vec::new(),
                             },
                             session.initial_checkpoint().expect("load checkpoint"),
+                            Vec::new(),
                         )
                         .await
                         .expect("settle task origin step");
@@ -9295,7 +10812,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid execution projection".to_owned(), selection())
+            .commit_request("invalid execution projection".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step = writer
@@ -9314,6 +10831,7 @@ mod tests {
                     step,
                     projection_code(crate::model::CodeResult::execution(String::new()), false),
                     checkpoint,
+                    Vec::new(),
                 )
                 .await,
             Err(SessionError::InvalidTransition)
@@ -9340,7 +10858,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid terminal projection".to_owned(), selection())
+            .commit_request("invalid terminal projection".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before_selection = selection_snapshot(&session);
@@ -9387,7 +10905,7 @@ mod tests {
         let before_history = writer.model_history().expect("read live history");
         assert!(matches!(
             writer
-                .commit_request("stale request".to_owned(), selection())
+                .commit_request("stale request".to_owned(), selection(), None)
                 .await,
             Err(SessionError::InvalidTransition)
         ));
@@ -9407,7 +10925,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale settlement".to_owned(), selection())
+            .commit_request("stale settlement".to_owned(), selection(), None)
             .await
             .expect("commit settlement request");
         let step = writer
@@ -9441,6 +10959,7 @@ mod tests {
                         attempts: Vec::new(),
                     },
                     session.initial_checkpoint().expect("load checkpoint"),
+                    Vec::new(),
                 )
                 .await,
             Err(SessionError::InvalidTransition)
@@ -9461,7 +10980,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale closure".to_owned(), selection())
+            .commit_request("stale closure".to_owned(), selection(), None)
             .await
             .expect("commit closure request");
         move_durable_active_entry(&session, branch);
@@ -9503,7 +11022,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let admission = writer
-            .commit_request("context request".to_owned(), selection())
+            .commit_request("context request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before = writer.model_history().expect("read request context");
@@ -9551,7 +11070,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("persist this request".to_owned(), selection())
+            .commit_request("persist this request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9587,6 +11106,7 @@ mod tests {
                 code_step,
                 code,
                 session.initial_checkpoint().unwrap(),
+                Vec::new(),
             )
             .await
             .expect("settle code step");
@@ -9667,7 +11187,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback allocation".to_owned(), selection())
+            .commit_request("rollback allocation".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9713,7 +11233,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback".to_owned(), selection())
+            .commit_request("rollback".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9750,7 +11270,13 @@ mod tests {
         };
         assert!(
             writer
-                .settle_execution(run_id, step_id, code, session.initial_checkpoint().unwrap())
+                .settle_execution(
+                    run_id,
+                    step_id,
+                    code,
+                    session.initial_checkpoint().unwrap(),
+                    Vec::new()
+                )
                 .await
                 .is_err()
         );
@@ -9784,7 +11310,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection())
+            .commit_request("parent".to_owned(), selection(), None)
             .await
             .expect("start parent run")
             .run_id;
@@ -10377,7 +11903,7 @@ mod tests {
         let writer = session.writer();
 
         let discarded = writer
-            .commit_request("discarded request".to_owned(), selection())
+            .commit_request("discarded request".to_owned(), selection(), None)
             .await
             .expect("commit discarded request");
         let discarded_step = writer
@@ -10404,7 +11930,7 @@ mod tests {
             .await
             .expect("close discarded run");
         let retained = writer
-            .commit_request("retained request".to_owned(), selection())
+            .commit_request("retained request".to_owned(), selection(), None)
             .await
             .expect("commit retained request");
         let retained_step = writer
@@ -10655,7 +12181,7 @@ mod tests {
             .await
             .expect("select reopened compaction");
         let child = reopened_writer
-            .commit_request("branch request".to_owned(), selection())
+            .commit_request("branch request".to_owned(), selection(), None)
             .await
             .expect("branch from applied compaction");
         let child_parent: i64 = reopened
@@ -10806,7 +12332,7 @@ mod tests {
                 .await
                 .expect("select compaction branch");
             let child = writer
-                .commit_request(format!("branch from {summary}"), selection())
+                .commit_request(format!("branch from {summary}"), selection(), None)
                 .await
                 .expect("branch from compaction");
             let child_parent: i64 = session
@@ -10895,7 +12421,7 @@ mod tests {
                 .await
                 .expect("select compaction outcome");
             let child = writer
-                .commit_request("branch request".to_owned(), selection())
+                .commit_request("branch request".to_owned(), selection(), None)
                 .await
                 .expect("branch from compaction outcome");
             let child_parent: i64 = session
@@ -11395,7 +12921,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let admission = writer
-            .commit_request("inspect".to_owned(), selection())
+            .commit_request("inspect".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step_id = writer
@@ -11738,7 +13264,7 @@ mod tests {
         append_cancelled_request(&writer, "first request").await;
         let branch_point = session.restore().expect("restore").observed_active_entry;
         let abandoned = writer
-            .commit_request("abandoned request".to_owned(), selection())
+            .commit_request("abandoned request".to_owned(), selection(), None)
             .await
             .expect("commit abandoned request");
         let abandoned_step = writer
@@ -11860,7 +13386,7 @@ mod tests {
     async fn compaction_snapshot_rejects_corrupt_selected_chains() {
         async fn append_request(writer: &SessionWriter, request: &str) -> i64 {
             let admission = writer
-                .commit_request(request.to_owned(), selection())
+                .commit_request(request.to_owned(), selection(), None)
                 .await
                 .expect("commit request");
             writer
@@ -12079,7 +13605,7 @@ mod tests {
         let call = known_usage(40, 2);
         let summary = known_usage(7, 1);
         let admission = writer
-            .commit_request("recover".to_owned(), selection())
+            .commit_request("recover".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let preparation = writer
@@ -12187,7 +13713,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let admission = writer
-            .commit_request("recover".to_owned(), selection())
+            .commit_request("recover".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step_id = writer
@@ -12247,7 +13773,7 @@ mod tests {
         append_cancelled_request(writer, "discarded request").await;
         append_cancelled_request(writer, "retained request").await;
         let admission = writer
-            .commit_request("recover".to_owned(), selection())
+            .commit_request("recover".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step_id = writer
@@ -12290,6 +13816,7 @@ mod tests {
                 super::RestoredRecordKind::CancelledRun { .. } => "cancelled",
                 super::RestoredRecordKind::FailedRun { .. } => "failed",
                 super::RestoredRecordKind::Compaction { .. } => "compaction",
+                super::RestoredRecordKind::SkillActivation { .. } => "skill_activation",
             })
             .collect()
     }

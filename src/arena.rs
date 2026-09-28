@@ -30,13 +30,16 @@ use crate::{
             COLLECTION_MAX_PAYLOAD_BYTES,
         },
     },
+    model::SkillActivation,
+    skills::SkillCatalog,
     subagents::{
         AgentInvocationContext, InvocationOperation, TrustedExecutionContext, WaitPhaseSignal,
         invoke as invoke_subagent,
     },
     tools::{
-        ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost, ToolOutputChunk, ToolResult,
-        ToolValue, WholeFileAuthorisations, bootstrap_source, type_check_stubs,
+        SkillLoadLedger, ToolCall as HostToolCall, ToolError, ToolErrorKind, ToolHost,
+        ToolOutputChunk, ToolResult, ToolValue, WholeFileAuthorisations, bootstrap_source,
+        type_check_stubs,
     },
 };
 
@@ -822,6 +825,10 @@ impl ArenaChildSource {
     pub(crate) fn prompt_reference(&self, read_only: bool) -> String {
         self.tool_host.for_child(read_only).prompt_reference()
     }
+
+    pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
+        self.tool_host.skill_catalog()
+    }
 }
 
 pub struct Arena {
@@ -1016,23 +1023,26 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
     ) -> Result<Execution, ArenaError> {
-        self.execute_with_context(code, cancellation, progress, invocation, true)
+        self.execute_with_context(code, cancellation, progress, invocation, true, &[])
             .await
+            .map(|(execution, _)| execution)
     }
 
-    pub(crate) async fn execute_model_code_with_progress_and_context(
+    pub(crate) async fn execute_model_code(
         &mut self,
         code: &str,
         cancellation: &CancellationToken,
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
-    ) -> Result<Execution, ArenaError> {
+        active_skills: &[SkillActivation],
+    ) -> Result<(Execution, Vec<SkillActivation>), ArenaError> {
         self.execute_with_context(
             code,
             cancellation,
             progress,
             invocation,
             self.model_type_check_disabled,
+            active_skills,
         )
         .await
     }
@@ -1044,7 +1054,13 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
         skip_type_check: bool,
-    ) -> Result<Execution, ArenaError> {
+        active_skills: &[SkillActivation],
+    ) -> Result<(Execution, Vec<SkillActivation>), ArenaError> {
+        let mut skill_ledger =
+            SkillLoadLedger::new(active_skills).map_err(|error| ArenaError::Infrastructure {
+                message: format!("active skill ledger is invalid: {error}"),
+                execution: None,
+            })?;
         let mut budget = ChargeableBudget::new(self.clock.clone(), self.execution_timeout);
         match budget
             .wait(cancellation, self.restore_current_checkpoint_if_needed())
@@ -1091,11 +1107,17 @@ impl Arena {
             &mut interruption,
             &mut budget,
             cancellation,
+            &mut skill_ledger,
         )
         .await;
 
         match attempt {
             Ok((outcome, state)) => {
+                let skill_activations = if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
+                    skill_ledger.into_captured()
+                } else {
+                    Vec::new()
+                };
                 self.checkout = Some(checkout);
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
@@ -1103,14 +1125,17 @@ impl Arena {
                     authorisations,
                 };
                 let (tool_calls, read_paths, modified_paths) = interruption.tools.into_parts();
-                Ok(Execution {
-                    stdout: interruption.streams.stdout.finish(),
-                    stderr: interruption.streams.stderr.finish(),
-                    outcome,
-                    tool_calls,
-                    read_paths,
-                    modified_paths,
-                })
+                Ok((
+                    Execution {
+                        stdout: interruption.streams.stdout.finish(),
+                        stderr: interruption.streams.stderr.finish(),
+                        outcome,
+                        tool_calls,
+                        read_paths,
+                        modified_paths,
+                    },
+                    skill_activations,
+                ))
             }
             Err(failure) => {
                 let error = failure
@@ -1535,6 +1560,7 @@ async fn execute_checkout(
     interruption: &mut InterruptedExecutionState,
     budget: &mut ChargeableBudget,
     cancellation: &CancellationToken,
+    skill_ledger: &mut SkillLoadLedger,
 ) -> Result<(ExecutionOutcome, Vec<u8>), AttemptFailure> {
     let result = drive(
         checkout,
@@ -1547,6 +1573,7 @@ async fn execute_checkout(
         interruption,
         budget,
         cancellation,
+        skill_ledger,
     )
     .await;
     interruption.streams.flush_stdout(Instant::now(), progress);
@@ -1689,6 +1716,7 @@ async fn drive(
     interruption: &mut InterruptedExecutionState,
     budget: &mut ChargeableBudget,
     cancellation: &CancellationToken,
+    skill_ledger: &mut SkillLoadLedger,
 ) -> Result<MontyObject, DriverError> {
     let InterruptedExecutionState {
         streams,
@@ -1854,7 +1882,13 @@ async fn drive(
                                 "a pending run call must have a unique call ID"
                             );
                         }
-                        if let Some(operation) = call.invocation {
+                        if call.tool == ToolName::LoadSkill {
+                            let result = tool_host.load_skill(call.arguments, skill_ledger);
+                            let call_id = call.call_id;
+                            invocation_calls.push(Box::pin(async move {
+                                ToolResult::from_result(call_id, result)
+                            }));
+                        } else if let Some(operation) = call.invocation {
                             let call_id = call.call_id;
                             let arguments = call.arguments;
                             let wait_phase_sender = wait_phase_sender.clone();
@@ -1892,6 +1926,7 @@ async fn drive(
                         filesystem_calls,
                         authorisations.clone(),
                         output_sender,
+                        skill_ledger.active(),
                     ));
                     let mut filesystem_complete = false;
                     while !tokens.is_empty() {
@@ -2192,6 +2227,10 @@ fn tool_summary(tool: ToolName, result: &ToolResult) -> ToolCallSummary {
             Ok(_) | Err(_) => ToolCallSummary::Failed,
         },
         ToolName::Write | ToolName::Edit => ToolCallSummary::Failed,
+        ToolName::LoadSkill => match &result.result {
+            Ok(ToolValue::String(_)) => ToolCallSummary::Count(1),
+            _ => ToolCallSummary::Failed,
+        },
         ToolName::Read | ToolName::ListDir | ToolName::Glob | ToolName::Grep => {
             match &result.result {
                 Ok(ToolValue::String(contents)) => ToolCallSummary::Count(contents.len()),
@@ -2802,7 +2841,8 @@ mod tests {
         parse_soft_memory_limit, result_values_from_monty, tool_summary, update_budget_pause,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::model::{ScriptedAction, ScriptedModel};
+    use crate::model::{ScriptedAction, ScriptedModel, SkillActivation};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
         ChildParameters, ChildPayload, ChildResult, ChildRun, ChildRunner, Clock,
@@ -2838,6 +2878,236 @@ mod tests {
         )
         .await
         .expect("create arena")
+    }
+
+    async fn arena_with_user_skill(workspace: &TempDir, home: &TempDir) -> Arena {
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_SKILL_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        Arena::new(worker_path(), host).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_load_skill_is_captured_after_execution_without_body_in_trace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let (execution, captured) = arena
+            .execute_model_code(
+                "await load_skill('review')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(execution.tool_calls.len(), 1);
+        assert_eq!(execution.tool_calls[0].tool, ToolName::LoadSkill);
+        assert_eq!(execution.tool_calls[0].summary, ToolCallSummary::Count(1));
+        assert!(!format!("{execution:?}").contains("PRIVATE_SKILL_BODY"));
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].source_text().contains("PRIVATE_SKILL_BODY"));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_reads_work_in_root_and_read_only_child_without_continuity_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut parent = arena_with_user_skill(&workspace, &home).await;
+        let references = home.path().join(".agents/skills/review/references");
+        fs::create_dir_all(&references).unwrap();
+        fs::write(references.join("note.md"), "live note").unwrap();
+        let initial_authorisations = parent.checkpoint().authorisations.clone();
+
+        let code = "note = await read('skill://review/references/note.md')\nentries = await list_dir('skill://review/references')\nnote == 'live note' and len(entries) == 1 and entries[0].path == 'skill://review/references/note.md'";
+        let execution = execute_without_cancellation(&mut parent, code)
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(execution.read_paths.is_empty());
+        assert!(execution.modified_paths.is_empty());
+        assert_eq!(parent.checkpoint().authorisations, initial_authorisations);
+
+        let checkpoint = parent.checkpoint();
+        let mut child = parent.child(&checkpoint, true).await.unwrap();
+        let execution = execute_without_cancellation(
+            &mut child,
+            "note = await read('skill://review/references/note.md')\nnote == 'live note' and (await list_dir('skill://review/references'))[0].path == 'skill://review/references/note.md'",
+        ).await.unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert!(execution.read_paths.is_empty());
+        assert_eq!(child.checkpoint().authorisations, initial_authorisations);
+    }
+
+    #[tokio::test]
+    async fn direct_only_skill_resources_require_the_skill_to_be_active() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "direct",
+            "description: Direct\ndisable-model-invocation: true\n",
+            "body",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let active = [SkillActivation::from_skill(
+            catalog.lookup("direct").unwrap(),
+        )];
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let code = "(await read('skill://direct/SKILL.md')).endswith('body') and len(await list_dir('skill://direct/')) == 1";
+
+        let (execution, _) = arena
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &active)
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        let (execution, _) = arena
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
+            .await
+            .unwrap();
+        assert!(
+            python_error(&execution)
+                .text
+                .contains("can only be activated directly by the user")
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_skill_resources_stay_readable_after_load_skill() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let (execution, captured) = arena
+            .execute_model_code(
+                "await load_skill('review')\n(await read('skill://review/SKILL.md')).endswith('PRIVATE_SKILL_BODY')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(captured.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn python_error_after_load_skill_discards_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let (execution, captured) = arena
+            .execute_model_code(
+                "await load_skill('review')\nraise ValueError('boom')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::PythonError(_)
+        ));
+        assert!(captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn caught_load_skill_error_keeps_earlier_successful_loads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            let name = format!("large-{index}");
+            write_skill(
+                &home.path().join(".agents/skills"),
+                &name,
+                &format!("name: {name}\ndescription: Large\n"),
+                &"BODY_SENTINEL".repeat(4_700),
+            );
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let code = "await load_skill('large-0')\nawait load_skill('large-1')\nawait load_skill('large-2')\nawait load_skill('large-3')\ntry:\n    await load_skill('large-4')\nexcept ValueError:\n    pass";
+        let (execution, captured) = arena
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            execution.outcome,
+            ExecutionOutcome::Complete { .. }
+        ));
+        assert_eq!(execution.tool_calls.len(), 5);
+        assert_eq!(execution.tool_calls[4].summary, ToolCallSummary::Failed);
+        assert_eq!(captured.len(), 4);
+        assert!(!format!("{execution:?}").contains("BODY_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_load_skill_discards_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("blocked"), "contents").unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "PRIVATE_SKILL_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let gate = ReadTestGate::new();
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog)
+            .with_test_gate(gate.clone());
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let mut progress = |_| {};
+        let mut execution = Box::pin(arena.execute_model_code(
+            "await load_skill('review')\nawait read('blocked')",
+            &cancellation,
+            &mut progress,
+            None,
+            &[],
+        ));
+        tokio::select! {
+            _ = gate.wait_until_read_settled() => {}
+            result = &mut execution => panic!("execution finished before skill load settled: {result:?}"),
+        }
+        gate.resume_driver();
+        tokio::select! {
+            _ = gate.wait_until_read_started() => {}
+            result = &mut execution => panic!("execution finished before read started: {result:?}"),
+        }
+        cancellation.cancel();
+        assert!(matches!(execution.await, Err(ArenaError::Cancelled { .. })));
     }
 
     async fn arena_with_collection_limits(
@@ -3111,13 +3381,9 @@ mod tests {
 
     async fn execute_checked(arena: &mut Arena, code: &str) -> Result<Execution, ArenaError> {
         arena
-            .execute_model_code_with_progress_and_context(
-                code,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
+            .map(|(execution, _)| execution)
     }
 
     fn gathered_reads(count: usize) -> String {
@@ -4127,7 +4393,7 @@ mod tests {
         let mut child = parent.child(&checkpoint, false).await.unwrap();
         assert_eq!(
             child.tool_host.prompt_reference(),
-            crate::tools::prompt_reference()
+            crate::tools::prompt_reference(&SkillCatalog::default())
         );
         assert!(
             python_error(
@@ -8763,6 +9029,7 @@ mod tests {
         let mut authorisations = WholeFileAuthorisations::default();
         let cancellation = CancellationToken::new();
         let mut budget = ChargeableBudget::new(arena.clock.clone(), Duration::from_secs(1));
+        let mut skill_ledger = crate::tools::SkillLoadLedger::new(&[]).unwrap();
         let result = drive(
             checkout,
             &arena.tool_host,
@@ -8774,6 +9041,7 @@ mod tests {
             &mut interruption,
             &mut budget,
             &cancellation,
+            &mut skill_ledger,
         )
         .await;
         let Err(DriverError::Runtime(error)) = result else {

@@ -174,6 +174,7 @@ mod tests {
         },
         openai::OpenAiModel,
         prompt::{child_prompt, root_prompt},
+        skills::SkillCatalog,
         sse_fixture::{Fixture, FixtureReply},
         subagents::ChildModelFactory,
     };
@@ -470,8 +471,9 @@ mod tests {
             .unwrap()
             .for_child(true)
             .prompt_reference();
-        let root = root_prompt("canonical base");
-        let child_instructions = child_prompt("canonical base", reference);
+        let empty = SkillCatalog::default();
+        let root = root_prompt("canonical base", &empty);
+        let child_instructions = child_prompt("canonical base", &empty, reference);
         assert!(root.contains("async def write("));
         assert!(!child_instructions.contains("async def write("));
         let openai_fixture = Fixture::start(openai_message("done")).await;

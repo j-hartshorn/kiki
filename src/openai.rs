@@ -144,6 +144,9 @@ impl OpenAiModel {
                         "content": canonical_compaction_summary(summary)
                     }));
                 }
+                ModelContextEntry::SkillActivation(activation) => {
+                    input.push(json!({"role": "user", "content": activation.model_text()}));
+                }
                 ModelContextEntry::CompletedCode(completed) => {
                     let replay = replay_values(completed.replay())?;
                     match validate_replay_output(&replay)? {
@@ -1888,6 +1891,7 @@ struct WireIncompleteDetails {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1912,7 +1916,10 @@ pub(crate) mod tests {
             models::{ASTRA, CATALOGUE, Provider, SOL, TERRA},
             settings::CrossProviderReasoning,
         },
-        model::{AttemptAccounting, Model, ModelError, ModelFailure, ModelHistory},
+        model::{
+            AttemptAccounting, Model, ModelError, ModelFailure, ModelHistory, SkillActivation,
+        },
+        skills::SkillOrigin,
         sse_fixture::{Fixture, FixtureReply},
     };
 
@@ -1928,6 +1935,38 @@ pub(crate) mod tests {
             crate::config::DEFAULT_MODEL.default_thinking,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn activated_skill_body_is_projected_once_in_next_openai_request() {
+        let model = super::OpenAiModel::new("system", "key", CrossProviderReasoning::Inline);
+        let mut history = history();
+        let activation = SkillActivation::new(
+            "build".to_owned(),
+            PathBuf::from("/home/skills/build"),
+            "---\nname: build\ndescription: Build\n---\nRun the build.".to_owned(),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        history.activate_skill(activation.clone()).unwrap();
+        history.activate_skill(activation).unwrap();
+        let request = model
+            .request(
+                ModelSelection::new(&SOL, SOL.default_thinking).unwrap(),
+                &history,
+            )
+            .unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Run the build.")))
+                .count(),
+            1
+        );
     }
 
     const COMPLETED_STREAM: &str = concat!(
@@ -5424,7 +5463,7 @@ pub(crate) mod tests {
                 Some(usage()),
             )))
             .await;
-            let reference = crate::tools::prompt_reference();
+            let reference = crate::tools::prompt_reference(&crate::skills::SkillCatalog::default());
             let prompt = format!("arbitrary base prompt\n\n{reference}");
             let mut model = OpenAiModel::with_endpoint(&prompt, "fixture-key", &fixture.endpoint);
             let cancellation = CancellationToken::new();
@@ -6602,7 +6641,7 @@ pub(crate) mod tests {
                         }
                         Record::CancelledRun { .. } => run.cancelled_runs += 1,
                         Record::FailedRun { .. } => run.failed_runs += 1,
-                        Record::Compaction { .. } => {}
+                        Record::Compaction { .. } | Record::SkillActivation { .. } => {}
                     }
                 }
                 RuntimeEvent::RunSettled { run_id } => {
@@ -6628,6 +6667,7 @@ pub(crate) mod tests {
                 | RuntimeEvent::CorrectionCompleted { .. }
                 | RuntimeEvent::TreeCatalogue { .. }
                 | RuntimeEvent::SubmissionRejectedBusy { .. }
+                | RuntimeEvent::SkillActivationRejected { .. }
                 | RuntimeEvent::CompactionAcknowledged { .. }
                 | RuntimeEvent::CompactionLifecycle { .. }
                 | RuntimeEvent::AutomaticCompactionStarted { .. }
@@ -6733,6 +6773,7 @@ pub(crate) mod tests {
                 ready.workspace_root().to_path_buf(),
                 crate::production_model(
                     &ready,
+                    &crate::skills::SkillCatalog::default(),
                     persisted_settings.anthropic_cache_ttl(),
                     persisted_settings.cross_provider_reasoning(),
                 ),
@@ -6947,6 +6988,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: FIRST_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let mut collector = LiveCollector::default();
@@ -6969,6 +7011,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: CANCELLATION_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let second_run_id = wait_for_request(
@@ -7007,6 +7050,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: FOLLOW_UP_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let third_run_id = wait_for_request(
@@ -7067,7 +7111,7 @@ pub(crate) mod tests {
                 }
                 Record::CancelledRun { .. } => cancelled_runs += 1,
                 Record::FailedRun { .. } => failed_runs += 1,
-                Record::Compaction { .. } => {}
+                Record::Compaction { .. } | Record::SkillActivation { .. } => {}
             }
         }
         (

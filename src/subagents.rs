@@ -1338,7 +1338,9 @@ impl<F: ChildModelFactory + Clone> ChildRunner<ChildPayload> for CompleteChildRu
             child.into_parts();
         let (request, selection, read_only) = parameters.into_parts();
         let accepted_thinking = payload.accepted_thinking.clone();
-        let child_prompt = child_prompt(&prompt_base, payload.source.prompt_reference(read_only));
+        let tool_reference = payload.source.prompt_reference(read_only);
+        let child_prompt =
+            child_prompt(&prompt_base, payload.source.skill_catalog(), tool_reference);
         let model = models.create(child_prompt);
         Box::pin(async move {
             trace.emit(|| TraceEvent::ChildArenaConstructionStarted {
@@ -3934,6 +3936,7 @@ mod tests {
         ModelHistory, ModelProgress, ModelStep, ProviderReplay, ScriptedAction, ScriptedModel,
     };
     use crate::session::{Session, SessionWriteGate, SessionWriteKind};
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::telemetry::TraceOwner;
     use crate::tools::{ReadTestGate, ToolErrorKind, ToolHost, ToolValue};
 
@@ -4549,7 +4552,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -4971,7 +4974,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -5649,7 +5652,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -6515,7 +6518,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -7937,6 +7940,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_runner_derives_catalog_from_child_source_in_read_only_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review workflow\n",
+            "PRIVATE_SKILL_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &scope,
+            home.path(),
+            false,
+            crate::prompt::skills_catalog_guidance(),
+        ));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog.clone());
+        let parent = Arena::new(worker_path(), host).await.unwrap();
+        let factory = ScriptedChildFactory::new([vec![ScriptedAction::Message {
+            text: "done".to_owned(),
+        }]]);
+        let runner = super::CompleteChildRunner::new("override base".to_owned(), factory.clone());
+        let coordinator = SubagentCoordinator::new(policy(), Arc::new(runner));
+        let caller = coordinator.root_caller().await;
+        let admitted = coordinator
+            .start(
+                &caller,
+                ChildParameters::new(
+                    "review".to_owned(),
+                    ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                    true,
+                ),
+                super::ChildPayload::new(parent.child_source(), parent.checkpoint()),
+            )
+            .await
+            .unwrap();
+        coordinator.wait(&caller, admitted.id()).await.unwrap();
+        let prompt = factory.prompts.lock().unwrap().pop().unwrap();
+        assert!(prompt.starts_with("override base\n\n# Subagent work"));
+        assert_eq!(prompt.matches("Review workflow").count(), 1);
+        assert!(prompt.contains(crate::prompt::skills_catalog_guidance()));
+        assert_eq!(
+            prompt
+                .matches("async def load_skill(name: str) -> str:")
+                .count(),
+            1
+        );
+        assert_eq!(prompt.matches("## Kiki tool reference").count(), 1);
+        assert!(!prompt.contains("PRIVATE_SKILL_BODY"));
+        for signature in ["async def write(", "async def edit(", "async def run("] {
+            assert!(!prompt.contains(signature));
+        }
+    }
+
+    #[tokio::test]
     async fn complete_runner_uses_a_child_checkpoint_and_validated_exports() {
         let workspace = tempfile::tempdir().unwrap();
         let mut parent = Arena::new(
@@ -7948,11 +8009,12 @@ mod tests {
         .await
         .expect("create parent arena");
         parent
-            .execute_model_code_with_progress_and_context(
+            .execute_model_code(
                 "inherited = 41\nresult_values = {'parent': 'kept'}",
                 &CancellationToken::new(),
                 &mut |_| {},
                 None,
+                &[],
             )
             .await
             .expect("initialise parent state");

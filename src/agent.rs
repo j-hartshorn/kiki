@@ -15,6 +15,7 @@ use crate::config::{
 use crate::model::{
     AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError, ModelFailure,
     ModelHistory, ModelHistoryError, ModelProgress, ModelStep, ProviderFailure, ProviderReplay,
+    SkillActivation,
 };
 use crate::session::{
     CommittedCompaction, CompactionOutcome, CompactionReason, CompactionSettlement, PersistedCode,
@@ -141,6 +142,7 @@ pub(crate) enum PersistedAgentEvent {
         run_id: u64,
         request_entry: SessionEntryId,
         request: String,
+        activation: Option<SkillActivation>,
     },
     CompactionStarted {
         run_id: u64,
@@ -199,6 +201,7 @@ pub(crate) enum PersistedAgentEvent {
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
+        activations: Vec<SkillActivation>,
     },
 }
 
@@ -740,16 +743,21 @@ impl<M: Model> Agent<M> {
         policy: CompactionSettings,
         reasoning: CrossProviderReasoning,
         request: String,
+        activation: Option<SkillActivation>,
         cancellation: &CancellationToken,
         writer: &SessionWriter,
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
-        let admission = writer.commit_request(request.clone(), selection).await?;
+        let admission = writer
+            .commit_request(request.clone(), selection, activation.clone())
+            .await?;
         let run_id = admission.run_id;
+        let activation_written = admission.effective_entry != admission.request_entry;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,
             request_entry: admission.request_entry,
             request,
+            activation: activation.filter(|_| activation_written),
         });
 
         let mut attempts = Vec::new();
@@ -1102,6 +1110,7 @@ impl<M: Model> Agent<M> {
                         step_id,
                         commentary: pending.commentary.clone(),
                     });
+                    let active_skills = history.active_skills().cloned().collect::<Vec<_>>();
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ToolUpdated { token, call } => {
@@ -1132,18 +1141,19 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_model_code_with_progress_and_context(
+                            .execute_model_code(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
                                 self.invocation_context
                                     .as_ref()
                                     .map(|context| (context, pending.selection)),
+                                &active_skills,
                             )
                             .await
                     };
                     match execution {
-                        Ok(execution) => {
+                        Ok((execution, skill_activations)) => {
                             let result = CodeResult::execution(execution_feedback(&execution));
                             let code = persisted_code(
                                 &pending,
@@ -1152,8 +1162,14 @@ impl<M: Model> Agent<M> {
                                 step_attempts.clone(),
                             );
                             let checkpoint = self.arena.checkpoint();
-                            writer
-                                .settle_execution(run_id, step_id, code, checkpoint)
+                            let activations = writer
+                                .settle_execution(
+                                    run_id,
+                                    step_id,
+                                    code,
+                                    checkpoint,
+                                    skill_activations,
+                                )
                                 .await?;
                             pending_step_id = None;
                             committed_attempts += step_attempts.len();
@@ -1165,6 +1181,7 @@ impl<M: Model> Agent<M> {
                                 reasoning_summary: pending.reasoning_summary,
                                 execution,
                                 attempts: step_attempts,
+                                activations,
                             });
                         }
                         Err(error) => {
@@ -1381,6 +1398,7 @@ impl<M: Model> Agent<M> {
                     progress(AgentProgress::ExecutionStarted {
                         commentary: pending.commentary.clone(),
                     });
+                    let active_skills = history.active_skills().cloned().collect::<Vec<_>>();
                     let execution = {
                         let mut arena_progress = |arena_progress| match arena_progress {
                             ArenaProgress::ToolUpdated { token, call } => {
@@ -1397,18 +1415,19 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_model_code_with_progress_and_context(
+                            .execute_model_code(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
                                 self.invocation_context
                                     .as_ref()
                                     .map(|context| (context, pending.selection)),
+                                &active_skills,
                             )
                             .await
                     };
                     match execution {
-                        Ok(execution) => {
+                        Ok((execution, skill_activations)) => {
                             let source = pending.source.clone();
                             let commentary = pending.commentary.clone();
                             let reasoning_summary = pending.reasoning_summary.clone();
@@ -1421,6 +1440,11 @@ impl<M: Model> Agent<M> {
                                     attempts,
                                     evidence: None,
                                 });
+                            }
+                            for activation in skill_activations {
+                                history
+                                    .activate_skill(activation)
+                                    .expect("load ledger validated active skill text cap");
                             }
                             progress(AgentProgress::ExecutionCompleted {
                                 source,
@@ -1705,6 +1729,7 @@ mod tests {
         RestoredRecordKind, Session, SessionEntryId, SessionWriteGate, SessionWriteKind,
         SessionWriter,
     };
+    use crate::skills::{ProjectScope, SkillCatalog, write_skill};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, ChildPayload, ChildResult, ChildRun, ChildRunner,
         RunnerFuture, SessionSubagents, SubagentCoordinator, SubagentPolicy,
@@ -1735,6 +1760,213 @@ mod tests {
         .await
         .expect("create arena");
         Agent::new(arena, model)
+    }
+
+    #[tokio::test]
+    async fn read_only_child_loads_skill_into_next_model_context_without_printing_body() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "CHILD_PRIVATE_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog)
+            .for_child(true);
+        let arena = Arena::new(worker_path(), tool_host).await.unwrap();
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await load_skill('review')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]),
+        );
+        let answer = agent
+            .run(default_selection(), "review", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(answer.text(), "done");
+        let contexts = agent.model.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[1]
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::SkillActivation(_)))
+                .count(),
+            1
+        );
+        assert!(format!("{:?}", contexts[1]).contains("CHILD_PRIVATE_BODY"));
+        assert!(!format!("{:?}", contexts[0]).contains("CHILD_PRIVATE_BODY"));
+    }
+
+    #[tokio::test]
+    async fn persisted_root_load_skill_reaches_next_model_step_and_restore() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "name: review\ndescription: Review\n",
+            "ROOT_PRIVATE_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let tool_host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let arena = Arena::new(worker_path(), tool_host).await.unwrap();
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await load_skill('review')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]),
+        );
+        let selection = default_selection();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, agent.checkpoint()).unwrap();
+        let writer = session.writer();
+        let outcome = agent
+            .run_persisted(
+                selection,
+                CompactionSettings::new(16_384, 20_000),
+                CrossProviderReasoning::Inline,
+                "review".to_owned(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome.terminal, PersistedTerminal::Final { .. }));
+        let contexts = agent.model.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert!(!format!("{:?}", contexts[0]).contains("ROOT_PRIVATE_BODY"));
+        assert_eq!(
+            contexts[1]
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::SkillActivation(_)))
+                .count(),
+            1
+        );
+        assert!(format!("{:?}", contexts[1]).contains("ROOT_PRIVATE_BODY"));
+        let restored = session.restore().unwrap();
+        let history = restored.executable.unwrap().history;
+        assert_eq!(history.active_skills().count(), 1);
+        assert!(
+            history
+                .active_skills()
+                .next()
+                .unwrap()
+                .source_text()
+                .contains("ROOT_PRIVATE_BODY")
+        );
+        drop(writer);
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_root_loads_two_skills_from_one_cell_into_next_step_and_ancestry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("alpha", "ALPHA_PRIVATE_BODY"),
+            ("beta", "BETA_PRIVATE_BODY"),
+        ] {
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                &format!("name: {name}\ndescription: {name}\n"),
+                body,
+            );
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let arena = Arena::new(worker_path(), host).await.unwrap();
+        let mut agent = Agent::new(
+            arena,
+            ScriptedModel::new(vec![
+                ModelAction::Code {
+                    source: "await load_skill('alpha')\nawait load_skill('beta')".to_owned(),
+                },
+                ModelAction::Message {
+                    text: "done".to_owned(),
+                },
+            ]),
+        );
+        let selection = default_selection();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, agent.checkpoint()).unwrap();
+        let writer = session.writer();
+        agent
+            .run_persisted(
+                selection,
+                CompactionSettings::new(16_384, 20_000),
+                CrossProviderReasoning::Inline,
+                "use both".to_owned(),
+                None,
+                &CancellationToken::new(),
+                &writer,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+
+        let contexts = agent.model.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[1]
+                .iter()
+                .filter(|entry| matches!(entry, ModelContextEntry::SkillActivation(_)))
+                .count(),
+            2
+        );
+        for body in ["ALPHA_PRIVATE_BODY", "BETA_PRIVATE_BODY"] {
+            assert!(!format!("{:?}", contexts[0]).contains(body));
+            assert!(format!("{:?}", contexts[1]).contains(body));
+        }
+
+        let restored = session.restore().unwrap();
+        let active = restored
+            .executable
+            .unwrap()
+            .history
+            .active_skills()
+            .map(|skill| (skill.name().to_owned(), skill.source_text().to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .any(|(name, body)| name == "alpha" && body.contains("ALPHA_PRIVATE_BODY"))
+        );
+        assert!(
+            active
+                .iter()
+                .any(|(name, body)| name == "beta" && body.contains("BETA_PRIVATE_BODY"))
+        );
+        drop(writer);
+        session.close().unwrap();
     }
 
     async fn run_capturing_progress(
@@ -1819,7 +2051,7 @@ mod tests {
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
-                .commit_request(format!("{label} request"), default_selection())
+                .commit_request(format!("{label} request"), default_selection(), None)
                 .await
                 .expect("commit compaction fixture request");
             let step_id = writer
@@ -2060,6 +2292,7 @@ mod tests {
                 CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "next request".to_owned(),
+                None,
                 &next_cancellation,
                 &writer,
                 &mut |event| events.push(event),
@@ -2095,7 +2328,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -2200,6 +2433,7 @@ mod tests {
                 policy,
                 CrossProviderReasoning::Inline,
                 "small request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -2221,6 +2455,7 @@ mod tests {
                 policy,
                 CrossProviderReasoning::Inline,
                 large_request.clone(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |event| events.push(event),
@@ -2370,6 +2605,7 @@ mod tests {
                 policy,
                 CrossProviderReasoning::Inline,
                 request,
+                None,
                 cancellation,
                 writer,
                 &mut |event| events.push(event),
@@ -2536,7 +2772,7 @@ mod tests {
         let writer = session.writer();
         append_seed_request(&writer, "oldest request").await;
         let admission = writer
-            .commit_request("earlier request".to_owned(), default_selection())
+            .commit_request("earlier request".to_owned(), default_selection(), None)
             .await
             .expect("commit earlier request");
         let step_id = writer
@@ -2822,7 +3058,7 @@ mod tests {
 
     async fn append_seed_request(writer: &SessionWriter, request: &str) {
         let admission = writer
-            .commit_request(request.to_owned(), default_selection())
+            .commit_request(request.to_owned(), default_selection(), None)
             .await
             .expect("commit seed request");
         writer
@@ -3324,7 +3560,8 @@ mod tests {
                             .flat_map(|recovery| recovery.attempts),
                     );
                 }
-                RestoredRecordKind::UserRequest { .. } => {}
+                RestoredRecordKind::UserRequest { .. }
+                | RestoredRecordKind::SkillActivation { .. } => {}
             }
         }
         billed
@@ -4026,6 +4263,7 @@ mod tests {
                     recovery_policy(),
                     CrossProviderReasoning::Inline,
                     large_request(),
+                    None,
                     &cancellation,
                     &writer,
                     &mut |event| {
@@ -4172,6 +4410,7 @@ mod tests {
                 recovery_policy(),
                 CrossProviderReasoning::Inline,
                 large_request(),
+                None,
                 &cancellation,
                 &writer,
                 &mut event,
@@ -4502,6 +4741,7 @@ mod tests {
                 CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "inspect".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |event| events.push(event),
@@ -5521,6 +5761,7 @@ mod tests {
                 CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "time out then cancel".to_owned(),
+                None,
                 &cancellation,
                 &writer,
                 &mut event,
@@ -5601,6 +5842,7 @@ mod tests {
                     CompactionSettings::default(),
                     CrossProviderReasoning::Inline,
                     "request entry".to_owned(),
+                    None,
                     &CancellationToken::new(),
                     &session.writer(),
                     &mut event,

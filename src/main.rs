@@ -15,6 +15,7 @@ mod provider;
 pub mod runtime;
 mod selection;
 mod session;
+mod skills;
 #[cfg(test)]
 mod sse_fixture;
 mod subagents;
@@ -41,6 +42,7 @@ use crate::config::{
     ApiKey, ModelSelection,
     models::Provider,
     settings::{CacheTtl, CrossProviderReasoning},
+    skill_trust,
 };
 use crate::provider::ProviderModel;
 use crate::runtime::{
@@ -48,6 +50,7 @@ use crate::runtime::{
     RuntimeEvent,
 };
 use crate::session::{Session, SessionListRow};
+use crate::skills::{ProjectScope, SkillCatalog, SkillProjectionPolicy};
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -56,11 +59,12 @@ use crate::tools::ToolHost;
 
 fn production_model(
     ready: &config::ReadyStartup<'_>,
+    catalog: &SkillCatalog,
     anthropic_cache_ttl: CacheTtl,
     cross_provider_reasoning: CrossProviderReasoning,
 ) -> ProviderModel {
     ProviderModel::new(
-        ready.system_prompt(),
+        &prompt::root_prompt(ready.prompt_base(), catalog),
         ready.api_key(Provider::OpenAi).map(ApiKey::expose),
         ready.api_key(Provider::Anthropic).map(ApiKey::expose),
         anthropic_cache_ttl,
@@ -258,6 +262,33 @@ fn run_open_configuration(
     close_result
 }
 
+fn startup_skill_catalog(
+    scope: &ProjectScope,
+    home: &Path,
+    guidance: &str,
+    has_active_project_skill: impl FnOnce() -> Result<bool, Box<dyn Error>>,
+    prompt: impl FnOnce(&Path) -> Result<bool, tui::TuiError>,
+) -> Result<(Arc<SkillCatalog>, bool), Box<dyn Error>> {
+    let project = scope.excluding_user_root(home);
+    let include_project =
+        if skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope) {
+            true
+        } else if project.has_skill_directory() || has_active_project_skill()? {
+            prompt(&scope.canonical_scope)?
+        } else {
+            false
+        };
+    Ok((
+        Arc::new(SkillCatalog::discover(
+            &project,
+            home,
+            include_project,
+            guidance,
+        )),
+        include_project,
+    ))
+}
+
 fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let disable_type_check =
         requested_type_check_disabled(std::env::var_os("KIKI_TYPE_CHECK").as_deref())?;
@@ -270,10 +301,30 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
     let startup = configuration.snapshot().clone();
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
+    let skill_scope = ProjectScope::discover(&workspace_root)?;
+    let (skills_catalog, project_skills_trusted) = match startup_skill_catalog(
+        &skill_scope,
+        &home,
+        ready.skills_catalog_guidance(),
+        || Ok(false),
+        |scope| {
+            tui::run_project_skill_trust(scope, || {
+                skill_trust::save_project_skill_scope_trust(&home, scope)
+                    .map_err(|error| error.to_string())
+            })
+        },
+    ) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = trace_owner.shutdown();
+            return Err(error);
+        }
+    };
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
+        &skills_catalog,
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -288,7 +339,10 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
             return run_configuration(configuration.snapshot().clone(), trace_owner);
         }
     };
-    let mut arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
+    let mut arena = match runtime.block_on(Arena::new(
+        worker_path,
+        tool_host.with_skill_catalog(skills_catalog.clone()),
+    )) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
@@ -302,6 +356,9 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         arena.checkpoint(),
         disable_type_check,
     )?;
+    session.configure_skill_projection(SkillProjectionPolicy::new(
+        project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
+    ))?;
     if disable_type_check {
         arena.disable_model_type_check();
     }
@@ -325,7 +382,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run(
-        startup,
+        tui::TuiStartup::new(startup, skills_catalog),
         providers,
         command_sender.clone(),
         event_receiver,
@@ -382,10 +439,37 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
+    let skill_startup = (|| -> Result<Arc<SkillCatalog>, Box<dyn Error>> {
+        let skill_scope = ProjectScope::discover(&workspace_root)?;
+        let (skills_catalog, project_skills_trusted) = startup_skill_catalog(
+            &skill_scope,
+            &home,
+            ready.skills_catalog_guidance(),
+            || Ok(session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?),
+            |scope| {
+                tui::run_project_skill_trust(scope, || {
+                    skill_trust::save_project_skill_scope_trust(&home, scope)
+                        .map_err(|error| error.to_string())
+                })
+            },
+        )?;
+        session.configure_skill_projection(SkillProjectionPolicy::new(
+            project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
+        ))?;
+        Ok(skills_catalog)
+    })();
+    let skills_catalog = match skill_startup {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            close_open_session(session, trace_owner)?;
+            return Err(error);
+        }
+    };
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
         &ready,
+        &skills_catalog,
         startup.settings().anthropic_cache_ttl(),
         startup.settings().cross_provider_reasoning(),
     );
@@ -405,7 +489,10 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
             return run_open_configuration(session, configuration.snapshot().clone(), trace_owner);
         }
     };
-    let arena = match runtime.block_on(Arena::new(worker_path, tool_host)) {
+    let arena = match runtime.block_on(Arena::new(
+        worker_path,
+        tool_host.with_skill_catalog(skills_catalog.clone()),
+    )) {
         Ok(arena) => arena,
         Err(error) => {
             let configuration = configuration.with_worker_construction_failure(error);
@@ -450,7 +537,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         mpsc::channel::<ProgressEnvelope<RuntimeEvent>>(PROGRESS_CHANNEL_CAPACITY);
     let controller = runtime.spawn(controller.run(command_receiver, event_sender, progress_sender));
     let tui_result = tui::run_restored(
-        startup,
+        tui::TuiStartup::new(startup, skills_catalog),
         initial,
         providers,
         command_sender.clone(),
@@ -487,8 +574,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
 
     use super::requested_type_check_disabled;
+
+    fn startup_catalog(
+        launch: &Path,
+        home: &Path,
+        has_active_project_skill_in_scope: bool,
+        prompt: impl FnOnce(&Path) -> Result<bool, super::tui::TuiError>,
+    ) -> Result<std::sync::Arc<super::SkillCatalog>, Box<dyn std::error::Error>> {
+        let scope = super::ProjectScope::discover(launch)?;
+        super::startup_skill_catalog(
+            &scope,
+            home,
+            super::prompt::skills_catalog_guidance(),
+            || Ok(has_active_project_skill_in_scope),
+            prompt,
+        )
+        .map(|(catalog, _)| catalog)
+    }
+
+    fn write_skill(root: &Path, name: &str, description: &str) {
+        super::skills::write_skill(
+            &root.join(".agents/skills"),
+            name,
+            &format!("description: {description}\n"),
+            "body",
+        );
+    }
 
     #[test]
     fn type_check_opt_out_accepts_only_on_and_off() {
@@ -497,5 +614,519 @@ mod tests {
         assert!(requested_type_check_disabled(Some(OsStr::new("off"))).unwrap());
         assert!(requested_type_check_disabled(Some(OsStr::new("false"))).is_err());
         assert!(requested_type_check_disabled(Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn startup_catalog_skips_untrusted_project_and_reprompts_after_skip() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let mut prompts = 0;
+        for _ in 0..2 {
+            let catalog = startup_catalog(project.path(), home.path(), false, |_| {
+                prompts += 1;
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(catalog.lookup("shared").unwrap().description(), "user");
+        }
+        assert_eq!(prompts, 2);
+    }
+
+    #[test]
+    fn startup_catalog_treats_home_skill_root_as_user_without_prompting() {
+        let home = tempdir().unwrap();
+        write_skill(home.path(), "review", "user");
+        let catalog = startup_catalog(home.path(), home.path(), false, |_| {
+            panic!("user skill root should not require project trust")
+        })
+        .unwrap();
+        assert_eq!(
+            catalog.lookup("review").unwrap().origin(),
+            super::skills::SkillOrigin::User
+        );
+
+        let scope = super::ProjectScope::discover(home.path()).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let trusted = startup_catalog(home.path(), home.path(), false, |_| {
+            panic!("saved trust should not prompt")
+        })
+        .unwrap();
+        assert_eq!(
+            trusted.lookup("review").unwrap().origin(),
+            super::skills::SkillOrigin::User
+        );
+    }
+
+    #[test]
+    fn startup_catalog_keeps_distinct_project_roots_and_user_origin() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".git")).unwrap();
+        let launch = home.path().join("workspace");
+        fs::create_dir(&launch).unwrap();
+        write_skill(home.path(), "shared", "user");
+        write_skill(&launch, "project", "project");
+
+        for trusted in [false, true] {
+            let mut prompts = 0;
+            let catalog = startup_catalog(&launch, home.path(), false, |_| {
+                prompts += 1;
+                Ok(trusted)
+            })
+            .unwrap();
+            assert_eq!(prompts, 1);
+            assert_eq!(
+                catalog.lookup("shared").unwrap().origin(),
+                super::skills::SkillOrigin::User
+            );
+            if trusted {
+                assert_eq!(
+                    catalog.lookup("project").unwrap().origin(),
+                    super::skills::SkillOrigin::Project
+                );
+            } else {
+                assert!(catalog.lookup("project").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn startup_catalog_still_prompts_for_a_stored_project_skill_at_the_user_root() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".git")).unwrap();
+        write_skill(home.path(), "review", "user");
+        let scope = super::ProjectScope::discover(home.path()).unwrap();
+        let mut probes = 0;
+        let mut prompts = 0;
+        let (catalog, trusted) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            || {
+                probes += 1;
+                Ok(true)
+            },
+            |_| {
+                prompts += 1;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!((probes, prompts), (1, 1));
+        assert!(!trusted);
+        assert_eq!(
+            catalog.lookup("review").unwrap().origin(),
+            super::skills::SkillOrigin::User
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_catalog_deduplicates_symlink_alias_of_home_skill_root() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".git")).unwrap();
+        write_skill(home.path(), "review", "user");
+        let launch = home.path().join("workspace");
+        fs::create_dir_all(launch.join(".agents")).unwrap();
+        symlink(
+            home.path().join(".agents/skills"),
+            launch.join(".agents/skills"),
+        )
+        .unwrap();
+
+        let catalog = startup_catalog(&launch, home.path(), false, |_| {
+            panic!("alias of user skill root should not require project trust")
+        })
+        .unwrap();
+        assert_eq!(
+            catalog.lookup("review").unwrap().origin(),
+            super::skills::SkillOrigin::User
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_catalog_does_not_treat_a_user_symlink_outside_home_as_user_root() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let home = project.path().join("home");
+        fs::create_dir_all(home.join(".agents")).unwrap();
+        let source = project.path().join("source");
+        super::skills::write_skill(&source, "review", "description: Project\n", "body");
+        symlink(&source, home.join(".agents/skills")).unwrap();
+        fs::create_dir(project.path().join(".agents")).unwrap();
+        symlink(&source, project.path().join(".agents/skills")).unwrap();
+
+        let mut prompts = 0;
+        let catalog = startup_catalog(project.path(), &home, false, |_| {
+            prompts += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(prompts, 1);
+        assert_eq!(
+            catalog.lookup("review").unwrap().origin(),
+            super::skills::SkillOrigin::Project
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_catalog_keeps_unresolved_project_root_diagnostics() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        fs::create_dir(project.path().join(".agents")).unwrap();
+        symlink(
+            project.path().join("missing"),
+            project.path().join(".agents/skills"),
+        )
+        .unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+
+        let catalog = startup_catalog(project.path(), home.path(), false, |_| {
+            panic!("saved trust should not prompt")
+        })
+        .unwrap();
+        assert!(
+            catalog
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("cannot resolve skill root"))
+        );
+    }
+
+    #[test]
+    fn startup_catalog_trust_persists_and_enables_project_snapshot() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let catalog = startup_catalog(project.path(), home.path(), false, |scope| {
+            super::config::skill_trust::save_project_skill_scope_trust(home.path(), scope).unwrap();
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
+        let next = startup_catalog(project.path(), home.path(), false, |_| {
+            panic!("trusted scope should not prompt again")
+        })
+        .unwrap();
+        assert_eq!(next.lookup("shared").unwrap().description(), "project");
+        fs::remove_file(project.path().join(".agents/skills/shared/SKILL.md")).unwrap();
+        let missing_source = startup_catalog(project.path(), home.path(), true, |_| {
+            panic!("saved positive trust should not prompt after source removal")
+        })
+        .unwrap();
+        assert_eq!(
+            missing_source.lookup("shared").unwrap().description(),
+            "user"
+        );
+    }
+
+    #[test]
+    fn trusted_startup_catalog_prompt_ignores_the_active_skill_flag() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "review", "Project review workflow");
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let (without_active, without_active_trusted) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            || Ok(false),
+            |_| panic!("saved trust should not prompt"),
+        )
+        .unwrap();
+        let (with_active, with_active_trusted) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            || Ok(true),
+            |_| panic!("saved trust should not prompt"),
+        )
+        .unwrap();
+        assert!(without_active_trusted && with_active_trusted);
+        let base = "exact override base";
+        let prompt = super::prompt::root_prompt(base, &without_active);
+        assert_eq!(prompt, super::prompt::root_prompt(base, &with_active));
+        assert!(prompt.contains("Project review workflow"));
+
+        fs::remove_file(project.path().join(".agents/skills/review/SKILL.md")).unwrap();
+        let (empty, _) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            || Ok(true),
+            |_| panic!("saved trust should not prompt"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::prompt::root_prompt(base, &empty),
+            super::prompt::root_prompt(base, &super::SkillCatalog::default())
+        );
+    }
+
+    #[test]
+    fn startup_catalog_keeps_skipped_root_diagnostics_out_of_the_model_prompt() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let root = project.path().join(".agents/skills");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..129 {
+            fs::create_dir(root.join(format!("candidate-{index:03}"))).unwrap();
+        }
+        super::skills::write_skill(
+            &home.path().join(".agents/skills"),
+            "private-workflow",
+            "description: Private workflow\ndisable-model-invocation: true\n",
+            "Body\n",
+        );
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let base = "exact override base";
+        let root_prompt = super::prompt::root_prompt(base, &super::SkillCatalog::default());
+        for has_active in [false, true] {
+            let (catalog, trusted) = super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                || Ok(has_active),
+                |_| panic!("saved trust should suppress fresh and resume prompts"),
+            )
+            .unwrap();
+            assert!(trusted);
+            assert_eq!(catalog.diagnostics().len(), 1);
+            assert!(
+                catalog.diagnostics()[0]
+                    .reason
+                    .contains("entire root skipped")
+            );
+            let model_prompt = super::prompt::root_prompt(base, &catalog);
+            assert_eq!(model_prompt, root_prompt);
+            assert!(!model_prompt.contains("entire root skipped"));
+            assert!(!model_prompt.contains("Private workflow"));
+            assert!(!model_prompt.contains("private-workflow"));
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_startup_catalog_serves_project_skill_resources_through_the_arena() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let root = super::skills::write_skill(
+            &project.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Body\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
+        fs::write(root.join("references/note.md"), "project resource").unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        let worker = std::path::PathBuf::from(
+            std::env::var_os("MONTY_BIN").expect("MONTY_BIN must point to the configured worker"),
+        );
+
+        for resume_active in [false, true] {
+            let (catalog, trusted) = super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                || Ok(resume_active),
+                |_| panic!("saved trust should avoid a fresh or resume popup"),
+            )
+            .unwrap();
+            assert!(trusted);
+            let host = super::ToolHost::new(project.path())
+                .await
+                .unwrap()
+                .with_skill_catalog(catalog);
+            let mut arena = super::Arena::new(worker.clone(), host).await.unwrap();
+            let execution = arena
+                .execute(
+                    "await read('skill://review/references/note.md')",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let super::arena::ExecutionOutcome::Complete {
+                result: Some(result),
+            } = execution.outcome
+            else {
+                panic!("skill resource read should complete");
+            };
+            assert_eq!(result.head, "'project resource'");
+            assert!(execution.read_paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_catalog_returns_the_trust_decision_used_for_its_snapshot() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        let (catalog, include_project) = super::startup_skill_catalog(
+            &scope,
+            home.path(),
+            super::prompt::skills_catalog_guidance(),
+            || Ok(false),
+            |path| {
+                super::config::skill_trust::save_project_skill_scope_trust(home.path(), path)
+                    .unwrap();
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(include_project);
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
+        fs::remove_file(home.path().join(".kiki/trusted-skills.toml")).unwrap();
+        assert!(!super::config::skill_trust::is_project_skill_scope_trusted(
+            home.path(),
+            &scope.canonical_scope
+        ));
+        let activation =
+            super::model::SkillActivation::from_skill(catalog.lookup("shared").unwrap());
+        assert!(
+            super::skills::SkillProjectionPolicy::new(
+                include_project.then_some(scope.canonical_scope)
+            )
+            .permits(&activation)
+        );
+    }
+
+    #[test]
+    fn startup_catalog_prompts_for_launch_scope_and_for_active_skill_without_directory() {
+        let home = tempdir().unwrap();
+        let old = tempdir().unwrap();
+        let here = tempdir().unwrap();
+        fs::create_dir(old.path().join(".git")).unwrap();
+        fs::create_dir(here.path().join(".git")).unwrap();
+        write_skill(old.path(), "old-skill", "old");
+        write_skill(here.path(), "here-skill", "here");
+        let old_scope = old.path().canonicalize().unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(home.path(), &old_scope)
+            .unwrap();
+        let mut prompted_scope = None;
+        let catalog = startup_catalog(here.path(), home.path(), false, |scope| {
+            prompted_scope = Some(scope.to_path_buf());
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(prompted_scope, Some(here.path().canonicalize().unwrap()));
+        assert!(catalog.lookup("old-skill").is_err());
+        assert!(catalog.lookup("here-skill").is_err());
+
+        fs::remove_dir_all(here.path().join(".agents/skills")).unwrap();
+        let mut prompted = false;
+        let _catalog = startup_catalog(here.path(), home.path(), true, |_| {
+            prompted = true;
+            Ok(false)
+        })
+        .unwrap();
+        assert!(
+            prompted,
+            "active in-scope project skill must prompt after directory removal"
+        );
+    }
+
+    #[test]
+    fn startup_catalog_probes_active_project_skill_only_when_it_decides_the_prompt() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        let scope = super::ProjectScope::discover(project.path()).unwrap();
+        let startup = || {
+            let (mut probed, mut prompted) = (false, false);
+            super::startup_skill_catalog(
+                &scope,
+                home.path(),
+                super::prompt::skills_catalog_guidance(),
+                || {
+                    probed = true;
+                    Ok(true)
+                },
+                |_| {
+                    prompted = true;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            (probed, prompted)
+        };
+
+        assert_eq!(startup(), (true, true));
+        write_skill(project.path(), "review", "project");
+        assert_eq!(startup(), (false, true));
+        fs::remove_dir_all(project.path().join(".agents/skills")).unwrap();
+        super::config::skill_trust::save_project_skill_scope_trust(
+            home.path(),
+            &scope.canonical_scope,
+        )
+        .unwrap();
+        assert_eq!(startup(), (false, false));
+    }
+
+    #[test]
+    fn startup_catalog_does_not_prompt_without_project_scope_candidates() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_skill(home.path(), "user-only", "user");
+        let catalog = startup_catalog(project.path(), home.path(), false, |_| {
+            panic!("no project root should not prompt")
+        })
+        .unwrap();
+        assert_eq!(catalog.lookup("user-only").unwrap().description(), "user");
+    }
+
+    #[test]
+    fn startup_catalog_prompt_trust_applies_without_saved_trust() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(project.path(), "shared", "project");
+        write_skill(home.path(), "shared", "user");
+        let catalog = startup_catalog(project.path(), home.path(), false, |_| Ok(true)).unwrap();
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
+        assert!(!super::config::skill_trust::is_project_skill_scope_trusted(
+            home.path(),
+            &project.path().canonicalize().unwrap()
+        ));
     }
 }

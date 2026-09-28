@@ -125,6 +125,13 @@ impl AnthropicModel {
                     let summary = canonical_compaction_summary(summary);
                     push_content(&mut messages, "user", [text_content(&summary)]);
                 }
+                ModelContextEntry::SkillActivation(activation) => {
+                    push_content(
+                        &mut messages,
+                        "user",
+                        [text_content(&activation.model_text())],
+                    );
+                }
                 ModelContextEntry::CompletedCode(completed) => {
                     let blocks = replay_blocks(completed.replay())?;
                     match replay_action(&blocks)? {
@@ -1291,6 +1298,7 @@ struct WireError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use eventsource_stream::Eventsource;
@@ -1313,10 +1321,11 @@ mod tests {
         model::{
             AttemptAccounting, CodeResult, Model, ModelAction, ModelCallId, ModelError,
             ModelFailure, ModelHistory, ModelProgress, ModelStep, ModelUsage, OpaqueReplayItem,
-            ProviderFailure, ProviderReplay, SummaryRequest, SummaryResult,
+            ProviderFailure, ProviderReplay, SkillActivation, SummaryRequest, SummaryResult,
             canonical_compaction_summary,
         },
         pricing::{RunCostEstimate, estimate_run_cost},
+        skills::SkillOrigin,
         sse_fixture::{Fixture, FixtureReply},
     };
 
@@ -1334,6 +1343,39 @@ mod tests {
         let mut history = ModelHistory::new();
         history.append_user_request(request);
         history
+    }
+
+    #[test]
+    fn activated_skill_body_is_projected_once_in_next_anthropic_request() {
+        let model = AnthropicModel::new(
+            "system",
+            KEY,
+            CacheTtl::FiveMinutes,
+            CrossProviderReasoning::Inline,
+        );
+        let mut history = history("inspect");
+        let activation = SkillActivation::new(
+            "build".to_owned(),
+            PathBuf::from("/home/skills/build"),
+            "---\nname: build\ndescription: Build\n---\nRun the build.".to_owned(),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        history.activate_skill(activation.clone()).unwrap();
+        history.activate_skill(activation).unwrap();
+        let request = model.request(selection(), &history).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .filter(|block| block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Run the build.")))
+                .count(),
+            1
+        );
     }
 
     fn start_usage() -> Value {

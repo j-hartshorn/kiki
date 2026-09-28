@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod picker;
@@ -12,14 +13,14 @@ mod tree;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::SetTitle;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rattles::TickedRattler;
 use thiserror::Error;
@@ -30,12 +31,14 @@ use crate::clipboard::{ClipboardPort, LocalClipboard};
 use crate::config::models::{CATALOGUE, Provider};
 use crate::config::settings::{SaveError, SaveOutcome, SettingsContext};
 use crate::config::{DEFAULT_MODEL, ModelConfiguration, ModelSelection, StartupSnapshot};
+use crate::model::SkillActivation;
 use crate::prompt_editor::{PromptEdit, PromptEditor, PromptLayout, PromptRow};
 use crate::runtime::{
     CorrectionOutcome, NavigationOutcome, ProgressEnvelope, RunId, RuntimeCommand, RuntimeEvent,
     RuntimeInitialState, RuntimeProgressReceiver, TreeRequestOutcome, control_command,
 };
 use crate::selection::{DocumentPosition, Selection};
+use crate::skills::{SkillCatalog, SkillDiagnostic, SkillLookupError};
 use crate::telemetry::{Trace, TraceEvent};
 #[cfg(test)]
 pub(crate) use crate::transcript::format_startup_configuration;
@@ -230,6 +233,8 @@ struct App {
     manual_navigation_pending: bool,
     next_tree_revision: u64,
     completion: slash::Completion,
+    skill_catalog: Arc<SkillCatalog>,
+    pending_skill_draft: Option<String>,
     slash_overlay: Option<Rect>,
     preview: Option<ThinkingPreview>,
     next_settings_revision: u64,
@@ -281,6 +286,8 @@ impl Default for App {
             manual_navigation_pending: false,
             next_tree_revision: 0,
             completion: slash::Completion::default(),
+            skill_catalog: Arc::default(),
+            pending_skill_draft: None,
             slash_overlay: None,
             preview: None,
             next_settings_revision: 0,
@@ -328,6 +335,7 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
         | RuntimeEvent::NavigationCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::SkillActivationRejected { .. }
         | RuntimeEvent::CompactionAcknowledged { .. }
         | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
@@ -341,6 +349,19 @@ fn runtime_event_run_id(event: &RuntimeEvent) -> Option<RunId> {
 }
 
 impl App {
+    fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.transcript
+            .append_metadata(skill_diagnostic_report(&catalog));
+        self.completion = slash::Completion::with_skills(
+            catalog
+                .entries()
+                .map(|skill| (skill.name(), skill.description())),
+        );
+        self.skill_catalog = catalog;
+        self.refresh_completion();
+        self
+    }
+
     fn configured(startup: StartupSnapshot) -> Self {
         let settings_selection = ModelSelection::new(startup.model(), startup.thinking())
             .expect("startup thinking must be supported by its model");
@@ -630,6 +651,12 @@ impl App {
             return update;
         }
         if key.code == KeyCode::Enter && key.modifiers.is_empty() && !self.prompt.is_empty() {
+            if let Some(command) = slash::parse(self.prompt.text())
+                && command.action == slash::Action::Skill
+            {
+                let name = command.skill_name.unwrap_or_default().to_owned();
+                return self.dispatch_skill(&name, now);
+            }
             let draft = self.prompt.take();
             if let Some(command) = slash::parse(&draft) {
                 return self.handle_slash_command(command);
@@ -639,7 +666,10 @@ impl App {
                 self.flush_preview(&mut commands);
                 self.transcript.begin_submission();
                 self.submission_at = Some(now);
-                commands.push(RuntimeCommand::Submit { request: draft });
+                commands.push(RuntimeCommand::Submit {
+                    request: draft,
+                    activation: None,
+                });
                 let mut update = Update::with_commands(commands);
                 update.visible_changed = true;
                 return update;
@@ -696,9 +726,9 @@ impl App {
             KeyCode::Up => self.completion.move_selection(-1),
             KeyCode::Down => self.completion.move_selection(1),
             KeyCode::Tab | KeyCode::Enter => {
-                let token = self.completion.selected_token()?;
+                let token = self.completion.selected_token()?.to_owned();
                 self.prompt.take();
-                self.prompt.insert_paste(token);
+                self.prompt.insert_paste(&token);
                 self.refresh_completion();
                 true
             }
@@ -712,8 +742,28 @@ impl App {
     }
 
     fn refresh_completion(&mut self) -> bool {
-        self.completion
-            .sync(self.prompt.text(), self.prompt.caret_at_end())
+        if self.is_exact_catalog_skill_command() {
+            self.completion.sync("", false)
+        } else {
+            self.completion
+                .sync(self.prompt.text(), self.prompt.caret_at_end())
+        }
+    }
+
+    fn is_exact_catalog_skill_command(&self) -> bool {
+        let Some(command) = slash::parse(self.prompt.text()) else {
+            return false;
+        };
+        if command.action != slash::Action::Skill {
+            return false;
+        }
+        let Some(name) = command.skill_name else {
+            return false;
+        };
+        !matches!(
+            self.skill_catalog.lookup(name),
+            Err(SkillLookupError::Unknown(_))
+        )
     }
 
     fn dispatch_compact(&mut self, focus: &str) -> Update {
@@ -732,6 +782,47 @@ impl App {
         let mut update = Update::with_commands([RuntimeCommand::Compact {
             focus: focus.to_owned(),
         }]);
+        update.visible_changed = true;
+        update
+    }
+
+    fn dispatch_skill(&mut self, name: &str, now: Instant) -> Update {
+        if !self.transcript.is_idle() {
+            self.set_notice("A run is still active.".to_owned());
+            return Update {
+                visible_changed: true,
+                ..Update::default()
+            };
+        }
+        if name.is_empty() {
+            self.set_notice("Enter a skill name after /skill:.".to_owned());
+            return Update {
+                visible_changed: true,
+                ..Update::default()
+            };
+        }
+        let activation = match self.skill_catalog.lookup(name) {
+            Ok(skill) => SkillActivation::from_skill(skill),
+            Err(error) => {
+                self.set_notice(normalise_single_line(&error.to_string()));
+                return Update {
+                    visible_changed: true,
+                    ..Update::default()
+                };
+            }
+        };
+        let request = self.prompt.take();
+        self.refresh_completion();
+        let mut commands = Vec::new();
+        self.flush_preview(&mut commands);
+        self.transcript.begin_submission();
+        self.submission_at = Some(now);
+        self.pending_skill_draft = Some(request.clone());
+        commands.push(RuntimeCommand::Submit {
+            request,
+            activation: Some(activation),
+        });
+        let mut update = Update::with_commands(commands);
         update.visible_changed = true;
         update
     }
@@ -759,6 +850,9 @@ impl App {
                 }
             }
             slash::Action::Name => self.name_session(command.argument),
+            slash::Action::Skill => {
+                unreachable!("direct skill dispatch precedes editor consumption")
+            }
             slash::Action::Tree => self.open_session_tree(command.argument),
             slash::Action::Thinking => {
                 let argument = command.argument;
@@ -1516,6 +1610,35 @@ impl App {
         gap_before: bool,
         now: Instant,
     ) -> bool {
+        if let RuntimeEvent::RecordAppended {
+            record:
+                crate::runtime::StoredRecord {
+                    record: crate::runtime::Record::UserRequest { request, .. },
+                    ..
+                },
+            ..
+        } = &event
+            && self.pending_skill_draft.as_ref() == Some(request)
+        {
+            self.pending_skill_draft = None;
+        }
+        let skill_draft_changed = if matches!(
+            &event,
+            RuntimeEvent::SkillActivationRejected { .. }
+                | RuntimeEvent::SubmissionRejectedBusy { .. }
+        ) {
+            self.restore_pending_skill_draft()
+        } else {
+            if matches!(
+                &event,
+                RuntimeEvent::SubmissionRejectedDisabled { .. }
+                    | RuntimeEvent::RuntimeDisabled { .. }
+                    | RuntimeEvent::RunSettled { .. }
+            ) {
+                self.pending_skill_draft = None;
+            }
+            false
+        };
         let compact_draft_changed = if self.compact_acknowledgement_pending
             && let RuntimeEvent::CompactionAcknowledged { acknowledgement } = &event
         {
@@ -1572,6 +1695,13 @@ impl App {
             }
         ) {
             self.submission_at = None;
+        }
+        if let RuntimeEvent::SkillActivationRejected { reason } = &event {
+            self.submission_at = None;
+            self.set_notice(format!(
+                "Skill activation failed: {}",
+                normalise_single_line(reason)
+            ));
         }
         if matches!(
             &event,
@@ -1631,7 +1761,26 @@ impl App {
         if transcript_changed {
             self.invalidate_layout_selection();
         }
-        compact_draft_changed || metadata_changed || monitor_changed || transcript_changed
+        skill_draft_changed
+            || compact_draft_changed
+            || metadata_changed
+            || monitor_changed
+            || transcript_changed
+    }
+
+    fn restore_pending_skill_draft(&mut self) -> bool {
+        let Some(draft) = self.pending_skill_draft.take() else {
+            return false;
+        };
+        if self.prompt.is_empty() {
+            let changed = self.prompt.insert_paste(&draft);
+            if changed {
+                self.refresh_completion();
+            }
+            changed
+        } else {
+            false
+        }
     }
 
     fn handle_tree_catalogue(&mut self, revision: u64, outcome: &TreeRequestOutcome) -> bool {
@@ -1730,6 +1879,7 @@ impl App {
     ) {
         let mut transcript = self.transcript.restored_replacement(state);
         transcript.append_restoration_card();
+        transcript.append_metadata(skill_diagnostic_report(&self.skill_catalog));
         self.transcript = transcript;
         self.subagent_monitor = subagents::SubagentMonitor::restored(&state.timeline);
         self.history_position = HistoryPosition::FollowingBottom;
@@ -1921,8 +2071,22 @@ fn publish_title(app: &mut App, publisher: &mut impl TitlePublisher) -> bool {
     }
 }
 
+pub(crate) struct TuiStartup {
+    snapshot: StartupSnapshot,
+    skills_catalog: Arc<SkillCatalog>,
+}
+
+impl TuiStartup {
+    pub(crate) fn new(snapshot: StartupSnapshot, skills_catalog: Arc<SkillCatalog>) -> Self {
+        Self {
+            snapshot,
+            skills_catalog,
+        }
+    }
+}
+
 pub(crate) fn run(
-    startup: StartupSnapshot,
+    startup: TuiStartup,
     providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
     events: mpsc::UnboundedReceiver<RuntimeEvent>,
@@ -1941,7 +2105,7 @@ pub(crate) fn run(
 }
 
 pub(crate) fn run_restored(
-    startup: StartupSnapshot,
+    startup: TuiStartup,
     initial: RuntimeInitialState,
     providers: Vec<Provider>,
     commands: mpsc::Sender<RuntimeCommand>,
@@ -1949,7 +2113,8 @@ pub(crate) fn run_restored(
     mut progress: RuntimeProgressReceiver,
     trace: Trace,
 ) -> Result<(), TuiError> {
-    let mut app = App::restored(startup, &initial);
+    let mut app =
+        App::restored(startup.snapshot, &initial).with_skill_catalog(startup.skills_catalog);
     app.providers = providers;
     let mut input = CrosstermEvents;
     let mut clipboard = LocalClipboard::new();
@@ -1999,6 +2164,281 @@ pub(crate) fn run_configuration(startup: StartupSnapshot) -> Result<(), TuiError
             })
         },
     )
+}
+
+pub(crate) fn run_project_skill_trust(
+    scope: &Path,
+    mut save: impl FnMut() -> Result<(), String>,
+) -> Result<bool, TuiError> {
+    let mut input = CrosstermEvents;
+    let mut trusted = false;
+    with_terminal(
+        || ratatui::try_init().map_err(|error| TuiError::Terminal(error.to_string())),
+        ratatui::restore,
+        |terminal| {
+            trusted = run_project_skill_trust_loop(terminal, &mut input, scope, &mut save)?;
+            Ok(())
+        },
+    )?;
+    Ok(trusted)
+}
+
+fn run_project_skill_trust_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    input: &mut impl EventSource,
+    scope: &Path,
+    mut save: impl FnMut() -> Result<(), String>,
+) -> Result<bool, TuiError> {
+    let mut trust_selected = false;
+    let mut save_error = None;
+    let mut path_scroll = 0usize;
+    let mut visible_path_rows = None;
+    let mut dirty = true;
+    loop {
+        if dirty {
+            terminal
+                .draw(|frame| {
+                    visible_path_rows = render_project_skill_trust(
+                        frame,
+                        scope,
+                        trust_selected,
+                        save_error.as_deref(),
+                        &mut path_scroll,
+                    );
+                })
+                .map_err(|error| TuiError::Terminal(error.to_string()))?;
+            dirty = false;
+        }
+        if !input.poll(POLL_INTERVAL).map_err(TuiError::Input)? {
+            continue;
+        }
+        match input.read().map_err(TuiError::Input)? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                    return Ok(false);
+                }
+                if key.modifiers != KeyModifiers::NONE {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter if trust_selected && visible_path_rows.is_some() => match save()
+                    {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            save_error = Some(error);
+                            trust_selected = false;
+                            dirty = true;
+                        }
+                    },
+                    KeyCode::Enter | KeyCode::Esc => return Ok(false),
+                    KeyCode::Left | KeyCode::Char('s') => {
+                        trust_selected = false;
+                        dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('t') => {
+                        trust_selected = true;
+                        dirty = true;
+                    }
+                    KeyCode::Tab => {
+                        trust_selected = !trust_selected;
+                        dirty = true;
+                    }
+                    KeyCode::Up => {
+                        path_scroll = path_scroll.saturating_sub(1);
+                        dirty = true;
+                    }
+                    KeyCode::Down => {
+                        path_scroll = path_scroll.saturating_add(1);
+                        dirty = true;
+                    }
+                    KeyCode::PageUp => {
+                        path_scroll = path_scroll.saturating_sub(visible_path_rows.unwrap_or(1));
+                        dirty = true;
+                    }
+                    KeyCode::PageDown => {
+                        path_scroll = path_scroll.saturating_add(visible_path_rows.unwrap_or(1));
+                        dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => dirty = true,
+            _ => {}
+        }
+    }
+}
+
+fn render_project_skill_trust(
+    frame: &mut Frame,
+    scope: &Path,
+    trust_selected: bool,
+    save_error: Option<&str>,
+    path_scroll: &mut usize,
+) -> Option<usize> {
+    let area = frame.area();
+    if area.is_empty() {
+        return None;
+    }
+    frame.buffer_mut().set_style(area, page_style());
+    let width = area.width.min(100);
+    let height = area.height.min(12);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title("Project skills");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return None;
+    }
+    let error_rows = if save_error.is_some() { 2 } else { 0 };
+    let minimum_height = if save_error.is_some() { 9 } else { 8 };
+    if inner.width < 46 || inner.height < minimum_height {
+        frame.render_widget(
+            Paragraph::new("Resize terminal to inspect the full project scope."),
+            inner,
+        );
+        return None;
+    }
+    let path = escaped_project_skill_scope(scope);
+    let path_lines = path
+        .as_bytes()
+        .chunks(inner.width as usize)
+        .map(|bytes| std::str::from_utf8(bytes).expect("escaped scope is ASCII"))
+        .collect::<Vec<_>>();
+    let visible_rows = (inner.height as usize - 6 - error_rows as usize).min(3);
+    let max_scroll = path_lines.len().saturating_sub(visible_rows);
+    *path_scroll = (*path_scroll).min(max_scroll);
+    let visible_end = (*path_scroll + visible_rows).min(path_lines.len());
+    let choices = if trust_selected {
+        "Skip    [Trust]"
+    } else {
+        "[Skip]    Trust"
+    };
+    let mut lines = vec![
+        Line::raw("This project has skills with assistant instructions."),
+        Line::raw("Project scope (escaped bytes):"),
+    ];
+    for line in &path_lines[*path_scroll..visible_end] {
+        lines.push(Line::raw(*line));
+    }
+    lines.extend([
+        Line::raw(format!(
+            "Path lines {}-{}/{} | Up/Down/Page",
+            *path_scroll + 1,
+            visible_end,
+            path_lines.len()
+        )),
+        Line::raw("Trust this project's skills?"),
+        Line::raw(choices),
+        Line::raw("Left/Right choice | Enter confirm | Esc skip"),
+    ]);
+    let content_height = (6 + visible_rows) as u16;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, content_height),
+    );
+    if let Some(error) = save_error {
+        let error_area = Rect::new(inner.x, inner.y + content_height, inner.width, error_rows);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Trust was not saved: {}",
+                normalise_terminal_text(error)
+            ))
+            .wrap(Wrap { trim: false }),
+            error_area,
+        );
+    }
+    Some(visible_rows)
+}
+
+fn escaped_project_skill_scope(scope: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    escaped_terminal_bytes(scope.as_os_str().as_bytes(), usize::MAX)
+}
+
+const SKILL_DIAGNOSTIC_LINE_BYTES: usize = 512;
+
+fn skill_diagnostic_report(catalog: &SkillCatalog) -> Vec<String> {
+    let diagnostics = catalog.diagnostics();
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Skill discovery diagnostics ({}):",
+        diagnostics.len()
+    )];
+    for diagnostic in diagnostics {
+        lines.push(format_skill_diagnostic(diagnostic));
+    }
+    lines
+}
+
+fn format_skill_diagnostic(diagnostic: &SkillDiagnostic) -> String {
+    let path = escaped_diagnostic_path(&diagnostic.path);
+    let reason = escaped_terminal_bytes(diagnostic.reason.as_bytes(), 176);
+    let line = if let Some(name) = &diagnostic.name {
+        let name = escaped_terminal_bytes(name.as_bytes(), 80);
+        format!("- {path} [skill {name}]: {reason}")
+    } else {
+        format!("- {path}: {reason}")
+    };
+    debug_assert!(line.len() <= SKILL_DIAGNOSTIC_LINE_BYTES);
+    line
+}
+
+fn escaped_diagnostic_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    const PATH_BYTES: usize = 224;
+    let bytes = path.as_os_str().as_bytes();
+    let full = escaped_terminal_bytes(bytes, usize::MAX);
+    if full.len() <= PATH_BYTES {
+        return full;
+    }
+    let hash = bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    let marker = format!("...#{hash:016X}:");
+    let mut suffix = String::new();
+    for byte in bytes.iter().rev() {
+        let encoded = escaped_terminal_bytes(std::slice::from_ref(byte), usize::MAX);
+        if marker.len() + suffix.len() + encoded.len() > PATH_BYTES {
+            break;
+        }
+        suffix.insert_str(0, &encoded);
+    }
+    format!("{marker}{suffix}")
+}
+
+fn escaped_terminal_bytes(bytes: &[u8], limit: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut escaped = String::new();
+    if limit < 3 {
+        return escaped;
+    }
+    for byte in bytes {
+        let encoded = match byte {
+            b'\\' => "\\\\".to_owned(),
+            0x20..=0x7e => (*byte as char).to_string(),
+            _ => format!(
+                "\\x{}{}",
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char
+            ),
+        };
+        if escaped.len() + encoded.len() > limit - 3 {
+            escaped.push_str("...");
+            break;
+        }
+        escaped.push_str(&encoded);
+    }
+    escaped
 }
 
 fn with_terminal<B: Backend>(
@@ -2760,6 +3200,8 @@ mod tests {
     use std::fs;
     use std::io;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::Path;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use ratatui::Terminal;
@@ -2796,6 +3238,7 @@ mod tests {
         SessionCatalogue, SessionCatalogueEntry, SessionCatalogueKind, SessionEntryId,
         SessionMetadata,
     };
+    use crate::skills::{ProjectScope, SkillCatalog, SkillDiagnostic, write_skill};
     use crate::subagents::{TaskRecord, TaskState};
     use crate::telemetry::{Trace, TraceOwner};
     use tempfile::tempdir;
@@ -2803,6 +3246,215 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn project_skill_trust_popup_defaults_to_skip_and_names_canonical_scope() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        let saved = Cell::new(false);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!trusted);
+        assert!(!saved.get());
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("/canonical/repository"));
+        assert!(screen.contains("[Skip]"));
+        assert!(screen.contains("Project scope (escaped bytes):"));
+        assert!(!screen.contains("Repository:"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_ignores_release_and_modified_keys() {
+        let unsafe_keys = [
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        ];
+        for unsafe_key in unsafe_keys {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(unsafe_key)),
+                Some(Event::Key(key(KeyCode::Enter))),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/project"),
+                || panic!("modified or release key must not select Trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
+
+        let unsafe_enter_keys = [
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        ];
+        for unsafe_key in unsafe_enter_keys {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(key(KeyCode::Right))),
+                Some(Event::Key(unsafe_key)),
+                Some(Event::Key(key(KeyCode::Esc))),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/project"),
+                || panic!("modified or release Enter must not confirm Trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
+    }
+
+    #[test]
+    fn project_skill_trust_popup_escapes_control_and_bidi_path_bytes() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/project/line\n\u{202e}tail"),
+            || panic!("default Skip must not save"),
+        )
+        .unwrap();
+        assert!(!trusted);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("/project/line\\x0A\\xE2\\x80\\xAEtail"));
+        assert!(!screen.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_scrolls_to_long_path_suffix() {
+        let path = format!("/project/{}/VISIBLE-SUFFIX", "a".repeat(240));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut input = FakeInput::new([Some(Event::Key(key(KeyCode::Enter)))]);
+        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
+            panic!("default Skip must not save")
+        })
+        .unwrap();
+        let initial = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!initial.contains("VISIBLE-SUFFIX"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::PageDown))),
+            Some(Event::Key(key(KeyCode::PageDown))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        super::run_project_skill_trust_loop(&mut terminal, &mut input, Path::new(&path), || {
+            panic!("default Skip must not save")
+        })
+        .unwrap();
+        let scrolled = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(scrolled.contains("VISIBLE-SUFFIX"));
+        assert!(scrolled.contains("Path lines"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_only_enables_after_successful_save() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::Right))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        let saved = Cell::new(0);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(saved.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(trusted);
+        assert_eq!(saved.get(), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(48, 11)).unwrap();
+        let mut input = FakeInput::new([
+            Some(Event::Key(key(KeyCode::Right))),
+            Some(Event::Key(key(KeyCode::Enter))),
+            Some(Event::Key(key(KeyCode::Enter))),
+        ]);
+        let saved = Cell::new(0);
+        let trusted = super::run_project_skill_trust_loop(
+            &mut terminal,
+            &mut input,
+            Path::new("/canonical/repository"),
+            || {
+                saved.set(saved.get() + 1);
+                Err("could not save project skill trust (PermissionDenied)".to_owned())
+            },
+        )
+        .unwrap();
+        assert!(!trusted);
+        assert_eq!(saved.get(), 1);
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("PermissionDenied"));
+    }
+
+    #[test]
+    fn project_skill_trust_popup_cancellation_skips_without_saving() {
+        for cancel in [
+            key(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            let mut input = FakeInput::new([
+                Some(Event::Key(key(KeyCode::Right))),
+                Some(Event::Key(cancel)),
+            ]);
+            let trusted = super::run_project_skill_trust_loop(
+                &mut terminal,
+                &mut input,
+                Path::new("/canonical/repository"),
+                || panic!("cancel must not save trust"),
+            )
+            .unwrap();
+            assert!(!trusted);
+        }
     }
 
     fn shifted_key(code: KeyCode) -> KeyEvent {
@@ -2959,7 +3611,11 @@ mod tests {
 
     fn submitted_prompt(app: &mut App) -> String {
         let update = app.handle_key(key(KeyCode::Enter));
-        let Some(RuntimeCommand::Submit { request }) = update.commands.into_iter().next() else {
+        let Some(RuntimeCommand::Submit {
+            request,
+            activation: None,
+        }) = update.commands.into_iter().next()
+        else {
             panic!("prompt was not submitted")
         };
         request
@@ -4067,6 +4723,383 @@ mod tests {
             assert!(app.prompt.is_empty());
             assert!(app.picker.is_some());
         }
+    }
+
+    #[test]
+    fn unknown_direct_skill_submits_nothing_and_keeps_draft() {
+        let mut app = app_with_prompt("/skill:missing inspect this");
+        let update = app.handle_key(key(KeyCode::Enter));
+        assert!(update.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:missing inspect this");
+        assert!(app.notice().unwrap_or("").contains("missing"));
+        assert!(app.transcript.is_idle());
+
+        set_prompt(&mut app, "/skill:");
+        let update = app.handle_key(key(KeyCode::Enter));
+        assert!(update.commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:");
+        assert!(app.notice().unwrap().contains("skill name"));
+    }
+
+    #[test]
+    fn catalog_diagnostics_appear_after_startup_and_restored_navigation() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let invalid = home.path().join(".agents/skills/broken");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        assert_eq!(catalog.diagnostics().len(), 1);
+
+        let mut app = App::default().with_skill_catalog(catalog);
+        let first = rendered(&mut app, 120, 20);
+        assert!(first.contains("Skill discovery diagnostics"), "{first}");
+        assert!(first.contains("description"), "{first}");
+        assert!(first.contains("must be a string"), "{first}");
+
+        app.replace_restored_state(&RuntimeInitialState::empty(), &None);
+        let restored = rendered(&mut app, 120, 20);
+        assert!(
+            restored.contains("Skill discovery diagnostics"),
+            "{restored}"
+        );
+        assert!(restored.contains("description"), "{restored}");
+        assert!(restored.contains("must be a string"), "{restored}");
+    }
+
+    #[test]
+    fn skipped_roots_have_distinct_bounded_escaped_diagnostic_rows() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let repository = project.path().join("a".repeat(100)).join("b".repeat(100));
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        let launch = repository.join("unsafe\n\u{202e}tail");
+        for scope in [&repository, &launch] {
+            let root = scope.join(".agents/skills");
+            fs::create_dir_all(&root).unwrap();
+            for index in 0..129 {
+                fs::create_dir(root.join(format!("candidate-{index:03}"))).unwrap();
+            }
+        }
+        let catalog = SkillCatalog::discover(
+            &ProjectScope::discover(&launch).unwrap(),
+            home.path(),
+            true,
+            "guidance",
+        );
+        let rows = super::skill_diagnostic_report(&catalog);
+        assert_eq!(catalog.diagnostics().len(), 2);
+        assert_eq!(rows.len(), 3, "one heading and one row per skipped root");
+        assert_ne!(rows[1], rows[2], "long roots must stay distinguishable");
+        for row in &rows[1..] {
+            assert!(row.len() <= super::SKILL_DIAGNOSTIC_LINE_BYTES);
+            assert!(row.contains("entire root skipped"), "{row}");
+            assert!(
+                row.contains("...#"),
+                "long path needs hash and suffix: {row}"
+            );
+            assert_eq!(row.lines().count(), 1);
+        }
+        let hostile = rows
+            .iter()
+            .find(|row| row.contains("\\x0A"))
+            .expect("hostile launch path must be visible as escaped bytes");
+        assert!(hostile.contains("\\xE2\\x80\\xAE"), "{hostile}");
+        assert!(!hostile.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn skill_diagnostic_row_escapes_hostile_name_and_reason() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let diagnostic = SkillDiagnostic {
+            path: OsString::from_vec(b"/root/unsafe\n\xe2\x80\xae\xff".to_vec()).into(),
+            name: Some("bad\x1bname".to_owned()),
+            reason: format!("bad\n\u{202e}{}", "x".repeat(1000)),
+        };
+        let row = super::format_skill_diagnostic(&diagnostic);
+        assert!(row.len() <= super::SKILL_DIAGNOSTIC_LINE_BYTES);
+        assert_eq!(row.lines().count(), 1);
+        assert!(row.contains("unsafe\\x0A\\xE2\\x80\\xAE\\xFF"), "{row}");
+        assert!(row.contains("bad\\x1Bname"), "{row}");
+        assert!(row.contains("bad\\x0A\\xE2\\x80\\xAE"), "{row}");
+        assert!(row.ends_with("..."), "{row}");
+    }
+
+    fn app_with_user_skills(home: &Path, project: &Path) -> App {
+        App::default().with_skill_catalog(Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project).unwrap(),
+            home,
+            false,
+            "guidance",
+        )))
+    }
+
+    #[test]
+    fn direct_only_skill_completes_and_submits_captured_activation() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let direct = write_skill(
+            &home.path().join(".agents/skills"),
+            "direct",
+            "description: A direct workflow\ndisable-model-invocation: true\n",
+            "Follow the direct workflow.\n",
+        );
+        let mut app = app_with_user_skills(home.path(), project.path());
+        set_prompt(&mut app, "/skill:di");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), Some("/skill:direct"));
+        assert_eq!(
+            app.completion.visible_rows(2)[0].purpose,
+            "A direct workflow"
+        );
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:direct");
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [
+            RuntimeCommand::Submit {
+                request,
+                activation: Some(activation),
+            },
+        ] = update.commands.as_slice()
+        else {
+            panic!("expected direct skill submission");
+        };
+        assert_eq!(request, "/skill:direct");
+        assert_eq!(activation.name(), "direct");
+        assert_eq!(
+            activation.source_text(),
+            fs::read_to_string(direct.join("SKILL.md")).unwrap()
+        );
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn skipped_project_and_invalid_skills_are_refused_without_submission() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let rejected = home.path().join(".agents/skills/rejected");
+        fs::create_dir_all(&rejected).unwrap();
+        fs::write(rejected.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        write_skill(
+            &project.path().join(".agents/skills"),
+            "hidden",
+            "description: Hidden\n",
+            "Hidden body\n",
+        );
+        let mut app = app_with_user_skills(home.path(), project.path());
+        set_prompt(&mut app, "/skill:hid");
+        app.refresh_completion();
+        assert!(app.completion.visible_rows(5).is_empty());
+        set_prompt(&mut app, "/skill:hidden");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(app.notice().unwrap().contains("hidden"));
+        set_prompt(&mut app, "/skill:rejected");
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert!(app.notice().unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn direct_skill_submits_the_typed_command_as_the_request() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Review this.\n",
+        );
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        for draft in [
+            "/skill:review",
+            "/skill:review fix it",
+            "/skill:review inspect this\n  and this",
+        ] {
+            let mut app = App::default().with_skill_catalog(catalog.clone());
+            set_prompt(&mut app, draft);
+            let update = app.handle_key(key(KeyCode::Enter));
+            let [
+                RuntimeCommand::Submit {
+                    request,
+                    activation: Some(activation),
+                },
+            ] = update.commands.as_slice()
+            else {
+                panic!("expected direct skill submission for {draft:?}");
+            };
+            assert_eq!(request, draft);
+            assert_eq!(activation.name(), "review");
+        }
+    }
+
+    #[test]
+    fn enter_invokes_exact_skill_even_when_a_longer_completion_exists() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        for name in ["review", "review-more"] {
+            write_skill(
+                &home.path().join(".agents/skills"),
+                name,
+                &format!("description: {name} instructions\ndisable-model-invocation: true\n"),
+                &format!("Use {name}.\n"),
+            );
+        }
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog.clone());
+        set_prompt(&mut app, "/skill:review");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), None);
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [
+            RuntimeCommand::Submit {
+                activation: Some(activation),
+                ..
+            },
+        ] = update.commands.as_slice()
+        else {
+            panic!("exact skill should invoke on Enter");
+        };
+        assert_eq!(activation.name(), "review");
+        assert!(app.prompt.is_empty());
+
+        let mut partial = App::default().with_skill_catalog(catalog.clone());
+        set_prompt(&mut partial, "/skill:rev");
+        assert!(partial.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(partial.prompt.text(), "/skill:review");
+
+        let mut tab = App::default().with_skill_catalog(catalog);
+        set_prompt(&mut tab, "/skill:review");
+        assert!(tab.handle_key(key(KeyCode::Tab)).commands.is_empty());
+        assert_eq!(tab.prompt.text(), "/skill:review");
+    }
+
+    #[test]
+    fn enter_reports_rejected_exact_skill_before_longer_completion() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let invalid = home.path().join(".agents/skills/review");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("SKILL.md"), "---\ndescription: \n---\nBody\n").unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review-more",
+            "description: Longer\n",
+            "Body\n",
+        );
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog);
+        set_prompt(&mut app, "/skill:review");
+        app.refresh_completion();
+        assert_eq!(app.completion.selected_token(), None);
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:review");
+        assert!(app.notice().unwrap().contains("invalid"));
+    }
+
+    #[test]
+    fn direct_skill_busy_rejection_preserves_draft_and_cap_rejection_restores_idle() {
+        let mut app = app_with_prompt("/skill:review inspect this");
+        app.transcript.begin_submission();
+        assert!(app.handle_key(key(KeyCode::Enter)).commands.is_empty());
+        assert_eq!(app.prompt.text(), "/skill:review inspect this");
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active skill instruction text exceeds 256 KiB".to_owned(),
+        });
+        assert!(app.transcript.is_idle());
+        assert!(!app.transcript.is_disabled());
+        assert!(app.notice().unwrap().contains("256 KiB"));
+    }
+
+    #[test]
+    fn direct_skill_admission_rejection_restores_unedited_draft_only() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Review this.\n",
+        );
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(project.path()).unwrap(),
+            home.path(),
+            false,
+            "guidance",
+        ));
+        let mut app = App::default().with_skill_catalog(catalog);
+        let draft = "/skill:review inspect this\n  and this";
+        set_prompt(&mut app, draft);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
+            [RuntimeCommand::Submit {
+                activation: Some(_),
+                ..
+            }]
+        ));
+        assert!(app.prompt.is_empty());
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active text exceeds 256 KiB".to_owned(),
+        });
+        assert_eq!(app.prompt.text(), draft);
+        assert!(app.transcript.is_idle());
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
+            [RuntimeCommand::Submit {
+                activation: Some(_),
+                ..
+            }]
+        ));
+        set_prompt(&mut app, "new draft");
+        app.handle_event(RuntimeEvent::SkillActivationRejected {
+            reason: "active text exceeds 256 KiB".to_owned(),
+        });
+        assert_eq!(app.prompt.text(), "new draft");
+
+        set_prompt(&mut app, draft);
+        let update = app.handle_key(key(KeyCode::Enter));
+        let [
+            RuntimeCommand::Submit {
+                request,
+                activation: Some(_),
+            },
+        ] = update.commands.as_slice()
+        else {
+            panic!("expected direct skill submission");
+        };
+        assert!(app.pending_skill_draft.is_some());
+        app.handle_event(RuntimeEvent::RecordAppended {
+            record: StoredRecord {
+                run_id: RunId(1),
+                record: Record::UserRequest {
+                    request: request.clone(),
+                    selection: None,
+                },
+            },
+            progress_gap: false,
+        });
+        assert!(app.pending_skill_draft.is_none());
     }
 
     #[test]
@@ -5541,7 +6574,8 @@ mod tests {
             assert_eq!(
                 enter_at(&mut app, draft, now).commands,
                 [RuntimeCommand::Submit {
-                    request: draft.to_owned()
+                    request: draft.to_owned(),
+                    activation: None,
                 }],
                 "{draft}"
             );
@@ -6074,7 +7108,10 @@ mod tests {
                 selection,
                 revision,
             },
-            RuntimeCommand::Submit { request },
+            RuntimeCommand::Submit {
+                request,
+                activation: None,
+            },
         ] = update.commands.as_slice()
         else {
             panic!("expected settings then submit, got {:?}", update.commands);
@@ -6093,7 +7130,10 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(RuntimeCommand::Submit { request }) if request == "use the visible setting"
+            Ok(RuntimeCommand::Submit {
+                request,
+                activation: None,
+            }) if request == "use the visible setting"
         ));
     }
 
@@ -6280,7 +7320,8 @@ mod tests {
         assert_eq!(
             update.commands,
             [RuntimeCommand::Submit {
-                request: "hi".to_owned()
+                request: "hi".to_owned(),
+                activation: None,
             }]
         );
         assert!(update.visible_changed);
@@ -6312,6 +7353,7 @@ mod tests {
             update.commands,
             [RuntimeCommand::Submit {
                 request: "send".to_owned(),
+                activation: None,
             }]
         );
         assert!(update.visible_changed);
@@ -6333,6 +7375,7 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)).commands,
             [RuntimeCommand::Submit {
                 request: "f\ng".to_owned(),
+                activation: None,
             }]
         );
 
@@ -6896,7 +7939,8 @@ mod tests {
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)).commands,
             [RuntimeCommand::Submit {
-                request: "x".to_owned()
+                request: "x".to_owned(),
+                activation: None,
             }]
         );
     }
@@ -9993,6 +11037,7 @@ mod tests {
                 enter_at(&mut app, "correct this", submitted_at).commands,
                 [RuntimeCommand::Submit {
                     request: "correct this".to_owned(),
+                    activation: None,
                 }]
             );
             assert_eq!(
@@ -10017,7 +11062,8 @@ mod tests {
         assert_eq!(
             enter_at(&mut app, "correct this", now).commands,
             [RuntimeCommand::Submit {
-                request: "correct this".to_owned()
+                request: "correct this".to_owned(),
+                activation: None,
             }]
         );
         app.handle_event_at(
@@ -10191,6 +11237,7 @@ mod tests {
             enter_at(&mut app, "second prompt", now).commands,
             vec![RuntimeCommand::Submit {
                 request: "second prompt".to_owned(),
+                activation: None,
             }]
         );
         assert_eq!(

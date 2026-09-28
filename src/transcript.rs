@@ -33,6 +33,7 @@ use crate::selection::{
     CardId, Extraction, RowBreaks, SelectableRegion, Selection, Viewport, highlight,
 };
 use crate::session::{CompactionOutcome, CompactionReason};
+use crate::skills::SkillOrigin;
 use crate::subagents::{TaskId, TaskOutcome, TaskRecord, TaskState};
 
 #[derive(Clone, Copy)]
@@ -111,6 +112,12 @@ struct CompactionCard {
     collapsed: String,
     expanded: CompactionContent,
     accounting: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillActivationCard {
+    heading: String,
+    source_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +235,7 @@ enum TranscriptBlock {
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
     Compaction(CompactionCard),
+    SkillActivation(SkillActivationCard),
     Reasoning {
         markdown: String,
     },
@@ -288,6 +296,7 @@ enum NormalisedBlock {
     SubagentSpawned(SubagentSpawnedCard),
     SubagentFinished(SubagentFinishedCard),
     Compaction(CompactionCard),
+    SkillActivation(SkillActivationCard),
     Reasoning {
         markdown: String,
     },
@@ -359,6 +368,10 @@ impl TranscriptBlock {
                 accounting: card
                     .accounting
                     .map(|accounting| normalise_terminal_text(&accounting)),
+            }),
+            Self::SkillActivation(card) => NormalisedBlock::SkillActivation(SkillActivationCard {
+                heading: normalise_terminal_text(&card.heading),
+                source_text: bounded_terminal_text(&card.source_text, 64 * 1024),
             }),
             Self::Reasoning { markdown } => NormalisedBlock::Reasoning {
                 markdown: normalise_terminal_text(&markdown),
@@ -1449,6 +1462,7 @@ impl NormalisedBlock {
             Self::SubagentSpawned(card) => subagent_spawned_plain_text(card),
             Self::SubagentFinished(card) => subagent_finished_plain_text(card),
             Self::Compaction(card) => format!("{}\n{}", card.heading, card.collapsed),
+            Self::SkillActivation(card) => card.heading.clone(),
             Self::Arena(arena) => arena.plain_text(),
             Self::Status { text } => text.clone(),
             Self::SessionRestored => "Session restored.".to_owned(),
@@ -2062,6 +2076,7 @@ impl SettledBlock {
                 | NormalisedBlock::SubagentSpawned(..)
                 | NormalisedBlock::SubagentFinished(..)
                 | NormalisedBlock::Compaction(..)
+                | NormalisedBlock::SkillActivation(..)
         )
     }
 }
@@ -2379,6 +2394,12 @@ impl Transcript {
     pub(crate) fn append_restoration_card(&mut self) {
         self.restoration_card = true;
         self.append_settled_blocks([TranscriptBlock::SessionRestored]);
+    }
+
+    pub(crate) fn append_metadata(&mut self, lines: Vec<String>) {
+        if !lines.is_empty() {
+            self.append_settled_blocks([TranscriptBlock::Metadata { lines }]);
+        }
     }
 
     fn apply_initial_state(&mut self, initial: &RuntimeInitialState) {
@@ -2731,6 +2752,13 @@ impl Transcript {
             }
             RuntimeEvent::RuntimeDisabled { reason } => self.disable(reason, false),
             RuntimeEvent::SubmissionRejectedDisabled { reason } => self.disable(reason, true),
+            RuntimeEvent::SkillActivationRejected { .. }
+                if self.disabled_reason.is_none() && self.run_state == RunState::Submitting =>
+            {
+                self.run_state = RunState::Idle;
+                self.compaction_state != CompactionState::Idle || self.set_status("idle".to_owned())
+            }
+            RuntimeEvent::SkillActivationRejected { .. } => false,
             RuntimeEvent::SubmissionRejectedBusy { .. } => false,
         }
     }
@@ -3290,7 +3318,8 @@ impl Transcript {
             | Record::FinalMessage { .. }
             | Record::CancelledRun { .. }
             | Record::FailedRun { .. }
-            | Record::Compaction { .. } => None,
+            | Record::Compaction { .. }
+            | Record::SkillActivation { .. } => None,
         };
         let settles_run = matches!(
             &record.record,
@@ -3338,7 +3367,9 @@ impl Transcript {
                 self.automatic_compaction = None;
                 self.set_status("starting run".to_owned());
             }
-            Record::UserRequest { .. } | Record::Compaction { .. } => {}
+            Record::UserRequest { .. }
+            | Record::Compaction { .. }
+            | Record::SkillActivation { .. } => {}
         }
         let displayed = DisplayedRecord {
             record,
@@ -3580,6 +3611,23 @@ fn build_render_block(
             }
             RenderBlock::card(own_styled_text(text, style), style, width, 1, 1)
         }
+        NormalisedBlock::SkillActivation(card) => {
+            let style = card_style(COMPLETE_ARENA);
+            let mut lines = vec![Line::raw(if expand_arenas {
+                card.heading.clone()
+            } else {
+                format!("{} \u{b7} Ctrl-O to expand", card.heading)
+            })];
+            if expand_arenas {
+                lines.extend(
+                    logical_lines(&card.source_text)
+                        .into_iter()
+                        .map(|line| Line::raw(line.to_owned())),
+                );
+            }
+            let text = own_styled_text(Text::from(lines), style);
+            RenderBlock::card(text, style, width, 1, 1)
+        }
         NormalisedBlock::Reasoning { markdown: source } => {
             let style = muted_card_style(REASONING).add_modifier(Modifier::ITALIC);
             let text = if show_reasoning {
@@ -3741,7 +3789,7 @@ fn record_attempts(record: &Record) -> &[AttemptAccounting] {
         | Record::CancelledRun { terminal }
         | Record::FailedRun { terminal, .. } => &terminal.attempts,
         Record::Compaction { outcome } => outcome.attempts(),
-        Record::UserRequest { .. } => &[],
+        Record::UserRequest { .. } | Record::SkillActivation { .. } => &[],
     }
 }
 
@@ -3839,6 +3887,16 @@ fn record_blocks(
         }
         Record::Compaction { outcome } => {
             vec![TranscriptBlock::Compaction(compaction_card(outcome))]
+        }
+        Record::SkillActivation { activation } => {
+            let origin = match activation.origin() {
+                SkillOrigin::Project => "project",
+                SkillOrigin::User => "user",
+            };
+            vec![TranscriptBlock::SkillActivation(SkillActivationCard {
+                heading: format!("Skill · {} · {origin}", activation.name()),
+                source_text: activation.source_text().to_owned(),
+            })]
         }
     }
 }
@@ -4573,7 +4631,7 @@ mod tests {
     use crate::config::models::{LUNA, SOL, TERRA};
     use crate::config::{ModelSelection, ready_snapshot_for_test};
     use crate::highlight::PythonHighlighter;
-    use crate::model::{AttemptAccounting, ModelProgress, ModelUsage};
+    use crate::model::{AttemptAccounting, ModelProgress, ModelUsage, SkillActivation};
     use crate::pricing::{RunCostEstimate, estimate_run_cost};
     use crate::runtime::{
         CompactionAcknowledgement, CompactionLifecycle, CompactionSettlement, ModelStepId, Record,
@@ -4582,6 +4640,7 @@ mod tests {
     };
     use crate::selection::{DocumentPosition, Selection};
     use crate::session::{CompactionOutcome, CompactionReason, SessionEntryId};
+    use crate::skills::SkillOrigin;
     use crate::subagents::TaskRecord;
 
     #[test]
@@ -5200,6 +5259,52 @@ mod tests {
             assert!(expanded.contains(expanded_content), "{expanded}");
             assert!(expanded.contains(&accounting), "{expanded}");
         }
+    }
+
+    #[test]
+    fn skill_activation_card_follows_its_request_and_expands_to_the_skill_text() {
+        let activation = SkillActivation::new(
+            "review".to_owned(),
+            PathBuf::from("/workspace/.agents/skills/review"),
+            "---\nname: review\ndescription: Review\n---\nReview every change.".to_owned(),
+            SkillOrigin::Project,
+            Some(PathBuf::from("/workspace")),
+        )
+        .unwrap();
+        let mut transcript = Transcript::default();
+        append_records(
+            &mut transcript,
+            vec![
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::UserRequest {
+                        request: "/skill:review".to_owned(),
+                        selection: None,
+                    },
+                },
+                StoredRecord {
+                    run_id: RunId(1),
+                    record: Record::SkillActivation { activation },
+                },
+            ],
+        );
+
+        let collapsed = rendered_layout_text(&mut transcript);
+        let card = collapsed
+            .find("Skill · review · project · Ctrl-O to expand")
+            .unwrap_or_else(|| panic!("{collapsed}"));
+        assert!(
+            collapsed.find("/skill:review").unwrap() < card,
+            "{collapsed}"
+        );
+        assert!(!collapsed.contains("Review every change."), "{collapsed}");
+
+        assert!(transcript.toggle_arena_expansion());
+        let expanded = rendered_layout_text(&mut transcript);
+        assert!(expanded.contains("Skill · review · project"), "{expanded}");
+        assert!(!expanded.contains("Ctrl-O to expand"), "{expanded}");
+        assert!(expanded.contains("description: Review"), "{expanded}");
+        assert!(expanded.contains("Review every change."), "{expanded}");
     }
 
     #[test]
@@ -9756,6 +9861,7 @@ truncated"
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
                 TranscriptBlock::Compaction(..) => "compaction",
+                TranscriptBlock::SkillActivation(..) => "skill activation",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",
@@ -9877,6 +9983,7 @@ truncated"
                 TranscriptBlock::SubagentSpawned(..) => "subagent spawned",
                 TranscriptBlock::SubagentFinished(..) => "subagent finished",
                 TranscriptBlock::Compaction(..) => "compaction",
+                TranscriptBlock::SkillActivation(..) => "skill activation",
                 TranscriptBlock::Reasoning { .. } => "reasoning",
                 TranscriptBlock::Arena(..) => "arena",
                 TranscriptBlock::Assistant { .. } => "assistant",

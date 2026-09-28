@@ -36,6 +36,10 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
+use crate::model::{ActiveSkills, SkillActivation, SkillActivationError};
+use crate::skills::{
+    SkillCatalog, SkillLookupError, model_visible_path, valid_name as valid_skill_name,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -57,6 +61,7 @@ pub(crate) enum ToolName {
     Glob,
     Grep,
     Run,
+    LoadSkill,
     StartSubagent,
     GetSubagent,
     RefreshSubagent,
@@ -74,6 +79,7 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Run => "run",
+            Self::LoadSkill => "load_skill",
             Self::StartSubagent => "start_subagent",
             Self::GetSubagent => "get_subagent",
             Self::RefreshSubagent => "refresh_subagent",
@@ -91,6 +97,7 @@ impl ToolName {
             Self::Glob => "_kiki_glob",
             Self::Grep => "_kiki_grep",
             Self::Run => "_kiki_run",
+            Self::LoadSkill => "_kiki_load_skill",
             Self::StartSubagent => "_kiki_start_subagent",
             Self::GetSubagent => "_kiki_get_subagent",
             Self::RefreshSubagent => "_kiki_refresh_subagent",
@@ -117,6 +124,7 @@ impl ToolName {
                 | Self::ListDir
                 | Self::Glob
                 | Self::Grep
+                | Self::LoadSkill
                 | Self::StartSubagent
                 | Self::GetSubagent
                 | Self::RefreshSubagent
@@ -133,6 +141,8 @@ impl ToolName {
             (Self::ListDir | Self::Glob, _) => "entries",
             (Self::Grep, 1) => "match",
             (Self::Grep, _) => "matches",
+            (Self::LoadSkill, 1) => "skill",
+            (Self::LoadSkill, _) => "skills",
             (Self::Write | Self::Edit, _) => {
                 unreachable!("mutations have status summaries rather than counts")
             }
@@ -170,6 +180,7 @@ impl ToolCall {
             | ToolName::Glob
             | ToolName::Grep
             | ToolName::Run
+            | ToolName::LoadSkill
             | ToolName::StartSubagent
             | ToolName::GetSubagent
             | ToolName::RefreshSubagent
@@ -586,12 +597,18 @@ const RUN_PARAMETERS: &[ToolParameter] = &[
     },
 ];
 
+const LOAD_SKILL_PARAMETERS: &[ToolParameter] = &[ToolParameter {
+    name: "name",
+    value_type: ToolValueType::String,
+    default: None,
+}];
+
 pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
         name: ToolName::Read,
         parameters: READ_PARAMETERS,
         result: ToolResultShape::String,
-        description: "Read one complete UTF-8 workspace file.",
+        description: "Read one complete UTF-8 workspace file or skill:// resource.",
     },
     ToolDefinition {
         name: ToolName::Write,
@@ -609,7 +626,7 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         name: ToolName::ListDir,
         parameters: LIST_DIR_PARAMETERS,
         result: ToolResultShape::RecordList(&DIRECTORY_ENTRY),
-        description: "List immediate workspace directory entries.",
+        description: "List immediate workspace or skill:// directory entries.",
     },
     ToolDefinition {
         name: ToolName::Glob,
@@ -629,6 +646,12 @@ pub(crate) const ACTIVE_TOOLS: &[ToolDefinition] = &[
         result: ToolResultShape::Record(&COMMAND_RESULT),
         description: "Run one project-local shell command.",
     },
+    ToolDefinition {
+        name: ToolName::LoadSkill,
+        parameters: LOAD_SKILL_PARAMETERS,
+        result: ToolResultShape::String,
+        description: "Activate one model-invocable skill from the process catalog.",
+    },
 ];
 
 pub(crate) fn bootstrap_source() -> String {
@@ -642,8 +665,21 @@ pub(crate) fn type_check_stubs() -> String {
     )
 }
 
-pub(crate) fn prompt_reference() -> String {
-    prompt_reference_for(&ACTIVE_TOOLS.iter().collect::<Vec<_>>(), false)
+pub(crate) fn prompt_reference(catalog: &SkillCatalog) -> String {
+    prompt_reference_with_visibility(catalog.rendered_catalog().is_some(), false)
+}
+
+fn prompt_reference_with_visibility(load_skill_visible: bool, read_only: bool) -> String {
+    prompt_reference_for(
+        &ACTIVE_TOOLS
+            .iter()
+            .filter(|definition| {
+                (load_skill_visible || definition.name != ToolName::LoadSkill)
+                    && (!read_only || definition.name.is_allowed_read_only())
+            })
+            .collect::<Vec<_>>(),
+        read_only,
+    )
 }
 
 fn prompt_reference_for(definitions: &[&ToolDefinition], read_only: bool) -> String {
@@ -1017,6 +1053,47 @@ struct BatchDispatch<'a> {
     active_mutation_paths: BTreeSet<PathBuf>,
     authorisations: WholeFileAuthorisations,
     output: Option<mpsc::Sender<ToolOutputChunk>>,
+    active_skills: &'a [SkillActivation],
+}
+
+pub(crate) struct SkillLoadLedger {
+    active: ActiveSkills,
+    captured: Vec<SkillActivation>,
+}
+
+impl SkillLoadLedger {
+    pub(crate) fn new(active: &[SkillActivation]) -> Result<Self, SkillActivationError> {
+        let mut skills = ActiveSkills::default();
+        for activation in active {
+            skills.activate(activation.clone())?;
+        }
+        Ok(Self {
+            active: skills,
+            captured: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured(&self) -> &[SkillActivation] {
+        &self.captured
+    }
+
+    pub(crate) fn into_captured(self) -> Vec<SkillActivation> {
+        self.captured
+    }
+
+    pub(crate) fn active(&self) -> &[SkillActivation] {
+        self.active.as_slice()
+    }
+
+    fn activate(&mut self, activation: SkillActivation) -> Result<(), SkillActivationError> {
+        if self.active.activate(activation.clone())? {
+            self.captured
+                .retain(|existing| existing.name() != activation.name());
+            self.captured.push(activation);
+        }
+        Ok(())
+    }
 }
 
 impl<'a> BatchDispatch<'a> {
@@ -1025,6 +1102,7 @@ impl<'a> BatchDispatch<'a> {
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
         output: Option<mpsc::Sender<ToolOutputChunk>>,
+        active_skills: &'a [SkillActivation],
     ) -> Self {
         Self {
             host,
@@ -1033,6 +1111,7 @@ impl<'a> BatchDispatch<'a> {
             active_mutation_paths: BTreeSet::new(),
             authorisations,
             output,
+            active_skills,
         }
     }
 
@@ -1073,10 +1152,16 @@ impl<'a> BatchDispatch<'a> {
             }
             let host = self.host;
             let output = self.output.clone();
+            let active_skills = self.active_skills;
             self.active.push(Box::pin(async move {
                 ScheduledCall {
                     result: host
-                        .call_with_authorisation_and_output(call, authorisation, output)
+                        .call_with_authorisation_and_output(
+                            call,
+                            authorisation,
+                            output,
+                            active_skills,
+                        )
                         .await,
                     mutation_path,
                 }
@@ -1088,6 +1173,7 @@ impl<'a> BatchDispatch<'a> {
 #[derive(Clone)]
 pub(crate) struct ToolHost {
     workspace: Arc<Dir>,
+    skill_catalog: Arc<SkillCatalog>,
     limits: ToolLimits,
     read_only: bool,
     #[cfg(test)]
@@ -1707,6 +1793,7 @@ impl ToolHost {
 
         Ok(Self {
             workspace,
+            skill_catalog: Arc::default(),
             limits,
             read_only: false,
             #[cfg(test)]
@@ -1730,12 +1817,52 @@ impl ToolHost {
         child
     }
 
+    pub(crate) fn with_skill_catalog(mut self, catalog: Arc<SkillCatalog>) -> Self {
+        self.skill_catalog = catalog;
+        self
+    }
+
+    pub(crate) fn load_skill(
+        &self,
+        arguments: ToolValue,
+        ledger: &mut SkillLoadLedger,
+    ) -> Result<ToolValue, ToolError> {
+        let ToolValue::List(arguments) = arguments else {
+            return Err(ToolError::type_error("load_skill expects one string name"));
+        };
+        let [ToolValue::String(name)] = arguments.as_slice() else {
+            return Err(ToolError::type_error("load_skill expects one string name"));
+        };
+        let skill = self
+            .skill_catalog
+            .lookup_model_invocable(name)
+            .map_err(|error| map_skill_lookup_error(name, error))?;
+        ledger
+            .activate(SkillActivation::from_skill(skill))
+            .map_err(|error| ToolError::value(error.to_string()))?;
+        let root = model_visible_path(skill.canonical_root()).map_or_else(
+            || "root path unavailable".to_owned(),
+            |path| {
+                format!(
+                    "root={}",
+                    serde_json::to_string(path).expect("path is UTF-8")
+                )
+            },
+        );
+        Ok(ToolValue::String(format!(
+            "Loaded skill {name}; resource skill://{name}/; {root}"
+        )))
+    }
+
     pub(crate) fn prompt_reference(&self) -> String {
-        let definitions = ACTIVE_TOOLS
-            .iter()
-            .filter(|definition| !self.read_only || definition.name.is_allowed_read_only())
-            .collect::<Vec<_>>();
-        prompt_reference_for(&definitions, self.read_only)
+        prompt_reference_with_visibility(
+            self.skill_catalog.rendered_catalog().is_some(),
+            self.read_only,
+        )
+    }
+
+    pub(crate) fn skill_catalog(&self) -> &SkillCatalog {
+        &self.skill_catalog
     }
 
     #[cfg(test)]
@@ -1787,19 +1914,20 @@ impl ToolHost {
         authorisations: WholeFileAuthorisations,
     ) -> impl Stream<Item = ToolResult> + '_ {
         stream::unfold(
-            BatchDispatch::new(self, calls, authorisations, None),
+            BatchDispatch::new(self, calls, authorisations, None, &[]),
             |dispatch| async move { dispatch.next().await },
         )
     }
 
-    pub(crate) fn dispatch_batch_with_output(
-        &self,
+    pub(crate) fn dispatch_batch_with_output<'a>(
+        &'a self,
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
         output: mpsc::Sender<ToolOutputChunk>,
-    ) -> impl Stream<Item = ToolResult> + '_ {
+        active_skills: &'a [SkillActivation],
+    ) -> impl Stream<Item = ToolResult> + 'a {
         stream::unfold(
-            BatchDispatch::new(self, calls, authorisations, Some(output)),
+            BatchDispatch::new(self, calls, authorisations, Some(output), active_skills),
             |dispatch| async move { dispatch.next().await },
         )
     }
@@ -1815,7 +1943,7 @@ impl ToolHost {
         call: ToolCall,
         authorisation: Option<ContentFingerprint>,
     ) -> ToolResult {
-        self.call_with_authorisation_and_output(call, authorisation, None)
+        self.call_with_authorisation_and_output(call, authorisation, None, &[])
             .await
     }
 
@@ -1824,6 +1952,7 @@ impl ToolHost {
         call: ToolCall,
         authorisation: Option<ContentFingerprint>,
         output: Option<mpsc::Sender<ToolOutputChunk>>,
+        active_skills: &[SkillActivation],
     ) -> ToolResult {
         let ToolCall {
             call_id,
@@ -1849,13 +1978,16 @@ impl ToolHost {
             batch_call.wait_until_released().await;
         }
         let result = match tool {
-            ToolName::Read => self.read(arguments).await,
+            ToolName::Read => self.read(arguments, active_skills).await,
             ToolName::Write => self.write(arguments, authorisation).await,
             ToolName::Edit => self.edit(arguments).await,
-            ToolName::ListDir => self.list_dir(arguments).await,
+            ToolName::ListDir => self.list_dir(arguments, active_skills).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
             ToolName::Run => self.run(call_id, arguments, output).await,
+            ToolName::LoadSkill => Err(ToolError::runtime(
+                "load_skill requires an active model execution",
+            )),
             ToolName::StartSubagent
             | ToolName::GetSubagent
             | ToolName::RefreshSubagent
@@ -2001,14 +2133,22 @@ impl ToolHost {
         })
     }
 
-    async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
-        let path = read_path(arguments)?;
+    async fn read(
+        &self,
+        arguments: ToolValue,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolOutput, ToolError> {
+        let target = read_path(arguments)?;
         #[cfg(test)]
         if let Some(test_gate) = &self.test_gate {
             test_gate.wait_before_read().await;
         }
 
-        let workspace = Arc::clone(&self.workspace);
+        let ResolvedResource {
+            directory,
+            path,
+            skill_name,
+        } = self.resolve_resource_path(target, active_skills)?;
         let limits = self.limits;
         let effect_path = path.clone();
         #[cfg(test)]
@@ -2018,7 +2158,7 @@ impl ToolHost {
             if let Some(test_gate) = &blocking_read_test_gate {
                 test_gate.wait_inside();
             }
-            let read = read_file(&workspace, &path, limits.max_file_bytes);
+            let read = read_file(&directory, &path, limits.max_file_bytes);
             #[cfg(test)]
             if let Some(test_gate) = &blocking_read_test_gate {
                 test_gate.note_finished();
@@ -2027,18 +2167,30 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
-        Ok(ToolOutput {
-            result: ToolValue::String(read.contents),
-            effect: Some(ToolEffect::Read {
-                path: effect_path,
-                fingerprint: read.fingerprint,
-            }),
-        })
+        if skill_name.is_some() {
+            Ok(ToolOutput::without_effect(ToolValue::String(read.contents)))
+        } else {
+            Ok(ToolOutput {
+                result: ToolValue::String(read.contents),
+                effect: Some(ToolEffect::Read {
+                    path: effect_path,
+                    fingerprint: read.fingerprint,
+                }),
+            })
+        }
     }
 
-    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
-        let path = list_dir_path(arguments)?;
-        let workspace = Arc::clone(&self.workspace);
+    async fn list_dir(
+        &self,
+        arguments: ToolValue,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolOutput, ToolError> {
+        let ResolvedResource {
+            directory,
+            path,
+            skill_name,
+        } = self.resolve_resource_path(list_dir_path(arguments)?, active_skills)?;
+        let prefix = skill_name.map_or_else(String::new, |name| format!("skill://{name}"));
         let limits = self.limits;
         #[cfg(test)]
         let test_gate = self.list_dir_test_gate.clone();
@@ -2047,12 +2199,49 @@ impl ToolHost {
             if let Some(test_gate) = test_gate {
                 test_gate.wait_inside();
             }
-            list_directory(&workspace, &path, limits)
+            list_directory(&directory, &path, limits, &prefix)
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))?
         .map(ToolValue::List)
         .map(ToolOutput::without_effect)
+    }
+
+    fn resolve_resource_path(
+        &self,
+        target: ResourcePath,
+        active_skills: &[SkillActivation],
+    ) -> Result<ResolvedResource, ToolError> {
+        match target {
+            ResourcePath::Workspace(path) => Ok(ResolvedResource {
+                directory: Arc::clone(&self.workspace),
+                path,
+                skill_name: None,
+            }),
+            ResourcePath::Skill { name, path } => {
+                let skill = self
+                    .skill_catalog
+                    .lookup_model_invocable(&name)
+                    .or_else(|error| {
+                        self.skill_catalog
+                            .lookup(&name)
+                            .ok()
+                            .filter(|skill| {
+                                active_skills.iter().any(|active| {
+                                    active.name() == name
+                                        && active.canonical_root() == skill.canonical_root()
+                                })
+                            })
+                            .ok_or(error)
+                    })
+                    .map_err(|error| map_skill_lookup_error(&name, error))?;
+                Ok(ResolvedResource {
+                    directory: skill.directory(),
+                    path,
+                    skill_name: Some(name),
+                })
+            }
+        }
     }
 
     async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
@@ -2152,7 +2341,7 @@ fn write_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
     let [ToolValue::String(path), ToolValue::String(_)] = arguments.as_slice() else {
         return None;
     };
-    normalise_path(path).ok()
+    workspace_mutation_path(path).ok()
 }
 
 fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
@@ -2167,7 +2356,7 @@ fn edit_mutation_path(arguments: &ToolValue) -> Option<PathBuf> {
     else {
         return None;
     };
-    normalise_path(path).ok()
+    workspace_mutation_path(path).ok()
 }
 
 fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError> {
@@ -2178,7 +2367,7 @@ fn write_arguments(arguments: ToolValue) -> Result<(PathBuf, String), ToolError>
     };
     match <[ToolValue; 2]>::try_from(arguments) {
         Ok([ToolValue::String(path), ToolValue::String(content)]) => {
-            Ok((normalise_path(&path)?, content))
+            Ok((workspace_mutation_path(&path)?, content))
         }
         _ => Err(ToolError::type_error(
             "write() expects two positional string arguments",
@@ -2199,7 +2388,7 @@ fn edit_arguments(arguments: ToolValue) -> Result<(PathBuf, String, String), Too
                 ToolValue::String(old),
                 ToolValue::String(new),
             ],
-        ) => Ok((normalise_path(&path)?, old, new)),
+        ) => Ok((workspace_mutation_path(&path)?, old, new)),
         _ => Err(ToolError::type_error(
             "edit() expects three positional string arguments",
         )),
@@ -2245,7 +2434,60 @@ fn map_command_error(error: command::CommandError) -> ToolError {
     }
 }
 
-fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
+fn map_skill_lookup_error(name: &str, error: SkillLookupError) -> ToolError {
+    ToolError::value(match error {
+        SkillLookupError::Unknown(_) => format!("unknown or unavailable skill {name:?}"),
+        SkillLookupError::Ambiguous { paths, .. } => {
+            format!("skill {name:?} is ambiguous among {} sources", paths.len())
+        }
+        SkillLookupError::Invalid { reason, .. } => {
+            format!("skill {name:?} is invalid: {reason:?}")
+        }
+        SkillLookupError::Omitted { reason, .. } => {
+            format!("skill {name:?} was omitted: {reason:?}")
+        }
+        SkillLookupError::DirectOnly(_) => {
+            format!("skill {name:?} can only be activated directly by the user")
+        }
+    })
+}
+
+enum ResourcePath {
+    Workspace(PathBuf),
+    Skill { name: String, path: PathBuf },
+}
+
+struct ResolvedResource {
+    directory: Arc<Dir>,
+    path: PathBuf,
+    skill_name: Option<String>,
+}
+
+fn parse_resource_path(path: &str) -> Result<ResourcePath, ToolError> {
+    let Some(locator) = path.strip_prefix("skill://") else {
+        return normalise_path(path).map(ResourcePath::Workspace);
+    };
+    let (name, relative) = locator
+        .split_once('/')
+        .ok_or_else(|| ToolError::value("skill locator must include a trailing slash"))?;
+    if !valid_skill_name(name) {
+        return Err(ToolError::value("skill locator has an invalid name"));
+    }
+    let path = normalise_path(relative)?;
+    Ok(ResourcePath::Skill {
+        name: name.to_owned(),
+        path,
+    })
+}
+
+fn workspace_mutation_path(path: &str) -> Result<PathBuf, ToolError> {
+    if path.starts_with("skill://") {
+        return Err(ToolError::permission("skill resources are read-only"));
+    }
+    normalise_path(path)
+}
+
+fn read_path(arguments: ToolValue) -> Result<ResourcePath, ToolError> {
     let ToolValue::List(arguments) = arguments else {
         return Err(ToolError::type_error(
             "read() expects one positional string argument",
@@ -2256,18 +2498,18 @@ fn read_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
             "read() expects one positional string argument",
         ));
     };
-    normalise_path(path)
+    parse_resource_path(path)
 }
 
-fn list_dir_path(arguments: ToolValue) -> Result<PathBuf, ToolError> {
+fn list_dir_path(arguments: ToolValue) -> Result<ResourcePath, ToolError> {
     let ToolValue::List(arguments) = arguments else {
         return Err(ToolError::type_error(
             "list_dir() expects zero or one positional string argument",
         ));
     };
     match arguments.as_slice() {
-        [] => Ok(PathBuf::new()),
-        [ToolValue::String(path)] => normalise_path(path),
+        [] => Ok(ResourcePath::Workspace(PathBuf::new())),
+        [ToolValue::String(path)] => parse_resource_path(path),
         _ => Err(ToolError::type_error(
             "list_dir() expects zero or one positional string argument",
         )),
@@ -2375,9 +2617,15 @@ fn list_directory(
     workspace: &Dir,
     path: &Path,
     limits: ToolLimits,
+    display_prefix: &str,
 ) -> Result<Vec<ToolValue>, ToolError> {
     let directory = open_directory_root(workspace, path)?;
-    let base_path = normalised_path_string(path);
+    let relative_base = normalised_path_string(path);
+    let base_path = match (display_prefix.is_empty(), relative_base.is_empty()) {
+        (true, _) => relative_base,
+        (false, true) => display_prefix.to_owned(),
+        (false, false) => format!("{display_prefix}/{relative_base}"),
+    };
     let mut entries = Vec::new();
 
     for entry in directory.entries().map_err(ToolError::from_io)? {
@@ -3749,16 +3997,592 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::config::constants::FILE_MAX_BYTES;
+    use crate::model::SkillActivation;
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin, write_skill};
 
     use super::{
-        ACTIVE_TOOLS, ContentFingerprint, ToolCall, ToolEffect, ToolError, ToolErrorKind, ToolHost,
-        ToolName, ToolResult, ToolValue, Utf8ValidatingReader, WholeFileAuthorisations,
-        WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source, content_fingerprint,
-        invocation_source, normalise_path, open_content_no_follow, open_parent, prompt_reference,
+        ACTIVE_TOOLS, ContentFingerprint, SkillLoadLedger, ToolCall, ToolEffect, ToolError,
+        ToolErrorKind, ToolHost, ToolName, ToolResult, ToolValue, Utf8ValidatingReader,
+        WholeFileAuthorisations, WholeFileEdit, WholeFileWrite, WriteTestHook, bootstrap_source,
+        content_fingerprint, invocation_source, normalise_path, open_content_no_follow,
+        open_parent, prompt_reference,
     };
 
     async fn tool_host(workspace: &TempDir) -> ToolHost {
         ToolHost::new(workspace.path()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn skill_resources_read_and_list_from_catalogued_directory() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Pinned body\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
+        fs::write(root.join("references/checklist.md"), "live resource").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+
+        assert_eq!(
+            read(&host, "skill://review/references/checklist.md")
+                .await
+                .unwrap(),
+            "live resource"
+        );
+        assert_eq!(
+            list_dir_path(&host, "skill://review/references")
+                .await
+                .unwrap(),
+            [directory_entry(
+                "skill://review/references/checklist.md",
+                "file",
+                Some(13)
+            )]
+        );
+        assert!(
+            list_dir_path(&host, "skill://review/")
+                .await
+                .unwrap()
+                .contains(&directory_entry(
+                    "skill://review/references",
+                    "directory",
+                    None
+                ))
+        );
+    }
+
+    async fn review_resource_host(
+        home: &TempDir,
+        workspace: &TempDir,
+    ) -> (ToolHost, Arc<SkillCatalog>, PathBuf) {
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "PINNED_BODY\n",
+        );
+        fs::write(root.join("reference.txt"), "first").unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(workspace)
+            .await
+            .with_skill_catalog(catalog.clone());
+        (host, catalog, root)
+    }
+
+    #[tokio::test]
+    async fn skill_resource_reads_record_no_file_effects() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let (host, _, _) = review_resource_host(&home, &workspace).await;
+        let result = host
+            .call(ToolCall {
+                call_id: 8,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String(
+                    "skill://review/reference.txt".to_owned(),
+                )]),
+            })
+            .await;
+        assert_eq!(result.result, Ok(ToolValue::String("first".to_owned())));
+        assert!(result.effect.is_none());
+        let mut reads = BTreeSet::new();
+        let mut modifications = BTreeSet::new();
+        let mut authorisations = WholeFileAuthorisations::default();
+        result.record_observed_file_operation(&mut reads, &mut modifications);
+        result.apply_batch_transition(&mut authorisations, &BTreeSet::new());
+        assert!(reads.is_empty());
+        assert!(modifications.is_empty());
+        assert_eq!(authorisations, WholeFileAuthorisations::default());
+    }
+
+    #[tokio::test]
+    async fn skill_resource_mutations_are_denied_without_touching_workspace_lookalikes() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_alias = workspace.path().join("skill:/review");
+        fs::create_dir_all(&workspace_alias).unwrap();
+        fs::write(workspace_alias.join("reference.txt"), "workspace file").unwrap();
+        let (host, _, root) = review_resource_host(&home, &workspace).await;
+        let locator = "skill://review/reference.txt";
+        for (tool, arguments) in [
+            (ToolName::Write, vec![locator, "changed"]),
+            (ToolName::Edit, vec![locator, "first", "changed"]),
+        ] {
+            let result = host
+                .call(ToolCall {
+                    call_id: 9,
+                    tool,
+                    arguments: ToolValue::List(
+                        arguments
+                            .into_iter()
+                            .map(|item| ToolValue::String(item.to_owned()))
+                            .collect(),
+                    ),
+                })
+                .await;
+            assert!(
+                matches!(result.result, Err(ref error) if error.kind == ToolErrorKind::Permission)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace_alias.join("reference.txt")).unwrap(),
+            "workspace file"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("reference.txt")).unwrap(),
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_reads_are_live_while_catalog_text_stays_pinned() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let (host, catalog, root) = review_resource_host(&home, &workspace).await;
+        fs::write(root.join("reference.txt"), "second").unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "CHANGED_BODY\n",
+        );
+        assert_eq!(
+            read(&host, "skill://review/reference.txt").await.unwrap(),
+            "second"
+        );
+        let pinned = catalog.lookup("review").unwrap().source_text();
+        assert!(pinned.contains("PINNED_BODY"));
+        assert!(!pinned.contains("CHANGED_BODY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_resources_reject_escapes_and_stay_on_held_directory_after_replacement() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "outside").unwrap();
+        let root = write_skill(
+            &home.path().join(".agents/skills"),
+            "review",
+            "description: Review\n",
+            "Pinned\n",
+        );
+        fs::create_dir(root.join("references")).unwrap();
+        fs::write(root.join("references/old.txt"), "old directory").unwrap();
+        fs::write(root.join("%2e%2e"), "literal escape").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("outside-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.join("final-link")).unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        for path in [
+            "skill://review/../secret",
+            "skill://review//secret",
+            "skill://review/outside-link/secret",
+            "skill://review/final-link",
+        ] {
+            assert_eq!(
+                read_error(&host, path).await,
+                ToolErrorKind::Permission,
+                "{path}"
+            );
+        }
+        for path in ["skill://review/outside-link", "skill://review/final-link"] {
+            assert_eq!(
+                list_dir_error(&host, path).await,
+                ToolErrorKind::Permission,
+                "{path}"
+            );
+        }
+        for path in ["skill:///secret", "skill://review", "skill://../secret"] {
+            assert_eq!(
+                read_error(&host, path).await,
+                ToolErrorKind::Value,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            read(&host, "skill://review/%2e%2e").await.unwrap(),
+            "literal escape"
+        );
+
+        let old = home.path().join(".agents/skills/review-old");
+        fs::rename(&root, &old).unwrap();
+        fs::create_dir_all(root.join("references")).unwrap();
+        fs::write(root.join("references/old.txt"), "new directory").unwrap();
+        assert_eq!(
+            read(&host, "skill://review/references/old.txt")
+                .await
+                .unwrap(),
+            "old directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_listing_counts_locator_prefix_and_skipped_project_is_unavailable() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let user_root = write_skill(
+            &home.path().join(".agents/skills"),
+            "user",
+            "description: User\n",
+            "Body\n",
+        );
+        fs::create_dir(user_root.join("references")).unwrap();
+        fs::write(user_root.join("references/x"), "").unwrap();
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "project",
+            "description: Project\n",
+            "Body\n",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let expected_path = "skill://user/references/x";
+        let exact = expected_path.len() + "file".len();
+        let at_limit = tool_host_with_collection_limits(&workspace, 1, exact)
+            .await
+            .with_skill_catalog(catalog.clone());
+        assert_eq!(
+            list_dir_path(&at_limit, "skill://user/references")
+                .await
+                .unwrap(),
+            [directory_entry(expected_path, "file", Some(0))]
+        );
+        let over_limit = tool_host_with_collection_limits(&workspace, 1, exact - 1)
+            .await
+            .with_skill_catalog(catalog);
+        assert_eq!(
+            list_dir_error(&over_limit, "skill://user/references").await,
+            ToolErrorKind::Runtime
+        );
+        assert_eq!(
+            read_error(&at_limit, "skill://project/SKILL.md").await,
+            ToolErrorKind::Value
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resources_require_a_listed_model_invocable_or_active_skill() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let skills = home.path().join(".agents/skills");
+        write_skill(
+            &skills,
+            "direct",
+            "description: Direct\ndisable-model-invocation: true\n",
+            "body",
+        );
+        for index in 0..33 {
+            write_skill(
+                &skills,
+                &format!("visible-{index:02}"),
+                "description: Visible\n",
+                "body",
+            );
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace)
+            .await
+            .with_skill_catalog(catalog.clone());
+
+        for (tool, path) in [
+            (ToolName::Read, "skill://visible-00/SKILL.md"),
+            (ToolName::ListDir, "skill://visible-00/"),
+        ] {
+            assert!(
+                skill_resource(&host, tool, path, &[]).await.is_ok(),
+                "{path}"
+            );
+        }
+        for (name, reason) in [
+            ("direct", "directly by the user"),
+            ("visible-32", "omitted"),
+        ] {
+            let refused = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.to_owned())]),
+                    &mut SkillLoadLedger::new(&[]).unwrap(),
+                )
+                .unwrap_err();
+            assert!(refused.to_string().contains(reason), "{name}: {refused}");
+            let active = [SkillActivation::from_skill(catalog.lookup(name).unwrap())];
+            let elsewhere = [SkillActivation::new(
+                name.to_owned(),
+                PathBuf::from("/elsewhere").join(name),
+                "---\ndescription: Other\n---\nbody".to_owned(),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap()];
+            for (tool, path) in [
+                (ToolName::Read, format!("skill://{name}/SKILL.md")),
+                (ToolName::ListDir, format!("skill://{name}/")),
+            ] {
+                assert_eq!(
+                    skill_resource(&host, tool, &path, &[]).await,
+                    Err(refused.clone()),
+                    "{path}"
+                );
+                assert!(
+                    skill_resource(&host, tool, &path, &active).await.is_ok(),
+                    "{path}"
+                );
+                assert_eq!(
+                    skill_resource(&host, tool, &path, &elsewhere).await,
+                    Err(refused.clone()),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_skill_ledger_captures_body_outside_ack_and_enforces_combined_limit() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        for index in 0..5 {
+            let name = format!("large-{index}");
+            write_skill(
+                &home.path().join(".agents/skills"),
+                &name,
+                &format!("name: {name}\ndescription: Large\n"),
+                &"BODY_SENTINEL".repeat(4_700),
+            );
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        for index in 0..4 {
+            let name = format!("large-{index}");
+            let ack = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.clone())]),
+                    &mut ledger,
+                )
+                .unwrap();
+            let ToolValue::String(ack) = ack else {
+                panic!("load_skill must return a string acknowledgement")
+            };
+            assert!(ack.contains(&format!("skill://{name}/")));
+            assert!(!ack.contains("BODY_SENTINEL"));
+        }
+        assert_eq!(ledger.captured().len(), 4);
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("large-4".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert_eq!(ledger.captured().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn load_skill_lookup_rejects_direct_only_invalid_ambiguous_and_skipped_project() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let user_root = home.path().join(".agents/skills");
+        for (directory, frontmatter, body) in [
+            (
+                "direct",
+                "name: direct\ndescription: Direct\ndisable-model-invocation: true\n",
+                "body",
+            ),
+            ("invalid", "name: invalid\n", "body"),
+            ("one", "name: shared\ndescription: One\n", "body"),
+            ("two", "name: shared\ndescription: Two\n", "body"),
+        ] {
+            write_skill(&user_root, directory, frontmatter, body);
+        }
+        write_skill(
+            &workspace.path().join(".agents/skills"),
+            "project",
+            "name: project\ndescription: Project\n",
+            "body",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        for (name, reason) in [
+            ("direct", "directly by the user"),
+            ("invalid", "invalid"),
+            ("shared", "ambiguous"),
+            ("project", "unavailable"),
+            ("missing", "unknown"),
+        ] {
+            let error = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.to_owned())]),
+                    &mut ledger,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::Value);
+            assert!(error.to_string().contains(reason), "{name}: {error}");
+        }
+        assert!(ledger.captured().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_skill_ack_omits_unsafe_root_path_and_is_allowed_in_read_only_host() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "\u{202e}hidden",
+            "name: safe\ndescription: Safe\n",
+            "body",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace)
+            .await
+            .with_skill_catalog(catalog)
+            .for_child(true);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        let result = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("safe".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap();
+        let ToolValue::String(ack) = result else {
+            panic!("load_skill must return a string")
+        };
+        assert!(ack.contains("skill://safe/"));
+        assert!(ack.contains("root path unavailable"));
+        assert!(!ack.contains('\u{202e}'));
+        assert_eq!(ledger.captured().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_skill_uses_process_catalog_snapshot_after_source_changes() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let skills = home.path().join(".agents/skills");
+        write_skill(
+            &skills,
+            "review",
+            "name: review\ndescription: Review\n",
+            "FIRST_BODY",
+        );
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let old_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let old_host = tool_host(&workspace).await.with_skill_catalog(old_catalog);
+
+        write_skill(
+            &skills,
+            "review",
+            "name: review\ndescription: Review\n",
+            "SECOND_BODY",
+        );
+        let new_catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let new_host = tool_host(&workspace).await.with_skill_catalog(new_catalog);
+        let mut old_ledger = SkillLoadLedger::new(&[]).unwrap();
+        old_host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut old_ledger,
+            )
+            .unwrap();
+        let mut new_ledger = SkillLoadLedger::new(old_ledger.captured()).unwrap();
+        assert!(
+            new_ledger
+                .active
+                .iter()
+                .next()
+                .unwrap()
+                .source_text()
+                .contains("FIRST_BODY")
+        );
+        assert!(new_ledger.captured().is_empty());
+        new_host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut new_ledger,
+            )
+            .unwrap();
+        assert!(
+            old_ledger.captured()[0]
+                .source_text()
+                .contains("FIRST_BODY")
+        );
+        assert!(
+            new_ledger.captured()[0]
+                .source_text()
+                .contains("SECOND_BODY")
+        );
+        assert!(
+            new_ledger
+                .active
+                .iter()
+                .next()
+                .unwrap()
+                .source_text()
+                .contains("SECOND_BODY")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_skill_reports_catalog_validation_reason() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let root = home.path().join(".agents/skills/oversized");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: oversized\ndescription: Large\n---\n{}",
+                "x".repeat(crate::skills::MAX_SKILL_BYTES)
+            ),
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace).await.with_skill_catalog(catalog);
+        let mut ledger = SkillLoadLedger::new(&[]).unwrap();
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("oversized".to_owned())]),
+                &mut ledger,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ToolErrorKind::Value);
+        assert!(error.to_string().contains("exceeds 65536 bytes"));
+    }
+
+    #[tokio::test]
+    async fn host_without_skills_reports_unknown_skill_for_load_and_resources() {
+        let workspace = TempDir::new().unwrap();
+        let host = tool_host(&workspace).await;
+        let unknown = ToolError::value("unknown or unavailable skill \"review\"");
+        let error = host
+            .load_skill(
+                ToolValue::List(vec![ToolValue::String("review".to_owned())]),
+                &mut SkillLoadLedger::new(&[]).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error, unknown);
+        let result = host
+            .call(ToolCall {
+                call_id: 7,
+                tool: ToolName::Read,
+                arguments: ToolValue::List(vec![ToolValue::String(
+                    "skill://review/SKILL.md".to_owned(),
+                )]),
+            })
+            .await;
+        assert_eq!(result.result, Err(unknown));
     }
 
     async fn tool_host_with_limits(workspace: &TempDir, max_bytes: usize) -> ToolHost {
@@ -3795,6 +4619,26 @@ mod tests {
 
     async fn read_error(host: &ToolHost, path: &str) -> ToolErrorKind {
         read(host, path).await.unwrap_err()
+    }
+
+    async fn skill_resource(
+        host: &ToolHost,
+        tool: ToolName,
+        path: &str,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolValue, ToolError> {
+        host.call_with_authorisation_and_output(
+            ToolCall {
+                call_id: 7,
+                tool,
+                arguments: ToolValue::List(vec![ToolValue::String(path.to_owned())]),
+            },
+            None,
+            None,
+            active_skills,
+        )
+        .await
+        .result
     }
 
     async fn list_dir(
@@ -5264,7 +6108,16 @@ mod tests {
                 .iter()
                 .map(|definition| definition.name.name())
                 .collect::<Vec<_>>(),
-            ["read", "write", "edit", "list_dir", "glob", "grep", "run"]
+            [
+                "read",
+                "write",
+                "edit",
+                "list_dir",
+                "glob",
+                "grep",
+                "run",
+                "load_skill"
+            ]
         );
         assert_eq!(ToolName::Grep.count_label(1), "match");
         assert_eq!(ToolName::Grep.count_label(2), "matches");
@@ -6959,8 +7812,9 @@ mod tests {
 
         assert_eq!(invocation_source(true), expected_reference);
         assert_eq!(invocation_source(false), expected_runtime);
-        assert!(prompt_reference().contains(expected_reference));
-        assert!(!prompt_reference().contains("def __init__(self, value: dict):"));
+        let reference = prompt_reference(&SkillCatalog::default());
+        assert!(reference.contains(expected_reference));
+        assert!(!reference.contains("def __init__(self, value: dict):"));
         assert!(bootstrap_source().contains(&expected_runtime));
     }
 
@@ -6979,6 +7833,7 @@ mod tests {
                 ToolName::Glob,
                 ToolName::Grep,
                 ToolName::Run,
+                ToolName::LoadSkill,
             ]
         );
         assert_eq!(
@@ -7002,7 +7857,7 @@ mod tests {
                     "    stdout: str\n",
                     "    stderr: str\n\n",
                     "async def read(path: str) -> str:\n",
-                    "    \"\"\"Read one complete UTF-8 workspace file.\"\"\"\n",
+                    "    \"\"\"Read one complete UTF-8 workspace file or skill:// resource.\"\"\"\n",
                     "    return await _kiki_read(path)\n\n",
                     "async def write(path: str, content: str) -> None:\n",
                     "    \"\"\"Create or replace one complete UTF-8 workspace file.\"\"\"\n",
@@ -7011,7 +7866,7 @@ mod tests {
                     "    \"\"\"Replace one exact occurrence in a UTF-8 workspace file.\"\"\"\n",
                     "    await _kiki_edit(path, old, new)\n\n",
                     "async def list_dir(path: str = \".\") -> list[DirectoryEntry]:\n",
-                    "    \"\"\"List immediate workspace directory entries.\"\"\"\n",
+                    "    \"\"\"List immediate workspace or skill:// directory entries.\"\"\"\n",
                     "    return [DirectoryEntry(**row) for row in await _kiki_list_dir(path)]\n\n",
                     "async def glob(pattern: str, path: str = \".\") -> list[DirectoryEntry]:\n",
                     "    \"\"\"Match workspace filesystem entries recursively.\"\"\"\n",
@@ -7021,12 +7876,15 @@ mod tests {
                     "    return [GrepMatch(**row) for row in await _kiki_grep(pattern, path, file_glob)]\n\n",
                     "async def run(command: str, cwd: str = \".\") -> CommandResult:\n",
                     "    \"\"\"Run one project-local shell command.\"\"\"\n",
-                    "    return CommandResult(**await _kiki_run(command, cwd))\n\n{}"
+                    "    return CommandResult(**await _kiki_run(command, cwd))\n\n",
+                    "async def load_skill(name: str) -> str:\n",
+                    "    \"\"\"Activate one model-invocable skill from the process catalog.\"\"\"\n",
+                    "    return await _kiki_load_skill(name)\n\n{}"
                 ),
                 invocation_source(false)
             )
         );
-        let reference = prompt_reference();
+        let reference = prompt_reference(&SkillCatalog::default());
         for signature in [
             "async def read(path: str) -> str:",
             "async def write(path: str, content: str) -> None:",
@@ -7056,7 +7914,7 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("file"), "before").unwrap();
         let root = tool_host(&workspace).await;
-        let root_reference = prompt_reference();
+        let root_reference = prompt_reference(&SkillCatalog::default());
         assert_eq!(root.prompt_reference(), root_reference);
         assert_eq!(root.for_child(false).prompt_reference(), root_reference);
 

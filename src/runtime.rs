@@ -17,7 +17,7 @@ use crate::config::{
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_MODEL, ModelConfiguration};
-use crate::model::{AttemptAccounting, Model, ModelProgress};
+use crate::model::{AttemptAccounting, Model, ModelProgress, SkillActivation};
 use crate::session::{
     CommittedCompaction, CompactionOutcome, CompactionReason, PersistedTerminal, ReadableTerminal,
     RestoredRecord, RestoredRecordKind, Session, SessionCatalogue, SessionEntryId, SessionError,
@@ -43,6 +43,7 @@ pub(crate) struct ModelStepId(pub(crate) u64);
 pub(crate) enum RuntimeCommand {
     Submit {
         request: String,
+        activation: Option<SkillActivation>,
     },
     #[allow(dead_code)]
     Compact {
@@ -147,6 +148,9 @@ pub(crate) enum Record {
     },
     Compaction {
         outcome: CompactionOutcome,
+    },
+    SkillActivation {
+        activation: SkillActivation,
     },
 }
 
@@ -335,6 +339,9 @@ pub(crate) enum RuntimeEvent {
     SubmissionRejectedBusy {
         active_run_id: Option<RunId>,
     },
+    SkillActivationRejected {
+        reason: String,
+    },
     CompactionAcknowledged {
         acknowledgement: CompactionAcknowledgement,
     },
@@ -466,6 +473,7 @@ enum WorkerMessage<M: Model> {
         request_entry: SessionEntryId,
         request: String,
         selection: ModelSelection,
+        activation: Option<SkillActivation>,
     },
     AutomaticCompactionStarted {
         run_id: u64,
@@ -503,6 +511,7 @@ enum WorkerMessage<M: Model> {
         reasoning_summary: String,
         execution: Execution,
         attempts: Vec<AttemptAccounting>,
+        activations: Vec<SkillActivation>,
     },
     PersistedFinished {
         agent: Agent<M>,
@@ -618,7 +627,8 @@ fn root_settlement(record: &Record) -> Settlement {
         Record::FailedRun { .. } => Settlement::Failed,
         Record::UserRequest { .. }
         | Record::CompletedExecution { .. }
-        | Record::Compaction { .. } => unreachable!("only terminal root records settle runs"),
+        | Record::Compaction { .. }
+        | Record::SkillActivation { .. } => unreachable!("only terminal root records settle runs"),
     }
 }
 
@@ -667,6 +677,7 @@ fn runtime_event_payload_bytes(event: &RuntimeEvent) -> usize {
         | RuntimeEvent::CorrectionCompleted { .. }
         | RuntimeEvent::TreeCatalogue { .. }
         | RuntimeEvent::SubmissionRejectedBusy { .. }
+        | RuntimeEvent::SkillActivationRejected { .. }
         | RuntimeEvent::CompactionAcknowledged { .. }
         | RuntimeEvent::CompactionLifecycle { .. }
         | RuntimeEvent::RuntimeDisabled { .. }
@@ -800,6 +811,9 @@ fn restored_stored_record(record: RestoredRecord) -> StoredRecord {
             terminal: terminal_details(terminal),
         },
         RestoredRecordKind::Compaction { outcome } => Record::Compaction { outcome },
+        RestoredRecordKind::SkillActivation { activation } => {
+            Record::SkillActivation { activation }
+        }
     };
     StoredRecord {
         run_id: RunId(run_id),
@@ -1171,7 +1185,10 @@ impl<M: Model> RuntimeController<M> {
                 .emit(|| TraceEvent::RuntimeCommandReceived { command });
         }
         match command {
-            RuntimeCommand::Submit { request } => {
+            RuntimeCommand::Submit {
+                request,
+                activation,
+            } => {
                 if self.subagents.storage_failure_token().is_cancelled() {
                     self.disable_session_storage(events).await;
                 }
@@ -1208,7 +1225,7 @@ impl<M: Model> RuntimeController<M> {
                         active.pending_busy_submissions += 1;
                     }
                 } else {
-                    self.start_run(request, events, progress).await;
+                    self.start_run(request, activation, events, progress).await;
                 }
             }
             RuntimeCommand::Compact { focus } => {
@@ -1653,6 +1670,7 @@ impl<M: Model> RuntimeController<M> {
     async fn start_run(
         &mut self,
         request: String,
+        activation: Option<SkillActivation>,
         _events: &mpsc::UnboundedSender<RuntimeEvent>,
         _progress: &mut ProgressPublisher<RuntimeEvent>,
     ) {
@@ -1684,12 +1702,14 @@ impl<M: Model> RuntimeController<M> {
                         run_id,
                         request_entry,
                         request,
+                        activation,
                     } => {
                         let _ = completion_sender.send(WorkerMessage::RequestCommitted {
                             run_id,
                             request_entry,
                             request,
                             selection,
+                            activation,
                         });
                     }
                     PersistedAgentEvent::CompactionStarted {
@@ -1750,6 +1770,7 @@ impl<M: Model> RuntimeController<M> {
                         reasoning_summary,
                         execution,
                         attempts,
+                        activations,
                     } => {
                         flush_persisted_tool_updates(
                             &completion_sender,
@@ -1766,6 +1787,7 @@ impl<M: Model> RuntimeController<M> {
                                 reasoning_summary,
                                 execution,
                                 attempts,
+                                activations,
                             });
                     }
                     PersistedAgentEvent::ModelProgress {
@@ -1884,6 +1906,7 @@ impl<M: Model> RuntimeController<M> {
                         policy,
                         reasoning,
                         request,
+                        activation,
                         &cancellation_for_worker,
                         &writer,
                         &mut event,
@@ -1996,6 +2019,7 @@ impl<M: Model> RuntimeController<M> {
                 request_entry,
                 request,
                 selection,
+                activation,
             } => {
                 let run_id = RunId(run_id);
                 let pending_busy_submissions = std::mem::take(
@@ -2023,6 +2047,14 @@ impl<M: Model> RuntimeController<M> {
                     },
                     false,
                 );
+                if let Some(activation) = activation {
+                    self.append_committed_record(
+                        events,
+                        run_id,
+                        Record::SkillActivation { activation },
+                        false,
+                    );
+                }
                 for _ in 0..pending_busy_submissions {
                     self.emit(
                         events,
@@ -2128,6 +2160,7 @@ impl<M: Model> RuntimeController<M> {
                 reasoning_summary,
                 execution,
                 attempts,
+                activations,
             } => {
                 self.append_committed_record(
                     events,
@@ -2142,6 +2175,14 @@ impl<M: Model> RuntimeController<M> {
                     },
                     false,
                 );
+                for activation in activations {
+                    self.append_committed_record(
+                        events,
+                        RunId(run_id),
+                        Record::SkillActivation { activation },
+                        false,
+                    );
+                }
                 self.session.clear_execution(step_id);
             }
             WorkerMessage::CompactionStarted => {
@@ -2318,6 +2359,31 @@ impl<M: Model> RuntimeController<M> {
                         if self.disabled_reason.is_none() {
                             self.start_pending_compaction().await;
                         }
+                    }
+                    Err(SessionError::SkillActivation(reason))
+                        if self
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.run_id.is_none()) =>
+                    {
+                        self.agent = Some(agent);
+                        let active = self
+                            .active
+                            .take()
+                            .expect("rejected admission has active run");
+                        self.subagents
+                            .settle_root_run(&active.caller, std::iter::empty())
+                            .await;
+                        self.emit(events, RuntimeEvent::SkillActivationRejected { reason });
+                        for _ in 0..active.pending_busy_submissions {
+                            self.emit(
+                                events,
+                                RuntimeEvent::SubmissionRejectedBusy {
+                                    active_run_id: None,
+                                },
+                            );
+                        }
+                        self.start_pending_compaction().await;
                     }
                     Err(_error) => {
                         self.agent = Some(agent);
@@ -2526,7 +2592,8 @@ mod tests {
         AttemptAccounting, CodeResult, Model, ModelAction as CompletedModelAction, ModelCallId,
         ModelContextEntry, ModelError, ModelFailure, ModelHistory, ModelProgress, ModelStep,
         ModelUsage, OpaqueReplayItem, ProviderFailure, ProviderReplay,
-        ScriptedAction as ModelAction, ScriptedModel, SummaryRequest, SummaryResult,
+        ScriptedAction as ModelAction, ScriptedModel, SkillActivation, SummaryRequest,
+        SummaryResult,
     };
     use crate::openai::OpenAiModel;
     use crate::session::{
@@ -2534,6 +2601,7 @@ mod tests {
         RestoredRecordKind, RestoredTask, Session, SessionEntryId, SessionRestore,
         SessionWriteGate, SessionWriteKind, SessionWriter, TaskAdmission, TaskTerminal,
     };
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin, write_skill};
     use crate::sse_fixture::{Fixture, FixtureReply};
     use crate::subagents::{
         ChildFailure, ChildModelFactory, ChildParameters, ChildPayload, ChildResult, ChildRunner,
@@ -2642,6 +2710,7 @@ mod tests {
                 .commit_request(
                     format!("{label} request"),
                     ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                    None,
                 )
                 .await
                 .expect("commit compaction fixture request");
@@ -3432,7 +3501,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -3487,6 +3556,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "busy request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit while compacting");
@@ -3772,7 +3842,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -3813,6 +3883,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "current ".to_owned() + &"z".repeat(100_000),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -3907,7 +3978,7 @@ mod tests {
                         .expect("create session");
                 let writer = session.writer();
                 let admission = writer
-                    .commit_request("inspect".to_owned(), selection)
+                    .commit_request("inspect".to_owned(), selection, None)
                     .await
                     .expect("commit foreign request");
                 let step_id = writer
@@ -3934,7 +4005,7 @@ mod tests {
                     .await
                     .expect("close foreign run");
                 let tail = writer
-                    .commit_request("tail ".to_owned() + &"z".repeat(100_000), selection)
+                    .commit_request("tail ".to_owned() + &"z".repeat(100_000), selection, None)
                     .await
                     .expect("commit tail request");
                 writer
@@ -4050,7 +4121,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -4091,6 +4162,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "current ".to_owned() + &"z".repeat(100_000),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4280,6 +4352,7 @@ mod tests {
         command_sender
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("submit large request");
@@ -4402,6 +4475,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4428,6 +4502,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "next".to_owned(),
+                activation: None,
             })
             .await
             .expect("start next run");
@@ -4474,6 +4549,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("submit large request");
@@ -4538,6 +4614,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("submit large request");
@@ -4621,6 +4698,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("submit large request");
@@ -4802,6 +4880,7 @@ mod tests {
             command_sender
                 .send(RuntimeCommand::Submit {
                     request: large_request(),
+                    activation: None,
                 })
                 .await
                 .expect("submit large request");
@@ -4865,6 +4944,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4912,6 +4992,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: large_request(),
+                activation: None,
             })
             .await
             .expect("submit large request");
@@ -4964,7 +5045,7 @@ mod tests {
             let writer = session.writer();
             seed_compactable_history(&writer).await;
             let admission = writer
-                .commit_request("race winner".to_owned(), selection)
+                .commit_request("race winner".to_owned(), selection, None)
                 .await
                 .expect("commit race request");
             let terminal = if terminal_kind == "final" {
@@ -5206,6 +5287,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "cancel and compact".to_owned(),
+                    activation: None,
                 })
                 .await
                 .expect("start run");
@@ -5350,6 +5432,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel and compact".to_owned(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -5470,6 +5553,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "running request".to_owned(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -5683,7 +5767,7 @@ mod tests {
             summary_started.notified().await;
             if failure == "expected leaf" {
                 let admission = writer
-                    .commit_request("concurrent leaf".to_owned(), selection)
+                    .commit_request("concurrent leaf".to_owned(), selection, None)
                     .await
                     .expect("advance selected leaf");
                 let step_id = writer
@@ -5776,7 +5860,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         let prior = writer
-            .commit_request("saved request".to_owned(), selection)
+            .commit_request("saved request".to_owned(), selection, None)
             .await
             .expect("commit saved request");
         writer
@@ -5807,6 +5891,7 @@ mod tests {
                 crate::config::CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "next request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut event,
@@ -5828,6 +5913,391 @@ mod tests {
 
         drop(writer);
         session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    async fn direct_skill_submission_activates_before_first_model_step_and_pins_versions() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ContextCapturingMessageModel {
+                    contexts: contexts.clone(),
+                },
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "baseline".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        let baseline_leaf: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM entries WHERE kind = 'final_reply' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let captured = |body: &str| {
+            SkillActivation::new(
+                "review".to_owned(),
+                home.path().join(".agents/skills/review"),
+                body.to_owned(),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap()
+        };
+        for (index, (body, expected_rows)) in [
+            ("pinned version one", 1),
+            ("pinned version one", 1),
+            ("pinned version two", 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: "inspect this".to_owned(),
+                    activation: Some(captured(body)),
+                })
+                .await
+                .unwrap();
+            events_until_settled(&mut events).await;
+            let stored: i64 = session
+                .connection_for_test()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE kind = 'skill_activation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, expected_rows);
+            let captured_contexts = contexts.lock().unwrap();
+            let latest = captured_contexts.last().unwrap();
+            let active = latest
+                .iter()
+                .filter_map(|entry| match entry {
+                    ModelContextEntry::SkillActivation(skill) => Some(skill.source_text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(active, [body]);
+            if index == 0 {
+                assert!(matches!(
+                    latest.last(),
+                    Some(ModelContextEntry::SkillActivation(_))
+                ));
+            }
+        }
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .next()
+                .unwrap()
+                .source_text(),
+            "pinned version two"
+        );
+
+        commands
+            .send(RuntimeCommand::Navigate {
+                entry: SessionEntryId(baseline_leaf as u64),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            RuntimeEvent::NavigationCompleted {
+                outcome: super::NavigationOutcome::Replaced { .. }
+            }
+        ));
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "alternate branch".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        assert!(
+            contexts
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .iter()
+                .all(|entry| !matches!(entry, ModelContextEntry::SkillActivation(_)))
+        );
+
+        shutdown_controller(commands, controller).await;
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn skill_activations_append_records_after_their_request_and_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join(".agents/skills"),
+            "loaded",
+            "name: loaded\ndescription: Loaded\n",
+            "Loaded body",
+        );
+        let catalog = Arc::new(SkillCatalog::discover(
+            &ProjectScope::discover(workspace.path()).unwrap(),
+            home.path(),
+            false,
+            "",
+        ));
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path())
+                .await
+                .unwrap()
+                .with_skill_catalog(catalog),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ScriptedModel::new(vec![
+                    ModelAction::Code {
+                        source: "await load_skill('loaded')".to_owned(),
+                    },
+                    ModelAction::Message {
+                        text: "done".to_owned(),
+                    },
+                ]),
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        let direct = SkillActivation::new(
+            "direct".to_owned(),
+            home.path().join(".agents/skills/direct"),
+            "direct body".to_owned(),
+            SkillOrigin::User,
+            None,
+        )
+        .unwrap();
+        let mut live = Vec::new();
+        for (request, expected) in [
+            (
+                "/skill:direct",
+                vec![
+                    "record:1:user:/skill:direct",
+                    "record:1:skill:direct",
+                    "record:1:execution:1",
+                    "record:1:skill:loaded",
+                    "record:1:message:2:done",
+                ],
+            ),
+            (
+                "/skill:direct again",
+                vec![
+                    "record:2:user:/skill:direct again",
+                    "record:2:execution:3",
+                    "record:2:message:4:done",
+                ],
+            ),
+        ] {
+            commands
+                .send(RuntimeCommand::Submit {
+                    request: request.to_owned(),
+                    activation: Some(direct.clone()),
+                })
+                .await
+                .unwrap();
+            let records = committed_records(&events_until_settled(&mut events).await);
+            assert_eq!(
+                records.iter().map(record_label).collect::<Vec<_>>(),
+                expected
+            );
+            live.extend(records);
+        }
+
+        let restored = restored_initial_state(&session.restore().unwrap())
+            .timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                RestoredTimelineItem::Record(record) => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored.iter().map(record_label).collect::<Vec<_>>(),
+            live.iter().map(record_label).collect::<Vec<_>>()
+        );
+        let activations = |records: &[StoredRecord]| {
+            records
+                .iter()
+                .filter(|record| matches!(record.record, Record::SkillActivation { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(activations(&restored), activations(&live));
+
+        shutdown_controller(commands, controller).await;
+        session.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_skill_text_limit_rejects_admission_without_disabling_session() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let arena = Arena::new(
+            worker_path(),
+            ToolHost::new(workspace.path()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap();
+        let session =
+            Session::create(home.path(), workspace.path(), selection, arena.checkpoint()).unwrap();
+        let writer = session.writer();
+        for index in 0..4 {
+            let name = format!("seed-{index}");
+            let activation = SkillActivation::new(
+                name.clone(),
+                home.path().join(format!(".agents/skills/{name}")),
+                "x".repeat(60 * 1024),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap();
+            let admission = writer
+                .commit_request(format!("seed {index}"), selection, Some(activation))
+                .await
+                .unwrap();
+            writer
+                .close_run(
+                    admission.run_id,
+                    None,
+                    || PersistedTerminal::Cancelled {
+                        evidence: None,
+                        attempts: Vec::new(),
+                        overflow_recovery: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = crate::config::ready_snapshot_for_test();
+        let controller = RuntimeController::with_session(
+            Agent::new(
+                arena,
+                ContextCapturingMessageModel {
+                    contexts: contexts.clone(),
+                },
+            ),
+            selection,
+            snapshot.settings().clone(),
+            SubagentCoordinator::new(
+                SubagentPolicy::from(snapshot.subagents()),
+                Arc::new(super::UnavailableChildRunner),
+            ),
+            session.writer(),
+        );
+        let (commands, mut events, _progress, controller) = start_controller(controller);
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "must not be admitted".to_owned(),
+                activation: Some(
+                    SkillActivation::new(
+                        "extra".to_owned(),
+                        home.path().join(".agents/skills/extra"),
+                        "y".repeat(20 * 1024),
+                        SkillOrigin::User,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_event(&mut events).await, RuntimeEvent::SkillActivationRejected { reason } if reason.contains("256 KiB"))
+        );
+        assert!(contexts.lock().unwrap().is_empty());
+        assert_eq!(writer.model_history().unwrap().active_skills().count(), 4);
+        let rows: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'user_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 4);
+
+        commands
+            .send(RuntimeCommand::Submit {
+                request: "session still writable".to_owned(),
+                activation: None,
+            })
+            .await
+            .unwrap();
+        events_until_settled(&mut events).await;
+        assert_eq!(contexts.lock().unwrap().len(), 1);
+        let rows: i64 = session
+            .connection_for_test()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE kind = 'user_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 5);
+        shutdown_controller(commands, controller).await;
+        drop(writer);
+        session.close().unwrap();
     }
 
     #[tokio::test]
@@ -5874,6 +6344,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "persist this request".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5987,6 +6458,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "allocate a step".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6051,6 +6523,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "settle before continuing".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6129,6 +6602,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "finish then cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6243,6 +6717,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel provider failure".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6365,6 +6840,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6422,6 +6898,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "trigger oversized failure".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6497,6 +6974,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "finish then shutdown".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6618,6 +7096,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot persist".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6625,6 +7104,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also retained".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6657,6 +7137,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6705,6 +7186,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must not start".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6769,6 +7251,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot allocate".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6795,6 +7278,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6872,6 +7356,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot settle".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6900,6 +7385,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6975,6 +7461,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot close".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7001,6 +7488,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7074,6 +7562,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7128,6 +7617,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "still disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7188,6 +7678,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7250,6 +7741,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "still disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7306,6 +7798,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7313,12 +7806,14 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
         commands
             .send(RuntimeCommand::Submit {
                 request: "third".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7632,6 +8127,7 @@ mod tests {
             RuntimeEvent::SubmissionRejectedBusy {
                 active_run_id: None,
             } => "busy:compaction".to_owned(),
+            RuntimeEvent::SkillActivationRejected { .. } => "skill-rejected".to_owned(),
             RuntimeEvent::CompactionAcknowledged { acknowledgement } => {
                 format!("compaction-ack:{acknowledgement:?}")
             }
@@ -7723,6 +8219,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "wait for child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit foreground request");
@@ -7744,6 +8241,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must be rejected".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after storage failure");
@@ -7816,6 +8314,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start children".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7928,6 +8427,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7968,6 +8468,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8055,6 +8556,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8141,6 +8643,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground-request-SECRET".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8308,6 +8811,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "disable runtime".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8352,6 +8856,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "rejected while disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8454,7 +8959,7 @@ mod tests {
         let mut live = Vec::new();
         for index in 0..3 {
             let admission = writer
-                .commit_request(format!("request {index}"), selection)
+                .commit_request(format!("request {index}"), selection, None)
                 .await
                 .expect("commit request");
             let step_id = writer
@@ -8631,6 +9136,9 @@ mod tests {
                 format!("record:{}:failed:{message}", record.run_id.0)
             }
             Record::Compaction { .. } => format!("record:{}:compaction", record.run_id.0),
+            Record::SkillActivation { activation } => {
+                format!("record:{}:skill:{}", record.run_id.0, activation.name())
+            }
         }
     }
 
@@ -8753,6 +9261,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8792,6 +9301,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "follow up".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8828,6 +9338,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8934,6 +9445,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -9080,6 +9592,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "use saved settings".to_owned(),
+                activation: None,
             })
             .await
             .expect("queue submission");
@@ -9243,6 +9756,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start background work".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit root request");
@@ -9400,6 +9914,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "keep running".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -9465,6 +9980,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must be rejected".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -9541,6 +10057,7 @@ mod tests {
                 crate::config::CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "first request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -9597,6 +10114,7 @@ mod tests {
                 crate::config::CompactionSettings::default(),
                 CrossProviderReasoning::Inline,
                 "second request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -9712,7 +10230,7 @@ mod tests {
             .expect("create session");
         session
             .writer()
-            .commit_request("readable saved request".to_owned(), selection)
+            .commit_request("readable saved request".to_owned(), selection, None)
             .await
             .expect("commit readable request");
         let saved_metadata = session.metadata().expect("read saved metadata");
@@ -9785,6 +10303,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must stay disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -9823,7 +10342,7 @@ mod tests {
         drop(saved_arena);
         session
             .writer()
-            .commit_request("readable saved request".to_owned(), saved_selection)
+            .commit_request("readable saved request".to_owned(), saved_selection, None)
             .await
             .expect("commit readable request");
         let metadata_before: (String, String, i64, i64) = session
@@ -9900,6 +10419,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must stay disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -10085,6 +10605,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10143,6 +10664,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10174,6 +10696,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "follow up".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10208,6 +10731,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10249,6 +10773,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11016,6 +11541,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11080,6 +11606,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11159,6 +11686,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11222,6 +11750,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "flood".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11297,6 +11826,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11426,6 +11956,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11472,6 +12003,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11529,6 +12061,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11583,6 +12116,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11633,6 +12167,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11641,6 +12176,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11710,6 +12246,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11747,6 +12284,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11754,6 +12292,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "rejected".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11808,6 +12347,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11880,6 +12420,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11922,6 +12463,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11970,6 +12512,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11982,6 +12525,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12048,6 +12592,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "stop".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12114,6 +12659,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "stop".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -12177,6 +12723,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "original request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit original request");
@@ -12245,6 +12792,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "corrected request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit corrected request");
@@ -12317,6 +12865,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "correct after execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -12395,6 +12944,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "admit before correcting".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -12589,6 +13139,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "correct this request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit correction request");
@@ -12855,6 +13406,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel but retain child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit foreground request");
@@ -13180,6 +13732,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel with a child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -13281,6 +13834,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel before output".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13324,6 +13878,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel during generation".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13375,6 +13930,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13423,6 +13979,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel before execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13464,6 +14021,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "fail execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13521,6 +14079,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "closed commands".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13558,6 +14117,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13627,6 +14187,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "accounting".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13694,6 +14255,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13725,6 +14287,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13815,6 +14378,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13868,6 +14432,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13910,6 +14475,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13941,6 +14507,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13979,6 +14546,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14010,6 +14578,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14071,6 +14640,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14240,6 +14810,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14297,6 +14868,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "first".to_owned(),
+                    activation: None,
                 })
                 .await
                 .unwrap();
@@ -14325,6 +14897,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "later".to_owned(),
+                    activation: None,
                 })
                 .await
                 .unwrap();
@@ -14370,6 +14943,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14403,6 +14977,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14446,6 +15021,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14478,6 +15054,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14506,6 +15083,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "after restart".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14577,6 +15155,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14679,6 +15258,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14875,6 +15455,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "add 40 and 2".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14942,6 +15523,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "double-check".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -15102,6 +15684,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -15223,6 +15806,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -15527,6 +16111,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "delegate the first request".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -15552,6 +16137,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "clarify the delegated work".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -16144,7 +16730,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("readable saved request".to_owned(), selection)
+            .commit_request("readable saved request".to_owned(), selection, None)
             .await
             .expect("commit readable request")
             .run_id;
@@ -16178,6 +16764,7 @@ mod tests {
                     attempts: Vec::new(),
                 },
                 incompatible,
+                Vec::new(),
             )
             .await
             .expect("persist incompatible checkpoint");
@@ -16260,6 +16847,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must not run".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -16457,6 +17045,7 @@ mod tests {
             .commit_request(
                 "sibling request".to_owned(),
                 ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                None,
             )
             .await
             .expect("commit sibling request")
@@ -16478,13 +17067,8 @@ mod tests {
             .await
             .expect("restore root checkpoint");
         let source = "sibling_value = 99\nresult_values = {'sibling': sibling_value}";
-        let execution = sibling_arena
-            .execute_model_code_with_progress_and_context(
-                source,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+        let (execution, _) = sibling_arena
+            .execute_model_code(source, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
             .expect("execute sibling branch");
         assert!(matches!(
@@ -16509,6 +17093,7 @@ mod tests {
                     attempts: vec![sibling_execution_attempt.clone()],
                 },
                 sibling_checkpoint,
+                Vec::new(),
             )
             .await
             .expect("settle sibling execution");
@@ -16844,6 +17429,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit continued request");
@@ -16952,6 +17538,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "save this state".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit saved request");
@@ -17128,6 +17715,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue sibling".to_owned(),
+                activation: None,
             })
             .await
             .expect("continue sibling");
@@ -17180,6 +17768,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "probe original".to_owned(),
+                activation: None,
             })
             .await
             .expect("probe original branch");
@@ -17299,6 +17888,7 @@ mod tests {
             .commit_request(
                 request.to_owned(),
                 ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                None,
             )
             .await
             .expect("commit branch request")
@@ -17307,13 +17897,8 @@ mod tests {
             .start_model_step(run_id)
             .await
             .expect("start branch execution");
-        let execution = arena
-            .execute_model_code_with_progress_and_context(
-                source,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+        let (execution, _) = arena
+            .execute_model_code(source, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
             .expect("execute branch state");
         let checkpoint = arena.checkpoint();
@@ -17332,6 +17917,7 @@ mod tests {
                     attempts: Vec::new(),
                 },
                 checkpoint.clone(),
+                Vec::new(),
             )
             .await
             .expect("settle branch execution");
@@ -17660,6 +18246,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after navigation");
@@ -18129,6 +18716,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue old branch".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after recovered navigation");
@@ -18204,6 +18792,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must remain disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -18259,6 +18848,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must remain disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -18288,6 +18878,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "active request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit active request");
@@ -18330,6 +18921,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start background work".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit child request");
@@ -18448,6 +19040,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold request admission".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18475,6 +19068,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold generation".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18512,6 +19106,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18538,6 +19133,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold closure".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18571,6 +19167,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child admission".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18605,6 +19202,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18640,6 +19238,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child terminal".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18734,6 +19333,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "after storage failure".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after storage failure");
@@ -18815,6 +19415,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "queued after navigation".to_owned(),
+                activation: None,
             })
             .await
             .expect("queue request after navigation");
@@ -18900,7 +19501,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let writer = session.writer();
         let run = writer
-            .commit_request("prefilled request".to_owned(), selection)
+            .commit_request("prefilled request".to_owned(), selection, None)
             .await
             .expect("commit request")
             .run_id;
@@ -19122,6 +19723,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold generation".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -19332,6 +19934,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
