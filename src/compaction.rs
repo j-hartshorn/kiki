@@ -11,7 +11,6 @@ use crate::prompt::{
     compaction_update_prompt,
 };
 use crate::session::SessionEntryId;
-use crate::skills::SkillOrigin;
 
 const OUTPUT_RATIO_DENOMINATOR: u64 = 100;
 const HISTORY_OUTPUT_RATIO: u64 = 80;
@@ -331,19 +330,6 @@ fn measure_context(
         let Some(attempts) = normal_attempts(&facts[index]) else {
             continue;
         };
-        // A baseline may come from another scope where a project skill was
-        // suppressed. Its saved usage has no projection provenance, so charge
-        // the current protected text again as a bounded conservative estimate.
-        let uncertain_projection_before_baseline = facts[..=index].iter().any(|fact| {
-            matches!(
-                fact.kind,
-                SelectedAncestryKind::SuppressedSkillActivation { .. }
-            ) || matches!(
-                &fact.kind,
-                SelectedAncestryKind::SkillActivation { activation }
-                    if activation.origin() == SkillOrigin::Project
-            )
-        });
         let Some(baseline) = attempts.iter().rev().find_map(context_usage) else {
             continue;
         };
@@ -359,9 +345,7 @@ fn measure_context(
         let baseline_skills = active_skills_in_range(facts, 0..=index);
         let current_bytes = active_text_bytes(active_skills);
         let previous_bytes = active_text_bytes(&baseline_skills);
-        let adjusted = if uncertain_projection_before_baseline {
-            baseline.saturating_add(estimate_tokens(current_bytes))
-        } else if current_bytes >= previous_bytes {
+        let adjusted = if current_bytes >= previous_bytes {
             baseline.saturating_add(estimate_tokens(current_bytes - previous_bytes))
         } else {
             baseline.saturating_sub(estimate_tokens(previous_bytes - current_bytes))
@@ -586,9 +570,6 @@ fn user_request(fact: &SelectedAncestryFact) -> Option<&str> {
 }
 
 fn context_bytes(entry: &ModelContextEntry) -> u64 {
-    if let ModelContextEntry::SkillActivation(activation) = entry {
-        return byte_len(&activation.model_text());
-    }
     if let Some(text) = entry.user_request() {
         return byte_len(text);
     }
@@ -1019,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_latest_project_omits_old_user_and_charges_independent_user() {
+    fn suppressed_latest_project_omits_old_user_and_keeps_independent_user() {
         let replaced_user = SkillActivation::new(
             "review".to_owned(),
             PathBuf::from("/home/review"),
@@ -1036,7 +1017,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let active_cost = estimate_tokens(independent.model_text().len() as u64);
         let facts = [
             user(1, "old"),
             SelectedAncestryFact {
@@ -1069,12 +1049,12 @@ mod tests {
             user(6, "tail"),
         ];
         let preparation = measured(&facts);
-        assert_eq!(preparation.context_tokens(), 101 + active_cost);
+        assert_eq!(preparation.context_tokens(), 101);
         assert_eq!(preparation.protected_skills(), &[independent]);
     }
 
     #[test]
-    fn newest_post_filter_baseline_wins_with_bounded_conservative_skill_cost() {
+    fn newest_post_filter_baseline_wins() {
         let active = SkillActivation::new(
             "review".to_owned(),
             PathBuf::from("/home/review"),
@@ -1119,24 +1099,21 @@ mod tests {
     }
 
     #[test]
-    fn project_skill_resumed_after_other_scope_charges_uncertain_usage_baseline() {
+    fn project_skill_active_before_baseline_is_not_charged_again() {
         let active = SkillActivation::new(
             "review".to_owned(),
-            PathBuf::from("/project-b/.agents/skills/review"),
+            PathBuf::from("/project/.agents/skills/review"),
             "x".repeat(1_000),
             SkillOrigin::Project,
-            Some(PathBuf::from("/project-b")),
+            Some(PathBuf::from("/project")),
         )
         .unwrap();
-        let active_cost = estimate_tokens(active.model_text().len() as u64);
         let facts = [
             user(1, "old"),
             SelectedAncestryFact {
                 entry_id: SessionEntryId(2),
                 kind: SelectedAncestryKind::SkillActivation { activation: active },
             },
-            // This provider step ran under a different --here scope, where
-            // the project activation was suppressed. The saved usage omits it.
             code(
                 3,
                 "pass",
@@ -1148,7 +1125,7 @@ mod tests {
             ),
             user(4, "tail"),
         ];
-        assert_eq!(measured(&facts).context_tokens(), 101 + active_cost);
+        assert_eq!(measured(&facts).context_tokens(), 101);
     }
 
     #[test]
