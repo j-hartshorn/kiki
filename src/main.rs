@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_resume_use_the_same_guided_catalog_prompt_snapshot() {
+    fn trusted_startup_catalog_prompt_ignores_the_active_skill_flag() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_resumed_startup_retain_skipped_root_diagnostics_only_for_ui() {
+    fn startup_catalog_keeps_skipped_root_diagnostics_out_of_the_model_prompt() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_and_resumed_catalogs_wire_skill_resources_into_the_arena() {
+    async fn trusted_startup_catalog_serves_project_skill_resources_through_the_arena() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_catalog_uses_effective_workspace_and_active_resume_input() {
+    fn startup_catalog_prompts_for_launch_scope_and_for_active_skill_without_directory() {
         let home = tempdir().unwrap();
         let old = tempdir().unwrap();
         let here = tempdir().unwrap();
@@ -932,30 +932,5 @@ mod tests {
             home.path(),
             &project.path().canonicalize().unwrap()
         ));
-    }
-
-    #[test]
-    fn startup_catalog_uses_launch_scope_without_git_and_worktree_file_scope_with_git() {
-        let home = tempdir().unwrap();
-        let project = tempdir().unwrap();
-        let launch = project.path().join("nested");
-        fs::create_dir_all(&launch).unwrap();
-        write_skill(&launch, "local", "local");
-        let mut requested = None;
-        let _ = startup_catalog(&launch, home.path(), false, |scope| {
-            requested = Some(scope.to_path_buf());
-            Ok(false)
-        })
-        .unwrap();
-        assert_eq!(requested, Some(launch.canonicalize().unwrap()));
-
-        fs::write(project.path().join(".git"), "gitdir: elsewhere").unwrap();
-        let mut requested = None;
-        let _ = startup_catalog(&launch, home.path(), false, |scope| {
-            requested = Some(scope.to_path_buf());
-            Ok(false)
-        })
-        .unwrap();
-        assert_eq!(requested, Some(project.path().canonicalize().unwrap()));
     }
 }
