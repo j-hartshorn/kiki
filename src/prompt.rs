@@ -113,7 +113,7 @@ fn assemble(base: &str, catalog: &SkillCatalog, tool_reference: String) -> Strin
 #[derive(Debug, thiserror::Error)]
 pub enum PromptError {
     #[error(
-        "system prompt override `{path}` could not be read: {source}",
+        "prompt override `{path}` could not be read: {source}",
         path = path.display()
     )]
     UnreadableOverride {
@@ -122,28 +122,10 @@ pub enum PromptError {
         source: io::Error,
     },
     #[error(
-        "system prompt override `{path}` is not valid UTF-8: {source}",
+        "prompt override `{path}` is not valid UTF-8: {source}",
         path = path.display()
     )]
     InvalidUtf8Override {
-        path: PathBuf,
-        #[source]
-        source: Utf8Error,
-    },
-    #[error(
-        "skills catalog prompt override `{path}` could not be read: {source}",
-        path = path.display()
-    )]
-    UnreadableSkillsCatalogOverride {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error(
-        "skills catalog prompt override `{path}` is not valid UTF-8: {source}",
-        path = path.display()
-    )]
-    InvalidUtf8SkillsCatalogOverride {
         path: PathBuf,
         #[source]
         source: Utf8Error,
@@ -164,22 +146,7 @@ fn resolve_skills_catalog_guidance_from_override(
     let Some(override_path) = override_path else {
         return Ok(skills_catalog_guidance().to_owned());
     };
-    let path = PathBuf::from(override_path);
-    let bytes = fs::read(&path).map_err(|source| PromptError::UnreadableSkillsCatalogOverride {
-        path: path.clone(),
-        source,
-    })?;
-    let text = std::str::from_utf8(&bytes).map_err(|source| {
-        PromptError::InvalidUtf8SkillsCatalogOverride {
-            path: path.clone(),
-            source,
-        }
-    })?;
-    Ok(text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text)
-        .to_owned())
+    read_override(Path::new(&override_path))
 }
 
 fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedPrompt, PromptError> {
@@ -193,19 +160,26 @@ fn resolve_from_override(override_path: Option<OsString>) -> Result<ResolvedProm
     };
 
     let path = PathBuf::from(override_path);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(source) => return Err(PromptError::UnreadableOverride { path, source }),
-    };
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text.to_owned(),
-        Err(source) => return Err(PromptError::InvalidUtf8Override { path, source }),
-    };
-
     Ok(ResolvedPrompt {
-        base: text,
+        base: read_override(&path)?,
         source: PromptSource::Override { path },
     })
+}
+
+fn read_override(path: &Path) -> Result<String, PromptError> {
+    let bytes = fs::read(path).map_err(|source| PromptError::UnreadableOverride {
+        path: path.to_owned(),
+        source,
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|source| PromptError::InvalidUtf8Override {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text)
+        .to_owned())
 }
 
 #[cfg(test)]
@@ -426,6 +400,20 @@ mod tests {
     }
 
     #[test]
+    fn an_override_drops_one_file_final_line_ending() {
+        let directory = tempfile::tempdir().unwrap();
+        let override_path = directory.path().join("override.md");
+        for contents in ["override text\n", "override text\r\n"] {
+            fs::write(&override_path, contents).unwrap();
+
+            let resolved =
+                resolve_from_override(Some(override_path.clone().into_os_string())).unwrap();
+
+            assert_eq!(resolved.base(), "override text");
+        }
+    }
+
+    #[test]
     fn child_prompts_keep_the_canonical_base_and_one_effective_reference() {
         let base = "canonical base";
         let empty = SkillCatalog::default();
@@ -637,13 +625,13 @@ mod tests {
         let missing = home.path().join("missing.md");
         assert!(matches!(
             super::resolve_skills_catalog_guidance_from_override(Some(missing.into_os_string())),
-            Err(PromptError::UnreadableSkillsCatalogOverride { .. })
+            Err(PromptError::UnreadableOverride { .. })
         ));
         let invalid = home.path().join("invalid.md");
         fs::write(&invalid, b"private\xff").unwrap();
         assert!(matches!(
             super::resolve_skills_catalog_guidance_from_override(Some(invalid.into_os_string())),
-            Err(PromptError::InvalidUtf8SkillsCatalogOverride { .. })
+            Err(PromptError::InvalidUtf8Override { .. })
         ));
     }
 

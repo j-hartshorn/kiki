@@ -451,10 +451,6 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
                     detail: source.to_string(),
                 },
             },
-            Err(
-                PromptError::UnreadableSkillsCatalogOverride { .. }
-                | PromptError::InvalidUtf8SkillsCatalogOverride { .. },
-            ) => unreachable!("catalog guidance error cannot resolve a system prompt"),
         }
     }
 }
@@ -722,7 +718,7 @@ fn resolve_skills_catalog_guidance(
 ) -> (Option<String>, Option<StartupProblem>) {
     match resolution {
         Ok(guidance) => (Some(guidance), None),
-        Err(PromptError::UnreadableSkillsCatalogOverride { path, source }) => (
+        Err(PromptError::UnreadableOverride { path, source }) => (
             None,
             Some(StartupProblem::new(
                 StartupProblemKind::SkillsCatalogPromptUnreadable,
@@ -734,7 +730,7 @@ fn resolve_skills_catalog_guidance(
                 secrets,
             )),
         ),
-        Err(PromptError::InvalidUtf8SkillsCatalogOverride { path, source }) => (
+        Err(PromptError::InvalidUtf8Override { path, source }) => (
             None,
             Some(StartupProblem::new(
                 StartupProblemKind::SkillsCatalogPromptInvalidUtf8,
@@ -746,9 +742,6 @@ fn resolve_skills_catalog_guidance(
                 secrets,
             )),
         ),
-        Err(PromptError::UnreadableOverride { .. } | PromptError::InvalidUtf8Override { .. }) => {
-            unreachable!("system prompt error cannot resolve catalog guidance")
-        }
     }
 }
 
@@ -1608,7 +1601,7 @@ mod tests {
 
         let path = PathBuf::from("/private/catalog-guidance.md");
         let mut unreadable = ready_input("key");
-        unreadable.skills_catalog_guidance = Err(PromptError::UnreadableSkillsCatalogOverride {
+        unreadable.skills_catalog_guidance = Err(PromptError::UnreadableOverride {
             path: path.clone(),
             source: io::Error::new(io::ErrorKind::NotFound, "missing override"),
         });
@@ -1630,7 +1623,7 @@ mod tests {
         assert!(unreadable.ready().is_none());
 
         let mut invalid = ready_input("key");
-        invalid.skills_catalog_guidance = Err(PromptError::InvalidUtf8SkillsCatalogOverride {
+        invalid.skills_catalog_guidance = Err(PromptError::InvalidUtf8Override {
             path,
             source: String::from_utf8(vec![0xff]).unwrap_err().utf8_error(),
         });
