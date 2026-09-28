@@ -1259,6 +1259,7 @@ impl SessionWriter {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_request(
         &self,
         request: String,

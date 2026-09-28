@@ -670,7 +670,10 @@ impl App {
                 self.flush_preview(&mut commands);
                 self.transcript.begin_submission();
                 self.submission_at = Some(now);
-                commands.push(RuntimeCommand::Submit { request: draft });
+                commands.push(RuntimeCommand::Submit {
+                    request: draft,
+                    activation: None,
+                });
                 let mut update = Update::with_commands(commands);
                 update.visible_changed = true;
                 return update;
@@ -827,9 +830,9 @@ impl App {
             draft,
             request: request.clone(),
         });
-        commands.push(RuntimeCommand::SubmitSkill {
+        commands.push(RuntimeCommand::Submit {
             request,
-            activation,
+            activation: Some(activation),
         });
         let mut update = Update::with_commands(commands);
         update.visible_changed = true;
@@ -3623,7 +3626,11 @@ mod tests {
 
     fn submitted_prompt(app: &mut App) -> String {
         let update = app.handle_key(key(KeyCode::Enter));
-        let Some(RuntimeCommand::Submit { request }) = update.commands.into_iter().next() else {
+        let Some(RuntimeCommand::Submit {
+            request,
+            activation: None,
+        }) = update.commands.into_iter().next()
+        else {
             panic!("prompt was not submitted")
         };
         request
@@ -4872,9 +4879,9 @@ mod tests {
         assert_eq!(app.prompt.text(), "/skill:direct");
         let update = app.handle_key(key(KeyCode::Enter));
         let [
-            RuntimeCommand::SubmitSkill {
+            RuntimeCommand::Submit {
                 request,
-                activation,
+                activation: Some(activation),
             },
         ] = update.commands.as_slice()
         else {
@@ -4893,7 +4900,13 @@ mod tests {
         );
         set_prompt(&mut app, "/skill:direct inspect this\n  and this");
         let update = app.handle_key(key(KeyCode::Enter));
-        let [RuntimeCommand::SubmitSkill { request, .. }] = update.commands.as_slice() else {
+        let [
+            RuntimeCommand::Submit {
+                request,
+                activation: Some(_),
+            },
+        ] = update.commands.as_slice()
+        else {
             panic!("expected multiline skill submission");
         };
         assert_eq!(request, "inspect this\n  and this");
@@ -4938,7 +4951,13 @@ mod tests {
         app.refresh_completion();
         assert_eq!(app.completion.selected_token(), None);
         let update = app.handle_key(key(KeyCode::Enter));
-        let [RuntimeCommand::SubmitSkill { activation, .. }] = update.commands.as_slice() else {
+        let [
+            RuntimeCommand::Submit {
+                activation: Some(activation),
+                ..
+            },
+        ] = update.commands.as_slice()
+        else {
             panic!("exact skill should invoke on Enter");
         };
         assert_eq!(activation.name(), "review");
@@ -5020,7 +5039,10 @@ mod tests {
         set_prompt(&mut app, draft);
         assert!(matches!(
             app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
-            [RuntimeCommand::SubmitSkill { .. }]
+            [RuntimeCommand::Submit {
+                activation: Some(_),
+                ..
+            }]
         ));
         assert!(app.prompt.is_empty());
         app.handle_event(RuntimeEvent::SkillActivationRejected {
@@ -5031,7 +5053,10 @@ mod tests {
 
         assert!(matches!(
             app.handle_key(key(KeyCode::Enter)).commands.as_slice(),
-            [RuntimeCommand::SubmitSkill { .. }]
+            [RuntimeCommand::Submit {
+                activation: Some(_),
+                ..
+            }]
         ));
         set_prompt(&mut app, "new draft");
         app.handle_event(RuntimeEvent::SkillActivationRejected {
@@ -5041,7 +5066,13 @@ mod tests {
 
         set_prompt(&mut app, draft);
         let update = app.handle_key(key(KeyCode::Enter));
-        let [RuntimeCommand::SubmitSkill { request, .. }] = update.commands.as_slice() else {
+        let [
+            RuntimeCommand::Submit {
+                request,
+                activation: Some(_),
+            },
+        ] = update.commands.as_slice()
+        else {
             panic!("expected direct skill submission");
         };
         assert!(app.pending_skill_submission.is_some());
@@ -6530,7 +6561,8 @@ mod tests {
             assert_eq!(
                 enter_at(&mut app, draft, now).commands,
                 [RuntimeCommand::Submit {
-                    request: draft.to_owned()
+                    request: draft.to_owned(),
+                    activation: None,
                 }],
                 "{draft}"
             );
@@ -7062,7 +7094,10 @@ mod tests {
                 selection,
                 revision,
             },
-            RuntimeCommand::Submit { request },
+            RuntimeCommand::Submit {
+                request,
+                activation: None,
+            },
         ] = update.commands.as_slice()
         else {
             panic!("expected settings then submit, got {:?}", update.commands);
@@ -7081,7 +7116,10 @@ mod tests {
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(RuntimeCommand::Submit { request }) if request == "use the visible setting"
+            Ok(RuntimeCommand::Submit {
+                request,
+                activation: None,
+            }) if request == "use the visible setting"
         ));
     }
 
@@ -7268,7 +7306,8 @@ mod tests {
         assert_eq!(
             update.commands,
             [RuntimeCommand::Submit {
-                request: "hi".to_owned()
+                request: "hi".to_owned(),
+                activation: None,
             }]
         );
         assert!(update.visible_changed);
@@ -7300,6 +7339,7 @@ mod tests {
             update.commands,
             [RuntimeCommand::Submit {
                 request: "send".to_owned(),
+                activation: None,
             }]
         );
         assert!(update.visible_changed);
@@ -7321,6 +7361,7 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)).commands,
             [RuntimeCommand::Submit {
                 request: "f\ng".to_owned(),
+                activation: None,
             }]
         );
 
@@ -7884,7 +7925,8 @@ mod tests {
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)).commands,
             [RuntimeCommand::Submit {
-                request: "x".to_owned()
+                request: "x".to_owned(),
+                activation: None,
             }]
         );
     }
@@ -10971,6 +11013,7 @@ mod tests {
                 enter_at(&mut app, "correct this", submitted_at).commands,
                 [RuntimeCommand::Submit {
                     request: "correct this".to_owned(),
+                    activation: None,
                 }]
             );
             assert_eq!(
@@ -10995,7 +11038,8 @@ mod tests {
         assert_eq!(
             enter_at(&mut app, "correct this", now).commands,
             [RuntimeCommand::Submit {
-                request: "correct this".to_owned()
+                request: "correct this".to_owned(),
+                activation: None,
             }]
         );
         app.handle_event_at(
@@ -11166,6 +11210,7 @@ mod tests {
             enter_at(&mut app, "second prompt", now).commands,
             vec![RuntimeCommand::Submit {
                 request: "second prompt".to_owned(),
+                activation: None,
             }]
         );
         assert_eq!(

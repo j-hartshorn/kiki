@@ -6625,6 +6625,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: FIRST_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let mut collector = LiveCollector::default();
@@ -6647,6 +6648,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: CANCELLATION_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let second_run_id = wait_for_request(
@@ -6685,6 +6687,7 @@ pub(crate) mod tests {
             &controller.commands,
             crate::runtime::RuntimeCommand::Submit {
                 request: FOLLOW_UP_REQUEST.to_owned(),
+                activation: None,
             },
         )?;
         let third_run_id = wait_for_request(

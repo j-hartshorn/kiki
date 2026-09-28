@@ -723,13 +723,9 @@ impl<M: Model> Agent<M> {
         writer: &SessionWriter,
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
-        let admission = if let Some(activation) = activation {
-            writer
-                .commit_request_with_skill(request.clone(), selection, Some(activation))
-                .await?
-        } else {
-            writer.commit_request(request.clone(), selection).await?
-        };
+        let admission = writer
+            .commit_request_with_skill(request.clone(), selection, activation)
+            .await?;
         let run_id = admission.run_id;
         event(PersistedAgentEvent::RequestCommitted {
             run_id,

@@ -41,10 +41,7 @@ pub(crate) struct ModelStepId(pub(crate) u64);
 pub(crate) enum RuntimeCommand {
     Submit {
         request: String,
-    },
-    SubmitSkill {
-        request: String,
-        activation: SkillActivation,
+        activation: Option<SkillActivation>,
     },
     #[allow(dead_code)]
     Compact {
@@ -539,7 +536,6 @@ pub(crate) fn control_command(command: &RuntimeCommand) -> Option<ControlCommand
         RuntimeCommand::CancelBackground => Some(ControlCommand::CancelBackground),
         RuntimeCommand::Shutdown => Some(ControlCommand::Shutdown),
         RuntimeCommand::Submit { .. }
-        | RuntimeCommand::SubmitSkill { .. }
         | RuntimeCommand::Compact { .. }
         | RuntimeCommand::ApplySettings { .. }
         | RuntimeCommand::SetSessionName { .. }
@@ -1120,15 +1116,10 @@ impl<M: Model> RuntimeController<M> {
                 .emit(|| TraceEvent::RuntimeCommandReceived { command });
         }
         match command {
-            command @ (RuntimeCommand::Submit { .. } | RuntimeCommand::SubmitSkill { .. }) => {
-                let (request, activation) = match command {
-                    RuntimeCommand::Submit { request } => (request, None),
-                    RuntimeCommand::SubmitSkill {
-                        request,
-                        activation,
-                    } => (request, Some(activation)),
-                    _ => unreachable!(),
-                };
+            RuntimeCommand::Submit {
+                request,
+                activation,
+            } => {
                 if self.subagents.storage_failure_token().is_cancelled() {
                     self.disable_session_storage(events).await;
                 }
@@ -3380,6 +3371,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "busy request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit while compacting");
@@ -3704,6 +3696,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "current ".to_owned() + &"z".repeat(100_000),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -3829,6 +3822,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "current ".to_owned() + &"z".repeat(100_000),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4159,6 +4153,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "cancel and compact".to_owned(),
+                    activation: None,
                 })
                 .await
                 .expect("start run");
@@ -4303,6 +4298,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel and compact".to_owned(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4423,6 +4419,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "running request".to_owned(),
+                activation: None,
             })
             .await
             .expect("start run");
@@ -4813,6 +4810,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "baseline".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -4846,9 +4844,9 @@ mod tests {
         .enumerate()
         {
             commands
-                .send(RuntimeCommand::SubmitSkill {
+                .send(RuntimeCommand::Submit {
                     request: "inspect this".to_owned(),
-                    activation: captured(body),
+                    activation: Some(captured(body)),
                 })
                 .await
                 .unwrap();
@@ -4909,6 +4907,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "alternate branch".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -4987,16 +4986,18 @@ mod tests {
         );
         let (commands, mut events, _progress, controller) = start_controller(controller);
         commands
-            .send(RuntimeCommand::SubmitSkill {
+            .send(RuntimeCommand::Submit {
                 request: "must not be admitted".to_owned(),
-                activation: SkillActivation::new(
-                    "extra".to_owned(),
-                    home.path().join(".agents/skills/extra"),
-                    "y".repeat(20 * 1024),
-                    SkillOrigin::User,
-                    None,
-                )
-                .unwrap(),
+                activation: Some(
+                    SkillActivation::new(
+                        "extra".to_owned(),
+                        home.path().join(".agents/skills/extra"),
+                        "y".repeat(20 * 1024),
+                        SkillOrigin::User,
+                        None,
+                    )
+                    .unwrap(),
+                ),
             })
             .await
             .unwrap();
@@ -5019,6 +5020,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "session still writable".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5083,6 +5085,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "persist this request".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5196,6 +5199,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "allocate a step".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5260,6 +5264,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "settle before continuing".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5338,6 +5343,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "finish then cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5452,6 +5458,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel provider failure".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5574,6 +5581,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5631,6 +5639,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "trigger oversized failure".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5706,6 +5715,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "finish then shutdown".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5827,6 +5837,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot persist".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5834,6 +5845,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also retained".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5866,6 +5878,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5914,6 +5927,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must not start".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -5978,6 +5992,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot allocate".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6004,6 +6019,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6081,6 +6097,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot settle".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6109,6 +6126,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6184,6 +6202,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cannot close".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6210,6 +6229,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "also blocked".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6283,6 +6303,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6337,6 +6358,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "still disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6397,6 +6419,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6459,6 +6482,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "still disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6515,6 +6539,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6522,12 +6547,14 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
         commands
             .send(RuntimeCommand::Submit {
                 request: "third".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -6915,6 +6942,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "wait for child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit foreground request");
@@ -6936,6 +6964,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must be rejected".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after storage failure");
@@ -7008,6 +7037,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start children".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7120,6 +7150,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7160,6 +7191,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7247,6 +7279,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7333,6 +7366,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground-request-SECRET".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7500,6 +7534,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "disable runtime".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7544,6 +7579,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "rejected while disabled".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7791,6 +7827,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7830,6 +7867,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "follow up".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7866,6 +7904,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -7972,6 +8011,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -8118,6 +8158,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "use saved settings".to_owned(),
+                activation: None,
             })
             .await
             .expect("queue submission");
@@ -8281,6 +8322,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start background work".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit root request");
@@ -8438,6 +8480,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "keep running".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -8503,6 +8546,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must be rejected".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -8819,6 +8863,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must stay disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -8934,6 +8979,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must stay disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -9119,6 +9165,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -9177,6 +9224,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -9208,6 +9256,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "follow up".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -9242,6 +9291,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -9283,6 +9333,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10050,6 +10101,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10114,6 +10166,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10193,6 +10246,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10256,6 +10310,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "flood".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10331,6 +10386,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10459,6 +10515,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10505,6 +10562,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10562,6 +10620,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10616,6 +10675,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10666,6 +10726,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10674,6 +10735,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10739,6 +10801,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10776,6 +10839,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10783,6 +10847,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "rejected".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10837,6 +10902,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10907,6 +10973,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10949,6 +11016,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -10997,6 +11065,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11009,6 +11078,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "second".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11073,6 +11143,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "stop".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -11139,6 +11210,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "stop".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -11202,6 +11274,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "original request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit original request");
@@ -11270,6 +11343,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "corrected request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit corrected request");
@@ -11342,6 +11416,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "correct after execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -11420,6 +11495,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "admit before correcting".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -11612,6 +11688,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "correct this request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit correction request");
@@ -11878,6 +11955,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel but retain child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit foreground request");
@@ -12203,6 +12281,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel with a child".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -12304,6 +12383,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel before output".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12347,6 +12427,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel during generation".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12398,6 +12479,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12446,6 +12528,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "cancel before execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12487,6 +12570,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "fail execution".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12544,6 +12628,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "closed commands".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12581,6 +12666,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12650,6 +12736,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "accounting".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12717,6 +12804,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12748,6 +12836,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12838,6 +12927,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12891,6 +12981,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12933,6 +13024,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -12964,6 +13056,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13002,6 +13095,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13033,6 +13127,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13094,6 +13189,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13263,6 +13359,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13320,6 +13417,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "first".to_owned(),
+                    activation: None,
                 })
                 .await
                 .unwrap();
@@ -13348,6 +13446,7 @@ mod tests {
             commands
                 .send(RuntimeCommand::Submit {
                     request: "later".to_owned(),
+                    activation: None,
                 })
                 .await
                 .unwrap();
@@ -13393,6 +13492,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13426,6 +13526,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13469,6 +13570,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "first".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13501,6 +13603,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "later".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13529,6 +13632,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "after restart".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13600,6 +13704,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13702,6 +13807,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13898,6 +14004,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "add 40 and 2".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -13965,6 +14072,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "double-check".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14125,6 +14233,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start a child".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14246,6 +14355,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "foreground".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14550,6 +14660,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "delegate the first request".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -14575,6 +14686,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "clarify the delegated work".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
@@ -15280,6 +15392,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must not run".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -15863,6 +15976,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit continued request");
@@ -15971,6 +16085,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "save this state".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit saved request");
@@ -16147,6 +16262,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue sibling".to_owned(),
+                activation: None,
             })
             .await
             .expect("continue sibling");
@@ -16199,6 +16315,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "probe original".to_owned(),
+                activation: None,
             })
             .await
             .expect("probe original branch");
@@ -16678,6 +16795,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after navigation");
@@ -17147,6 +17265,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "continue old branch".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after recovered navigation");
@@ -17222,6 +17341,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must remain disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -17277,6 +17397,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "must remain disabled".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit disabled request");
@@ -17306,6 +17427,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "active request".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit active request");
@@ -17348,6 +17470,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "start background work".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit child request");
@@ -17466,6 +17589,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold request admission".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17493,6 +17617,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold generation".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17530,6 +17655,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17556,6 +17682,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold closure".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17589,6 +17716,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child admission".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17623,6 +17751,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child execution".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17658,6 +17787,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold child terminal".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -17752,6 +17882,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "after storage failure".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit after storage failure");
@@ -17833,6 +17964,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "queued after navigation".to_owned(),
+                activation: None,
             })
             .await
             .expect("queue request after navigation");
@@ -18139,6 +18271,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "hold generation".to_owned(),
+                activation: None,
             })
             .await
             .expect("submit request");
@@ -18349,6 +18482,7 @@ mod tests {
         commands
             .send(RuntimeCommand::Submit {
                 request: "inspect".to_owned(),
+                activation: None,
             })
             .await
             .unwrap();
