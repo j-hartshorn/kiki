@@ -101,22 +101,30 @@ pub(crate) struct ActiveSkills {
     activations: Vec<SkillActivation>,
 }
 
+fn check_activation<'a>(
+    active: impl Iterator<Item = &'a SkillActivation> + Clone,
+    activation: &SkillActivation,
+) -> Result<bool, SkillActivationError> {
+    if active.clone().any(|current| current == activation) {
+        return Ok(false);
+    }
+    let retained_bytes: usize = active
+        .filter(|current| current.name() != activation.name())
+        .map(|current| current.model_text().len())
+        .sum();
+    if retained_bytes + activation.model_text().len() > MAX_ACTIVE_SKILL_TEXT_BYTES {
+        return Err(SkillActivationError::ActiveTextLimit);
+    }
+    Ok(true)
+}
+
 impl ActiveSkills {
     pub(crate) fn activate(
         &mut self,
         activation: SkillActivation,
     ) -> Result<bool, SkillActivationError> {
-        if self.activations.contains(&activation) {
+        if !check_activation(self.activations.iter(), &activation)? {
             return Ok(false);
-        }
-        let retained_bytes: usize = self
-            .activations
-            .iter()
-            .filter(|active| active.name() != activation.name())
-            .map(|active| active.model_text().len())
-            .sum();
-        if retained_bytes + activation.model_text().len() > MAX_ACTIVE_SKILL_TEXT_BYTES {
-            return Err(SkillActivationError::ActiveTextLimit);
         }
         self.replay(activation);
         Ok(true)
@@ -144,10 +152,6 @@ impl ActiveSkills {
             .iter()
             .map(|active| active.model_text().len())
             .sum()
-    }
-
-    pub(crate) fn within_text_limit(&self) -> bool {
-        self.text_bytes() <= MAX_ACTIVE_SKILL_TEXT_BYTES
     }
 }
 
@@ -459,7 +463,6 @@ pub(crate) fn canonical_compaction_summary(summary: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelHistory {
     entries: Vec<ModelContextEntry>,
-    skills: ActiveSkills,
 }
 
 impl Default for ModelHistory {
@@ -472,7 +475,6 @@ impl ModelHistory {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            skills: ActiveSkills::default(),
         }
     }
 
@@ -480,43 +482,39 @@ impl ModelHistory {
         &self.entries
     }
 
-    pub fn active_skills(&self) -> impl Iterator<Item = &SkillActivation> {
-        self.skills.iter()
+    pub fn active_skills(&self) -> impl Iterator<Item = &SkillActivation> + Clone {
+        self.entries.iter().filter_map(|entry| match entry {
+            ModelContextEntry::SkillActivation(activation) => Some(activation),
+            _ => None,
+        })
     }
 
     pub fn activate_skill(
         &mut self,
         activation: SkillActivation,
     ) -> Result<bool, SkillActivationError> {
-        if !self.skills.activate(activation.clone())? {
+        if !check_activation(self.active_skills(), &activation)? {
             return Ok(false);
         }
-        self.push_skill_entry(activation);
+        self.replay_skill(activation);
         Ok(true)
     }
 
     pub(crate) fn replay_skill(&mut self, activation: SkillActivation) {
-        self.skills.replay(activation.clone());
-        self.push_skill_entry(activation);
-    }
-
-    pub(crate) fn deactivate_skill(&mut self, name: &str) {
-        self.skills.deactivate(name);
-        self.remove_skill_entry(name);
-    }
-
-    pub(crate) fn active_skills_within_text_limit(&self) -> bool {
-        self.skills.within_text_limit()
-    }
-
-    fn push_skill_entry(&mut self, activation: SkillActivation) {
-        self.remove_skill_entry(activation.name());
+        self.deactivate_skill(activation.name());
         self.entries
             .push(ModelContextEntry::SkillActivation(activation));
     }
 
-    fn remove_skill_entry(&mut self, name: &str) {
+    pub(crate) fn deactivate_skill(&mut self, name: &str) {
         self.entries.retain(|entry| !matches!(entry, ModelContextEntry::SkillActivation(active) if active.name() == name));
+    }
+
+    pub(crate) fn active_skills_within_text_limit(&self) -> bool {
+        self.active_skills()
+            .map(|active| active.model_text().len())
+            .sum::<usize>()
+            <= MAX_ACTIVE_SKILL_TEXT_BYTES
     }
 
     pub fn append_user_request(&mut self, text: impl Into<String>) {
