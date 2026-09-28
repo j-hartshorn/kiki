@@ -1926,6 +1926,7 @@ async fn drive(
                         filesystem_calls,
                         authorisations.clone(),
                         output_sender,
+                        skill_ledger.active(),
                     ));
                     let mut filesystem_complete = false;
                     while !tokens.is_empty() {
@@ -2840,7 +2841,7 @@ mod tests {
         parse_soft_memory_limit, result_values_from_monty, tool_summary, update_budget_pause,
         validate_worker, validate_worker_with_timeout,
     };
-    use crate::model::{ScriptedAction, ScriptedModel};
+    use crate::model::{ScriptedAction, ScriptedModel, SkillActivation};
     use crate::skills::{ProjectScope, SkillCatalog};
     use crate::subagents::{
         AcceptedThinking, AgentInvocationContext, Caller, ChildFailure, ChildModelFactory,
@@ -2951,6 +2952,65 @@ mod tests {
         assert_eq!(complete(&execution).unwrap().head, "True");
         assert!(execution.read_paths.is_empty());
         assert_eq!(child.checkpoint().authorisations, initial_authorisations);
+    }
+
+    #[tokio::test]
+    async fn direct_only_skill_resources_require_the_skill_to_be_active() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".agents/skills/direct");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\ndescription: Direct\ndisable-model-invocation: true\n---\nbody",
+        )
+        .unwrap();
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let active = [SkillActivation::from_skill(
+            catalog.lookup("direct").unwrap(),
+        )];
+        let host = ToolHost::new(workspace.path())
+            .await
+            .unwrap()
+            .with_skill_catalog(catalog);
+        let mut arena = Arena::new(worker_path(), host).await.unwrap();
+        let code = "(await read('skill://direct/SKILL.md')).endswith('body') and len(await list_dir('skill://direct/')) == 1";
+
+        let (execution, _) = arena
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &active)
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+
+        let (execution, _) = arena
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
+            .await
+            .unwrap();
+        assert!(
+            python_error(&execution)
+                .text
+                .contains("can only be activated directly by the user")
+        );
+    }
+
+    #[tokio::test]
+    async fn loaded_skill_resources_are_readable_in_the_same_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut arena = arena_with_user_skill(&workspace, &home).await;
+        let (execution, captured) = arena
+            .execute_model_code(
+                "await load_skill('review')\n(await read('skill://review/SKILL.md')).endswith('PRIVATE_SKILL_BODY')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&execution).unwrap().head, "True");
+        assert_eq!(captured.len(), 1);
     }
 
     #[tokio::test]

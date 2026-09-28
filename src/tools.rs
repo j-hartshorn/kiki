@@ -1053,6 +1053,7 @@ struct BatchDispatch<'a> {
     active_mutation_paths: BTreeSet<PathBuf>,
     authorisations: WholeFileAuthorisations,
     output: Option<mpsc::Sender<ToolOutputChunk>>,
+    active_skills: &'a [SkillActivation],
 }
 
 pub(crate) struct SkillLoadLedger {
@@ -1081,6 +1082,10 @@ impl SkillLoadLedger {
         self.captured
     }
 
+    pub(crate) fn active(&self) -> &[SkillActivation] {
+        self.active.as_slice()
+    }
+
     fn activate(&mut self, activation: SkillActivation) -> Result<(), SkillActivationError> {
         if self.active.activate(activation.clone())? {
             self.captured
@@ -1097,6 +1102,7 @@ impl<'a> BatchDispatch<'a> {
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
         output: Option<mpsc::Sender<ToolOutputChunk>>,
+        active_skills: &'a [SkillActivation],
     ) -> Self {
         Self {
             host,
@@ -1105,6 +1111,7 @@ impl<'a> BatchDispatch<'a> {
             active_mutation_paths: BTreeSet::new(),
             authorisations,
             output,
+            active_skills,
         }
     }
 
@@ -1145,10 +1152,16 @@ impl<'a> BatchDispatch<'a> {
             }
             let host = self.host;
             let output = self.output.clone();
+            let active_skills = self.active_skills;
             self.active.push(Box::pin(async move {
                 ScheduledCall {
                     result: host
-                        .call_with_authorisation_and_output(call, authorisation, output)
+                        .call_with_authorisation_and_output(
+                            call,
+                            authorisation,
+                            output,
+                            active_skills,
+                        )
                         .await,
                     mutation_path,
                 }
@@ -1901,19 +1914,20 @@ impl ToolHost {
         authorisations: WholeFileAuthorisations,
     ) -> impl Stream<Item = ToolResult> + '_ {
         stream::unfold(
-            BatchDispatch::new(self, calls, authorisations, None),
+            BatchDispatch::new(self, calls, authorisations, None, &[]),
             |dispatch| async move { dispatch.next().await },
         )
     }
 
-    pub(crate) fn dispatch_batch_with_output(
-        &self,
+    pub(crate) fn dispatch_batch_with_output<'a>(
+        &'a self,
         calls: Vec<ToolCall>,
         authorisations: WholeFileAuthorisations,
         output: mpsc::Sender<ToolOutputChunk>,
-    ) -> impl Stream<Item = ToolResult> + '_ {
+        active_skills: &'a [SkillActivation],
+    ) -> impl Stream<Item = ToolResult> + 'a {
         stream::unfold(
-            BatchDispatch::new(self, calls, authorisations, Some(output)),
+            BatchDispatch::new(self, calls, authorisations, Some(output), active_skills),
             |dispatch| async move { dispatch.next().await },
         )
     }
@@ -1929,7 +1943,7 @@ impl ToolHost {
         call: ToolCall,
         authorisation: Option<ContentFingerprint>,
     ) -> ToolResult {
-        self.call_with_authorisation_and_output(call, authorisation, None)
+        self.call_with_authorisation_and_output(call, authorisation, None, &[])
             .await
     }
 
@@ -1938,6 +1952,7 @@ impl ToolHost {
         call: ToolCall,
         authorisation: Option<ContentFingerprint>,
         output: Option<mpsc::Sender<ToolOutputChunk>>,
+        active_skills: &[SkillActivation],
     ) -> ToolResult {
         let ToolCall {
             call_id,
@@ -1963,10 +1978,10 @@ impl ToolHost {
             batch_call.wait_until_released().await;
         }
         let result = match tool {
-            ToolName::Read => self.read(arguments).await,
+            ToolName::Read => self.read(arguments, active_skills).await,
             ToolName::Write => self.write(arguments, authorisation).await,
             ToolName::Edit => self.edit(arguments).await,
-            ToolName::ListDir => self.list_dir(arguments).await,
+            ToolName::ListDir => self.list_dir(arguments, active_skills).await,
             ToolName::Glob => self.glob(arguments).await,
             ToolName::Grep => self.grep(arguments).await,
             ToolName::Run => self.run(call_id, arguments, output).await,
@@ -2118,7 +2133,11 @@ impl ToolHost {
         })
     }
 
-    async fn read(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+    async fn read(
+        &self,
+        arguments: ToolValue,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolOutput, ToolError> {
         let target = read_path(arguments)?;
         #[cfg(test)]
         if let Some(test_gate) = &self.test_gate {
@@ -2129,7 +2148,7 @@ impl ToolHost {
             directory,
             path,
             skill_name,
-        } = self.resolve_resource_path(target)?;
+        } = self.resolve_resource_path(target, active_skills)?;
         let limits = self.limits;
         let effect_path = path.clone();
         #[cfg(test)]
@@ -2161,12 +2180,16 @@ impl ToolHost {
         }
     }
 
-    async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
+    async fn list_dir(
+        &self,
+        arguments: ToolValue,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolOutput, ToolError> {
         let ResolvedResource {
             directory,
             path,
             skill_name,
-        } = self.resolve_resource_path(list_dir_path(arguments)?)?;
+        } = self.resolve_resource_path(list_dir_path(arguments)?, active_skills)?;
         let prefix = skill_name.map_or_else(String::new, |name| format!("skill://{name}"));
         let limits = self.limits;
         #[cfg(test)]
@@ -2184,27 +2207,31 @@ impl ToolHost {
         .map(ToolOutput::without_effect)
     }
 
-    fn resolve_resource_path(&self, target: ResourcePath) -> Result<ResolvedResource, ToolError> {
+    fn resolve_resource_path(
+        &self,
+        target: ResourcePath,
+        active_skills: &[SkillActivation],
+    ) -> Result<ResolvedResource, ToolError> {
         match target {
             ResourcePath::Workspace(path) => Ok(ResolvedResource {
                 directory: Arc::clone(&self.workspace),
                 path,
                 skill_name: None,
             }),
-            ResourcePath::Skill { name, path } => Ok(ResolvedResource {
-                directory: self.skill_directory(&name)?,
-                path,
-                skill_name: Some(name),
-            }),
+            ResourcePath::Skill { name, path } => {
+                let skill = if active_skills.iter().any(|skill| skill.name() == name) {
+                    self.skill_catalog.lookup(&name)
+                } else {
+                    self.skill_catalog.lookup_model_invocable(&name)
+                }
+                .map_err(|error| map_skill_lookup_error(&name, error))?;
+                Ok(ResolvedResource {
+                    directory: skill.directory(),
+                    path,
+                    skill_name: Some(name),
+                })
+            }
         }
-    }
-
-    fn skill_directory(&self, name: &str) -> Result<Arc<Dir>, ToolError> {
-        let skill = self
-            .skill_catalog
-            .lookup(name)
-            .map_err(|error| map_skill_lookup_error(name, error))?;
-        Ok(skill.directory())
     }
 
     async fn glob(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
@@ -3960,6 +3987,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::config::constants::FILE_MAX_BYTES;
+    use crate::model::SkillActivation;
     use crate::skills::{ProjectScope, SkillCatalog};
 
     use super::{
@@ -4208,6 +4236,71 @@ mod tests {
             read_error(&at_limit, "skill://project/SKILL.md").await,
             ToolErrorKind::Value
         );
+    }
+
+    #[tokio::test]
+    async fn skill_resources_require_a_listed_model_invocable_or_active_skill() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let skills = home.path().join(".agents/skills");
+        let direct = skills.join("direct");
+        fs::create_dir_all(&direct).unwrap();
+        fs::write(
+            direct.join("SKILL.md"),
+            "---\ndescription: Direct\ndisable-model-invocation: true\n---\nbody",
+        )
+        .unwrap();
+        for index in 0..33 {
+            let root = skills.join(format!("visible-{index:02}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                "---\ndescription: Visible\n---\nbody",
+            )
+            .unwrap();
+        }
+        let scope = ProjectScope::discover(workspace.path()).unwrap();
+        let catalog = Arc::new(SkillCatalog::discover(&scope, home.path(), false, ""));
+        let host = tool_host(&workspace)
+            .await
+            .with_skill_catalog(catalog.clone());
+
+        for (tool, path) in [
+            (ToolName::Read, "skill://visible-00/SKILL.md"),
+            (ToolName::ListDir, "skill://visible-00/"),
+        ] {
+            assert!(
+                skill_resource(&host, tool, path, &[]).await.is_ok(),
+                "{path}"
+            );
+        }
+        for (name, reason) in [
+            ("direct", "directly by the user"),
+            ("visible-32", "omitted"),
+        ] {
+            let refused = host
+                .load_skill(
+                    ToolValue::List(vec![ToolValue::String(name.to_owned())]),
+                    &mut SkillLoadLedger::new(&[]).unwrap(),
+                )
+                .unwrap_err();
+            assert!(refused.to_string().contains(reason), "{name}: {refused}");
+            let active = [SkillActivation::from_skill(catalog.lookup(name).unwrap())];
+            for (tool, path) in [
+                (ToolName::Read, format!("skill://{name}/SKILL.md")),
+                (ToolName::ListDir, format!("skill://{name}/")),
+            ] {
+                assert_eq!(
+                    skill_resource(&host, tool, &path, &[]).await,
+                    Err(refused.clone()),
+                    "{path}"
+                );
+                assert!(
+                    skill_resource(&host, tool, &path, &active).await.is_ok(),
+                    "{path}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4496,6 +4589,26 @@ mod tests {
 
     async fn read_error(host: &ToolHost, path: &str) -> ToolErrorKind {
         read(host, path).await.unwrap_err()
+    }
+
+    async fn skill_resource(
+        host: &ToolHost,
+        tool: ToolName,
+        path: &str,
+        active_skills: &[SkillActivation],
+    ) -> Result<ToolValue, ToolError> {
+        host.call_with_authorisation_and_output(
+            ToolCall {
+                call_id: 7,
+                tool,
+                arguments: ToolValue::List(vec![ToolValue::String(path.to_owned())]),
+            },
+            None,
+            None,
+            active_skills,
+        )
+        .await
+        .result
     }
 
     async fn list_dir(

@@ -135,6 +135,10 @@ impl ActiveSkills {
         self.activations.iter()
     }
 
+    pub(crate) fn as_slice(&self) -> &[SkillActivation] {
+        &self.activations
+    }
+
     pub(crate) fn text_bytes(&self) -> usize {
         self.activations
             .iter()
