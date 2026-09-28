@@ -37,7 +37,9 @@ use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
 use crate::model::{ActiveSkills, SkillActivation, SkillActivationError};
-use crate::skills::{SkillCatalog, SkillLookupError, valid_name as valid_skill_name};
+use crate::skills::{
+    SkillCatalog, SkillLookupError, model_visible_path, valid_name as valid_skill_name,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ToolValue {
@@ -1821,39 +1823,11 @@ impl ToolHost {
         let skill = self
             .skill_catalog
             .lookup_model_invocable(name)
-            .map_err(|error| {
-                let message = match error {
-                    SkillLookupError::Unknown(_) => {
-                        format!("unknown or unavailable skill {name:?}")
-                    }
-                    SkillLookupError::Ambiguous { paths, .. } => {
-                        format!("skill {name:?} is ambiguous among {} sources", paths.len())
-                    }
-                    SkillLookupError::Invalid { reason, .. } => {
-                        format!("skill {name:?} is invalid: {reason:?}")
-                    }
-                    SkillLookupError::Omitted { reason, .. } => {
-                        format!("skill {name:?} was omitted: {reason:?}")
-                    }
-                    SkillLookupError::DirectOnly(_) => {
-                        format!("skill {name:?} can only be activated directly by the user")
-                    }
-                };
-                ToolError::value(message)
-            })?;
+            .map_err(|error| map_skill_lookup_error(name, error))?;
         ledger
             .activate(SkillActivation::from_skill(skill))
             .map_err(|error| ToolError::value(error.to_string()))?;
-        let root = skill.canonical_root().to_str().filter(|path| {
-            !path.chars().any(|character| {
-                character.is_control()
-                    || matches!(
-                        character,
-                        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
-                    )
-            })
-        });
-        let root = root.map_or_else(
+        let root = model_visible_path(skill.canonical_root()).map_or_else(
             || "root path unavailable".to_owned(),
             |path| {
                 format!(
@@ -2151,7 +2125,11 @@ impl ToolHost {
             test_gate.wait_before_read().await;
         }
 
-        let (directory, path, is_skill) = self.resolve_resource_path(target)?;
+        let ResolvedResource {
+            directory,
+            path,
+            skill_name,
+        } = self.resolve_resource_path(target)?;
         let limits = self.limits;
         let effect_path = path.clone();
         #[cfg(test)]
@@ -2170,7 +2148,7 @@ impl ToolHost {
         })
         .await
         .map_err(|_| ToolError::new(ToolErrorKind::Os, "blocking filesystem operation failed"))??;
-        if is_skill {
+        if skill_name.is_some() {
             Ok(ToolOutput::without_effect(ToolValue::String(read.contents)))
         } else {
             Ok(ToolOutput {
@@ -2184,14 +2162,12 @@ impl ToolHost {
     }
 
     async fn list_dir(&self, arguments: ToolValue) -> Result<ToolOutput, ToolError> {
-        let target = list_dir_path(arguments)?;
-        let (directory, path, prefix) = match target {
-            ResourcePath::Workspace(path) => (Arc::clone(&self.workspace), path, String::new()),
-            ResourcePath::Skill { name, path } => {
-                let directory = self.skill_directory(&name)?;
-                (directory, path, format!("skill://{name}"))
-            }
-        };
+        let ResolvedResource {
+            directory,
+            path,
+            skill_name,
+        } = self.resolve_resource_path(list_dir_path(arguments)?)?;
+        let prefix = skill_name.map_or_else(String::new, |name| format!("skill://{name}"));
         let limits = self.limits;
         #[cfg(test)]
         let test_gate = self.list_dir_test_gate.clone();
@@ -2208,13 +2184,18 @@ impl ToolHost {
         .map(ToolOutput::without_effect)
     }
 
-    fn resolve_resource_path(
-        &self,
-        target: ResourcePath,
-    ) -> Result<(Arc<Dir>, PathBuf, bool), ToolError> {
+    fn resolve_resource_path(&self, target: ResourcePath) -> Result<ResolvedResource, ToolError> {
         match target {
-            ResourcePath::Workspace(path) => Ok((Arc::clone(&self.workspace), path, false)),
-            ResourcePath::Skill { name, path } => Ok((self.skill_directory(&name)?, path, true)),
+            ResourcePath::Workspace(path) => Ok(ResolvedResource {
+                directory: Arc::clone(&self.workspace),
+                path,
+                skill_name: None,
+            }),
+            ResourcePath::Skill { name, path } => Ok(ResolvedResource {
+                directory: self.skill_directory(&name)?,
+                path,
+                skill_name: Some(name),
+            }),
         }
     }
 
@@ -2222,24 +2203,7 @@ impl ToolHost {
         let skill = self
             .skill_catalog
             .lookup(name)
-            .map_err(|error| match error {
-                SkillLookupError::Unknown(_) => {
-                    ToolError::value(format!("unknown or unavailable skill {name:?}"))
-                }
-                SkillLookupError::Ambiguous { paths, .. } => ToolError::value(format!(
-                    "skill {name:?} is ambiguous among {} sources",
-                    paths.len()
-                )),
-                SkillLookupError::Invalid { reason, .. } => {
-                    ToolError::value(format!("skill {name:?} is invalid: {reason:?}"))
-                }
-                SkillLookupError::Omitted { reason, .. } => {
-                    ToolError::value(format!("skill {name:?} was omitted: {reason:?}"))
-                }
-                SkillLookupError::DirectOnly(_) => {
-                    unreachable!("direct-only skills are permitted as resources")
-                }
-            })?;
+            .map_err(|error| map_skill_lookup_error(name, error))?;
         Ok(skill.directory())
     }
 
@@ -2433,9 +2397,33 @@ fn map_command_error(error: command::CommandError) -> ToolError {
     }
 }
 
+fn map_skill_lookup_error(name: &str, error: SkillLookupError) -> ToolError {
+    ToolError::value(match error {
+        SkillLookupError::Unknown(_) => format!("unknown or unavailable skill {name:?}"),
+        SkillLookupError::Ambiguous { paths, .. } => {
+            format!("skill {name:?} is ambiguous among {} sources", paths.len())
+        }
+        SkillLookupError::Invalid { reason, .. } => {
+            format!("skill {name:?} is invalid: {reason:?}")
+        }
+        SkillLookupError::Omitted { reason, .. } => {
+            format!("skill {name:?} was omitted: {reason:?}")
+        }
+        SkillLookupError::DirectOnly(_) => {
+            format!("skill {name:?} can only be activated directly by the user")
+        }
+    })
+}
+
 enum ResourcePath {
     Workspace(PathBuf),
     Skill { name: String, path: PathBuf },
+}
+
+struct ResolvedResource {
+    directory: Arc<Dir>,
+    path: PathBuf,
+    skill_name: Option<String>,
 }
 
 fn parse_resource_path(path: &str) -> Result<ResourcePath, ToolError> {

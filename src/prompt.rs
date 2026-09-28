@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
-use crate::skills::SkillCatalog;
+use crate::skills::{SkillCatalog, model_visible_path};
 use crate::tools::prompt_reference;
 
 const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");
@@ -63,17 +63,7 @@ pub(crate) fn skill_activation_text(
     canonical_root: &Path,
     source_text: &str,
 ) -> String {
-    let root = canonical_root
-        .to_str()
-        .filter(|path| {
-            !path.chars().any(|character| {
-                character.is_control()
-                    || matches!(
-                        character,
-                        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-                    )
-            })
-        })
+    let root = model_visible_path(canonical_root)
         .map_or_else(String::new, |path| format!("Skill root path: {path}\n"));
     format!(
         "{}\n\n{root}Skill resource locator: skill://{name}/\n\n<skill name=\"{name}\">\n{source_text}\n</skill>",
@@ -210,6 +200,9 @@ mod tests {
             super::skill_activation_text("review", Path::new("/home/\u{202e}review"), "body");
         assert!(!unsafe_path.contains("Skill root path:"));
         assert!(unsafe_path.contains("skill://review/"));
+        let line_separator_path =
+            super::skill_activation_text("review", Path::new("/home/\u{2028}review"), "body");
+        assert!(!line_separator_path.contains("Skill root path:"));
     }
 
     const BUNDLED_PROMPT: &str = include_str!("../prompts/system.md");

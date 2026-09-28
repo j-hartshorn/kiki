@@ -1623,14 +1623,15 @@ fn commit_request(
     if let Some(activation) = activation {
         let stored = codec::encode_skill_activation(activation)
             .map_err(|error| SessionError::Codec(error.to_string()))?;
-        effective_revision = effective_revision
-            .checked_add(1)
-            .ok_or(SessionError::IdOverflow)?;
-        transaction.execute(
-            "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
-            params![entry_id, run_id, checkpoint_id, stored.payload_json, now, effective_revision],
+        effective_entry_id = insert_skill_activation(
+            &transaction,
+            entry_id,
+            run_id,
+            checkpoint_id,
+            &stored.payload_json,
+            now,
+            &mut effective_revision,
         )?;
-        effective_entry_id = transaction.last_insert_rowid();
     }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
@@ -1730,14 +1731,15 @@ fn settle_execution(
     }
     let mut effective_entry_id = entry_id;
     for stored in &stored_activations {
-        next_revision = next_revision
-            .checked_add(1)
-            .ok_or(SessionError::IdOverflow)?;
-        transaction.execute(
-            "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
-            params![effective_entry_id, run_id, checkpoint_id, stored.payload_json, now, next_revision],
+        effective_entry_id = insert_skill_activation(
+            &transaction,
+            effective_entry_id,
+            run_id,
+            checkpoint_id,
+            &stored.payload_json,
+            now,
+            &mut next_revision,
         )?;
-        effective_entry_id = transaction.last_insert_rowid();
     }
     transaction.execute(
         "UPDATE session SET active_entry_id = ?1, updated_at_ms = ?2, revision = ?3 WHERE singleton = 1",
@@ -1745,6 +1747,23 @@ fn settle_execution(
     )?;
     transaction.commit()?;
     session_entry_id(effective_entry_id)
+}
+
+fn insert_skill_activation(
+    connection: &Connection,
+    parent_id: i64,
+    run_id: i64,
+    checkpoint_id: i64,
+    payload_json: &str,
+    now: i64,
+    revision: &mut i64,
+) -> Result<i64, SessionError> {
+    *revision = revision.checked_add(1).ok_or(SessionError::IdOverflow)?;
+    connection.execute(
+        "INSERT INTO entries (parent_id, run_id, kind, checkpoint_id, payload_json, provider_replay, created_at_ms, revision) VALUES (?1, ?2, 'skill_activation', ?3, ?4, NULL, ?5, ?6)",
+        params![parent_id, run_id, checkpoint_id, payload_json, now, *revision],
+    )?;
+    Ok(connection.last_insert_rowid())
 }
 
 fn close_run(

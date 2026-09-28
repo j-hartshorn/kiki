@@ -896,6 +896,18 @@ pub(crate) fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
+pub(crate) fn model_visible_path(path: &Path) -> Option<&str> {
+    path.to_str().filter(|path| {
+        !path.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+                )
+        })
+    })
+}
+
 fn valid_directory_name(path: &Path) -> Option<String> {
     path.file_name()
         .and_then(|name| name.to_str())
