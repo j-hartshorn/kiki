@@ -275,7 +275,6 @@ fn startup_skill_catalog(
     let include_project =
         if project_trust_prompt_required(scope, saved_trust, has_active_project_skill_in_scope) {
             prompt(&scope.canonical_scope)?
-                && skill_trust::is_project_skill_scope_trusted(home, &scope.canonical_scope)
         } else {
             saved_trust
         };
@@ -923,24 +922,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_catalog_failed_trust_save_keeps_project_disabled() {
+    fn startup_catalog_prompt_trust_applies_without_saved_trust() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         fs::create_dir(project.path().join(".git")).unwrap();
         write_skill(project.path(), "shared", "project");
         write_skill(home.path(), "shared", "user");
-        let trust_store = home.path().join(".kiki/trusted-skills.toml");
-        fs::create_dir_all(trust_store.parent().unwrap()).unwrap();
-        fs::write(trust_store, "trusted_skill_scopes = [true]").unwrap();
-        let catalog = startup_catalog(project.path(), home.path(), false, |scope| {
-            assert!(
-                super::config::skill_trust::save_project_skill_scope_trust(home.path(), scope)
-                    .is_err()
-            );
-            Ok(true)
-        })
-        .unwrap();
-        assert_eq!(catalog.lookup("shared").unwrap().description(), "user");
+        let catalog = startup_catalog(project.path(), home.path(), false, |_| Ok(true)).unwrap();
+        assert_eq!(catalog.lookup("shared").unwrap().description(), "project");
         assert!(!super::config::skill_trust::is_project_skill_scope_trusted(
             home.path(),
             &project.path().canonicalize().unwrap()

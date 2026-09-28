@@ -42,18 +42,27 @@ impl fmt::Display for SkillTrustSaveError {
 impl std::error::Error for SkillTrustSaveError {}
 
 pub(crate) fn is_project_skill_scope_trusted(home: &Path, scope: &Path) -> bool {
-    let Some(scope_key) = canonical_scope_key(scope) else {
+    if !is_canonical_scope(scope) {
+        return false;
+    }
+    let Some(scope) = scope.to_str() else {
         return false;
     };
     read_project_skill_trust_store(&home.join(SKILL_TRUST_FILE))
-        .is_ok_and(|scopes| scopes.contains(&scope_key))
+        .is_ok_and(|scopes| scopes.contains(scope))
 }
 
 pub(crate) fn save_project_skill_scope_trust(
     home: &Path,
     scope: &Path,
 ) -> Result<(), SkillTrustSaveError> {
-    let scope_key = canonical_scope_key(scope).ok_or(SkillTrustSaveError::NonCanonicalScope)?;
+    if !is_canonical_scope(scope) {
+        return Err(SkillTrustSaveError::NonCanonicalScope);
+    }
+    // A non-UTF-8 scope can't be stored, so its trust lasts for this launch only.
+    let Some(scope) = scope.to_str() else {
+        return Ok(());
+    };
     let path = home.join(SKILL_TRUST_FILE);
     let parent = path.parent().ok_or(SkillTrustSaveError::InvalidStore)?;
     fs::create_dir_all(parent).map_err(SkillTrustSaveError::Io)?;
@@ -80,7 +89,7 @@ pub(crate) fn save_project_skill_scope_trust(
     fcntl_lock(&lock_file, FlockOperation::LockExclusive)
         .map_err(|error| SkillTrustSaveError::Io(error.into()))?;
     let mut scopes = read_project_skill_trust_store(&path)?;
-    scopes.insert(scope_key);
+    scopes.insert(scope.to_owned());
     let mut array = Array::new();
     for scope in scopes {
         array.push(scope);
@@ -101,24 +110,8 @@ pub(crate) fn save_project_skill_scope_trust(
         .map_err(|error| SkillTrustSaveError::Io(error.error))
 }
 
-fn canonical_scope_key(scope: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    if !scope.is_absolute() || fs::canonicalize(scope).ok().as_deref() != Some(scope) {
-        return None;
-    }
-    Some(scope_bytes_key(scope.as_os_str().as_bytes()))
-}
-
-fn scope_bytes_key(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut key = String::with_capacity(5 + bytes.len() * 2);
-    key.push_str("unix:");
-    for byte in bytes {
-        key.push(HEX[(byte >> 4) as usize] as char);
-        key.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    key
+fn is_canonical_scope(scope: &Path) -> bool {
+    scope.is_absolute() && fs::canonicalize(scope).ok().as_deref() == Some(scope)
 }
 
 fn read_project_skill_trust_store(path: &Path) -> Result<BTreeSet<String>, SkillTrustSaveError> {
@@ -153,15 +146,7 @@ fn read_project_skill_trust_store(path: &Path) -> Result<BTreeSet<String>, Skill
     let mut scopes = BTreeSet::new();
     for entry in array.iter() {
         let text = entry.as_str().ok_or(SkillTrustSaveError::InvalidStore)?;
-        let Some(hex) = text.strip_prefix("unix:") else {
-            return Err(SkillTrustSaveError::InvalidStore);
-        };
-        if !hex.starts_with("2f")
-            || hex.len() % 2 != 0
-            || !hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !Path::new(text).is_absolute() {
             return Err(SkillTrustSaveError::InvalidStore);
         }
         scopes.insert(text.to_owned());
@@ -208,39 +193,40 @@ mod tests {
             &second_scope
         ));
         let stored = fs::read_to_string(home.path().join(super::SKILL_TRUST_FILE)).unwrap();
-        assert!(stored.contains(&super::canonical_scope_key(&first_scope).unwrap()));
-        assert!(stored.contains(&super::canonical_scope_key(&second_scope).unwrap()));
+        assert!(stored.contains(first_scope.to_str().unwrap()));
+        assert!(stored.contains(second_scope.to_str().unwrap()));
         assert!(!stored.contains("false"));
+    }
+
+    #[test]
+    fn project_skill_trust_reads_hand_written_plain_paths() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let scope = project.path().canonicalize().unwrap();
+        let store = home.path().join(super::SKILL_TRUST_FILE);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(
+            &store,
+            format!("trusted_skill_scopes = [\"{}\"]\n", scope.display()),
+        )
+        .unwrap();
+        assert!(super::is_project_skill_scope_trusted(home.path(), &scope));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn project_skill_trust_round_trips_non_utf8_scope_bytes() {
-        use std::os::unix::ffi::OsStringExt;
+    fn project_skill_trust_does_not_store_non_utf8_scopes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
 
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
-        let name = std::ffi::OsString::from_vec(b"project-\xff".to_vec());
-        let scope = project.path().join(name);
+        let scope = project.path().join(OsStr::from_bytes(b"project-\xff"));
         fs::create_dir(&scope).unwrap();
         let scope = scope.canonicalize().unwrap();
         super::save_project_skill_scope_trust(home.path(), &scope).unwrap();
-        assert!(super::is_project_skill_scope_trusted(home.path(), &scope));
-        let stored = fs::read_to_string(home.path().join(super::SKILL_TRUST_FILE)).unwrap();
-        assert!(!stored.contains('\u{fffd}'));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn project_skill_trust_key_preserves_exact_non_utf8_unix_bytes() {
-        assert_ne!(
-            super::scope_bytes_key(b"/project/\xff"),
-            super::scope_bytes_key(b"/project/\xfe")
-        );
-        assert_eq!(
-            super::scope_bytes_key(b"/project/\xff"),
-            "unix:2f70726f6a6563742fff"
-        );
+        assert!(!home.path().join(super::SKILL_TRUST_FILE).exists());
+        assert!(!super::is_project_skill_scope_trusted(home.path(), &scope));
     }
 
     #[cfg(unix)]
@@ -353,17 +339,22 @@ mod tests {
         ));
         assert!(!super::is_project_skill_scope_trusted(home.path(), &scope));
 
-        let other_home = tempdir().unwrap();
-        let store = other_home.path().join(super::SKILL_TRUST_FILE);
-        fs::create_dir_all(store.parent().unwrap()).unwrap();
-        fs::write(&store, "trusted_skill_scopes = [true]").unwrap();
-        assert!(!super::is_project_skill_scope_trusted(
-            other_home.path(),
-            &scope
-        ));
-        assert!(matches!(
-            super::save_project_skill_scope_trust(other_home.path(), &scope),
-            Err(super::SkillTrustSaveError::InvalidStore)
-        ));
+        for content in [
+            "trusted_skill_scopes = [true]",
+            "trusted_skill_scopes = [\"relative/project\"]",
+        ] {
+            let other_home = tempdir().unwrap();
+            let store = other_home.path().join(super::SKILL_TRUST_FILE);
+            fs::create_dir_all(store.parent().unwrap()).unwrap();
+            fs::write(&store, content).unwrap();
+            assert!(!super::is_project_skill_scope_trusted(
+                other_home.path(),
+                &scope
+            ));
+            assert!(matches!(
+                super::save_project_skill_scope_trust(other_home.path(), &scope),
+                Err(super::SkillTrustSaveError::InvalidStore)
+            ));
+        }
     }
 }
