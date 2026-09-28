@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-#[cfg(unix)]
 use rustix::fs::{Mode, OFlags, openat};
 use yaml_rust2::parser::Parser;
+use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Event, Yaml, YamlLoader};
 
 use crate::model::SkillActivation;
+use crate::prompt;
 
 const MAX_ANCESTOR_DIRS: usize = 32;
 const MAX_PROJECT_ENTRIES: usize = 128;
@@ -30,9 +31,6 @@ pub(crate) const MAX_CATALOG_BYTES: usize = 16 * 1024;
 const MAX_YAML_DEPTH: usize = 64;
 
 const SKILL_FILE: &str = "SKILL.md";
-const CATALOG_HEADER: &str = "## Available skills\n";
-const CATALOG_OMISSION: &str =
-    "Additional model-invocable skills were omitted because the catalog limit was reached.\n";
 
 /// Project roots in precedence order. Discovering this scope reads no SKILL.md.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,53 +331,29 @@ impl Scanner {
             SkillOrigin::Project => self.project_remaining,
             SkillOrigin::User => self.user_remaining,
         };
-        let raw_metadata = match fs::symlink_metadata(source.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => {
-                self.diagnostic(
-                    source.path,
-                    None,
-                    format!("cannot inspect skill root: {error}"),
-                );
+        let root = open_contained_directory(source.path, source.boundary);
+        let (canonical_root, directory) = match root {
+            Ok(opened) => opened,
+            Err(ContainedDirError::Inspect(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return;
             }
-        };
-        if !raw_metadata.is_dir() && !raw_metadata.file_type().is_symlink() {
-            self.diagnostic(source.path, None, "skill root is not a directory");
-            return;
-        }
-        let canonical_root = match fs::canonicalize(source.path) {
-            Ok(path) => path,
             Err(error) => {
-                self.diagnostic(
-                    source.path,
-                    None,
-                    format!("cannot resolve skill root: {error}"),
-                );
-                return;
-            }
-        };
-        if !canonical_root.starts_with(source.boundary) {
-            self.diagnostic(
-                source.path,
-                None,
-                "skill root resolves outside its allowed boundary",
-            );
-            return;
-        }
-        if !canonical_root.is_dir() {
-            self.diagnostic(source.path, None, "skill root is not a directory");
-            return;
-        }
-        let directory = match open_directory_under_boundary(source.boundary, &canonical_root) {
-            Ok(directory) => directory,
-            Err(error) => {
-                self.diagnostic(
-                    source.path,
-                    None,
-                    format!("cannot open skill root safely: {error}"),
-                );
+                let reason = match error {
+                    ContainedDirError::Inspect(error) => {
+                        format!("cannot inspect skill root: {error}")
+                    }
+                    ContainedDirError::NotDirectory => "skill root is not a directory".to_owned(),
+                    ContainedDirError::Resolve(error) => {
+                        format!("cannot resolve skill root: {error}")
+                    }
+                    ContainedDirError::OutsideBoundary => {
+                        "skill root resolves outside its allowed boundary".to_owned()
+                    }
+                    ContainedDirError::Open(error) => {
+                        format!("cannot open skill root safely: {error}")
+                    }
+                };
+                self.diagnostic(source.path, None, reason);
                 return;
             }
         };
@@ -457,63 +431,34 @@ impl Scanner {
     }
 
     fn read_candidate(&self, source: &SourceRoot<'_>, path: &Path) -> Candidate {
-        let raw = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return Candidate::Invalid {
-                    name: valid_directory_name(path),
-                    reason: format!("cannot inspect skill candidate: {error}"),
-                };
-            }
+        let unnamed = |reason: String| Candidate::Invalid {
+            name: valid_directory_name(path),
+            reason,
         };
-        if !raw.is_dir() && !raw.file_type().is_symlink() {
-            return Candidate::NotDirectory;
-        }
-        let canonical_root = match fs::canonicalize(path) {
-            Ok(path) => path,
-            Err(error) => {
-                return Candidate::Invalid {
-                    name: valid_directory_name(path),
-                    reason: format!("cannot resolve skill candidate: {error}"),
-                };
+        let (canonical_root, directory) = match open_contained_directory(path, source.boundary) {
+            Ok(opened) => opened,
+            Err(ContainedDirError::NotDirectory) => return Candidate::NotDirectory,
+            Err(ContainedDirError::Inspect(error)) => {
+                return unnamed(format!("cannot inspect skill candidate: {error}"));
             }
-        };
-        if !canonical_root.starts_with(source.boundary) {
-            return Candidate::Invalid {
-                name: valid_directory_name(path),
-                reason: "skill candidate resolves outside its allowed boundary".to_owned(),
-            };
-        }
-        if !canonical_root.is_dir() {
-            return Candidate::NotDirectory;
-        }
-        let directory = match open_directory_under_boundary(source.boundary, &canonical_root) {
-            Ok(directory) => directory,
-            Err(error) => {
-                return Candidate::Invalid {
-                    name: valid_directory_name(path),
-                    reason: format!("cannot open skill directory: {error}"),
-                };
+            Err(ContainedDirError::Resolve(error)) => {
+                return unnamed(format!("cannot resolve skill candidate: {error}"));
+            }
+            Err(ContainedDirError::OutsideBoundary) => {
+                return unnamed("skill candidate resolves outside its allowed boundary".to_owned());
+            }
+            Err(ContainedDirError::Open(error)) => {
+                return unnamed(format!("cannot open skill directory: {error}"));
             }
         };
         let source_text = match read_skill_file(&directory) {
             Ok(Some(text)) => text,
             Ok(None) => return Candidate::NotDirectory,
-            Err(reason) => {
-                return Candidate::Invalid {
-                    name: valid_directory_name(path),
-                    reason,
-                };
-            }
+            Err(reason) => return unnamed(reason),
         };
         let metadata = match parse_metadata(&source_text, path) {
             Ok(metadata) => metadata,
-            Err(reason) => {
-                return Candidate::Invalid {
-                    name: identified_name(&source_text, path),
-                    reason,
-                };
-            }
+            Err((name, reason)) => return Candidate::Invalid { name, reason },
         };
         Candidate::Skill(Arc::new(Skill {
             name: metadata.name,
@@ -574,7 +519,8 @@ impl Scanner {
             .filter(|(_, skill)| !skill.disable_model_invocation)
             .map(|(name, _)| name.clone())
             .collect();
-        let mut rendered = String::from(CATALOG_HEADER);
+        let omission = format!("{}\n", prompt::skills_catalog_omission());
+        let mut rendered = format!("{}\n", prompt::skills_catalog_header());
         if !guidance.is_empty() {
             rendered.push_str(guidance);
             rendered.push('\n');
@@ -587,7 +533,7 @@ impl Scanner {
             let skill = selected.get(name).unwrap();
             let line = format!("- {}: {}\n", skill.name, skill.description);
             let has_more = index + 1 < all_visible.len();
-            let reserve = if has_more { CATALOG_OMISSION.len() } else { 0 };
+            let reserve = if has_more { omission.len() } else { 0 };
             if rendered.len() + line.len() + reserve > MAX_CATALOG_BYTES {
                 break;
             }
@@ -611,8 +557,8 @@ impl Scanner {
             );
         }
         let omitted_visible = visible_names.len() < all_visible.len();
-        if omitted_visible && rendered.len() + CATALOG_OMISSION.len() <= MAX_CATALOG_BYTES {
-            rendered.push_str(CATALOG_OMISSION);
+        if omitted_visible && rendered.len() + omission.len() <= MAX_CATALOG_BYTES {
+            rendered.push_str(&omission);
         }
         let rendered_catalog = (!visible_names.is_empty()).then_some(rendered);
         SkillCatalog {
@@ -633,6 +579,34 @@ enum Candidate {
     NotDirectory,
 }
 
+enum ContainedDirError {
+    Inspect(io::Error),
+    NotDirectory,
+    Resolve(io::Error),
+    OutsideBoundary,
+    Open(io::Error),
+}
+
+fn open_contained_directory(
+    path: &Path,
+    boundary: &Path,
+) -> Result<(PathBuf, Dir), ContainedDirError> {
+    let metadata = fs::symlink_metadata(path).map_err(ContainedDirError::Inspect)?;
+    if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(ContainedDirError::NotDirectory);
+    }
+    let canonical = fs::canonicalize(path).map_err(ContainedDirError::Resolve)?;
+    if !canonical.starts_with(boundary) {
+        return Err(ContainedDirError::OutsideBoundary);
+    }
+    if !canonical.is_dir() {
+        return Err(ContainedDirError::NotDirectory);
+    }
+    let directory =
+        open_directory_under_boundary(boundary, &canonical).map_err(ContainedDirError::Open)?;
+    Ok((canonical, directory))
+}
+
 fn open_directory_under_boundary(boundary: &Path, target: &Path) -> io::Result<Dir> {
     let relative = target.strip_prefix(boundary).map_err(|_| {
         io::Error::new(
@@ -640,10 +614,7 @@ fn open_directory_under_boundary(boundary: &Path, target: &Path) -> io::Result<D
             "directory lies outside boundary",
         )
     })?;
-    #[cfg(unix)]
     let mut directory = open_canonical_directory(boundary)?;
-    #[cfg(not(unix))]
-    let mut directory = Dir::open_ambient_dir(boundary, ambient_authority())?;
     for component in relative.components() {
         let Component::Normal(name) = component else {
             return Err(io::Error::new(
@@ -656,7 +627,6 @@ fn open_directory_under_boundary(boundary: &Path, target: &Path) -> io::Result<D
     Ok(directory)
 }
 
-#[cfg(unix)]
 fn open_canonical_directory(path: &Path) -> io::Result<Dir> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -683,7 +653,6 @@ fn open_canonical_directory(path: &Path) -> io::Result<Dir> {
     Ok(directory)
 }
 
-#[cfg(unix)]
 fn open_directory_component_no_follow(directory: &Dir, name: &OsStr) -> io::Result<Dir> {
     openat(
         directory,
@@ -693,17 +662,6 @@ fn open_directory_component_no_follow(directory: &Dir, name: &OsStr) -> io::Resu
     )
     .map(|descriptor| Dir::from_std_file(std::fs::File::from(descriptor)))
     .map_err(io::Error::from)
-}
-
-#[cfg(not(unix))]
-fn open_directory_component_no_follow(directory: &Dir, name: &OsStr) -> io::Result<Dir> {
-    if directory.symlink_metadata(name)?.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory component became a symlink",
-        ));
-    }
-    directory.open_dir(name)
 }
 
 struct ParsedMetadata {
@@ -727,7 +685,6 @@ fn read_skill_file(directory: &Dir) -> Result<Option<String>, String> {
     if metadata.len() > MAX_SKILL_BYTES as u64 {
         return Err(format!("SKILL.md exceeds {MAX_SKILL_BYTES} bytes"));
     }
-    #[cfg(unix)]
     let mut file = std::fs::File::from(
         openat(
             directory,
@@ -737,10 +694,6 @@ fn read_skill_file(directory: &Dir) -> Result<Option<String>, String> {
         )
         .map_err(|error| format!("cannot open SKILL.md without following symlinks: {error}"))?,
     );
-    #[cfg(not(unix))]
-    let mut file = directory
-        .open(SKILL_FILE)
-        .map_err(|error| format!("cannot open SKILL.md: {error}"))?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take((MAX_SKILL_BYTES + 1) as u64)
@@ -770,17 +723,38 @@ pub(crate) fn line_count(text: &str) -> usize {
     count
 }
 
-fn parse_metadata(source: &str, path: &Path) -> Result<ParsedMetadata, String> {
-    let (frontmatter, body) = split_frontmatter(source)?;
+/// Errors carry the name the candidate claims, when one can be identified.
+fn parse_metadata(source: &str, path: &Path) -> Result<ParsedMetadata, (Option<String>, String)> {
+    let (frontmatter, body) =
+        split_frontmatter(source).map_err(|reason| (valid_directory_name(path), reason))?;
+    let fields = frontmatter_fields(frontmatter);
+    let identified_name = if let Ok(fields) = &fields
+        && let Some(Yaml::String(name)) = fields.get(&Yaml::String("name".to_owned()))
+        && valid_name(name)
+    {
+        Some(name.clone())
+    } else {
+        valid_directory_name(path)
+    };
     if body.trim().is_empty() {
-        return Err("SKILL.md body is empty".to_owned());
+        return Err((identified_name, "SKILL.md body is empty".to_owned()));
     }
+    fields
+        .and_then(|fields| metadata_from_fields(&fields, path))
+        .map_err(|reason| (identified_name, reason))
+}
+
+fn frontmatter_fields(frontmatter: &str) -> Result<Hash, String> {
     validate_yaml_frontmatter(frontmatter)?;
     let documents = YamlLoader::load_from_str(frontmatter)
         .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
-    let [Yaml::Hash(fields)] = documents.as_slice() else {
+    let Ok([Yaml::Hash(fields)]) = <[Yaml; 1]>::try_from(documents) else {
         return Err("frontmatter must be one YAML mapping".to_owned());
     };
+    Ok(fields)
+}
+
+fn metadata_from_fields(fields: &Hash, path: &Path) -> Result<ParsedMetadata, String> {
     let description = match fields.get(&Yaml::String("description".to_owned())) {
         Some(Yaml::String(value)) => value.split_whitespace().collect::<Vec<_>>().join(" "),
         Some(_) => return Err("description must be a string".to_owned()),
@@ -856,23 +830,13 @@ fn validate_yaml_frontmatter(frontmatter: &str) -> Result<(), String> {
 }
 
 fn split_frontmatter(source: &str) -> Result<(&str, &str), String> {
-    let mut offset = 0;
-    let mut opening = false;
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if !opening {
-            if trimmed != "---" {
-                return Err("SKILL.md must begin with YAML frontmatter".to_owned());
-            }
-            opening = true;
-            offset += line.len();
-            break;
-        }
-    }
-    if !opening {
-        return Err("SKILL.md must begin with YAML frontmatter".to_owned());
-    }
-    let frontmatter_start = offset;
+    let opening = source
+        .split_inclusive('\n')
+        .next()
+        .filter(|line| line.trim_end_matches(['\r', '\n']) == "---")
+        .ok_or_else(|| "SKILL.md must begin with YAML frontmatter".to_owned())?;
+    let frontmatter_start = opening.len();
+    let mut offset = frontmatter_start;
     for line in source[frontmatter_start..].split_inclusive('\n') {
         if line.trim_end_matches(['\r', '\n']) == "---" {
             return Ok((
@@ -913,19 +877,6 @@ fn valid_directory_name(path: &Path) -> Option<String> {
         .and_then(|name| name.to_str())
         .filter(|name| valid_name(name))
         .map(str::to_owned)
-}
-
-fn identified_name(source: &str, path: &Path) -> Option<String> {
-    if let Ok((frontmatter, _)) = split_frontmatter(source)
-        && validate_yaml_frontmatter(frontmatter).is_ok()
-        && let Ok(documents) = YamlLoader::load_from_str(frontmatter)
-        && let [Yaml::Hash(fields)] = documents.as_slice()
-        && let Some(Yaml::String(name)) = fields.get(&Yaml::String("name".to_owned()))
-        && valid_name(name)
-    {
-        return Some(name.clone());
-    }
-    valid_directory_name(path)
 }
 
 #[cfg(test)]
@@ -1559,7 +1510,8 @@ mod tests {
         let fixture = Fixture::new();
         Fixture::skill(&fixture.user_root(), "one", "description: one\n", "body");
         let line = "- one: one\n";
-        let exact_guidance = "g".repeat(MAX_CATALOG_BYTES - CATALOG_HEADER.len() - line.len() - 1);
+        let header = format!("{}\n", crate::prompt::skills_catalog_header());
+        let exact_guidance = "g".repeat(MAX_CATALOG_BYTES - header.len() - line.len() - 1);
         let project = fixture.scope();
         let exact = SkillCatalog::discover(&project, &fixture.home, false, &exact_guidance);
         assert_eq!(exact.rendered_catalog().unwrap().len(), MAX_CATALOG_BYTES);

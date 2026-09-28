@@ -17,6 +17,8 @@ const COMPACTION_UPDATE_PROMPT: &str = include_str!("../prompts/compaction-updat
 const COMPACTION_SPLIT_RUN_PROMPT: &str = include_str!("../prompts/compaction-split-run.md");
 const SKILL_ACTIVATION_PROMPT: &str = include_str!("../prompts/skill-activation.md");
 const SKILLS_CATALOG_GUIDANCE: &str = include_str!("../prompts/skills-catalog.md");
+const SKILLS_CATALOG_HEADER: &str = include_str!("../prompts/skills-catalog-header.md");
+const SKILLS_CATALOG_OMISSION: &str = include_str!("../prompts/skills-catalog-omission.md");
 const BUNDLED_PROMPT_NAME: &str = "system";
 const SYSTEM_PROMPT_ENV: &str = "KIKI_SYSTEM_PROMPT";
 const SKILLS_CATALOG_PROMPT_ENV: &str = "KIKI_SKILLS_CATALOG_PROMPT";
@@ -56,6 +58,14 @@ pub(crate) fn child_prompt(base: &str, catalog: &SkillCatalog, tool_reference: S
 
 pub(crate) fn skills_catalog_guidance() -> &'static str {
     strip_file_final_lf(SKILLS_CATALOG_GUIDANCE)
+}
+
+pub(crate) fn skills_catalog_header() -> &'static str {
+    strip_file_final_lf(SKILLS_CATALOG_HEADER)
+}
+
+pub(crate) fn skills_catalog_omission() -> &'static str {
+    strip_file_final_lf(SKILLS_CATALOG_OMISSION)
 }
 
 pub(crate) fn skill_activation_text(
