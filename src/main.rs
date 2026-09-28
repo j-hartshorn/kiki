@@ -454,30 +454,34 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
     };
     let worker_path = ready.worker_path().to_path_buf();
     let workspace_root = ready.workspace_root().to_path_buf();
-    let skill_scope = ProjectScope::discover(&workspace_root)?;
-    let has_active_project_skill_in_scope =
-        session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?;
-    let (skills_catalog, project_skills_trusted) = match startup_skill_catalog(
-        &skill_scope,
-        &home,
-        ready.skills_catalog_guidance(),
-        has_active_project_skill_in_scope,
-        |scope| {
-            tui::run_project_skill_trust(scope, || {
-                settings::save_project_skill_scope_trust(&home, scope)
-                    .map_err(|error| error.to_string())
-            })
-        },
-    ) {
+    let skill_startup = (|| -> Result<Arc<SkillCatalog>, Box<dyn Error>> {
+        let skill_scope = ProjectScope::discover(&workspace_root)?;
+        let has_active_project_skill_in_scope =
+            session.has_active_project_skill_in_scope(&skill_scope.canonical_scope)?;
+        let (skills_catalog, project_skills_trusted) = startup_skill_catalog(
+            &skill_scope,
+            &home,
+            ready.skills_catalog_guidance(),
+            has_active_project_skill_in_scope,
+            |scope| {
+                tui::run_project_skill_trust(scope, || {
+                    settings::save_project_skill_scope_trust(&home, scope)
+                        .map_err(|error| error.to_string())
+                })
+            },
+        )?;
+        session.configure_skill_projection(SkillProjectionPolicy::new(
+            project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
+        ))?;
+        Ok(skills_catalog)
+    })();
+    let skills_catalog = match skill_startup {
         Ok(catalog) => catalog,
         Err(error) => {
             close_open_session(session, trace_owner)?;
             return Err(error);
         }
     };
-    session.configure_skill_projection(SkillProjectionPolicy::new(
-        project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
-    ))?;
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
     let model = production_model(
