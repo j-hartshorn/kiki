@@ -2219,12 +2219,22 @@ impl ToolHost {
                 skill_name: None,
             }),
             ResourcePath::Skill { name, path } => {
-                let skill = if active_skills.iter().any(|skill| skill.name() == name) {
-                    self.skill_catalog.lookup(&name)
-                } else {
-                    self.skill_catalog.lookup_model_invocable(&name)
-                }
-                .map_err(|error| map_skill_lookup_error(&name, error))?;
+                let skill = self
+                    .skill_catalog
+                    .lookup_model_invocable(&name)
+                    .or_else(|error| {
+                        self.skill_catalog
+                            .lookup(&name)
+                            .ok()
+                            .filter(|skill| {
+                                active_skills.iter().any(|active| {
+                                    active.name() == name
+                                        && active.canonical_root() == skill.canonical_root()
+                                })
+                            })
+                            .ok_or(error)
+                    })
+                    .map_err(|error| map_skill_lookup_error(&name, error))?;
                 Ok(ResolvedResource {
                     directory: skill.directory(),
                     path,
@@ -3988,7 +3998,7 @@ mod tests {
 
     use crate::config::constants::FILE_MAX_BYTES;
     use crate::model::SkillActivation;
-    use crate::skills::{ProjectScope, SkillCatalog};
+    use crate::skills::{ProjectScope, SkillCatalog, SkillOrigin};
 
     use super::{
         ACTIVE_TOOLS, ContentFingerprint, SkillLoadLedger, ToolCall, ToolEffect, ToolError,
@@ -4286,6 +4296,14 @@ mod tests {
                 .unwrap_err();
             assert!(refused.to_string().contains(reason), "{name}: {refused}");
             let active = [SkillActivation::from_skill(catalog.lookup(name).unwrap())];
+            let elsewhere = [SkillActivation::new(
+                name.to_owned(),
+                PathBuf::from("/elsewhere").join(name),
+                "---\ndescription: Other\n---\nbody".to_owned(),
+                SkillOrigin::User,
+                None,
+            )
+            .unwrap()];
             for (tool, path) in [
                 (ToolName::Read, format!("skill://{name}/SKILL.md")),
                 (ToolName::ListDir, format!("skill://{name}/")),
@@ -4297,6 +4315,11 @@ mod tests {
                 );
                 assert!(
                     skill_resource(&host, tool, &path, &active).await.is_ok(),
+                    "{path}"
+                );
+                assert_eq!(
+                    skill_resource(&host, tool, &path, &elsewhere).await,
+                    Err(refused.clone()),
                     "{path}"
                 );
             }
