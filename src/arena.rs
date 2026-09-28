@@ -811,7 +811,6 @@ impl ArenaChildSource {
             model_type_check_disabled: self.model_type_check_disabled,
             execution_timeout: self.execution_timeout,
             clock: self.clock.clone(),
-            last_skill_activations: Vec::new(),
             #[cfg(test)]
             collection_test_gate: self.collection_test_gate.clone(),
             #[cfg(test)]
@@ -843,7 +842,6 @@ pub struct Arena {
     model_type_check_disabled: bool,
     execution_timeout: Duration,
     clock: Arc<dyn ArenaClock>,
-    last_skill_activations: Vec<SkillActivation>,
     #[cfg(test)]
     collection_test_gate: Option<CollectionTestGate>,
     #[cfg(test)]
@@ -948,7 +946,6 @@ impl Arena {
             model_type_check_disabled: false,
             execution_timeout,
             clock,
-            last_skill_activations: Vec::new(),
             #[cfg(test)]
             collection_test_gate: None,
             #[cfg(test)]
@@ -1028,6 +1025,7 @@ impl Arena {
     ) -> Result<Execution, ArenaError> {
         self.execute_with_context(code, cancellation, progress, invocation, true, &[])
             .await
+            .map(|(execution, _)| execution)
     }
 
     #[cfg(test)]
@@ -1046,6 +1044,7 @@ impl Arena {
             &[],
         )
         .await
+        .map(|(execution, _)| execution)
     }
 
     pub(crate) async fn execute_model_code_with_skills_and_context(
@@ -1055,7 +1054,7 @@ impl Arena {
         progress: &mut (impl FnMut(ArenaProgress) + Send),
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
         active_skills: &[SkillActivation],
-    ) -> Result<Execution, ArenaError> {
+    ) -> Result<(Execution, Vec<SkillActivation>), ArenaError> {
         self.execute_with_context(
             code,
             cancellation,
@@ -1075,8 +1074,7 @@ impl Arena {
         invocation: Option<(&AgentInvocationContext, ModelSelection)>,
         skip_type_check: bool,
         active_skills: &[SkillActivation],
-    ) -> Result<Execution, ArenaError> {
-        self.last_skill_activations.clear();
+    ) -> Result<(Execution, Vec<SkillActivation>), ArenaError> {
         let mut skill_ledger =
             SkillLoadLedger::new(active_skills).map_err(|error| ArenaError::Infrastructure {
                 message: format!("active skill ledger is invalid: {error}"),
@@ -1134,9 +1132,11 @@ impl Arena {
 
         match attempt {
             Ok((outcome, state)) => {
-                if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
-                    self.last_skill_activations = skill_ledger.into_captured();
-                }
+                let skill_activations = if matches!(&outcome, ExecutionOutcome::Complete { .. }) {
+                    skill_ledger.into_captured()
+                } else {
+                    Vec::new()
+                };
                 self.checkout = Some(checkout);
                 self.checkpoint = Checkpoint {
                     identity: self.runtime.clone(),
@@ -1144,14 +1144,17 @@ impl Arena {
                     authorisations,
                 };
                 let (tool_calls, read_paths, modified_paths) = interruption.tools.into_parts();
-                Ok(Execution {
-                    stdout: interruption.streams.stdout.finish(),
-                    stderr: interruption.streams.stderr.finish(),
-                    outcome,
-                    tool_calls,
-                    read_paths,
-                    modified_paths,
-                })
+                Ok((
+                    Execution {
+                        stdout: interruption.streams.stdout.finish(),
+                        stderr: interruption.streams.stderr.finish(),
+                        outcome,
+                        tool_calls,
+                        read_paths,
+                        modified_paths,
+                    },
+                    skill_activations,
+                ))
             }
             Err(failure) => {
                 let error = failure
@@ -1164,10 +1167,6 @@ impl Arena {
 
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint.clone()
-    }
-
-    pub(crate) fn take_skill_activations(&mut self) -> Vec<SkillActivation> {
-        std::mem::take(&mut self.last_skill_activations)
     }
 
     #[cfg(test)]
@@ -2921,8 +2920,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let mut arena = arena_with_user_skill(&workspace, &home).await;
-        let execution = arena
-            .execute("await load_skill('review')", &CancellationToken::new())
+        let (execution, captured) = arena
+            .execute_model_code_with_skills_and_context(
+                "await load_skill('review')",
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -2933,7 +2938,6 @@ mod tests {
         assert_eq!(execution.tool_calls[0].tool, ToolName::LoadSkill);
         assert_eq!(execution.tool_calls[0].summary, ToolCallSummary::Count(1));
         assert!(!format!("{execution:?}").contains("PRIVATE_SKILL_BODY"));
-        let captured = arena.take_skill_activations();
         assert_eq!(captured.len(), 1);
         assert!(captured[0].source_text().contains("PRIVATE_SKILL_BODY"));
     }
@@ -2973,10 +2977,13 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let mut arena = arena_with_user_skill(&workspace, &home).await;
-        let execution = arena
-            .execute(
+        let (execution, captured) = arena
+            .execute_model_code_with_skills_and_context(
                 "await load_skill('review')\nraise ValueError('boom')",
                 &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
             )
             .await
             .unwrap();
@@ -2984,7 +2991,7 @@ mod tests {
             execution.outcome,
             ExecutionOutcome::PythonError(_)
         ));
-        assert!(arena.take_skill_activations().is_empty());
+        assert!(captured.is_empty());
     }
 
     #[tokio::test]
@@ -3012,8 +3019,14 @@ mod tests {
             .with_skill_catalog(catalog);
         let mut arena = Arena::new(worker_path(), host).await.unwrap();
         let code = "await load_skill('large-0')\nawait load_skill('large-1')\nawait load_skill('large-2')\nawait load_skill('large-3')\ntry:\n    await load_skill('large-4')\nexcept ValueError:\n    pass";
-        let execution = arena
-            .execute(code, &CancellationToken::new())
+        let (execution, captured) = arena
+            .execute_model_code_with_skills_and_context(
+                code,
+                &CancellationToken::new(),
+                &mut |_| {},
+                None,
+                &[],
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3022,7 +3035,6 @@ mod tests {
         ));
         assert_eq!(execution.tool_calls.len(), 5);
         assert_eq!(execution.tool_calls[4].summary, ToolCallSummary::Failed);
-        let captured = arena.take_skill_activations();
         assert_eq!(captured.len(), 4);
         assert!(!format!("{execution:?}").contains("BODY_SENTINEL"));
     }
@@ -3049,9 +3061,13 @@ mod tests {
             .with_test_gate(gate.clone());
         let mut arena = Arena::new(worker_path(), host).await.unwrap();
         let cancellation = CancellationToken::new();
-        let mut execution = Box::pin(arena.execute(
+        let mut progress = |_| {};
+        let mut execution = Box::pin(arena.execute_model_code_with_skills_and_context(
             "await load_skill('review')\nawait read('blocked')",
             &cancellation,
+            &mut progress,
+            None,
+            &[],
         ));
         tokio::select! {
             _ = gate.wait_until_read_settled() => {}
@@ -3064,7 +3080,6 @@ mod tests {
         }
         cancellation.cancel();
         assert!(matches!(execution.await, Err(ArenaError::Cancelled { .. })));
-        assert!(arena.take_skill_activations().is_empty());
     }
 
     async fn arena_with_collection_limits(

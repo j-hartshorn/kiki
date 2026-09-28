@@ -959,8 +959,7 @@ impl<M: Model> Agent<M> {
                             .await
                     };
                     match execution {
-                        Ok(execution) => {
-                            let skill_activations = self.arena.take_skill_activations();
+                        Ok((execution, skill_activations)) => {
                             let result = CodeResult::execution(execution_feedback(&execution));
                             let code = persisted_code(
                                 &pending,
@@ -1218,8 +1217,7 @@ impl<M: Model> Agent<M> {
                             .await
                     };
                     match execution {
-                        Ok(execution) => {
-                            let skill_activations = self.arena.take_skill_activations();
+                        Ok((execution, skill_activations)) => {
                             let source = pending.source.clone();
                             let commentary = pending.commentary.clone();
                             let reasoning_summary = pending.reasoning_summary.clone();
