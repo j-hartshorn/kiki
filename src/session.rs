@@ -1259,17 +1259,7 @@ impl SessionWriter {
         .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn commit_request(
-        &self,
-        request: String,
-        selection: ModelSelection,
-    ) -> Result<RequestAdmission, SessionError> {
-        self.commit_request_with_skill(request, selection, None)
-            .await
-    }
-
-    pub(crate) async fn commit_request_with_skill(
         &self,
         request: String,
         selection: ModelSelection,
@@ -1306,19 +1296,7 @@ impl SessionWriter {
         .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn settle_execution(
-        &self,
-        run_id: u64,
-        step_id: u64,
-        code: PersistedCode,
-        checkpoint: Checkpoint,
-    ) -> Result<(), SessionError> {
-        self.settle_execution_with_skills(run_id, step_id, code, checkpoint, Vec::new())
-            .await
-    }
-
-    pub(crate) async fn settle_execution_with_skills(
         &self,
         run_id: u64,
         step_id: u64,
@@ -2936,7 +2914,7 @@ fn load_session_restore_for_entry(
         )
         .optional()?;
     transaction.commit()?;
-    Ok(restore_projection_at_with_policy(
+    Ok(restore_projection_at(
         RestoreSnapshot {
             active_entry_id: observed_active_entry_id,
             session_revision,
@@ -3061,24 +3039,15 @@ fn session_catalogue_entry(
 #[cfg(test)]
 fn restore_projection(snapshot: RestoreSnapshot) -> SessionRestore {
     let active_entry_id = snapshot.active_entry_id;
-    restore_projection_at(snapshot, active_entry_id, active_entry_id)
-}
-
-#[cfg(test)]
-fn restore_projection_at(
-    snapshot: RestoreSnapshot,
-    requested_entry_id: i64,
-    effective_entry_id: i64,
-) -> SessionRestore {
-    restore_projection_at_with_policy(
+    restore_projection_at(
         snapshot,
-        requested_entry_id,
-        effective_entry_id,
+        active_entry_id,
+        active_entry_id,
         &SkillProjectionPolicy::default(),
     )
 }
 
-fn restore_projection_at_with_policy(
+fn restore_projection_at(
     snapshot: RestoreSnapshot,
     requested_entry_id: i64,
     effective_entry_id: i64,
@@ -4252,7 +4221,7 @@ mod tests {
             None,
         );
         let first = writer
-            .commit_request_with_skill("first".to_owned(), selection(), Some(user.clone()))
+            .commit_request("first".to_owned(), selection(), Some(user.clone()))
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
@@ -4265,7 +4234,7 @@ mod tests {
             None,
         );
         let notes_run = writer
-            .commit_request_with_skill("notes".to_owned(), selection(), Some(independent.clone()))
+            .commit_request("notes".to_owned(), selection(), Some(independent.clone()))
             .await
             .unwrap();
         close_cancelled(&writer, notes_run.run_id).await;
@@ -4278,7 +4247,7 @@ mod tests {
             Some(scope.clone()),
         );
         let second = writer
-            .commit_request_with_skill("second".to_owned(), selection(), Some(project.clone()))
+            .commit_request("second".to_owned(), selection(), Some(project.clone()))
             .await
             .unwrap();
         close_cancelled(&writer, second.run_id).await;
@@ -4390,7 +4359,7 @@ mod tests {
             vec![&independent]
         );
         let reactivated = writer
-            .commit_request_with_skill(
+            .commit_request(
                 "explicit user reactivation".to_owned(),
                 selection(),
                 Some(user.clone()),
@@ -4427,7 +4396,7 @@ mod tests {
             Some(scope_b.clone()),
         );
         let b_run = writer
-            .commit_request_with_skill("B".to_owned(), selection(), Some(b_skill))
+            .commit_request("B".to_owned(), selection(), Some(b_skill))
             .await
             .unwrap();
         close_cancelled(&writer, b_run.run_id).await;
@@ -4448,7 +4417,7 @@ mod tests {
             Some(scope_a),
         );
         let a_run = writer
-            .commit_request_with_skill("A".to_owned(), selection(), Some(a_skill))
+            .commit_request("A".to_owned(), selection(), Some(a_skill))
             .await
             .unwrap();
         close_cancelled(&writer, a_run.run_id).await;
@@ -4490,7 +4459,7 @@ mod tests {
             Some(scope.clone()),
         );
         let first = writer
-            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .commit_request("project".to_owned(), selection(), Some(project))
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
@@ -4503,7 +4472,7 @@ mod tests {
             None,
         );
         let second = writer
-            .commit_request_with_skill("user".to_owned(), selection(), Some(user.clone()))
+            .commit_request("user".to_owned(), selection(), Some(user.clone()))
             .await
             .unwrap();
         close_cancelled(&writer, second.run_id).await;
@@ -4539,7 +4508,7 @@ mod tests {
             Some(scope.clone()),
         );
         let run = writer
-            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .commit_request("project".to_owned(), selection(), Some(project))
             .await
             .unwrap();
         close_cancelled(&writer, run.run_id).await;
@@ -4561,7 +4530,7 @@ mod tests {
                 None,
             );
             let run = writer
-                .commit_request_with_skill(name.to_owned(), selection(), Some(user))
+                .commit_request(name.to_owned(), selection(), Some(user))
                 .await
                 .unwrap();
             close_cancelled(&writer, run.run_id).await;
@@ -4593,7 +4562,7 @@ mod tests {
             Some(scope.clone()),
         );
         let run = writer
-            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .commit_request("project".to_owned(), selection(), Some(project))
             .await
             .unwrap();
         close_cancelled(&writer, run.run_id).await;
@@ -4631,7 +4600,7 @@ mod tests {
             Some(scope.clone()),
         );
         let run = writer
-            .commit_request_with_skill("inspect".to_owned(), selection(), Some(project))
+            .commit_request("inspect".to_owned(), selection(), Some(project))
             .await
             .unwrap();
         settle_fixture_execution(&session, &writer, run.run_id, "pass", None, Vec::new()).await;
@@ -4675,7 +4644,7 @@ mod tests {
                 Some(scope_a.clone()),
             );
             let run = writer
-                .commit_request_with_skill(name, selection(), Some(activation))
+                .commit_request(name, selection(), Some(activation))
                 .await
                 .unwrap();
             close_cancelled(&writer, run.run_id).await;
@@ -4699,7 +4668,7 @@ mod tests {
                 Some(scope_b.clone()),
             );
             let run = writer
-                .commit_request_with_skill(name, selection(), Some(activation))
+                .commit_request(name, selection(), Some(activation))
                 .await
                 .unwrap();
             close_cancelled(&writer, run.run_id).await;
@@ -4733,7 +4702,7 @@ mod tests {
                 None,
             );
             let user_run = writer
-                .commit_request_with_skill(format!("user {index}"), selection(), Some(user))
+                .commit_request(format!("user {index}"), selection(), Some(user))
                 .await
                 .unwrap();
             close_cancelled(&writer, user_run.run_id).await;
@@ -4745,7 +4714,7 @@ mod tests {
                 Some(scope.clone()),
             );
             let project_run = writer
-                .commit_request_with_skill(format!("project {index}"), selection(), Some(project))
+                .commit_request(format!("project {index}"), selection(), Some(project))
                 .await
                 .unwrap();
             close_cancelled(&writer, project_run.run_id).await;
@@ -4758,7 +4727,7 @@ mod tests {
             None,
         );
         let last = writer
-            .commit_request_with_skill(
+            .commit_request(
                 "independent".to_owned(),
                 selection(),
                 Some(independent.clone()),
@@ -4837,7 +4806,7 @@ mod tests {
         let body = "---\nname: shared\ndescription: Same\n---\nSame text";
         let user = skill("shared", source.clone(), body, SkillOrigin::User, None);
         let first = writer
-            .commit_request_with_skill("user".to_owned(), selection(), Some(user))
+            .commit_request("user".to_owned(), selection(), Some(user))
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
@@ -4849,7 +4818,7 @@ mod tests {
             Some(scope.clone()),
         );
         let second = writer
-            .commit_request_with_skill("project".to_owned(), selection(), Some(project.clone()))
+            .commit_request("project".to_owned(), selection(), Some(project.clone()))
             .await
             .unwrap();
         assert_ne!(second.effective_entry, second.request_entry);
@@ -4909,7 +4878,7 @@ mod tests {
             Some(scope.clone()),
         );
         let first = writer
-            .commit_request_with_skill("outer".to_owned(), selection(), Some(outer))
+            .commit_request("outer".to_owned(), selection(), Some(outer))
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
@@ -4921,7 +4890,7 @@ mod tests {
             Some(nested_scope.clone()),
         );
         let second = writer
-            .commit_request_with_skill("inner".to_owned(), selection(), Some(inner.clone()))
+            .commit_request("inner".to_owned(), selection(), Some(inner.clone()))
             .await
             .unwrap();
         assert_ne!(second.effective_entry, second.request_entry);
@@ -4973,7 +4942,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("load".to_owned(), selection())
+            .commit_request("load".to_owned(), selection(), None)
             .await
             .unwrap();
         let step = writer.start_model_step(run.run_id).await.unwrap();
@@ -5011,7 +4980,7 @@ mod tests {
             None,
         );
         writer
-            .settle_execution_with_skills(
+            .settle_execution(
                 run.run_id,
                 step,
                 make_code("batch-1"),
@@ -5053,7 +5022,7 @@ mod tests {
             .collect();
         assert!(
             writer
-                .settle_execution_with_skills(
+                .settle_execution(
                     run.run_id,
                     next_step,
                     make_code("batch-2"),
@@ -5105,7 +5074,7 @@ mod tests {
         );
         assert!(
             writer
-                .settle_execution_with_skills(
+                .settle_execution(
                     run.run_id,
                     next_step,
                     make_code("batch-2"),
@@ -5149,7 +5118,7 @@ mod tests {
             None,
         );
         let first = writer
-            .commit_request_with_skill(
+            .commit_request(
                 "old request".to_owned(),
                 selection(),
                 Some(activation.clone()),
@@ -5211,12 +5180,12 @@ mod tests {
             None,
         );
         let first = writer
-            .commit_request_with_skill("first".to_owned(), selection(), Some(activation.clone()))
+            .commit_request("first".to_owned(), selection(), Some(activation.clone()))
             .await
             .unwrap();
         close_cancelled(&writer, first.run_id).await;
         let second = writer
-            .commit_request_with_skill("second".to_owned(), selection(), Some(activation.clone()))
+            .commit_request("second".to_owned(), selection(), Some(activation.clone()))
             .await
             .unwrap();
         assert_eq!(second.effective_entry, second.request_entry);
@@ -5259,7 +5228,7 @@ mod tests {
             Some(scope.clone()),
         );
         let run = writer
-            .commit_request_with_skill("inspect".to_owned(), selection(), Some(activation))
+            .commit_request("inspect".to_owned(), selection(), Some(activation))
             .await
             .unwrap();
         close_cancelled(&writer, run.run_id).await;
@@ -5291,7 +5260,7 @@ mod tests {
 
     async fn append_cancelled_request(writer: &SessionWriter, request: &str) {
         let admission = writer
-            .commit_request(request.to_owned(), selection())
+            .commit_request(request.to_owned(), selection(), None)
             .await
             .expect("commit request");
         writer
@@ -5317,7 +5286,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let completed = writer
-            .commit_request("completed branch".to_owned(), selection())
+            .commit_request("completed branch".to_owned(), selection(), None)
             .await
             .expect("commit completed branch");
         writer
@@ -5614,6 +5583,7 @@ mod tests {
                 session
                     .initial_checkpoint()
                     .expect("load fixture checkpoint"),
+                Vec::new(),
             )
             .await
             .expect("settle fixture execution");
@@ -6040,7 +6010,7 @@ mod tests {
             .expect("read root entry");
 
         let first_run = writer
-            .commit_request("first branch request".to_owned(), selection())
+            .commit_request("first branch request".to_owned(), selection(), None)
             .await
             .expect("commit first request")
             .run_id;
@@ -6060,6 +6030,7 @@ mod tests {
                 first_step,
                 persisted_execution("first_value = 1", first_execution),
                 first_checkpoint.clone(),
+                Vec::new(),
             )
             .await
             .expect("settle first execution");
@@ -6146,7 +6117,7 @@ mod tests {
             .sync_model_context_for_test()
             .expect("sync root fixture context");
         let sibling_run = writer
-            .commit_request("sibling branch request".to_owned(), selection())
+            .commit_request("sibling branch request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -6165,6 +6136,7 @@ mod tests {
                 sibling_step,
                 persisted_execution("sibling_value = 2", sibling_execution),
                 sibling_arena.checkpoint(),
+                Vec::new(),
             )
             .await
             .expect("settle sibling execution");
@@ -6253,7 +6225,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("original request".to_owned(), selection())
+            .commit_request("original request".to_owned(), selection(), None)
             .await
             .expect("commit original request")
             .run_id;
@@ -6332,7 +6304,7 @@ mod tests {
         assert_eq!(selection_snapshot(&session), after_selection);
         let writer = session.writer();
         writer
-            .commit_request("branched request".to_owned(), selection())
+            .commit_request("branched request".to_owned(), selection(), None)
             .await
             .expect("commit branched request");
         let connection = session
@@ -6373,7 +6345,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
 
         let original = writer
-            .commit_request("original request".to_owned(), selection())
+            .commit_request("original request".to_owned(), selection(), None)
             .await
             .expect("commit original request");
         assert_eq!(
@@ -6404,7 +6376,7 @@ mod tests {
             .expect("select original request parent");
 
         let corrected = writer
-            .commit_request("corrected request".to_owned(), selection())
+            .commit_request("corrected request".to_owned(), selection(), None)
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -6456,7 +6428,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("request to correct".to_owned(), selection())
+            .commit_request("request to correct".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -6487,7 +6459,7 @@ mod tests {
         assert_eq!(selected.effective_entry, SessionEntryId(root as u64));
         assert!(selected.records.is_empty());
         writer
-            .commit_request("corrected request".to_owned(), selection())
+            .commit_request("corrected request".to_owned(), selection(), None)
             .await
             .expect("commit corrected request");
         assert_eq!(
@@ -6549,7 +6521,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let completed_run = writer
-            .commit_request("completed request".to_owned(), selection())
+            .commit_request("completed request".to_owned(), selection(), None)
             .await
             .expect("commit completed request")
             .run_id;
@@ -6614,7 +6586,7 @@ mod tests {
         );
 
         let open_run = writer
-            .commit_request("open request".to_owned(), selection())
+            .commit_request("open request".to_owned(), selection(), None)
             .await
             .expect("commit open request")
             .run_id;
@@ -6661,7 +6633,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("pending step request".to_owned(), selection())
+            .commit_request("pending step request".to_owned(), selection(), None)
             .await
             .expect("commit pending step request")
             .run_id;
@@ -6733,7 +6705,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("task request".to_owned(), selection())
+            .commit_request("task request".to_owned(), selection(), None)
             .await
             .expect("commit task request")
             .run_id;
@@ -6833,7 +6805,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("gated request".to_owned(), selection())
+            .commit_request("gated request".to_owned(), selection(), None)
             .await
             .expect("commit gated request")
             .run_id;
@@ -6888,7 +6860,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let run = writer
-            .commit_request("failing selection request".to_owned(), selection())
+            .commit_request("failing selection request".to_owned(), selection(), None)
             .await
             .expect("commit failing selection request")
             .run_id;
@@ -6951,7 +6923,7 @@ mod tests {
         let root_checkpoint = session.initial_checkpoint().expect("load root checkpoint");
 
         let final_run = writer
-            .commit_request("final request".to_owned(), selection())
+            .commit_request("final request".to_owned(), selection(), None)
             .await
             .expect("commit final request")
             .run_id;
@@ -6988,7 +6960,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("cancelled request".to_owned(), selection())
+            .commit_request("cancelled request".to_owned(), selection(), None)
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -7008,7 +6980,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("failed request".to_owned(), selection())
+            .commit_request("failed request".to_owned(), selection(), None)
             .await
             .expect("commit failed request")
             .run_id;
@@ -7155,7 +7127,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         writer
-            .commit_request("known request".to_owned(), selection())
+            .commit_request("known request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before: (i64, i64, i64) = session
@@ -7199,7 +7171,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let final_run = writer
-            .commit_request("catalogue request".to_owned(), selection())
+            .commit_request("catalogue request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -7258,7 +7230,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let cancelled_run = writer
-            .commit_request("catalogue cancelled".to_owned(), selection())
+            .commit_request("catalogue cancelled".to_owned(), selection(), None)
             .await
             .expect("commit cancelled request")
             .run_id;
@@ -7278,7 +7250,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let failed_run = writer
-            .commit_request("catalogue failed".to_owned(), selection())
+            .commit_request("catalogue failed".to_owned(), selection(), None)
             .await
             .expect("commit failed request")
             .run_id;
@@ -7369,7 +7341,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -7412,7 +7384,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let hidden_run = writer
-            .commit_request("hidden request".to_owned(), selection())
+            .commit_request("hidden request".to_owned(), selection(), None)
             .await
             .expect("commit hidden request")
             .run_id;
@@ -7521,7 +7493,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -7551,7 +7523,7 @@ mod tests {
 
         set_active_entry(&session, root);
         writer
-            .commit_request("corrupt sibling request".to_owned(), selection())
+            .commit_request("corrupt sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request");
         let corrupt_request = active_entry_id(&session);
@@ -7595,7 +7567,7 @@ mod tests {
         let writer = session.writer();
         let root = active_entry_id(&session);
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -7625,7 +7597,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned(), selection())
+            .commit_request("sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -7688,7 +7660,7 @@ mod tests {
         let root = active_entry_id(&session);
 
         let selected_run = writer
-            .commit_request("selected request".to_owned(), selection())
+            .commit_request("selected request".to_owned(), selection(), None)
             .await
             .expect("commit selected request")
             .run_id;
@@ -7718,7 +7690,7 @@ mod tests {
 
         set_active_entry(&session, root);
         let sibling_run = writer
-            .commit_request("sibling request".to_owned(), selection())
+            .commit_request("sibling request".to_owned(), selection(), None)
             .await
             .expect("commit sibling request")
             .run_id;
@@ -7763,7 +7735,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("restore target".to_owned(), selection())
+            .commit_request("restore target".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -8290,7 +8262,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         session
             .writer()
-            .commit_request("readable request".to_owned(), selection())
+            .commit_request("readable request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         session
@@ -8366,7 +8338,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run = writer
-            .commit_request("persist file operations".to_owned(), selection())
+            .commit_request("persist file operations".to_owned(), selection(), None)
             .await
             .expect("commit request");
         settle_fixture_execution_with(
@@ -9002,7 +8974,7 @@ mod tests {
                 let signal = match milestone.as_str() {
                     "generation" => {
                         let run_id = writer
-                            .commit_request("generation interruption".to_owned(), selection())
+                            .commit_request("generation interruption".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -9014,7 +8986,7 @@ mod tests {
                     }
                     "execution" => {
                         let run_id = writer
-                            .commit_request("execution interruption".to_owned(), selection())
+                            .commit_request("execution interruption".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -9039,7 +9011,11 @@ mod tests {
                     }
                     "committed-step" => {
                         let run_id = writer
-                            .commit_request("committed step interruption".to_owned(), selection())
+                            .commit_request(
+                                "committed step interruption".to_owned(),
+                                selection(),
+                                None,
+                            )
                             .await
                             .expect("commit request")
                             .run_id;
@@ -9064,6 +9040,7 @@ mod tests {
                                 settled_step,
                                 persisted_execution(source, execution),
                                 arena.checkpoint(),
+                                Vec::new(),
                             )
                             .await
                             .expect("commit settled step");
@@ -9086,7 +9063,7 @@ mod tests {
                     }
                     "background-only" => {
                         let run_id = writer
-                            .commit_request("closed foreground".to_owned(), selection())
+                            .commit_request("closed foreground".to_owned(), selection(), None)
                             .await
                             .expect("commit request")
                             .run_id;
@@ -9288,7 +9265,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned(), selection())
+            .commit_request("interrupted request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9400,7 +9377,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("closed foreground".to_owned(), selection())
+            .commit_request("closed foreground".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9709,7 +9686,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("combined interruption".to_owned(), selection())
+            .commit_request("combined interruption".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -9977,7 +9954,7 @@ mod tests {
         let id = session.id().to_owned();
         let writer = session.writer();
         let run_id = writer
-            .commit_request("interrupted request".to_owned(), selection())
+            .commit_request("interrupted request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -10083,7 +10060,7 @@ mod tests {
         );
 
         let admission = writer
-            .commit_request("saved request".to_owned(), selection())
+            .commit_request("saved request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step = writer
@@ -10149,7 +10126,7 @@ mod tests {
         let terra = ModelSelection::new(&TERRA, "high").expect("select Terra");
         for (request, selection) in [("first request", selection()), ("second request", terra)] {
             let admission = writer
-                .commit_request(request.to_owned(), selection)
+                .commit_request(request.to_owned(), selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -10215,7 +10192,7 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let admission = writer
-            .commit_request("branch request".to_owned(), selection())
+            .commit_request("branch request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         writer
@@ -10282,7 +10259,7 @@ mod tests {
             let session = create_session(&home, &workspace).await;
             let writer = session.writer();
             let run = writer
-                .commit_request(format!("unfinished {unfinished}"), selection())
+                .commit_request(format!("unfinished {unfinished}"), selection(), None)
                 .await
                 .expect("commit request");
             match unfinished {
@@ -10338,6 +10315,7 @@ mod tests {
                                 attempts: Vec::new(),
                             },
                             session.initial_checkpoint().expect("load checkpoint"),
+                            Vec::new(),
                         )
                         .await
                         .expect("settle task origin step");
@@ -10555,7 +10533,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid execution projection".to_owned(), selection())
+            .commit_request("invalid execution projection".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let step = writer
@@ -10574,6 +10552,7 @@ mod tests {
                     step,
                     projection_code(crate::model::CodeResult::execution(String::new()), false),
                     checkpoint,
+                    Vec::new(),
                 )
                 .await,
             Err(SessionError::InvalidTransition)
@@ -10600,7 +10579,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run = writer
-            .commit_request("invalid terminal projection".to_owned(), selection())
+            .commit_request("invalid terminal projection".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before_selection = selection_snapshot(&session);
@@ -10646,7 +10625,7 @@ mod tests {
         let before_history = writer.model_history().expect("read live history");
         assert!(matches!(
             writer
-                .commit_request("stale request".to_owned(), selection())
+                .commit_request("stale request".to_owned(), selection(), None)
                 .await,
             Err(SessionError::InvalidTransition)
         ));
@@ -10666,7 +10645,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale settlement".to_owned(), selection())
+            .commit_request("stale settlement".to_owned(), selection(), None)
             .await
             .expect("commit settlement request");
         let step = writer
@@ -10700,6 +10679,7 @@ mod tests {
                         attempts: Vec::new(),
                     },
                     session.initial_checkpoint().expect("load checkpoint"),
+                    Vec::new(),
                 )
                 .await,
             Err(SessionError::InvalidTransition)
@@ -10720,7 +10700,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("create workspace");
         let (session, writer, branch) = stale_parent_fixture(&home, &workspace).await;
         let request = writer
-            .commit_request("stale closure".to_owned(), selection())
+            .commit_request("stale closure".to_owned(), selection(), None)
             .await
             .expect("commit closure request");
         move_durable_active_entry(&session, branch);
@@ -10761,7 +10741,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let admission = writer
-            .commit_request("context request".to_owned(), selection())
+            .commit_request("context request".to_owned(), selection(), None)
             .await
             .expect("commit request");
         let before = writer.model_history().expect("read request context");
@@ -10808,7 +10788,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("persist this request".to_owned(), selection())
+            .commit_request("persist this request".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -10844,6 +10824,7 @@ mod tests {
                 code_step,
                 code,
                 session.initial_checkpoint().unwrap(),
+                Vec::new(),
             )
             .await
             .expect("settle code step");
@@ -10923,7 +10904,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback allocation".to_owned(), selection())
+            .commit_request("rollback allocation".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -10969,7 +10950,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("rollback".to_owned(), selection())
+            .commit_request("rollback".to_owned(), selection(), None)
             .await
             .expect("commit request")
             .run_id;
@@ -11006,7 +10987,13 @@ mod tests {
         };
         assert!(
             writer
-                .settle_execution(run_id, step_id, code, session.initial_checkpoint().unwrap())
+                .settle_execution(
+                    run_id,
+                    step_id,
+                    code,
+                    session.initial_checkpoint().unwrap(),
+                    Vec::new()
+                )
                 .await
                 .is_err()
         );
@@ -11040,7 +11027,7 @@ mod tests {
         let session = create_session(&home, &workspace).await;
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection())
+            .commit_request("parent".to_owned(), selection(), None)
             .await
             .expect("start parent run")
             .run_id;
@@ -11633,7 +11620,7 @@ mod tests {
         let writer = session.writer();
 
         let discarded = writer
-            .commit_request("discarded request".to_owned(), selection())
+            .commit_request("discarded request".to_owned(), selection(), None)
             .await
             .expect("commit discarded request");
         let discarded_step = writer
@@ -11659,7 +11646,7 @@ mod tests {
             .await
             .expect("close discarded run");
         let retained = writer
-            .commit_request("retained request".to_owned(), selection())
+            .commit_request("retained request".to_owned(), selection(), None)
             .await
             .expect("commit retained request");
         let retained_step = writer
@@ -11908,7 +11895,7 @@ mod tests {
             .await
             .expect("select reopened compaction");
         let child = reopened_writer
-            .commit_request("branch request".to_owned(), selection())
+            .commit_request("branch request".to_owned(), selection(), None)
             .await
             .expect("branch from applied compaction");
         let child_parent: i64 = reopened
@@ -12057,7 +12044,7 @@ mod tests {
                 .await
                 .expect("select compaction branch");
             let child = writer
-                .commit_request(format!("branch from {summary}"), selection())
+                .commit_request(format!("branch from {summary}"), selection(), None)
                 .await
                 .expect("branch from compaction");
             let child_parent: i64 = session
@@ -12144,7 +12131,7 @@ mod tests {
                 .await
                 .expect("select compaction outcome");
             let child = writer
-                .commit_request("branch request".to_owned(), selection())
+                .commit_request("branch request".to_owned(), selection(), None)
                 .await
                 .expect("branch from compaction outcome");
             let child_parent: i64 = session

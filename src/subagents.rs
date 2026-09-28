@@ -4552,7 +4552,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -4974,7 +4974,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -5652,7 +5652,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -6516,7 +6516,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("parent".to_owned(), selection)
+            .commit_request("parent".to_owned(), selection, None)
             .await
             .expect("start parent run")
             .run_id;
@@ -8008,11 +8008,12 @@ mod tests {
         .await
         .expect("create parent arena");
         parent
-            .execute_model_code_with_progress_and_context(
+            .execute_model_code(
                 "inherited = 41\nresult_values = {'parent': 'kept'}",
                 &CancellationToken::new(),
                 &mut |_| {},
                 None,
+                &[],
             )
             .await
             .expect("initialise parent state");

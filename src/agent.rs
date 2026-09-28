@@ -701,20 +701,7 @@ impl<M: Model> Agent<M> {
             .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn run_persisted(
-        &mut self,
-        selection: ModelSelection,
-        request: String,
-        cancellation: &CancellationToken,
-        writer: &SessionWriter,
-        event: &mut (impl FnMut(PersistedAgentEvent) + Send),
-    ) -> Result<PersistedRunOutcome, SessionError> {
-        self.run_persisted_with_skill(selection, request, None, cancellation, writer, event)
-            .await
-    }
-
-    pub(crate) async fn run_persisted_with_skill(
         &mut self,
         selection: ModelSelection,
         request: String,
@@ -724,7 +711,7 @@ impl<M: Model> Agent<M> {
         event: &mut (impl FnMut(PersistedAgentEvent) + Send),
     ) -> Result<PersistedRunOutcome, SessionError> {
         let admission = writer
-            .commit_request_with_skill(request.clone(), selection, activation)
+            .commit_request(request.clone(), selection, activation)
             .await?;
         let run_id = admission.run_id;
         event(PersistedAgentEvent::RequestCommitted {
@@ -943,7 +930,7 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_model_code_with_skills_and_context(
+                            .execute_model_code(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
@@ -965,7 +952,7 @@ impl<M: Model> Agent<M> {
                             );
                             let checkpoint = self.arena.checkpoint();
                             writer
-                                .settle_execution_with_skills(
+                                .settle_execution(
                                     run_id,
                                     step_id,
                                     code,
@@ -1201,7 +1188,7 @@ impl<M: Model> Agent<M> {
                             }
                         };
                         self.arena
-                            .execute_model_code_with_skills_and_context(
+                            .execute_model_code(
                                 &pending.source,
                                 cancellation,
                                 &mut arena_progress,
@@ -1606,6 +1593,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "review".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -1681,6 +1669,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "use both".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -1807,7 +1796,7 @@ mod tests {
     async fn seed_compactable_history(writer: &SessionWriter) {
         for label in ["discarded", "retained"] {
             let admission = writer
-                .commit_request(format!("{label} request"), default_selection())
+                .commit_request(format!("{label} request"), default_selection(), None)
                 .await
                 .expect("commit compaction fixture request");
             let step_id = writer
@@ -2039,6 +2028,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "next request".to_owned(),
+                None,
                 &next_cancellation,
                 &writer,
                 &mut |event| events.push(event),
@@ -2074,7 +2064,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -2414,6 +2404,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "inspect".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |event| events.push(event),
@@ -3431,6 +3422,7 @@ mod tests {
             let run = agent.run_persisted(
                 selection,
                 "time out then cancel".to_owned(),
+                None,
                 &cancellation,
                 &writer,
                 &mut event,
@@ -3509,6 +3501,7 @@ mod tests {
                 .run_persisted(
                     selection,
                     "request entry".to_owned(),
+                    None,
                     &CancellationToken::new(),
                     &session.writer(),
                     &mut event,

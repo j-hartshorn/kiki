@@ -1785,7 +1785,7 @@ impl<M: Model> RuntimeController<M> {
                     }
                 };
                 agent
-                    .run_persisted_with_skill(
+                    .run_persisted(
                         selection,
                         request,
                         activation,
@@ -2528,6 +2528,7 @@ mod tests {
                 .commit_request(
                     format!("{label} request"),
                     ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                    None,
                 )
                 .await
                 .expect("commit compaction fixture request");
@@ -3317,7 +3318,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -3656,7 +3657,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -3782,7 +3783,7 @@ mod tests {
             "second ".to_owned() + &"y".repeat(100_000),
         ] {
             let admission = writer
-                .commit_request(request, selection)
+                .commit_request(request, selection, None)
                 .await
                 .expect("commit request");
             writer
@@ -3913,7 +3914,7 @@ mod tests {
             let writer = session.writer();
             seed_compactable_history(&writer).await;
             let admission = writer
-                .commit_request("race winner".to_owned(), selection)
+                .commit_request("race winner".to_owned(), selection, None)
                 .await
                 .expect("commit race request");
             let terminal = if terminal_kind == "final" {
@@ -4633,7 +4634,7 @@ mod tests {
             summary_started.notified().await;
             if failure == "expected leaf" {
                 let admission = writer
-                    .commit_request("concurrent leaf".to_owned(), selection)
+                    .commit_request("concurrent leaf".to_owned(), selection, None)
                     .await
                     .expect("advance selected leaf");
                 let step_id = writer
@@ -4725,7 +4726,7 @@ mod tests {
             .expect("create session");
         let writer = session.writer();
         let prior = writer
-            .commit_request("saved request".to_owned(), selection)
+            .commit_request("saved request".to_owned(), selection, None)
             .await
             .expect("commit saved request");
         writer
@@ -4753,6 +4754,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "next request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut event,
@@ -4951,7 +4953,7 @@ mod tests {
             )
             .unwrap();
             let admission = writer
-                .commit_request_with_skill(format!("seed {index}"), selection, Some(activation))
+                .commit_request(format!("seed {index}"), selection, Some(activation))
                 .await
                 .unwrap();
             writer
@@ -8621,6 +8623,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "first request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -8675,6 +8678,7 @@ mod tests {
             .run_persisted(
                 selection,
                 "second request".to_owned(),
+                None,
                 &CancellationToken::new(),
                 &writer,
                 &mut |_| {},
@@ -8790,7 +8794,7 @@ mod tests {
             .expect("create session");
         session
             .writer()
-            .commit_request("readable saved request".to_owned(), selection)
+            .commit_request("readable saved request".to_owned(), selection, None)
             .await
             .expect("commit readable request");
         let saved_metadata = session.metadata().expect("read saved metadata");
@@ -8902,7 +8906,7 @@ mod tests {
         drop(saved_arena);
         session
             .writer()
-            .commit_request("readable saved request".to_owned(), saved_selection)
+            .commit_request("readable saved request".to_owned(), saved_selection, None)
             .await
             .expect("commit readable request");
         let metadata_before: (String, String, i64, i64) = session
@@ -15276,7 +15280,7 @@ mod tests {
         .expect("create session");
         let writer = session.writer();
         let run_id = writer
-            .commit_request("readable saved request".to_owned(), selection)
+            .commit_request("readable saved request".to_owned(), selection, None)
             .await
             .expect("commit readable request")
             .run_id;
@@ -15310,6 +15314,7 @@ mod tests {
                     attempts: Vec::new(),
                 },
                 incompatible,
+                Vec::new(),
             )
             .await
             .expect("persist incompatible checkpoint");
@@ -15590,6 +15595,7 @@ mod tests {
             .commit_request(
                 "sibling request".to_owned(),
                 ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                None,
             )
             .await
             .expect("commit sibling request")
@@ -15611,13 +15617,8 @@ mod tests {
             .await
             .expect("restore root checkpoint");
         let source = "sibling_value = 99\nresult_values = {'sibling': sibling_value}";
-        let execution = sibling_arena
-            .execute_model_code_with_progress_and_context(
-                source,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+        let (execution, _) = sibling_arena
+            .execute_model_code(source, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
             .expect("execute sibling branch");
         assert!(matches!(
@@ -15642,6 +15643,7 @@ mod tests {
                     attempts: vec![sibling_execution_attempt.clone()],
                 },
                 sibling_checkpoint,
+                Vec::new(),
             )
             .await
             .expect("settle sibling execution");
@@ -16435,6 +16437,7 @@ mod tests {
             .commit_request(
                 request.to_owned(),
                 ModelSelection::new(DEFAULT_MODEL, DEFAULT_MODEL.default_thinking).unwrap(),
+                None,
             )
             .await
             .expect("commit branch request")
@@ -16443,13 +16446,8 @@ mod tests {
             .start_model_step(run_id)
             .await
             .expect("start branch execution");
-        let execution = arena
-            .execute_model_code_with_progress_and_context(
-                source,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+        let (execution, _) = arena
+            .execute_model_code(source, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
             .expect("execute branch state");
         let checkpoint = arena.checkpoint();
@@ -16468,6 +16466,7 @@ mod tests {
                     attempts: Vec::new(),
                 },
                 checkpoint.clone(),
+                Vec::new(),
             )
             .await
             .expect("settle branch execution");
@@ -18050,7 +18049,7 @@ mod tests {
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let writer = session.writer();
         let run = writer
-            .commit_request("prefilled request".to_owned(), selection)
+            .commit_request("prefilled request".to_owned(), selection, None)
             .await
             .expect("commit request")
             .run_id;

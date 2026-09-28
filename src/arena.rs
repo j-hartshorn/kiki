@@ -1028,26 +1028,7 @@ impl Arena {
             .map(|(execution, _)| execution)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn execute_model_code_with_progress_and_context(
-        &mut self,
-        code: &str,
-        cancellation: &CancellationToken,
-        progress: &mut (impl FnMut(ArenaProgress) + Send),
-        invocation: Option<(&AgentInvocationContext, ModelSelection)>,
-    ) -> Result<Execution, ArenaError> {
-        self.execute_model_code_with_skills_and_context(
-            code,
-            cancellation,
-            progress,
-            invocation,
-            &[],
-        )
-        .await
-        .map(|(execution, _)| execution)
-    }
-
-    pub(crate) async fn execute_model_code_with_skills_and_context(
+    pub(crate) async fn execute_model_code(
         &mut self,
         code: &str,
         cancellation: &CancellationToken,
@@ -2921,7 +2902,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut arena = arena_with_user_skill(&workspace, &home).await;
         let (execution, captured) = arena
-            .execute_model_code_with_skills_and_context(
+            .execute_model_code(
                 "await load_skill('review')",
                 &CancellationToken::new(),
                 &mut |_| {},
@@ -2978,7 +2959,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut arena = arena_with_user_skill(&workspace, &home).await;
         let (execution, captured) = arena
-            .execute_model_code_with_skills_and_context(
+            .execute_model_code(
                 "await load_skill('review')\nraise ValueError('boom')",
                 &CancellationToken::new(),
                 &mut |_| {},
@@ -3020,13 +3001,7 @@ mod tests {
         let mut arena = Arena::new(worker_path(), host).await.unwrap();
         let code = "await load_skill('large-0')\nawait load_skill('large-1')\nawait load_skill('large-2')\nawait load_skill('large-3')\ntry:\n    await load_skill('large-4')\nexcept ValueError:\n    pass";
         let (execution, captured) = arena
-            .execute_model_code_with_skills_and_context(
-                code,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-                &[],
-            )
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
             .unwrap();
         assert!(matches!(
@@ -3062,7 +3037,7 @@ mod tests {
         let mut arena = Arena::new(worker_path(), host).await.unwrap();
         let cancellation = CancellationToken::new();
         let mut progress = |_| {};
-        let mut execution = Box::pin(arena.execute_model_code_with_skills_and_context(
+        let mut execution = Box::pin(arena.execute_model_code(
             "await load_skill('review')\nawait read('blocked')",
             &cancellation,
             &mut progress,
@@ -3353,13 +3328,9 @@ mod tests {
 
     async fn execute_checked(arena: &mut Arena, code: &str) -> Result<Execution, ArenaError> {
         arena
-            .execute_model_code_with_progress_and_context(
-                code,
-                &CancellationToken::new(),
-                &mut |_| {},
-                None,
-            )
+            .execute_model_code(code, &CancellationToken::new(), &mut |_| {}, None, &[])
             .await
+            .map(|(execution, _)| execution)
     }
 
     fn gathered_reads(count: usize) -> String {
