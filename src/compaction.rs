@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::config::{CompactionSettings, ModelSelection};
 use crate::model::{
-    AttemptAccounting, ModelContextEntry, SkillActivation, SummaryRequest,
+    ActiveSkills, AttemptAccounting, ModelContextEntry, SkillActivation, SummaryRequest,
     canonical_compaction_summary,
 };
 use crate::prompt::{
@@ -138,12 +138,7 @@ pub(crate) fn prepare(
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
     let latest = latest_applied(facts)?;
     let active_skills = active_skills(facts);
-    let mut protected_skills = active_skills.values().copied().collect::<Vec<_>>();
-    protected_skills.sort_by_key(|(index, _)| *index);
-    let protected_skills = protected_skills
-        .into_iter()
-        .map(|(_, activation)| activation.clone())
-        .collect();
+    let protected_skills = active_skills.iter().cloned().collect();
     let projected = projected_context_indices(facts, latest)?;
     let context_tokens = measure_context(facts, &projected, latest, &active_skills);
     let start = latest.map_or(0, |applied| applied.boundary_index);
@@ -314,7 +309,7 @@ fn measure_context(
     facts: &[SelectedAncestryFact],
     projected: &[usize],
     latest: Option<LatestApplied<'_>>,
-    active_skills: &BTreeMap<&str, (usize, &SkillActivation)>,
+    current_skills: &ActiveSkills,
 ) -> u64 {
     let baseline_start = latest.map_or(0, |applied| applied.index.saturating_add(1));
     for (position, &index) in projected.iter().enumerate().rev() {
@@ -342,8 +337,8 @@ fn measure_context(
                 context_entry(&facts[later]).expect("projected entries are context entries"),
             ));
         }
-        let baseline_skills = active_skills_in_range(facts, 0..=index);
-        let current_bytes = active_text_bytes(active_skills);
+        let baseline_skills = active_skills(&facts[..=index]);
+        let current_bytes = active_text_bytes(current_skills);
         let previous_bytes = active_text_bytes(&baseline_skills);
         let adjusted = if current_bytes >= previous_bytes {
             baseline.saturating_add(estimate_tokens(current_bytes - previous_bytes))
@@ -361,26 +356,19 @@ fn measure_context(
             context_entry(&facts[index]).expect("projected entries are context entries"),
         ));
     }
-    bytes = bytes.saturating_add(active_text_bytes(active_skills));
+    bytes = bytes.saturating_add(active_text_bytes(current_skills));
     estimate_tokens(bytes)
 }
 
-fn active_skills(facts: &[SelectedAncestryFact]) -> BTreeMap<&str, (usize, &SkillActivation)> {
-    active_skills_in_range(facts, 0..facts.len())
-}
-
-fn active_skills_in_range(
-    facts: &[SelectedAncestryFact],
-    range: impl IntoIterator<Item = usize>,
-) -> BTreeMap<&str, (usize, &SkillActivation)> {
-    let mut active = BTreeMap::new();
-    for index in range {
-        match &facts[index].kind {
+fn active_skills(facts: &[SelectedAncestryFact]) -> ActiveSkills {
+    let mut active = ActiveSkills::default();
+    for fact in facts {
+        match &fact.kind {
             SelectedAncestryKind::SkillActivation { activation } => {
-                active.insert(activation.name(), (index, activation));
+                active.replay(activation.clone());
             }
             SelectedAncestryKind::SuppressedSkillActivation { name } => {
-                active.remove(name.as_str());
+                active.deactivate(name);
             }
             _ => {}
         }
@@ -388,10 +376,8 @@ fn active_skills_in_range(
     active
 }
 
-fn active_text_bytes(active: &BTreeMap<&str, (usize, &SkillActivation)>) -> u64 {
-    active.values().fold(0, |total, (_, activation)| {
-        total.saturating_add(byte_len(&activation.model_text()))
-    })
+fn active_text_bytes(active: &ActiveSkills) -> u64 {
+    u64::try_from(active.text_bytes()).unwrap_or(u64::MAX)
 }
 
 fn context_usage(attempt: &AttemptAccounting) -> Option<u64> {
@@ -413,7 +399,7 @@ fn first_retained_index(
     facts: &[SelectedAncestryFact],
     start: usize,
     keep_recent_tokens: u64,
-    active_skills: &BTreeMap<&str, (usize, &SkillActivation)>,
+    active_skills: &ActiveSkills,
 ) -> Option<usize> {
     let mut bytes = active_text_bytes(active_skills);
     for index in (start..facts.len()).rev() {

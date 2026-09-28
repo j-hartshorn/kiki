@@ -22,7 +22,8 @@ use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{
-    AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation, SummaryRequest,
+    ActiveSkills, AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation,
+    SummaryRequest,
 };
 use crate::skills::SkillProjectionPolicy;
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
@@ -2607,9 +2608,8 @@ fn probe_active_project_skill_in_scope(
     if !ancestry.intact {
         return Ok(false);
     }
-    let mut seen_names = BTreeSet::new();
-    let mut active_in_scope = false;
-    for entry in ancestry.entries.iter().rev() {
+    let mut active = ActiveSkills::default();
+    for entry in &ancestry.entries {
         if entry.kind != "skill_activation" {
             continue;
         }
@@ -2622,14 +2622,12 @@ fn probe_active_project_skill_in_scope(
         let Some(activation) = codec::decoded_skill_activation(&decoded) else {
             return Ok(false);
         };
-        if seen_names.insert(activation.name().to_owned())
-            && activation.origin() == crate::skills::SkillOrigin::Project
-            && activation.trust_scope() == Some(scope)
-        {
-            active_in_scope = true;
-        }
+        active.replay(activation.clone());
     }
-    Ok(active_in_scope)
+    Ok(active.iter().any(|activation| {
+        activation.origin() == crate::skills::SkillOrigin::Project
+            && activation.trust_scope() == Some(scope)
+    }))
 }
 
 fn load_compaction_snapshot(
@@ -3981,21 +3979,13 @@ fn restored_history(
     runs: &BTreeMap<i64, Option<i64>>,
     policy: &SkillProjectionPolicy,
 ) -> Option<ModelHistory> {
-    let mut seen_names = BTreeSet::new();
-    let mut latest_activation_indices = BTreeSet::new();
-    for (index, entry) in selected.iter().enumerate().rev() {
-        if entry.kind != "skill_activation" {
-            continue;
+    let replay_activation = |history: &mut ModelHistory, activation: &SkillActivation| {
+        if policy.permits(activation) {
+            history.replay_skill(activation.clone());
+        } else {
+            history.deactivate_skill(activation.name());
         }
-        if entry.provider_replay.is_some() {
-            return None;
-        }
-        let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
-        let activation = codec::decoded_skill_activation(decoded)?;
-        if seen_names.insert(activation.name().to_owned()) {
-            latest_activation_indices.insert(index);
-        }
-    }
+    };
     let latest_applied = selected
         .iter()
         .enumerate()
@@ -4026,13 +4016,13 @@ fn restored_history(
                 return None;
             }
             let mut history = ModelHistory::new();
-            for (index, entry) in selected[..applied_index].iter().enumerate() {
+            for entry in &selected[..applied_index] {
                 if entry.kind == "skill_activation" {
-                    let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
-                    let activation = codec::decoded_skill_activation(decoded)?;
-                    if latest_activation_indices.contains(&index) && policy.permits(activation) {
-                        history.activate_skill(activation.clone()).ok()?;
+                    if entry.provider_replay.is_some() {
+                        return None;
                     }
+                    let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
+                    replay_activation(&mut history, codec::decoded_skill_activation(decoded)?);
                 }
             }
             history.append_compaction_summary(summary);
@@ -4122,14 +4112,13 @@ fn restored_history(
                 if applied_index.is_some_and(|applied| index <= applied) {
                     continue;
                 }
-                if latest_activation_indices.contains(&index) && policy.permits(activation) {
-                    history.activate_skill(activation.clone()).ok()?;
-                }
+                replay_activation(&mut history, activation);
             }
             _ => return None,
         }
     }
-    Some(history)
+    // Superseded activations never count towards the limit, so check only the final set.
+    history.active_skills_within_text_limit().then_some(history)
 }
 
 fn append_history_code(history: &mut ModelHistory, code: PersistedCode) -> Result<(), ()> {
@@ -4561,6 +4550,62 @@ mod tests {
                 .active_skills()
                 .next(),
             Some(&user)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_limits_only_latest_skill_activations_after_trust_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        let trusted = SkillProjectionPolicy::new(Some(scope.clone()));
+        session.configure_skill_projection(trusted.clone()).unwrap();
+        let large = "x".repeat(crate::skills::MAX_SKILL_BYTES);
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            &large,
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        session
+            .configure_skill_projection(SkillProjectionPolicy::default())
+            .unwrap();
+        session.sync_model_context_for_test().unwrap();
+        for (name, body) in [
+            ("one", large.as_str()),
+            ("two", large.as_str()),
+            ("three", large.as_str()),
+            ("review", "user version"),
+        ] {
+            let user = skill(
+                name,
+                home.path().join(".agents/skills").join(name),
+                body,
+                SkillOrigin::User,
+                None,
+            );
+            let run = writer
+                .commit_request_with_skill(name.to_owned(), selection(), Some(user))
+                .await
+                .unwrap();
+            close_cancelled(&writer, run.run_id).await;
+        }
+        session.configure_skill_projection(trusted).unwrap();
+        let history = session.restore().unwrap().executable.unwrap().history;
+        assert_eq!(
+            history
+                .active_skills()
+                .map(SkillActivation::name)
+                .collect::<Vec<_>>(),
+            ["one", "two", "three", "review"]
         );
     }
 

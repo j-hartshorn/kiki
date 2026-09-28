@@ -36,7 +36,7 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::constants::{
     COLLECTION_MAX_ITEMS, COLLECTION_MAX_PAYLOAD_BYTES, FILE_MAX_BYTES, TOOL_CONCURRENCY_LIMIT,
 };
-use crate::model::{ModelHistory, SkillActivation, SkillActivationError};
+use crate::model::{ActiveSkills, SkillActivation, SkillActivationError};
 use crate::skills::{SkillCatalog, SkillLookupError, valid_name as valid_skill_name};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1058,18 +1058,18 @@ struct BatchDispatch<'a> {
 }
 
 pub(crate) struct SkillLoadLedger {
-    history: ModelHistory,
+    active: ActiveSkills,
     captured: Vec<SkillActivation>,
 }
 
 impl SkillLoadLedger {
     pub(crate) fn new(active: &[SkillActivation]) -> Result<Self, SkillActivationError> {
-        let mut history = ModelHistory::new();
+        let mut skills = ActiveSkills::default();
         for activation in active {
-            history.activate_skill(activation.clone())?;
+            skills.activate(activation.clone())?;
         }
         Ok(Self {
-            history,
+            active: skills,
             captured: Vec::new(),
         })
     }
@@ -1084,7 +1084,7 @@ impl SkillLoadLedger {
     }
 
     fn activate(&mut self, activation: SkillActivation) -> Result<(), SkillActivationError> {
-        if self.history.activate_skill(activation.clone())? {
+        if self.active.activate(activation.clone())? {
             self.captured
                 .retain(|existing| existing.name() != activation.name());
             self.captured.push(activation);
@@ -4393,8 +4393,8 @@ mod tests {
         let mut new_ledger = SkillLoadLedger::new(old_ledger.captured()).unwrap();
         assert!(
             new_ledger
-                .history
-                .active_skills()
+                .active
+                .iter()
                 .next()
                 .unwrap()
                 .source_text()
@@ -4419,8 +4419,8 @@ mod tests {
         );
         assert!(
             new_ledger
-                .history
-                .active_skills()
+                .active
+                .iter()
                 .next()
                 .unwrap()
                 .source_text()
