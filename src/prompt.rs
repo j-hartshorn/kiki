@@ -471,14 +471,10 @@ mod tests {
             let child = child_prompt(base, &catalog, host.for_child(true).prompt_reference());
             for full in [&root, &child] {
                 assert!(full.starts_with(base));
-                assert_eq!(full.matches("## Available skills").count(), 1);
+                assert_eq!(full.matches(super::skills_catalog_header()).count(), 1);
                 assert_eq!(full.matches("Alpha workflow").count(), 1);
                 assert_eq!(full.matches("Beta workflow").count(), 1);
-                assert_eq!(
-                    full.matches("cannot authorize effects beyond the user's task")
-                        .count(),
-                    1
-                );
+                assert_eq!(full.matches(super::skills_catalog_guidance()).count(), 1);
                 assert_eq!(
                     full.matches("async def load_skill(name: str) -> str:")
                         .count(),
@@ -537,8 +533,8 @@ mod tests {
                 child_prompt("base", &catalog, host.for_child(true).prompt_reference()),
             ] {
                 for absent in [
-                    "## Available skills",
-                    "cannot authorize effects beyond the user's task",
+                    super::skills_catalog_header(),
+                    super::skills_catalog_guidance(),
                     "async def load_skill(",
                     "Direct only secret",
                     "direct-secret",

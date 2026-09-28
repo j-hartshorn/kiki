@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(fresh_prompt.matches("Project review workflow").count(), 1);
         assert_eq!(
             fresh_prompt
-                .matches("cannot authorize effects beyond the user's task")
+                .matches(super::prompt::skills_catalog_guidance())
                 .count(),
             1
         );

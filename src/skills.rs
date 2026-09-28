@@ -1456,7 +1456,7 @@ mod tests {
         ));
         let rendered = catalog.rendered_catalog().unwrap();
         assert!(!rendered.contains("secret"));
-        assert!(rendered.contains("omitted"));
+        assert!(rendered.contains(prompt::skills_catalog_omission()));
     }
 
     #[test]
@@ -1630,7 +1630,12 @@ mod tests {
                 .all(|pair| pair[0] < pair[1])
         );
         assert!(first.rendered_catalog().unwrap().len() <= MAX_CATALOG_BYTES);
-        assert!(first.rendered_catalog().unwrap().contains("omitted"));
+        assert!(
+            first
+                .rendered_catalog()
+                .unwrap()
+                .contains(prompt::skills_catalog_omission())
+        );
     }
 
     #[cfg(unix)]

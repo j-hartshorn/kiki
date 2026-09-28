@@ -7981,7 +7981,7 @@ mod tests {
         let prompt = factory.prompts.lock().unwrap().pop().unwrap();
         assert!(prompt.starts_with("override base\n\n# Subagent work"));
         assert_eq!(prompt.matches("Review workflow").count(), 1);
-        assert!(prompt.contains("cannot authorize effects beyond the user's task"));
+        assert!(prompt.contains(crate::prompt::skills_catalog_guidance()));
         assert_eq!(
             prompt
                 .matches("async def load_skill(name: str) -> str:")
