@@ -994,9 +994,15 @@ impl SessionWriter {
         reason: CompactionReason,
     ) -> Result<Option<PreparedCompaction>, SessionError> {
         let snapshot = self.read(load_compaction_snapshot).await?;
-        let Some(planner) =
-            crate::compaction::prepare(&snapshot.facts, policy, selection, reasoning, &focus)
-                .map_err(|error| SessionError::Codec(error.to_string()))?
+        let Some(planner) = crate::compaction::prepare(
+            &snapshot.facts,
+            policy,
+            selection,
+            reasoning,
+            &focus,
+            reason,
+        )
+        .map_err(|error| SessionError::Codec(error.to_string()))?
         else {
             return Ok(None);
         };
@@ -11450,6 +11456,127 @@ mod tests {
         );
         assert_eq!(restored.requests(), repeated.requests());
         reopened.close().expect("close reopened session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn automatic_preparation_honours_enabled_threshold_and_progress() {
+        use super::CompactionReason::{AutomaticThreshold, ContextOverflow, Manual};
+        use crate::config::CompactionSettings;
+
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "only request").await;
+        let prepares = |policy, reason| {
+            let writer = &writer;
+            async move {
+                writer
+                    .prepare_compaction(
+                        policy,
+                        selection(),
+                        CrossProviderReasoning::Inline,
+                        String::new(),
+                        reason,
+                    )
+                    .await
+                    .expect("prepare compaction")
+                    .is_some()
+            }
+        };
+        let above = CompactionSettings::new(u64::MAX, 4);
+        let below = CompactionSettings::new(100, 4);
+        for reason in [Manual, AutomaticThreshold, ContextOverflow] {
+            assert!(!prepares(above, reason).await, "no progress: {reason:?}");
+        }
+
+        append_cancelled_request(&writer, "retained request").await;
+        let history = writer.model_history().expect("read context");
+        let entry_count = || -> i64 {
+            session
+                .connection_for_test()
+                .expect("lock session connection")
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .expect("count entries")
+        };
+        let entries = entry_count();
+        for (policy, reason, expected) in [
+            (above.disabled(), AutomaticThreshold, false),
+            (above.disabled(), ContextOverflow, false),
+            (above.disabled(), Manual, true),
+            (below.disabled(), Manual, true),
+            (below, AutomaticThreshold, false),
+            (below, ContextOverflow, true),
+            (above, AutomaticThreshold, true),
+        ] {
+            assert_eq!(
+                prepares(policy, reason).await,
+                expected,
+                "{policy:?} {reason:?}"
+            );
+        }
+        assert_eq!(entry_count(), entries);
+        assert_eq!(writer.model_history().expect("read context"), history);
+        drop(writer);
+        session.close().expect("close session");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn below_threshold_preparation_skips_summary_assembly() {
+        let home = tempfile::tempdir().expect("create home");
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let session = create_session(&home, &workspace).await;
+        let writer = session.writer();
+        append_cancelled_request(&writer, "discarded request").await;
+        append_cancelled_request(&writer, "retained request").await;
+        let prepare = |reserve, reason| {
+            writer.prepare_compaction(
+                crate::config::CompactionSettings::new(reserve, 4),
+                selection(),
+                CrossProviderReasoning::Inline,
+                String::new(),
+                reason,
+            )
+        };
+        let preparation = prepare(100, super::CompactionReason::Manual)
+            .await
+            .expect("prepare compaction")
+            .expect("prepare compactable history");
+        writer
+            .settle_compaction(
+                preparation,
+                super::CompactionSettlement::Applied {
+                    summary: "malformed <read-files>".to_owned(),
+                    attempts: Vec::new(),
+                },
+            )
+            .await
+            .expect("settle compaction");
+        append_cancelled_request(&writer, "newly discarded").await;
+        append_cancelled_request(&writer, "tail").await;
+
+        assert!(
+            prepare(100, super::CompactionReason::AutomaticThreshold)
+                .await
+                .expect("below-threshold check")
+                .is_none()
+        );
+        for (reserve, reason) in [
+            (100, super::CompactionReason::Manual),
+            (u64::MAX, super::CompactionReason::AutomaticThreshold),
+        ] {
+            assert!(
+                matches!(
+                    prepare(reserve, reason).await,
+                    Err(super::SessionError::Codec(message)) if message.contains("reserved file tag")
+                ),
+                "{reason:?}"
+            );
+        }
+        drop(writer);
+        session.close().expect("close session");
     }
 
     #[tokio::test]

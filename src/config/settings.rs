@@ -134,6 +134,7 @@ impl fmt::Display for SettingsOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompactionSettings {
+    enabled: bool,
     reserve_tokens: u64,
     keep_recent_tokens: u64,
 }
@@ -150,8 +151,21 @@ impl Default for CompactionSettings {
 impl CompactionSettings {
     pub(crate) fn new(reserve_tokens: u64, keep_recent_tokens: u64) -> Self {
         Self {
+            enabled: true,
             reserve_tokens,
             keep_recent_tokens,
+        }
+    }
+
+    pub(crate) fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disabled(self) -> Self {
+        Self {
+            enabled: false,
+            ..self
         }
     }
 
@@ -665,6 +679,9 @@ fn apply_compaction_layer(settings: Option<&FileSettings>, compaction: &mut Comp
     let Some(settings) = settings else {
         return;
     };
+    if let Some(enabled) = settings.compaction.enabled {
+        compaction.enabled = enabled;
+    }
     if let Some(reserve_tokens) = settings.compaction.reserve_tokens {
         compaction.reserve_tokens = reserve_tokens;
     }
@@ -914,6 +931,13 @@ fn validate_compaction_table(
 
     for (key, item) in table.iter() {
         match key {
+            "enabled" => match item.as_bool() {
+                Some(value) => compaction.enabled = Some(value),
+                None => problems.push(
+                    "field `compaction.enabled` must be a boolean",
+                    "Set it to true or false, then restart Kiki.",
+                ),
+            },
             "reserve_tokens" => {
                 compaction.reserve_tokens = positive_compaction_tokens(item, key, problems);
             }
@@ -921,7 +945,7 @@ fn validate_compaction_table(
                 compaction.keep_recent_tokens = positive_compaction_tokens(item, key, problems);
             }
             _ => problems.push(
-                "table `compaction` contains an unknown key; only `reserve_tokens` and `keep_recent_tokens` are allowed",
+                "table `compaction` contains an unknown key; only `enabled`, `reserve_tokens`, and `keep_recent_tokens` are allowed",
                 "Remove the unknown key from table `compaction`, then restart Kiki.",
             ),
         }
@@ -1079,6 +1103,7 @@ struct FileSubagentSettings {
 
 #[derive(Default)]
 struct FileCompactionSettings {
+    enabled: Option<bool>,
     reserve_tokens: Option<u64>,
     keep_recent_tokens: Option<u64>,
 }
@@ -1317,6 +1342,91 @@ mod tests {
     }
 
     #[test]
+    fn compaction_enabled_defaults_true_and_project_overrides_user() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        let phase_2 = "[compaction]\nreserve_tokens = 1024\nkeep_recent_tokens = 2048\n";
+        let enabled = "[compaction]\nenabled = true\n";
+        let disabled = "[compaction]\nenabled = false\n";
+
+        for (user_content, project_content, expected) in [
+            ("", "", true),
+            (phase_2, "", true),
+            ("", phase_2, true),
+            (disabled, "", false),
+            ("", disabled, false),
+            (disabled, "[compaction]\nreserve_tokens = 4096\n", false),
+            (disabled, enabled, true),
+            (enabled, disabled, false),
+        ] {
+            write_settings(home.path(), user_content);
+            write_settings(project.path(), project_content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+
+            assert!(
+                resolution.problems().is_empty(),
+                "{user_content:?} / {project_content:?}"
+            );
+            assert_eq!(
+                resolution.context().compaction().enabled(),
+                expected,
+                "{user_content:?} / {project_content:?}"
+            );
+        }
+
+        write_settings(
+            home.path(),
+            "[compaction]\nenabled = false\nreserve_tokens = 1024\nkeep_recent_tokens = 2048\n",
+        );
+        write_settings(
+            project.path(),
+            "[compaction]\nenabled = true\nreserve_tokens = 4096\n",
+        );
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        let policy = resolution.context().compaction();
+        assert!(resolution.problems().is_empty());
+        assert!(policy.enabled());
+        assert_eq!(policy.reserve_tokens(), 4096);
+        assert_eq!(policy.keep_recent_tokens(), 2048);
+    }
+
+    #[test]
+    fn compaction_enabled_requires_a_boolean_and_valid_neighbours() {
+        let home = tempdir().expect("home directory");
+        let project = tempdir().expect("project directory");
+        write_settings(project.path(), "[compaction]\nkeep_recent_tokens = 2048\n");
+
+        for content in [
+            "[compaction]\nenabled = \"false\"\n",
+            "[compaction]\nenabled = 0\n",
+            "[compaction]\nenabled = [false]\n",
+            "[compaction]\nenabled = false\nreserve_tokens = 0\n",
+            "[compaction]\nenabled = false\nother = true\n",
+        ] {
+            write_settings(home.path(), content);
+            let resolution = resolve(input(Some(home.path()), Some(project.path())));
+            let policy = resolution.context().compaction();
+
+            assert!(policy.enabled(), "{content:?}");
+            assert_eq!(policy.reserve_tokens(), 16_384, "{content:?}");
+            assert_eq!(policy.keep_recent_tokens(), 2048, "{content:?}");
+            assert_eq!(
+                resolution.problems()[0].kind(),
+                crate::config::StartupProblemKind::UserSettingsInvalid,
+                "{content:?}"
+            );
+        }
+
+        write_settings(home.path(), "[compaction]\nenabled = \"false\"\n");
+        let resolution = resolve(input(Some(home.path()), Some(project.path())));
+        assert!(
+            resolution.problems()[0]
+                .diagnostic()
+                .contains("field `compaction.enabled` must be a boolean")
+        );
+    }
+
+    #[test]
     fn compaction_settings_require_a_table_of_positive_integers() {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
@@ -1373,7 +1483,7 @@ mod tests {
         let home = tempdir().expect("home directory");
         let project = tempdir().expect("project directory");
         write_settings(project.path(), "[compaction]\nkeep_recent_tokens = 2048\n");
-        for unknown in ["enabled", "other"] {
+        for unknown in ["enable", "other"] {
             write_settings(
                 home.path(),
                 &format!(

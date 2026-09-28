@@ -12,7 +12,7 @@ use crate::prompt::{
     compaction_initial_prompt, compaction_split_run_prompt, compaction_system_prompt,
     compaction_update_prompt,
 };
-use crate::session::SessionEntryId;
+use crate::session::{CompactionReason, SessionEntryId};
 
 const OUTPUT_RATIO_DENOMINATOR: u64 = 100;
 const HISTORY_OUTPUT_RATIO: u64 = 80;
@@ -128,12 +128,25 @@ pub(crate) fn prepare(
     selection: ModelSelection,
     reasoning: CrossProviderReasoning,
     focus: &str,
+    reason: CompactionReason,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
+    if reason != CompactionReason::Manual && !policy.enabled() {
+        return Ok(None);
+    }
     let destination = Destination::new(selection, reasoning);
     let latest = latest_applied(facts)?;
     let projected = projected_context_indices(facts, latest)?;
     let context_tokens =
         measure_context(facts, &projected, latest, destination, selection.model().id);
+    if reason == CompactionReason::AutomaticThreshold
+        && !exceeds_threshold(
+            context_tokens,
+            selection.model().context_window_tokens,
+            policy.reserve_tokens(),
+        )
+    {
+        return Ok(None);
+    }
     let start = latest.map_or(0, |applied| applied.boundary_index);
     let Some(first_retained_index) =
         first_retained_index(facts, start, policy.keep_recent_tokens(), destination)
@@ -348,6 +361,10 @@ fn measure_context(
         bytes = bytes.saturating_add(context_bytes(projected_entry(index), destination));
     }
     estimate_tokens(bytes)
+}
+
+fn exceeds_threshold(context_tokens: u64, context_window: u64, reserve_tokens: u64) -> bool {
+    context_tokens > context_window.saturating_sub(reserve_tokens)
 }
 
 fn usage_baseline(
@@ -818,8 +835,8 @@ mod tests {
 
     use super::{
         CompactionError, Destination, SPLIT_SEPARATOR, SelectedAncestryFact, SelectedAncestryKind,
-        estimate_tokens, output_budget, prepare, serialise_entry, strip_reserved_blocks,
-        truncate_feedback,
+        estimate_tokens, exceeds_threshold, output_budget, prepare, serialise_entry,
+        strip_reserved_blocks, truncate_feedback,
     };
     use crate::config::models::{OPUS_5_5, TERRA};
     use crate::config::settings::CrossProviderReasoning;
@@ -828,9 +845,12 @@ mod tests {
         AttemptAccounting, CodeResult, ModelCallId, ModelContextEntry, ModelHistory, ModelUsage,
         OpaqueReplayItem, ProviderReplay,
     };
-    use crate::session::SessionEntryId;
+    use crate::session::{CompactionReason, SessionEntryId};
 
     const INLINE: CrossProviderReasoning = CrossProviderReasoning::Inline;
+    const MANUAL: CompactionReason = CompactionReason::Manual;
+    const THRESHOLD: CompactionReason = CompactionReason::AutomaticThreshold;
+    const OVERFLOW: CompactionReason = CompactionReason::ContextOverflow;
     const NATIVE: &str = "openai";
 
     fn selection() -> ModelSelection {
@@ -995,13 +1015,13 @@ mod tests {
     }
 
     fn prepared(facts: &[SelectedAncestryFact]) -> super::CompactionPreparation {
-        prepare(facts, policy(1), selection(), INLINE, "")
+        prepare(facts, policy(1), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("a removable prefix")
     }
 
     fn measured(facts: &[SelectedAncestryFact]) -> super::CompactionPreparation {
-        prepare(facts, policy(0), selection(), INLINE, "")
+        prepare(facts, policy(0), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("a removable prefix")
     }
@@ -1058,7 +1078,7 @@ mod tests {
                     + padding.len()
                     + "tail".len();
 
-                let summarised = prepare(&facts, policy(1), destination, reasoning, "")
+                let summarised = prepare(&facts, policy(1), destination, reasoning, "", MANUAL)
                     .unwrap()
                     .expect("a removable prefix");
                 assert_eq!(
@@ -1087,7 +1107,7 @@ mod tests {
                     assert_eq!(input.contains(sentinel), inline, "{case}");
                 }
 
-                let tail = prepare(&facts, policy(20), destination, reasoning, "")
+                let tail = prepare(&facts, policy(20), destination, reasoning, "", MANUAL)
                     .unwrap()
                     .expect("a removable prefix");
                 assert_eq!(tail.first_retained(), SessionEntryId(2), "{case}");
@@ -1143,6 +1163,7 @@ mod tests {
                 destination,
                 CrossProviderReasoning::Drop,
                 "",
+                MANUAL,
             )
             .unwrap()
             .expect("a removable prefix");
@@ -1206,9 +1227,16 @@ mod tests {
                 final_message(3, "new", "", b"abcd", vec![own(900)]),
                 user(4, "abcd"),
             ];
-            let preparation = prepare(&own_after_foreign, policy(0), selection(), reasoning, "")
-                .unwrap()
-                .expect("a removable prefix");
+            let preparation = prepare(
+                &own_after_foreign,
+                policy(0),
+                selection(),
+                reasoning,
+                "",
+                MANUAL,
+            )
+            .unwrap()
+            .expect("a removable prefix");
             assert_eq!(preparation.context_tokens(), expected, "{reasoning:?}");
         }
 
@@ -1247,6 +1275,130 @@ mod tests {
         );
     }
 
+    fn measured_at(tokens: u64) -> [SelectedAncestryFact; 3] {
+        [
+            user(1, "old"),
+            final_message(2, "answer", "", b"", vec![usage(Some(tokens), None, None)]),
+            user(3, ""),
+        ]
+    }
+
+    fn prepares(
+        facts: &[SelectedAncestryFact],
+        policy: crate::config::CompactionSettings,
+        reason: CompactionReason,
+    ) -> bool {
+        prepare(facts, policy, selection(), INLINE, "", reason)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn threshold_is_strict_against_the_model_context_window() {
+        let model = selection().model();
+        let window = model.context_window_tokens;
+        assert!(model.pricing.long_context_threshold < window - 100);
+        let cases = [
+            (model.pricing.long_context_threshold + 1, false),
+            (window - 101, false),
+            (window - 100, false),
+            (window - 99, true),
+            (u64::MAX, true),
+        ];
+        for (tokens, expected) in cases {
+            let facts = measured_at(tokens);
+            assert_eq!(measured(&facts).context_tokens(), tokens, "{tokens} tokens");
+            assert_eq!(
+                prepares(&facts, policy(0), THRESHOLD),
+                expected,
+                "{tokens} tokens"
+            );
+            assert!(prepares(&facts, policy(0), MANUAL), "{tokens} tokens");
+        }
+    }
+
+    #[test]
+    fn threshold_saturates_when_reserve_reaches_the_window() {
+        let window = selection().model().context_window_tokens;
+        let empty = [user(1, ""), user(2, "")];
+        let one_token = [user(1, "a"), user(2, "")];
+        for reserve in [window, window + 1, u64::MAX] {
+            let policy = crate::config::CompactionSettings::new(reserve, 0);
+            assert!(!prepares(&empty, policy, THRESHOLD), "{reserve}");
+            assert!(prepares(&one_token, policy, THRESHOLD), "{reserve}");
+            assert!(prepares(&empty, policy, MANUAL), "{reserve}");
+        }
+        assert!(!prepares(&empty, policy(0), THRESHOLD));
+
+        let cases = [
+            (0, 0, 0, false),
+            (1, 0, 0, true),
+            (0, 0, u64::MAX, false),
+            (u64::MAX, u64::MAX, 0, false),
+            (u64::MAX, u64::MAX, 1, true),
+            (0, u64::MAX, u64::MAX, false),
+            (1, u64::MAX, u64::MAX, true),
+        ];
+        for (context, window, reserve, expected) in cases {
+            assert_eq!(
+                exceeds_threshold(context, window, reserve),
+                expected,
+                "{context} > {window} - {reserve}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_policy_skips_automatic_reasons_but_not_manual() {
+        let above = measured_at(u64::MAX);
+        let below = measured_at(1);
+        let disabled = policy(0).disabled();
+        assert!(!prepares(&above, disabled, THRESHOLD));
+        assert!(!prepares(&above, disabled, OVERFLOW));
+        assert!(prepares(&above, disabled, MANUAL));
+        assert!(prepares(&below, disabled, MANUAL));
+
+        assert!(prepares(&below, policy(0), OVERFLOW));
+        assert!(!prepares(&below, policy(0), THRESHOLD));
+
+        let no_progress = [
+            user(1, "boundary"),
+            applied(2, "prior", 1),
+            final_message(3, "", "", b"", vec![usage(Some(u64::MAX), None, None)]),
+        ];
+        for reason in [MANUAL, THRESHOLD, OVERFLOW] {
+            assert!(!prepares(&no_progress, policy(1), reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn below_threshold_returns_before_summary_assembly() {
+        let facts = [
+            user(1, "old"),
+            applied(2, "inline <read-files>", 1),
+            user(3, "tail"),
+        ];
+        assert!(matches!(
+            prepare(&facts, policy(1), selection(), INLINE, "", MANUAL),
+            Err(CompactionError::MalformedReservedTag(_))
+        ));
+        assert_eq!(
+            prepare(&facts, policy(1), selection(), INLINE, "", THRESHOLD),
+            Ok(None)
+        );
+        assert!(matches!(
+            prepare(
+                &facts,
+                crate::config::CompactionSettings::new(u64::MAX, 1),
+                selection(),
+                INLINE,
+                "",
+                THRESHOLD,
+            ),
+            Err(CompactionError::MalformedReservedTag(_))
+        ));
+    }
+
     #[test]
     fn repeated_compaction_retains_exact_tail_from_previous_boundary() {
         let facts = [
@@ -1256,7 +1408,7 @@ mod tests {
             user(4, "tail"),
         ];
 
-        let preparation = prepare(&facts, policy(1), selection(), INLINE, "")
+        let preparation = prepare(&facts, policy(1), selection(), INLINE, "", MANUAL)
             .unwrap()
             .expect("new context after the previous boundary is removable");
 
@@ -1453,7 +1605,7 @@ mod tests {
         let initial = [user(1, "aaaa"), user(2, "bbbb"), user(3, "cccc")];
         let cases = [(1, Some(3)), (2, Some(2)), (3, None)];
         for (keep, expected) in cases {
-            let result = prepare(&initial, policy(keep), selection(), INLINE, "").unwrap();
+            let result = prepare(&initial, policy(keep), selection(), INLINE, "", MANUAL).unwrap();
             assert_eq!(
                 result.map(|preparation| preparation.first_retained().0),
                 expected
@@ -1475,9 +1627,16 @@ mod tests {
 
         let no_progress = [user(1, "boundary"), applied(2, "prior", 1), neutral(3)];
         assert!(
-            prepare(&no_progress, policy(1), selection(), INLINE, "focus")
-                .unwrap()
-                .is_none()
+            prepare(
+                &no_progress,
+                policy(1),
+                selection(),
+                INLINE,
+                "focus",
+                MANUAL
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1485,7 +1644,7 @@ mod tests {
     fn invalid_applied_boundaries_are_rejected() {
         let missing = [user(1, "old"), applied(2, "prior", 99), user(3, "tail")];
         assert!(matches!(
-            prepare(&missing, policy(1), selection(), INLINE, ""),
+            prepare(&missing, policy(1), selection(), INLINE, "", MANUAL),
             Err(CompactionError::InvalidAncestry(_))
         ));
 
@@ -1496,7 +1655,14 @@ mod tests {
             user(4, "tail"),
         ];
         assert!(matches!(
-            prepare(&neutral_boundary, policy(1), selection(), INLINE, ""),
+            prepare(
+                &neutral_boundary,
+                policy(1),
+                selection(),
+                INLINE,
+                "",
+                MANUAL
+            ),
             Err(CompactionError::InvalidAncestry(_))
         ));
     }
@@ -1609,7 +1775,7 @@ mod tests {
             applied(2, "previous", 1),
             code(3, "tail", None, "", b"", "tail", Vec::new()),
         ];
-        let no_focus = prepare(&facts, policy(1), selection(), INLINE, "  ")
+        let no_focus = prepare(&facts, policy(1), selection(), INLINE, "  ", MANUAL)
             .unwrap()
             .unwrap();
         assert_eq!(no_focus.requests().len(), 1);
@@ -1619,9 +1785,16 @@ mod tests {
             format!("previous{SPLIT_SEPARATOR}turn")
         );
 
-        let focused = prepare(&facts, policy(1), selection(), INLINE, "  keep variables  ")
-            .unwrap()
-            .unwrap();
+        let focused = prepare(
+            &facts,
+            policy(1),
+            selection(),
+            INLINE,
+            "  keep variables  ",
+            MANUAL,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(focused.requests().len(), 2);
         assert_eq!(
             focused.requests()[0].input,
@@ -1838,7 +2011,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            prepare(&facts, policy(1), selection(), INLINE, ""),
+            prepare(&facts, policy(1), selection(), INLINE, "", MANUAL),
             Err(CompactionError::NonUtf8Path)
         );
     }
