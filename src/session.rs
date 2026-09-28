@@ -22,9 +22,9 @@ use crate::arena::{Checkpoint, Execution};
 use crate::compaction::{CompactionError, SelectedAncestryFact, SelectedAncestryKind};
 use crate::config::{CompactionSettings, ModelSelection, SessionPreferences};
 use crate::model::{
-    AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation, SkillProjectionPolicy,
-    SummaryRequest,
+    AttemptAccounting, ModelContextEntry, ModelHistory, SkillActivation, SummaryRequest,
 };
+use crate::skills::SkillProjectionPolicy;
 use crate::subagents::{RestoredTaskRecord, TaskId, TaskRecord, TaskState};
 
 const DATABASE_SUFFIX: &str = ".sqlite3";
@@ -609,7 +609,7 @@ struct LiveSessionContext {
 struct SessionState {
     connection: Mutex<Connection>,
     model_context: Mutex<Option<LiveSessionContext>>,
-    skill_policy: Mutex<Option<SkillProjectionPolicy>>,
+    skill_policy: Mutex<SkillProjectionPolicy>,
     active_execution_step: Mutex<Option<u64>>,
     _writer_lock: File,
     #[cfg(test)]
@@ -872,7 +872,7 @@ impl Session {
             state: Arc::new(SessionState {
                 connection: Mutex::new(connection),
                 model_context: Mutex::new(None),
-                skill_policy: Mutex::new(None),
+                skill_policy: Mutex::new(SkillProjectionPolicy::default()),
                 active_execution_step: Mutex::new(None),
                 _writer_lock: writer_lock,
                 #[cfg(test)]
@@ -917,7 +917,7 @@ impl Session {
             .map_err(|_| SessionError::WriterUnavailable)?
             .clone();
         let mut connection = self.connection()?;
-        load_session_restore(&mut connection, policy.as_ref())
+        load_session_restore(&mut connection, &policy)
     }
 
     pub(crate) fn configure_skill_projection(
@@ -928,7 +928,7 @@ impl Session {
             .state
             .skill_policy
             .lock()
-            .map_err(|_| SessionError::WriterUnavailable)? = Some(policy);
+            .map_err(|_| SessionError::WriterUnavailable)? = policy;
         Ok(())
     }
 
@@ -1009,10 +1009,8 @@ impl SessionWriter {
             .lock()
             .map_err(|_| SessionError::WriterUnavailable)?
             .clone();
-        self.read(move |connection| {
-            load_session_restore_at(connection, requested_entry, policy.as_ref())
-        })
-        .await
+        self.read(move |connection| load_session_restore_at(connection, requested_entry, &policy))
+            .await
     }
 
     pub(crate) async fn catalogue(&self) -> Result<SessionCatalogue, SessionError> {
@@ -1043,7 +1041,7 @@ impl SessionWriter {
             .map_err(|_| SessionError::WriterUnavailable)?
             .clone();
         let snapshot = self
-            .read(move |connection| load_compaction_snapshot(connection, skill_policy.as_ref()))
+            .read(move |connection| load_compaction_snapshot(connection, &skill_policy))
             .await?;
         let Some(planner) = crate::compaction::prepare(&snapshot.facts, policy, selection, &focus)
             .map_err(|error| SessionError::Codec(error.to_string()))?
@@ -2259,7 +2257,7 @@ fn initialise(
                 effective_entry: session_entry_id(root_entry_id)?,
                 history: ModelHistory::new(),
             })),
-            skill_policy: Mutex::new(None),
+            skill_policy: Mutex::new(SkillProjectionPolicy::default()),
             active_execution_step: Mutex::new(None),
             _writer_lock: writer_lock,
             #[cfg(test)]
@@ -2636,7 +2634,7 @@ fn probe_active_project_skill_in_scope(
 
 fn load_compaction_snapshot(
     connection: &mut Connection,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<CompactionSnapshot, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let active_entry_id: i64 = transaction.query_row(
@@ -2699,7 +2697,7 @@ fn load_compaction_snapshot(
 fn compaction_fact(
     entry: &RestoreEntryRow,
     entries: &[RestoreEntryRow],
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SelectedAncestryFact, SessionError> {
     let decoded = codec::decode_entry(&entry.kind, &entry.payload_json)
         .map_err(|error| SessionError::Codec(error.to_string()))?;
@@ -2832,7 +2830,7 @@ fn compaction_fact(
             }
             let activation =
                 codec::decoded_skill_activation(&decoded).ok_or(SessionError::InvalidTransition)?;
-            if policy.is_none_or(|policy| policy.permits(activation)) {
+            if policy.permits(activation) {
                 SelectedAncestryKind::SkillActivation {
                     activation: activation.clone(),
                 }
@@ -2859,7 +2857,7 @@ fn model_entry_from_code(code: PersistedCode) -> Result<ModelContextEntry, Sessi
 
 fn load_session_restore(
     connection: &mut Connection,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SessionRestore, SessionError> {
     load_session_restore_for_entry(connection, None, policy)
 }
@@ -2867,7 +2865,7 @@ fn load_session_restore(
 fn load_session_restore_at(
     connection: &mut Connection,
     requested_entry: SessionEntryId,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SessionRestore, SessionError> {
     let requested_entry =
         i64::try_from(requested_entry.0).map_err(|_| SessionError::InvalidTransition)?;
@@ -2877,7 +2875,7 @@ fn load_session_restore_at(
 fn load_session_restore_for_entry(
     connection: &mut Connection,
     requested_entry: Option<i64>,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Result<SessionRestore, SessionError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let (observed_active_entry_id, name, preferences_json, session_revision): (
@@ -3106,14 +3104,19 @@ fn restore_projection_at(
     requested_entry_id: i64,
     effective_entry_id: i64,
 ) -> SessionRestore {
-    restore_projection_at_with_policy(snapshot, requested_entry_id, effective_entry_id, None)
+    restore_projection_at_with_policy(
+        snapshot,
+        requested_entry_id,
+        effective_entry_id,
+        &SkillProjectionPolicy::default(),
+    )
 }
 
 fn restore_projection_at_with_policy(
     snapshot: RestoreSnapshot,
     requested_entry_id: i64,
     effective_entry_id: i64,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> SessionRestore {
     let effective_entry = session_entry_id(effective_entry_id).unwrap_or(SessionEntryId(0));
     let observed_active_entry =
@@ -3976,7 +3979,7 @@ fn restored_history(
     decoded_entries: &BTreeMap<i64, Result<codec::DecodedEntry, ()>>,
     steps: &[RestoreStepRow],
     runs: &BTreeMap<i64, Option<i64>>,
-    policy: Option<&SkillProjectionPolicy>,
+    policy: &SkillProjectionPolicy,
 ) -> Option<ModelHistory> {
     let mut seen_names = BTreeSet::new();
     let mut latest_activation_indices = BTreeSet::new();
@@ -4027,9 +4030,7 @@ fn restored_history(
                 if entry.kind == "skill_activation" {
                     let decoded = decoded_restore_entry(decoded_entries, entry.id).ok()?;
                     let activation = codec::decoded_skill_activation(decoded)?;
-                    if latest_activation_indices.contains(&index)
-                        && policy.is_none_or(|policy| policy.permits(activation))
-                    {
+                    if latest_activation_indices.contains(&index) && policy.permits(activation) {
                         history.activate_skill(activation.clone()).ok()?;
                     }
                 }
@@ -4121,9 +4122,7 @@ fn restored_history(
                 if applied_index.is_some_and(|applied| index <= applied) {
                     continue;
                 }
-                if latest_activation_indices.contains(&index)
-                    && policy.is_none_or(|policy| policy.permits(activation))
-                {
+                if latest_activation_indices.contains(&index) && policy.permits(activation) {
                     history.activate_skill(activation.clone()).ok()?;
                 }
             }
@@ -4209,8 +4208,8 @@ mod tests {
         ToolName,
     };
     use crate::config::{DEFAULT_MODEL, ModelSelection, SessionPreferences, models::TERRA};
-    use crate::model::{SkillActivation, SkillProjectionPolicy};
-    use crate::skills::SkillOrigin;
+    use crate::model::SkillActivation;
+    use crate::skills::{SkillOrigin, SkillProjectionPolicy};
     use crate::subagents::{ChildResult, TaskOutcome, TaskPersistedDetails, TaskRecord, TaskState};
     use crate::tools::{ToolHost, ToolValue, WholeFileAuthorisations};
 
@@ -4283,6 +4282,9 @@ mod tests {
         let writer = session.writer();
         let root = SessionEntryId(active_entry_id(&session) as u64);
         let scope = workspace.path().canonicalize().unwrap();
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope.clone())))
+            .unwrap();
         let user_body = "---\nname: review\ndescription: User\n---\nUser instructions æ";
         let project_body = "---\nname: review\ndescription: Project\n---\nProject instructions β";
         let user = skill(
@@ -4348,13 +4350,13 @@ mod tests {
             project_body
         );
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope.clone(), false))
+            .configure_skill_projection(SkillProjectionPolicy::default())
             .unwrap();
         let filtered = session.restore().unwrap().executable.unwrap().history;
         assert_eq!(filtered.active_skills().next().unwrap(), &independent);
         assert_eq!(filtered.active_skills().count(), 1);
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(home.path().to_path_buf(), true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(home.path().to_path_buf())))
             .unwrap();
         let relocated = session.restore().unwrap().executable.unwrap().history;
         assert_eq!(
@@ -4477,7 +4479,7 @@ mod tests {
 
         let session = Session::open(home.path(), &id).unwrap();
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope_a.clone(), true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_a.clone())))
             .unwrap();
         activate_session(&session).await;
         let writer = session.writer();
@@ -4498,7 +4500,7 @@ mod tests {
 
         let session = Session::open(home.path(), &id).unwrap();
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
             .unwrap();
         assert!(!b_source.exists());
         assert!(session.restore().unwrap().executable.is_some());
@@ -4559,6 +4561,44 @@ mod tests {
                 .active_skills()
                 .next(),
             Some(&user)
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_session_does_not_project_stored_project_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let scope = workspace.path().canonicalize().unwrap();
+        let session = create_session(&home, &workspace).await;
+        let id = session.id().to_owned();
+        let writer = session.writer();
+        let project = skill(
+            "review",
+            scope.join(".agents/skills/review"),
+            "project version",
+            SkillOrigin::Project,
+            Some(scope.clone()),
+        );
+        let run = writer
+            .commit_request_with_skill("project".to_owned(), selection(), Some(project))
+            .await
+            .unwrap();
+        close_cancelled(&writer, run.run_id).await;
+        drop(writer);
+        drop(session);
+
+        let session = Session::open(home.path(), &id).unwrap();
+        assert!(session.has_active_project_skill_in_scope(&scope).unwrap());
+        assert_eq!(
+            session
+                .restore()
+                .unwrap()
+                .executable
+                .unwrap()
+                .history
+                .active_skills()
+                .count(),
+            0
         );
     }
 
@@ -4632,7 +4672,7 @@ mod tests {
 
         let session = Session::open(home.path(), &id).unwrap();
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
             .unwrap();
         activate_session(&session).await;
         let writer = session.writer();
@@ -4656,7 +4696,7 @@ mod tests {
 
         let session = Session::open(home.path(), &id).unwrap();
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope_b.clone(), true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope_b.clone())))
             .unwrap();
         assert!(session.restore().unwrap().executable.is_some());
         assert!(session.has_active_project_skill_in_scope(&scope_b).unwrap());
@@ -4715,7 +4755,7 @@ mod tests {
         close_cancelled(&writer, last.run_id).await;
         let leaf = SessionEntryId(active_entry_id(&session) as u64);
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope, false))
+            .configure_skill_projection(SkillProjectionPolicy::default())
             .unwrap();
         let restored = session.restore().unwrap().executable.unwrap().history;
         assert_eq!(
@@ -4776,6 +4816,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let scope = workspace.path().canonicalize().unwrap();
         let session = create_session(&home, &workspace).await;
+        session
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope.clone())))
+            .unwrap();
         let writer = session.writer();
         let source = scope.join(".agents/skills/shared");
         let body = "---\nname: shared\ndescription: Same\n---\nSame text";
@@ -4820,7 +4863,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored, 2);
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope, false))
+            .configure_skill_projection(SkillProjectionPolicy::default())
             .unwrap();
         assert_eq!(
             session
@@ -4881,7 +4924,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored, 2);
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(nested_scope, true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(nested_scope)))
             .unwrap();
         assert_eq!(
             session
@@ -4895,7 +4938,7 @@ mod tests {
             Some(&inner)
         );
         session
-            .configure_skill_projection(SkillProjectionPolicy::new(scope, true))
+            .configure_skill_projection(SkillProjectionPolicy::new(Some(scope)))
             .unwrap();
         assert_eq!(
             session

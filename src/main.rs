@@ -43,14 +43,15 @@ use crate::config::{
     models::Provider,
     settings::{self, CacheTtl, CrossProviderReasoning},
 };
-use crate::model::SkillProjectionPolicy;
 use crate::provider::ProviderModel;
 use crate::runtime::{
     PROGRESS_CHANNEL_CAPACITY, ProgressEnvelope, ResumeOptions, RuntimeCommand, RuntimeController,
     RuntimeEvent,
 };
 use crate::session::{Session, SessionListRow};
-use crate::skills::{ProjectScope, SkillCatalog, project_trust_prompt_required};
+use crate::skills::{
+    ProjectScope, SkillCatalog, SkillProjectionPolicy, project_trust_prompt_required,
+};
 use crate::subagents::{
     CompleteChildRunner, SessionSubagents, SubagentCoordinator, SubagentPolicy,
 };
@@ -371,8 +372,7 @@ fn run_fresh(home: PathBuf) -> Result<(), Box<dyn Error>> {
         disable_type_check,
     )?;
     session.configure_skill_projection(SkillProjectionPolicy::new(
-        skill_scope.canonical_scope.clone(),
-        project_skills_trusted,
+        project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
     ))?;
     if disable_type_check {
         arena.disable_model_type_check();
@@ -476,8 +476,7 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
         }
     };
     session.configure_skill_projection(SkillProjectionPolicy::new(
-        skill_scope.canonical_scope.clone(),
-        project_skills_trusted,
+        project_skills_trusted.then(|| skill_scope.canonical_scope.clone()),
     ))?;
     let selection = ModelSelection::new(ready.model(), ready.thinking())
         .expect("ready startup selection must be valid");
@@ -881,8 +880,10 @@ mod tests {
         let activation =
             super::model::SkillActivation::from_skill(catalog.lookup("shared").unwrap());
         assert!(
-            super::model::SkillProjectionPolicy::new(scope.canonical_scope, include_project)
-                .permits(&activation)
+            super::skills::SkillProjectionPolicy::new(
+                include_project.then_some(scope.canonical_scope)
+            )
+            .permits(&activation)
         );
     }
 

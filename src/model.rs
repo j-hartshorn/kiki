@@ -97,27 +97,6 @@ pub enum SkillActivationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillProjectionPolicy {
-    scope: PathBuf,
-    project_trusted: bool,
-}
-
-impl SkillProjectionPolicy {
-    pub fn new(scope: PathBuf, project_trusted: bool) -> Self {
-        Self {
-            scope,
-            project_trusted,
-        }
-    }
-
-    pub fn permits(&self, activation: &SkillActivation) -> bool {
-        activation.origin == SkillOrigin::User
-            || (self.project_trusted
-                && activation.trust_scope.as_deref() == Some(self.scope.as_path()))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptedAction {
     Code { source: String },
     Message { text: String },

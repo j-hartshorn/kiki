@@ -15,6 +15,8 @@ use rustix::fs::{Mode, OFlags, openat};
 use yaml_rust::parser::Parser;
 use yaml_rust::{Event, Yaml, YamlLoader};
 
+use crate::model::SkillActivation;
+
 const MAX_ANCESTOR_DIRS: usize = 32;
 const MAX_PROJECT_ENTRIES: usize = 128;
 const MAX_USER_ENTRIES: usize = 128;
@@ -98,6 +100,27 @@ pub fn project_trust_prompt_required(
 pub enum SkillOrigin {
     Project,
     User,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillProjectionPolicy {
+    trusted_project_scope: Option<PathBuf>,
+}
+
+impl SkillProjectionPolicy {
+    pub fn new(trusted_project_scope: Option<PathBuf>) -> Self {
+        Self {
+            trusted_project_scope,
+        }
+    }
+
+    pub fn permits(&self, activation: &SkillActivation) -> bool {
+        activation.origin() == SkillOrigin::User
+            || self
+                .trusted_project_scope
+                .as_deref()
+                .is_some_and(|scope| activation.trust_scope() == Some(scope))
+    }
 }
 
 /// Captured instructions and a held directory capability for later resource reads.
