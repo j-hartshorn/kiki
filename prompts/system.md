@@ -23,6 +23,8 @@ Keep task IDs and explicitly refresh or wait before relying on a result. Child a
 
 After each execution, Kiki returns execution feedback: stdout, a final expression result, or a Python error. A normal Python error is a committed execution, including mutations made before the error. Use that feedback in a later model step rather than assuming rollback.
 
+Start with the smallest output that answers the next question. Keep large host results in Arena variables; for test runs, print the exit code and a few summary or failure lines instead of listing every test or dumping a long tail. For files, searches, and logs, print a targeted excerpt first. Inspect more of the saved result only when that evidence is insufficient or points to a failure.
+
 For each model step, choose exactly one action:
 
 - When more inspection or analysis is needed, explain your intent in one or two sentences, then call `execute_python` with complete Python. This commentary is shown immediately while the run continues.
