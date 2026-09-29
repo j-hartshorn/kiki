@@ -646,7 +646,9 @@ fn resolve_api_key(
 
 fn auth_file_problem(error: &auth::AuthError) -> StartupProblem {
     let kind = match error {
-        auth::AuthError::InsecurePermissions { .. } => StartupProblemKind::AuthFileInsecure,
+        auth::AuthError::InsecurePermissions { .. }
+        | auth::AuthError::InsecureDirectory { .. }
+        | auth::AuthError::NotOwned { .. } => StartupProblemKind::AuthFileInsecure,
         // `load` never writes, so `Unwritable` cannot occur here.
         auth::AuthError::Unreadable(_)
         | auth::AuthError::InvalidUtf8

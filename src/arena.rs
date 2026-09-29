@@ -786,6 +786,9 @@ impl ArenaChildSource {
                 actual: checkpoint.identity.0.clone(),
             });
         }
+        // The worker path may be the kiki executable itself, which an upgrade can
+        // replace mid-session; never restore a checkpoint into a different runtime.
+        validate_worker(&self.worker_path).await?;
         let pool = Arena::open_pool(self.worker_path.clone()).await?;
         progress(ChildArenaConstructionPhase::PoolOpened);
         let mut checkout = pool
@@ -4278,6 +4281,32 @@ mod tests {
         let error = validate_worker(&worker).await.unwrap_err();
 
         assert!(matches!(error, ArenaError::WorkerVersionMismatch { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_arenas_revalidate_a_replaced_worker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut parent = arena(&workspace).await;
+        let checkpoint = parent.checkpoint();
+        let directory = tempfile::tempdir().unwrap();
+        let worker = directory.path().join("kiki");
+        fs::write(
+            &worker,
+            "#!/bin/sh\nprintf 'kiki 9.9.9 (monty-runtime 9.9.9)\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+        parent.worker_path = worker;
+
+        let Err(error) = parent.child(&checkpoint, false).await else {
+            panic!("a replaced worker with another runtime unexpectedly created a child");
+        };
+
+        assert!(
+            matches!(error, ArenaError::WorkerVersionMismatch { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

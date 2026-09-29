@@ -77,6 +77,8 @@ pub(crate) enum AuthError {
     Malformed,
     Invalid(&'static str),
     InsecurePermissions { mode: u32 },
+    InsecureDirectory { mode: u32 },
+    NotOwned { what: &'static str },
     Unwritable(io::Error),
 }
 
@@ -85,6 +87,13 @@ impl AuthError {
         match self {
             Self::InsecurePermissions { .. } => format!(
                 "Run `chmod 600 {AUTH_FILE_LABEL}` (and rotate the keys if the file was shared), then restart Kiki."
+            ),
+            Self::InsecureDirectory { .. } => "Run `chmod go-w ~/.kiki` (or `chmod 700 ~/.kiki`), check that nobody else changed ~/.kiki/auth.toml, then try again.".to_owned(),
+            Self::NotOwned { .. } => format!(
+                "Make sure ~/.kiki and {AUTH_FILE_LABEL} belong to your user (or delete them and run `kiki login <provider>`), then try again."
+            ),
+            Self::Unreadable(_) => format!(
+                "Check that you can access ~/.kiki and {AUTH_FILE_LABEL}, then try again."
             ),
             Self::Unwritable(_) => {
                 "Check that ~/.kiki is a writable directory, then try again.".to_owned()
@@ -108,6 +117,14 @@ impl fmt::Display for AuthError {
             Self::InsecurePermissions { mode } => write!(
                 formatter,
                 "{AUTH_FILE_LABEL} is accessible by other users (mode {mode:03o}), so Kiki will not use it"
+            ),
+            Self::InsecureDirectory { mode } => write!(
+                formatter,
+                "~/.kiki is writable by other users (mode {mode:03o}), so Kiki will not use {AUTH_FILE_LABEL}"
+            ),
+            Self::NotOwned { what } => write!(
+                formatter,
+                "{what} belongs to another user, so Kiki will not use {AUTH_FILE_LABEL}"
             ),
             Self::Unwritable(error) => {
                 write!(formatter, "could not write {AUTH_FILE_LABEL}: {error}")
@@ -143,8 +160,11 @@ pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<()
 /// Removes one provider's key. Returns whether a key was stored; the file is
 /// left untouched when it was not.
 pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError> {
-    if !auth_path(home).exists() {
-        return Ok(false);
+    // Only a missing file means "no key"; an unreadable one is an error, not a no-op.
+    match fs::metadata(auth_path(home)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(AuthError::Unreadable(error)),
     }
     update(home, |document| {
         document.remove(provider_id(provider)).is_some()
@@ -195,19 +215,75 @@ fn lock(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
+/// Reads the auth file after checking that `~/.kiki` is owned by the current
+/// user and not writable by others. Ownership (and, when enforced, the owner-only
+/// mode) is checked on the opened file, and the content is read from that same
+/// handle, so the checked file is the one used.
 fn read(path: &Path, permissions: Permissions) -> Result<Option<String>, AuthError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let directory = path
+        .parent()
+        .ok_or(AuthError::Invalid("the auth file has no parent directory"))?;
+    match fs::metadata(directory) {
+        Ok(metadata) => ensure_safe_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AuthError::Unreadable(error)),
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(AuthError::Unreadable(error)),
     };
+    let metadata = file.metadata().map_err(AuthError::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(AuthError::Invalid("it is not a regular file"));
+    }
+    ensure_owned(&metadata, "the auth file")?;
     if permissions == Permissions::Enforce {
         ensure_private(&metadata)?;
     }
-    let bytes = fs::read(path).map_err(AuthError::Unreadable)?;
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut file, &mut bytes).map_err(AuthError::Unreadable)?;
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| AuthError::InvalidUtf8)
+}
+
+#[cfg(unix)]
+fn ensure_safe_directory(metadata: &fs::Metadata) -> Result<(), AuthError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !metadata.is_dir() {
+        return Err(AuthError::Invalid("~/.kiki is not a directory"));
+    }
+    ensure_owned(metadata, "~/.kiki")?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 == 0 {
+        Ok(())
+    } else {
+        Err(AuthError::InsecureDirectory { mode })
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_safe_directory(_metadata: &fs::Metadata) -> Result<(), AuthError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owned(metadata: &fs::Metadata, what: &'static str) -> Result<(), AuthError> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if metadata.uid() == unsafe { libc::geteuid() } {
+        Ok(())
+    } else {
+        Err(AuthError::NotOwned { what })
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_owned(_metadata: &fs::Metadata, _what: &'static str) -> Result<(), AuthError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -251,7 +327,7 @@ fn parse(content: &str) -> Result<(StoredKeys, DocumentMut), AuthError> {
             if api_key.trim().is_empty() {
                 return Err(AuthError::Invalid("`api_key` must not be empty"));
             }
-            *keys.slot_mut(provider) = Some(api_key.to_owned());
+            *keys.slot_mut(provider) = Some(api_key.trim().to_owned());
         }
     }
     Ok((keys, document))
@@ -405,6 +481,81 @@ mod tests {
         let keys = load(home.path()).unwrap();
         assert_eq!(keys.get(Provider::OpenAi), Some("sk-open"));
         assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+    }
+
+    #[test]
+    fn stored_keys_are_trimmed() {
+        let home = tempdir().unwrap();
+        write_auth(home.path(), "[openai]\napi_key = \"  sk-padded \\n\"\n");
+        assert_eq!(
+            load(home.path()).unwrap().get(Provider::OpenAi),
+            Some("sk-padded")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_by_others_directory_is_refused_for_reads_and_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        write_auth(home.path(), "[openai]\napi_key = \"sk-open\"\n");
+        let directory = auth_path(home.path()).parent().unwrap().to_path_buf();
+        for mode in [0o777, 0o720, 0o702] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+            let error = load(home.path()).unwrap_err();
+            assert!(
+                matches!(error, AuthError::InsecureDirectory { mode: found } if found == mode),
+                "{mode:o}: {error:?}"
+            );
+            assert!(error.remediation().contains("chmod go-w ~/.kiki"));
+            assert!(matches!(
+                store(home.path(), Provider::Anthropic, "sk-ant"),
+                Err(AuthError::InsecureDirectory { .. })
+            ));
+            assert!(matches!(
+                remove(home.path(), Provider::OpenAi),
+                Err(AuthError::InsecureDirectory { .. })
+            ));
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            load(home.path()).unwrap().get(Provider::OpenAi),
+            Some("sk-open")
+        );
+        assert_eq!(load(home.path()).unwrap().get(Provider::Anthropic), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_reports_an_inaccessible_directory_instead_of_no_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        store(home.path(), Provider::OpenAi, "sk-open").unwrap();
+        let directory = auth_path(home.path()).parent().unwrap().to_path_buf();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = remove(home.path(), Provider::OpenAi);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(result, Err(AuthError::Unreadable(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            load(home.path()).unwrap().get(Provider::OpenAi),
+            Some("sk-open")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_auth_file_is_refused() {
+        let home = tempdir().unwrap();
+        fs::create_dir_all(auth_path(home.path())).unwrap();
+        assert!(matches!(
+            load(home.path()),
+            Err(AuthError::Invalid(_) | AuthError::Unreadable(_))
+        ));
     }
 
     #[test]
