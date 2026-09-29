@@ -63,7 +63,7 @@ pub(crate) fn save_project_skill_scope_trust(
     };
     let path = home.join(SKILL_TRUST_FILE);
     let parent = path.parent().ok_or(SkillTrustSaveError::InvalidStore)?;
-    fs::create_dir_all(parent).map_err(SkillTrustSaveError::Io)?;
+    super::create_private_dir_all(parent).map_err(SkillTrustSaveError::Io)?;
     let mut lock_options = OpenOptions::new();
     lock_options
         .read(true)
@@ -378,5 +378,22 @@ mod tests {
                 Err(super::SkillTrustSaveError::InvalidStore)
             ));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_kiki_directory_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn saving_skill_trust_creates_a_private_kiki_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let scope = std::fs::canonicalize(home.path()).unwrap();
+        super::save_project_skill_scope_trust(home.path(), &scope).unwrap();
+        let mode = std::fs::metadata(home.path().join(".kiki"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
 }

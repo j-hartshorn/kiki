@@ -5,6 +5,7 @@ mod clipboard;
 mod compaction;
 pub mod config;
 mod highlight;
+mod login;
 pub mod model;
 mod openai;
 mod presentation;
@@ -23,11 +24,13 @@ mod telemetry;
 pub mod tools;
 mod transcript;
 pub mod tui;
+mod worker;
 
 use std::error::Error;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -73,6 +76,9 @@ fn production_model(
 }
 
 enum Invocation {
+    Version,
+    Login(Provider),
+    Logout(Provider),
     Fresh,
     List,
     Continue,
@@ -82,7 +88,7 @@ enum Invocation {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here]]",
+        "Usage: kiki [sessions | --continue | --resume <32-lowerhex-id> [--here] | login <openai|anthropic> | logout <openai|anthropic> | --version]",
     )
 }
 
@@ -100,6 +106,15 @@ fn invocation() -> Result<Invocation, io::Error> {
     }
     match arguments.as_slice() {
         [] => Ok(Invocation::Fresh),
+        [flag] if flag == "--version" || flag == "-V" => Ok(Invocation::Version),
+        [command, provider] if command == "login" || command == "logout" => {
+            let provider = config::auth::parse_provider(provider).ok_or_else(usage)?;
+            Ok(if command == "login" {
+                Invocation::Login(provider)
+            } else {
+                Invocation::Logout(provider)
+            })
+        }
         [command] if command == "sessions" => Ok(Invocation::List),
         [command] if command == "--continue" => Ok(Invocation::Continue),
         [command, id] if command == "--resume" && valid_session_id(id) => Ok(Invocation::Resume {
@@ -128,6 +143,15 @@ fn requested_type_check_disabled(value: Option<&OsStr>) -> Result<bool, io::Erro
             "KIKI_TYPE_CHECK must be `on` or `off`",
         )),
     }
+}
+
+/// `kiki --version`. The arena also runs this to validate the embedded worker.
+fn version_line() -> String {
+    format!(
+        "kiki {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        arena::RUNTIME_IDENTITY
+    )
 }
 
 fn home_directory() -> Result<PathBuf, io::Error> {
@@ -554,21 +578,35 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let invocation = invocation()?;
-    let home = home_directory()?;
-    match invocation {
-        Invocation::Fresh => run_fresh(home),
-        Invocation::List => list_sessions(&home),
-        Invocation::Continue => continue_latest_session(home),
-        Invocation::Resume { id, here } => run_resume(home, id, here),
+    match invocation()? {
+        Invocation::Version => {
+            println!("{}", version_line());
+            Ok(())
+        }
+        Invocation::Login(provider) => login::login(&home_directory()?, provider),
+        Invocation::Logout(provider) => login::logout(&home_directory()?, provider),
+        Invocation::Fresh => run_fresh(home_directory()?),
+        Invocation::List => list_sessions(&home_directory()?),
+        Invocation::Continue => continue_latest_session(home_directory()?),
+        Invocation::Resume { id, here } => run_resume(home_directory()?, id, here),
     }
 }
 
-fn main() {
+/// Bounds embedded Monty worker memory (see `worker`). Only a binary may declare
+/// the global allocator, so it also serves the parent process, where no limit
+/// is ever set and it only counts live bytes.
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
+
+fn main() -> ExitCode {
+    if worker::requested() {
+        return worker::run();
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

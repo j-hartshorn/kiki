@@ -1260,7 +1260,7 @@ fn update_user_document(
 
 fn write_document(path: &Path, content: &str) -> Result<(), SaveError> {
     let parent = path.parent().ok_or(SaveError::UserSettingsUnavailable)?;
-    fs::create_dir_all(parent).map_err(SaveError::Io)?;
+    super::create_private_dir_all(parent).map_err(SaveError::Io)?;
     let mut temporary = NamedTempFile::new_in(parent).map_err(SaveError::Io)?;
     temporary
         .write_all(content.as_bytes())
@@ -2666,5 +2666,21 @@ mod tests {
             fs::read_to_string(home.path().join(".kiki/config.toml")).expect("saved user settings");
         assert!(user.contains("model = \"openai/gpt-5.6-sol\""));
         assert!(user.contains("\"openai/gpt-5.6-terra\" = \"low\""));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_kiki_directory_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn saving_user_settings_creates_a_private_kiki_directory() {
+        let home = tempfile::tempdir().unwrap();
+        super::write_document(&home.path().join(".kiki/config.toml"), "").unwrap();
+        let mode = std::fs::metadata(home.path().join(".kiki"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
 }

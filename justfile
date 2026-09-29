@@ -1,10 +1,15 @@
 set dotenv-load
 
-monty_root := "/tmp/kiki-monty"
-export MONTY_BIN := monty_root + "/bin/monty"
+# Kiki embeds its Monty worker (`kiki subprocess`). Tests that construct an
+# arena directly need a worker path, so point them at the freshly built binary.
+export MONTY_BIN := env("CARGO_TARGET_DIR", justfile_directory() / "target") / "debug/kiki"
 
-monty:
-    test -x "$MONTY_BIN" && test "$("$MONTY_BIN" --version)" = "monty-runtime 0.0.22" || cargo install monty-runtime --version 0.0.22 --locked --root "{{ monty_root }}" --force
+# Install `kiki` into ~/.cargo/bin. Store API keys with `kiki login <provider>`.
+install:
+    cargo install --path . --locked
+
+worker:
+    cargo build
 
 check:
     cargo check --all-targets
@@ -15,17 +20,17 @@ lint:
 format:
     cargo fmt --all
 
-run *args: monty
+run *args: worker
     cargo run -- {{args}}
 
-continue: monty
+continue: worker
     cargo run -- --continue
 
-test: monty
+test: worker
     cargo test --all-targets
 
-live-test: monty
+live-test: worker
     KIKI_MODEL=openai/gpt-5.6-sol cargo test openai::tests::live_sol -- --exact --ignored --test-threads=1
 
-live-test-anthropic: monty
+live-test-anthropic: worker
     KIKI_MODEL=anthropic/claude-opus-5-5 cargo test anthropic::tests::live_opus -- --exact --ignored --test-threads=1

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::prompt::{self, PromptError, PromptSource, ResolvedPrompt};
 use models::Provider;
 
+pub(crate) mod auth;
 pub(crate) mod constants;
 pub mod models;
 pub(crate) mod settings;
@@ -66,6 +67,9 @@ pub enum StartupProblemKind {
     SkillsCatalogPromptInvalidUtf8,
     ApiKeyMissing,
     ApiKeyInvalidUnicode,
+    AuthFileUnreadable,
+    AuthFileInvalid,
+    AuthFileInsecure,
 }
 
 impl StartupProblemKind {
@@ -92,7 +96,11 @@ impl StartupProblemKind {
             | Self::PromptOverrideInvalidUtf8
             | Self::SkillsCatalogPromptUnreadable
             | Self::SkillsCatalogPromptInvalidUtf8 => 8,
-            Self::ApiKeyMissing | Self::ApiKeyInvalidUnicode => 9,
+            Self::ApiKeyMissing
+            | Self::ApiKeyInvalidUnicode
+            | Self::AuthFileUnreadable
+            | Self::AuthFileInvalid
+            | Self::AuthFileInsecure => 9,
         }
     }
 }
@@ -206,6 +214,9 @@ pub struct StartupSnapshot {
     openai_api_key_presence: ApiKeyPresence,
     anthropic_api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
+    /// Non-blocking issues, such as an unusable auth file while the selected
+    /// provider's key comes from the environment.
+    warnings: Vec<StartupProblem>,
 }
 
 impl StartupSnapshot {
@@ -246,6 +257,10 @@ impl StartupSnapshot {
 
     pub fn problems(&self) -> &[StartupProblem] {
         &self.problems
+    }
+
+    pub fn warnings(&self) -> &[StartupProblem] {
+        &self.warnings
     }
 
     pub fn submission_availability(&self) -> SubmissionAvailability {
@@ -294,7 +309,7 @@ impl StartupConfiguration {
         self.with_construction_failure(
             StartupProblemKind::WorkerConstructionFailed,
             format!("Monty worker construction failed: {failure}"),
-            "Check that MONTY_BIN points to a working monty-runtime 0.0.22 executable, then restart Kiki.",
+            "Check that the Monty worker (this kiki executable, or MONTY_BIN if set) can start, then restart Kiki.",
         )
     }
 
@@ -415,6 +430,8 @@ struct StartupInput {
     skills_catalog_guidance: Result<String, PromptError>,
     openai_api_key: Option<OsString>,
     anthropic_api_key: Option<OsString>,
+    /// Keys from `~/.kiki/auth.toml`, used when the environment has none.
+    stored_api_keys: Result<auth::StoredKeys, auth::AuthError>,
 }
 
 enum PromptResolution {
@@ -456,6 +473,31 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
     }
 }
 
+/// Creates `path` and any missing parents owner-only (`0700` on Unix). Used for
+/// `~/.kiki` and its subdirectories, which hold sessions, settings and keys.
+/// Existing directories keep their mode.
+pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// The embedded Monty worker is this executable (`kiki subprocess`, see
+/// `crate::worker`); `MONTY_BIN` overrides it.
+fn embedded_worker_path() -> Option<OsString> {
+    env::current_exe().ok().map(PathBuf::into_os_string)
+}
+
 pub fn load() -> StartupConfiguration {
     load_with_session_preferences(None)
 }
@@ -463,16 +505,22 @@ pub fn load() -> StartupConfiguration {
 pub(crate) fn load_with_session_preferences(
     session_preferences: Option<SessionPreferences>,
 ) -> StartupConfiguration {
+    let home = env::var_os("HOME");
+    let stored_api_keys = match &home {
+        Some(home) => auth::load(Path::new(home)),
+        None => Ok(auth::StoredKeys::default()),
+    };
     let input = StartupInput {
-        worker_path: env::var_os(MONTY_BIN_ENV),
+        worker_path: env::var_os(MONTY_BIN_ENV).or_else(embedded_worker_path),
         model: env::var_os(KIKI_MODEL_ENV),
         thinking: env::var_os(KIKI_THINKING_ENV),
-        home: env::var_os("HOME"),
+        home,
         workspace_root: env::current_dir(),
         prompt: PromptResolution::from(prompt::resolve()),
         skills_catalog_guidance: prompt::resolve_skills_catalog_guidance(),
         openai_api_key: env::var_os(Provider::OpenAi.api_key_variable()),
         anthropic_api_key: env::var_os(Provider::Anthropic.api_key_variable()),
+        stored_api_keys,
     };
     resolve_startup_with_session_preferences(input, session_preferences)
 }
@@ -496,10 +544,18 @@ fn resolve_startup_with_session_preferences(
         skills_catalog_guidance,
         openai_api_key,
         anthropic_api_key,
+        stored_api_keys,
     } = input;
     let resuming = session_preferences.is_some();
-    let openai_api_key = resolve_api_key(openai_api_key);
-    let anthropic_api_key = resolve_api_key(anthropic_api_key);
+    let stored = stored_api_keys.as_ref().ok();
+    let openai_api_key = resolve_api_key(
+        openai_api_key,
+        stored.and_then(|keys| keys.get(Provider::OpenAi)),
+    );
+    let anthropic_api_key = resolve_api_key(
+        anthropic_api_key,
+        stored.and_then(|keys| keys.get(Provider::Anthropic)),
+    );
     let settings = settings::resolve(settings::Input {
         home,
         workspace_root: workspace_root.as_ref().ok().cloned(),
@@ -512,10 +568,23 @@ fn resolve_startup_with_session_preferences(
         Provider::OpenAi => &openai_api_key,
         Provider::Anthropic => &anthropic_api_key,
     };
+    let auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
     let api_key_problem = selected_api_key
         .as_ref()
         .err()
         .map(|&kind| api_key_problem(kind, model.provider(), resuming));
+    // An unusable auth file may be why the selected key is missing, so report it
+    // next to the missing-key problem (which still names the environment
+    // variable and resume alternatives). Otherwise it does not block startup,
+    // but its keys are unavailable, so it is a warning.
+    let key_missing = api_key_problem
+        .as_ref()
+        .is_some_and(|problem| problem.kind == StartupProblemKind::ApiKeyMissing);
+    let (auth_file_problem, warnings) = if key_missing {
+        (auth_file_issue, Vec::new())
+    } else {
+        (None, auth_file_issue.into_iter().collect())
+    };
     let api_keys = ApiKeys {
         openai: openai_api_key.ok(),
         anthropic: anthropic_api_key.ok(),
@@ -548,6 +617,7 @@ fn resolve_startup_with_session_preferences(
     problems.extend(settings_problems);
     problems.extend(prompt_problem);
     problems.extend(skills_catalog_problem);
+    problems.extend(auth_file_problem);
     problems.extend(api_key_problem);
     problems.sort_by_key(|problem| problem.kind.order());
 
@@ -563,6 +633,7 @@ fn resolve_startup_with_session_preferences(
             openai_api_key_presence: api_keys.presence(Provider::OpenAi),
             anthropic_api_key_presence: api_keys.presence(Provider::Anthropic),
             problems,
+            warnings,
         },
         construction: StartupConstruction {
             worker_path,
@@ -584,7 +655,51 @@ fn startup_settings_problem(problem: &settings::Problem, secrets: &[&str]) -> St
     )
 }
 
-fn resolve_api_key(api_key: Option<OsString>) -> Result<ApiKey, StartupProblemKind> {
+/// The environment variable wins; a stored key fills in only when it is unset or empty.
+fn resolve_api_key(
+    environment: Option<OsString>,
+    stored: Option<&str>,
+) -> Result<ApiKey, StartupProblemKind> {
+    match resolve_environment_api_key(environment) {
+        Err(StartupProblemKind::ApiKeyMissing) => stored
+            .map(|api_key| ApiKey(api_key.to_owned()))
+            .ok_or(StartupProblemKind::ApiKeyMissing),
+        resolved => resolved,
+    }
+}
+
+fn auth_file_problem(error: &auth::AuthError) -> StartupProblem {
+    let kind = match error {
+        auth::AuthError::InsecurePermissions { .. }
+        | auth::AuthError::InsecureDirectory { .. }
+        | auth::AuthError::NotOwned { .. } => StartupProblemKind::AuthFileInsecure,
+        // `load` never writes, so `Unwritable` cannot occur here.
+        auth::AuthError::Unreadable(_)
+        | auth::AuthError::InvalidUtf8
+        | auth::AuthError::WrongType { .. }
+        | auth::AuthError::Unwritable(_) => StartupProblemKind::AuthFileUnreadable,
+        auth::AuthError::Malformed | auth::AuthError::Invalid(_) => {
+            StartupProblemKind::AuthFileInvalid
+        }
+    };
+    StartupProblem::new(kind, format!("{error}."), error.remediation(), &[])
+}
+
+/// Whether `provider`'s environment variable is used instead of a stored key.
+/// Shares the startup rule: an unset, empty or whitespace-only variable falls
+/// back to the stored key; any other value (even invalid) takes precedence.
+pub(crate) fn environment_api_key_overrides_stored(provider: Provider) -> bool {
+    environment_value_overrides_stored(env::var_os(provider.api_key_variable()))
+}
+
+fn environment_value_overrides_stored(value: Option<OsString>) -> bool {
+    !matches!(
+        resolve_environment_api_key(value),
+        Err(StartupProblemKind::ApiKeyMissing)
+    )
+}
+
+fn resolve_environment_api_key(api_key: Option<OsString>) -> Result<ApiKey, StartupProblemKind> {
     let api_key = api_key
         .ok_or(StartupProblemKind::ApiKeyMissing)?
         .into_string()
@@ -597,10 +712,14 @@ fn resolve_api_key(api_key: Option<OsString>) -> Result<ApiKey, StartupProblemKi
 
 fn api_key_problem(kind: StartupProblemKind, provider: Provider, resuming: bool) -> StartupProblem {
     let variable = provider.api_key_variable();
-    let (diagnostic, key) = if kind == StartupProblemKind::ApiKeyInvalidUnicode {
-        ("is not valid Unicode", "a non-empty Unicode")
+    let (diagnostic, key, login) = if kind == StartupProblemKind::ApiKeyInvalidUnicode {
+        ("is not valid Unicode", "a non-empty Unicode", String::new())
     } else {
-        ("is missing or empty", "a non-empty")
+        (
+            "is missing or empty",
+            "a non-empty",
+            format!(" or run `kiki login {}`", auth::provider_id(provider)),
+        )
     };
     let saved_model = if resuming {
         ", or set KIKI_MODEL to override the saved model"
@@ -611,7 +730,7 @@ fn api_key_problem(kind: StartupProblemKind, provider: Provider, resuming: bool)
         kind,
         format!("{variable} {diagnostic}."),
         format!(
-            "Set {variable} to {key} {} API key{saved_model}, then restart Kiki.",
+            "Set {variable} to {key} {} API key{login}{saved_model}, then restart Kiki.",
             provider.display_name()
         ),
         &[],
@@ -627,8 +746,8 @@ fn resolve_worker_path(
             None,
             Some(StartupProblem::new(
                 StartupProblemKind::WorkerPathMissing,
-                "MONTY_BIN is not set.",
-                "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
+                "Kiki could not locate its own executable to run the embedded Monty worker.",
+                "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 0.0.22 executable, then restart Kiki.",
                 secrets,
             )),
         );
@@ -641,7 +760,7 @@ fn resolve_worker_path(
                 "MONTY_BIN must be an absolute path, but is `{}`.",
                 worker_path.display()
             ),
-            "Set MONTY_BIN to the absolute path of monty-runtime 0.0.22, then restart Kiki.",
+            "Set MONTY_BIN to the absolute path of a kiki or monty-runtime 0.0.22 executable, or unset it, then restart Kiki.",
             secrets,
         )
     });
@@ -776,6 +895,7 @@ pub(crate) fn ready_snapshot_with_settings_for_test(
         skills_catalog_guidance: Ok(prompt::skills_catalog_guidance().to_owned()),
         openai_api_key: Some(OsString::from("test-api-key")),
         anthropic_api_key: None,
+        stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
     })
     .snapshot
 }
@@ -858,6 +978,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(api_key.into()),
             anthropic_api_key: None,
+            stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         }
     }
 
@@ -1014,10 +1135,103 @@ mod tests {
             );
             assert_eq!(
                 problems[0].remediation(),
-                format!("Set {variable} to a non-empty {provider} API key, then restart Kiki.")
+                format!(
+                    "Set {variable} to a non-empty {provider} API key or run `kiki login {}`, then restart Kiki.",
+                    provider.to_lowercase()
+                )
             );
             assert!(configuration.ready().is_none());
         }
+    }
+
+    #[test]
+    fn stored_key_fills_in_only_when_the_environment_has_none() {
+        let home = tempfile::tempdir().unwrap();
+        crate::config::auth::store(home.path(), Provider::OpenAi, "sk-stored").unwrap();
+        let stored = crate::config::auth::load(home.path()).unwrap();
+
+        let mut input = ready_input("");
+        input.openai_api_key = None;
+        input.stored_api_keys = Ok(stored.clone());
+        let configuration = resolve_startup(input);
+        assert!(configuration.snapshot().problems().is_empty());
+        assert_eq!(
+            configuration
+                .ready()
+                .unwrap()
+                .api_key(Provider::OpenAi)
+                .map(super::ApiKey::expose),
+            Some("sk-stored")
+        );
+
+        let mut input = ready_input("sk-environment");
+        input.stored_api_keys = Ok(stored);
+        let configuration = resolve_startup(input);
+        assert_eq!(
+            configuration
+                .ready()
+                .unwrap()
+                .api_key(Provider::OpenAi)
+                .map(super::ApiKey::expose),
+            Some("sk-environment")
+        );
+    }
+
+    #[test]
+    fn environment_overrides_stored_keys_by_the_startup_rule() {
+        use super::environment_value_overrides_stored as overrides;
+
+        assert!(!overrides(None));
+        assert!(!overrides(Some(OsString::from(""))));
+        assert!(!overrides(Some(OsString::from("  \t"))));
+        assert!(overrides(Some(OsString::from("sk-environment"))));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(overrides(Some(OsString::from_vec(vec![0xff]))));
+        }
+    }
+
+    #[test]
+    fn unusable_auth_file_explains_a_missing_key_but_not_a_present_one() {
+        let mut input = ready_input("");
+        input.openai_api_key = None;
+        input.stored_api_keys =
+            Err(crate::config::auth::AuthError::InsecurePermissions { mode: 0o644 });
+        let configuration = resolve_startup(input);
+        let problems = configuration.snapshot().problems();
+        assert_eq!(
+            problems
+                .iter()
+                .map(|problem| problem.kind())
+                .collect::<Vec<_>>(),
+            [
+                StartupProblemKind::AuthFileInsecure,
+                StartupProblemKind::ApiKeyMissing
+            ]
+        );
+        assert!(
+            problems[0]
+                .remediation()
+                .contains("chmod 600 ~/.kiki/auth.toml")
+        );
+        assert!(problems[1].remediation().contains("Set OPENAI_API_KEY"));
+        assert!(problems[1].remediation().contains("kiki login openai"));
+
+        let mut input = ready_input("sk-environment");
+        input.stored_api_keys = Err(crate::config::auth::AuthError::Malformed);
+        let configuration = resolve_startup(input);
+        assert!(configuration.snapshot().problems().is_empty());
+        assert!(configuration.ready().is_some());
+        assert_eq!(
+            configuration
+                .snapshot()
+                .warnings()
+                .iter()
+                .map(|warning| warning.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::AuthFileInvalid]
+        );
     }
 
     #[test]
@@ -1044,7 +1258,7 @@ mod tests {
         );
         assert_eq!(
             problems[0].remediation(),
-            "Set ANTHROPIC_API_KEY to a non-empty Anthropic API key, or set KIKI_MODEL to override the saved model, then restart Kiki."
+            "Set ANTHROPIC_API_KEY to a non-empty Anthropic API key or run `kiki login anthropic`, or set KIKI_MODEL to override the saved model, then restart Kiki."
         );
         assert!(configuration.ready().is_none());
     }
@@ -1429,6 +1643,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
+            stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         };
 
         let configuration = resolve_startup(input);
@@ -1726,6 +1941,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: None,
             anthropic_api_key: None,
+            stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         };
 
         let configuration = resolve_startup(input)
@@ -1844,6 +2060,7 @@ mod tests {
             skills_catalog_guidance: Ok(crate::prompt::skills_catalog_guidance().to_owned()),
             openai_api_key: Some(OsString::from(api_key)),
             anthropic_api_key: None,
+            stored_api_keys: Ok(crate::config::auth::StoredKeys::default()),
         })
         .with_worker_construction_failure(format!("worker failure \x1b {api_key}"))
         .with_workspace_construction_failure(format!("workspace failure \r {api_key}"));
@@ -1863,7 +2080,7 @@ mod tests {
         assert!(rendered.contains(
             "Problem: Workspace construction failed: workspace failure \\x0D [redacted]"
         ));
-        assert!(rendered.contains("Remediation: Check that MONTY_BIN points to a working monty-runtime 0.0.22 executable, then restart Kiki."));
+        assert!(rendered.contains("Remediation: Check that the Monty worker (this kiki executable, or MONTY_BIN if set) can start, then restart Kiki."));
         assert!(rendered.contains("Remediation: Check the workspace directory permissions and filesystem access, then restart Kiki."));
         assert!(!rendered.contains(api_key), "{rendered}");
         assert!(!rendered.contains('\x1b'), "{rendered}");
