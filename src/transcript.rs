@@ -3771,6 +3771,10 @@ fn startup_block(snapshot: &StartupSnapshot) -> TranscriptBlock {
             lines.push(format!("Remediation: {}", problem.remediation()));
         }
     }
+    for warning in snapshot.warnings() {
+        lines.push(format!("Warning: {}", warning.diagnostic()));
+        lines.push(format!("Remediation: {}", warning.remediation()));
+    }
     TranscriptBlock::Startup { lines }
 }
 

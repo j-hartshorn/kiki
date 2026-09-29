@@ -578,20 +578,17 @@ fn run_resume(home: PathBuf, id: String, here: bool) -> Result<(), Box<dyn Error
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let invocation = invocation()?;
-    if let Invocation::Version = invocation {
-        println!("{}", version_line());
-        return Ok(());
-    }
-    let home = home_directory()?;
-    match invocation {
-        Invocation::Version => Ok(()),
-        Invocation::Login(provider) => login::login(&home, provider),
-        Invocation::Logout(provider) => login::logout(&home, provider),
-        Invocation::Fresh => run_fresh(home),
-        Invocation::List => list_sessions(&home),
-        Invocation::Continue => continue_latest_session(home),
-        Invocation::Resume { id, here } => run_resume(home, id, here),
+    match invocation()? {
+        Invocation::Version => {
+            println!("{}", version_line());
+            Ok(())
+        }
+        Invocation::Login(provider) => login::login(&home_directory()?, provider),
+        Invocation::Logout(provider) => login::logout(&home_directory()?, provider),
+        Invocation::Fresh => run_fresh(home_directory()?),
+        Invocation::List => list_sessions(&home_directory()?),
+        Invocation::Continue => continue_latest_session(home_directory()?),
+        Invocation::Resume { id, here } => run_resume(home_directory()?, id, here),
     }
 }
 

@@ -15,12 +15,12 @@ The Monty worker is embedded: `kiki` runs itself as `kiki subprocess` for its Py
 Store an API key for each provider you use:
 
 ```sh
-kiki login openai      # prompts for the key with echo off
+kiki login openai      # prompts for the key without echoing it; Ctrl-C cancels
 kiki login anthropic
 kiki logout anthropic  # removes a stored key
 ```
 
-Keys are stored in `~/.kiki/auth.toml`, which Kiki writes with mode `0600` inside a `0700` directory it creates. Kiki refuses to use the file if other users can access it; run `chmod 600 ~/.kiki/auth.toml` to fix that. Piping a key into `kiki login <provider>` also works. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` still work and take precedence over stored keys.
+Keys are stored in `~/.kiki/auth.toml`. Kiki always writes that file with owner-only mode `0600`; if it has to create `~/.kiki` it makes it `0700`, but an existing `~/.kiki` keeps its mode. Kiki refuses to use the auth file if other users can access it (run `chmod 600 ~/.kiki/auth.toml` to fix that); if the selected provider's key comes from the environment, the unusable file is shown as a startup warning instead. Concurrent `kiki login`/`logout` runs are serialised with `~/.kiki/auth.lock`. Piping a key into `kiki login <provider>` also works. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` still work and take precedence over stored keys.
 
 A non-empty key is needed for the selected model's provider: OpenAI or Anthropic. The keys are independently optional; with the default `openai/gpt-5.6-sol` model, only an OpenAI key is needed. On resume, the saved model requires its provider's key unless an explicit `KIKI_MODEL` overrides it. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to any supported qualified model ID above, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured and an OpenAI key is present, but does not change the Sol default. All eight models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, Opus to `medium`, Fable to `high`, and the remaining OpenAI models to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
 

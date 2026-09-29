@@ -214,6 +214,9 @@ pub struct StartupSnapshot {
     openai_api_key_presence: ApiKeyPresence,
     anthropic_api_key_presence: ApiKeyPresence,
     problems: Vec<StartupProblem>,
+    /// Non-blocking issues, such as an unusable auth file while the selected
+    /// provider's key comes from the environment.
+    warnings: Vec<StartupProblem>,
 }
 
 impl StartupSnapshot {
@@ -254,6 +257,10 @@ impl StartupSnapshot {
 
     pub fn problems(&self) -> &[StartupProblem] {
         &self.problems
+    }
+
+    pub fn warnings(&self) -> &[StartupProblem] {
+        &self.warnings
     }
 
     pub fn submission_availability(&self) -> SubmissionAvailability {
@@ -542,13 +549,19 @@ fn resolve_startup_with_session_preferences(
         Provider::OpenAi => &openai_api_key,
         Provider::Anthropic => &anthropic_api_key,
     };
+    let mut auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
     let api_key_problem = selected_api_key.as_ref().err().map(|&kind| {
         // A missing key is best explained by an unusable auth file, if there is one.
-        match (&stored_api_keys, kind) {
-            (Err(error), StartupProblemKind::ApiKeyMissing) => auth_file_problem(error),
-            _ => api_key_problem(kind, model.provider(), resuming),
+        match (
+            auth_file_issue.take_if(|_| kind == StartupProblemKind::ApiKeyMissing),
+            kind,
+        ) {
+            (Some(problem), _) => problem,
+            (None, kind) => api_key_problem(kind, model.provider(), resuming),
         }
     });
+    // Otherwise it does not block startup, but its keys are unavailable.
+    let warnings = auth_file_issue.into_iter().collect();
     let api_keys = ApiKeys {
         openai: openai_api_key.ok(),
         anthropic: anthropic_api_key.ok(),
@@ -596,6 +609,7 @@ fn resolve_startup_with_session_preferences(
             openai_api_key_presence: api_keys.presence(Provider::OpenAi),
             anthropic_api_key_presence: api_keys.presence(Provider::Anthropic),
             problems,
+            warnings,
         },
         construction: StartupConstruction {
             worker_path,
@@ -633,6 +647,7 @@ fn resolve_api_key(
 fn auth_file_problem(error: &auth::AuthError) -> StartupProblem {
     let kind = match error {
         auth::AuthError::InsecurePermissions { .. } => StartupProblemKind::AuthFileInsecure,
+        // `load` never writes, so `Unwritable` cannot occur here.
         auth::AuthError::Unreadable(_)
         | auth::AuthError::InvalidUtf8
         | auth::AuthError::Unwritable(_) => StartupProblemKind::AuthFileUnreadable,
@@ -1090,10 +1105,9 @@ mod tests {
 
     #[test]
     fn stored_key_fills_in_only_when_the_environment_has_none() {
-        let mut stored = crate::config::auth::StoredKeys::default();
         let home = tempfile::tempdir().unwrap();
         crate::config::auth::store(home.path(), Provider::OpenAi, "sk-stored").unwrap();
-        stored.clone_from(&crate::config::auth::load(home.path()).unwrap());
+        let stored = crate::config::auth::load(home.path()).unwrap();
 
         let mut input = ready_input("");
         input.openai_api_key = None;
@@ -1145,7 +1159,18 @@ mod tests {
 
         let mut input = ready_input("sk-environment");
         input.stored_api_keys = Err(crate::config::auth::AuthError::Malformed);
-        assert!(resolve_startup(input).snapshot().problems().is_empty());
+        let configuration = resolve_startup(input);
+        assert!(configuration.snapshot().problems().is_empty());
+        assert!(configuration.ready().is_some());
+        assert_eq!(
+            configuration
+                .snapshot()
+                .warnings()
+                .iter()
+                .map(|warning| warning.kind())
+                .collect::<Vec<_>>(),
+            [StartupProblemKind::AuthFileInvalid]
+        );
     }
 
     #[test]

@@ -135,11 +135,13 @@ pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<()
         let mut table = Table::new();
         table.insert(API_KEY_FIELD, value(api_key));
         document.insert(provider_id(provider), Item::Table(table));
+        true
     })
     .map(|_| ())
 }
 
-/// Removes one provider's key. Returns whether a key was stored.
+/// Removes one provider's key. Returns whether a key was stored; the file is
+/// left untouched when it was not.
 pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError> {
     if !auth_path(home).exists() {
         return Ok(false);
@@ -156,16 +158,41 @@ enum Permissions {
     Repair,
 }
 
-fn update<T>(home: &Path, change: impl FnOnce(&mut DocumentMut) -> T) -> Result<T, AuthError> {
+/// Read-modify-write under `~/.kiki/auth.lock`, so concurrent `kiki login`s
+/// cannot drop each other's keys. `change` returns whether it modified the
+/// document; the file is rewritten only if so.
+fn update(home: &Path, change: impl FnOnce(&mut DocumentMut) -> bool) -> Result<bool, AuthError> {
     let path = auth_path(home);
+    let _lock = lock(&path).map_err(AuthError::Unwritable)?;
     // Refuse to clobber a file that does not parse: it may hold hand-edited keys.
     let mut document = match read(&path, Permissions::Repair)? {
         Some(content) => parse(&content)?.1,
         None => DocumentMut::new(),
     };
-    let result = change(&mut document);
-    write_private(&path, &document.to_string()).map_err(AuthError::Unwritable)?;
-    Ok(result)
+    let changed = change(&mut document);
+    if changed {
+        write_private(&path, &document.to_string()).map_err(AuthError::Unwritable)?;
+    }
+    Ok(changed)
+}
+
+/// Takes an exclusive lock on a sibling lock file (the auth file itself is
+/// replaced by rename, so it cannot carry the lock). Released on drop.
+fn lock(path: &Path) -> io::Result<fs::File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("auth file has no parent directory"))?;
+    create_private_dir_all(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(parent.join("auth.lock"))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn read(path: &Path, permissions: Permissions) -> Result<Option<String>, AuthError> {
@@ -302,6 +329,35 @@ mod tests {
         let keys = load(home.path()).unwrap();
         assert_eq!(keys.get(Provider::OpenAi), None);
         assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+    }
+
+    #[test]
+    fn removing_an_absent_key_leaves_the_file_untouched() {
+        let home = tempdir().unwrap();
+        let content = "# my keys\n[openai]\napi_key =   \"sk-open\"\n";
+        write_auth(home.path(), content);
+        assert!(!remove(home.path(), Provider::Anthropic).unwrap());
+        assert_eq!(fs::read_to_string(auth_path(home.path())).unwrap(), content);
+    }
+
+    #[test]
+    fn concurrent_stores_keep_every_key() {
+        let home = tempdir().unwrap();
+        let providers = [Provider::OpenAi, Provider::Anthropic];
+        for round in 0..20 {
+            std::thread::scope(|scope| {
+                for provider in providers {
+                    let home = home.path();
+                    scope.spawn(move || {
+                        store(home, provider, &format!("sk-{round}")).unwrap();
+                    });
+                }
+            });
+            let keys = load(home.path()).unwrap();
+            for provider in providers {
+                assert_eq!(keys.get(provider), Some(format!("sk-{round}").as_str()));
+            }
+        }
     }
 
     #[test]
