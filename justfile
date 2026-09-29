@@ -2,7 +2,7 @@ set dotenv-load
 
 # Kiki embeds its Monty worker (`kiki subprocess`). Tests that construct an
 # arena directly need a worker path, so point them at the freshly built binary.
-export MONTY_BIN := justfile_directory() / "target/debug/kiki"
+export MONTY_BIN := env("CARGO_TARGET_DIR", justfile_directory() / "target") / "debug/kiki"
 
 # Install `kiki` into ~/.cargo/bin. Store API keys with `kiki login <provider>`.
 install:

@@ -2305,7 +2305,8 @@ fn initialise(
 
 fn sessions_directory(home: &Path) -> Result<PathBuf, SessionError> {
     let directory = home.join(".kiki/sessions");
-    fs::create_dir_all(&directory)?;
+    // Creates `~/.kiki` owner-only too; `config::auth` refuses group-writable ones.
+    crate::config::create_private_dir_all(&directory)?;
     set_owner_only(&directory, 0o700)?;
     Ok(directory)
 }
@@ -14014,5 +14015,21 @@ mod tests {
             writer_process_result(home.path(), &id, &second_socket),
             [b'R', b'O']
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_kiki_directory_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn sessions_directory_creates_a_private_kiki_directory() {
+        let home = tempfile::tempdir().unwrap();
+        super::sessions_directory(home.path()).unwrap();
+        let mode = std::fs::metadata(home.path().join(".kiki"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
 }

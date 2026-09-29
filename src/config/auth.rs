@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use super::create_private_dir_all;
 use super::models::Provider;
 
 pub(crate) const AUTH_FILE_LABEL: &str = "~/.kiki/auth.toml";
@@ -76,9 +77,19 @@ pub(crate) enum AuthError {
     InvalidUtf8,
     Malformed,
     Invalid(&'static str),
-    InsecurePermissions { mode: u32 },
-    InsecureDirectory { mode: u32 },
-    NotOwned { what: &'static str },
+    InsecurePermissions {
+        mode: u32,
+    },
+    InsecureDirectory {
+        mode: u32,
+    },
+    NotOwned {
+        what: &'static str,
+    },
+    WrongType {
+        what: &'static str,
+        expected: &'static str,
+    },
     Unwritable(io::Error),
 }
 
@@ -91,6 +102,9 @@ impl AuthError {
             Self::InsecureDirectory { .. } => "Run `chmod go-w ~/.kiki` (or `chmod 700 ~/.kiki`), check that nobody else changed ~/.kiki/auth.toml, then try again.".to_owned(),
             Self::NotOwned { .. } => format!(
                 "Make sure ~/.kiki and {AUTH_FILE_LABEL} belong to your user (or delete them and run `kiki login <provider>`), then try again."
+            ),
+            Self::WrongType { what, .. } => format!(
+                "Move or remove {what} so that Kiki can recreate it, then try again."
             ),
             Self::Unreadable(_) => format!(
                 "Check that you can access ~/.kiki and {AUTH_FILE_LABEL}, then try again."
@@ -122,6 +136,10 @@ impl fmt::Display for AuthError {
                 formatter,
                 "~/.kiki is writable by other users (mode {mode:03o}), so Kiki will not use {AUTH_FILE_LABEL}"
             ),
+            Self::WrongType { what, expected } => write!(
+                formatter,
+                "{what} is not a {expected}, so Kiki cannot use {AUTH_FILE_LABEL}"
+            ),
             Self::NotOwned { what } => write!(
                 formatter,
                 "{what} belongs to another user, so Kiki will not use {AUTH_FILE_LABEL}"
@@ -150,7 +168,7 @@ pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<()
     }
     update(home, |document| {
         let mut table = Table::new();
-        table.insert(API_KEY_FIELD, value(api_key));
+        table.insert(API_KEY_FIELD, value(api_key.trim()));
         document.insert(provider_id(provider), Item::Table(table));
         true
     })
@@ -171,6 +189,48 @@ pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError>
     })
 }
 
+/// Removes group and other write access from an existing `~/.kiki` owned by
+/// the current user, so stored keys can be used. Returns the previous mode if
+/// it changed. Older Kiki versions created `~/.kiki` with the default umask,
+/// which is group-writable on some systems.
+pub(crate) fn secure_directory(home: &Path) -> Result<Option<u32>, AuthError> {
+    let directory = home.join(".kiki");
+    let metadata = match fs::metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AuthError::Unreadable(error)),
+    };
+    if !metadata.is_dir() {
+        return Err(AuthError::WrongType {
+            what: "~/.kiki",
+            expected: "directory",
+        });
+    }
+    ensure_owned(&metadata, "~/.kiki")?;
+    tighten_directory(&directory, &metadata)
+}
+
+#[cfg(unix)]
+fn tighten_directory(directory: &Path, metadata: &fs::Metadata) -> Result<Option<u32>, AuthError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 == 0 {
+        return Ok(None);
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(mode & !0o022))
+        .map_err(AuthError::Unwritable)?;
+    Ok(Some(mode))
+}
+
+#[cfg(not(unix))]
+fn tighten_directory(
+    _directory: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<Option<u32>, AuthError> {
+    Ok(None)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Permissions {
     Enforce,
@@ -179,11 +239,17 @@ enum Permissions {
 }
 
 /// Read-modify-write under `~/.kiki/auth.lock`, so concurrent `kiki login`s
-/// cannot drop each other's keys. `change` returns whether it modified the
-/// document; the file is rewritten only if so.
+/// cannot drop each other's keys. The directory is checked before anything in
+/// it is opened. `change` returns whether it modified the document; the file is
+/// rewritten only if so.
 fn update(home: &Path, change: impl FnOnce(&mut DocumentMut) -> bool) -> Result<bool, AuthError> {
     let path = auth_path(home);
-    let _lock = lock(&path).map_err(AuthError::Unwritable)?;
+    let directory = path
+        .parent()
+        .ok_or(AuthError::Invalid("the auth file has no parent directory"))?;
+    create_private_dir_all(directory).map_err(AuthError::Unwritable)?;
+    ensure_safe_directory(&fs::metadata(directory).map_err(AuthError::Unreadable)?)?;
+    let _lock = lock(directory).map_err(AuthError::Unwritable)?;
     // Refuse to clobber a file that does not parse: it may hold hand-edited keys.
     let mut document = match read(&path, Permissions::Repair)? {
         Some(content) => parse(&content)?.1,
@@ -196,21 +262,20 @@ fn update(home: &Path, change: impl FnOnce(&mut DocumentMut) -> bool) -> Result<
     Ok(changed)
 }
 
-/// Takes an exclusive lock on a sibling lock file (the auth file itself is
-/// replaced by rename, so it cannot carry the lock). Released on drop.
-fn lock(path: &Path) -> io::Result<fs::File> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("auth file has no parent directory"))?;
-    create_private_dir_all(parent)?;
+/// Takes an exclusive lock on `auth.lock` in the (already checked) directory;
+/// the auth file itself is replaced by rename, so it cannot carry the lock.
+/// Symlinks are not followed. Released on drop.
+fn lock(directory: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
-    let file = options.open(parent.join("auth.lock"))?;
+    let file = options.open(directory.join("auth.lock"))?;
     file.lock()?;
     Ok(file)
 }
@@ -235,7 +300,10 @@ fn read(path: &Path, permissions: Permissions) -> Result<Option<String>, AuthErr
     };
     let metadata = file.metadata().map_err(AuthError::Unreadable)?;
     if !metadata.is_file() {
-        return Err(AuthError::Invalid("it is not a regular file"));
+        return Err(AuthError::WrongType {
+            what: AUTH_FILE_LABEL,
+            expected: "regular file",
+        });
     }
     ensure_owned(&metadata, "the auth file")?;
     if permissions == Permissions::Enforce {
@@ -253,7 +321,10 @@ fn ensure_safe_directory(metadata: &fs::Metadata) -> Result<(), AuthError> {
     use std::os::unix::fs::PermissionsExt;
 
     if !metadata.is_dir() {
-        return Err(AuthError::Invalid("~/.kiki is not a directory"));
+        return Err(AuthError::WrongType {
+            what: "~/.kiki",
+            expected: "directory",
+        });
     }
     ensure_owned(metadata, "~/.kiki")?;
     let mode = metadata.permissions().mode() & 0o777;
@@ -347,21 +418,6 @@ fn write_private(path: &Path, content: &str) -> io::Result<()> {
         .persist(path)
         .map(|_| ())
         .map_err(|error| error.error)
-}
-
-#[cfg(unix)]
-fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)
 }
 
 #[cfg(test)]
@@ -554,8 +610,64 @@ mod tests {
         fs::create_dir_all(auth_path(home.path())).unwrap();
         assert!(matches!(
             load(home.path()),
-            Err(AuthError::Invalid(_) | AuthError::Unreadable(_))
+            Err(AuthError::WrongType {
+                expected: "regular file",
+                ..
+            })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_directory_is_refused_before_anything_in_it_is_opened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        let directory = home.path().join(".kiki");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        let planted_target = home.path().join("planted-target");
+        std::os::unix::fs::symlink(&planted_target, directory.join("auth.lock")).unwrap();
+
+        assert!(matches!(
+            store(home.path(), Provider::OpenAi, "sk-open"),
+            Err(AuthError::InsecureDirectory { mode: 0o777 })
+        ));
+        assert!(!planted_target.exists());
+
+        // Even in a safe directory, a planted lock symlink is not followed.
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            store(home.path(), Provider::OpenAi, "sk-open"),
+            Err(AuthError::Unwritable(_))
+        ));
+        assert!(!planted_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_directory_removes_group_and_other_write_access_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        assert_eq!(super::secure_directory(home.path()).unwrap(), None);
+        let directory = home.path().join(".kiki");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).unwrap();
+
+        assert_eq!(super::secure_directory(home.path()).unwrap(), Some(0o775));
+        let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(super::secure_directory(home.path()).unwrap(), None);
+        store(home.path(), Provider::OpenAi, "sk-open").unwrap();
+    }
+
+    #[test]
+    fn stored_keys_are_written_trimmed() {
+        let home = tempdir().unwrap();
+        store(home.path(), Provider::OpenAi, "  sk-open\n").unwrap();
+        let content = fs::read_to_string(auth_path(home.path())).unwrap();
+        assert!(content.contains("api_key = \"sk-open\""), "{content}");
     }
 
     #[test]

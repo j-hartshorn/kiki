@@ -302,7 +302,7 @@ The ordinary suite is credential-free and uses local fixtures:
 cargo fmt --all -- --check
 cargo check --all-targets
 cargo build
-env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY MONTY_BIN="$PWD/target/debug/kiki" cargo test --all-targets -- --test-threads=1
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY MONTY_BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug/kiki" cargo test --all-targets -- --test-threads=1
 cargo clippy --all-targets -- -D warnings
 test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
 test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"

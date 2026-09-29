@@ -473,6 +473,25 @@ impl From<Result<ResolvedPrompt, PromptError>> for PromptResolution {
     }
 }
 
+/// Creates `path` and any missing parents owner-only (`0700` on Unix). Used for
+/// `~/.kiki` and its subdirectories, which hold sessions, settings and keys.
+/// Existing directories keep their mode.
+pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 /// The embedded Monty worker is this executable (`kiki subprocess`, see
 /// `crate::worker`); `MONTY_BIN` overrides it.
 fn embedded_worker_path() -> Option<OsString> {
@@ -549,19 +568,23 @@ fn resolve_startup_with_session_preferences(
         Provider::OpenAi => &openai_api_key,
         Provider::Anthropic => &anthropic_api_key,
     };
-    let mut auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
-    let api_key_problem = selected_api_key.as_ref().err().map(|&kind| {
-        // A missing key is best explained by an unusable auth file, if there is one.
-        match (
-            auth_file_issue.take_if(|_| kind == StartupProblemKind::ApiKeyMissing),
-            kind,
-        ) {
-            (Some(problem), _) => problem,
-            (None, kind) => api_key_problem(kind, model.provider(), resuming),
-        }
-    });
-    // Otherwise it does not block startup, but its keys are unavailable.
-    let warnings = auth_file_issue.into_iter().collect();
+    let auth_file_issue = stored_api_keys.as_ref().err().map(auth_file_problem);
+    let api_key_problem = selected_api_key
+        .as_ref()
+        .err()
+        .map(|&kind| api_key_problem(kind, model.provider(), resuming));
+    // An unusable auth file may be why the selected key is missing, so report it
+    // next to the missing-key problem (which still names the environment
+    // variable and resume alternatives). Otherwise it does not block startup,
+    // but its keys are unavailable, so it is a warning.
+    let key_missing = api_key_problem
+        .as_ref()
+        .is_some_and(|problem| problem.kind == StartupProblemKind::ApiKeyMissing);
+    let (auth_file_problem, warnings) = if key_missing {
+        (auth_file_issue, Vec::new())
+    } else {
+        (None, auth_file_issue.into_iter().collect())
+    };
     let api_keys = ApiKeys {
         openai: openai_api_key.ok(),
         anthropic: anthropic_api_key.ok(),
@@ -594,6 +617,7 @@ fn resolve_startup_with_session_preferences(
     problems.extend(settings_problems);
     problems.extend(prompt_problem);
     problems.extend(skills_catalog_problem);
+    problems.extend(auth_file_problem);
     problems.extend(api_key_problem);
     problems.sort_by_key(|problem| problem.kind.order());
 
@@ -652,12 +676,27 @@ fn auth_file_problem(error: &auth::AuthError) -> StartupProblem {
         // `load` never writes, so `Unwritable` cannot occur here.
         auth::AuthError::Unreadable(_)
         | auth::AuthError::InvalidUtf8
+        | auth::AuthError::WrongType { .. }
         | auth::AuthError::Unwritable(_) => StartupProblemKind::AuthFileUnreadable,
         auth::AuthError::Malformed | auth::AuthError::Invalid(_) => {
             StartupProblemKind::AuthFileInvalid
         }
     };
     StartupProblem::new(kind, format!("{error}."), error.remediation(), &[])
+}
+
+/// Whether `provider`'s environment variable is used instead of a stored key.
+/// Shares the startup rule: an unset, empty or whitespace-only variable falls
+/// back to the stored key; any other value (even invalid) takes precedence.
+pub(crate) fn environment_api_key_overrides_stored(provider: Provider) -> bool {
+    environment_value_overrides_stored(env::var_os(provider.api_key_variable()))
+}
+
+fn environment_value_overrides_stored(value: Option<OsString>) -> bool {
+    !matches!(
+        resolve_environment_api_key(value),
+        Err(StartupProblemKind::ApiKeyMissing)
+    )
 }
 
 fn resolve_environment_api_key(api_key: Option<OsString>) -> Result<ApiKey, StartupProblemKind> {
@@ -1139,6 +1178,21 @@ mod tests {
     }
 
     #[test]
+    fn environment_overrides_stored_keys_by_the_startup_rule() {
+        use super::environment_value_overrides_stored as overrides;
+
+        assert!(!overrides(None));
+        assert!(!overrides(Some(OsString::from(""))));
+        assert!(!overrides(Some(OsString::from("  \t"))));
+        assert!(overrides(Some(OsString::from("sk-environment"))));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(overrides(Some(OsString::from_vec(vec![0xff]))));
+        }
+    }
+
+    #[test]
     fn unusable_auth_file_explains_a_missing_key_but_not_a_present_one() {
         let mut input = ready_input("");
         input.openai_api_key = None;
@@ -1151,13 +1205,18 @@ mod tests {
                 .iter()
                 .map(|problem| problem.kind())
                 .collect::<Vec<_>>(),
-            [StartupProblemKind::AuthFileInsecure]
+            [
+                StartupProblemKind::AuthFileInsecure,
+                StartupProblemKind::ApiKeyMissing
+            ]
         );
         assert!(
             problems[0]
                 .remediation()
                 .contains("chmod 600 ~/.kiki/auth.toml")
         );
+        assert!(problems[1].remediation().contains("Set OPENAI_API_KEY"));
+        assert!(problems[1].remediation().contains("kiki login openai"));
 
         let mut input = ready_input("sk-environment");
         input.stored_api_keys = Err(crate::config::auth::AuthError::Malformed);

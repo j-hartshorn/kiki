@@ -112,6 +112,84 @@ fn stored_key_and_embedded_worker_launch_until_logout() {
 }
 
 #[cfg(unix)]
+fn with_umask(command: &mut Command, mask: libc::mode_t) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `umask` is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(mask);
+            Ok(())
+        });
+    }
+    command
+}
+
+#[cfg(unix)]
+fn directory_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn login_after_a_first_launch_under_a_group_writable_umask() {
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+
+    // The first launch creates ~/.kiki (for its session) with umask 002.
+    let first = with_umask(&mut kiki(home.path(), workspace.path(), &[]), 0o002)
+        .env("OPENAI_API_KEY", "sk-environment")
+        .stdin(Stdio::null())
+        .output()
+        .expect("launch kiki");
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("Session: "),
+        "{}",
+        text(&first)
+    );
+    let mode = directory_mode(&home.path().join(".kiki"));
+    assert_eq!(mode & 0o077, 0, "~/.kiki mode {mode:o}");
+
+    let login = login_with_piped_key(home.path(), workspace.path(), "openai", "sk-after-launch");
+    assert!(login.status.success(), "{}", text(&login));
+    assert!(!String::from_utf8_lossy(&login.stderr).contains("removed group"));
+}
+
+#[cfg(unix)]
+#[test]
+fn login_repairs_a_group_writable_kiki_directory_from_older_versions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().expect("create home");
+    let workspace = tempdir().expect("create workspace");
+    let directory = home.path().join(".kiki");
+    std::fs::create_dir(&directory).expect("create ~/.kiki");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775))
+        .expect("make ~/.kiki group-writable");
+
+    let login = login_with_piped_key(home.path(), workspace.path(), "openai", "sk-repaired");
+    assert!(login.status.success(), "{}", text(&login));
+    assert!(
+        String::from_utf8_lossy(&login.stderr)
+            .contains("removed group and other write access from ~/.kiki (was 775)"),
+        "{}",
+        text(&login)
+    );
+    assert_eq!(directory_mode(&directory), 0o755);
+
+    let ready = launch(home.path(), workspace.path());
+    assert!(
+        String::from_utf8_lossy(&ready.stdout).contains("Session: "),
+        "{}",
+        text(&ready)
+    );
+}
+
+#[cfg(unix)]
 mod pseudo_terminal {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

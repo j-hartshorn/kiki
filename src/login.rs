@@ -13,6 +13,7 @@ const PROMPT_NOTE: &str = "input hidden; Ctrl-C cancels";
 const PROMPT_NOTE: &str = "input is shown";
 
 pub(crate) fn login(home: &Path, provider: Provider) -> Result<(), Box<dyn Error>> {
+    secure_directory(home)?;
     let api_key = if io::stdin().is_terminal() {
         eprint!(
             "Paste your {} API key ({PROMPT_NOTE}): ",
@@ -41,6 +42,7 @@ pub(crate) fn login(home: &Path, provider: Provider) -> Result<(), Box<dyn Error
 }
 
 pub(crate) fn logout(home: &Path, provider: Provider) -> Result<(), Box<dyn Error>> {
+    secure_directory(home)?;
     if auth::remove(home, provider).map_err(with_remediation)? {
         println!(
             "Removed your {} API key from {}.",
@@ -58,15 +60,26 @@ pub(crate) fn logout(home: &Path, provider: Provider) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+/// Repairs a group- or other-writable `~/.kiki` left by older Kiki versions,
+/// telling the user, since stored keys are refused in such a directory.
+fn secure_directory(home: &Path) -> Result<(), Box<dyn Error>> {
+    if let Some(mode) = auth::secure_directory(home).map_err(with_remediation)? {
+        eprintln!(
+            "Note: removed group and other write access from ~/.kiki (was {mode:03o}). If other users could have changed files in it, check ~/.kiki before relying on it."
+        );
+    }
+    Ok(())
+}
+
 fn with_remediation(error: auth::AuthError) -> Box<dyn Error> {
     format!("{error}. {}", error.remediation()).into()
 }
 
 fn warn_if_environment_overrides(provider: Provider) {
-    let variable = provider.api_key_variable();
-    if std::env::var_os(variable).is_some_and(|value| !value.is_empty()) {
+    if crate::config::environment_api_key_overrides_stored(provider) {
         eprintln!(
-            "Note: {variable} is set in this environment and takes precedence over {}.",
+            "Note: {} is set in this environment and takes precedence over {}.",
+            provider.api_key_variable(),
             auth::AUTH_FILE_LABEL
         );
     }

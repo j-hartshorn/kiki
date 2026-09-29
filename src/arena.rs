@@ -786,8 +786,9 @@ impl ArenaChildSource {
                 actual: checkpoint.identity.0.clone(),
             });
         }
-        // The worker path may be the kiki executable itself, which an upgrade can
-        // replace mid-session; never restore a checkpoint into a different runtime.
+        // With the embedded worker this path is the kiki executable, which an
+        // upgrade can replace mid-session. Re-checking catches a replacement with a
+        // different runtime; it cannot rule out one between this check and spawn.
         validate_worker(&self.worker_path).await?;
         let pool = Arena::open_pool(self.worker_path.clone()).await?;
         progress(ChildArenaConstructionPhase::PoolOpened);
