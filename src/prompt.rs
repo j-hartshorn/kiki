@@ -360,6 +360,17 @@ mod tests {
     }
 
     #[test]
+    fn bundled_prompt_asks_for_focused_initial_output() {
+        for guidance in [
+            "Start with the smallest output",
+            "print the exit code and a few summary or failure lines",
+            "Inspect more of the saved result only when",
+        ] {
+            assert!(BUNDLED_PROMPT.contains(guidance), "missing `{guidance}`");
+        }
+    }
+
+    #[test]
     fn resolves_the_named_bundled_prompt_with_one_generated_tool_reference() {
         let resolved = resolve_from_override(None).unwrap();
         let empty = SkillCatalog::default();
