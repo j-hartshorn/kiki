@@ -45,7 +45,11 @@ use crate::{
 
 pub(crate) use crate::tools::ToolName;
 
-const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.22";
+/// Identity of the Monty worker runtime. A standalone `monty` prints exactly
+/// this for `--version`; `kiki --version` (the embedded worker, see
+/// `crate::worker`) prints `kiki <version> (monty-runtime 0.0.22)`. Both run the
+/// same pinned Monty, so both map to this identity and share checkpoints.
+pub(crate) const RUNTIME_IDENTITY: &str = "monty-runtime 0.0.22";
 const WORKER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_BYTES: usize = 32 * 1024;
 const INTERRUPTED_EVIDENCE_TEXT_LIMIT: usize = 4 * 1024;
@@ -1488,6 +1492,14 @@ fn result_value_from_monty(
     }
 }
 
+fn is_supported_worker_identity(version_output: &str) -> bool {
+    version_output == RUNTIME_IDENTITY
+        || version_output
+            .strip_prefix("kiki ")
+            .and_then(|rest| rest.strip_suffix(&format!(" ({RUNTIME_IDENTITY})")))
+            .is_some_and(|version| !version.is_empty() && !version.contains(char::is_whitespace))
+}
+
 async fn validate_worker(path: &Path) -> Result<RuntimeIdentity, ArenaError> {
     validate_worker_with_timeout(path, WORKER_VERSION_TIMEOUT).await
 }
@@ -1516,7 +1528,7 @@ async fn validate_worker_with_timeout(
         .map_err(|_| ArenaError::WorkerVersionInvalidOutput)?
         .trim()
         .to_owned();
-    if actual != RUNTIME_IDENTITY {
+    if !is_supported_worker_identity(&actual) {
         return Err(ArenaError::WorkerVersionMismatch {
             expected: RUNTIME_IDENTITY.to_owned(),
             actual,
@@ -9300,5 +9312,28 @@ mod tests {
             .head,
             "2"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_identity_tests {
+    use super::is_supported_worker_identity;
+
+    #[test]
+    fn accepts_standalone_monty_and_embedded_kiki_workers_only() {
+        assert!(is_supported_worker_identity("monty-runtime 0.0.22"));
+        assert!(is_supported_worker_identity(
+            "kiki 0.1.0 (monty-runtime 0.0.22)"
+        ));
+        assert!(!is_supported_worker_identity("monty-runtime 9.9.9"));
+        assert!(!is_supported_worker_identity(
+            "kiki 0.1.0 (monty-runtime 9.9.9)"
+        ));
+        assert!(!is_supported_worker_identity(
+            "kiki  (monty-runtime 0.0.22)"
+        ));
+        assert!(!is_supported_worker_identity(
+            "other 0.1.0 (monty-runtime 0.0.22)"
+        ));
     }
 }

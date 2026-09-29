@@ -1,0 +1,394 @@
+//! Stored provider API keys for a user installation: `~/.kiki/auth.toml`.
+//!
+//! ```toml
+//! [openai]
+//! api_key = "sk-..."
+//!
+//! [anthropic]
+//! api_key = "sk-ant-..."
+//! ```
+//!
+//! Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) take
+//! precedence over stored keys. The file holds secrets, so it lives apart from
+//! `config.toml` (which is safe to share) and must be accessible by its owner
+//! only: Kiki writes it with mode `0600` and refuses to read a file that other
+//! users can access. Diagnostics never echo file content, which may be a key.
+
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use tempfile::NamedTempFile;
+use toml_edit::{DocumentMut, Item, Table, value};
+
+use super::models::Provider;
+
+pub(crate) const AUTH_FILE_LABEL: &str = "~/.kiki/auth.toml";
+const API_KEY_FIELD: &str = "api_key";
+
+pub(crate) fn auth_path(home: &Path) -> PathBuf {
+    home.join(".kiki").join("auth.toml")
+}
+
+/// The table name (and `kiki login` argument) for a provider.
+pub(crate) fn provider_id(provider: Provider) -> &'static str {
+    match provider {
+        Provider::OpenAi => "openai",
+        Provider::Anthropic => "anthropic",
+    }
+}
+
+pub(crate) fn parse_provider(id: &str) -> Option<Provider> {
+    match id {
+        "openai" => Some(Provider::OpenAi),
+        "anthropic" => Some(Provider::Anthropic),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StoredKeys {
+    openai: Option<String>,
+    anthropic: Option<String>,
+}
+
+impl StoredKeys {
+    pub(crate) fn get(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::OpenAi => self.openai.as_deref(),
+            Provider::Anthropic => self.anthropic.as_deref(),
+        }
+    }
+
+    fn slot_mut(&mut self, provider: Provider) -> &mut Option<String> {
+        match provider {
+            Provider::OpenAi => &mut self.openai,
+            Provider::Anthropic => &mut self.anthropic,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum AuthError {
+    Unreadable(io::Error),
+    InvalidUtf8,
+    Malformed,
+    Invalid(&'static str),
+    InsecurePermissions { mode: u32 },
+    Unwritable(io::Error),
+}
+
+impl AuthError {
+    pub(crate) fn remediation(&self) -> String {
+        match self {
+            Self::InsecurePermissions { .. } => format!(
+                "Run `chmod 600 {AUTH_FILE_LABEL}` (and rotate the keys if the file was shared), then restart Kiki."
+            ),
+            Self::Unwritable(_) => {
+                "Check that ~/.kiki is a writable directory, then try again.".to_owned()
+            }
+            _ => format!(
+                "Fix {AUTH_FILE_LABEL}, or delete it and run `kiki login <provider>`, then restart Kiki."
+            ),
+        }
+    }
+}
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable(error) => {
+                write!(formatter, "could not read {AUTH_FILE_LABEL}: {error}")
+            }
+            Self::InvalidUtf8 => write!(formatter, "{AUTH_FILE_LABEL} is not valid UTF-8"),
+            Self::Malformed => write!(formatter, "{AUTH_FILE_LABEL} is not valid TOML"),
+            Self::Invalid(detail) => write!(formatter, "{AUTH_FILE_LABEL} is invalid: {detail}"),
+            Self::InsecurePermissions { mode } => write!(
+                formatter,
+                "{AUTH_FILE_LABEL} is accessible by other users (mode {mode:03o}), so Kiki will not use it"
+            ),
+            Self::Unwritable(error) => {
+                write!(formatter, "could not write {AUTH_FILE_LABEL}: {error}")
+            }
+        }
+    }
+}
+
+impl Error for AuthError {}
+
+/// Reads the stored keys. A missing file is an empty store.
+pub(crate) fn load(home: &Path) -> Result<StoredKeys, AuthError> {
+    match read(&auth_path(home), Permissions::Enforce)? {
+        Some(content) => parse(&content).map(|(keys, _)| keys),
+        None => Ok(StoredKeys::default()),
+    }
+}
+
+/// Stores (or replaces) one provider's key, preserving the others.
+pub(crate) fn store(home: &Path, provider: Provider, api_key: &str) -> Result<(), AuthError> {
+    if api_key.trim().is_empty() {
+        return Err(AuthError::Invalid("an API key must not be empty"));
+    }
+    update(home, |document| {
+        let mut table = Table::new();
+        table.insert(API_KEY_FIELD, value(api_key));
+        document.insert(provider_id(provider), Item::Table(table));
+    })
+    .map(|_| ())
+}
+
+/// Removes one provider's key. Returns whether a key was stored.
+pub(crate) fn remove(home: &Path, provider: Provider) -> Result<bool, AuthError> {
+    if !auth_path(home).exists() {
+        return Ok(false);
+    }
+    update(home, |document| {
+        document.remove(provider_id(provider)).is_some()
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Permissions {
+    Enforce,
+    /// Rewriting replaces the file with a private one, which repairs its mode.
+    Repair,
+}
+
+fn update<T>(home: &Path, change: impl FnOnce(&mut DocumentMut) -> T) -> Result<T, AuthError> {
+    let path = auth_path(home);
+    // Refuse to clobber a file that does not parse: it may hold hand-edited keys.
+    let mut document = match read(&path, Permissions::Repair)? {
+        Some(content) => parse(&content)?.1,
+        None => DocumentMut::new(),
+    };
+    let result = change(&mut document);
+    write_private(&path, &document.to_string()).map_err(AuthError::Unwritable)?;
+    Ok(result)
+}
+
+fn read(path: &Path, permissions: Permissions) -> Result<Option<String>, AuthError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AuthError::Unreadable(error)),
+    };
+    if permissions == Permissions::Enforce {
+        ensure_private(&metadata)?;
+    }
+    let bytes = fs::read(path).map_err(AuthError::Unreadable)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| AuthError::InvalidUtf8)
+}
+
+#[cfg(unix)]
+fn ensure_private(metadata: &fs::Metadata) -> Result<(), AuthError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        Ok(())
+    } else {
+        Err(AuthError::InsecurePermissions { mode })
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_private(_metadata: &fs::Metadata) -> Result<(), AuthError> {
+    Ok(())
+}
+
+fn parse(content: &str) -> Result<(StoredKeys, DocumentMut), AuthError> {
+    let document = content
+        .parse::<DocumentMut>()
+        .map_err(|_| AuthError::Malformed)?;
+    let mut keys = StoredKeys::default();
+    for (name, item) in document.iter() {
+        let provider = parse_provider(name).ok_or(AuthError::Invalid(
+            "it contains an unknown table; only [openai] and [anthropic] are allowed",
+        ))?;
+        let table = item
+            .as_table_like()
+            .ok_or(AuthError::Invalid("each provider entry must be a table"))?;
+        if table.iter().any(|(field, _)| field != API_KEY_FIELD) {
+            return Err(AuthError::Invalid(
+                "a provider table contains an unknown field; only `api_key` is allowed",
+            ));
+        }
+        if let Some(item) = table.get(API_KEY_FIELD) {
+            let api_key = item
+                .as_str()
+                .ok_or(AuthError::Invalid("`api_key` must be a string"))?;
+            if api_key.trim().is_empty() {
+                return Err(AuthError::Invalid("`api_key` must not be empty"));
+            }
+            *keys.slot_mut(provider) = Some(api_key.to_owned());
+        }
+    }
+    Ok((keys, document))
+}
+
+/// Atomically replaces `path` with an owner-only (`0600`) file.
+fn write_private(path: &Path, content: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("auth file has no parent directory"))?;
+    create_private_dir_all(parent)?;
+    // `NamedTempFile` creates its file with mode 0600 on Unix.
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+#[cfg(unix)]
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{AuthError, StoredKeys, auth_path, load, remove, store};
+    use crate::config::models::Provider;
+
+    fn write_auth(home: &std::path::Path, content: &str) {
+        let path = auth_path(home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_file_is_an_empty_store() {
+        let home = tempdir().unwrap();
+        assert_eq!(load(home.path()).unwrap(), StoredKeys::default());
+    }
+
+    #[test]
+    fn store_round_trips_and_preserves_other_providers() {
+        let home = tempdir().unwrap();
+        store(home.path(), Provider::OpenAi, "sk-open").unwrap();
+        store(home.path(), Provider::Anthropic, "sk-ant").unwrap();
+        store(home.path(), Provider::OpenAi, "sk-open-2").unwrap();
+        let keys = load(home.path()).unwrap();
+        assert_eq!(keys.get(Provider::OpenAi), Some("sk-open-2"));
+        assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+
+        assert!(remove(home.path(), Provider::OpenAi).unwrap());
+        assert!(!remove(home.path(), Provider::OpenAi).unwrap());
+        let keys = load(home.path()).unwrap();
+        assert_eq!(keys.get(Provider::OpenAi), None);
+        assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+    }
+
+    #[test]
+    fn remove_without_a_file_does_not_create_one() {
+        let home = tempdir().unwrap();
+        assert!(!remove(home.path(), Provider::OpenAi).unwrap());
+        assert!(!auth_path(home.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_file_and_new_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        store(home.path(), Provider::OpenAi, "sk-open").unwrap();
+        let path = auth_path(home.path());
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_file_is_refused_and_rewriting_repairs_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        write_auth(home.path(), "[openai]\napi_key = \"sk-open\"\n");
+        let path = auth_path(home.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = load(home.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            AuthError::InsecurePermissions { mode: 0o644 }
+        ));
+        assert!(error.remediation().contains("chmod 600"));
+
+        store(home.path(), Provider::Anthropic, "sk-ant").unwrap();
+        let keys = load(home.path()).unwrap();
+        assert_eq!(keys.get(Provider::OpenAi), Some("sk-open"));
+        assert_eq!(keys.get(Provider::Anthropic), Some("sk-ant"));
+    }
+
+    #[test]
+    fn accepts_inline_tables() {
+        let home = tempdir().unwrap();
+        write_auth(home.path(), "openai = { api_key = \"sk-inline\" }\n");
+        assert_eq!(
+            load(home.path()).unwrap().get(Provider::OpenAi),
+            Some("sk-inline")
+        );
+    }
+
+    #[test]
+    fn invalid_files_are_rejected_without_echoing_content() {
+        let home = tempdir().unwrap();
+        for content in [
+            "[openai]\napi_key = \"sk-secret\n",
+            "[sk-secret]\napi_key = \"x\"\n",
+            "[openai]\ntoken = \"sk-secret\"\n",
+            "[openai]\napi_key = 7\n",
+            "[openai]\napi_key = \"  \"\n",
+            "openai = \"sk-secret\"\n",
+        ] {
+            write_auth(home.path(), content);
+            let error = load(home.path()).unwrap_err();
+            assert!(
+                matches!(error, AuthError::Malformed | AuthError::Invalid(_)),
+                "{content}: {error:?}"
+            );
+            assert!(!error.to_string().contains("sk-secret"), "{error}");
+            // A file that does not parse is never overwritten.
+            assert!(store(home.path(), Provider::OpenAi, "sk-new").is_err());
+            assert_eq!(fs::read_to_string(auth_path(home.path())).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn empty_keys_are_not_stored() {
+        let home = tempdir().unwrap();
+        assert!(store(home.path(), Provider::OpenAi, " ").is_err());
+        assert!(!auth_path(home.path()).exists());
+    }
+}

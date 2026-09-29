@@ -150,15 +150,13 @@ fn invoke_ready(
     arguments: &[&str],
     selection: Option<(&str, &str)>,
 ) -> Output {
-    let monty = std::env::var_os("MONTY_BIN")
-        .expect("MONTY_BIN must be exported for configured CLI integration tests");
+    // No MONTY_BIN: the configured binary runs its embedded worker.
     let mut command = Command::new(env!("CARGO_BIN_EXE_kiki"));
     command
         .args(arguments)
         .current_dir(workspace)
         .env_clear()
         .env("HOME", home)
-        .env("MONTY_BIN", monty)
         .env("OPENAI_API_KEY", "test-api-key");
     if let Some((model, thinking)) = selection {
         command
@@ -970,4 +968,81 @@ fn continue_without_matching_session_fails_without_session_or_runtime() {
     assert!(!stdout.contains("Session:"), "{stdout}");
     assert!(!trace.exists());
     assert_eq!(entries(&sessions), entries_before);
+}
+
+#[test]
+fn version_reports_the_embedded_monty_runtime() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kiki"))
+        .arg("--version")
+        .env_clear()
+        .output()
+        .expect("run kiki --version");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!(
+            "kiki ",
+            env!("CARGO_PKG_VERSION"),
+            " (monty-runtime 0.0.22)"
+        )
+    );
+}
+
+#[test]
+fn login_stores_a_private_key_that_logout_removes() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let home = tempdir().expect("create home");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kiki"))
+        .args(["login", "anthropic"])
+        .env_clear()
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run kiki login");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"sk-ant-from-stdin\n")
+        .expect("write key");
+    let output = child.wait_with_output().expect("wait for kiki login");
+    assert!(output.status.success(), "{:?}", output_text(&output));
+
+    let auth = home.path().join(".kiki/auth.toml");
+    let content = std::fs::read_to_string(&auth).expect("auth file");
+    assert!(content.contains("[anthropic]") && content.contains("sk-ant-from-stdin"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("sk-ant-from-stdin"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&auth).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kiki"))
+        .args(["logout", "anthropic"])
+        .env_clear()
+        .env("HOME", home.path())
+        .output()
+        .expect("run kiki logout");
+    assert!(output.status.success(), "{:?}", output_text(&output));
+    let content = std::fs::read_to_string(&auth).expect("auth file");
+    assert!(!content.contains("sk-ant-from-stdin"));
+}
+
+#[test]
+fn login_rejects_unknown_providers() {
+    let home = tempdir().expect("create home");
+    let output = Command::new(env!("CARGO_BIN_EXE_kiki"))
+        .args(["login", "nope"])
+        .env_clear()
+        .env("HOME", home.path())
+        .output()
+        .expect("run kiki login");
+    assert!(!output.status.success());
+    assert!(!home.path().join(".kiki/auth.toml").exists());
 }

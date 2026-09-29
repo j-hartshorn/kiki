@@ -4,21 +4,31 @@ Kiki runs a Python agent with either the OpenAI Responses API or the Anthropic M
 
 ## Setup
 
-Install the exact Monty worker:
+Install the `kiki` command into `~/.cargo/bin` (make sure that directory is on your `PATH`):
 
 ```sh
-cargo install monty-runtime --version 0.0.22 --locked --root /tmp/kiki-monty
+just install   # or: cargo install --path . --locked
 ```
 
-Set an absolute path to that exact worker and a non-empty key for the selected model's provider: `OPENAI_API_KEY` for OpenAI or `ANTHROPIC_API_KEY` for Anthropic. The keys are independently optional; with the default `openai/gpt-5.6-sol` model, only `OPENAI_API_KEY` is needed. On resume, the saved model requires its provider's key unless an explicit `KIKI_MODEL` overrides it. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to any supported qualified model ID above, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured and an OpenAI key is present, but does not change the Sol default. All eight models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, Opus to `medium`, Fable to `high`, and the remaining OpenAI models to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
+The Monty worker is embedded: `kiki` runs itself as `kiki subprocess` for its Python arena, so no separate `monty-runtime` install is needed. `kiki --version` prints `kiki <version> (monty-runtime 0.0.22)`. Setting `MONTY_BIN` to the absolute path of another `kiki` or a `monty-runtime` 0.0.22 executable overrides the embedded worker.
+
+Store an API key for each provider you use:
+
+```sh
+kiki login openai      # prompts for the key with echo off
+kiki login anthropic
+kiki logout anthropic  # removes a stored key
+```
+
+Keys are stored in `~/.kiki/auth.toml`, which Kiki writes with mode `0600` inside a `0700` directory it creates. Kiki refuses to use the file if other users can access it; run `chmod 600 ~/.kiki/auth.toml` to fix that. Piping a key into `kiki login <provider>` also works. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` still work and take precedence over stored keys.
+
+A non-empty key is needed for the selected model's provider: OpenAI or Anthropic. The keys are independently optional; with the default `openai/gpt-5.6-sol` model, only an OpenAI key is needed. On resume, the saved model requires its provider's key unless an explicit `KIKI_MODEL` overrides it. Optionally set `KIKI_SYSTEM_PROMPT` to the path of a UTF-8 Markdown system-prompt override, `KIKI_MODEL` to any supported qualified model ID above, and `KIKI_THINKING` to a supported thinking level. Kiki falls back to `openai/gpt-5.6-sol` with `medium` thinking only when no higher-precedence layer selects those values. Astra appears first in the model picker when no favourites are configured and an OpenAI key is present, but does not change the Sol default. All eight models support `low`, `medium`, `high`, `xhigh`, and `max`; Astra defaults to `low`, Opus to `medium`, Fable to `high`, and the remaining OpenAI models to `medium`. Higher Astra efforts may have greater latency and may require provider account eligibility (Daybreak Blue / Trusted Access or suitable rate limits); Kiki does not grant eligibility or locally block those efforts.
 
 Set `KIKI_TYPE_CHECK=off` at startup to disable checking for a new session or opt out when resuming one. Unset or `on` leaves checking enabled for new sessions. An opt-out persists across restarts and tree navigation even after the variable is removed or set to `on`; start a new session to re-enable checking. Other values are rejected.
 
-Export the variables:
+Optional environment variables:
 
 ```sh
-export ANTHROPIC_API_KEY=...
-export MONTY_BIN=/tmp/kiki-monty/bin/monty
 export KIKI_SYSTEM_PROMPT=/absolute/path/to/system.md
 export KIKI_MODEL=anthropic/claude-opus-5-5
 export KIKI_THINKING=high
@@ -27,10 +37,10 @@ export KIKI_THINKING=high
 Launch Kiki from the workspace the agent may inspect and modify:
 
 ```sh
-cargo run
+kiki
 ```
 
-Alternatively, put the variables in the ignored root `.env` file and launch with `just run`. Plain `cargo run` does not load `.env`.
+When developing, `just run` builds and launches the checkout, loading the ignored root `.env` file; plain `cargo run` also works, but does not load `.env`.
 
 ## Agent Skills
 
@@ -273,7 +283,6 @@ Start Kiki with live credentials:
 ```sh
 ANTHROPIC_API_KEY=... \
 KIKI_MODEL=anthropic/claude-opus-5-5 \
-MONTY_BIN=/tmp/kiki-monty/bin/monty \
 cargo run
 ```
 
@@ -292,7 +301,8 @@ The ordinary suite is credential-free and uses local fixtures:
 ```sh
 cargo fmt --all -- --check
 cargo check --all-targets
-env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY MONTY_BIN=/tmp/kiki-monty/bin/monty cargo test --all-targets -- --test-threads=1
+cargo build
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY MONTY_BIN="$PWD/target/debug/kiki" cargo test --all-targets -- --test-threads=1
 cargo clippy --all-targets -- -D warnings
 test "$(rg -l 'async_openai' src --glob '*.rs')" = "src/openai.rs"
 test "$(rg -l 'monty_(pool|types)' src --glob '*.rs')" = "src/arena.rs"
@@ -301,11 +311,11 @@ test "$(rg -l '(cap_std|blake3)' src --glob '*.rs')" = "src/tools.rs"
 
 ## Opt-in live smoke test
 
-The ignored live scenarios require a key for the selected provider and the Monty worker. `just` loads the ignored root `.env` if used; the Anthropic recipe explicitly selects Opus 5.5:
+The ignored live scenarios require a key for the selected provider and a worker; the `just` recipes point `MONTY_BIN` at the freshly built `target/debug/kiki`. `just` loads the ignored root `.env` if used; the Anthropic recipe explicitly selects Opus 5.5:
 
 ```sh
-OPENAI_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test
-ANTHROPIC_API_KEY=... MONTY_BIN=/tmp/kiki-monty/bin/monty just live-test-anthropic
+OPENAI_API_KEY=... just live-test
+ANTHROPIC_API_KEY=... just live-test-anthropic
 ```
 
 Each runs three requests on one controller. The complete scenario has a five-minute watchdog; every provider attempt has a two-minute deadline; if the first request starts a ninth model step, the test cancels it and fails. The cancellation request must start an attempt within 30 seconds and settle within another 30 seconds. The follow-up request must finish within two minutes. Cleanup always requests shutdown, waits up to ten seconds, then aborts and awaits the controller if necessary.
