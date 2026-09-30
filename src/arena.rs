@@ -920,9 +920,7 @@ impl Arena {
         max_memory: Option<usize>,
         clock: Arc<dyn ArenaClock>,
     ) -> Result<Self, ArenaError> {
-        let worker_identity = validate_worker(&worker_path).await?;
-        // Monty dumps retain type checking and its host stubs.
-        let runtime = RuntimeIdentity(format!("{}+type-check-v3", worker_identity.0));
+        validate_worker(&worker_path).await?;
         let pool = Self::open_pool(worker_path.clone()).await?;
         let repl_config = ReplConfig {
             limits: Some(ResourceLimits {
@@ -943,6 +941,7 @@ impl Arena {
         let mut checkout = pool.checkout(&repl_config).await.map_err(pool_failure)?;
         bootstrap(&mut checkout).await?;
         let state = checkout.dump().await.map_err(pool_failure)?;
+        let runtime = checkpoint_runtime(&state)?;
         let checkpoint = Checkpoint {
             identity: runtime.clone(),
             state,
@@ -1540,6 +1539,23 @@ fn is_supported_worker_identity(version_output: &str) -> bool {
             .strip_prefix("kiki ")
             .and_then(|rest| rest.strip_suffix(&format!(" ({RUNTIME_IDENTITY})")))
             .is_some_and(|version| !version.is_empty() && !version.contains(char::is_whitespace))
+}
+
+/// Monty loads dumps across releases sharing a dump-format version, which its
+/// documented `MONTY\0` + little-endian `u16` header names. Dumps also retain
+/// type checking and Kiki's host stubs.
+fn checkpoint_runtime(state: &[u8]) -> Result<RuntimeIdentity, ArenaError> {
+    let version = state
+        .strip_prefix(b"MONTY\0")
+        .and_then(|rest| rest.first_chunk::<2>())
+        .map(|version| u16::from_le_bytes(*version))
+        .ok_or_else(|| ArenaError::Infrastructure {
+            message: "Monty dump has no format header".to_owned(),
+            execution: None,
+        })?;
+    Ok(RuntimeIdentity(format!(
+        "monty-dump-{version}+type-check-v3"
+    )))
 }
 
 async fn validate_worker(path: &Path) -> Result<RuntimeIdentity, ArenaError> {
@@ -3467,9 +3483,12 @@ mod tests {
     async fn legacy_checkpoints_cannot_disable_model_type_checks() {
         let workspace = tempfile::tempdir().unwrap();
         let mut arena = arena(&workspace).await;
+        assert_eq!(arena.checkpoint().identity.0, "monty-dump-13+type-check-v3");
         for identity in [
             RUNTIME_IDENTITY.to_owned(),
             format!("{RUNTIME_IDENTITY}+type-check"),
+            format!("{RUNTIME_IDENTITY}+type-check-v3"),
+            "monty-dump-13+type-check-v2".to_owned(),
         ] {
             let mut checkpoint = arena.checkpoint();
             checkpoint.identity = RuntimeIdentity(identity);
